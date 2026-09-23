@@ -122,6 +122,61 @@ def _kill_if_alive(pid: int | None) -> None:
         )
 
 
+def _hold_capacity(env: dict[str, str], tmp: Path, dispatch_id: str):
+    """Acquire a slot for a genuinely live worker, matching the lease contract."""
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        held = subprocess.run(
+            [
+                sys.executable,
+                "scripts/goalflight_capacity.py",
+                "acquire",
+                "--agent",
+                "test-dispatch",
+                "--dispatch-id",
+                dispatch_id,
+                "--project-root",
+                str(tmp),
+                "--ttl-s",
+                "60",
+                "--worker-pid",
+                str(worker.pid),
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except BaseException:
+        worker.kill()
+        worker.wait(timeout=5)
+        raise
+    return json.loads(held.stdout)["lease"]["lease_id"], worker
+
+
+def _release_capacity_holder(env: dict[str, str], lease_id: str, worker) -> None:
+    _kill_if_alive(worker.pid)
+    worker.wait(timeout=5)
+    subprocess.run(
+        [sys.executable, "scripts/goalflight_capacity.py", "release", "--lease-id", lease_id],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+
 def case_kill_waits_for_exact_process_generation_exit() -> None:
     pid = 424242
     identity = {"pid": pid, "start_token": "test-generation"}
@@ -290,7 +345,12 @@ def _capacity_release_stale(env: dict[str, str], *, cwd: Path | None = None) -> 
 
 
 def _assert_terminal_record_and_lease(
-    env: dict[str, str], dispatch_id: str, state: str, *, cwd: Path | None = None
+    env: dict[str, str],
+    dispatch_id: str,
+    state: str,
+    *,
+    cwd: Path | None = None,
+    lease_state: str | None = None,
 ) -> None:
     payload = _status(env, cwd=cwd)
     row = _record(payload, dispatch_id)
@@ -308,8 +368,10 @@ def _assert_terminal_record_and_lease(
         assert row.get("reason") or row.get("error"), row
     leases = _leases(payload, dispatch_id)
     assert leases, f"lease missing for {dispatch_id}"
-    assert all(lease.get("state") == state for lease in leases), leases
-    assert all(lease.get("released_at") for lease in leases), leases
+    expected_lease_state = lease_state or state
+    assert all(lease.get("state") == expected_lease_state for lease in leases), leases
+    if expected_lease_state != "active":
+        assert all(lease.get("released_at") for lease in leases), leases
 
 
 def case_status_sees_dispatch_and_lease_releases() -> None:
@@ -433,7 +495,9 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
                     sys.executable,
                     "-c",
                     "import sys; sys.path.insert(0, 'scripts'); "
-                    "import goalflight_acp_client; print(goalflight_acp_client.cleanup_ghosts())",
+                    "import goalflight_ledger; goalflight_ledger._POSIX_PS_AVAILABLE = False; "
+                    "import goalflight_acp_client; goalflight_acp_client._ps_meta = lambda _pid: None; "
+                    "print(goalflight_acp_client.cleanup_ghosts())",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -445,7 +509,11 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
             assert int(cleanup.stdout.strip()) == 0, cleanup
             assert _process_exists(worker_pid), "cleanup killed live unowned worker"
             assert list((tmp / "pids").glob("*.jsonl")), "pidfile removed before reattach"
-            _assert_terminal_record_and_lease(env, dispatch_id, "blocked", cwd=tmp)
+            # Terminal journal authority does not authorize releasing capacity
+            # while this deliberately detached worker is still alive.
+            _assert_terminal_record_and_lease(
+                env, dispatch_id, "blocked", cwd=tmp, lease_state="active"
+            )
         finally:
             _kill_if_alive(worker_pid)
 
@@ -532,11 +600,16 @@ def case_from_queue_detached_launch_reparents_lease_and_survives_release_stale()
             _kill_if_alive(worker_pid)
             _wait_for(lambda: not _process_exists(worker_pid), timeout_s=10.0)
             dead_release = _capacity_release_stale(env, cwd=tmp)
-            assert dead_release["count"] == 1, dead_release
+            # The watcher may have observed terminal worker death first and
+            # released the lease through terminal authority. release-stale is
+            # the idempotent repair path, so either observer may win.
+            assert dead_release["count"] in {0, 1}, dead_release
             payload = _status(env, cwd=tmp)
             dead_lease = _leases(payload, dispatch_id)[0]
-            assert dead_lease.get("state") == "expired", dead_lease
-            assert dead_lease.get("reason") == "test_release_stale", dead_lease
+            assert dead_lease.get("state") != "active", dead_lease
+            if dead_release["count"] == 1:
+                assert dead_lease.get("state") == "expired", dead_lease
+                assert dead_lease.get("reason") == "test_release_stale", dead_lease
         finally:
             _kill_if_alive(worker_pid)
             _kill_if_alive(watcher_pid)
@@ -663,7 +736,9 @@ def case_default_background_finalizes_ledger_and_rate_pressure_once() -> None:
             assert rate_record.get("error", {}).get("message") == "dispatch_worker_limit_reached", rate_record
             assert "usage limit" in json.dumps(rate_record.get("error"), sort_keys=True).lower(), rate_record
             release = _capacity_release_stale(env)
-            assert release["count"] == 1, release
+            # Terminal authority may have released the dead worker before the
+            # operator repair sweep; release-stale remains idempotent.
+            assert release["count"] in {0, 1}, release
 
             clean_proc = _run_dispatch(
                 tmp,
@@ -788,28 +863,7 @@ def case_capacity_block_does_not_spawn() -> None:
         tmp = Path(td)
         env = _env(tmp)
         env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
-        held = subprocess.run(
-            [
-                sys.executable,
-                "scripts/goalflight_capacity.py",
-                "acquire",
-                "--agent",
-                "test-dispatch",
-                "--dispatch-id",
-                "held-capacity",
-                "--project-root",
-                str(tmp),
-                "--ttl-s",
-                "60",
-            ],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        assert json.loads(held.stdout)["decision"] == "allow", held.stdout
+        lease_id, holder = _hold_capacity(env, tmp, "held-capacity")
 
         marker = tmp / "should-not-exist"
         status_path = tmp / "blocked.status.json"
@@ -847,6 +901,7 @@ def case_capacity_block_does_not_spawn() -> None:
         # Instant fail must report the queue context (waited_s ~0, 1 attempt).
         reason = json.loads(status_path.read_text())["reason"]
         assert reason.get("attempts") == 1, reason
+        _release_capacity_holder(env, lease_id, holder)
 
 
 def case_capacity_wait_queues_until_slot_frees() -> None:
@@ -858,16 +913,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         env = _env(tmp)
         env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
         env.pop("GOALFLIGHT_CAPACITY_WAIT_S", None)  # use the CLI flag below
-        held = subprocess.run(
-            [
-                sys.executable, "scripts/goalflight_capacity.py", "acquire",
-                "--agent", "test-dispatch", "--dispatch-id", "held-for-queue",
-                "--project-root", str(tmp), "--ttl-s", "60",
-            ],
-            cwd=ROOT, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
-        )
-        lease_id = json.loads(held.stdout)["lease"]["lease_id"]
+        lease_id, holder = _hold_capacity(env, tmp, "held-for-queue")
 
         marker = tmp / "queued-then-spawned"
         status_path = tmp / "queued.status.json"
@@ -933,14 +979,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         assert reuse.returncode != 0, "duplicate dispatch-id accepted during capacity wait"
         assert "non-terminal" in (reuse.stderr + reuse.stdout), (reuse.stdout, reuse.stderr)
 
-        subprocess.run(
-            [
-                sys.executable, "scripts/goalflight_capacity.py", "release",
-                "--lease-id", lease_id,
-            ],
-            cwd=ROOT, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
-        )
+        _release_capacity_holder(env, lease_id, holder)
         stdout, stderr = proc.communicate(timeout=60)
         assert proc.returncode == 0, f"queued dispatch rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
         assert "CAPACITY-WAIT " in stdout, stdout
@@ -956,15 +995,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
         tmp = Path(td)
         env = _env(tmp)
         env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
-        subprocess.run(
-            [
-                sys.executable, "scripts/goalflight_capacity.py", "acquire",
-                "--agent", "test-dispatch", "--dispatch-id", "held-for-interrupt",
-                "--project-root", str(tmp), "--ttl-s", "60",
-            ],
-            cwd=ROOT, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
-        )
+        lease_id, holder = _hold_capacity(env, tmp, "held-for-interrupt")
         status_path = tmp / "interrupted.status.json"
         proc = subprocess.Popen(
             [
@@ -993,6 +1024,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
         payload = _status(env)
         row = _record(payload, "interrupted-dispatch")
         assert row and row.get("state") == "blocked_capacity", row
+        _release_capacity_holder(env, lease_id, holder)
 
 
 def case_require_prompt_before_side_effects() -> None:

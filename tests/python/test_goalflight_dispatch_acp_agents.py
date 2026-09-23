@@ -910,25 +910,47 @@ def _capacity_cmd(state_dir: Path, args: list[str]) -> subprocess.CompletedProce
     return proc
 
 
+_HELD_CAPACITY_WORKERS: dict[tuple[str, str], subprocess.Popen] = {}
+
+
 def _hold_capacity(state_dir: Path, *, agent: str = "fake-acp", dispatch_id: str = "held-acp-capacity") -> str:
-    proc = _capacity_cmd(
-        state_dir,
-        [
-            "acquire",
-            "--agent",
-            agent,
-            "--dispatch-id",
-            dispatch_id,
-            "--project-root",
-            str(ROOT),
-            "--ttl-s",
-            "60",
-        ],
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    return json.loads(proc.stdout)["lease"]["lease_id"]
+    try:
+        proc = _capacity_cmd(
+            state_dir,
+            [
+                "acquire",
+                "--agent",
+                agent,
+                "--dispatch-id",
+                dispatch_id,
+                "--project-root",
+                str(ROOT),
+                "--ttl-s",
+                "60",
+                "--worker-pid",
+                str(worker.pid),
+            ],
+        )
+    except BaseException:
+        worker.terminate()
+        worker.wait(timeout=5)
+        raise
+    lease_id = json.loads(proc.stdout)["lease"]["lease_id"]
+    _HELD_CAPACITY_WORKERS[(str(state_dir), lease_id)] = worker
+    return lease_id
 
 
 def _release_capacity(state_dir: Path, lease_id: str) -> None:
+    worker = _HELD_CAPACITY_WORKERS.pop((str(state_dir), lease_id), None)
+    if worker is not None:
+        worker.terminate()
+        worker.wait(timeout=5)
     _capacity_cmd(state_dir, ["release", "--lease-id", lease_id])
 
 
@@ -1070,7 +1092,13 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
         cfg = _acp_cfg(tmp, dispatch_id="queued-acp", status_json=status_json, capacity_wait_s=6.0)
         saved = _install_fake_acp_after_capacity()
         try:
-            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            # ACP startup's unrelated ghost sweep uses a macOS ``ps`` probe.
+            # This capacity test already controls process identity through the
+            # fake ACP seam; keep the sandboxed test hermetic and out of ps.
+            with (
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            ):
                 thread, result = _run_acp_thread(cfg)
                 waiting = _wait_for_status(status_json, "waiting_capacity", timeout_s=5.0)
                 assert waiting["reason"]["decision"] == "wait", waiting
@@ -1080,6 +1108,11 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
                     )
                 )
                 assert ledger["state"] == "waiting_capacity", ledger
+                attempt = goalflight_journal.open_or_create_journal(ROOT).attempt_for_dispatch(
+                    "queued-acp"
+                )
+                assert attempt is not None
+                assert attempt.lifecycle_state not in goalflight_journal.ATTEMPT_FINAL_STATES
                 _release_capacity(state_dir, lease_id)
                 thread.join(timeout=20)
                 if thread.is_alive():

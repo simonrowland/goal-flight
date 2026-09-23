@@ -1,14 +1,13 @@
-"""A lease with no worker is reclaimable when its claimant is gone.
+"""A lease with no worker stays protected through the spawn handoff.
 
 Measured 2026-08-31: 29 active leases had worker=none, claimant=dead,
 controller=alive -- oldest 14.2 hours. `stale_active_leases` keyed the
 no-worker branch on the CONTROLLER pid, and a controller is a long-running
 session that outlives every lease it requests, so those leases were immortal.
 
-20 of them were held by dispatches whose own state was `queued`. Queued work
-therefore held the capacity that queued work needed in order to launch, and the
-codex pool sat at 31/30 while grok-code sat at 2/30. `release-stale` reclaimed
-nothing, correctly by its own logic and uselessly in practice.
+Queued work may hold capacity until terminal ledger evidence proves that no
+worker was spawned. Claimant death alone is not that evidence: the launcher can
+die after spawning and before persisting the worker identity.
 
 Three cases pin the fix, and the middle one is why the controller check existed
 at all: the acquire-then-spawn window must stay protected.
@@ -71,10 +70,14 @@ def _capacity_module():
 
 
 def _lease(lease_id: str, *, worker, claimant, controller) -> dict:
+    import goalflight_capacity as current_capacity
+
     return {
         "lease_id": lease_id,
         "agent": "codex",
         "state": "active",
+        "machine_id": current_capacity.machine_id(),
+        "lease_schema": current_capacity.LEASE_SCHEMA,
         "worker_pid": worker,
         "claimant_pid": claimant,
         "controller_pid": controller,
@@ -101,13 +104,13 @@ def test_orphaned_lease_is_stale_while_acquiring_and_working_are_not() -> None:
 
     stale = {row["lease_id"] for row in cap.stale_active_leases(data)}
 
-    check("orphaned lease (claimant dead, no worker) is reclaimable", "orphan" in stale)
+    check("unattached lease stays protected despite claimant death", "orphan" not in stale)
     check("acquire-then-spawn window is protected", "acquiring" not in stale)
     check("lease with a live worker is never reclaimed", "working" not in stale)
 
 
-def test_a_live_controller_does_not_keep_an_orphaned_lease_alive() -> None:
-    """The regression itself: controller liveness must not decide this."""
+def test_a_live_controller_does_not_change_an_unattached_lease() -> None:
+    """Controller liveness cannot prove an unattached worker is absent."""
     cap = _capacity_module()
     dead = _reaped_pid()
 
@@ -117,7 +120,7 @@ def test_a_live_controller_does_not_keep_an_orphaned_lease_alive() -> None:
         }
     }
     stale = {row["lease_id"] for row in cap.stale_active_leases(data)}
-    check("a live controller no longer pins an orphaned lease", "orphan" in stale)
+    check("a live controller cannot make an unattached lease stale", "orphan" not in stale)
 
 
 def test_unprobeable_claimant_is_not_reclaimed() -> None:

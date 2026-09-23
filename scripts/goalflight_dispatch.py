@@ -8644,12 +8644,7 @@ def _alert_launched_carrier_pending(dispatch_id: str, *, where: str) -> None:
 def _attach_worker_to_lease(lease_id: str | None, worker_pid: int) -> None:
     if not lease_id:
         return
-    with goalflight_capacity.StateLock():
-        data = goalflight_capacity.load_state()
-        lease = data.get("leases", {}).get(lease_id)
-        if lease:
-            lease["worker_pid"] = worker_pid
-            goalflight_capacity.save_state(data)
+    goalflight_capacity.attach_worker_to_capacity_lease(lease_id, worker_pid)
 
 
 def _detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> None:
@@ -8938,6 +8933,12 @@ def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> N
         return
     with contextlib.redirect_stdout(io.StringIO()):
         goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=state, reason=reason, keep=True))
+
+
+def _release_terminal_capacity(dispatch_id: str, terminal_state: str) -> None:
+    """Retry the idempotent lease hook after a terminal ledger projection."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        goalflight_capacity.release_terminal_dispatch(dispatch_id, terminal_state)
 
 
 def _release_stale_capacity_for_drain() -> None:
@@ -9478,6 +9479,14 @@ def _commit_abandoned_dispatch(
     if elapsed_s is not None:
         record["elapsed_s"] = elapsed_s
     goalflight_ledger.write_record(record)
+    try:
+        _release_terminal_capacity(str(record["dispatch_id"]), terminal_state)
+    except Exception as exc:
+        print(
+            "goalflight_dispatch: terminal capacity cleanup deferred: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     _maybe_mark_grok_quota_exhausted(record=record, state=state)
 
 
@@ -9829,6 +9838,16 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
         else:
             if projected != record:
                 goalflight_ledger.write_record(projected)
+            # A settled dispatch is terminal: release its capacity lease after the
+            # terminal projection, like withdraw does.
+            try:
+                _release_terminal_capacity(args.dispatch_id, journal_state)
+            except Exception as exc:
+                print(
+                    "goalflight_dispatch: terminal capacity cleanup deferred: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             archived = _archive_withdraw_carriers(carriers)
             payload.update(archived_carriers=archived,
                            archived_carrier=archived[0] if archived else None)
@@ -9895,6 +9914,14 @@ def _cmd_withdraw(argv: list[str]) -> int:
         # No constructors, locks, projection rewrites, or timestamp changes on a retry.
         if withdrawn and record and record.get("terminal_state") == terminal_state and not carriers:
             payload["status"] = "already withdrawn"
+            try:
+                _release_terminal_capacity(args.dispatch_id, terminal_state)
+            except Exception as exc:
+                print(
+                    "goalflight_dispatch: terminal capacity cleanup deferred: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         elif args.dry_run:
             terminal = goalflight_journal.TerminalCommit(
                 attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
@@ -9937,6 +9964,14 @@ def _cmd_withdraw(argv: list[str]) -> int:
                     return 0
                 if withdrawn and record and record.get("terminal_state") == attempt["terminal_state"] and not carriers:
                     payload.update(status="already withdrawn", withdrawn_by=outcome["withdrawn_by"])
+                    try:
+                        _release_terminal_capacity(args.dispatch_id, attempt["terminal_state"])
+                    except Exception as exc:
+                        print(
+                            "goalflight_dispatch: terminal capacity cleanup deferred: "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
                     print(json.dumps(payload, sort_keys=True) if args.json else
                           f"{args.dispatch_id}: already withdrawn by {payload['withdrawn_by']}")
                     return 0
@@ -9956,6 +9991,14 @@ def _cmd_withdraw(argv: list[str]) -> int:
                 )
                 current["project_root"] = str(root)
                 goalflight_ledger.write_record(current)
+                try:
+                    _release_terminal_capacity(args.dispatch_id, terminal.terminal_state)
+                except Exception as exc:
+                    print(
+                        "goalflight_dispatch: terminal capacity cleanup deferred: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
                 archived_carriers = _archive_withdraw_carriers(carriers)
                 payload.update(status="withdrawn", withdrawn_by=terminal.observation["withdrawn_by"],
                                attempt_id=terminal.attempt_id,
@@ -14640,6 +14683,14 @@ def commit_reconciled_terminal(
             goalflight_ledger.write_record(record)
         except OSError:
             return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+        try:
+            _release_terminal_capacity(dispatch_id, committed.value.terminal_state)
+        except Exception as exc:
+            print(
+                "goalflight_dispatch: terminal capacity cleanup deferred: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         existing_state = str(record.get("state") or existing_terminal)
         _maybe_mark_grok_quota_exhausted(record=record, state=existing_state)
         return TerminalCommitResult(
@@ -14710,6 +14761,14 @@ def commit_reconciled_terminal(
         goalflight_ledger.write_record(record)
     except OSError:
         return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    try:
+        _release_terminal_capacity(dispatch_id, terminal_state)
+    except Exception as exc:
+        print(
+            "goalflight_dispatch: terminal capacity cleanup deferred: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     _maybe_mark_grok_quota_exhausted(record=record, state=state)
     return TerminalCommitResult(
         TerminalCommitKind.CREATED_TERMINAL if created else TerminalCommitKind.UPDATED_TERMINAL,
@@ -19502,6 +19561,8 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv,
         )
         _mark_queue_claim_worker_spawn_intent(args)
+        if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+            raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
         worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,
@@ -19840,6 +19901,35 @@ def main(argv: list[str] | None = None) -> int:
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
+        elif final_worker_alive is None and not worker_pid:
+            # No positive spawn result is explicit pre-spawn evidence. Preserve
+            # it in the terminal ledger so a reserved lease can be released;
+            # an unknown positive worker PID remains UNKNOWN and cannot release
+            # an unattached lease during the spawn handoff.
+            final_worker_alive = False
+        if lease_id and final_worker_alive is False and not worker_pid:
+            # _spawn_daemonized_process raised before returning a pid. That is
+            # launcher-owned proof of non-launch, so do not leave the durable
+            # reservation in spawning until its TTL expires.
+            try:
+                goalflight_capacity.mark_lease_spawn_failed(
+                    lease_id, reason=final_reason or "spawn_failed"
+                )
+            except Exception as exc:
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        "DISPATCH-FINALIZE-WARN "
+                        + json.dumps(
+                            {
+                                "dispatch_id": args.dispatch_id,
+                                "write": "capacity_spawn_failure",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
         keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
         capacity_state, capacity_reason = _quota_limited_state_reason(
             final_state,

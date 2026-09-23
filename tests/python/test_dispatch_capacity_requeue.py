@@ -22,6 +22,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 CAPACITY = ROOT / "scripts" / "goalflight_capacity.py"
@@ -68,7 +70,28 @@ def _run(
     )
 
 
-def _hold_capacity(tmp: Path, env: dict[str, str], dispatch_id: str) -> str:
+_HELD_CAPACITY: dict[str, tuple[str, subprocess.Popen]] = {}
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_capacity_holders():
+    yield
+    for holder in list(_HELD_CAPACITY.values()):
+        _release_capacity(_HELD_ENV[holder[0]], holder)
+
+
+_HELD_ENV: dict[str, dict[str, str]] = {}
+
+
+def _hold_capacity(tmp: Path, env: dict[str, str], dispatch_id: str) -> tuple[str, subprocess.Popen]:
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     held = _run(
         [
             sys.executable,
@@ -84,16 +107,30 @@ def _hold_capacity(tmp: Path, env: dict[str, str], dispatch_id: str) -> str:
             str(os.getpid()),
             "--ttl-s",
             "60",
+            "--worker-pid",
+            str(worker.pid),
         ],
         env,
     )
+    if held.returncode != 0:
+        worker.kill()
+        worker.wait(timeout=5)
     assert held.returncode == 0, (held.stdout, held.stderr)
     payload = json.loads(held.stdout)
     assert payload["decision"] == "allow", payload
-    return str(payload["lease"]["lease_id"])
+    holder = (str(payload["lease"]["lease_id"]), worker)
+    _HELD_CAPACITY[holder[0]] = holder
+    _HELD_ENV[holder[0]] = env
+    return holder
 
 
-def _release_capacity(env: dict[str, str], lease_id: str) -> None:
+def _release_capacity(env: dict[str, str], holder: tuple[str, subprocess.Popen]) -> None:
+    lease_id, worker = holder
+    _HELD_CAPACITY.pop(lease_id, None)
+    _HELD_ENV.pop(lease_id, None)
+    if worker.poll() is None:
+        worker.terminate()
+        worker.wait(timeout=5)
     released = _run(
         [
             sys.executable,
@@ -104,7 +141,11 @@ def _release_capacity(env: dict[str, str], lease_id: str) -> None:
         ],
         env,
     )
-    assert released.returncode == 0, (released.stdout, released.stderr)
+    if released.returncode != 0:
+        assert released.returncode == 1 and "missing_lease" in released.stdout, (
+            released.stdout,
+            released.stderr,
+        )
 
 
 def _dispatch_command(
