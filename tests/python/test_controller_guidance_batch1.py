@@ -43,13 +43,25 @@ def test_docs_do_not_say_a_watchdog_tick_renews() -> None:
         assert "do not auto-renew" not in _text(relative), relative
 
 
-def test_resume_drains_mail_before_arming_and_confirms_probe() -> None:
+def test_resume_drains_mail_before_arming_and_describes_probe() -> None:
     resume = _text("commands/resume.md")
     drain_at = resume.index("relay --drain")
     arm_at = resume.index("goalflight_messages.py supervise")
     assert drain_at < arm_at
     assert '"type":"probe"' in resume or '"type": "probe"' in resume
     assert "--controller-pid-from-ancestry" in _text("SKILL.md")
+
+
+def test_probe_docs_require_coverage_evidence() -> None:
+    for relative in ("commands/resume.md", "protocols/controller-mail.md"):
+        text = " ".join(_text(relative).split())
+        assert "proves stdout connectivity only, before migration and child spawn" in text
+        assert "does not prove armed coverage" in text
+        assert "`--chatty` / `--debug`" in text
+        assert "default terse output has no full-coverage readiness record" in text
+        assert "`live=target=4`" in text
+        assert "Supervisor process presence alone is insufficient" in text
+        assert "startup `stop` or child failure" in text
 
 
 def test_native_claude_messaging_is_allowed_with_limits() -> None:

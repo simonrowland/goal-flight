@@ -97,8 +97,14 @@ python3 <skill-root>/scripts/goalflight_messages.py supervise \
 
 Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one.
 
-Confirm it is actually armed before moving on: the supervisor's first write is
-a `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record.
+The first `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}`
+record proves stdout connectivity only, before migration and child spawn; it
+does not prove armed coverage. Before moving on, confirm the current generation's
+stream, two backup listeners, and watchdog with a subsequent `--chatty` / `--debug`
+coverage record showing `live=target=4` (4/4). Use either flag when verifying
+startup; default terse output has no full-coverage readiness record after the
+probe. Supervisor process presence alone is insufficient. Resolve any
+subsequent startup `stop` or child failure before proceeding.
 Do not grep that feed; default is terse.
 If `--list-controllers` still reports `supervisor: absent` after arming, treat
 that as a blocker and resolve it — do not proceed to STEP 2 deaf.

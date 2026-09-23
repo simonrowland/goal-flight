@@ -2692,11 +2692,10 @@ def _renew_controller_lease_before_arm(
 ) -> str | None:
     """Extend the live lease before supervise arms.
 
-    Controllers re-launch supervise at every monitor re-arm (the host cap is
-    30 minutes) and nothing else renews the lease. Same-principal renewal
-    keeps generation and nonce and moves ``renew_deadline_at`` forward. A
-    missing journal is left alone: the startup pin already decided. A live
-    lease whose nonce does not match is not renewed and must not be armed.
+    Only the pinned active generation may renew. A dead holder refuses without
+    expiring journal or coverage state. If the holder dies after the liveness
+    check, the renewed lease simply lapses at its next deadline; no generation
+    is created. Journal unreadability retains the runtime probe's retry path.
     """
     import goalflight_journal  # type: ignore
 
@@ -2710,18 +2709,23 @@ def _renew_controller_lease_before_arm(
         lease = authority.active_lease(controller_label)
     except unavailable:
         return nonce
-    if lease is None:
-        return nonce
-    if lease.nonce != nonce:
+    if lease is None or lease.nonce != nonce:
+        return None
+    if wake.lease_holder_alive(
+        Path(project_root), controller_label=controller_label,
+        lease_nonce=nonce, prune_dead=False,
+    ) is False:
         return None
     try:
-        result = authority.claim_or_renew_lease(
+        result = authority.renew_active_lease(
             controller_label,
-            principal=lease.principal,
             nonce=lease.nonce,
+            generation=lease.generation,
         )
     except unavailable:
         return nonce
+    if result.disposition == goalflight_journal.WriteDisposition.CAS_LOST:
+        return None
     if not result.committed or result.value is None:
         return nonce
     return str(result.value.nonce)
@@ -2766,21 +2770,6 @@ def cmd_supervise(
     if not live_nonce:
         print(f"supervise: {refusal}", file=sys.stderr)
         return int(refusal_code or SUPERVISE_START_EXIT)
-    # Renew before the arm check. Same-principal renewal keeps the nonce;
-    # arming first can bind the supervisor to a nonce the renewal is about
-    # to replace. A stale nonce already returned above and is not renewed.
-    renewed_nonce = _renew_controller_lease_before_arm(
-        project_root=project_root,
-        controller_label=label,
-        nonce=live_nonce,
-    )
-    if not renewed_nonce:
-        print(
-            "supervise: did-not-arm: live lease nonce changed before arm",
-            file=sys.stderr,
-        )
-        return SUPERVISE_STOP_EXIT
-    live_nonce = renewed_nonce
     if on_startup_probe is not None:
         listing = wake._process_listing()
         if listing is not None:
@@ -2830,6 +2819,19 @@ def cmd_supervise(
         if coverage_s <= 0:
             print("supervise: coverage-secs must be positive", file=sys.stderr)
             return SUPERVISE_START_EXIT
+    # Refused starts must not extend the lease. Renew only just before arming.
+    renewed_nonce = _renew_controller_lease_before_arm(
+        project_root=project_root,
+        controller_label=label,
+        nonce=live_nonce,
+    )
+    if not renewed_nonce:
+        print(
+            "supervise: did-not-arm: controller lease lost before arm",
+            file=sys.stderr,
+        )
+        return SUPERVISE_STOP_EXIT
+    live_nonce = renewed_nonce
     host = RealHost(
         project_root=project_root,
         controller_label=label,
