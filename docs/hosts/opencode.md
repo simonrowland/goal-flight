@@ -22,6 +22,14 @@ check for drift, run
 OpenCode can run Goal Flight as an orchestrator through the installed skill wrapper
 and can run `opencode acp` as an ACP worker.
 
+Servers started by `scripts/hosts/opencode/prompt.py` or `bash_tail.py` append
+directly to `/tmp/opencode-serve-<port>.log` (override with `--log`). Before
+starting a server, an existing log larger than 16 MiB rotates to `.1`, keeping
+two archive generations (`.1` and `.2`). Symlinked logs and archives are refused.
+A single long-lived server's log grows until its next restart, including with
+`--keep-server`; rotation bounds archived space, not the active log. Direct
+file output preserves boot-failure diagnostics without a separate pipe writer.
+
 - OpenCode config lives in `~/.config/opencode/opencode.json` globally or
   `<project>/opencode.json` for one project.
 - Skills live in `~/.config/opencode/skills/<name>/SKILL.md` globally or

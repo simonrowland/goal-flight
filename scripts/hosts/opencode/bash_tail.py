@@ -32,6 +32,7 @@ from prompt import (  # noqa: E402
     DEFAULT_PORT,
     REPO_ROOT as _PROMPT_REPO_ROOT,
     _load_litellm_env,
+    default_log_path,
     prompt_once,
 )
 
@@ -99,7 +100,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"OpenCode serve port (default: {DEFAULT_PORT})")
     parser.add_argument("--boot-timeout", type=float, default=120.0, help="Seconds to wait for server health")
     parser.add_argument("--timeout", type=float, default=180.0, help="Seconds to wait for model reply")
-    parser.add_argument("--log", default=str(Path("/tmp/opencode-serve.log")), help="Serve log when auto-starting")
+    parser.add_argument("--log", help="Serve log when auto-starting (default: /tmp/opencode-serve-<port>.log)")
     args = parser.parse_args()
 
     _load_litellm_env()
@@ -120,7 +121,7 @@ def main() -> int:
         port=args.port,
         boot_timeout_s=args.boot_timeout,
         reply_timeout_s=args.timeout,
-        log_path=Path(args.log),
+        log_path=Path(args.log) if args.log else default_log_path(args.port),
     )
 
 

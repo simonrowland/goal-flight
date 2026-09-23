@@ -489,6 +489,11 @@ incremented when meaningful skill behaviour changes.
   candidate announcement persist in the status sidecar so a watcher
   restart does not reset the window or re-announce.
 
+### Deferred
+
+- Dispatch-artifact retention is deferred until the worktree GC design covers
+  dry-run, re-verification, and resume-aware cleanup together.
+
 ## [1.5.1] - 2026-08-23
 
 ### Changed
