@@ -4967,6 +4967,7 @@ def _rebuild_codex_resume_home(
     *,
     home_owner_dispatch_id: str | None = None,
     explicit_account: str | None = None,
+    model: str | None = None,
 ) -> tuple[str, str]:
     """Refresh auth/config in the original home while preserving its rollout."""
     if not expected_home.is_dir():
@@ -4995,6 +4996,7 @@ def _rebuild_codex_resume_home(
             project_root,
             explicit_account,
             home_owner_dispatch_id or parent_dispatch_id,
+            model=model,
         )
         if (
             rebuilt_home is None
@@ -5122,7 +5124,7 @@ def _cmd_resume(argv: list[str]) -> int:
     parser.add_argument(
         "--account",
         help=(
-            "Seat to bill the resumed worker to. Honored as a pin. "
+            "Account to bill the resumed worker to. Honored as a pin. "
             "When omitted, default selection skips recently quota-exhausted "
             "accounts until their reset."
         ),
@@ -6772,21 +6774,79 @@ def _call_resolve_codex_seat(
     return home, effective_account
 
 
+def _codex_account_admission_reason(
+    account: str,
+    *,
+    model: str | None = None,
+    require_probe: bool = True,
+) -> str | None:
+    """Return why a configured account cannot accept this dispatch."""
+    probe = _seat_probe_says_usable(account, "codex")
+    if probe is False or _account_quota_blocked(account, engine="codex"):
+        return "walled or quota-blocked"
+    if require_probe and probe is not True:
+        return "health probe unknown"
+    try:
+        budget = goalflight_capacity.launch_slot_budget(
+            "codex",
+            account=account,
+            model=model,
+        )
+        if budget.get("unreadable"):
+            return "capacity unavailable"
+        remaining = budget.get("account_remaining")
+        request_weight = budget.get("request_weight", 1.0)
+        if remaining is not None and float(remaining) < float(request_weight):
+            row = (budget.get("by_account") or {}).get(f"codex/{account}") or {}
+            return (
+                f"capacity {row.get('active_weight', 0)}/"
+                f"{row.get('cap', '?')} weight"
+            )
+    except (TypeError, ValueError, OSError):
+        return "capacity unavailable"
+    return None
+
+
+def select_codex_account(
+    *,
+    model: str | None = None,
+    explicit_account: str | None = None,
+) -> tuple[str | None, list[dict[str, str]]]:
+    """Pick a healthy Codex account with capacity headroom.
+
+    This is deliberately side-effect free. Home/session creation happens only
+    after the returned account is passed to ``resolve_codex_home``. Rejected
+    accounts are returned for diagnostics so a healthy account is never hidden
+    behind a generic "no healthy account" message.
+    """
+    if explicit_account:
+        return explicit_account.strip() or None, []
+    rejected: list[dict[str, str]] = []
+    for account in _configured_account_names("codex"):
+        reason = _codex_account_admission_reason(account, model=model)
+        if reason is None:
+            return account, rejected
+        rejected.append({"account": account, "reason": reason})
+    return None, rejected
+
+
 def resolve_codex_home(
     project_root: Path | str,
     explicit_account: str | None,
     dispatch_id: str,
+    *,
+    model: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve one launch snapshot without ever failing the dispatch.
 
-    An explicit ``--account`` is honored as a pin. Unpinned selection skips
-    recently quota-exhausted seats until their reset rather than dying on
-    the first serial seat.
+    An explicit ``--account`` is honored as a pin. Unpinned selection first
+    chooses a measured healthy account with per-account capacity headroom, then
+    resolves its home. This keeps home/session claiming after account choice.
 
-    When the seat library is absent this returns ``(None, None)``: we did
-    not look. When it is present but no managed seat is selectable, the
-    launch still proceeds on the inherited host login and the billed
-    account is labelled ``host`` so the ledger does not record ``None``.
+    When the optional account library is absent this returns ``(None, None)``:
+    no account lookup occurred. When it is present but no managed account is
+    selectable, the launch still proceeds on the inherited host login and the
+    billed account is labelled ``host`` so the ledger does not record ``None``.
     """
     api = _codex_seat_api()
     if api is None:
@@ -6795,21 +6855,31 @@ def resolve_codex_home(
         return _call_resolve_codex_seat(
             api, project_root, explicit_account, dispatch_id
         )
-    resolved = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
-    home, account = resolved
-    if account is not None and _account_quota_blocked(account, engine="codex"):
-        alternative = _first_unblocked_account("codex", exclude={account})
-        if alternative is not None:
-            retried = _call_resolve_codex_seat(
-                api, project_root, alternative, dispatch_id
-            )
-            if retried != (None, None):
-                home, account = retried
+    selected, rejected = select_codex_account(model=model)
+    if selected:
+        resolved = _call_resolve_codex_seat(
+            api, project_root, selected, dispatch_id
+        )
+        if resolved != (None, None):
+            return resolved
+        rejected.append({"account": selected, "reason": "account resolution failed"})
+
+    # Preserve the optional library's own dispatch-time selector for machines
+    # whose account homes are not discoverable by directory enumeration. A
+    # returned account is still checked against the same health evidence before
+    # it is accepted; it cannot mask a healthy configured sibling.
+    home, account = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
     if account:
-        return home, account
+        reason = _codex_account_admission_reason(
+            account,
+            require_probe=bool(_configured_account_names("codex")),
+        )
+        if reason is None:
+            return home, account
+        rejected.append({"account": account, "reason": reason})
     print(
-        "goalflight_dispatch: WARN: no managed codex seat selectable "
-        "(all seats walled or discovery failed); billing host",
+        "goalflight_dispatch: WARN: no managed codex account selectable "
+        f"(rejected: {rejected or 'discovery failed'}); billing host",
         file=sys.stderr,
     )
     return home, "host"
@@ -7061,6 +7131,12 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
     lease_ttl_s = min(max(int(args.max_idle_secs or 300) * 4, 3600), 7200)
     acquire_args = argparse.Namespace(
         agent=args.agent,
+        account=(
+            getattr(args, "_capacity_account", None)
+            or getattr(args, "effective_account", None)
+            or getattr(args, "account", None)
+        ),
+        model=getattr(args, "model", None),
         dispatch_id=args.dispatch_id,
         prompt_id=None,
         project_root=str(project_root),
@@ -19660,6 +19736,17 @@ def main(argv: list[str] | None = None) -> int:
                 state="waiting_capacity",
             )
         ledger_recorded = True
+        if (
+            _account_engine(args.agent) == "codex"
+            and not getattr(args, "account", None)
+            and not getattr(args, "_codex_selected_account", None)
+        ):
+            selected_account, selection_rejections = select_codex_account(
+                model=getattr(args, "model", None)
+            )
+            args._codex_selected_account = selected_account
+            args._capacity_account = selected_account
+            args._codex_account_rejections = selection_rejections
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
         except (SystemExit, KeyboardInterrupt) as exc:
@@ -19766,15 +19853,21 @@ def main(argv: list[str] | None = None) -> int:
                                 resume_home,
                                 args.codex_session_id,
                                 home_owner_dispatch_id=codex_home_owner_dispatch_id,
-                                explicit_account=getattr(args, "account", None),
+                                explicit_account=(
+                                    getattr(args, "_codex_selected_account", None)
+                                    or getattr(args, "account", None)
+                                ),
+                                model=getattr(args, "model", None),
                             )
                         )
             else:
                 try:
                     codex_dispatch_home, effective_account = resolve_codex_home(
                         project_root,
-                        args.account,
+                        getattr(args, "_codex_selected_account", None)
+                        or args.account,
                         args.dispatch_id,
+                        model=getattr(args, "model", None),
                     )
                 except BaseException:
                     codex_dispatch_home, effective_account = None, None

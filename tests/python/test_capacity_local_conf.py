@@ -66,6 +66,8 @@ def case_conf_overrides_merge_over_baseline() -> None:
                 "hard_cap": 75,
                 "operating_total": 75,
                 "agent_caps": {"grok": 60, "codex": 15, "codex-acp": 15},
+                "account_caps": {"codex": {"25ca6b": 30, "default": 24}},
+                "model_weights": {"codex": {"gpt-5.6-luna": 0.25}},
                 "agent_rss_mb": {"grok": 250},
             }
         )
@@ -78,6 +80,10 @@ def case_conf_overrides_merge_over_baseline() -> None:
         # A cap not named in the conf keeps its baseline.
         assert mod.DEFAULT_AGENT_CAPS["claude"] == 5
         assert mod.AGENT_RSS_MB["grok"] == 250
+        assert mod.account_cap("codex", "25ca6b") == 30
+        assert mod.account_cap("codex", "new-account") == 24
+        assert mod.model_weight("codex", "gpt-5.6-luna") == 0.25
+        assert mod.model_weight("codex", "max-model") == 1.0
         assert mod.local_hard_cap(40) == 75
         assert mod.local_operating_total() == 75
     finally:
