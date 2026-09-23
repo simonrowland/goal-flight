@@ -82,6 +82,154 @@ def test_release_stale_uses_terminal_ledger_after_failed_attach(tmp_path, monkey
     assert cap.load_state()["leases"]["held"]["state"] == "released"
 
 
+def test_current_reserved_lease_needs_explicit_no_spawn_proof(tmp_path):
+    record = {
+        "dispatch_id": "reserved-terminal",
+        "project_root": str(tmp_path),
+        "state": "waiting_capacity",
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "reserved-terminal-lease",
+        "dispatch_id": record["dispatch_id"],
+        "state": "active",
+        "agent": "codex",
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "launch_state": "reserved",
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    authority = journal.open_or_create_journal(tmp_path)
+    attempt = authority.prepare_attempt(record["dispatch_id"]).value
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = ledger.cmd_finish(argparse.Namespace(
+            dispatch_id=record["dispatch_id"],
+            state="failed",
+            reason="pre-spawn failure",
+            terminal_state=None,
+            elapsed_s=None,
+            worker_still_alive=False,
+            headline=None,
+        ))
+    assert rc == 0
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "error"
+
+
+def test_current_spawning_lease_stays_protected_without_worker_identity(tmp_path):
+    record = {
+        "dispatch_id": "spawning-terminal",
+        "project_root": str(tmp_path),
+        "state": "failed",
+        "terminal_state": "failed",
+        "worker_still_alive": False,
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "spawning-terminal-lease",
+        "dispatch_id": record["dispatch_id"],
+        "state": "active",
+        "agent": "codex",
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "launch_state": "spawning",
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    cap.cmd_release_stale(argparse.Namespace(state="released", reason="stale", keep=True))
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "active"
+
+
+def test_unattached_lease_is_not_reclaimed_from_claimant_death(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: False)
+    lease = {
+        "lease_id": "spawn-handoff",
+        "dispatch_id": "spawn-handoff-dispatch",
+        "state": "active",
+        "agent": "codex",
+        "claimant_pid": 4242,
+        "controller_pid": 4343,
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "started_at": cap.iso(cap.utc_now() - dt.timedelta(hours=2)),
+        "expires_at": cap.iso(cap.utc_now() - dt.timedelta(hours=1)),
+    }
+    data = {"machine_id": cap.machine_id(), "leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert cap.reclaim_stale_leases(data) == []
+    cap.prune_state(data)
+    assert data["leases"][lease["lease_id"]]["state"] == "active"
+
+
+def test_legacy_unattached_lease_uses_existing_ttl_backstop(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: False)
+    lease = {
+        # v1.7.0 wrote no per-lease machine_id or lease_schema.
+        "lease_id": "legacy-spawn-handoff",
+        "state": "active",
+        "agent": "codex",
+        "claimant_pid": 4242,
+        "controller_pid": 4343,
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    data = {"machine_id": cap.machine_id(), "leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert cap.reclaim_stale_leases(data) == []
+    lease["expires_at"] = cap.iso(cap.utc_now() - dt.timedelta(seconds=1))
+    assert cap.reclaim_stale_leases(data) == [lease["lease_id"]]
+    cap.prune_state(data)
+    assert data["leases"][lease["lease_id"]]["state"] == "expired"
+
+
+def test_remote_lease_is_never_probed_or_reclaimed(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "machine_id", lambda: "local-machine")
+
+    def fail_probe(_pid):
+        raise AssertionError("remote worker identity was probed locally")
+
+    monkeypatch.setattr(cap, "_probe_pid_liveness", fail_probe)
+    lease = {
+        "lease_id": "remote-holder",
+        "state": "active",
+        "agent": "codex",
+        "machine_id": "remote-machine",
+        "worker_pid": 4242,
+        "worker_identity": {"pid": 4242, "start_token": "remote"},
+        "expires_at": cap.iso(cap.utc_now() - dt.timedelta(hours=1)),
+    }
+    data = {"machine_id": "local-machine", "leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert cap.reclaim_stale_leases(data) == []
+    cap.prune_state(data)
+    assert data["leases"][lease["lease_id"]]["state"] == "active"
+
+
+def test_release_does_not_free_unattached_live_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: True)
+    record = {
+        "dispatch_id": "running-after-attach-failure",
+        "project_root": str(tmp_path),
+        "state": "running",
+        "worker_pid": 4242,
+        "worker_identity": {"pid": 4242, "start_token": "live"},
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "unattached-live",
+        "dispatch_id": record["dispatch_id"],
+        "state": "active",
+        "agent": "codex",
+        "project_root": str(tmp_path),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.cmd_release(argparse.Namespace(
+            lease_id=lease["lease_id"], state="failed", reason="finalize", keep=True,
+        ))
+    assert rc == 1
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "active"
+
+
 def test_terminal_authority_survives_capacity_cleanup_error(tmp_path, monkeypatch):
     record = seed(tmp_path)
     def fail_cleanup(*_args):

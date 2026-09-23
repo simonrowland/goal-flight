@@ -979,9 +979,11 @@ def case_unowned_acquire_tracks_pre_attach_claimant(state_dir: Path) -> None:
     assert lease.get("state") == "active", lease
 
     lease["claimant_pid"] = _dead_pid()
-    assert lease in cap.stale_active_leases(data), lease
+    # A dead claimant does not prove that the launcher failed before spawn.
+    # Only terminal ledger evidence can resolve a lease with no worker identity.
+    assert lease not in cap.stale_active_leases(data), lease
     cap.prune_state(data)
-    assert lease.get("state") == "expired", lease
+    assert lease.get("state") == "active", lease
 
 
 def case_attach_persists_worker_start_identity(state_dir: Path) -> None:

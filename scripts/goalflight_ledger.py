@@ -1623,6 +1623,22 @@ def cmd_finish(args: argparse.Namespace) -> int:
         # home. Readers derive running/terminal from this ledger/journal
         # write. Updating the sidecar here would mint a third writer of
         # the same fact.
+    # The journal hook runs before this ledger projection and can therefore
+    # miss a reserved lease whose no-spawn proof is written here. Retry the
+    # idempotent cleanup after publishing the terminal ledger row; attached
+    # leases remain protected by worker identity.
+    try:
+        import goalflight_capacity
+
+        goalflight_capacity.release_terminal_dispatch(
+            str(args.dispatch_id), terminal_state,
+        )
+    except Exception as exc:
+        print(
+            "goalflight_ledger: terminal capacity cleanup deferred: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     try:
         import goalflight_messages
 

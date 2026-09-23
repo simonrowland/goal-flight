@@ -39,6 +39,7 @@ import goalflight_rate_pressure
 from goalflight_liveness import active_monotonic
 
 SCHEMA = "goalflight.capacity.v1"
+LEASE_SCHEMA = "goalflight.capacity.lease.v2"
 
 
 DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
@@ -449,6 +450,22 @@ def machine_id() -> str:
     return f"{socket.gethostname()}:{platform.machine()}"
 
 
+def _lease_is_legacy(lease: dict) -> bool:
+    """Recognize leases written before per-lease host/launch metadata."""
+    return "machine_id" not in lease and lease.get("lease_schema") != LEASE_SCHEMA
+
+
+def _legacy_lease_expired(
+    lease: dict,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    if not _lease_is_legacy(lease):
+        return False
+    expires_at = parse_iso(lease.get("expires_at"))
+    return expires_at is not None and expires_at < (now or utc_now())
+
+
 def run_text(cmd: list[str], timeout: float = 2.0) -> str | None:
     try:
         return subprocess.check_output(
@@ -756,6 +773,21 @@ def worker_identity_liveness(
     return "live", "worker_identity_match"
 
 
+def _lease_machine_id(lease: dict, data: dict | None = None) -> str:
+    """Return the host that owns a lease, including legacy state-level leases."""
+    recorded = lease.get("machine_id")
+    if recorded not in (None, ""):
+        return str(recorded)
+    if data is not None and data.get("machine_id") not in (None, ""):
+        return str(data["machine_id"])
+    return machine_id()
+
+
+def _lease_is_local(lease: dict, data: dict | None = None) -> bool:
+    """Only probe process identities for leases owned by this host."""
+    return _lease_machine_id(lease, data) == machine_id()
+
+
 def _pid_holds_capacity(
     pid: object,
     lease: dict,
@@ -890,6 +922,7 @@ def unknown_claimant_leases(data: dict) -> list[dict]:
     return [
         lease
         for lease in active_leases(data)
+        if _lease_is_local(lease, data)
         if _pre_attach_claimant_liveness(lease) is None
     ]
 
@@ -901,24 +934,24 @@ def _lease_pids_dead(lease: dict) -> bool:
     one with a live pid is still consuming RAM and must not be evicted by a
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
-    An indeterminate worker identity is never dead. An unprobeable
-    pre-attach claimant is never dead: age is not a negative liveness
-    observation, and converting unknown into TTL expiry would free the slot
-    for a second worker against the same reservation.
+    An indeterminate worker identity is never dead. A current-format lease
+    with no worker identity is a pre-attach uncertainty: age is not a negative
+    liveness observation, and converting unknown into TTL expiry would free the
+    slot for a second worker against the same reservation. Legacy leases are
+    the explicit upgrade compatibility exception handled below.
     """
     if retained_live_scope_holds_capacity(lease):
         return False
-    if _pre_attach_claimant_liveness(lease) is None:
-        return False
     worker_pid = lease.get("worker_pid")
-    if worker_pid is not None:
-        liveness, _ = worker_identity_liveness(lease)
-        return liveness == "dead" and not attached_worker_group_holds_capacity(lease)
-    claimant_pid = lease.get("claimant_pid")
-    return (
-        not _pid_holds_capacity(lease.get("controller_pid"), lease)
-        and not _pid_holds_capacity(claimant_pid, lease)
-    )
+    if worker_pid is None:
+        # No worker identity is a spawn-handoff uncertainty, not proof that the
+        # claimant died before spawning. The lease remains capacity-bearing
+        # until terminal ledger evidence proves no worker was spawned. Legacy
+        # leases are the compatibility exception: their existing TTL is the
+        # bounded upgrade backstop requested for pre-v2 state.
+        return _legacy_lease_expired(lease)
+    liveness, _ = worker_identity_liveness(lease)
+    return liveness == "dead" and not attached_worker_group_holds_capacity(lease)
 
 
 def prune_state(data: dict) -> None:
@@ -927,12 +960,16 @@ def prune_state(data: dict) -> None:
     for lease_id in list(leases):
         lease = leases[lease_id]
         expires_at = parse_iso(lease.get("expires_at"))
-        # TTL expiry is gated on liveness: only flip a past-TTL lease to
-        # "expired" when its worker, controller, and pre-attach claimant are all
-        # dead. A LIVE lease past its TTL is kept and left to liveness-based
-        # reclaim (cmd_release-stale / stale_active_leases), so a long-running
-        # worker in a sibling project is never evicted out from under itself.
-        if expires_at and expires_at < now and _lease_pids_dead(lease):
+        # TTL expiry is gated on liveness: only local leases with a proven-dead
+        # worker may expire. Remote process identities are never probed here.
+        # An active lease past its TTL is otherwise left to liveness-based
+        # reclaim (cmd_release-stale / stale_active_leases).
+        if (
+            expires_at
+            and expires_at < now
+            and _lease_is_local(lease, data)
+            and _lease_pids_dead(lease)
+        ):
             lease["state"] = "expired"
             lease["ended_at"] = lease.get("ended_at") or iso()
         terminal_at = parse_iso(lease.get("released_at") or lease.get("ended_at"))
@@ -986,6 +1023,7 @@ def record_attached_worker(
     if worker_pgid and worker_pgid > 1:
         lease["worker_pgid"] = worker_pgid
     identity = _process_start_identity(worker_pid)
+    lease["launch_state"] = "attached"
     lease["process_identity_schema"] = PROCESS_IDENTITY_SCHEMA
     lease.pop("worker_identity", None)
     if identity is not None:
@@ -1008,6 +1046,22 @@ def attach_worker_to_capacity_lease(
             save_state(data)
 
 
+def mark_lease_spawning(lease_id: str | None) -> bool:
+    """Record the irreversible handoff from reservation to worker spawn."""
+    if not lease_id:
+        return False
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if not lease or lease.get("state") != "active":
+            return False
+        if lease.get("launch_state") not in (None, "reserved"):
+            return lease.get("launch_state") == "spawning"
+        lease["launch_state"] = "spawning"
+        save_state(data)
+        return True
+
+
 def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> bool:
     """Make a detached worker's own pid authoritative for lease liveness."""
     if not lease_id or not worker_pid:
@@ -1028,6 +1082,7 @@ def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object
         lease.pop("controller_identity", None)
         if worker_identity is not None:
             lease["controller_identity"] = worker_identity
+        lease["launch_state"] = "attached"
         lease["detached_at"] = iso()
         lease["detached_reason"] = reason
         save_state(data)
@@ -1457,6 +1512,9 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             # Claimant liveness closes the acquire-to-worker-attach race without
             # conflating this short-lived launcher with controller ownership.
             "claimant_pid": os.getpid(),
+            "machine_id": machine_id(),
+            "lease_schema": LEASE_SCHEMA,
+            "launch_state": "reserved",
             "worker_pid": args.worker_pid,
             "mem_mb": rss_mb,
             "priority": priority,
@@ -1482,14 +1540,18 @@ def cmd_release(args: argparse.Namespace) -> int:
         if not lease:
             print(json.dumps({"ok": False, "reason": "missing_lease", "lease_id": args.lease_id}, sort_keys=True))
             return 1
+        if not _lease_is_local(lease, data):
+            print(json.dumps({"ok": False, "reason": "remote_lease", "lease_id": args.lease_id}, sort_keys=True))
+            return 1
         if lease.get("state") in TERMINAL_LEASE_STATES:
             print(json.dumps({"ok": True, "lease_id": args.lease_id, "state": lease["state"]}, sort_keys=True))
             return 0
-        if lease.get("worker_pid") and (
-            worker_identity_liveness(lease)[0] != "dead"
-            or attached_worker_group_holds_capacity(lease)
-            or retained_live_scope_holds_capacity(lease)
-        ):
+        record = None
+        if lease.get("dispatch_id"):
+            import goalflight_ledger
+
+            record = goalflight_ledger.read_record(str(lease["dispatch_id"]))
+        if not _terminal_worker_gone(lease, record):
             print(json.dumps({"ok": False, "reason": "worker_alive", "lease_id": args.lease_id}, sort_keys=True))
             return 1
         lease["state"] = args.state
@@ -1547,6 +1609,26 @@ def _terminal_worker_gone(lease: dict, record: dict | None = None) -> bool:
     reclaimable.
     """
     worker = _worker_lease_view(lease, record)
+    if worker.get("worker_pid") is None:
+        if not record:
+            return False
+        import goalflight_ledger
+
+        if goalflight_ledger._terminal_key(record) not in dispatch_states.TERMINAL_STATES:
+            return False
+        # A current-format lease is safe to release without a worker identity
+        # only when the launcher proved it never crossed the spawn handoff:
+        # ``reserved`` is before the durable ``spawning`` transition, and the
+        # terminal observation explicitly says no worker was alive. A lease in
+        # ``spawning`` may have lost its launcher between spawn and attach, so
+        # terminal state alone cannot free it. Legacy leases have no transition
+        # marker; their upgrade compatibility rule is the explicit exception.
+        if _lease_is_legacy(lease):
+            return record.get("worker_still_alive") is not True
+        return (
+            lease.get("launch_state") == "reserved"
+            and record.get("worker_still_alive") is False
+        )
     liveness, _ = worker_identity_liveness(worker)
     if liveness != "dead":
         return False
@@ -1560,13 +1642,25 @@ def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
     """Idempotent post-commit cleanup, retried by terminal observers/reconcile."""
     with StateLock():
         data = load_state()
+        record = None
+        try:
+            import goalflight_ledger
+
+            record = goalflight_ledger.read_record(str(dispatch_id))
+        except Exception:
+            # An attached lease can still be proved dead from its own worker
+            # identity. An unattached lease stays protected until a later
+            # release-stale pass can read terminal ledger evidence.
+            record = None
         candidates = [lease for lease in data.get("leases", {}).values()
-                      if lease.get("dispatch_id") == dispatch_id and lease.get("state") == "active"]
+                      if lease.get("dispatch_id") == dispatch_id
+                      and lease.get("state") == "active"
+                      and _lease_is_local(lease, data)]
         if not candidates:
             return
         changed = False
         for lease in candidates:
-            if _terminal_worker_gone(lease):
+            if _terminal_worker_gone(lease, record):
                 lease.update(state=state, released_at=iso(), reason="dispatch_terminal")
                 changed = True
         if changed:
@@ -1574,9 +1668,11 @@ def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
 
 
 def stale_active_leases(data: dict) -> list[dict]:
-    """Active leases whose worker/claimant identity proves the holder gone."""
+    """Active local leases whose worker identity proves the holder gone."""
     stale: list[dict] = []
     for lease in active_leases(data):
+        if not _lease_is_local(lease, data):
+            continue
         if retained_live_scope_holds_capacity(lease):
             continue
         record = None
@@ -1589,7 +1685,6 @@ def stale_active_leases(data: dict) -> list[dict]:
                 stale.append(lease)
                 continue
         worker = _worker_lease_view(lease, record)
-        controller_pid = lease.get("controller_pid")
         worker_pid = worker.get("worker_pid")
         if worker_pid is not None:
             liveness, _ = worker_identity_liveness(worker)
@@ -1599,35 +1694,13 @@ def stale_active_leases(data: dict) -> list[dict]:
                 continue
             stale.append(lease)
             continue
-        # No worker ever attached. The question is whether anything can still
-        # attach one -- which is the CLAIMANT's job, not the controller's.
-        #
-        # Keying on controller_pid made these leases immortal: a controller is a
-        # long-running session, so it outlives every lease it requests. Measured
-        # 2026-08-31 -- 29 leases with worker=none, claimant=dead,
-        # controller=alive, oldest 14.2h, 20 of them held by dispatches whose
-        # own state was `queued`. Queued work therefore held the capacity that
-        # queued work needed in order to launch, and the pool drained until
-        # nothing could start. release-stale refused them all, correctly by its
-        # own logic and uselessly in practice.
-        #
-        # A live claimant still protects the acquire-then-spawn window, which is
-        # the race this branch exists for. A claimant that cannot be probed is
-        # NOT proven gone and holds, so an indeterminate read never authorises
-        # reclamation.
-        claimant_pid = lease.get("claimant_pid")
-        if _pre_attach_claimant_liveness(lease) is None:
-            # Unprobeable claimant: never stale, however old. Status reports
-            # these separately as unknown_claimant. Operator reclaim is
-            # release-stale --include-unknown-claimant, not the age path.
-            continue
-        if _pid_holds_capacity(claimant_pid, lease):
-            continue
-        if claimant_pid is None and _pid_holds_capacity(controller_pid, lease):
-            # Never had a distinct claimant: fall back to the requester so a
-            # controller-held lease is not reclaimed out from under itself.
-            continue
-        stale.append(lease)
+        # A lease with no worker identity is the spawn-handoff window. Claimant
+        # death cannot prove that a worker was not spawned; only the terminal
+        # ledger path above may reclaim it. Legacy v1.7.0 leases have no
+        # per-lease host/launch marker, so their existing TTL is the bounded
+        # compatibility backstop after an upgrade.
+        if _legacy_lease_expired(lease):
+            stale.append(lease)
     return stale
 
 

@@ -8583,12 +8583,7 @@ def _alert_launched_carrier_pending(dispatch_id: str, *, where: str) -> None:
 def _attach_worker_to_lease(lease_id: str | None, worker_pid: int) -> None:
     if not lease_id:
         return
-    with goalflight_capacity.StateLock():
-        data = goalflight_capacity.load_state()
-        lease = data.get("leases", {}).get(lease_id)
-        if lease:
-            lease["worker_pid"] = worker_pid
-            goalflight_capacity.save_state(data)
+    goalflight_capacity.attach_worker_to_capacity_lease(lease_id, worker_pid)
 
 
 def _detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> None:
@@ -19289,6 +19284,8 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv,
         )
         _mark_queue_claim_worker_spawn_intent(args)
+        if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+            raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
@@ -19626,6 +19623,12 @@ def main(argv: list[str] | None = None) -> int:
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
+        elif final_worker_alive is None and not worker_pid:
+            # No positive spawn result is explicit pre-spawn evidence. Preserve
+            # it in the terminal ledger so a reserved lease can be released;
+            # an unknown positive worker PID remains UNKNOWN and cannot release
+            # an unattached lease during the spawn handoff.
+            final_worker_alive = False
         keep_live_watcher_open = _is_live_watcher_stopped(final_state, final_worker_alive)
         capacity_state, capacity_reason = _quota_limited_state_reason(
             final_state,
