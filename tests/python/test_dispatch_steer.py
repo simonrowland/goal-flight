@@ -754,6 +754,8 @@ def case_prompt_preamble_is_materialized() -> None:
             + goalflight_dispatch.PROMPT_FILE_PREAMBLE
             + "\n\n"
             + goalflight_dispatch.SCOPE_GUARD_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.SEARCH_SCOPE_PREAMBLE
             + "\n\nTerminal evidence identity contract:\n"
             + "- Every terminal marker payload starts with the exact dispatch id `prompt-case`.\n"
             + "- Successful final shape: `!COMPLETE: prompt-case — <summary>`.\n"
@@ -906,6 +908,20 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
 
 
 def case_preamble_routing_matrix() -> None:
+    search_rule = goalflight_dispatch.SEARCH_SCOPE_PREAMBLE
+    for phrase in ("worktree", "git ls-files", "rg --files", "rg <pattern>",
+                   "Never run `find` or recursive globbing", "repo root",
+                   "parent of `worktrees/`", "$HOME", "~/.goal-flight",
+                   "/private/tmp", "known path"):
+        assert phrase in search_rule, phrase
+    assert len(search_rule.splitlines()) == 4
+    for agent in ("grok-code", "grok-research", "moonshot", "codex", "cursor",
+                  "cursor-agent", "claude", "claude-acp", "codex-acp", "opencode", None):
+        assert search_rule in goalflight_dispatch._worker_prompt_preamble(agent), agent
+    for path in ("SKILL.md", "templates/worker-orientation.md",
+                 "templates/codex-goal-prompt.md.tpl", "protocols/subagent-preamble.md",
+                 "protocols/worker-context-package.md"):
+        assert search_rule in (ROOT / path).read_text(encoding="utf-8"), path
     # Lock the shared execution-preamble routing across every agent label.
     worker_marker = goalflight_dispatch.WORKER_EXECUTION_PREAMBLE
     for agent in ("grok-code", "grok-research", "moonshot"):
