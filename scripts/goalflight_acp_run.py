@@ -2665,6 +2665,7 @@ async def _run_acp_dispatch_impl(
             setattr(cfg, "_codex_dispatch_home_resolved", True)
         capacity_account = codex_selected_account
 
+    effective_account: str | None = None
     if (
         goalflight_ledger.infer_engine(cfg.agent) == "grok"
         and not getattr(cfg, "account", None)
@@ -2682,6 +2683,7 @@ async def _run_acp_dispatch_impl(
             capacity_account = getattr(cfg, "_grok_selected_account", None)
         except ImportError:
             pass
+        effective_account = getattr(cfg, "_grok_selected_account", None)
 
     acquire_args = argparse.Namespace(
         agent=cfg.agent,
@@ -2721,7 +2723,7 @@ async def _run_acp_dispatch_impl(
         controller_label=controller_label,
         status_path=status_path,
         payload=payload,
-        effective_account=None,
+        effective_account=effective_account,
         lease_id=None,
         worker_pid=None,
         state="waiting_capacity",
@@ -2840,7 +2842,6 @@ async def _run_acp_dispatch_impl(
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
-    effective_account: str | None = None
     activity = AcpLivenessActivity()
     heartbeat_outcome: str | None = None
     heartbeat_error: dict[str, object] | None = None

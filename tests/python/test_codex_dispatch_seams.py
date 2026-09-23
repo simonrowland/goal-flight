@@ -918,7 +918,7 @@ def test_acp_grok_selection_reaches_capacity_before_spawn(
         lambda _cfg: selected.append("healthy") or "healthy",
     )
     capacity_calls: list[argparse.Namespace] = []
-    _cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+    cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
         monkeypatch,
         tmp_path,
         resolved=(None, None),
@@ -928,6 +928,9 @@ def test_acp_grok_selection_reaches_capacity_before_spawn(
     )
     assert selected == ["healthy"]
     assert capacity_calls[0].account == "healthy"
+    record = json.loads(L.record_path(cfg.dispatch_id).read_text(encoding="utf-8"))
+    assert record["account"] == "default"
+    assert record["effective_account"] == "healthy"
 
 
 def test_acp_capacity_uses_selected_account_before_home_resolution(
