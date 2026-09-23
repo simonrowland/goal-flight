@@ -12,8 +12,8 @@ path", "the ingest schema"). Pinning is per-lane, not per-project: most lanes ne
 nothing beyond the standard five-layer briefing.
 
 Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
-Never run `find` or recursive globbing from a repo root, a parent of `worktrees/`,
-`$HOME`, `~/.goal-flight`, or `/private/tmp`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
 For a file outside your worktree, use its known path.
 
 ## Canned orientation

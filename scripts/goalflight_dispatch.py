@@ -1059,8 +1059,8 @@ WORKER_EXECUTION_PREAMBLE = (
 
 SEARCH_SCOPE_PREAMBLE = (
     "Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.\n"
-    "Never run `find` or recursive globbing from a repo root, a parent of `worktrees/`,\n"
-    "`$HOME`, `~/.goal-flight`, or `/private/tmp`.\n"
+    "Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,\n"
+    "`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.\n"
     "For a file outside your worktree, use its known path."
 )
 

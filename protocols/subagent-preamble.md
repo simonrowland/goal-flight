@@ -16,8 +16,8 @@ Repository: <absolute-repository-path>
 3. North star: <one sentence from the project or lane>.
 
 Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
-Never run `find` or recursive globbing from a repo root, a parent of `worktrees/`,
-`$HOME`, `~/.goal-flight`, or `/private/tmp`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
 For a file outside your worktree, use its known path.
 
 You are READ-ONLY unless this prompt explicitly authorizes exact edit paths.

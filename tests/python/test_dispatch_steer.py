@@ -910,9 +910,9 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
 def case_preamble_routing_matrix() -> None:
     search_rule = goalflight_dispatch.SEARCH_SCOPE_PREAMBLE
     for phrase in ("worktree", "git ls-files", "rg --files", "rg <pattern>",
-                   "Never run `find` or recursive globbing", "repo root",
-                   "parent of `worktrees/`", "$HOME", "~/.goal-flight",
-                   "/private/tmp", "known path"):
+                   "Never run `find` or recursive globbing", "above your worktree",
+                   "repo root that contains `worktrees/`", "$HOME", "~/.goal-flight",
+                   "/tmp", "/private/tmp", "$TMPDIR", "known path"):
         assert phrase in search_rule, phrase
     assert len(search_rule.splitlines()) == 4
     for agent in ("grok-code", "grok-research", "moonshot", "codex", "cursor",
