@@ -216,7 +216,8 @@ mirror.
 - `pipe [--agent AGENT] [--dry-run] [--json]` -> emit queue-ready task prompts for worker dispatch
 - check: `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1 node scripts/check_tasks_mirror.js docs-private dashboard`
   validates mirror parity; `goalflight_task.py` runs it on writes only when mirror
-  export is enabled. The mirror defaults off; existing mirror files remain untouched.
+  export is enabled. The mirror defaults off; save/recovery replaces retained
+  mirrors with a tiny disabled stub once, without rewriting an existing stub.
 
 Importable Python read API (any agent, no grep):
 

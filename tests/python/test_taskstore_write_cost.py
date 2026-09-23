@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import sys
 import subprocess
+import types
 
 import pytest
 
@@ -145,7 +146,8 @@ def test_comparison_nonregular_and_unreadable_are_changed(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("changed", [False, True])
-def test_dashboard_off_by_default_removes_existing_mirrors(store, monkeypatch, changed):
+@pytest.mark.parametrize("recover", [False, True])
+def test_dashboard_off_tombstones_existing_mirrors_once(store, monkeypatch, changed, recover):
     monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
     monkeypatch.setattr(task, "CHECKER", store.project_root / "nonexistent-checker.js")
     monkeypatch.setattr(task, "_items_data_js", lambda *a: pytest.fail("generated disabled mirror"))
@@ -157,11 +159,85 @@ def test_dashboard_off_by_default_removes_existing_mirrors(store, monkeypatch, c
     fixture = task.ROOT / "tests/fixtures/tasks-mirror/tasks-data.js"
     for path in (store.data_js_path, exported):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(fixture.read_bytes())
-    store.mutate_items(lambda rows: rows[0].update(title="Changed") if changed else None)
-    assert not store.data_js_path.exists()
-    assert not exported.exists()
-    # Browser boot after publication must render no stale rows and explain why.
+        path.write_bytes(fixture.read_bytes() + b" " * (2 * 1024 * 1024))
+    replacements = []
+    replace = Path.replace
+    monkeypatch.setattr(Path, "replace", lambda src, dst: (replacements.append((src, dst)), replace(src, dst))[-1])
+    if recover:
+        store._write_publish_marker("interrupted")
+        store._recover_interrupted_publish()
+    else:
+        store.mutate_items(lambda rows: rows[0].update(title="Changed") if changed else None)
+    for path in (store.data_js_path, exported):
+        assert path.stat().st_size < 200
+        assert b'"dashboard_export":"disabled"' in path.read_bytes()
+        assert b'window.GF_ITEMS = [];' in path.read_bytes()
+        assert any(src.name.startswith(".tmp-") and dst == path for src, dst in replacements)
+    before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+              for p in (store.data_js_path, exported)}
+    replacements.clear()
+    store.save_items_atomic(store.load_items())
+    store._write_publish_marker("interrupted")
+    store._recover_interrupted_publish()
+    assert not store.publish_marker_path.exists()
+    assert before == {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in before}
+    assert not any(dst in before for src, dst in replacements)
+    assert not list(store.log_dir.glob("tasks-data-*.js"))
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_disabled_export_preserves_symlinked_directory(store, monkeypatch, tmp_path, canonical):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    outside = tmp_path / "unrelated"
+    outside.mkdir()
+    victim = outside / "tasks-data.js"
+    victim.write_bytes(b"unrelated data")
+    before = victim.stat()
+    dashboard = store.dashboard_dir if canonical else store.export_dashboard_dir
+    dashboard.parent.mkdir(parents=True, exist_ok=True)
+    dashboard.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(task.TaskError, match="escapes|symlink"):
+        store.save_items_atomic([item()])
+    assert victim.read_bytes() == b"unrelated data"
+    assert (victim.stat().st_ino, victim.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_disabled_mirror_replaces_file_symlink_not_referent(store, monkeypatch, tmp_path, canonical):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    victim = tmp_path / "unrelated.js"
+    victim.write_bytes(b"unrelated data")
+    before = victim.stat()
+    path = store.data_js_path if canonical else store.export_dashboard_dir / "tasks-data.js"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(victim)
+    store.save_items_atomic([item()])
+    assert not path.is_symlink()
+    assert b'"dashboard_export":"disabled"' in path.read_bytes()
+    assert victim.read_bytes() == b"unrelated data"
+    assert (victim.stat().st_ino, victim.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_old_process_can_mutate_after_new_default_write(store, monkeypatch):
+    # Keep the old module/store alive across the new writer's publication.
+    old = types.ModuleType("taskstore_before_default_off")
+    old.__file__ = str(task.ROOT / "goalflight_task.py")
+    monkeypatch.setitem(sys.modules, old.__name__, old)
+    source = subprocess.check_output(["git", "show", "59f803f:goalflight_task.py"], cwd=task.ROOT)
+    exec(compile(source, old.__file__, "exec"), old.__dict__)
+    old_store = old.TaskStore(store.project_root)
+    old_store.save_items_atomic([item()])
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.mutate_items(lambda rows: rows[0].update(title="New writer"))
+    old_store.mutate_items(lambda rows: rows[0].update(title="Old writer"))
+    assert store.load_items()[0]["title"] == "Old writer"
+
+
+def test_disabled_stub_browser_notice_and_no_records(store, monkeypatch):
+    store.save_items_atomic([item()])
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store._write_publish_marker("interrupted")
+    store._recover_interrupted_publish()
     browser = subprocess.run(["node", "-e", """
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const notices = [];
@@ -174,24 +250,19 @@ const window = {
   addEventListener() {}, removeEventListener() {}
 };
 const context = vm.createContext({window, URL, URLSearchParams});
-if (fs.existsSync(process.argv[1])) vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+assert.strictEqual(window.GF_ITEMS.length, 0);
+// Disabled metadata must also override any retained in-memory array.
+window.GF_ITEMS = [{id: 't-999', kind: 'task', title: 'Stale'}];
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
 const driver = window.GF.attach({});
 assert.strictEqual(window.GF.store.items.length, 0);
-assert(notices.some(text => text.includes('GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1')));
+assert(notices.some(text => text.includes('Dashboard export disabled') &&
+  text.includes('GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1')));
 driver.destroy();
-""", str(exported), str(task.ROOT / "templates/state-skeleton/gf.js")], capture_output=True, text=True)
+""", str(store.export_dashboard_dir / "tasks-data.js"),
+        str(task.ROOT / "templates/state-skeleton/gf.js")], capture_output=True, text=True)
     assert browser.returncode == 0, browser.stderr
-    # Interrupted-publish recovery also invalidates the canonical mirror.
-    store.data_js_path.write_bytes(fixture.read_bytes())
-    store._write_publish_marker("interrupted")
-    assert "dashboard/tasks-data.js" not in json.loads(store.publish_marker_path.read_text())["artifacts"]
-    store._recover_interrupted_publish()
-    assert not store.publish_marker_path.exists()
-    assert not store.data_js_path.exists()
-    assert not exported.exists()
-    assert len(list(store.log_dir.glob("tasks-*.jsonl"))) == 1
-    assert not list(store.log_dir.glob("tasks-data-*.js"))
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -212,8 +283,10 @@ def test_dashboard_opt_in_restores_exact_output(store, monkeypatch):
     monkeypatch.setattr(task, "utc_now", lambda: "2026-09-23T00:00:00+00:00")
     items = [item()]
     expected = task._items_data_js(store._mirror_items_for_script(items)).encode()
+    store.save_items_atomic(items)
     monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
     store.save_items_atomic(items)
+    assert b'"dashboard_export":"disabled"' in store.data_js_path.read_bytes()
     monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     store.mutate_items(lambda rows: None, allow_invalid_live_mirror=True)
     assert store.data_js_path.read_bytes() == expected
@@ -390,4 +463,4 @@ def test_mutation_disk_write_cost(store, monkeypatch):
     disabled = written() - start
     print(f"diskio_byteswritten original={before} optimized_mirror_on={after} mirror_off={disabled}")
     assert disabled < after * 0.6
-    assert all(path.name != "tasks-data.js" for path, _size in published)
+    assert all(size < 200 for path, size in published if path.name == "tasks-data.js")

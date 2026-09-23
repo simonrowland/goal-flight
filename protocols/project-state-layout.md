@@ -72,7 +72,8 @@ dashboard/
 while the static client-side views in repo-root `dashboard/` render over
 `dashboard/tasks-data.js` when `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1` is set.
 The mirror is off by default; enable it and run `goalflight_task.py sync` to
-create it. Disabled exports leave existing mirror files untouched. Add/edit tasks via `goalflight_task.py` (don't hand-edit
+create it. A disabled save or recovery replaces retained mirrors with a tiny
+disabled stub, leaving an existing stub unchanged. Add/edit tasks via `goalflight_task.py` (don't hand-edit
 generated snapshots). A task lives in exactly one derived state; `done` marks
 DONE/awaiting-review and `accept` moves it to DONE-REVIEWED. Bugs follow the
 same split. Status is machine-owned — see [task-lifecycle.md](task-lifecycle.md).

@@ -2709,8 +2709,7 @@ class TaskStore:
         try:
             unchanged = self._write_staged_generation(staging, items)
             _run_checker(staging)
-            if not _dashboard_export_enabled():
-                self.data_js_path.unlink(missing_ok=True)
+            self._disable_dashboard_mirrors()
             targets = {
                 self.tasks_path: staging / "tasks.jsonl",
                 **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),
@@ -2757,17 +2756,32 @@ class TaskStore:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+    def _disable_dashboard_mirrors(self) -> None:
+        """Retire retained snapshots once, without touching symlink referents."""
+        if _dashboard_export_enabled():
+            return
+        self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+        self._require_export_dir_safe(self.export_dashboard_dir, "dashboard")
+        stub = (
+            'window.GF_META = {"dashboard_export":"disabled",'
+            '"enable_with":"GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1"};\n'
+            'window.GF_ITEMS = [];\n'
+        ).encode("utf-8")
+        for path in (self.data_js_path, self.export_dashboard_dir / "tasks-data.js"):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                raise TaskError(f"{path}: expected regular file or symlink")
+            if not _file_matches_bytes(path, stub):
+                _atomic_write_bytes(path, stub)
+
     def _export_to_project_tree(self) -> None:
         """Copy the canonical views into the project tree for the dashboard and
         for agents that python-read the JSON directly. One-way and non-fatal: the
         canonical store is already committed before this runs, so any failure
         (including a sync daemon racing these copies) never corrupts the store."""
-        if not _dashboard_export_enabled():
-            # A retained snapshot would keep browser pages showing obsolete data.
-            try:
-                (self.export_dashboard_dir / "tasks-data.js").unlink(missing_ok=True)
-            except OSError as exc:
-                print(f"goalflight_task: disabled dashboard mirror removal failed: {exc}", file=sys.stderr)
         exports = [
             (self.tasks_path, self.export_docs_dir / "tasks.jsonl"),
             *([(self.data_js_path, self.export_dashboard_dir / "tasks-data.js")] if _dashboard_export_enabled() else []),
@@ -2880,8 +2894,7 @@ class TaskStore:
         try:
             self._write_staged_generation(staging, items)
             _run_checker(staging)
-            if not _dashboard_export_enabled():
-                self.data_js_path.unlink(missing_ok=True)
+            self._disable_dashboard_mirrors()
             for target, source in {
                 self.tasks_path: staging / "tasks.jsonl",
                 **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),

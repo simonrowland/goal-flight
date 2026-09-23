@@ -21,10 +21,12 @@ Enable it using the existing environment configuration mechanism:
 `python3 goalflight_task.py --project-root <project> sync`. Keep that variable
 set for subsequent writers and dashboard refresh processes. Accepted true values
 are `1`, `true`, `yes`, and `on` (case-insensitive); unset or other values disable it.
-When disabled, writes, snapshots, recovery, scaffolding, and mirror checks skip
-`tasks-data.js`. Existing mirror files remain untouched and may be stale; move
-them to the Trash when turning the mirror off. Pages without a mirror display
-an enablement hint. JSONL, markdown, task queries, and the separate status/fleet
+When disabled, full mirror generation, snapshots, scaffolding, and mirror checks
+are skipped. The first save or recovery replaces retained `tasks-data.js` files
+with a tiny disabled stub; subsequent writes leave that stub unchanged. Directory
+symlinks are refused; file symlinks are replaced without touching their referents.
+Pages with the stub or without a mirror display an enablement hint. JSONL,
+markdown, task queries, and the separate status/fleet
 exports remain available.
 
 Views derived from `tasks.jsonl` are STATIC pages + a shared JS include that
