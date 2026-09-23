@@ -2700,12 +2700,15 @@ def _renew_controller_lease_before_arm(
     """
     import goalflight_journal  # type: ignore
 
+    unavailable = (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    )
     try:
         authority = goalflight_journal.Journal(project_root)
         lease = authority.active_lease(controller_label)
-    except goalflight_journal.JournalUpgradeRequired:
-        raise
-    except goalflight_journal.JournalError:
+    except unavailable:
         return nonce
     if lease is None:
         return nonce
@@ -2717,9 +2720,7 @@ def _renew_controller_lease_before_arm(
             principal=lease.principal,
             nonce=lease.nonce,
         )
-    except goalflight_journal.JournalUpgradeRequired:
-        raise
-    except goalflight_journal.JournalError:
+    except unavailable:
         return nonce
     if not result.committed or result.value is None:
         return nonce
