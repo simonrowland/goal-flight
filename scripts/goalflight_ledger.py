@@ -246,49 +246,45 @@ def process_identity(pid: int | None) -> dict | None:
         if start_token:
             ident["start_token"] = start_token
         return ident
-    ident = None
-    for attempt in range(20):
-        liveness = goalflight_compat.pid_liveness(pid)
-        if liveness is False:
-            return None
-        if liveness is None:
-            ident = {
-                "pid": pid,
-                "identity_available": False,
-                "identity_probe_error": True,
-                "identity_source": "pid_probe_error",
-            }
-            if start_token:
-                ident["start_token"] = start_token
-            return ident
-        fields, probe_ok = _ps_identity(pid)
-        if not probe_ok:
-            liveness = goalflight_compat.pid_liveness(pid)
-            if liveness is False:
-                return None
-            ident = {
-                "pid": pid,
-                "identity_available": False,
-                "identity_probe_error": True,
-                "identity_source": (
-                    "ps_probe_error" if liveness is True else "pid_probe_error"
-                ),
-            }
-            if start_token:
-                ident["start_token"] = start_token
-            return ident
-        if fields is None:
-            fields = {}
+    liveness = goalflight_compat.pid_liveness(pid)
+    if liveness is False:
+        return None
+    if liveness is None:
         ident = {
             "pid": pid,
-            **fields,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": "pid_probe_error",
         }
         if start_token:
             ident["start_token"] = start_token
-        if ident.get("lstart"):
-            return ident
-        if attempt < 19:
-            time.sleep(_capped_backoff_s(0.01, attempt, cap_s=0.25))
+        return ident
+    fields, probe_ok = _ps_identity(pid)
+    if not probe_ok:
+        liveness = goalflight_compat.pid_liveness(pid)
+        if liveness is False:
+            return None
+        ident = {
+            "pid": pid,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": (
+                "ps_probe_error" if liveness is True else "pid_probe_error"
+            ),
+        }
+        if start_token:
+            ident["start_token"] = start_token
+        return ident
+    if fields is None:
+        fields = {}
+    ident = {
+        "pid": pid,
+        **fields,
+    }
+    if start_token:
+        ident["start_token"] = start_token
+    if ident.get("lstart"):
+        return ident
     if ident is not None:
         ident.update(
             {
@@ -379,6 +375,15 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     prior_has_start = bool(prior.get("start_token"))
     current_has_start = bool(current.get("start_token"))
     fine_start_available = prior_has_start and current_has_start
+    expected_lstart = prior.get("lstart")
+    actual_lstart = current.get("lstart")
+    if (
+        not fine_start_available
+        and expected_lstart
+        and actual_lstart
+        and actual_lstart != expected_lstart
+    ):
+        return False, "pid_reused_lstart"
     if (
         goalflight_compat.is_windows()
         and not fine_start_available
@@ -853,6 +858,34 @@ def read_records(
     return records
 
 
+def _read_archived_records() -> list[dict]:
+    """Load archived rows for reconciliation, which repairs terminal history."""
+    archive_root = runs_archive_dir(create=False)
+    presence = goalflight_fs.path_presence(archive_root)
+    if presence == "absent":
+        return []
+    if presence == "unknown":
+        raise OSError(f"ledger archive unreadable: {archive_root}")
+    records: list[dict] = []
+    for month in sorted(os.listdir(archive_root), reverse=True):
+        month_dir = archive_root / month
+        if not month_dir.is_dir():
+            continue
+        for name in sorted(os.listdir(month_dir)):
+            if not name.endswith(".json"):
+                continue
+            path = month_dir / name
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                records.append(_unreadable_record(path))
+                continue
+            if isinstance(record, dict):
+                record["_archived_record"] = True
+                records.append(record)
+    return records
+
+
 def record_is_unreadable(record: dict | None) -> bool:
     """True when *record* is the placeholder ``read_records`` inserts for a bad file.
 
@@ -1251,18 +1284,22 @@ def retry_record_after_startup_race(
     """
     deadline = time.monotonic() + timeout_s
     code, refusal = initial_code, initial_refusal
-    try:
-        reader = goalflight_journal.Journal.open_reader(
-            project_root, persistent=True
-        )
-    except Exception:
-        reader = None
+    reader = None
     attempt_no = 0
     while time.monotonic() < deadline:
+        if reader is None:
+            try:
+                reader = goalflight_journal.Journal.open_reader(
+                    project_root, persistent=True
+                )
+            except Exception:
+                reader = None
         attempt = None
         if reader is not None:
-            with contextlib.suppress(Exception):
+            try:
                 attempt = reader.attempt_for_dispatch(dispatch_id)
+            except Exception:
+                reader = None
         if attempt is None:
             delay = _capped_backoff_s(poll_s, attempt_no, cap_s=0.25)
             attempt_no += 1
@@ -2036,6 +2073,7 @@ def reconcile_terminal_outbox(
     overruled: list[dict[str, object]] = []
     history_records: list[dict] = []
     records = read_records()
+    records.extend(_read_archived_records())
     known_dispatch_ids = {
         str(record.get("dispatch_id"))
         for record in records
@@ -2266,16 +2304,21 @@ def reconcile_terminal_outbox(
             else:
                 committed += 1
             if needs_ledger_projection:
-                with StateLock():
-                    current_path = record_path(str(record["dispatch_id"]))
-                    current = (
-                        json.loads(current_path.read_text())
-                        if current_path.exists()
-                        else dict(record)
-                    )
-                    current = terminal_record_projection(current, result.value, reason)
-                    write_record(current)
-                history_records.append(dict(current))
+                if record.get("_archived_record"):
+                    archived_history = dict(record)
+                    archived_history.pop("_archived_record", None)
+                    history_records.append(archived_history)
+                else:
+                    with StateLock():
+                        current_path = record_path(str(record["dispatch_id"]))
+                        current = (
+                            json.loads(current_path.read_text())
+                            if current_path.exists()
+                            else dict(record)
+                        )
+                        current = terminal_record_projection(current, result.value, reason)
+                        write_record(current)
+                    history_records.append(dict(current))
             try:
                 import goalflight_capacity
 

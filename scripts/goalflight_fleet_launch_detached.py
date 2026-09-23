@@ -99,7 +99,11 @@ def _process_identity(pid: int) -> dict[str, Any] | None:
 
 
 def _process_identity_after_spawn(pid: int) -> dict[str, Any] | None:
-    return _process_identity(pid)
+    for attempt in range(2):
+        identity = _process_identity(pid)
+        if identity is not None or attempt == 1:
+            return identity
+    return None
 
 
 def _sanitized_env(source: dict[str, str]) -> dict[str, str]:

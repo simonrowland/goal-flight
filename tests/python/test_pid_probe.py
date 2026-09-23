@@ -234,12 +234,13 @@ def case_live_ps_missing_lstart_classifies_indeterminate() -> None:
     with patch(
         "goalflight_ledger.subprocess.check_output",
         side_effect=ps_without_lstart,
-    ), patch("goalflight_ledger.time.sleep", return_value=None):
+    ) as check_output, patch("goalflight_ledger.time.sleep", return_value=None):
         current = goalflight_ledger.process_identity(pid)
         assert current is not None
         assert current["identity_available"] is False
         assert current["identity_probe_error"] is True
         assert current["identity_source"] == "ps_identity_incomplete"
+        assert check_output.call_count == 1
         assert goalflight_ledger.classify(record) == "identity_indeterminate"
 
 

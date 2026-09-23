@@ -223,6 +223,35 @@ def test_archive_moves_old_terminal_rows_and_read_record_falls_back(
     assert ledger.read_record("archived-id")["state"] == "complete"
 
 
+def test_reconcile_includes_archived_terminal_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journals"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    project = tmp_path / "project"
+    project.mkdir()
+    now = dt.datetime(2026, 9, 23, 12, tzinfo=dt.timezone.utc)
+    ended_at = now - dt.timedelta(days=ledger.TERMINAL_RECORD_RETENTION_DAYS + 1)
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "archived-reconcile",
+            "project_root": str(project),
+            "state": "complete",
+            "terminal_state": "complete",
+            "ended_at": ended_at.isoformat(),
+        }
+    )
+    ledger.archive_terminal_records(now=now)
+
+    result = ledger.reconcile_terminal_outbox(project)
+
+    assert result["committed"] == 1
+    assert not ledger.record_path("archived-reconcile", create=False).exists()
+    assert ledger.read_record("archived-reconcile")["terminal_state"] == "complete"
+
+
 def test_status_reads_live_and_recent_rows_without_parsing_old_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

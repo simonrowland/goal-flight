@@ -912,6 +912,20 @@ def test_identity_after_spawn_is_one_ledger_probe() -> None:
     assert_true("single identity probe", calls == [4242])
 
 
+def test_identity_after_spawn_retries_one_transient_miss() -> None:
+    calls: list[int] = []
+
+    def identity(pid: int) -> dict[str, Any] | None:
+        calls.append(pid)
+        return None if len(calls) == 1 else {"pid": pid, "start_token": "native-token"}
+
+    with patched_process_identity(identity):
+        result = fleet_launch._process_identity_after_spawn(4242)
+
+    assert_true("transient identity retained", result == {"pid": 4242, "start_token": "native-token"})
+    assert_true("bounded identity retries", calls == [4242, 4242])
+
+
 def main() -> None:
     tests = [
         test_sanitized_env_allows_oauth_token_exact_not_prefix,

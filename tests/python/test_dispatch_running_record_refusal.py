@@ -471,6 +471,53 @@ def test_startup_race_reuses_one_reader_with_capped_poll_backoff(
     assert clock[0] == 2.0
 
 
+def test_startup_race_retries_initial_reader_open_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = [0.0]
+    open_calls: list[dict] = []
+    reader = SimpleNamespace(
+        attempt_for_dispatch=lambda _dispatch_id: SimpleNamespace(
+            lifecycle_state=L.goalflight_journal.ATTEMPT_STARTING
+        )
+    )
+
+    def monotonic() -> float:
+        return clock[0]
+
+    def sleep(delay: float) -> None:
+        clock[0] += delay
+
+    def open_reader(_cls, project_root, **kwargs):
+        open_calls.append({"project_root": project_root, "kwargs": kwargs})
+        if len(open_calls) == 1:
+            raise OSError("journal startup race")
+        return reader
+
+    monkeypatch.setattr(L.time, "monotonic", monotonic)
+    monkeypatch.setattr(L.time, "sleep", sleep)
+    monkeypatch.setattr(
+        L.goalflight_journal.Journal,
+        "open_reader",
+        classmethod(open_reader),
+    )
+
+    code, refusal = L.retry_record_after_startup_race(
+        lambda: (1, {"reason": "attempt_not_yet_running"}),
+        1,
+        {"reason": "attempt_not_yet_running"},
+        project_root=tmp_path,
+        dispatch_id="reader-open-race",
+        timeout_s=2.0,
+        poll_s=0.05,
+    )
+
+    assert code == 1
+    assert refusal == {"reason": "attempt_not_yet_running"}
+    assert len(open_calls) == 2
+
+
 def test_startup_race_budget_exhausted_still_warns_and_writes_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
