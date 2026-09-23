@@ -413,14 +413,15 @@ def _record_owns_path(record: dict[str, Any], path: str) -> bool:
     A liveness verdict (``idle_timeout``, ``worker_dead``, ``blocked``, …) is
     not proof the process is gone. Observed: a worker sat in ``idle_timeout``
     for 35 minutes while identity-live and mid-gate. If the recorded pid +
-    start_token still match, the row owns the path.
+    start_token still match, the row owns the path. If the identity probe is
+    indeterminate, the row also owns the path: unknown liveness is live for GC.
     """
     if not _record_cwd_matches(record, path):
         return False
     live = _identity_live(record)
     if live is True:
         return True
-    if live is None and _is_liveness_verdict(record):
+    if live is None:
         return True
     for state in _record_states(record):
         if goalflight_dispatch_states.is_terminal_state(state):

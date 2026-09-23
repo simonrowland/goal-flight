@@ -303,16 +303,23 @@ import re as _re
 
 
 _ACP_PERMISSION_READ_ONLY_AGENTS = frozenset({"claude", "claude-acp"})
+_ACP_OS_SANDBOX_READ_ONLY_AGENTS = frozenset({"codex-acp"})
 
 
 def acp_permission_read_only_supported(agent: str | None) -> bool:
-    """Whether this adapter routes writes through ACP request_permission.
+    """Whether this adapter enforces an ACP read-only dispatch.
 
     Keep this allowlist explicit. Cursor/Grok bypass the permission gate for
-    writes, and Codex is deliberately excluded because its existing sandbox
-    behavior is outside the fallback introduced for Claude ACP.
+    writes. Claude uses the ACP permission boundary as a fallback; Codex ACP
+    uses its enforced read-only OS sandbox on macOS.
     """
-    return str(agent or "").strip().lower() in _ACP_PERMISSION_READ_ONLY_AGENTS
+    normalized = str(agent or "").strip().lower()
+    if normalized in _ACP_PERMISSION_READ_ONLY_AGENTS:
+        return True
+    return (
+        normalized in _ACP_OS_SANDBOX_READ_ONLY_AGENTS
+        and goalflight_compat.is_macos()
+    )
 
 
 def _read_only_permission_policy(tool_call, options, cwd):
@@ -5159,8 +5166,9 @@ def main(argv: list[str] | None = None) -> int:
         "--worktree",
         choices=["off", "create", "shared-read-only"],
         default="off",
-        help="Dispatch worktree mode. 'create' leases and acquire-resets one "
-             "lazy seat from the configured wt-1..wt-N pool.",
+        help="Dispatch worktree mode. 'create' acquires and resets one "
+             "repository-scoped pooled worktree at worktrees/s-N; "
+             "'shared-read-only' uses a commit-keyed checkout.",
     )
     parser.add_argument(
         "--worktree-root",
