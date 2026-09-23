@@ -633,10 +633,11 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
 
 def test_acp_writer_refused_into_occupied_worktree() -> None:
     """ACP --cwd is a separate main() branch; occupancy must refuse there too."""
+    import pytest
+
     acp_py = _managed_acp_python()
     if acp_py is None:
-        print("SKIP live ACP occupancy (no managed ACP interpreter)")
-        return
+        pytest.skip("live ACP occupancy requires a managed ACP interpreter")
     from test_acp_dispatch_sigterm import _write_fake_codex_acp_manifest
     with _temp_dir() as td:
         tmp = Path(td)
@@ -667,17 +668,16 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
                 ),
                 env,
             )
-            # ACP maps admission exceptions to failed_worktree (rc 1), and
-            # reports the diagnostic in status JSON and DISPATCH-END stdout.
-            assert refused.returncode == 1, (refused.returncode, refused.stdout, refused.stderr)
+            assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
             refusal = json.loads((tmp / "acp-second.status.json").read_text(encoding="utf-8"))
             assert refusal["state"] == "failed_worktree", refusal
+            assert refusal["reason"] == "worktree_occupied", refusal
             assert "acp-incumbent" in refusal["error"], refusal
             assert "already owned" in refusal["error"], refusal
             assert "acp-incumbent" in refused.stdout, refused.stdout
+            assert "acp-incumbent" in refused.stderr, refused.stderr
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
             assert not _ledger_record(tmp, "acp-second"), refused.stderr
-            import pytest
             from unittest.mock import patch
             from test_dispatch_registration_gate import _register_controller
 
@@ -713,6 +713,9 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
             assert forced_status["state"] == "complete", forced_status
             assert forced_status["controller_label"] == "registered-test", forced_status
             assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+            tail = (tmp / "acp-forced.tail").read_text(encoding="utf-8")
+            assert "--occupied-worktree-forced accepted" in tail, tail
+            assert "acp-incumbent" in tail, tail
             assert "acp-incumbent" in forced.stderr, forced.stderr
             assert "DISPATCH-END" in forced.stdout, forced.stdout
         finally:

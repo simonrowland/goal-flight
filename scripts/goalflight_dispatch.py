@@ -17961,6 +17961,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         controller_pid=_controller_pid(args),
         controller_label=_controller_label(args),
         unregistered_forced=bool(getattr(args, "unregistered_forced", False)),
+        occupied_worktree_forced=bool(getattr(args, "occupied_worktree_forced", False)),
+        tail=str(Path(args.tail) if args.tail else (base or _dispatch_base_dir()) / f"{args.dispatch_id}.tail"),
         _controller_registration_script="goalflight_acp_run.py",
         cpu_epsilon=0.1,
         json=False,
@@ -18260,6 +18262,12 @@ def _run_acp_detached_launcher(
             with contextlib.suppress(OSError, json.JSONDecodeError):
                 status_payload = json.loads(status_json.read_text(encoding="utf-8"))
                 last_state = status_payload.get("state")
+                if (
+                    last_state == "failed_worktree"
+                    and status_payload.get("reason") == "worktree_occupied"
+                ):
+                    print(f"goalflight_dispatch: {status_payload['error']}", file=sys.stderr)
+                    return 64
                 if str(last_state).startswith("blocked_capacity"):
                     if child_alive:
                         time.sleep(0.2)
