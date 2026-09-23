@@ -70,6 +70,7 @@ def _stub_bash_launch(
     tmp_path: Path,
     *,
     resolved: tuple[str | None, str | None],
+    agent: str = "codex",
     account: str | None = None,
     api_missing: bool = False,
     failure_phase: str | None = None,
@@ -140,6 +141,8 @@ def _stub_bash_launch(
 
     def recorded_attempt_peek(*peek_args, **peek_kwargs):
         ordering.append("attempt_peek")
+        if failure_phase == "after_isolation":
+            raise RuntimeError("pre-spawn validation failure")
         return real_attempt_peek(*peek_args, **peek_kwargs)
 
     monkeypatch.setattr(D, "_attempt_claiming_worker_argv", recorded_attempt_peek)
@@ -182,7 +185,7 @@ def _stub_bash_launch(
     monkeypatch.setattr(D, "_spawn_daemonized_process", fake_spawn)
     argv = [
         "--agent",
-        "codex",
+        agent,
         "--unregistered-forced",
         "--dispatch-id",
         "bash-seat-seam",
@@ -202,13 +205,13 @@ def _stub_bash_launch(
     argv.extend(["--", sys.executable, "-c", "pass"])
     rc = D.main(argv)
     assert rc == (1 if failure_phase else 0)
-    assert resolve_accounts == ([] if api_missing else [account])
-    if not api_missing:
+    assert resolve_accounts == ([] if api_missing or agent != "codex" else [account])
+    if not api_missing and agent == "codex":
         assert ordering.index("capacity") < ordering.index("resolve")
         assert ordering.index("resolve") < ordering.index("ledger:starting")
     else:
         assert ordering.index("capacity") < ordering.index("ledger:starting")
-    if failure_phase != "pre_spawn":
+    if failure_phase not in {"pre_spawn", "after_isolation"}:
         assert ordering.index("ledger:starting") < ordering.index("spawn:worker")
         # The attempt peek may busy-wait for the launch budget. It must finish
         # before the claim is stamped with spawn intent: a launcher killed

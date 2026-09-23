@@ -43,6 +43,7 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
+import goalflight_cursor  # noqa: E402
 import goalflight_dispatch_paths  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
@@ -4168,6 +4169,9 @@ async def _run_acp_dispatch_impl(
                 worktree_branch=worktree_seat.branch,
                 quarantine_branch=worktree_seat.quarantine_branch,
             )
+        goalflight_cursor.isolate_context_mode(
+            cfg.agent, spawn_env, cwd=worker_cwd, dispatch_id=dispatch_id,
+        )
         try:
             if os_sandbox_profile != OS_SANDBOX_OFF:
                 prepare_os_sandbox_command(
@@ -4990,6 +4994,10 @@ async def _run_acp_dispatch_impl(
                 )
         if worktree_seat is not None:
             worktree_seat.release()
+        if not detach_worker and (proc is None or (termination_result is not None and termination_result.confirmed)):
+            goalflight_cursor.cleanup_dispatch_data(
+                dispatch_id, launcher_finished=True, prelaunch_failure=proc is None,
+            )
     _attach_agent_stderr_tail(payload, agent_stderr_capture)
     write_status(status_path, payload)
     return payload

@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import goalflight_compat
+import goalflight_cursor
 import goalflight_codex_sessions
 import goalflight_capacity
 import goalflight_dispatch_states
@@ -1686,6 +1687,7 @@ def _finish_existing_ledger(
             ),
             codex_session_id=codex_session_id,
         )
+        goalflight_cursor.cleanup_dispatch_data(dispatch_id)
 
 
 def _status_snapshot(payload: dict) -> dict:

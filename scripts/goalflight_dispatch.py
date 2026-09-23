@@ -75,6 +75,7 @@ import uuid
 from pathlib import Path
 
 import goalflight_compat
+import goalflight_cursor
 import goalflight_output_redact
 import goalflight_capacity
 import goalflight_codex_sessions
@@ -9594,6 +9595,8 @@ def reconcile_abandoned_dispatches(
 
     for project_root in changed_projects:
         _export_dashboard_status_for_project(project_root)
+    if not dry_run:
+        goalflight_cursor.cleanup_dispatch_data()
     closed = [entry for entry in entries if entry.get("action") == "closed"]
     would_close = [entry for entry in entries if entry.get("action") == "would_close"]
     kept_reasons: dict[str, int] = {}
@@ -17869,8 +17872,7 @@ def _cursor_context_mode_enabled() -> bool:
     Headless workers do not need it. Opt back in with
     GOALFLIGHT_CURSOR_CONTEXT_MODE in {1,true,yes,enabled,on}.
     """
-    raw = os.environ.get("GOALFLIGHT_CURSOR_CONTEXT_MODE", "").strip().lower()
-    return raw in {"1", "true", "yes", "enabled", "on"}
+    return goalflight_cursor.context_mode_enabled(os.environ)
 
 
 def _acp_context_mode_default(args) -> str:
@@ -18913,6 +18915,7 @@ def main(argv: list[str] | None = None) -> int:
     worker_stdout_mode = "ab" if dispatch_warnings else "wb"
     _reap_quota_stuck_before_bash_launch()
     worker_pid = None
+    worker_spawn_attempted = False
     watcher_pid = None
     caffeinate_pid = None
     pidfile = None
@@ -19276,6 +19279,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
         _apply_web_qa_env(env, args, project_root)
+        goalflight_cursor.isolate_context_mode(
+            args.agent, env, cwd=str(_worker_cwd(args)),
+        )
         if _account_engine(args.agent) == "codex":
             worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
 
@@ -19289,6 +19295,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv,
         )
         _mark_queue_claim_worker_spawn_intent(args)
+        worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
@@ -19701,6 +19708,11 @@ def main(argv: list[str] | None = None) -> int:
             and codex_session_id is None
         ):
             cleanup_codex_dispatch_home(args.dispatch_id)
+        if not detached_launched:
+            goalflight_cursor.cleanup_dispatch_data(
+                args.dispatch_id, launcher_finished=True,
+                prelaunch_failure=not worker_spawn_attempted,
+            )
 
 
 def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
