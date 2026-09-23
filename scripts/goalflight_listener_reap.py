@@ -34,7 +34,6 @@ cannot answer yields `known=False` and the caller kills nothing:
 from __future__ import annotations
 
 import ctypes
-import errno
 import os
 from pathlib import Path
 import shlex
@@ -95,33 +94,34 @@ def _process_argv(pid: int) -> list[str] | None:
             ]
             sysctl.restype = ctypes.c_int
             mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-            size = ctypes.c_size_t(4096)
-            for _ in range(4):
-                buffer = (ctypes.c_ubyte * size.value)()
-                actual = ctypes.c_size_t(size.value)
-                if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) == 0:
-                    raw = bytes(buffer[: actual.value])
-                    if len(raw) < 4:
-                        return None
-                    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
-                    if argc < 1:
-                        return None
-                    payload = raw[4:]
-                    exec_end = payload.find(b"\0")
-                    if exec_end < 0:
-                        return None
-                    argv_payload = payload[exec_end + 1 :].lstrip(b"\0")
-                    fields = argv_payload.split(b"\0")
-                    if len(fields) < argc:
-                        return None
-                    argv_fields = fields[:argc]
-                    try:
-                        return [os.fsdecode(field) for field in argv_fields]
-                    except UnicodeDecodeError:
-                        return None
-                if ctypes.get_errno() != errno.ENOMEM:
-                    return None
-                size.value = max(size.value * 2, actual.value * 2)
+            # A short buffer can succeed with only the TAIL of argv/environment.
+            # Query the required capacity first; an ENOMEM retry cannot fix that.
+            size = ctypes.c_size_t()
+            if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+                return None
+            buffer = (ctypes.c_ubyte * size.value)()
+            actual = ctypes.c_size_t(size.value)
+            if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) != 0:
+                return None
+            if not 4 <= actual.value <= size.value:
+                return None
+            raw = bytes(buffer[: actual.value])
+            argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+            if not 0 < argc < 65536:
+                return None
+            exec_end = raw.find(b"\0", 4)
+            if exec_end < 0:
+                return None
+            argv_start = exec_end + 1
+            while argv_start < len(raw) and raw[argv_start] == 0:
+                argv_start += 1
+            # Padding and an empty argv[0] are indistinguishable. If skipping
+            # them leaves fewer than argc terminated strings, refuse the
+            # ambiguous result rather than returning shifted/incomplete argv.
+            fields = raw[argv_start:].split(b"\0")
+            if len(fields) - 1 < argc:
+                return None
+            return [os.fsdecode(field) for field in fields[:argc]]
         except (OSError, AttributeError, TypeError, ValueError):
             return None
         return None

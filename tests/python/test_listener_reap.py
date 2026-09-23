@@ -463,11 +463,48 @@ def test_project_root_with_spaces_uses_exact_argv_boundaries(monkeypatch) -> Non
     assert got == {DEAD: [{"pid": 303, "start_token": "test:303"}]}, got
 
 
+@pytest.mark.parametrize(
+    ("argc", "payload", "expected"),
+    [
+        (
+            2,
+            b"/bin/python\0\0python\0script with spaces\0" + b"X=" + b"x" * 8192 + b"\0",
+            ["python", "script with spaces"],
+        ),
+        # Empty argv[0] cannot be distinguished from exec-path padding. With
+        # too few remaining strings, the only safe interpretation is unknown.
+        (2, b"/bin/python\0\0\0script\0", None),
+        (2, b"/bin/python\0\0python\0unterminated", None),
+        (0, b"/bin/python\0python\0", None),
+        (65536, b"/bin/python\0python\0", None),
+    ],
+)
+def test_macos_argv_buffer_and_parser(monkeypatch, argc, payload, expected) -> None:
+    raw = argc.to_bytes(4, sys.byteorder, signed=True) + payload
+    calls = []
+
+    def sysctl(mib, mib_len, buffer, size, new, new_len):
+        assert list(mib) == [1, 49, 123]
+        assert mib_len == 3
+        calls.append(buffer is None)
+        if buffer is not None:
+            assert size._obj.value == len(raw)
+            R.ctypes.memmove(buffer, raw, len(raw))
+        size._obj.value = len(raw)
+        return 0
+
+    monkeypatch.setattr(R.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        R.ctypes, "CDLL",
+        lambda *a, **k: type("Libc", (), {"sysctl": staticmethod(sysctl)})(),
+    )
+
+    assert R._process_argv(123) == expected
+    assert calls == [True, False]
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="exercises KERN_PROCARGS2 on macOS")
 def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> None:
-    if not _ps_liveness_available(os.getpid()):
-        pytest.skip("sandbox denies the process-table probe")
-
     project_root = tmp_path / "project with spaces"
     project_root.mkdir()
     script = tmp_path / "goalflight_messages.py"
@@ -481,19 +518,10 @@ def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> N
             str(project_root),
             "--lease-nonce",
             DEAD,
-        ]
+        ],
+        env={**os.environ, "GOALFLIGHT_TEST_LARGE_ENV": "x" * 8192},
     )
     try:
-        deadline = time.monotonic() + 5
-        got = None
-        while time.monotonic() < deadline:
-            got = R.listener_processes_by_nonce(project_root)
-            if got and got.get(DEAD) and got[DEAD][0]["pid"] == victim.pid:
-                break
-            time.sleep(0.05)
-        assert got is not None and DEAD in got, got
-        assert got[DEAD][0]["pid"] == victim.pid, got
-        assert got[DEAD][0]["start_token"], got
         assert R._process_argv(victim.pid) == [
             sys.executable,
             str(script),
@@ -503,6 +531,19 @@ def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> N
             "--lease-nonce",
             DEAD,
         ]
+        # sysctl can read our child even when the sandbox denies ps. Always
+        # exercise argv above; verify full enumeration where ps is available.
+        if _ps_liveness_available(os.getpid()):
+            deadline = time.monotonic() + 5
+            got = None
+            while time.monotonic() < deadline:
+                got = R.listener_processes_by_nonce(project_root)
+                if got and got.get(DEAD) and got[DEAD][0]["pid"] == victim.pid:
+                    break
+                time.sleep(0.05)
+            assert got is not None and DEAD in got, got
+            assert got[DEAD][0]["pid"] == victim.pid, got
+            assert got[DEAD][0]["start_token"], got
     finally:
         victim.terminate()
         victim.wait(timeout=10)
