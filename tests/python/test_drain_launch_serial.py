@@ -480,6 +480,15 @@ def test_healthy_entry_launches_promptly_when_capacity_available(
     assert elapsed < 2.0, elapsed
 
 
+def test_launch_timeout_includes_capacity_and_seat_preparation_window(
+    tmp_path: Path,
+) -> None:
+    args = _drain_args(_queue_dir(tmp_path), capacity_wait_s=7.0)
+    assert D._drain_launch_timeout_s(args) == pytest.approx(
+        7.0 + D.DRAIN_LAUNCH_PREPARATION_S + D.DRAIN_LAUNCH_CONFIRM_S
+    )
+
+
 def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
@@ -543,6 +552,13 @@ def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     status = json.loads((project / f"{dispatch_id}.status.json").read_text(encoding="utf-8"))
     assert status.get("state") == "failed", status
     assert str(status.get("reason") or "").startswith("launch_attempt_limit_exceeded:"), status
+    attention = [
+        item
+        for payload in payloads
+        for item in payload.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert attention and attention[-1]["attention"] == "launch_attempt_limit_exceeded", attention
 
 
 def test_legacy_launch_timeout_count_does_not_spend_new_failure_budget(
@@ -1120,6 +1136,45 @@ def test_launch_backoff_counter_saturates_at_capped_delay(tmp_path: Path) -> Non
     record = ledger.read_record("saturated-backoff")
     assert record is not None
     assert record["launch_backoff_count"] == D.MAX_LAUNCH_BACKOFF_COUNT, record
+
+
+def test_proven_failure_backoff_grows_between_retries(tmp_path: Path) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = _write_entry(
+        queue,
+        "growing-backoff",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    entry = _write_queued_ledger(path)
+
+    assert D._stamp_launch_attempt(
+        path,
+        entry,
+        backoff=True,
+        failed=True,
+        fail_reason="launch_timeout_pending_ledger",
+        attempt_class=D.LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE,
+    ) is None
+    first = json.loads(path.read_text(encoding="utf-8"))
+    first_until = ledger.parse_utc(first["launch_backoff_until"])
+    assert first["launch_backoff_count"] == 1, first
+
+    assert D._stamp_launch_attempt(
+        path,
+        first,
+        backoff=True,
+        failed=True,
+        fail_reason="launch_timeout_pending_ledger",
+        attempt_class=D.LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE,
+    ) is None
+    second = json.loads(path.read_text(encoding="utf-8"))
+    second_until = ledger.parse_utc(second["launch_backoff_until"])
+    assert second["launch_backoff_count"] == 2, second
+    assert first_until is not None and second_until is not None
+    assert second_until > first_until, (first, second)
 
 
 def test_two_drain_threads_on_one_dispatch_id_yield_one_launch(

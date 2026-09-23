@@ -83,6 +83,35 @@ def _cleanup_capacity_holders():
 _HELD_ENV: dict[str, dict[str, str]] = {}
 
 
+def _make_repo(tmp: Path) -> Path:
+    repo = tmp / "repo"
+    repo.mkdir()
+    for args in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "goalflight-test@example.invalid"],
+        ["git", "config", "user.name", "Goal Flight Test"],
+    ):
+        result = subprocess.run(
+            args,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for args in (["git", "add", "tracked.txt"], ["git", "commit", "-m", "base"]):
+        result = subprocess.run(
+            args,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+    return repo
+
+
 def _hold_capacity(tmp: Path, env: dict[str, str], dispatch_id: str) -> tuple[str, subprocess.Popen]:
     worker = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -154,8 +183,10 @@ def _dispatch_command(
     worker_code: str,
     *,
     extra: list[str] | None = None,
+    include_cwd: bool = True,
+    cwd: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(DISPATCH),
         "--unregistered-forced",
@@ -171,14 +202,19 @@ def _dispatch_command(
         "0.1",
         "--max-idle-secs",
         "10",
-        "--cwd",
-        str(tmp),
-        *(extra or []),
-        "--",
-        sys.executable,
-        "-c",
-        worker_code,
     ]
+    if include_cwd:
+        command.extend(["--cwd", str(cwd or tmp)])
+    command.extend(
+        [
+            *(extra or []),
+            "--",
+            sys.executable,
+            "-c",
+            worker_code,
+        ]
+    )
+    return command
 
 
 def _write_fake_codex_acp(tmp: Path, spawned: Path) -> Path:
@@ -198,8 +234,10 @@ def _acp_dispatch_command(
     dispatch_id: str,
     *,
     extra: list[str] | None = None,
+    include_cwd: bool = True,
+    cwd: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(DISPATCH),
         "--unregistered-forced",
@@ -219,10 +257,11 @@ def _acp_dispatch_command(
         "0.1",
         "--max-idle-secs",
         "10",
-        "--cwd",
-        str(tmp),
-        *(extra or []),
     ]
+    if include_cwd:
+        command.extend(["--cwd", str(cwd or tmp)])
+    command.extend(extra or [])
+    return command
 
 
 def _wait_for(predicate, *, label: str, timeout: float = 20.0) -> None:
@@ -249,7 +288,9 @@ def _write_queue_entry(
     agent: str,
     shape: str,
     replay_argv: list[str],
+    project_root: Path | None = None,
 ) -> Path:
+    root = project_root or tmp
     queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
     queue_path.parent.mkdir(parents=True)
     D._write_json_atomic(
@@ -260,16 +301,16 @@ def _write_queue_entry(
             "dispatch_id": dispatch_id,
             "agent": agent,
             "shape": shape,
-            "project_root": str(tmp),
-            "process_cwd": str(tmp),
-            "worker_cwd": str(tmp),
+            "project_root": str(root),
+            "process_cwd": str(root),
+            "worker_cwd": str(root),
             "created_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
             "queue_path": str(queue_path),
             "dispatch_argv": replay_argv,
             "request": {
                 "agent": agent,
-                "cwd": str(tmp),
+                "cwd": str(root),
                 "tail": str(tmp / f"{dispatch_id}.tail"),
                 "status_json": str(tmp / f"{dispatch_id}.status.json"),
             },
@@ -301,6 +342,32 @@ def test_detached_capacity_refusal_is_visible_and_not_queued() -> None:
         assert "DISPATCH-BLOCKED" in refused.stdout, refused.stdout
         assert _read_json(status_path).get("state") == "blocked_capacity"
         assert not queue_path.exists(), "capacity refusal silently created a queue entry"
+
+
+def test_direct_capacity_refusal_never_prepares_default_worktree() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = _make_repo(tmp)
+        env = _env(tmp)
+        env["GOALFLIGHT_WORKTREE_SEATS"] = "1"
+        held_lease = _hold_capacity(tmp, env, "held-before-direct-worktree")
+        try:
+            refused = _run(
+                _dispatch_command(
+                    tmp,
+                    "direct-capacity-no-seat",
+                    "raise SystemExit('must not run')",
+                    extra=["--capacity-wait-s", "0"],
+                    include_cwd=False,
+                ),
+                env,
+                cwd=repo,
+            )
+        finally:
+            _release_capacity(env, held_lease)
+        assert refused.returncode == 2, (refused.stdout, refused.stderr)
+        assert not (repo / "worktrees").exists()
+        assert not (repo / ".git" / "goalflight-worktree-seat-locks").exists()
 
 
 def test_capacity_refusal_guard_mirrors() -> None:
@@ -388,6 +455,36 @@ def test_acp_detached_capacity_refusal_is_visible_and_not_queued() -> None:
         queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
         assert not queue_path.exists(), f"{dispatch_id} incorrectly re-enqueued"
         assert not spawned.exists(), "ACP worker spawned despite capacity refusal"
+
+
+def test_acp_capacity_refusal_never_prepares_default_worktree() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = _make_repo(tmp)
+        env = _env(tmp)
+        env["GOALFLIGHT_WORKTREE_SEATS"] = "1"
+        spawned = tmp / "acp-no-seat-spawned"
+        _write_fake_codex_acp(tmp, spawned)
+        env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
+        env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
+        held_lease = _hold_capacity(tmp, env, "held-before-acp-worktree")
+        try:
+            refused = _run(
+                _acp_dispatch_command(
+                    tmp,
+                    "acp-capacity-no-seat",
+                    extra=["--capacity-wait-s", "0", "--foreground"],
+                    include_cwd=False,
+                ),
+                env,
+                cwd=repo,
+            )
+        finally:
+            _release_capacity(env, held_lease)
+        assert refused.returncode == 1, (refused.stdout, refused.stderr)
+        assert not spawned.exists()
+        assert not (repo / "worktrees").exists()
+        assert not (repo / ".git" / "goalflight-worktree-seat-locks").exists()
 
 
 def test_acp_detached_launcher_reads_final_capacity_status_before_exit() -> None:
@@ -568,6 +665,61 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
         )
         run_records = marker.read_text(encoding="utf-8").splitlines()
         assert len(run_records) == 1, f"queued worker ran {len(run_records)} times: {run_records!r}"
+
+
+def test_drain_capacity_refusal_restores_without_preparing_worktree() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = _make_repo(tmp)
+        env = _env(tmp)
+        env["GOALFLIGHT_WORKTREE_SEATS"] = "1"
+        held_lease = _hold_capacity(tmp, env, "held-before-drain-worktree")
+        dispatch_id = "drain-capacity-no-seat"
+        queue_dir = tmp / "state" / "dispatch-queue"
+        replay_argv = _dispatch_command(
+            tmp,
+            dispatch_id,
+            "raise SystemExit('must not run')",
+            extra=["--capacity-wait-s", "0"],
+            include_cwd=False,
+        )[2:]
+        queue_path = _write_queue_entry(
+            tmp,
+            dispatch_id=dispatch_id,
+            agent="test-dispatch",
+            shape="bash",
+            replay_argv=replay_argv,
+            project_root=repo,
+        )
+        old_env = os.environ.copy()
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(
+                SimpleNamespace(
+                    queue_dir=str(queue_dir),
+                    remote_node=None,
+                    capacity_wait_s=0.0,
+                    claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+                    limit=1,
+                    dispatch_id=None,
+                )
+            )
+        finally:
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+            _release_capacity(env, held_lease)
+        assert payload["launched"] == 0, payload
+        assert payload["left_queued"] == 1, payload
+        assert queue_path.exists()
+        assert not (repo / "worktrees").exists()
+        assert not (repo / ".git" / "goalflight-worktree-seat-locks").exists()
 
 
 def test_acp_preexisting_queue_capacity_refusal_restores_claim() -> None:

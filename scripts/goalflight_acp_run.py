@@ -4143,16 +4143,33 @@ async def _run_acp_dispatch_impl(
     try:
         if worktree_mode == "create":
             try:
-                worktree_seat = create_and_route_dispatch_worktree(
-                    cfg, project_root, dispatch_id
-                )
+                if getattr(cfg, "worktree_bind_after_capacity", False):
+                    import goalflight_dispatch
+
+                    worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+                else:
+                    worktree_seat = create_and_route_dispatch_worktree(
+                        cfg, project_root, dispatch_id
+                    )
             except Exception as e:
+                if getattr(cfg, "_worktree_occupancy_refused", False):
+                    import goalflight_dispatch
+
+                    goalflight_dispatch._discard_preworker_ledger(cfg)
                 await update_status(
                     state="failed_worktree",
                     ok=False,
                     error=f"{type(e).__name__}: {e}",
                 )
                 return payload
+            spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                worktree_seat.fileno()
+            )
+            occupancy_fd = os.environ.get(
+                goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+            )
+            if occupancy_fd:
+                spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
             worker_cwd = str(worktree_seat.path)
             prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
             attach_worktree_to_lease(worktree_seat.path)

@@ -1042,6 +1042,83 @@ def test_resume_injects_skip_seat_reset(tmp_path: Path) -> None:
     assert Path(str(cwd)).resolve() == worktree.resolve()
 
 
+def test_queue_retry_carrier_pins_exact_seat_without_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    claim = tmp_path / "queued.claimed"
+    dispatch_id = "queue-pin-retry"
+    goalflight_dispatch._write_json_atomic(
+        claim,
+        {
+            "dispatch_id": dispatch_id,
+            "queue_launch_token": "queue-token",
+            "dispatch_argv": [
+                "--agent",
+                "test-dispatch",
+                "--dispatch-id",
+                dispatch_id,
+                "--worktree",
+                "HEAD",
+            ],
+        },
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_project_root", lambda _args: repo)
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_controller_ring_label",
+        lambda *_args: "controller",
+    )
+    calls: list[dict] = []
+    real_acquire = goalflight_worktree_pool.acquire_worktree_seat
+
+    def acquire(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return real_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(goalflight_worktree_pool, "acquire_worktree_seat", acquire)
+    first_args = SimpleNamespace(
+        agent="test-dispatch",
+        dispatch_id=dispatch_id,
+        cwd=None,
+        worktree="HEAD",
+        in_place=False,
+        skip_seat_reset=False,
+        from_queue=True,
+        queue_claim_path=str(claim),
+        queue_launch_token="queue-token",
+        controller_label="controller",
+        parent_dispatch_id=None,
+        _worktree_seat=None,
+    )
+    first = goalflight_dispatch._bind_dispatch_worktree(first_args)
+    assert first is not None
+    seat = first.path
+    first.release()
+
+    carrier = json.loads(claim.read_text(encoding="utf-8"))
+    assert carrier["worktree_path"] == str(seat)
+    assert carrier["worktree_seat"] == seat.name
+    assert "--skip-seat-reset" in carrier["dispatch_argv"]
+    assert carrier["dispatch_argv"][carrier["dispatch_argv"].index("--cwd") + 1] == str(seat)
+
+    retry_args = SimpleNamespace(
+        **{
+            **vars(first_args),
+            "cwd": str(seat),
+            "skip_seat_reset": True,
+            "_worktree_seat": None,
+        }
+    )
+    retry = goalflight_dispatch._bind_dispatch_worktree(retry_args)
+    assert retry is not None
+    try:
+        assert retry.path == seat
+        assert calls[-1]["reset"] is False
+    finally:
+        retry.release()
+
+
 def _completion_refusal_env(tmp_path: Path) -> dict[str, str]:
     """Launch env that cannot touch the operator's ledger, journal, or tasks."""
     env = _env(tmp_path, seats=2)

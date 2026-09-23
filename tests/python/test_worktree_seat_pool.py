@@ -503,6 +503,73 @@ def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
             reused.release()
 
 
+def test_free_seat_nearest_to_target_base_is_selected() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(2):
+        repo = make_repo(Path(td))
+        base = git(repo, "rev-parse", "HEAD")
+        old = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "old-base", base=base
+        )
+        warm = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "warm-base", base=base
+        )
+        warm_path = warm.path
+        old.release()
+        warm.release()
+
+        (repo / "target.txt").write_text("target\n", encoding="utf-8")
+        git(repo, "add", "target.txt")
+        git(repo, "commit", "-m", "target")
+        target = git(repo, "rev-parse", "HEAD")
+
+        # Prepare s-2 at the target while s-1 remains on the old base. This
+        # mirrors a free pinned seat left behind by a previous launch.
+        exact = goalflight_worktree_pool.acquire_worktree_seat(
+            repo,
+            "warm-target",
+            base=target,
+            occupy_path=warm_path,
+        )
+        exact.release()
+
+        selected = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "target-dispatch", base=target
+        )
+        try:
+            assert_true("nearest target-base seat wins", selected.path == warm_path)
+        finally:
+            selected.release()
+
+
+def test_exact_retry_base_skips_checkout() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        base = git(repo, "rev-parse", "HEAD")
+        first = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "retry-dispatch", base=base
+        )
+        first.release()
+
+        real_git = goalflight_worktree_pool._git
+        checkout_calls: list[tuple[str, ...]] = []
+
+        def recording_git(worktree: Path, *args: str) -> str:
+            if args and args[0] == "checkout":
+                checkout_calls.append(args)
+            return real_git(worktree, *args)
+
+        goalflight_worktree_pool._git = recording_git
+        try:
+            retry = goalflight_worktree_pool.acquire_worktree_seat(
+                repo, "retry-dispatch", base=base
+            )
+            retry.release()
+        finally:
+            goalflight_worktree_pool._git = real_git
+
+        assert_true("pinned retry performs zero checkouts", not checkout_calls)
+
+
 def test_skip_reset_keeps_dirty_product_files() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         repo = make_repo(Path(td))

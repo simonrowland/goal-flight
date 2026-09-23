@@ -890,10 +890,44 @@ def _create_seat_worktree(
 def _prepare_seat_checkout(
     worktree_path: Path, *, branch: str, base_commit: str
 ) -> None:
-    _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
+    current_branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    current_head = _git(worktree_path, "rev-parse", "HEAD")
+    tracked_status = _git(worktree_path, "status", "--porcelain", "--untracked-files=no")
+    if (
+        current_branch != branch
+        or current_head != base_commit
+        or tracked_status
+    ):
+        _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
     # when a temp repo has not gitignored ``.goal-flight/``.
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
+
+
+def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
+    """Return changed-path distance from a free seat to ``base_commit``.
+
+    This is deliberately read-only and advisory. An unreadable or invalid
+    seat sorts after readable seats; normal reset-safety checks still decide
+    whether the selected seat may be reused.
+    """
+    if not worktree_path.is_dir():
+        return None
+    head = _git_proc(worktree_path, "rev-parse", "HEAD")
+    if head is None or head.returncode != 0 or not head.stdout.strip():
+        return None
+    diff = _git_proc(
+        worktree_path,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        base_commit,
+        head.stdout.strip(),
+        "--",
+    )
+    if diff is None or diff.returncode != 0:
+        return None
+    return sum(1 for line in diff.stdout.splitlines() if line.strip())
 
 
 def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
@@ -1224,7 +1258,21 @@ def acquire_worktree_seat(
 
         refused: list[str] = []
         occupants = []
-        for slot in range(1, hwm + 1):
+        distances = {
+            slot: _seat_base_distance(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}", base_commit
+            )
+            for slot in range(1, hwm + 1)
+        }
+        candidate_slots = sorted(
+            range(1, hwm + 1),
+            key=lambda slot: (
+                distances[slot] is None,
+                distances[slot] if distances[slot] is not None else 0,
+                slot,
+            ),
+        )
+        for slot in candidate_slots:
             seat_name = f"{CAPTIVE_SEAT_PREFIX}{slot}"
             worktree_path = managed_root / seat_name
             lock_path = lock_root / f"{seat_name}.lock"
