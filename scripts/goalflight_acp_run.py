@@ -158,6 +158,20 @@ def _finalize_capacity_after_cleanup(
     """Release only after confirmed group death; otherwise retain visibly."""
     if not lease_id:
         return
+    if worker_pid is None:
+        # ACP can fail after reservation but before the adapter spawn (for
+        # example, worktree admission or sandbox preparation). Mark that
+        # launcher-owned proof before cmd_release; a plain reserved lease is
+        # intentionally protected because it may still have crossed spawn.
+        try:
+            goalflight_capacity.mark_lease_spawn_failed(
+                lease_id,
+                reason=str(reason or "spawn_failed"),
+            )
+        except Exception as exc:
+            payload["capacity_spawn_failure_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
     release_confirmed = (
         worker_pid is None
         or (

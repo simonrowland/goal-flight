@@ -430,7 +430,10 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             assert_true("worktree left on disk", worktree_path.is_dir())
             assert_true("worker spawned in worktree", spawn_calls[0]["cwd"] == str(worktree_path))
             inherited_fds = spawn_calls[0]["pass_fds"]
-            assert_true("worker inherits seat lock", len(inherited_fds) == 1)
+            seat_fd = int(
+                spawn_calls[0]["env"][goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV]
+            )
+            assert_true("worker inherits seat lock", seat_fd in inherited_fds)
 
             state = goalflight_capacity.load_state()
             leases = list(state.get("leases", {}).values())
