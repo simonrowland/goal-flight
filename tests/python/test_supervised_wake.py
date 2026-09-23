@@ -2753,9 +2753,10 @@ def test_controller_mail_documents_supervise_front_door() -> None:
     assert "--controller-label" in doctrine
     assert "live/" in doctrine
     assert "do **not** grep" in doctrine.lower()
-    assert "no timeout" in doctrine.lower()
-    assert "`persistent: true`" in doctrine
-    assert "`timeout_ms` inert" in doctrine
+    assert "30 minutes" in doctrine
+    assert "renews the lease" in doctrine
+    assert "`persistent: true`" not in doctrine
+    assert "timeout_ms` inert" not in doctrine
 
 
 def test_supervisor_signal_exit_contract_matches_installed_handlers(
@@ -2798,9 +2799,10 @@ def test_every_supervisor_arming_site_requires_session_lifetime_no_timeout(
     relative: str,
 ) -> None:
     doctrine = (ROOT / relative).read_text(encoding="utf-8")
-    assert "no timeout" in doctrine.lower()
-    assert "`persistent: true`" in doctrine
-    assert "`timeout_ms` inert" in doctrine
+    assert "30 minutes" in doctrine
+    assert "renews the lease" in doctrine
+    assert "`persistent: true`" not in doctrine
+    assert "timeout_ms` inert" not in doctrine
 
 
 def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:

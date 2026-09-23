@@ -399,12 +399,7 @@ remains the persistent JSON-line surface for hosts that still arm components
 separately. The host persistent monitor must own the tracked task's stdout
 directly; ordinary shell backgrounding, detaching, or a task surface that
 reports only at process exit produces no wakes.
-Arm the supervisor with **no timeout** so it runs for the life of the session.
-Never set, tune, or reason about a timeout value: a bounded monitor is killed
-outside the supervisor, so no `type=stop` record appears and the controller
-goes deaf without a diagnostic. On Claude Code use `persistent: true`; that
-makes `timeout_ms` inert, and a host-required value is only a placeholder,
-never a knob.
+Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one.
 `follow` sends only `event`, `heartbeat`, and `frontier` records to stdout; the
 supervisor multiplexes those and adds its tagged `kind=supervise` records.
 Diagnostics go to stderr, which the measured host contract does not notify. Fatal journal, cursor,

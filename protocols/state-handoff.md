@@ -49,7 +49,7 @@ lease described in `protocols/session-preflight.md`. The lease carries the stabl
 label, one active generation, nonce capability, exact PID/start-token principal when
 available, and renewal horizon. A live different generation is never displaced by an
 automatic claim. Listener, drainer, mirror, and dashboard roles do not claim or renew;
-a verified watchdog tick may renew.
+`supervise` renews the lease when it starts, before it arms; a watchdog tick does not.
 
 Dispatch ownership is stamped only when the declared label and measured incarnation
 match the active lease. A mismatch is visible and remains honestly unowned. Normal

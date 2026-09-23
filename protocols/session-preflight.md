@@ -21,8 +21,7 @@ lease. A child of that recorded holder reconnects the same generation even when
 a liveness probe is UNKNOWN. A proven-live different generation returns visible
 `label in use`; it is not stolen. Use `--join <name> --acknowledge-controller-conflict`
 only for an explicit cooperative succession. Listener, drainer, mirror, and dashboard
-roles never claim or renew; a nonce-carrying verified watchdog tick may renew the
-controller lease.
+roles never claim or renew. `supervise` renews the lease when it starts, before it arms; a watchdog tick does not.
 
 The lease, not a process scan or heartbeat JSON map, is liveness authority. It is
 keyed by canonical project, label, and nonce and has one active generation. Stored

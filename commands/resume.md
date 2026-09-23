@@ -53,7 +53,7 @@ waiting for a re-prompt when no real blocker exists.
 
 The resume entry auto-claims/renews only the controller role's journal lease. Carry
 its label. Listener, drainer, mirror, and dashboard children never claim during
-resume; a verified watchdog tick may renew the controller lease.
+resume. `supervise` renews the lease when it starts, before it arms; a watchdog tick does not.
 
 ### `label in use` — adopt by default; defer only on PROVEN live competition
 
@@ -84,22 +84,21 @@ notes, before any measurement.** A controller without a wake is deaf: worker
 results land in the journal and nothing tells it. Every minute spent
 "orienting" first is a minute of missed events.
 
-Arm ONE `supervise` process through the host's persistent monitor — never a
-bounded monitor, never a shell `&`, never per-component listeners when a
-supervisor is available:
+Before arming, drain or peek pending mail (`relay --drain`, or `listen
+--report-pending`) so a long gap is not skipped when the cursor advances.
+
+Arm ONE `supervise` process through the host monitor — never a shell `&`,
+never per-component listeners when a supervisor is available:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py supervise \
   --project-root "$PWD" --controller-label <label>
 ```
 
-On Claude Code that is the Monitor tool with `persistent: true` and **no
-timeout you reason about** — a bounded monitor is killed outside the
-supervisor, so no `type=stop` record appears and the controller goes deaf with
-no diagnostic.
+Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one.
 
 Confirm it is actually armed before moving on: the supervisor's first write is
-a `{"kind":"supervise","type":"arm","owned":"stream/backup/watchdog"}` record.
+a `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record.
 Do not grep that feed; default is terse.
 If `--list-controllers` still reports `supervisor: absent` after arming, treat
 that as a blocker and resolve it — do not proceed to STEP 2 deaf.
