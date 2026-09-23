@@ -65,6 +65,18 @@ def test_default_model_and_explicit_override(codex_home):
         validate(codex_home, None)
 
 
+def test_catalog_default_skips_hidden_model(codex_home):
+    path = codex_home / "models_cache.json"
+    cache = json.loads(path.read_text())
+    cache["models"][0].update(priority=0, visibility="hide")
+    cache["models"][1]["visibility"] = "list"
+    path.write_text(json.dumps(cache))
+    validate(codex_home, None)
+    # Explicit selection still validates the requested model, even if hidden.
+    with pytest.raises(D.DispatchUsageError, match="'limited'"):
+        validate(codex_home, "limited")
+
+
 @pytest.mark.parametrize("cache", [None, b"{broken", b"\xff", b"null", b"{}",
                                       b'{"models": []}', b'{"models": null}'])
 def test_cache_fallback(codex_home, cache):
@@ -106,8 +118,52 @@ def test_acp_refuses_effort_before_launch_setup(monkeypatch, capsys, agent, rout
         "--reasoning-effort", effort, "--prompt", "read only",
     ]) == 64
     error = capsys.readouterr().err
-    assert "--reasoning-effort is not supported for Codex over ACP" in error
-    assert "--shape bash without --interactive" in error
+    assert "--reasoning-effort requires --agent codex --shape bash" in error
+    assert "without --interactive or a raw command after --" in error
+
+
+@pytest.mark.parametrize("route", [
+    ["--agent", "codex", "--", "codex", "exec", "read only"],
+    ["--agent", "claude"],
+    ["--agent", "claude", "--shape", "bash"],
+    ["--agent", "grok-code"],
+    ["--agent", "grok-research"],
+    ["--agent", "grok-acp"],
+    ["--agent", "cursor"],
+    ["--agent", "moonshot"],
+    ["--agent", "codex-acp"],
+    ["--shape", "bash"],
+])
+@pytest.mark.parametrize("replay", [False, True])
+def test_unsupported_routes_refuse_effort(monkeypatch, capsys, route, replay):
+    def unexpected_setup(*_args, **_kwargs):
+        pytest.fail("unsupported effort reached launch setup")
+
+    monkeypatch.setattr(D, "_ensure_assigned_engine_session", unexpected_setup)
+    argv = ["--reasoning-effort", "max", "--prompt", "read only", *route]
+    if replay:
+        argv = D._reconstruct_launch_argv(argv)
+        assert D._option_value_before_worker_remainder(argv, "--reasoning-effort") == "max"
+    assert D.main(argv) == 64
+    assert "--reasoning-effort requires --agent codex --shape bash" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("route", [[], ["--shape", "bash"]])
+def test_supported_route_preserves_effort_on_replay(monkeypatch, route):
+    class LaunchSetupReached(Exception):
+        pass
+
+    def stop_before_setup(args):
+        assert args.reasoning_effort == "max"
+        assert args.shape == "bash"
+        raise LaunchSetupReached
+
+    monkeypatch.setattr(D, "_ensure_assigned_engine_session", stop_before_setup)
+    argv = D._reconstruct_launch_argv([
+        "--agent", "codex", *route, "--reasoning-effort", "max", "--prompt", "read only",
+    ])
+    with pytest.raises(LaunchSetupReached):
+        D.main(argv)
 
 
 @pytest.mark.parametrize("route", [["--shape", "acp"], ["--interactive"], ["--shape", "bash"]])

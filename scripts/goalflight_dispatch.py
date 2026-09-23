@@ -6691,8 +6691,11 @@ def _validate_codex_reasoning_effort(args, env: dict[str, str]) -> None:
         cache = json.loads((home / "models_cache.json").read_text(encoding="utf-8"))
         models = cache["models"]
         if not model:
-            # Codex's catalog default is the first model in priority order.
-            model = min(models, key=lambda entry: entry["priority"])["slug"]
+            # Codex's catalog default is the first visible model in priority order.
+            model = min(
+                (entry for entry in models if entry.get("visibility") != "hide"),
+                key=lambda entry: entry["priority"],
+            )["slug"]
         entry = next(entry for entry in models if entry["slug"] == model)
         supported = entry["supported_reasoning_levels"]
         if supported and all(
@@ -18356,7 +18359,8 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                         default=None,
                         help="Codex reasoning effort for this dispatch "
                              f"({', '.join(sorted(CODEX_REASONING_EFFORTS))}). "
-                             "Bash only; unsupported with --shape acp or --interactive. "
+                             "Requires --agent codex --shape bash without --interactive "
+                             "or a raw command after --. "
                              "Validated against the selected model's models_cache.json; "
                              "fallback: low, medium, high, xhigh. "
                              "Default = whatever the worker CLI config sets, so "
@@ -18678,13 +18682,12 @@ def main(argv: list[str] | None = None) -> int:
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
     if (
-        shape == "acp"
-        and args.agent in {"codex", "codex-acp", "worker"}
-        and args.reasoning_effort is not None
+        args.reasoning_effort is not None
+        and not (args.agent == "codex" and shape == "bash" and not raw)
     ):
         print(
-            "goalflight_dispatch: --reasoning-effort is not supported for Codex over ACP; "
-            "use --agent codex --shape bash without --interactive to set it.",
+            "goalflight_dispatch: --reasoning-effort requires --agent codex --shape bash "
+            "without --interactive or a raw command after --.",
             file=sys.stderr,
         )
         return 64
