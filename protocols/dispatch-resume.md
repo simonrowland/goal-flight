@@ -110,8 +110,15 @@ you want to keep, not by what killed the worker.
 - Ownership is recorded at dispatch time; a resumed dispatch keeps its
   original owner, so wakes still route to the controller that started it.
 - Never resume a source that is still live or whose liveness is
-  indeterminate.
+  indeterminate. A row labeled `worker_dead` whose pid is still live is
+  this case, not a successful resume.
 - Never resume into a session another non-terminal child already holds.
+- `partial_task_supersession` from this attempt's own `worker_dead`,
+  `superseded`, or `abandoned` row: the hold is the ledger row. Resume
+  that dispatch; a later resume in the same chain is the same attempt.
+  A live sibling, or a fresh dispatch on the same task, is still refused.
+  `reconcile-outbox` does not clear this hold. Opening a new task row is
+  interim and leaves the old id held.
 - Resume refuses honestly when it cannot attach:
   - no recorded engine session handle (typical of dispatches that predate
     capture — Grok/Claude now assign at launch; Kimi/cursor harvest after

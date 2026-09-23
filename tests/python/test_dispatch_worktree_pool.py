@@ -1040,3 +1040,166 @@ def test_resume_injects_skip_seat_reset(tmp_path: Path) -> None:
     assert "--skip-seat-reset" in argv
     cwd = D._option_value_before_worker_remainder(argv, "--cwd")
     assert Path(str(cwd)).resolve() == worktree.resolve()
+
+
+def _completion_refusal_env(tmp_path: Path) -> dict[str, str]:
+    """Launch env that cannot touch the operator's ledger, journal, or tasks."""
+    env = _env(tmp_path, seats=2)
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp_path / "task-store")
+    env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "4"
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_DISPATCH_SCRIPT",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_CONTROLLER_LABEL",
+        "GOALFLIGHT_CONTROLLER_PID",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_PROCESS_ROLE",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def _apply_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_DISPATCH_SCRIPT",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_CONTROLLER_LABEL",
+        "GOALFLIGHT_CONTROLLER_PID",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_PROCESS_ROLE",
+        "GOALFLIGHT_WORKTREE_LOCK_FD",
+        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+    ):
+        if key not in env:
+            monkeypatch.delenv(key, raising=False)
+
+
+def _lock_dispatch_id(lock_path: Path) -> str:
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    return str(payload.get("dispatch_id") or "")
+
+
+@pytest.mark.parametrize("shape", ["bash", "acp"])
+def test_completion_refusal_leaves_seat_occupant_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    """A launch the completion gate refuses must not rewrite the seat occupant.
+
+    Both launch shapes bind the seat before they refuse today, so a rejected
+    child becomes the lock-file occupant and the next resume of the real
+    holder is told the seat was reclaimed.
+    """
+    import goalflight_ledger as ledger
+    import goalflight_task
+
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    env = _completion_refusal_env(tmp_path)
+    _apply_env(monkeypatch, env)
+    monkeypatch.chdir(repo)
+
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "seat-parent")
+    seat = parent.path
+    lock_path = goalflight_worktree_pool.worktree_seat_lock_path(
+        repo,
+        parent.seat_name,
+        controller_label=goalflight_worktree_pool.default_controller_ring_label(
+            None, project_root=repo
+        ),
+    )
+    parent.release()
+    (seat / "keep-me.txt").write_text("still here\n", encoding="utf-8")
+    assert _lock_dispatch_id(lock_path) == "seat-parent"
+
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "blocker-dead",
+            "agent": "test-dispatch",
+            "state": "worker_dead",
+            "terminal_state": "worker_dead",
+            "project_root": str(repo),
+            "task_ids": ["t-370"],
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "worker_cwd": str(seat),
+        }
+    )
+    store = goalflight_task.TaskStore(repo)
+    store.docs_dir.mkdir(parents=True, exist_ok=True)
+    store.tasks_path.write_text(
+        json.dumps(
+            {
+                "id": "t-370",
+                "kind": "task",
+                "title": "held by a dead attempt",
+                "blocked_by": [],
+                "links": [],
+                "tags": [],
+                "done": False,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "created_by": "test",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    child_id = f"refused-child-{shape}"
+    argv = [
+        sys.executable,
+        str(DISPATCH),
+        "--unregistered-forced",
+        "--shape",
+        shape,
+        "--dispatch-id",
+        child_id,
+        "--task",
+        "t-370",
+        "--cwd",
+        str(seat),
+        "--launch-detached",
+    ]
+    if shape == "acp":
+        prompt = tmp_path / "prompt.md"
+        prompt.write_text("continue the held task\n", encoding="utf-8")
+        argv.extend(["--agent", "claude", "--prompt-file", str(prompt)])
+    else:
+        argv.extend(
+            [
+                "--agent",
+                "test-dispatch",
+                "--",
+                sys.executable,
+                "-c",
+                "raise SystemExit('should-not-spawn')",
+            ]
+        )
+
+    proc = subprocess.run(
+        argv,
+        cwd=str(repo),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 64, combined
+    assert "partial_task_supersession" in combined, combined
+    assert _lock_dispatch_id(lock_path) == "seat-parent", combined
+    assert child_id not in _lock_dispatch_id(lock_path)
+    assert (seat / "keep-me.txt").read_text(encoding="utf-8") == "still here\n"
