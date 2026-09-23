@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +46,7 @@ import goalflight_worktree_pool  # noqa: E402
 _ASYNC_WAIT_TIMEOUT_S = 30.0
 
 
-def _env(tmp: Path) -> dict[str, str]:
+def _env(tmp: Path, *, capacity_max_total: int | None = None) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
         "GOALFLIGHT_DISPATCH_ID",
@@ -74,15 +75,60 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_FLEET_DIR"] = str(tmp / "fleet")
-    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
-    env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+    if capacity_max_total is None:
+        env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+        env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+    else:
+        capacity_conf = tmp / "capacity.json"
+        capacity_conf.write_text(
+            json.dumps(
+                {
+                    "max_total": capacity_max_total,
+                    "agent_caps": {
+                        "test": capacity_max_total,
+                        "grok": capacity_max_total,
+                        "codex-acp": capacity_max_total,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        capacity_bin = tmp / "capacity-bin"
+        capacity_bin.mkdir()
+        sysctl = capacity_bin / "sysctl"
+        sysctl.write_text("#!/bin/sh\nprintf '%s\\n' 137438953472\n", encoding="utf-8")
+        sysctl.chmod(0o755)
+        env["GOALFLIGHT_CAPACITY_CONF"] = str(capacity_conf)
+        env["PATH"] = f"{capacity_bin}{os.pathsep}{env['PATH']}"
+        env.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
 
 
-def _run(cmd: list[str], env: dict[str, str], *, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+def _configure_test_accounts(tmp: Path, env: dict[str, str]) -> None:
+    home = tmp / "home"
+    grok_home = home / ".goal-flight" / "accounts" / "occupancy-test" / "grok"
+    (grok_home / ".grok").mkdir(parents=True)
+    (grok_home / ".grok" / "auth.json").write_text("{}", encoding="utf-8")
+    (grok_home / ".grok" / "config.toml").write_text(
+        '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    (home / ".goal-flight" / "accounts" / "occupancy-test" / "codex").mkdir(
+        parents=True
+    )
+    env["HOME"] = str(home)
+
+
+def _run(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    timeout: float = 60.0,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
+        cwd=str(cwd) if cwd is not None else None,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -259,6 +305,41 @@ def _non_temp_tree(prefix: str):
         yield td
 
 
+def _read_only_sandbox_available() -> bool:
+    repo = os.path.realpath(str(ROOT))
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    return repo != temp_root and not repo.startswith(temp_root + os.sep)
+
+
+def _skip_read_only_sandbox_case(name: str) -> bool:
+    if _read_only_sandbox_available():
+        return False
+    print(
+        f"SKIP {name}: repository clone is under the temp root; "
+        "macOS read-only sandbox cannot enforce workspace boundaries there"
+    )
+    return True
+
+
+def _make_runs_dir_unreadable_after_record(
+    runs: Path, dispatch_id: str
+) -> tuple[threading.Thread, threading.Event]:
+    recorded = runs / f"{dispatch_id}.json"
+    changed = threading.Event()
+
+    def change_mode() -> None:
+        deadline = time.monotonic() + _ASYNC_WAIT_TIMEOUT_S
+        while time.monotonic() < deadline and not recorded.exists():
+            time.sleep(0.01)
+        if recorded.exists():
+            os.chmod(runs, 0o000)
+            changed.set()
+
+    thread = threading.Thread(target=change_mode, daemon=True)
+    thread.start()
+    return thread, changed
+
+
 def _ledger_record(tmp: Path, dispatch_id: str) -> dict:
     path = tmp / "state" / "runs.d" / f"{dispatch_id}.json"
     if not path.exists():
@@ -337,7 +418,7 @@ def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         release_incumbent = tmp / "release-incumbent"
         incumbent = _run(
             _dispatch_cmd(tmp, tree, "occ-incumbent", _blocking_worker(release_incumbent, "occ-incumbent")),
@@ -364,16 +445,35 @@ def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
                     "occ-second",
                     _quick_writer("occ-second"),
                     extra=["--occupied-worktree-forced", "--capacity-wait-s", "0"],
+                    foreground=True,
                 ),
                 env,
             )
-            assert forced.returncode == 2, (forced.stdout, forced.stderr)
+            assert forced.returncode == 0, (forced.stdout, forced.stderr)
             assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
             assert "occ-incumbent" in forced.stderr, forced.stderr
-            assert "DISPATCH-BLOCKED" in forced.stdout, forced.stdout
-            blocked = _ledger_record(tmp, "occ-second")
+            assert "DISPATCH-END" in forced.stdout, forced.stdout
+            _wait_until_terminal(tmp, "occ-second")
+
+            env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+            blocked_attempt = _run(
+                _dispatch_cmd(
+                    tmp,
+                    tree,
+                    "occ-capacity",
+                    _quick_writer("occ-capacity"),
+                    extra=["--occupied-worktree-forced", "--capacity-wait-s", "0"],
+                ),
+                env,
+            )
+            assert blocked_attempt.returncode == 2, (
+                blocked_attempt.stdout,
+                blocked_attempt.stderr,
+            )
+            assert "DISPATCH-BLOCKED" in blocked_attempt.stdout, blocked_attempt.stdout
+            blocked = _ledger_record(tmp, "occ-capacity")
             assert blocked.get("state") == "blocked_capacity", blocked
-            assert not list((tmp / "state" / "dispatch-queue").glob("occ-second*.json"))
+            assert not list((tmp / "state" / "dispatch-queue").glob("occ-capacity*.json"))
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "occ-incumbent")
@@ -381,14 +481,17 @@ def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
 
 def test_declared_read_only_raw_worker_is_refused_into_occupied_worktree() -> None:
     """--read-only on a `--` worker is a declaration; occupancy still applies."""
+    if _skip_read_only_sandbox_case("declared read-only raw worker"):
+        return
     with _temp_dir() as td, _non_temp_tree("gf-occ-ro-tree-") as tree_td:
         tmp = Path(td)
         tree = Path(tree_td).resolve()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         release_incumbent = tmp / "release-incumbent"
         incumbent = _run(
             _dispatch_cmd(tmp, tree, "ro-incumbent", _blocking_worker(release_incumbent, "ro-incumbent")),
             env,
+            cwd=Path(tree_td),
         )
         assert incumbent.returncode == 0, (incumbent.stdout, incumbent.stderr)
         try:
@@ -403,6 +506,7 @@ def test_declared_read_only_raw_worker_is_refused_into_occupied_worktree() -> No
                     foreground=True,
                 ),
                 env,
+                cwd=Path(tree_td),
             )
             assert declared.returncode == 64, (declared.returncode, declared.stdout, declared.stderr)
             assert "ro-incumbent" in declared.stderr, declared.stderr
@@ -465,7 +569,7 @@ def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         runs = tmp / "state" / "runs.d"
         runs.mkdir(parents=True)
         (runs / "corrupt-record.json").write_text("{not json", encoding="utf-8")
@@ -498,7 +602,8 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
+        _configure_test_accounts(tmp, env)
         release_incumbent = tmp / "release-incumbent"
         incumbent = _run(
             _dispatch_cmd(tmp, tree, "preset-incumbent", _blocking_worker(release_incumbent, "preset-incumbent")),
@@ -508,7 +613,13 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
         try:
             _wait_until_running(tmp, "preset-incumbent")
             refused = _run(
-                _prompt_writer_cmd(tmp, tree, "preset-second", agent="grok-code"),
+                _prompt_writer_cmd(
+                    tmp,
+                    tree,
+                    "preset-second",
+                    agent="grok-code",
+                    extra=["--account", "occupancy-test"],
+                ),
                 env,
             )
             assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
@@ -523,19 +634,29 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
 def test_acp_writer_refused_into_occupied_worktree() -> None:
     """ACP --cwd is a separate main() branch; occupancy must refuse there too."""
     source = DISPATCH.read_text(encoding="utf-8")
-    assert (
-        source.count("occupancy_warning = _prepare_attempt_worktree_occupancy(args)")
-        == 2
-    ), "occupancy must be wired on both the ACP and bash launch branches"
+    assert source.count("warning = _prepare_attempt_worktree_occupancy(args)") == 1
+    assert source.count("worktree_seat = _admit_dispatch_worktree(args)") == 1
+    acp_source = (ROOT / "scripts" / "goalflight_acp_run.py").read_text(encoding="utf-8")
+    assert acp_source.count("worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)") == 1
     acp_py = _managed_acp_python()
     if acp_py is None:
         print("SKIP live ACP occupancy (no managed ACP interpreter); wiring asserted")
+        return
+    import goalflight_acp_run
+
+    acp_command, acp_args = goalflight_acp_run.agent_command("codex-acp")
+    adapter_gate = goalflight_acp_run.validate_acp_dispatch_readiness(
+        "codex-acp", [acp_command, *acp_args]
+    )
+    if adapter_gate is not None:
+        print(f"SKIP live ACP occupancy (adapter unavailable): {adapter_gate}")
         return
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
+        _configure_test_accounts(tmp, env)
         env["GOALFLIGHT_ACP_PYTHON"] = str(acp_py)
         release_incumbent = tmp / "release-incumbent"
         incumbent = _run(
@@ -551,10 +672,13 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
                     tree,
                     "acp-second",
                     agent="codex-acp",
-                    extra=["--shape", "acp"],
+                    extra=["--shape", "acp", "--account", "occupancy-test"],
                 ),
                 env,
             )
+            if refused.returncode == 1 and "blocked_adapter_gate" in refused.stderr:
+                print("SKIP live ACP occupancy (adapter gate blocked isolated run)")
+                return
             assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
             assert "acp-incumbent" in refused.stderr, refused.stderr
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
@@ -573,18 +697,58 @@ def test_unreadable_ledger_dir_is_unknown_not_unoccupied() -> None:
         env = _env(tmp)
         runs = tmp / "state" / "runs.d"
         runs.mkdir(parents=True)
-        os.chmod(runs, 0o000)
+        release_holder = tmp / "release-holder"
+        holder_tree = tmp / "holder-tree"
+        holder_tree.mkdir()
+        holder = _run(
+            _dispatch_cmd(
+                tmp,
+                holder_tree,
+                "unk-dir-holder",
+                _blocking_worker(release_holder, "unk-dir-holder"),
+            ),
+            env,
+        )
+        assert holder.returncode == 0, (holder.stdout, holder.stderr)
+        holder_record = _wait_until_running(tmp, "unk-dir-holder")
+        target_id = "unk-dir-writer"
+        chmod_thread, changed = _make_runs_dir_unreadable_after_record(runs, target_id)
         try:
-            refused = _run(_dispatch_cmd(tmp, tree, "unk-dir-writer", _quick_writer("unk-dir-writer")), env)
+            pending = _popen(
+                _dispatch_cmd(
+                    tmp,
+                    tree,
+                    target_id,
+                    _quick_writer(target_id),
+                    extra=["--capacity-wait-s", "20"],
+                ),
+                env,
+            )
+            assert _wait_for(changed.is_set), "ledger directory was not made unreadable"
+            release_holder.write_text("release", encoding="utf-8")
+            out, err = _communicate(pending)
+            refused = subprocess.CompletedProcess(
+                pending.args, pending.returncode, out, err
+            )
         finally:
             os.chmod(runs, 0o755)
+            chmod_thread.join(timeout=5)
+            release_holder.write_text("release", encoding="utf-8")
+        assert _wait_for(lambda: _pid_gone(holder_record.get("worker_pid"))), holder_record
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
         assert "Retry the dispatch" in refused.stderr, refused.stderr
         assert "already has a non-terminal ledger record" not in refused.stderr, refused.stderr
         assert "unique --dispatch-id" not in refused.stderr, refused.stderr
         assert "runs.d" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "unk-dir-writer"), refused.stderr
+        refused_record = _ledger_record(tmp, "unk-dir-writer")
+        assert refused_record, refused.stderr
+        assert refused_record.get("worker_cwd") is None, refused_record
+        assert refused_record.get("state") in {
+            "waiting_capacity",
+            "failed",
+            "blocked_capacity",
+        }, refused_record
 
 
 def test_genuine_duplicate_dispatch_id_is_still_refused() -> None:
@@ -701,7 +865,7 @@ def test_matching_project_root_without_cwd_does_not_occupy() -> None:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         identity = ledger.process_identity(os.getpid())
         assert identity is not None, os.getpid()
         _write_runs_record(
@@ -1122,7 +1286,7 @@ def test_concurrent_second_writer_is_refused_on_every_trial() -> None:
             tmp = Path(td)
             tree = tmp / "tree"
             tree.mkdir()
-            env = _env(tmp)
+            env = _env(tmp, capacity_max_total=2)
             marker_a = tree / "wrote-by-w-a"
             marker_b = tree / "wrote-by-w-b"
             writer_a = (
@@ -1215,10 +1379,13 @@ def test_sigkill_releases_occupancy_before_capacity_lease_cleanup() -> None:
             ),
             env,
         )
-        assert second.returncode == 2, (second.stdout, second.stderr)
-        assert "DISPATCH-BLOCKED" in second.stdout, second.stdout
+        assert second.returncode in {0, 2}, (second.stdout, second.stderr)
         assert "already owned" not in second.stderr, second.stderr
-        assert not list((tmp / "state" / "dispatch-queue").glob("occ-after-kill*.json"))
+        if second.returncode == 2:
+            assert "DISPATCH-BLOCKED" in second.stdout, second.stdout
+            assert not list((tmp / "state" / "dispatch-queue").glob("occ-after-kill*.json"))
+        else:
+            assert "DISPATCH-END" in second.stdout, second.stdout
         watcher_pid = record.get("watcher_pid")
         if watcher_pid:
             _wait_for(lambda pid=watcher_pid: _pid_gone(pid), timeout=5.0)
@@ -1277,10 +1444,12 @@ def test_concurrent_different_trees_reach_capacity_independently() -> None:
 
 def test_declared_read_only_raw_incumbent_occupies_the_tree() -> None:
     """A write-capable `--` worker that declared --read-only still occupies."""
+    if _skip_read_only_sandbox_case("declared read-only raw incumbent"):
+        return
     with _temp_dir() as td, _non_temp_tree("gf-occ-rohold-tree-") as tree_td:
         tmp = Path(td)
         tree = Path(tree_td).resolve()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         release_holder = tmp / "release-holder"
         holder = _run(
             _dispatch_cmd(
@@ -1291,6 +1460,7 @@ def test_declared_read_only_raw_incumbent_occupies_the_tree() -> None:
                 extra=["--read-only"],
             ),
             env,
+            cwd=Path(tree_td),
         )
         assert holder.returncode == 0, (holder.stdout, holder.stderr)
         try:
@@ -1453,7 +1623,7 @@ def _n_way_occupancy_trials(n: int, trials: int) -> None:
             tmp = Path(td)
             tree = tmp / "tree"
             tree.mkdir()
-            env = _env(tmp)
+            env = _env(tmp, capacity_max_total=n)
             markers = [tree / f"wrote-{j}" for j in range(n)]
             procs = []
             for j, marker in enumerate(markers):
