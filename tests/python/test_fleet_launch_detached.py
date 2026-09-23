@@ -167,17 +167,19 @@ def test_clean_first_launch_creates_marker_and_spawns() -> None:
         assert_true("prompt written", (dispatch_dir / "prompt.md").read_text(encoding="utf-8") == prompt_text)
         assert_true("receipt written", (dispatch_dir / "launch_receipt.json").exists())
         assert_true("stdout receipt", receipt.get("remote_pid") == 4242)
-        assert_true("receipt names pooled seat", receipt.get("worktree_seat") == "wt-1")
-        assert_true("receipt carries seat path", receipt.get("worktree_path") == str(ROOT))
+        assert_true("receipt defers seat admission", receipt.get("worktree_admission") == "child_dispatch")
+        assert_true("receipt has no prebound seat", receipt.get("worktree_path") is None)
         assert_true("marker receipted", marker.get("state") == "receipted")
         assert_true("marker pid", marker.get("remote_pid") == 4242)
         spawn_kwargs = calls[0]["kwargs"]
-        inherited_fds = spawn_kwargs.get("pass_fds") or ()
-        assert_true("detached worker inherits one seat fd", len(inherited_fds) == 1)
+        child_argv = calls[0]["argv"]
+        assert_true("child receives target base", child_argv[child_argv.index("--worktree") + 1] == BASE_SHA)
+        assert_true("child receives managed root", "--worktree-root" in child_argv)
+        assert_true("child admission owns cwd", "--cwd" not in child_argv)
+        assert_true("no prebound seat fd", not (spawn_kwargs.get("pass_fds") or ()))
         assert_true(
-            "seat fd is identified in child env",
-            spawn_kwargs["env"].get(fleet_launch.goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV)
-            == str(inherited_fds[0]),
+            "no prebound seat env",
+            fleet_launch.goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV not in spawn_kwargs["env"],
         )
 
 

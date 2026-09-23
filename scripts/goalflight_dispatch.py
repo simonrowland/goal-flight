@@ -128,6 +128,7 @@ _ROUTED_SUBCOMMANDS = (
     "dashboard-refresh",
 )
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
+DISPATCH_QUEUE_PINNED_SCHEMA = "goalflight.dispatch-queue.v2"
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
 # Drain launch-confirmation wait. Per-entry subprocess.run used to use this
@@ -1721,7 +1722,10 @@ def _project_orientation_preamble(orientation_path: Path) -> str:
 
 
 def _project_root(args) -> Path:
-    return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
+    configured = getattr(args, "project_root", None)
+    return goalflight_task.resolve_project_root(
+        str(configured or getattr(args, "cwd", None) or Path.cwd())
+    )
 
 
 def _worker_cwd(args) -> Path:
@@ -1741,6 +1745,8 @@ def _worker_cwd(args) -> Path:
 
 def _requested_worktree_base(args) -> str | None:
     raw = getattr(args, "worktree", None)
+    if raw in {None, "", "create", "off"}:
+        raw = getattr(args, "worktree_base", None)
     if raw is None:
         return None
     text = str(raw).strip()
@@ -1846,6 +1852,11 @@ def _dispatch_requires_captive_worktree(args) -> bool:
             Path(str(cwd_raw)).expanduser().resolve(strict=False),
             project_root=_project_root(args),
             controller_label=_controller_ring_label(args, _project_root(args)),
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
         )
     except (OSError, goalflight_worktree_pool.WorktreeSeatError):
         return True
@@ -1889,9 +1900,14 @@ def _persist_queue_worktree_pin(
             current["worktree_seat"] = lease.seat_name
             current["worktree_path"] = str(lease.path)
             current["worktree_base_sha"] = base_commit
+            current["worktree_pin_holder"] = str(args.dispatch_id)
+            current["schema"] = DISPATCH_QUEUE_PINNED_SCHEMA
             current["dispatch_argv"] = _reconstruct_launch_argv(
                 recorded,
-                replace={"--cwd": str(lease.path)},
+                replace={
+                    "--cwd": str(lease.path),
+                    "--worktree-pin-holder": str(args.dispatch_id),
+                },
                 inject=["--skip-seat-reset"],
             )
             _write_json_atomic(claim, current)
@@ -1940,6 +1956,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 cwd,
                 project_root=project_root,
                 controller_label=label,
+                managed_root=(
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
+                    else None
+                ),
             )
             resumed_linked_worktree = bool(
                 skip_reset
@@ -1956,7 +1977,14 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     if cwd_raw:
         cwd = Path(str(cwd_raw)).expanduser().resolve(strict=False)
         kind = goalflight_worktree_pool.classify_dispatch_cwd(
-            cwd, project_root=project_root, controller_label=label
+            cwd,
+            project_root=project_root,
+            controller_label=label,
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
         )
         if kind == "in-place":
             return None
@@ -1973,8 +2001,16 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     str(parent_dispatch_id) if parent_dispatch_id else None
                 )
                 or (
-                    str(args.dispatch_id)
+                    str(
+                        getattr(args, "worktree_pin_holder", None)
+                        or args.dispatch_id
+                    )
                     if skip_reset and getattr(args, "from_queue", False)
+                    else None
+                ),
+                managed_root=(
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
                     else None
                 ),
             )
@@ -2000,6 +2036,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         base=base,
         controller_label=label,
         reset=not skip_reset,
+        managed_root=(
+            Path(str(args.worktree_root)).expanduser()
+            if getattr(args, "worktree_root", None)
+            else None
+        ),
     )
     _record_dispatch_worktree(args, lease)
     return lease
@@ -3705,6 +3746,10 @@ def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
         if goalflight_ledger.record_is_unreadable(record):
             continue
         state = record.get("state")
+        if state in PRE_WORKER_LEDGER_STATES:
+            # Capacity/pre-launch rows are duplicate-dispatch visibility only;
+            # they do not own a tree until admission has actually bound it.
+            continue
         terminal = goalflight_ledger.terminal_state_for(
             state, record.get("reason") or record.get("error")
         )
@@ -3774,6 +3819,10 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
             unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
             continue
         state = record.get("state")
+        if state in PRE_WORKER_LEDGER_STATES:
+            # A capacity/pre-launch row advertises duplicate identity only;
+            # it cannot own a worktree before admission binds one.
+            continue
         terminal = goalflight_ledger.terminal_state_for(
             state, record.get("reason") or record.get("error")
         )
@@ -4026,12 +4075,9 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
         # waiting_capacity row whose holder already died (SIGKILL) leaves
         # the kernel lock free; dropping the lock we just won would recreate
         # the dual-launch TOCTOU until the watcher rewrites the ledger.
-        # waiting_capacity is a live dispatcher holding occupancy through
-        # the capacity wait; a killed preclaim is not a holder.
         if inherited is None and occupied_state in {
             "running",
             "starting",
-            "waiting_capacity",
         }:
             _bind_worktree_occupancy_lock(args, lock)
             return None
@@ -7195,7 +7241,11 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     codex_home=codex_home or getattr(args, "codex_resume_home", None),
                     codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                     parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
-                    worker_cwd=str(_worker_cwd(args)),
+                    worker_cwd=(
+                        None
+                        if state in PRE_WORKER_LEDGER_STATES
+                        else str(_worker_cwd(args))
+                    ),
                     dispatch_argv=_canonical_replay_argv(
                         args,
                         _raw_worker_args(args)
@@ -7669,6 +7719,8 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--prompt": "preserve",
     "--task": "preserve",
     "--cwd": "preserve",
+    "--worktree-root": "preserve",
+    "--worktree-pin-holder": "preserve",
     "--worktree": "preserve",
     "--at": "preserve",
     "--in-place": "preserve",
@@ -7731,6 +7783,8 @@ _REPLAY_VALUE_OPTIONS = {
     "--prompt",
     "--task",
     "--cwd",
+    "--worktree-root",
+    "--worktree-pin-holder",
     "--worktree",
     "--at",
     "--model",
@@ -7904,10 +7958,14 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
     worktree_base = _requested_worktree_base(args)
     if worktree_base:
         argv += ["--worktree", worktree_base]
+    if getattr(args, "worktree_root", None):
+        argv += ["--worktree-root", str(args.worktree_root)]
     if getattr(args, "in_place", False):
         argv.append("--in-place")
     if getattr(args, "skip_seat_reset", False):
         argv.append("--skip-seat-reset")
+    if getattr(args, "worktree_pin_holder", None):
+        argv += ["--worktree-pin-holder", str(args.worktree_pin_holder)]
     if args.capacity_wait_s is not None:
         argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
     if args.account:
@@ -15313,6 +15371,13 @@ def _requeue_child_entry(
     dispatch_argv = _set_option_before_worker_remainder(
         dispatch_argv, "--status-json", str(status_json)
     )
+    # A retry with a new dispatch id cannot satisfy the parent's seat lock.
+    # Drop the old pin and let normal post-capacity admission choose and bind
+    # a seat for the child.
+    dispatch_argv = _reconstruct_launch_argv(
+        dispatch_argv,
+        strip_options=("--cwd", "--worktree-pin-holder"),
+    )
     now = goalflight_ledger.utc_now()
     child_created_at = created_at if isinstance(created_at, str) and created_at.strip() else now
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
@@ -15330,6 +15395,14 @@ def _requeue_child_entry(
             "requeued_from": requeued_from,
         }
     )
+    for key in (
+        "cwd",
+        "worktree_path",
+        "worktree_seat",
+        "worktree_base_sha",
+        "worktree_pin_holder",
+    ):
+        request.pop(key, None)
     child.update(
         {
             "schema": DISPATCH_QUEUE_SCHEMA,
@@ -15352,6 +15425,10 @@ def _requeue_child_entry(
         "restore_reason",
         "claim_recovery_count",
         "orphan_first_seen_at",
+        "worktree_seat",
+        "worktree_path",
+        "worktree_base_sha",
+        "worktree_pin_holder",
     ):
         child.pop(key, None)
     if not_before:
@@ -17643,9 +17720,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         requested_worktree_base = goalflight_worktree_pool.default_seat_base(project_root)
     acp_cwd = (
         _worker_cwd(args)
-        if outer_seat_bound or deferred_worktree
+        if outer_seat_bound
         else project_root
     )
+    if deferred_worktree and not outer_seat_bound:
+        acp_cwd = None
     acp_worktree = "create" if deferred_worktree else "off"
     prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
     orientation_path = _project_orientation_path(
@@ -17689,9 +17768,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         install_slot=None,
         account=getattr(args, "account", None),
         project_root=str(project_root),
-        cwd=str(acp_cwd),
+        cwd=str(acp_cwd) if acp_cwd is not None else None,
         worktree=acp_worktree,
         worktree_base=requested_worktree_base or "HEAD",
+        worktree_root=getattr(args, "worktree_root", None),
+        worktree_pin_holder=getattr(args, "worktree_pin_holder", None),
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -18705,6 +18786,10 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--worktree-root", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worktree-pin-holder", default=None, help=argparse.SUPPRESS
     )
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "

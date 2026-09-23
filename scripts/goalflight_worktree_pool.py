@@ -581,6 +581,7 @@ def classify_dispatch_cwd(
     *,
     project_root: Path,
     controller_label: str | None,
+    managed_root: Path | None = None,
 ) -> str:
     """Classify ``--cwd`` as ``in-place``, ``ring-seat``, or ``refuse``.
 
@@ -613,7 +614,14 @@ def classify_dispatch_cwd(
             return "in-place"
     elif resolved == root:
         return "in-place"
-    if is_controller_ring_seat(
+    if managed_root is not None:
+        try:
+            ring_root = Path(managed_root).expanduser().resolve(strict=False)
+            if resolved.parent == ring_root and is_captive_seat_name(resolved.name):
+                return "ring-seat"
+        except OSError:
+            pass
+    elif is_controller_ring_seat(
         resolved, project_root=root, controller_label=controller_label
     ):
         return "ring-seat"
@@ -905,29 +913,53 @@ def _prepare_seat_checkout(
 
 
 def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
-    """Return changed-path distance from a free seat to ``base_commit``.
+    """Return a cheap base-affinity rank from worktree metadata.
 
-    This is deliberately read-only and advisory. An unreadable or invalid
-    seat sorts after readable seats; normal reset-safety checks still decide
-    whether the selected seat may be reused.
+    Admission may inspect hundreds of seats. Reading HEAD and refs directly
+    avoids one ``git`` process (and a potentially large diff) per candidate.
+    Exact matches sort first; every other readable seat is equivalent because
+    the normal reset-safety path decides whether it can be reused.
     """
     if not worktree_path.is_dir():
         return None
-    head = _git_proc(worktree_path, "rev-parse", "HEAD")
-    if head is None or head.returncode != 0 or not head.stdout.strip():
+    try:
+        git_marker = worktree_path / ".git"
+        if git_marker.is_file():
+            marker = git_marker.read_text(encoding="utf-8").strip()
+            if not marker.startswith("gitdir:"):
+                return None
+            git_dir = Path(marker.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = (worktree_path / git_dir).resolve()
+        elif git_marker.is_dir():
+            git_dir = git_marker.resolve()
+        else:
+            return None
+        head_text = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head_text.startswith("ref: "):
+            ref = head_text[5:].strip()
+            common_dir = git_dir
+            commondir = git_dir / "commondir"
+            if commondir.is_file():
+                common_dir = (git_dir / commondir.read_text(encoding="utf-8").strip()).resolve()
+            ref_path = common_dir / ref
+            if ref_path.is_file():
+                head_text = ref_path.read_text(encoding="utf-8").strip()
+            else:
+                head_text = next(
+                    (
+                        line.split(" ", 1)[1].strip()
+                        for line in (common_dir / "packed-refs").read_text(encoding="utf-8").splitlines()
+                        if line and not line.startswith("#") and not line.startswith("^") and " " in line and line.split(" ", 1)[1] == ref
+                    ),
+                    "",
+                )
+        head = head_text.strip()
+    except (OSError, UnicodeError, ValueError):
         return None
-    diff = _git_proc(
-        worktree_path,
-        "diff",
-        "--name-only",
-        "--no-renames",
-        base_commit,
-        head.stdout.strip(),
-        "--",
-    )
-    if diff is None or diff.returncode != 0:
+    if not head:
         return None
-    return sum(1 for line in diff.stdout.splitlines() if line.strip())
+    return 0 if head == str(base_commit).strip() else 1
 
 
 def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
