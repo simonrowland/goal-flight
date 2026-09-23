@@ -1281,7 +1281,10 @@ def _canonical_json(value: Any) -> str:
 
 
 def _item_json_line(item: dict[str, Any]) -> str:
-    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    try:
+        return json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except ValueError as exc:
+        raise TaskError(f"tasks.jsonl: item is not valid JSON: {exc}") from exc
 
 
 def _items_jsonl(items: list[dict[str, Any]]) -> str:
@@ -2706,6 +2709,8 @@ class TaskStore:
         try:
             unchanged = self._write_staged_generation(staging, items)
             _run_checker(staging)
+            if not _dashboard_export_enabled():
+                self.data_js_path.unlink(missing_ok=True)
             targets = {
                 self.tasks_path: staging / "tasks.jsonl",
                 **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),
@@ -2757,6 +2762,12 @@ class TaskStore:
         for agents that python-read the JSON directly. One-way and non-fatal: the
         canonical store is already committed before this runs, so any failure
         (including a sync daemon racing these copies) never corrupts the store."""
+        if not _dashboard_export_enabled():
+            # A retained snapshot would keep browser pages showing obsolete data.
+            try:
+                (self.export_dashboard_dir / "tasks-data.js").unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"goalflight_task: disabled dashboard mirror removal failed: {exc}", file=sys.stderr)
         exports = [
             (self.tasks_path, self.export_docs_dir / "tasks.jsonl"),
             *([(self.data_js_path, self.export_dashboard_dir / "tasks-data.js")] if _dashboard_export_enabled() else []),
@@ -2869,6 +2880,8 @@ class TaskStore:
         try:
             self._write_staged_generation(staging, items)
             _run_checker(staging)
+            if not _dashboard_export_enabled():
+                self.data_js_path.unlink(missing_ok=True)
             for target, source in {
                 self.tasks_path: staging / "tasks.jsonl",
                 **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),

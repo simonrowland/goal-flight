@@ -144,7 +144,8 @@ def test_comparison_nonregular_and_unreadable_are_changed(tmp_path, monkeypatch)
     assert not task._file_matches_bytes(path, b"abc")
 
 
-def test_dashboard_off_by_default_preserves_existing_mirrors(store, monkeypatch):
+@pytest.mark.parametrize("changed", [False, True])
+def test_dashboard_off_by_default_removes_existing_mirrors(store, monkeypatch, changed):
     monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
     monkeypatch.setattr(task, "CHECKER", store.project_root / "nonexistent-checker.js")
     monkeypatch.setattr(task, "_items_data_js", lambda *a: pytest.fail("generated disabled mirror"))
@@ -152,20 +153,59 @@ def test_dashboard_off_by_default_preserves_existing_mirrors(store, monkeypatch)
     assert not store.data_js_path.exists()
     exported = store.export_dashboard_dir / "tasks-data.js"
     assert not exported.exists()
-    # Existing mirrors (even invalid ones) are left for the operator to remove.
+    # Upgrade from an enabled installation with a valid, now stale snapshot.
+    fixture = task.ROOT / "tests/fixtures/tasks-mirror/tasks-data.js"
     for path in (store.data_js_path, exported):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"stale mirror")
-    before = {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in (store.data_js_path, exported)}
-    store.mutate_items(lambda rows: rows[0].update(title="Changed"))
+        path.write_bytes(fixture.read_bytes())
+    store.mutate_items(lambda rows: rows[0].update(title="Changed") if changed else None)
+    assert not store.data_js_path.exists()
+    assert not exported.exists()
+    # Browser boot after publication must render no stale rows and explain why.
+    browser = subprocess.run(["node", "-e", """
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const notices = [];
+const window = {
+  document: {
+    createElement: () => ({setAttribute() {}}),
+    querySelector: () => ({prepend: node => notices.push(node.textContent)}),
+    addEventListener() {}, removeEventListener() {}
+  },
+  addEventListener() {}, removeEventListener() {}
+};
+const context = vm.createContext({window, URL, URLSearchParams});
+if (fs.existsSync(process.argv[1])) vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
+const driver = window.GF.attach({});
+assert.strictEqual(window.GF.store.items.length, 0);
+assert(notices.some(text => text.includes('GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1')));
+driver.destroy();
+""", str(exported), str(task.ROOT / "templates/state-skeleton/gf.js")], capture_output=True, text=True)
+    assert browser.returncode == 0, browser.stderr
+    # Interrupted-publish recovery also invalidates the canonical mirror.
+    store.data_js_path.write_bytes(fixture.read_bytes())
     store._write_publish_marker("interrupted")
     assert "dashboard/tasks-data.js" not in json.loads(store.publish_marker_path.read_text())["artifacts"]
     store._recover_interrupted_publish()
     assert not store.publish_marker_path.exists()
-    assert before == {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in before}
-    assert all(p.read_bytes() == b"stale mirror" for p in before)
+    assert not store.data_js_path.exists()
+    assert not exported.exists()
     assert len(list(store.log_dir.glob("tasks-*.jsonl"))) == 1
     assert not list(store.log_dir.glob("tasks-data-*.js"))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("nested", [False, True])
+def test_dashboard_off_rejects_nonfinite_canonical_values(store, monkeypatch, value, nested):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.save_items_atomic([item()])
+    before = store.tasks_path.read_bytes()
+    invalid = item()
+    invalid["measurement"] = {"samples": [value]} if nested else value
+    with pytest.raises(task.TaskError, match="JSON"):
+        store.save_items_atomic([invalid])
+    assert store.tasks_path.read_bytes() == before
+    assert not store.publish_marker_path.exists()
 
 
 def test_dashboard_opt_in_restores_exact_output(store, monkeypatch):
