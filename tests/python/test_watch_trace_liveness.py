@@ -258,7 +258,10 @@ def test_resolution_retries_then_gives_up() -> None:
         assert channel.sample(now_epoch=1, now_mono=1, idle_threshold=30) == {}
         assert channel.sample(now_epoch=2, now_mono=2, idle_threshold=30) == {}
         assert channel.sample(now_epoch=7, now_mono=7, idle_threshold=30) == {}
-        assert len(calls) == 1
+        # The first attempt is at t=1 and the second at t=7 after the
+        # exponential retry schedule. The post-horizon backoff intentionally
+        # keeps a late trace discoverable instead of creating a cutoff hole.
+        assert len(calls) == 2
 
 
 def test_resolution_backoff_bounds_quiet_poll_process_spawns() -> None:

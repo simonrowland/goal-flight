@@ -109,13 +109,9 @@ def _has_recorded_worker_identity(record: dict) -> bool:
     ident = record.get("worker_identity")
     if not isinstance(ident, dict):
         return False
-    return bool(
-        ident.get("start_token")
-        or ident.get("lstart")
-        or ident.get("creation_time")
-        or ident.get("creation_time_filetime")
-        or ident.get("create_time")
-    )
+    # lstart is legacy, second-granularity metadata, not PID-generation
+    # ownership. Keep old records readable but leave them UNKNOWN.
+    return bool(ident.get("start_token"))
 
 
 def worker_process_identity_liveness(record: dict | None) -> bool | None:
@@ -263,13 +259,21 @@ def _record_pid_alive(record: dict) -> bool:
         return False
 
 
-def _rechecked_worker_alive(record: dict) -> bool:
+def _rechecked_worker_alive(record: dict) -> bool | None:
     if not _needs_liveness_recheck(record):
         return False
+    source = _wait_liveness_record(record)
+    if source is not None and source.get("worker_pid") and not _has_recorded_worker_identity(source):
+        # A legacy or incomplete record cannot establish the PID generation.
+        # Raw PID presence is not a confirmed ownership signal.
+        try:
+            return False if goalflight_compat.pid_liveness(int(source["worker_pid"])) is False else None
+        except (TypeError, ValueError):
+            return False
     identity_record = _identity_record_for_liveness_recheck(record)
     if identity_record is not None:
-        ok, _reason = goalflight_ledger.identity_matches(identity_record)
-        return ok
+        ok, reason = goalflight_ledger.identity_matches(identity_record)
+        return ok if reason != "identity_indeterminate" else None
     return _record_pid_alive(record)
 
 
@@ -1415,7 +1419,7 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     if _needs_liveness_recheck(record):
         if worker_alive is None:
             worker_alive = _rechecked_worker_alive(record)
-        return 1 if worker_alive else 0
+        return 1 if worker_alive is True else 2 if worker_alive is None else 0
     if cls == _LIVE_CLASS:
         return 1
     if cls in {"queued_capacity", "waiting_capacity", "queued"}:

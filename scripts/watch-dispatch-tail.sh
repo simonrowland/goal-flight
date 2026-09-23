@@ -603,32 +603,35 @@ prev_loop_ts=$(date +%s)
 
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s total_runtime=${TOTAL_RUNTIME_SECS}s"
 
-# Marker parsing is content-dependent. Keep its result while the tail byte
-# count and trailing content are unchanged; equal-size rewrites (including
-# rotation) must invalidate the cache without rereading the whole tail.
-marker_cache_size="__unset__"
-marker_cache_boundary=""
+# Marker parsing is content-dependent. Keep its result while the tail's
+# filesystem identity is unchanged; equal-size rewrites (including rotation)
+# must invalidate the cache without rereading the whole tail.
+marker_cache_identity="__unset__"
 marker_cache_value=""
 
 terminal_marker_seen() {
   [ -f "$TAIL_PATH" ] || return 1
-  local marker_size="${current_size:-}"
-  if [ -z "$marker_size" ]; then
-    marker_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
-    marker_size=${marker_size:-0}
-  fi
-  # The last 4096 bytes are the scanner's content boundary. This catches a
-  # same-size rewrite of the final lines while keeping quiet polls bounded and
-  # portable across the macOS bash/stat variants.
-  local marker_boundary
-  marker_boundary=$(tail -c 4096 "$TAIL_PATH" 2>/dev/null || true)
-  if [ "$marker_cache_size" = "$marker_size" ] && [ "$marker_cache_boundary" = "$marker_boundary" ]; then
+  # Size and a trailing excerpt are insufficient: an equal-size in-place rewrite
+  # can change a marker before that excerpt. Use the full filesystem identity
+  # tuple so every inode, size, or nanosecond timestamp change re-scans.
+  local marker_identity
+  marker_identity=$(python3 - "$TAIL_PATH" <<'PY'
+import os
+import sys
+
+try:
+    stat = os.stat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+print(f"{stat.st_ino} {stat.st_size} {stat.st_mtime_ns}")
+PY
+  ) || return 1
+  if [ "$marker_cache_identity" = "$marker_identity" ]; then
     [ -n "$marker_cache_value" ] || return 1
     printf '%s\n' "$marker_cache_value"
     return 0
   fi
-  marker_cache_size="$marker_size"
-  marker_cache_boundary="$marker_boundary"
+  marker_cache_identity="$marker_identity"
   marker_cache_value=""
   if [ "$MARKER_RE" != "$DEFAULT_MARKER_RE" ]; then
     # A custom regex is an additional filter, never an alternate identity

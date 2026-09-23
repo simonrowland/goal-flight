@@ -1199,10 +1199,12 @@ def darwin_process_snapshot() -> list[dict[str, int]] | None:
             if capacity > 131072:
                 return None
         rows: list[dict[str, int]] = []
+        listed_pids = 0
         for index in range(max(0, byte_count // ctypes.sizeof(ctypes.c_int))):
             pid = int(pid_buffer[index])
             if pid <= 0:
                 continue
+            listed_pids += 1
             info = ProcBsdInfo()
             if libproc.proc_pidinfo(
                 pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
@@ -1216,7 +1218,10 @@ def darwin_process_snapshot() -> list[dict[str, int]] | None:
                     "status": int(info.pbi_status),
                 }
             )
-        return rows
+        # A non-empty process list with no readable rows means the process
+        # table probe was denied or failed for every candidate. Do not turn
+        # that absence of evidence into an empty, idle-looking snapshot.
+        return rows if rows or not listed_pids else None
     except (AttributeError, OSError, TypeError, ValueError):
         return None
 

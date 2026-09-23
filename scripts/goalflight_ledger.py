@@ -315,34 +315,18 @@ def compare_process_identities(
         actual_lstart = current_identity.get("lstart")
         expected_start_token = expected_identity.get("start_token")
         actual_start_token = current_identity.get("start_token")
-        if expected_start_token and actual_start_token:
-            if actual_start_token != expected_start_token:
-                return False, "pid_reused_start_token"
-            if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
-                return False, "pid_reused_lstart"
-            # exec(2) preserves the process generation while replacing comm.
-            # A matching fine-grained start token is decisive, unlike lstart's
-            # second-granularity wall-clock representation.
-            return True, "live"
-
-        if expected_lstart and actual_lstart:
-            if actual_lstart != expected_lstart:
-                return False, "pid_reused_lstart"
-            # exec(2) preserves pid and lstart while replacing comm. The
-            # launcher records its Python identity immediately before execing
-            # the worker CLI, so comm is diagnostic only and cannot disprove
-            # this durable identity pair.
-            return True, "live"
-
-        missing_sides = []
-        if not expected_lstart:
-            missing_sides.append("expected")
-        if not actual_lstart:
-            missing_sides.append("current")
-        return True, (
-            "identity_inconclusive_missing_" + "_".join(missing_sides) + "_lstart"
-        )
-    return True, "identity_inconclusive"
+        if not expected_start_token or not actual_start_token:
+            # lstart has only second-granularity wall-clock precision and is
+            # not a process-generation identity. Old records remain readable,
+            # but never confirm a live PID without the fine-grained token.
+            return True, "identity_indeterminate"
+        if actual_start_token != expected_start_token:
+            return False, "pid_reused_start_token"
+        if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
+            return False, "pid_reused_lstart"
+        # exec(2) preserves the process generation while replacing comm.
+        return True, "live"
+    return True, "identity_indeterminate"
 
 
 def compare_fine_process_identities(
@@ -406,13 +390,10 @@ def identity_matches(record: dict) -> tuple[bool, str]:
 def worker_identity_liveness(record: dict) -> tuple[str, str]:
     """Three-state worker liveness: ``live`` / ``dead`` / ``unknown``, plus reason.
 
-    ``identity_matches`` already collapses every maybe-live reading (coarse
-    identity, a missing lstart side) to ``live``. What remains genuinely
-    indeterminate is an absent recorded identity (``no_pid``) or a failed
-    process-table probe (``identity_indeterminate``); those map to ``unknown``,
-    never to ``dead`` -- "could not find out" is not non-existence. A pid that
-    now belongs to a different process (``pid_reused_*``) is ``dead``: the
-    recorded worker is gone even though the pid number survives.
+    A missing fine-grained start token is genuinely indeterminate and maps to
+    ``unknown``, never to ``live`` or ``dead``. A PID that now belongs to a
+    different process (``pid_reused_*``) is ``dead``: the recorded worker is
+    gone even though the PID number survives.
     """
     matched, reason = identity_matches(record)
     if reason in {"no_pid", "identity_indeterminate"}:

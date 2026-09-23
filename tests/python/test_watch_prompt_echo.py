@@ -403,17 +403,23 @@ def case_identity_mismatch_not_alive() -> None:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "actual process start",
+            "start_token": "actual-token",
             "comm": "worker",
         }
         is_alive, reason, current = goalflight_watch.worker_alive(
             12345,
-            {"pid": 12345, "lstart": "expected process start", "comm": "worker"},
+            {
+                "pid": 12345,
+                "lstart": "expected process start",
+                "start_token": "expected-token",
+                "comm": "worker",
+            },
         )
     finally:
         goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is False, current
-    assert reason == "pid_reused_lstart", reason
+    assert reason == "pid_reused_start_token", reason
 
 
 def case_matching_lstart_ignores_comm_form_change() -> None:
@@ -422,11 +428,17 @@ def case_matching_lstart_ignores_comm_form_change() -> None:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "Sun May 31 19:28:48 2026",
+            "start_token": "same-token",
             "comm": "(grok-0.2.11-maco)",
         }
         is_alive, reason, current = goalflight_watch.worker_alive(
             12345,
-            {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
+            {
+                "pid": 12345,
+                "lstart": "Sun May 31 19:28:48 2026",
+                "start_token": "same-token",
+                "comm": "grok",
+            },
         )
     finally:
         goalflight_watch._lightweight_process_identity = original
@@ -443,11 +455,17 @@ def case_exec_comm_change_with_same_lstart_is_alive() -> None:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "Sun May 31 19:28:48 2026",
+            "start_token": "same-token",
             "comm": "node",
         }
         is_alive, reason, current = goalflight_watch.worker_alive(
             12345,
-            {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
+            {
+                "pid": 12345,
+                "lstart": "Sun May 31 19:28:48 2026",
+                "start_token": "same-token",
+                "comm": "grok",
+            },
         )
     finally:
         goalflight_watch._lightweight_process_identity = original
@@ -456,40 +474,42 @@ def case_exec_comm_change_with_same_lstart_is_alive() -> None:
     assert reason == "live", reason
 
 
-def case_missing_lstart_matching_comm_is_inconclusive_alive() -> None:
+def case_missing_lstart_matching_comm_is_live_with_start_token() -> None:
     original = goalflight_watch._lightweight_process_identity
     try:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
+            "start_token": "same-token",
             "comm": "(grok-0.2.11-maco)",
         }
         is_alive, reason, current = goalflight_watch.worker_alive(
             12345,
-            {"pid": 12345, "comm": "grok"},
+            {"pid": 12345, "start_token": "same-token", "comm": "grok"},
         )
     finally:
         goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
-    assert reason == "identity_inconclusive_missing_expected_current_lstart", reason
+    assert reason == "live", reason
 
 
-def case_missing_lstart_unrelated_comm_is_inconclusive_alive() -> None:
+def case_missing_lstart_unrelated_comm_is_live_with_start_token() -> None:
     original = goalflight_watch._lightweight_process_identity
     try:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
+            "start_token": "same-token",
             "comm": "python",
         }
         is_alive, reason, current = goalflight_watch.worker_alive(
             12345,
-            {"pid": 12345, "comm": "grok"},
+            {"pid": 12345, "start_token": "same-token", "comm": "grok"},
         )
     finally:
         goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
-    assert reason == "identity_inconclusive_missing_expected_current_lstart", reason
+    assert reason == "live", reason
 
 
 def case_incomplete_identity_is_inconclusive_alive() -> None:
@@ -521,7 +541,7 @@ def case_incomplete_identity_is_inconclusive_alive() -> None:
         assert term.get("text") == "identity stayed fail-safe", term
         assert payload.get("worker_alive") is True, payload
         assert payload.get("state") == "inconclusive_timeout", payload
-        assert payload.get("worker_identity_reason", "").startswith("identity_inconclusive_"), payload
+        assert payload.get("worker_identity_reason") == "identity_indeterminate", payload
 
 
 def case_steer_ack_is_non_terminal_marker() -> None:
@@ -554,9 +574,12 @@ def case_mid_output_marker_ignored() -> None:
         )
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         try:
+            identity = goalflight_watch._lightweight_process_identity(worker.pid) or {
+                "pid": worker.pid
+            }
             rc, elapsed, term, _ = _run_watcher(
                 tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
-                poll_secs="0.2", max_idle_secs="1",
+                identity=identity, poll_secs="0.2", max_idle_secs="1",
             )
         finally:
             worker.terminate()
@@ -2906,8 +2929,8 @@ def main() -> None:
     case_identity_mismatch_not_alive()
     case_matching_lstart_ignores_comm_form_change()
     case_exec_comm_change_with_same_lstart_is_alive()
-    case_missing_lstart_matching_comm_is_inconclusive_alive()
-    case_missing_lstart_unrelated_comm_is_inconclusive_alive()
+    case_missing_lstart_matching_comm_is_live_with_start_token()
+    case_missing_lstart_unrelated_comm_is_live_with_start_token()
     case_incomplete_identity_is_inconclusive_alive()
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()

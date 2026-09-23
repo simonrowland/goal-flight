@@ -244,7 +244,7 @@ def test_done_code() -> None:
         "detached": True,
         "agent": "codex",
         "worker_pid": 444,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:444:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
         "project_root": "/repo/A",
         "started_at": S.goalflight_ledger.utc_now(),
     }
@@ -308,7 +308,7 @@ def test_done_code() -> None:
     }
     timeout_raw = {
         **timeout_summary,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -345,7 +345,7 @@ def test_done_code() -> None:
     }
     watcher_raw = {
         **watcher_summary,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:444:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -413,7 +413,7 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
             "terminal_state": "unknown",
             "agent": "codex",
             "worker_pid": 999999,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:999:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
             "stdout_path": str(tail),
             "started_at": started,
         }
@@ -535,7 +535,7 @@ def test_idle_timeout_live_hint_rendered() -> None:
             "agent": "codex",
             "worker_pid": 333,
             "worker_still_alive": True,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
             "status_path": "/tmp/timeout-live.json",
         }
     )
@@ -1138,7 +1138,7 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
             "agent": "codex",
             "worker_pid": 333,
             "worker_still_alive": True,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
         }
     )
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -1205,6 +1205,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                     "worker_alive": True,
                     "expected_worker_identity": {
                         "pid": 4242,
+                        "start_token": "test:4242:generation-1",
                         "lstart": "Thu Jul  2 17:53:52 2026",
                         "comm": "node",
                     },
@@ -1228,6 +1229,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                         "worker_pid": 4242,
                         "worker_identity": {
                             "pid": 4242,
+                            "start_token": "test:4242:generation-1",
                             "lstart": "Thu Jul  2 17:53:52 2026",
                             "comm": "node",
                         },
@@ -1294,6 +1296,7 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
                     "worker_alive": False,
                     "expected_worker_identity": {
                         "pid": 4242,
+                        "start_token": "test:4242:generation-1",
                         "lstart": "Thu Jul  2 17:53:52 2026",
                         "comm": "node",
                     },
@@ -1317,6 +1320,7 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
                         "worker_pid": 4242,
                         "worker_identity": {
                             "pid": 4242,
+                            "start_token": "test:4242:generation-1",
                             "lstart": "Thu Jul  2 17:53:52 2026",
                             "comm": "node",
                         },

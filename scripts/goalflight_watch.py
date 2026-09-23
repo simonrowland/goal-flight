@@ -2656,8 +2656,11 @@ class _WorkerProcessProbe:
                 )
                 self._identity_result = (alive, reason, current)
                 self._identity_checked = True
-            if self._identity_result is not None and not self._identity_result[0]:
-                return self._identity_result
+            if self._identity_result is not None:
+                if self._identity_result[1] == "identity_indeterminate":
+                    return self._identity_result
+                if not self._identity_result[0]:
+                    return self._identity_result
         if self._exit_event_seen():
             return False, "dead", None
         liveness = goalflight_compat.pid_liveness(self.pid)

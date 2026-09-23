@@ -1320,6 +1320,56 @@ def test_darwin_all_proc_rusage_failures_are_unknown(monkeypatch) -> None:
     assert goalflight_liveness._darwin_pgroup_cputime_snapshot(123) is None
 
 
+def test_linux_all_proc_stat_failures_are_unknown(monkeypatch) -> None:
+    class DeniedEntry:
+        name = "123"
+        path = "/proc/123"
+
+    class DeniedScan:
+        def __iter__(self):
+            return iter((DeniedEntry(),))
+
+        def close(self):
+            return None
+
+    class DeniedPath:
+        def __init__(self, *_parts):
+            pass
+
+        def read_text(self, **_kwargs):
+            raise PermissionError("proc denied")
+
+    monkeypatch.setattr(goalflight_liveness.os, "scandir", lambda _path: DeniedScan())
+    monkeypatch.setattr(goalflight_liveness, "Path", DeniedPath)
+    assert goalflight_liveness._linux_pgroup_cputime_snapshot(123) is None
+
+
+def test_darwin_all_process_rows_denied_are_unknown(monkeypatch) -> None:
+    import ctypes
+
+    class ProcFn:
+        argtypes = None
+        restype = None
+
+        def __init__(self, impl):
+            self.impl = impl
+
+        def __call__(self, *args):
+            return self.impl(*args)
+
+    def listpids(_type, _type2, buffer, _size):
+        buffer[0] = 123
+        return ctypes.sizeof(ctypes.c_int)
+
+    libproc = SimpleNamespace(
+        proc_listpids=ProcFn(listpids),
+        proc_pidinfo=ProcFn(lambda *_args: 0),
+    )
+    monkeypatch.setattr(goalflight_liveness.goalflight_compat.sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path: libproc)
+    assert goalflight_liveness.goalflight_compat.darwin_process_snapshot() is None
+
+
 @skipif(os.name == "nt", reason="POSIX watcher process-group CPU sampler")
 def test_python_watcher_busy_silence_records_running_quiet() -> None:
     with tempfile.TemporaryDirectory() as td:

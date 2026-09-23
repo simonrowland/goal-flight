@@ -72,6 +72,11 @@ def case_windows_cleanup_preserves_legacy_pidfile_without_identity() -> None:
     assert missing_identity_preserved
 
 
+def case_windows_cleanup_skips_bare_pidfile_pid() -> None:
+    """Compatibility name for the mixed-version bare-pidfile regression."""
+    case_windows_cleanup_preserves_legacy_pidfile_without_identity()
+
+
 def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
     """pid_liveness None must not reach kill_pid, even with creation identity.
 
@@ -1323,6 +1328,7 @@ def main() -> None:
     case_pid_reuse_lstart_change_is_different()
     case_unavailable_meta_preserves_kill_fallthrough()
     case_windows_cleanup_preserves_legacy_pidfile_without_identity()
+    case_windows_cleanup_skips_bare_pidfile_pid()
     case_windows_cleanup_does_not_kill_indeterminate_pid()
     case_windows_cleanup_preserves_live_pidfile_without_creation_identity()
     case_windows_cleanup_kills_confirmed_live_identity()
@@ -1343,7 +1349,7 @@ def main() -> None:
     case_initial_lease_attach_failure_cleans_before_running()
     case_group_kill_can_disable_unchecked_pid_fallback()
     case_atexit_pool_kill_requires_fine_identity()
-    print("OK: 22 ACP kill identity tests pass")
+    print("OK: 19 ACP kill identity tests pass")
 
 
 if __name__ == "__main__":

@@ -305,6 +305,70 @@ expect_eq "case-1q worker exit reconciles quiet marker" "0" "$watcher_exit"
 rm -f "$TAIL" "$OUT" "$HOLD"
 cleanup_pidfile "$PIDFILE_STEM"
 
+# ---- Case 1ab: equal-size rewrite before the cached tail boundary ----
+# Keep the final 4096 bytes identical while replacing a marker at byte 1000.
+# Size-plus-tail caching misses this terminal rewrite; inode/size/mtime_ns must
+# invalidate it even though the changed marker is outside the cached boundary.
+TAIL=/tmp/test-watch-large-equal-size-rewrite-$$.txt
+OUT=/tmp/watcher-out-large-equal-size-rewrite-$$.txt
+OLD_MARKER='COMPLETE: equal-size-large-rewrite - old!'
+OLD_MARKER_TEXT='equal-size-large-rewrite - old!'
+MARKER='COMPLETE: equal-size-large-rewrite - done'
+MARKER_TEXT='equal-size-large-rewrite - done'
+python3 - "$TAIL" "$OLD_MARKER" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+marker = sys.argv[2].encode()
+prefix = b'x' * 999 + b'\n'
+line = marker
+suffix = b'\n' * (6000 - len(prefix) - len(line) - 1)
+path.write_bytes(prefix + line + b'\n' + suffix)
+PY
+sleep 30 & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "equal-size-large-rewrite" \
+  --poll-secs 1 --max-idle-secs 30 \
+  > "$OUT" 2>&1 &
+WATCHER_PID=$!
+if wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM" 50; then
+  if wait_for_needle "$OUT" "$OLD_MARKER_TEXT"; then
+    expect_eq "case-1ab initial marker cached" "yes" "yes"
+  else
+    expect_eq "case-1ab initial marker cached" "yes" "no"
+  fi
+  python3 - "$TAIL" "$MARKER" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+marker = sys.argv[2].encode()
+prefix = b'x' * 999 + b'\n'
+suffix = b'\n' * (6000 - len(prefix) - len(marker) - 1)
+path.write_bytes(prefix + marker + b'\n' + suffix)
+PY
+  if wait_for_needle "$OUT" "$MARKER_TEXT"; then
+    expect_eq "case-1ab equal-size rewrite observed before worker exit" "yes" "yes"
+  else
+    expect_eq "case-1ab equal-size rewrite observed before worker exit" "yes" "no"
+  fi
+  kill "$WORKER_PID" 2>/dev/null
+  wait "$WORKER_PID" 2>/dev/null
+  wait "$WATCHER_PID"
+  expect_eq "case-1ab large equal-size rewrite terminalizes" "0" "$?"
+else
+  expect_eq "case-1ab watcher registered live worker" "yes" "no"
+  stop_pid "$WATCHER_PID"
+  stop_pid "$WORKER_PID"
+fi
+rm -f "$TAIL" "$OUT"
+cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 1b: marker received + worker also dead → pidfile REMOVED ----
 # ---- Case 1r: tail growth resets the outer event-silence clock ----
 TAIL=/tmp/test-watch-runtime-bound-$$.txt
 OUT=/tmp/watcher-out-runtime-bound-$$.txt

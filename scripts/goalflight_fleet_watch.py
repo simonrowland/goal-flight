@@ -862,13 +862,13 @@ class SshFleetWatchTransport:
                 matched, reason = goalflight_ledger.compare_process_identities(
                     pid, expected_identity, reported_identity
                 )
+            if reason == "identity_indeterminate":
+                return RemoteIdentityResult(
+                    ok=False,
+                    identity=reported_identity,
+                    error="legacy identity response lacks a fine start token",
+                )
             if not matched:
-                if reason == "identity_indeterminate":
-                    return RemoteIdentityResult(
-                        ok=False,
-                        identity=reported_identity,
-                        error="legacy identity response lacks a fine start token",
-                    )
                 return RemoteIdentityResult(
                     ok=True,
                     alive=False,

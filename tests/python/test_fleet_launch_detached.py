@@ -285,6 +285,7 @@ def test_read_only_recovery_inspection_preserves_status() -> None:
             "worker_pid": 12345,
             "worker_identity": {
                 "pid": 12345,
+                "start_token": "linux:boot:12345",
                 "lstart": "Thu Jun 11 12:00:00 2026",
                 "comm": "python3",
             },
@@ -636,6 +637,7 @@ def test_recovery_reclaims_dead_owner_lock() -> None:
     prompt_text = "retry prompt"
     old_owner = {
         "pid": 7777,
+        "start_token": "linux:boot:7777",
         "lstart": "Thu Jun 11 12:00:00 2026",
         "comm": "python3",
     }
@@ -680,6 +682,7 @@ def test_recovery_reclaims_reused_pid_owner_lock() -> None:
     prompt_text = "retry prompt"
     old_owner = {
         "pid": 7779,
+        "start_token": "linux:boot:7779",
         "lstart": "Thu Jun 11 12:00:00 2026",
         "comm": "python3",
     }
@@ -706,6 +709,7 @@ def test_recovery_reclaims_reused_pid_owner_lock() -> None:
             if pid == old_owner["pid"]:
                 return {
                     "pid": pid,
+                    "start_token": "linux:boot:7779-new",
                     "lstart": "Thu Jun 11 12:00:01 2026",
                     "comm": "python3",
                 }
@@ -718,7 +722,7 @@ def test_recovery_reclaims_reused_pid_owner_lock() -> None:
         assert_true("spawn once", len(calls) == 1)
         assert_true(
             "reused pid lock reclaimed",
-            marker.get("reclaimed_recovery_lock") == "owner_pid_reused_lstart",
+            marker.get("reclaimed_recovery_lock") == "owner_pid_reused_start_token",
         )
         assert_true("recovery lock cleared", not lock_path.exists())
 
@@ -728,6 +732,7 @@ def test_recovery_live_owner_lock_refuses() -> None:
     prompt_text = "retry prompt"
     live_owner = {
         "pid": 7778,
+        "start_token": "linux:boot:7778",
         "lstart": "Thu Jun 11 12:00:00 2026",
         "comm": "python3",
     }
@@ -864,9 +869,34 @@ def test_sanitized_env_allows_oauth_token_exact_not_prefix() -> None:
     assert_true("path preserved", env.get("PATH") == "/usr/bin")
 
 
+def test_pid_identity_lstart_only_is_unknown() -> None:
+    expected_lstart = "Thu Jun 11 12:00:00 2026"
+    args = SimpleNamespace(
+        pid=4242,
+        expected_lstart_b64=base64.b64encode(expected_lstart.encode()).decode(),
+        expected_identity_b64=None,
+    )
+    output = io.StringIO()
+    with patched_process_identity(
+        lambda pid: {
+            "pid": pid,
+            "lstart": expected_lstart,
+            "start_token": "linux:boot:current",
+        }
+    ), redirect_stdout(output):
+        assert fleet_launch._pid_identity(args) == 0
+    payload = json.loads(output.getvalue())
+    assert_true("lstart-only identity is unknown", payload["alive"] is None)
+    assert_true(
+        "lstart-only identity reason",
+        payload["identity_reason"] == "identity_indeterminate",
+    )
+
+
 def main() -> None:
     tests = [
         test_sanitized_env_allows_oauth_token_exact_not_prefix,
+        test_pid_identity_lstart_only_is_unknown,
         test_ensure_local_bin_prepends_when_absent,
         test_ensure_local_bin_idempotent_when_present,
         test_ensure_local_bin_no_home_noop,
