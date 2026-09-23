@@ -173,6 +173,105 @@ def test_claimed_launch_ownership_rechecked_under_lock(prepared, claimed, monkey
     assert attempt_row(authority) == row
 
 
+@pytest.mark.parametrize("kind", ["unknown", "worker", "worker-unknown", "intent", "undated-intent"])
+@pytest.mark.parametrize("under_lock", [False, True])
+def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, kind, under_lock):
+    _, authority, _, carrier = prepared
+    entry = json.loads(claimed.read_text())
+    carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(entry, increment_recovery_count=False)))
+    original_lock = dispatch._queue_mutation_lock
+    original_status = dispatch._queue_claim_identity_status
+    locked = False
+    child = None
+    if kind in {"worker", "worker-unknown"}:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        entry.update(queue_worker_pid=child.pid, queue_worker_identity=ledger.process_identity(child.pid))
+    elif "intent" in kind:
+        entry.update(queue_worker_spawn_intent=True)
+        if kind == "intent":
+            entry["queue_worker_spawn_intent_at"] = time.time()
+
+    @contextlib.contextmanager
+    def queue_lock(path):
+        nonlocal locked
+        with original_lock(path):
+            locked = True
+            claimed.write_text(json.dumps(entry))
+            yield
+
+    def identity_status(pid, identity):
+        if kind == "unknown" and (locked or not under_lock):
+            return "indeterminate", "identity_provider_exception:OSError"
+        if kind == "worker-unknown" and child and pid == child.pid:
+            return "indeterminate", "identity_provider_exception:OSError"
+        return original_status(pid, identity)
+
+    if not under_lock:
+        claimed.write_text(json.dumps(entry))
+    monkeypatch.setattr(dispatch, "_queue_mutation_lock", queue_lock)
+    monkeypatch.setattr(dispatch, "_queue_claim_identity_status", identity_status)
+    row = attempt_row(authority)
+    record = ledger.record_path("withdraw-test").read_bytes()
+    plain = carrier.read_bytes()
+    try:
+        code, result = withdraw()
+        assert code == 1, result
+        assert locked == under_lock
+        assert attempt_row(authority) == row
+        assert ledger.record_path("withdraw-test").read_bytes() == record
+        assert carrier.read_bytes() == plain
+        assert json.loads(claimed.read_text()) == entry
+        if child:
+            assert child.poll() is None
+    finally:
+        if child:
+            child.terminate()
+            child.wait(timeout=10)
+
+
+@pytest.mark.parametrize("plain,claim_count", [(True, 1), (False, 2), (True, 2)])
+def test_parallel_carriers_archive_all(prepared, claimed, monkeypatch, tmp_path, plain, claim_count):
+    _, authority, _, carrier = prepared
+    entry = json.loads(claimed.read_text())
+    paths = [claimed]
+    if plain:
+        carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(entry, increment_recovery_count=False)))
+        paths.append(carrier)
+    if claim_count == 2:
+        second = claimed.with_name(claimed.name + "-second")
+        second.write_text(json.dumps(entry))
+        paths.append(second)
+    originals = {path: path.read_bytes() for path in paths}
+    before = snapshot(tmp_path)
+    row = attempt_row(authority)
+    code, result = withdraw("--dry-run")
+    assert code == 0, result
+    assert {step["record"] for step in result["plan"][2:]} == {str(path) for path in paths}
+    assert snapshot(tmp_path) == before
+    assert attempt_row(authority) == row
+    original_replace = Path.replace
+    archived = {}
+
+    def checked_replace(path, target):
+        if path in originals:
+            assert attempt_row(authority)["terminal_state"] == "withdrawn"
+            assert ledger.read_record("withdraw-test")["terminal_state"] == "withdrawn"
+            archived[path] = Path(target)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", checked_replace)
+    code, result = withdraw()
+    assert code == 0, result
+    assert set(archived) == set(paths)
+    assert set(result["archived_carriers"]) == {str(path) for path in archived.values()}
+    for path, data in originals.items():
+        assert not path.exists()
+        assert archived[path].read_bytes() == data
+    settled = snapshot(tmp_path)
+    assert withdraw()[1]["status"] == "already withdrawn"
+    assert snapshot(tmp_path) == settled
+
+
 def test_queued_withdraw_then_real_drain(prepared):
     project, authority, attempt, carrier = prepared
     original_carrier = carrier.read_bytes()
