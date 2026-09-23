@@ -1833,6 +1833,69 @@ def case_dead_pid_unbound_done_signoff_is_rejected() -> None:
         assert not term, term
 
 
+# A real cursor `--output-format text` tail (cursor-53688-1790108089, trimmed
+# only in the middle), kept ugly on purpose: the dispatcher's WARN line, the
+# transport reconnect chatter, and a follow-up reply glued to the end of the
+# first message with no newline ("...in the report.All eight ..."). The worker
+# finished and committed, but signed off with its task id instead of its
+# dispatch id, and was recorded worker_dead.
+_CURSOR_TAIL_HEAD = (
+    "goalflight_dispatch: WARN: prompt carries no git base pin; HEAD is b9439d2 - "
+    "workers on stale clones will build on the wrong base; mark the base explicitly "
+    "with a 'base: b9439d2' line or a 'branch <name> @ b9439d2' header, or pass "
+    "--ignore-git-warn\n"
+    "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...\n"
+    "Retry attempt 1...\n"
+)
+_CURSOR_TAIL_BODY = (
+    "\n"
+    "**What shipped**\n"
+    "- `application/ifc_member_axis.py` (new): the t-1942 axis recovery, once — "
+    "horizontal extrusion unchanged; anything else → `RcBondBeamAxisRefusal`.\n"
+    "\n"
+    "**Scope deviation flagged**: the brief said \"validator calls the helper for "
+    "every solid\"; I applied it role-scoped. Stated in the report.All eight "
+    "notifications are for runs already consumed and reported — no new information:\n"
+    "\n"
+    "- `202845` (exit 1): final BASE arm — exactly the 3 intended RED tests.\n"
+    "\n"
+    "Task is complete; report committed at `5bbbc5e7d5`. No follow-up actions needed.\n"
+)
+_CURSOR_DISPATCH_ID = "cursor-53688-1790108089"
+
+
+def test_cursor_tail_completes_only_with_the_dispatch_id() -> None:
+    """CONTROL, not a RED test: this passes on unchanged watcher code.
+
+    Teaching cursor the identity contract is only worth doing if an id-bound
+    marker in a real cursor-shaped tail completes the dispatch, and the fix
+    must not have loosened the watcher: the same tail signed off with the
+    task id (what cursor did when it was never told the dispatch id) must
+    still record worker_dead.
+    """
+    summary = (
+        "b-5856 landed on `seat/cursor-53688-1790108089`, report committed at "
+        "`5bbbc5e7d5` (`docs-private/build/b5856/REPORT.md`)."
+    )
+    bound = (
+        _CURSOR_TAIL_HEAD
+        + f"!COMPLETE: {_CURSOR_DISPATCH_ID} — {summary}\n"
+        + _CURSOR_TAIL_BODY
+    )
+    _rc, _elapsed, term, payload = _run_dead_worker_tail(
+        bound, dispatch_id=_CURSOR_DISPATCH_ID
+    )
+    assert payload.get("state") == "complete", payload
+    assert term.get("kind") == "COMPLETE", term
+
+    unbound = _CURSOR_TAIL_HEAD + f"COMPLETE: {summary}\n" + _CURSOR_TAIL_BODY
+    _rc, _elapsed, term, payload = _run_dead_worker_tail(
+        unbound, dispatch_id=_CURSOR_DISPATCH_ID
+    )
+    assert payload.get("state") == "worker_dead", payload
+    assert not term, term
+
+
 def case_dead_pid_unbound_attention_markers_block_not_die() -> None:
     """BLOCKED/USER-NEED/USER-CONFIRM must terminalize without a dispatch-id prefix.
 
@@ -2884,6 +2947,7 @@ def main() -> None:
     test_restored_same_prompt_signature_reenables_classification()
     test_ordinary_provider_like_prose_surfaces_no_evidence()
     case_dead_pid_unbound_done_signoff_is_rejected()
+    test_cursor_tail_completes_only_with_the_dispatch_id()
     case_dead_pid_unbound_attention_markers_block_not_die()
     test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript()
     test_dead_path_attention_only_own_final_unquoted_line()

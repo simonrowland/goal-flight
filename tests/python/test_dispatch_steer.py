@@ -860,9 +860,23 @@ def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
         assert text.startswith(expected_prefix), text
         assert "Use your available tools to actually perform" in text, text
         assert "`!COMPLETE: grok-prompt-case — <summary>`" in text, text
-        assert "Legacy unprefixed marker lines remain accepted" in text, text
+        assert "without this dispatch's id is ignored" in text, text
         assert "last non-empty line" in text, text
         assert "Write target.txt with ok." in text, text
+
+
+def case_execution_preamble_does_not_excuse_id_less_success_markers() -> None:
+    # The watcher ignores a COMPLETE/READY/RESULT line that lacks this
+    # dispatch's id (goalflight_watch._terminal_marker_matches_dispatch).
+    # "Legacy unprefixed marker lines remain accepted" meant the optional `!`
+    # sigil, but beside an id-prefix contract it reads as "the id prefix is
+    # optional" -- the exact wrong shape that records a finished worker dead.
+    preamble = goalflight_dispatch.WORKER_EXECUTION_PREAMBLE
+    assert "remain accepted" not in preamble, preamble
+    assert "without this dispatch's id is ignored" in preamble, preamble
+    # The `!` sigil really is optional (goalflight_terminal.MARKER_SIGIL_OPT_RE);
+    # the preamble may say so, but only about the sigil.
+    assert "`!` sigil is optional" in preamble, preamble
 
 
 def case_codex_prompt_does_not_add_grok_contract() -> None:
@@ -948,6 +962,7 @@ def main() -> None:
     case_orientation_path_resolves_linked_worktree_to_main_root()
     case_orientation_path_resolves_from_repo_subdirectory()
     case_grok_prompt_adds_execution_and_terminal_contract()
+    case_execution_preamble_does_not_excuse_id_less_success_markers()
     case_codex_prompt_does_not_add_grok_contract()
     case_preamble_routing_matrix()
     print("OK: goalflight_dispatch steer tests pass")
