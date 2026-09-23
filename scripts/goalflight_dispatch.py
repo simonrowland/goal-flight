@@ -19779,7 +19779,6 @@ def main(argv: list[str] | None = None) -> int:
                 codex_env["CODEX_HOME"] = codex_dispatch_home
             _validate_codex_reasoning_effort(args, codex_env)
         worktree_seat = _admit_dispatch_worktree(args)
-        dispatch_warnings = getattr(args, "dispatch_warnings", dispatch_warnings)
         occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
         if occupancy_warning is not None:
             _emit_dispatch_warnings(

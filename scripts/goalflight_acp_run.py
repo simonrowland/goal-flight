@@ -4145,6 +4145,9 @@ async def _run_acp_dispatch_impl(
             # Every ACP shape binds only after account/capacity admission. The
             # central hook also handles in-place launches and occupancy locking.
             worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+            occupancy_warning = getattr(cfg, "_worktree_occupancy_warning", None)
+            if occupancy_warning is not None:
+                goalflight_dispatch._emit_dispatch_warnings([occupancy_warning])
             if worktree_mode == "create":
                 if worktree_seat is None:
                     raise goalflight_worktree_pool.WorktreeSeatError(

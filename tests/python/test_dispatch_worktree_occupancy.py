@@ -633,24 +633,11 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
 
 def test_acp_writer_refused_into_occupied_worktree() -> None:
     """ACP --cwd is a separate main() branch; occupancy must refuse there too."""
-    source = DISPATCH.read_text(encoding="utf-8")
-    assert source.count("warning = _prepare_attempt_worktree_occupancy(args)") == 1
-    assert source.count("worktree_seat = _admit_dispatch_worktree(args)") == 1
-    acp_source = (ROOT / "scripts" / "goalflight_acp_run.py").read_text(encoding="utf-8")
-    assert acp_source.count("worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)") == 1
     acp_py = _managed_acp_python()
     if acp_py is None:
-        print("SKIP live ACP occupancy (no managed ACP interpreter); wiring asserted")
+        print("SKIP live ACP occupancy (no managed ACP interpreter)")
         return
-    import goalflight_acp_run
-
-    acp_command, acp_args = goalflight_acp_run.agent_command("codex-acp")
-    adapter_gate = goalflight_acp_run.validate_acp_dispatch_readiness(
-        "codex-acp", [acp_command, *acp_args]
-    )
-    if adapter_gate is not None:
-        print(f"SKIP live ACP occupancy (adapter unavailable): {adapter_gate}")
-        return
+    from test_acp_dispatch_sigterm import _write_fake_codex_acp_manifest
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -658,6 +645,10 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
         env = _env(tmp, capacity_max_total=2)
         _configure_test_accounts(tmp, env)
         env["GOALFLIGHT_ACP_PYTHON"] = str(acp_py)
+        _write_fake_codex_acp_manifest(tmp / "adapters")
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+        env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "echo"
         release_incumbent = tmp / "release-incumbent"
         incumbent = _run(
             _dispatch_cmd(tmp, tree, "acp-incumbent", _blocking_worker(release_incumbent, "acp-incumbent")),
@@ -672,17 +663,31 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
                     tree,
                     "acp-second",
                     agent="codex-acp",
-                    extra=["--shape", "acp", "--account", "occupancy-test"],
+                    extra=["--shape", "acp", "--account", "occupancy-test", "--foreground"],
                 ),
                 env,
             )
-            if refused.returncode == 1 and "blocked_adapter_gate" in refused.stderr:
-                print("SKIP live ACP occupancy (adapter gate blocked isolated run)")
-                return
             assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
             assert "acp-incumbent" in refused.stderr, refused.stderr
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
             assert not _ledger_record(tmp, "acp-second"), refused.stderr
+            forced = _run(
+                _prompt_writer_cmd(
+                    tmp,
+                    tree,
+                    "acp-forced",
+                    agent="codex-acp",
+                    extra=[
+                        "--shape", "acp", "--account", "occupancy-test",
+                        "--occupied-worktree-forced", "--foreground",
+                    ],
+                ),
+                env,
+            )
+            assert forced.returncode == 0, (forced.stdout, forced.stderr)
+            assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+            assert "acp-incumbent" in forced.stderr, forced.stderr
+            assert "DISPATCH-END" in forced.stdout, forced.stdout
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "acp-incumbent")
@@ -1361,7 +1366,7 @@ def test_sigkill_releases_occupancy_before_capacity_lease_cleanup() -> None:
         tmp = Path(td)
         tree = tmp / "tree"
         tree.mkdir()
-        env = _env(tmp)
+        env = _env(tmp, capacity_max_total=2)
         release = tmp / "release-incumbent"
         incumbent = _run(
             _dispatch_cmd(tmp, tree, "occ-kill", _blocking_worker(release, "occ-kill")),
@@ -1379,13 +1384,9 @@ def test_sigkill_releases_occupancy_before_capacity_lease_cleanup() -> None:
             ),
             env,
         )
-        assert second.returncode in {0, 2}, (second.stdout, second.stderr)
+        assert second.returncode == 0, (second.stdout, second.stderr)
         assert "already owned" not in second.stderr, second.stderr
-        if second.returncode == 2:
-            assert "DISPATCH-BLOCKED" in second.stdout, second.stdout
-            assert not list((tmp / "state" / "dispatch-queue").glob("occ-after-kill*.json"))
-        else:
-            assert "DISPATCH-END" in second.stdout, second.stdout
+        assert "DISPATCH-END" in second.stdout, second.stdout
         watcher_pid = record.get("watcher_pid")
         if watcher_pid:
             _wait_for(lambda pid=watcher_pid: _pid_gone(pid), timeout=5.0)
