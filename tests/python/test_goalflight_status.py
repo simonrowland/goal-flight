@@ -250,8 +250,9 @@ def test_done_code() -> None:
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
+    read_record_kwargs = []
     try:
-        S.goalflight_ledger.read_records = lambda: [detached_controller_dead]
+        S.goalflight_ledger.read_records = lambda **kwargs: read_record_kwargs.append(kwargs) or [detached_controller_dead]
         S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
         rows = S.goalflight_ledger.status_payload()["records"]
         check("detached controller_dead live classified expected_live",
@@ -267,10 +268,16 @@ def test_done_code() -> None:
               dead_rows[0].get("classification") == "worker_dead")
         check("detached controller_dead dead worker terminal worker_dead",
               dead_rows[0].get("terminal_state") == "worker_dead")
+        check(
+            "ledger status requests recent window",
+            read_record_kwargs == [
+                {"recent_window_days": S.goalflight_ledger.STATUS_RECENT_WINDOW_DAYS},
+                {"recent_window_days": S.goalflight_ledger.STATUS_RECENT_WINDOW_DAYS},
+            ],
+        )
     finally:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
-
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "detached-success.tail"
         started = S.goalflight_ledger.utc_now()
@@ -311,6 +318,7 @@ def test_done_code() -> None:
         "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
+    orig_read_record = S.goalflight_ledger.read_record
     orig_identity_matches = S.goalflight_ledger.identity_matches
     orig_pid_alive = S.goalflight_compat.pid_alive
     try:
@@ -320,7 +328,7 @@ def test_done_code() -> None:
             captured.append(record)
             return True, "live"
 
-        S.goalflight_ledger.read_records = lambda: [timeout_raw]
+        S.goalflight_ledger.read_record = lambda _dispatch_id: timeout_raw
         S.goalflight_ledger.identity_matches = identity_live
         check("idle_timeout refreshes raw identity before live", S.done_code(timeout_summary) == 1)
         check("idle_timeout liveness used raw identity", captured and captured[-1] is timeout_raw)
@@ -328,11 +336,12 @@ def test_done_code() -> None:
         S.goalflight_ledger.identity_matches = lambda record: (False, "dead")
         check("idle_timeout stale cached worker -> 0", S.done_code(timeout_summary) == 0)
 
-        S.goalflight_ledger.read_records = lambda: []
+        S.goalflight_ledger.read_record = lambda _dispatch_id: None
         S.goalflight_compat.pid_alive = lambda _pid: False
         check("idle_timeout cached flag without identity -> 0", S.done_code(timeout_summary) == 0)
     finally:
         S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.read_record = orig_read_record
         S.goalflight_ledger.identity_matches = orig_identity_matches
         S.goalflight_compat.pid_alive = orig_pid_alive
     watcher_summary = {
@@ -348,6 +357,7 @@ def test_done_code() -> None:
         "worker_identity": {"start_token": "test:444:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
+    orig_read_record = S.goalflight_ledger.read_record
     orig_identity_matches = S.goalflight_ledger.identity_matches
     orig_pid_alive = S.goalflight_compat.pid_alive
     try:
@@ -357,7 +367,7 @@ def test_done_code() -> None:
             captured.append(record)
             return True, "live"
 
-        S.goalflight_ledger.read_records = lambda: [watcher_raw]
+        S.goalflight_ledger.read_record = lambda _dispatch_id: watcher_raw
         S.goalflight_ledger.identity_matches = identity_live
         check("watcher_stopped live marker -> 1", S.done_code(watcher_summary) == 1)
         check("watcher_stopped liveness used raw identity", captured and captured[-1] is watcher_raw)
@@ -378,6 +388,7 @@ def test_done_code() -> None:
         )
     finally:
         S.goalflight_ledger.read_records = orig_read_records
+        S.goalflight_ledger.read_record = orig_read_record
         S.goalflight_ledger.identity_matches = orig_identity_matches
         S.goalflight_compat.pid_alive = orig_pid_alive
     check("stale_dead -> 0", S.done_code({"classification": "stale_dead"}) == 0)
@@ -396,6 +407,55 @@ def test_done_code() -> None:
         )
         == 2,
     )
+
+
+def test_archived_id_status_and_wait_use_read_record_fallback() -> None:
+    archived = {
+        "dispatch_id": "archived-status",
+        "state": "complete",
+        "terminal_state": "complete",
+    }
+    original_read_record = S.goalflight_ledger.read_record
+    original_read_records = S.goalflight_ledger.read_records
+    try:
+        S.goalflight_ledger.read_record = lambda dispatch_id: (
+            archived if dispatch_id == "archived-status" else None
+        )
+        S.goalflight_ledger.read_records = lambda **_kwargs: []
+        check(
+            "status by archived id uses read_record",
+            S._raw_ledger_record_for_dispatch("archived-status") == archived,
+        )
+        check(
+            "wait by archived id uses read_record",
+            S._wait_raw_record("archived-status") == archived,
+        )
+        check(
+            "status by archived id renders read_record row",
+            S.find_record_or_read({"dispatch": {"records": []}}, "archived-status", None)[
+                "classification"
+            ] == "complete",
+        )
+    finally:
+        S.goalflight_ledger.read_record = original_read_record
+        S.goalflight_ledger.read_records = original_read_records
+
+
+def test_dashboard_status_requests_recent_window() -> None:
+    calls = []
+    original_read_records = S.goalflight_ledger.read_records
+    try:
+        S.goalflight_ledger.read_records = lambda **kwargs: calls.append(kwargs) or [
+            {"dispatch_id": "dashboard-recent", "state": "queued", "project_root": "/repo"}
+        ]
+        rows = S._dashboard_status_records(None)
+        check("dashboard retained test row", [row["dispatch_id"] for row in rows] == ["dashboard-recent"])
+        check(
+            "dashboard status requests recent window",
+            calls == [{"recent_window_days": S.goalflight_ledger.STATUS_RECENT_WINDOW_DAYS}],
+        )
+    finally:
+        S.goalflight_ledger.read_records = original_read_records
 
 
 def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
@@ -1423,6 +1483,8 @@ def main() -> int:
     test_worktree_scope_symlinked_root()
     test_done_code()
     test_output_tail_reconciles_success_marker_after_watcher_death()
+    test_archived_id_status_and_wait_use_read_record_fallback()
+    test_dashboard_status_requests_recent_window()
     test_idle_timeout_live_hint_rendered()
     test_effective_account_status_line_regression_pair()
     test_rate_pressure_warning_rendered()

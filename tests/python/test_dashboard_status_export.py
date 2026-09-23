@@ -249,11 +249,12 @@ def test_dashboard_export_filters_project_before_reconcile_and_reads_ledger_once
         tmp = Path(td)
         project = (tmp / "project").resolve()
         other = (tmp / "other").resolve()
-        calls = {"read_records": 0}
+        calls = {"read_records": 0, "recent_window_days": None}
         reconciled: list[str] = []
 
-        def fake_read_records() -> list[dict]:
+        def fake_read_records(*, recent_window_days: int) -> list[dict]:
             calls["read_records"] += 1
+            calls["recent_window_days"] = recent_window_days
             return [
                 {
                     "schema": goalflight_ledger.SCHEMA,
@@ -287,6 +288,7 @@ def test_dashboard_export_filters_project_before_reconcile_and_reads_ledger_once
         payload = S.dashboard_status_payload(project)
 
     assert calls["read_records"] == 1
+    assert calls["recent_window_days"] == goalflight_ledger.STATUS_RECENT_WINDOW_DAYS
     assert reconciled == ["in-project"]
     assert [row["dispatch_id"] for row in payload["dispatches"]] == ["in-project"]
     assert payload["dispatches"][0]["task_ids"] == ["t-001"]
@@ -459,6 +461,31 @@ def test_dashboard_refresh_liveness_ignores_stale_queued_rows_but_display_count_
 
     assert payload["counts"]["running"] == 1
     assert live is False
+
+
+def test_dashboard_project_liveness_reads_recent_window(monkeypatch, tmp_path: Path) -> None:
+    project = (tmp_path / "project").resolve()
+    project.mkdir()
+    calls: list[int] = []
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+    def bounded_read_records(*, recent_window_days: int) -> list[dict]:
+        calls.append(recent_window_days)
+        return [
+            {
+                "schema": goalflight_ledger.SCHEMA,
+                "dispatch_id": "recent-queued",
+                "project_root": str(project),
+                "state": "queued",
+                "terminal_state": "unknown",
+                "started_at": now,
+            }
+        ]
+
+    monkeypatch.setattr(D.goalflight_ledger, "read_records", bounded_read_records)
+
+    assert D._dashboard_project_has_live_dispatch(project) is True
+    assert calls == [goalflight_ledger.STATUS_RECENT_WINDOW_DAYS]
 
 
 def test_dashboard_refresh_liveness_is_unknown_without_queued_timestamp() -> None:

@@ -206,7 +206,7 @@ def case_live_ps_probe_error_classifies_indeterminate() -> None:
     with patch(
         "goalflight_ledger.subprocess.check_output",
         side_effect=OSError(errno.ENFILE, "file table full"),
-    ), patch("goalflight_ledger._posix_ps_available", return_value=True):
+    ):
         current = goalflight_ledger.process_identity(pid)
         assert current is not None
         assert current["identity_available"] is False
@@ -234,15 +234,44 @@ def case_live_ps_missing_lstart_classifies_indeterminate() -> None:
     with patch(
         "goalflight_ledger.subprocess.check_output",
         side_effect=ps_without_lstart,
-    ), patch("goalflight_ledger._posix_ps_available", return_value=True), patch(
-        "goalflight_ledger.time.sleep", return_value=None
-    ):
+    ) as check_output, patch("goalflight_ledger.time.sleep", return_value=None):
         current = goalflight_ledger.process_identity(pid)
         assert current is not None
         assert current["identity_available"] is False
         assert current["identity_probe_error"] is True
         assert current["identity_source"] == "ps_identity_incomplete"
+        assert check_output.call_count == 1
         assert goalflight_ledger.classify(record) == "identity_indeterminate"
+
+
+def case_process_identity_uses_one_combined_ps_probe() -> None:
+    pid = os.getpid()
+    ps_output = "123 456 Wed Sep 23 12:34:56 2026 python3 python3 worker\n"
+    with patch("goalflight_compat.pid_liveness", return_value=True), patch(
+        "goalflight_compat.process_start_identity",
+        return_value={"pid": pid, "start_token": "native-token"},
+    ), patch(
+        "goalflight_ledger.subprocess.check_output", return_value=ps_output
+    ) as check_output:
+        identity = goalflight_ledger.process_identity(pid)
+
+    assert identity == {
+        "pid": pid,
+        "ppid": "123",
+        "pgid": "456",
+        "lstart": "Wed Sep 23 12:34:56 2026",
+        "comm": "python3",
+        "args": "python3 worker",
+        "start_token": "native-token",
+    }
+    assert check_output.call_count == 1
+    assert check_output.call_args.args[0] == [
+        "ps",
+        "-o",
+        "ppid=,pgid=,lstart=,comm=,args=",
+        "-p",
+        str(pid),
+    ]
 
 
 def case_reaped_pid_still_classifies_dead() -> None:
@@ -334,6 +363,7 @@ def main() -> None:
     case_live_pid_probe_error_classifies_indeterminate()
     case_live_ps_probe_error_classifies_indeterminate()
     case_live_ps_missing_lstart_classifies_indeterminate()
+    case_process_identity_uses_one_combined_ps_probe()
     case_reaped_pid_still_classifies_dead()
     case_ledger_windows_identity_indeterminate_not_expected_live()
     case_lstart_only_identity_is_unknown()

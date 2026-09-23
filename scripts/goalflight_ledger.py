@@ -37,6 +37,8 @@ import goalflight_task
 import goalflight_terminal
 
 SCHEMA = "goalflight.dispatch.v1"
+TERMINAL_RECORD_RETENTION_DAYS = 7.0
+STATUS_RECENT_WINDOW_DAYS = TERMINAL_RECORD_RETENTION_DAYS
 
 
 DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
@@ -51,7 +53,6 @@ WORKER_PATTERNS = (
     "opencode-bash-tail",
 )
 KIMI_WORKER_BASENAME = "kimi"
-_POSIX_PS_AVAILABLE: bool | None = None
 
 
 def utc_now() -> str:
@@ -97,6 +98,13 @@ def canonicalize_project_root_on_store(project_root: object) -> str:
 
 def runs_dir(*, create: bool = True) -> Path:
     path = state_dir() / "runs.d"
+    if create:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+def runs_archive_dir(*, create: bool = True) -> Path:
+    path = state_dir() / "runs.d.archive"
     if create:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
     return path
@@ -172,10 +180,17 @@ def sha256_file(path: str | None) -> str | None:
     return h.hexdigest()
 
 
-def _ps_field(pid: int, field: str) -> tuple[str | None, bool]:
+def _ps_identity(pid: int) -> tuple[dict[str, str | None] | None, bool]:
+    """Read the diagnostic identity fields with one process-table probe."""
     try:
         out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", f"{field}="],
+            [
+                "ps",
+                "-o",
+                "ppid=,pgid=,lstart=,comm=,args=",
+                "-p",
+                str(pid),
+            ],
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -183,23 +198,23 @@ def _ps_field(pid: int, field: str) -> tuple[str | None, bool]:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return None, False
-    return out or None, True
+    if not out:
+        return None, True
+    fields = out.split(None, 8)
+    if len(fields) < 8:
+        return None, True
+    return {
+        "ppid": fields[0],
+        "pgid": fields[1],
+        "lstart": " ".join(fields[2:7]),
+        "comm": fields[7],
+        "args": fields[8] if len(fields) > 8 else None,
+    }, True
 
 
-def _posix_ps_available() -> bool:
-    global _POSIX_PS_AVAILABLE
-    if _POSIX_PS_AVAILABLE is None:
-        try:
-            subprocess.check_call(
-                ["ps", "-p", str(os.getpid()), "-o", "pid="],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.CalledProcessError):
-            _POSIX_PS_AVAILABLE = False
-        else:
-            _POSIX_PS_AVAILABLE = True
-    return _POSIX_PS_AVAILABLE
+def _capped_backoff_s(initial_s: float, attempt: int, *, cap_s: float) -> float:
+    """Return an exponential delay that never exceeds its caller's cap."""
+    return min(float(cap_s), float(initial_s) * (2 ** max(0, int(attempt))))
 
 
 def process_identity(pid: int | None) -> dict | None:
@@ -231,58 +246,45 @@ def process_identity(pid: int | None) -> dict | None:
         if start_token:
             ident["start_token"] = start_token
         return ident
-    if not _posix_ps_available():
+    liveness = goalflight_compat.pid_liveness(pid)
+    if liveness is False:
+        return None
+    if liveness is None:
         ident = {
             "pid": pid,
             "identity_available": False,
-            "identity_source": "posix_pid_probe_only",
+            "identity_probe_error": True,
+            "identity_source": "pid_probe_error",
         }
         if start_token:
             ident["start_token"] = start_token
         return ident
-    ident = None
-    for attempt in range(20):
+    fields, probe_ok = _ps_identity(pid)
+    if not probe_ok:
         liveness = goalflight_compat.pid_liveness(pid)
         if liveness is False:
             return None
-        if liveness is None:
-            ident = {
-                "pid": pid,
-                "identity_available": False,
-                "identity_probe_error": True,
-                "identity_source": "pid_probe_error",
-            }
-            if start_token:
-                ident["start_token"] = start_token
-            return ident
-        fields = {
-            field: _ps_field(pid, field)
-            for field in ("ppid", "pgid", "lstart", "comm", "args")
-        }
         ident = {
             "pid": pid,
-            **{field: result[0] for field, result in fields.items()},
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": (
+                "ps_probe_error" if liveness is True else "pid_probe_error"
+            ),
         }
         if start_token:
             ident["start_token"] = start_token
-        if not all(result[1] for result in fields.values()):
-            liveness = goalflight_compat.pid_liveness(pid)
-            if liveness is False:
-                return None
-            ident.update(
-                {
-                    "identity_available": False,
-                    "identity_probe_error": True,
-                    "identity_source": (
-                        "ps_probe_error" if liveness is True else "pid_probe_error"
-                    ),
-                }
-            )
-            return ident
-        if ident.get("lstart"):
-            return ident
-        if attempt < 19:
-            time.sleep(0.1)
+        return ident
+    if fields is None:
+        fields = {}
+    ident = {
+        "pid": pid,
+        **fields,
+    }
+    if start_token:
+        ident["start_token"] = start_token
+    if ident.get("lstart"):
+        return ident
     if ident is not None:
         ident.update(
             {
@@ -315,6 +317,9 @@ def compare_process_identities(
         actual_lstart = current_identity.get("lstart")
         expected_start_token = expected_identity.get("start_token")
         actual_start_token = current_identity.get("start_token")
+        if expected_start_token and actual_start_token:
+            if actual_start_token != expected_start_token:
+                return False, "pid_reused_start_token"
         # A changed legacy lstart still proves PID reuse even when the old
         # record has no fine-grained start token. Matching lstart remains
         # indeterminate below; status-only consumers may treat it as
@@ -326,8 +331,6 @@ def compare_process_identities(
             # not a process-generation identity. Old records remain readable,
             # but never confirm a live PID without the fine-grained token.
             return True, "identity_indeterminate"
-        if actual_start_token != expected_start_token:
-            return False, "pid_reused_start_token"
         # exec(2) preserves the process generation while replacing comm.
         return True, "live"
     return True, "identity_indeterminate"
@@ -372,6 +375,15 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     prior_has_start = bool(prior.get("start_token"))
     current_has_start = bool(current.get("start_token"))
     fine_start_available = prior_has_start and current_has_start
+    expected_lstart = prior.get("lstart")
+    actual_lstart = current.get("lstart")
+    if (
+        not fine_start_available
+        and expected_lstart
+        and actual_lstart
+        and actual_lstart != expected_lstart
+    ):
+        return False, "pid_reused_lstart"
     if (
         goalflight_compat.is_windows()
         and not fine_start_available
@@ -625,6 +637,9 @@ def _stamp_nonterminal_fields(record: dict, fields: dict) -> None:
             current = dict(record)
         if _terminal_key(current) not in {"", "unknown", "watcher_stopped"}:
             return
+        if all(current.get(key) == value for key, value in fields.items()):
+            record.update(fields)
+            return
         current.update(fields)
         write_record(current)
         record.update(fields)
@@ -677,12 +692,33 @@ def read_record(dispatch_id: str) -> dict | None:
         return None
     path = record_path(dispatch_id, create=False)
     presence = goalflight_fs.path_presence(path)
-    if presence == "absent":
-        return None
     if presence == "unknown":
         return _unreadable_record(
             path, goalflight_compat.safe_dispatch_filename(dispatch_id)
         )
+    if presence == "absent":
+        archive_root = runs_archive_dir(create=False)
+        archive_presence = goalflight_fs.path_presence(archive_root)
+        if archive_presence == "absent":
+            return None
+        if archive_presence == "unknown":
+            return _unreadable_record(
+                archive_root,
+                goalflight_compat.safe_dispatch_filename(dispatch_id),
+            )
+        filename = f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
+        try:
+            months = sorted(os.listdir(archive_root), reverse=True)
+        except OSError:
+            return _unreadable_record(archive_root, filename[:-5])
+        for month in months:
+            candidate = archive_root / month / filename
+            if goalflight_fs.path_presence(candidate) != "present":
+                continue
+            path = candidate
+            break
+        else:
+            return None
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -731,7 +767,9 @@ def _peek_top_level_state(raw: str) -> str | None:
     return match.group(1) if match else None
 
 
-def read_records(*, skip_terminal: bool = False) -> list[dict]:
+def read_records(
+    *, skip_terminal: bool = False, recent_window_days: float | None = None
+) -> list[dict]:
     """Load ledger rows.
 
     Drain used to ``json.loads`` every historical row every pass, so cost
@@ -745,11 +783,23 @@ def read_records(*, skip_terminal: bool = False) -> list[dict]:
     row closed by the other pass either still peeks as running (existing
     lock/progress checks apply) or peeks as terminal (correctly skipped).
 
-    Default ``skip_terminal=False`` keeps occupancy/status callers on the
-    full history.  An absent ledger directory returns an empty list; an
-    indeterminate directory presence raises ``OSError`` so callers fail closed
-    instead of treating an unreadable ledger as an observed empty one.
+    ``recent_window_days`` keeps non-terminal rows and terminal files whose
+    publication mtime is inside the requested window. Old terminal files are
+    skipped from parsing; the archive job uses their authoritative terminal
+    timestamps before moving them out of this directory. An absent ledger
+    directory returns an empty list; an indeterminate directory presence
+    raises ``OSError`` so callers fail closed instead of treating an unreadable
+    ledger as an observed empty one.
     """
+    if recent_window_days is not None and (
+        not math.isfinite(float(recent_window_days)) or float(recent_window_days) < 0
+    ):
+        raise ValueError("recent_window_days must be finite and >= 0")
+    recent_cutoff = (
+        time.time() - float(recent_window_days) * 86400
+        if recent_window_days is not None
+        else None
+    )
     records: list[dict] = []
     listed = 0
     parsed = 0
@@ -779,10 +829,23 @@ def read_records(*, skip_terminal: bool = False) -> list[dict]:
             parsed += 1
             records.append(_unreadable_record(p))
             continue
+        peeked = _peek_top_level_state(raw)
         if skip_terminal:
-            peeked = _peek_top_level_state(raw)
             if peeked is not None and goalflight_dispatch_states.is_terminal_state(peeked):
                 skipped_terminal += 1
+                continue
+        if (
+            recent_cutoff is not None
+            and peeked is not None
+            and goalflight_dispatch_states.is_terminal_state(peeked)
+        ):
+            try:
+                if p.stat().st_mtime < recent_cutoff:
+                    skipped_terminal += 1
+                    continue
+            except OSError:
+                parsed += 1
+                records.append(_unreadable_record(p))
                 continue
         try:
             records.append(json.loads(raw))
@@ -792,6 +855,34 @@ def read_records(*, skip_terminal: bool = False) -> list[dict]:
     _LAST_READ_WORK.update(
         listed=listed, parsed=parsed, skipped_terminal=skipped_terminal
     )
+    return records
+
+
+def _read_archived_records() -> list[dict]:
+    """Load archived rows for reconciliation, which repairs terminal history."""
+    archive_root = runs_archive_dir(create=False)
+    presence = goalflight_fs.path_presence(archive_root)
+    if presence == "absent":
+        return []
+    if presence == "unknown":
+        raise OSError(f"ledger archive unreadable: {archive_root}")
+    records: list[dict] = []
+    for month in sorted(os.listdir(archive_root), reverse=True):
+        month_dir = archive_root / month
+        if not month_dir.is_dir():
+            continue
+        for name in sorted(os.listdir(month_dir)):
+            if not name.endswith(".json"):
+                continue
+            path = month_dir / name
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                records.append(_unreadable_record(path))
+                continue
+            if isinstance(record, dict):
+                record["_archived_record"] = True
+                records.append(record)
     return records
 
 
@@ -879,6 +970,78 @@ def _terminal_key(record: dict) -> str:
     if terminal_state:
         return str(terminal_state)
     return terminal_state_for(record.get("state"), record.get("reason") or record.get("error"))
+
+
+def _terminal_record_time(record: dict) -> dt.datetime | None:
+    for field in ("ended_at", "updated_at"):
+        parsed = parse_utc(record.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def archive_terminal_records(*, now: dt.datetime | None = None) -> dict[str, object]:
+    """Move settled rows past retention into month-partitioned cold storage."""
+    current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    cutoff = current - dt.timedelta(days=TERMINAL_RECORD_RETENTION_DAYS)
+    moved = 0
+    skipped = 0
+    source_dir = runs_dir(create=False)
+    archive_root = runs_archive_dir(create=False)
+    with StateLock():
+        presence = goalflight_fs.path_presence(source_dir)
+        if presence == "absent":
+            return {"moved": 0, "skipped": 0, "cutoff": cutoff.isoformat()}
+        if presence == "unknown":
+            raise OSError(f"ledger directory unreadable: {source_dir}")
+
+        candidates: list[tuple[Path, Path]] = []
+        for name in sorted(os.listdir(source_dir)):
+            if not name.endswith(".json"):
+                continue
+            source = source_dir / name
+            try:
+                record = json.loads(source.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                skipped += 1
+                continue
+            if not isinstance(record, dict) or not goalflight_dispatch_states.is_terminal_state(
+                _terminal_key(record)
+            ):
+                skipped += 1
+                continue
+            terminal_at = _terminal_record_time(record)
+            if terminal_at is None or terminal_at >= cutoff:
+                skipped += 1
+                continue
+            destination = archive_root / terminal_at.strftime("%Y-%m") / name
+            destination_presence = goalflight_fs.path_presence(destination)
+            if destination_presence == "present":
+                raise OSError(f"archive destination already exists: {destination}")
+            if destination_presence == "unknown":
+                raise OSError(f"archive destination unreadable: {destination}")
+            candidates.append((source, destination))
+
+        for _source, destination in candidates:
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for source, destination in candidates:
+            if goalflight_fs.path_presence(destination) != "absent":
+                raise OSError(f"archive destination already exists: {destination}")
+            source.replace(destination)
+            moved += 1
+
+        if candidates:
+            for directory in {
+                source_dir,
+                archive_root,
+                *(destination.parent for _, destination in candidates),
+            }:
+                fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+    return {"moved": moved, "skipped": skipped, "cutoff": cutoff.isoformat()}
 
 
 def elapsed_seconds(record: dict, ended_at: str | None = None) -> float | None:
@@ -1121,14 +1284,26 @@ def retry_record_after_startup_race(
     """
     deadline = time.monotonic() + timeout_s
     code, refusal = initial_code, initial_refusal
+    reader = None
+    attempt_no = 0
     while time.monotonic() < deadline:
+        if reader is None:
+            try:
+                reader = goalflight_journal.Journal.open_reader(
+                    project_root, persistent=True
+                )
+            except Exception:
+                reader = None
         attempt = None
-        with contextlib.suppress(Exception):
-            attempt = goalflight_journal.Journal.open_reader(
-                project_root
-            ).attempt_for_dispatch(dispatch_id)
+        if reader is not None:
+            try:
+                attempt = reader.attempt_for_dispatch(dispatch_id)
+            except Exception:
+                reader = None
         if attempt is None:
-            time.sleep(poll_s)
+            delay = _capped_backoff_s(poll_s, attempt_no, cap_s=0.25)
+            attempt_no += 1
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             continue
         if attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES:
             break
@@ -1136,7 +1311,9 @@ def retry_record_after_startup_race(
             code, refusal = record_once()
             if code == 0 or not is_retryable_startup_race(refusal):
                 break
-        time.sleep(poll_s)
+        delay = _capped_backoff_s(poll_s, attempt_no, cap_s=0.25)
+        attempt_no += 1
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
     return code, refusal
 
 
@@ -1896,6 +2073,7 @@ def reconcile_terminal_outbox(
     overruled: list[dict[str, object]] = []
     history_records: list[dict] = []
     records = read_records()
+    records.extend(_read_archived_records())
     known_dispatch_ids = {
         str(record.get("dispatch_id"))
         for record in records
@@ -2126,16 +2304,21 @@ def reconcile_terminal_outbox(
             else:
                 committed += 1
             if needs_ledger_projection:
-                with StateLock():
-                    current_path = record_path(str(record["dispatch_id"]))
-                    current = (
-                        json.loads(current_path.read_text())
-                        if current_path.exists()
-                        else dict(record)
-                    )
-                    current = terminal_record_projection(current, result.value, reason)
-                    write_record(current)
-                history_records.append(dict(current))
+                if record.get("_archived_record"):
+                    archived_history = dict(record)
+                    archived_history.pop("_archived_record", None)
+                    history_records.append(archived_history)
+                else:
+                    with StateLock():
+                        current_path = record_path(str(record["dispatch_id"]))
+                        current = (
+                            json.loads(current_path.read_text())
+                            if current_path.exists()
+                            else dict(record)
+                        )
+                        current = terminal_record_projection(current, result.value, reason)
+                        write_record(current)
+                    history_records.append(dict(current))
             try:
                 import goalflight_capacity
 
@@ -2217,8 +2400,14 @@ def cmd_reconcile_outbox(args: argparse.Namespace) -> int:
     return 0 if payload["ok"] else 2
 
 
+def cmd_archive(args: argparse.Namespace) -> int:
+    payload = archive_terminal_records()
+    print(json.dumps(payload, indent=None if args.json else 2, sort_keys=True))
+    return 0
+
+
 def status_payload() -> dict:
-    records = read_records()
+    records = read_records(recent_window_days=STATUS_RECENT_WINDOW_DAYS)
     rows = []
     for r in records:
         classification = classify(r)
@@ -2650,6 +2839,13 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--project-root", type=Path, default=Path.cwd())
     reconcile.add_argument("--json", action="store_true")
     reconcile.set_defaults(func=cmd_reconcile_outbox)
+
+    archive = sub.add_parser(
+        "archive",
+        help="move terminal ledger rows outside the recent history window",
+    )
+    archive.add_argument("--json", action="store_true")
+    archive.set_defaults(func=cmd_archive)
 
     stat = sub.add_parser("status")
     stat.add_argument("--json", action="store_true")

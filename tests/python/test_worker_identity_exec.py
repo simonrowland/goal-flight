@@ -153,6 +153,30 @@ def test_reap_identity_check_uses_constructed_identity_comparison(monkeypatch) -
     ) == (True, "identity_indeterminate")
 
 
+def test_legacy_unavailable_identity_still_detects_lstart_reuse(monkeypatch) -> None:
+    expected = _identity(
+        lstart="old process start",
+        start_token=None,
+        identity_available=False,
+    )
+    current = _identity(
+        lstart="new process start",
+        start_token="linux:boot:current",
+        identity_available=True,
+    )
+    monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: current)
+
+    record = {"worker_pid": PID, "worker_identity": expected}
+    assert goalflight_ledger.identity_matches(record) == (
+        False,
+        "pid_reused_lstart",
+    )
+    assert goalflight_ledger.worker_identity_liveness(record) == (
+        "dead",
+        "pid_reused_lstart",
+    )
+
+
 def test_quota_reaper_identity_reader_ignores_exec_comm_change(monkeypatch) -> None:
     expected = _identity(comm="python")
     current = _identity(comm="node")
@@ -375,8 +399,6 @@ def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) 
         "process_start_identity",
         lambda pid: {"pid": pid, "start_token": START_TOKEN},
     )
-    monkeypatch.setattr(goalflight_ledger, "_posix_ps_available", lambda: False)
-
     identity = goalflight_ledger.process_identity(PID)
     assert identity and identity.get("start_token") == START_TOKEN
     assert goalflight_dispatch._watch_identity_token(identity) == {

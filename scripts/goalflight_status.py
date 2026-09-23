@@ -186,17 +186,7 @@ def _status_json_worker_record(record: dict) -> dict | None:
 def _raw_ledger_record_for_dispatch(dispatch_id: object) -> dict | None:
     if not dispatch_id:
         return None
-    dispatch_id = str(dispatch_id)
-    try:
-        path = goalflight_ledger.record_path(dispatch_id, create=False)
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        raw = None
-    if isinstance(raw, dict):
-        return raw
-    for raw_record in goalflight_ledger.read_records():
-        if raw_record.get("dispatch_id") == dispatch_id:
-            return raw_record
+    raw = goalflight_ledger.read_record(str(dispatch_id))
     return raw if isinstance(raw, dict) else None
 
 
@@ -557,10 +547,8 @@ def _ledger_record_payload(record: dict) -> dict:
     dispatch_id = record.get("dispatch_id")
     if not dispatch_id:
         return {}
-    for raw in goalflight_ledger.read_records():
-        if raw.get("dispatch_id") == dispatch_id:
-            return raw
-    return {}
+    raw = goalflight_ledger.read_record(str(dispatch_id))
+    return raw if isinstance(raw, dict) else {}
 
 
 def _artifact_provenance_final(payload: dict, artifact: Path) -> tuple[bool, str | None]:
@@ -1157,7 +1145,9 @@ def _dashboard_status_row(record: dict) -> dict:
 
 
 def _dashboard_status_records(project_root: str | None) -> list[dict]:
-    records = goalflight_ledger.read_records()
+    records = goalflight_ledger.read_records(
+        recent_window_days=goalflight_ledger.STATUS_RECENT_WINDOW_DAYS
+    )
     if project_root is not None:
         records = [record for record in records if record.get("project_root") == project_root]
     return [
@@ -1525,6 +1515,21 @@ def find_record(payload: dict, dispatch_id: str) -> dict | None:
     return None
 
 
+def find_record_or_read(
+    payload: dict, dispatch_id: str, project_root: str | None
+) -> dict | None:
+    """Find a retained row, then fall back to one id-bound ledger read."""
+    record = find_record(payload, dispatch_id)
+    if record is not None:
+        return record
+    raw = goalflight_ledger.read_record(dispatch_id)
+    if not isinstance(raw, dict):
+        return None
+    if project_root is not None and raw.get("project_root") != project_root:
+        return None
+    return _dashboard_status_row(raw)
+
+
 def _payload_with_explicit_wait_records(scoped_payload: dict, machine_payload: dict, wait_ids: list[str]) -> dict:
     scoped_records = list(scoped_payload["dispatch"].get("records", []))
     present = {r.get("dispatch_id") for r in scoped_records}
@@ -1546,11 +1551,7 @@ def _payload_with_explicit_wait_records(scoped_payload: dict, machine_payload: d
 
 def _wait_raw_record(dispatch_id: str) -> dict | None:
     """Read exactly one id-bound runs.d row; never enumerate dispatch history."""
-    try:
-        path = goalflight_ledger.record_path(dispatch_id, create=False)
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    raw = goalflight_ledger.read_record(dispatch_id)
     if not isinstance(raw, dict) or raw.get("dispatch_id") != dispatch_id:
         return None
     return raw
@@ -3079,14 +3080,12 @@ def _verify_record(dispatch_id: str, project_root: str | None) -> dict | None:
     """Look up a dispatch's ledger record DIRECTLY by id (no aggregate status_payload /
     no reconcile pass) — the run-ledger lookup is by id, and artifact verification then
     opens declared paths directly, so nothing here enumerates the worker's output dir."""
-    match = None
-    for record in goalflight_ledger.read_records():
-        if record.get("dispatch_id") != dispatch_id:
-            continue
-        if project_root and record.get("project_root") not in (None, project_root):
-            continue
-        match = record  # latest matching record wins
-    return match
+    record = goalflight_ledger.read_record(dispatch_id)
+    if not isinstance(record, dict):
+        return None
+    if project_root and record.get("project_root") not in (None, project_root):
+        return None
+    return record
 
 
 def _direct_open_exists(path: Path) -> tuple[bool | None, int]:
@@ -3378,11 +3377,11 @@ def main(argv: list[str] | None = None) -> int:
     payload = scope_payload(status_payload(), project_root)
 
     if args.done is not None:
-        record = find_record(payload, args.done)
+        record = find_record_or_read(payload, args.done, project_root)
         return 2 if record is None else done_code(record)
 
     if args.dispatch is not None:
-        record = find_record(payload, args.dispatch)
+        record = find_record_or_read(payload, args.dispatch, project_root)
         if record is None:
             print(f"{args.dispatch}  unknown (no record for this scope; try --all-projects)")
             return 2

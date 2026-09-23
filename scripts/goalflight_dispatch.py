@@ -2338,7 +2338,9 @@ def _dashboard_project_has_live_dispatch(project_root: Path) -> bool | None:
         now = dt.datetime.now(dt.timezone.utc)
         candidates = []
         scan_unknown = False
-        for record in goalflight_ledger.read_records():
+        for record in goalflight_ledger.read_records(
+            recent_window_days=goalflight_ledger.STATUS_RECENT_WINDOW_DAYS
+        ):
             if not isinstance(record, dict) or goalflight_ledger.record_is_unreadable(
                 record
             ):
