@@ -667,8 +667,14 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
                 ),
                 env,
             )
-            assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-            assert "acp-incumbent" in refused.stderr, refused.stderr
+            # ACP maps admission exceptions to failed_worktree (rc 1), and
+            # reports the diagnostic in status JSON and DISPATCH-END stdout.
+            assert refused.returncode == 1, (refused.returncode, refused.stdout, refused.stderr)
+            refusal = json.loads((tmp / "acp-second.status.json").read_text(encoding="utf-8"))
+            assert refusal["state"] == "failed_worktree", refusal
+            assert "acp-incumbent" in refusal["error"], refusal
+            assert "already owned" in refusal["error"], refusal
+            assert "acp-incumbent" in refused.stdout, refused.stdout
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
             assert not _ledger_record(tmp, "acp-second"), refused.stderr
             forced = _run(
