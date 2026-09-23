@@ -233,11 +233,91 @@ def test_old_process_can_mutate_after_new_default_write(store, monkeypatch):
     assert store.load_items()[0]["title"] == "Old writer"
 
 
+@pytest.mark.parametrize("revision", ["c6062e5", "6665a21"])
+def test_opted_in_old_writer_refusal_and_watcher_recovery(store, monkeypatch, tmp_path, revision):
+    from test_watch_prompt_echo import _watcher_command, _wait_for_status_matching
+
+    store.save_items_atomic([item()])
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.save_items_atomic(store.load_items())
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
+    before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in targets(store)}
+    old = types.ModuleType("taskstore_old_opted_in")
+    old.__file__ = str(task.ROOT / "goalflight_task.py")
+    monkeypatch.setitem(sys.modules, old.__name__, old)
+    source = subprocess.check_output(["git", "show", f"{revision}:goalflight_task.py"], cwd=task.ROOT)
+    exec(compile(source, old.__file__, "exec"), old.__dict__)
+    with pytest.raises(old.TaskError, match="id-sets differ"):
+        old.TaskStore(store.project_root).mutate_items(lambda rows: pytest.fail("refused mutation ran"))
+    assert before == {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in before}
+    assert not store.publish_marker_path.exists()
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setenv("GOALFLIGHT_TEST_PGROUP_CPU_PCT", "0.0")
+    tail, status = tmp_path / "tail.txt", tmp_path / "status.json"
+    tail.write_text("Worker running\n")
+    dispatch_id = "old-writer-upgrade"
+    worker = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE, start_new_session=True)
+    watcher = None
+    try:
+        command = _watcher_command(tail=tail, status=status, worker_pid=worker.pid,
+                                   dispatch_id=dispatch_id, poll_secs="1", max_idle_secs="30")
+        bootstrap = """
+import pathlib, subprocess, sys, types
+root = pathlib.Path.cwd()
+sys.path[:0] = [str(root), str(root / 'scripts')]
+revision = sys.argv.pop(1)
+old = types.ModuleType('goalflight_task')
+old.__file__ = str(root / 'goalflight_task.py')
+sys.modules['goalflight_task'] = old
+exec(compile(subprocess.check_output(['git', 'show', revision + ':goalflight_task.py']), old.__file__, 'exec'), old.__dict__)
+watch_path = str(root / 'scripts/goalflight_watch.py')
+sys.argv[0] = watch_path
+exec(compile(subprocess.check_output(['git', 'show', revision + ':scripts/goalflight_watch.py']), watch_path, 'exec'), {'__name__':'__main__', '__file__':watch_path})
+"""
+        watcher = subprocess.Popen([sys.executable, "-c", bootstrap, revision, *command[2:],
+                                    "--project-root", str(store.project_root), "--task-ids", "t-001"],
+                                   cwd=task.ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Old watcher breadcrumbs deliberately allow an invalid live mirror,
+        # unlike ordinary mutations: they repair the pair and keep running.
+        _wait_for_status_matching(status, lambda p: bool(store.load_items()[0]["dispatches"]))
+        first_mtime = status.stat().st_mtime_ns
+        _wait_for_status_matching(status, lambda p: status.stat().st_mtime_ns != first_mtime)
+        assert watcher.poll() is None
+        assert worker.poll() is None
+        assert len(store.load_items()[0]["dispatches"]) == 1
+        task._run_checker(store.docs_dir, store.dashboard_dir)
+        with tail.open("a") as stream:
+            stream.write(f"!COMPLETE: {dispatch_id} — work finished\n")
+        worker.stdin.close()
+        worker.wait(timeout=5)
+        stdout, stderr = watcher.communicate(timeout=30)
+        final = json.loads(status.read_text())
+        assert watcher.returncode == 0, (stdout, stderr, final)
+        assert final["state"] == "complete"
+        assert final["terminal_marker"]["kind"] == "COMPLETE"
+        rows = store.load_items()
+        assert len(rows) == 1 and rows[0]["title"] == "Initial"
+        assert [crumb["state"] for crumb in rows[0]["dispatches"]] == ["working", "worker-finished"]
+        task._run_checker(store.docs_dir, store.dashboard_dir)
+        assert not store.publish_marker_path.exists()
+        assert not list(store.docs_dir.glob(".tasks-stage-*"))
+    finally:
+        for process in (watcher, worker):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
 def test_disabled_stub_browser_notice_and_no_records(store, monkeypatch):
     store.save_items_atomic([item()])
     monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
     store._write_publish_marker("interrupted")
     store._recover_interrupted_publish()
+    assert_disabled_browser(store.export_dashboard_dir / "tasks-data.js", task.ROOT / "templates/state-skeleton/gf.js")
+
+
+def assert_disabled_browser(mirror, renderer):
     browser = subprocess.run(["node", "-e", """
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const notices = [];
@@ -260,9 +340,52 @@ assert.strictEqual(window.GF.store.items.length, 0);
 assert(notices.some(text => text.includes('Dashboard export disabled') &&
   text.includes('GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1')));
 driver.destroy();
-""", str(store.export_dashboard_dir / "tasks-data.js"),
-        str(task.ROOT / "templates/state-skeleton/gf.js")], capture_output=True, text=True)
+""", str(mirror), str(renderer)], capture_output=True, text=True)
     assert browser.returncode == 0, browser.stderr
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_upgrade_tombstones_retained_mirrors_once(store, monkeypatch, refresh):
+    import goalflight_setup as setup
+
+    setup.scaffold_project_state(task.ROOT, store.project_root, apply=True)
+    store.save_items_atomic([item()])
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    paths = (store.data_js_path, store.export_dashboard_dir / "tasks-data.js")
+    before = {p: p.read_bytes() for p in paths}
+    if refresh:
+        setup.refresh_managed_views(task.ROOT, store.project_root, dry_run=True)
+    else:
+        setup.scaffold_project_state(task.ROOT, store.project_root, apply=False)
+    assert before == {p: p.read_bytes() for p in paths}
+    for _ in range(2):
+        if refresh:
+            setup.refresh_managed_views(task.ROOT, store.project_root)
+        else:
+            setup.scaffold_project_state(task.ROOT, store.project_root, apply=True)
+        assert_disabled_browser(paths[1], store.export_dashboard_dir / "gf.js")
+        after = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns) for p in paths}
+        if _ == 0:
+            stub = after
+        else:
+            assert after == stub
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_refresh_refuses_symlinked_dashboard(store, monkeypatch, tmp_path, canonical):
+    import goalflight_setup as setup
+
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    outside = tmp_path / "unrelated"
+    outside.mkdir()
+    victim = outside / "tasks-data.js"
+    victim.write_bytes(b"unrelated data")
+    dashboard = store.dashboard_dir if canonical else store.export_dashboard_dir
+    dashboard.parent.mkdir(parents=True, exist_ok=True)
+    dashboard.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(setup.SetupError, match="escapes|symlink"):
+        setup.refresh_managed_views(task.ROOT, store.project_root)
+    assert victim.read_bytes() == b"unrelated data"
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
