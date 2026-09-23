@@ -69,6 +69,30 @@ def test_acp_waiting_capacity_record_has_no_worker_cwd(
     assert captured and captured[0].worker_cwd is None
 
 
+def test_starting_record_remains_a_worktree_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seat = tmp_path / "s-1"
+    seat.mkdir()
+    monkeypatch.setattr(
+        dispatch.goalflight_ledger,
+        "read_records",
+        lambda: [
+            {
+                "dispatch_id": "bound-owner",
+                "state": "starting",
+                "worker_cwd": str(seat),
+                "project_root": str(tmp_path),
+            }
+        ],
+    )
+    args = argparse.Namespace(dispatch_id="new-dispatch", parent_dispatch_id=None, cwd=str(seat))
+    occupied, unknown, state = dispatch._worktree_incumbent_reason(args)
+    assert occupied and "bound-owner" in occupied
+    assert unknown is None
+    assert state == "starting"
+
+
 def test_requeue_child_drops_parent_worktree_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
