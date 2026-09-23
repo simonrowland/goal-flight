@@ -2735,6 +2735,7 @@ def cmd_supervise(
     args: Any,
     *,
     forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+    before_renewal: Callable[[Path, str, str], str | None] | None = None,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
@@ -2819,7 +2820,14 @@ def cmd_supervise(
         if coverage_s <= 0:
             print("supervise: coverage-secs must be positive", file=sys.stderr)
             return SUPERVISE_START_EXIT
-    # Refused starts must not extend the lease. Renew only just before arming.
+    if before_renewal is not None:
+        refusal = before_renewal(project_root, label, live_nonce)
+        if refusal:
+            print(f"supervise: did-not-arm: {refusal}", file=sys.stderr)
+            return SUPERVISE_START_EXIT
+    # Eligibility refusals must not extend the lease. Later startup I/O failures
+    # (including broken stdout or child-start failure) can follow renewal; this
+    # is not an atomic arm operation. Release still waits for stdout proof.
     renewed_nonce = _renew_controller_lease_before_arm(
         project_root=project_root,
         controller_label=label,

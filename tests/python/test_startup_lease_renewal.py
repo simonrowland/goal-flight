@@ -12,6 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import goalflight_journal as journal
 import goalflight_wake as wake
 import goalflight_wake_supervise as supervise
+import goalflight_messages as messages
+from test_supervised_wake import FakeHost
+
+
+RUN_SUPERVISOR = supervise.run_supervisor
 
 
 def snapshot(authority):
@@ -131,3 +136,79 @@ def test_refused_start_does_not_renew(startup, monkeypatch, refusal):
     before = snapshot(authority)
     assert supervise.cmd_supervise(args, on_startup_probe=callback) == supervise.SUPERVISE_START_EXIT
     assert snapshot(authority) == before
+
+
+@pytest.mark.parametrize("refusal", ["snapshot", "refresh", "identity"])
+def test_migration_refusal_does_not_renew(startup, monkeypatch, capsys, refusal):
+    authority, lease, args, _holders = startup
+    host = FakeHost(nonce=lease.nonce, lease_nonce=lease.nonce)
+    monkeypatch.setattr(supervise, "run_supervisor", RUN_SUPERVISOR)
+    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: host)
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    incumbent = wake.WaiterRecord(
+        kind="listener", label_hash="a" * 16, pid=41001,
+        start_hash=wake._start_hash("incumbent"), instance_id="b" * 32,
+        path=authority.path.parent / "incumbent.lock", generation_hash="c" * 24,
+    )
+    readings = iter({
+        "snapshot": [None],
+        "refresh": [[incumbent], None],
+        "identity": [[incumbent], [incumbent]],
+    }[refusal])
+    def live_waiters(*_args, **kwargs):
+        assert kwargs["prune_dead"] is False
+        return next(readings)
+
+    monkeypatch.setattr(wake, "live_waiters", live_waiters)
+    monkeypatch.setattr(messages.goalflight_compat, "process_start_identity", lambda _pid: None)
+    monkeypatch.setattr(messages.goalflight_compat, "pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(messages.goalflight_compat, "pid_is_zombie", lambda _pid: False)
+    monkeypatch.setattr(messages.os, "kill", lambda *_args: pytest.fail("must not release coverage"))
+    before = snapshot(authority)  # Includes the incumbent's listener coverage row.
+    assert messages.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
+    assert not host.spawns
+    assert snapshot(authority) == before
+    assert "indeterminate" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reused_after_probe", [False, True])
+def test_migration_checks_then_renews_then_releases_and_arms(startup, monkeypatch, reused_after_probe):
+    authority, lease, args, _holders = startup
+    host = FakeHost(nonce=lease.nonce, lease_nonce=lease.nonce, stop_after_spawns=4)
+    monkeypatch.setattr(supervise, "run_supervisor", RUN_SUPERVISOR)
+    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: host)
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    incumbent = wake.WaiterRecord(
+        kind="listener", label_hash="a" * 16, pid=41001,
+        start_hash=wake._start_hash("incumbent"), instance_id="b" * 32,
+        path=authority.path.parent / "incumbent.lock", generation_hash="c" * 24,
+    )
+    before = snapshot(authority)
+
+    def live_waiters(*_args, **_kwargs):
+        if "write:probe" not in host.actions:
+            assert snapshot(authority) == before
+            return [incumbent]
+        return []
+
+    def identity(_pid):
+        if "write:probe" in host.actions:
+            assert snapshot(authority) != before
+            assert not host.spawns
+            return {"start_token": "reused" if reused_after_probe else "incumbent"}
+        assert snapshot(authority) == before
+        return {"start_token": "incumbent"}
+
+    signals = []
+
+    def release(pid, signum):
+        assert "write:probe" in host.actions
+        assert not host.spawns
+        signals.append((pid, signum))
+
+    monkeypatch.setattr(wake, "live_waiters", live_waiters)
+    monkeypatch.setattr(messages.goalflight_compat, "process_start_identity", identity)
+    monkeypatch.setattr(messages.os, "kill", release)
+    assert messages.cmd_supervise(args) == 0
+    assert signals == ([] if reused_after_probe else [(incumbent.pid, messages.signal.SIGTERM)])
+    assert len(host.spawns) == 4

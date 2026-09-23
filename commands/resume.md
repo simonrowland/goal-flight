@@ -100,9 +100,11 @@ Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes a
 The first `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}`
 record proves stdout connectivity only, before migration and child spawn; it
 does not prove armed coverage. Before moving on, confirm the current generation's
-stream, two backup listeners, and watchdog with a subsequent `--chatty` / `--debug`
-coverage record showing `live=target=4` (4/4). Use either flag when verifying
-startup; default terse output has no full-coverage readiness record after the
+stream, two backup listeners, and watchdog with a subsequent `--chatty`
+coverage record showing `live=target=4` (4/4). Use `--chatty` when verifying
+startup; optionally combine it with `--debug`. Bare `--debug` waits for the
+coverage tick (3600 seconds by default), beyond the 1800-second monitor cap.
+Default terse output has no full-coverage readiness record after the
 probe. Supervisor process presence alone is insufficient. Resolve any
 subsequent startup `stop` or child failure before proceeding.
 Do not grep that feed; default is terse.

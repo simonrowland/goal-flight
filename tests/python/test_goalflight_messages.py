@@ -2220,6 +2220,7 @@ def test_supervise_proven_migration_releases_existing_coverage_once() -> None:
     events: list[object] = []
 
     def replacement_proves_live(_args, **kwargs) -> int:
+        assert kwargs["before_renewal"](ROOT, "migration-test", "resolved-migration-nonce") is None
         events.append("probe")
         on_probe = kwargs["on_startup_probe"]
         assert on_probe(ROOT, "migration-test", "resolved-migration-nonce") is None
@@ -2287,6 +2288,7 @@ def test_supervise_uncertain_release_arms_proven_replacement() -> None:
 
     def replacement_proves_live(_args, **kwargs) -> int:
         nonlocal continued
+        assert kwargs["before_renewal"](ROOT, "migration-test", "resolved-migration-nonce") is None
         on_probe = kwargs["on_startup_probe"]
         assert on_probe(ROOT, "migration-test", "resolved-migration-nonce") is None
         continued = True
@@ -2342,6 +2344,7 @@ def test_supervise_migration_skips_released_or_reused_incumbent_pid() -> None:
     )
 
     def replacement_proves_live(_args, **kwargs) -> int:
+        assert kwargs["before_renewal"](ROOT, "migration-test", "resolved-migration-nonce") is None
         failure = kwargs["on_startup_probe"](
             ROOT,
             "migration-test",

@@ -237,9 +237,11 @@ The CLI's first write is
 `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}`.
 It proves stdout connectivity only, before migration and child spawn; it does
 not prove armed coverage. Confirm the current generation's stream, two backup
-listeners, and watchdog with a subsequent `--chatty` / `--debug` coverage record
-showing `live=target=4` (4/4). Use either flag when verifying startup; default
-terse output has no full-coverage readiness record after the probe.
+listeners, and watchdog with a subsequent `--chatty` coverage record
+showing `live=target=4` (4/4). Use `--chatty` when verifying startup; optionally
+combine it with `--debug`. Bare `--debug` waits for the coverage tick
+(3600 seconds by default), beyond the 1800-second monitor cap.
+Default terse output has no full-coverage readiness record after the probe.
 Supervisor process presence alone is insufficient. A subsequent startup `stop`
 or child failure invalidates startup success and must be resolved before
 proceeding. A later heartbeat is an internal peer probe and does not print

@@ -9191,22 +9191,20 @@ def cmd_supervise(args) -> int:
 
     probe_seen = False
     incumbents_released = False
+    verified_records: dict[int, object] = {}
 
-    def release_incumbents_after_probe(
+    def check_incumbents_before_renewal(
         project_root: Path,
         label: str,
         lease_nonce: str,
     ) -> str | None:
-        """Release the incumbents observed after proof and before child spawn."""
-        nonlocal probe_seen, incumbents_released
-        probe_seen = True
-        if incumbents_released:
-            return None
+        """Resolve migration eligibility without changing lease or coverage."""
         try:
             observed = goalflight_wake.live_waiters(
                 project_root,
                 controller_label=label,
                 generation_key=lease_nonce,
+                prune_dead=False,
                 kinds={
                     "listener",
                     goalflight_wake.MONITOR_KIND,
@@ -9225,13 +9223,13 @@ def cmd_supervise(args) -> int:
             )
         targets = frozenset(observed)
         if not targets:
-            incumbents_released = True
             return None
         try:
             refreshed = goalflight_wake.live_waiters(
                 project_root,
                 controller_label=label,
                 generation_key=lease_nonce,
+                prune_dead=False,
                 kinds={
                     "listener",
                     goalflight_wake.MONITOR_KIND,
@@ -9251,7 +9249,6 @@ def cmd_supervise(args) -> int:
         target_records = {
             record.pid: record for record in targets.intersection(refreshed)
         }
-        verified_records: dict[int, object] = {}
         identity_unknown: list[str] = []
         for pid, record in sorted(target_records.items()):
             try:
@@ -9271,6 +9268,8 @@ def cmd_supervise(args) -> int:
                     identity_unknown.append(f"pid {pid} owner is unavailable")
                     continue
                 if goalflight_wake._start_hash(start_token) == record.start_hash:
+                    if pid == os.getpid():
+                        return f"refused to signal current process {pid}; coverage retained"
                     verified_records[pid] = record
                 # A different start token proves the incumbent exited and its
                 # PID was reused. It is already released; never signal the new
@@ -9282,22 +9281,46 @@ def cmd_supervise(args) -> int:
                 "existing wake coverage identity is indeterminate before release; "
                 "coverage retained: " + "; ".join(identity_unknown)
             )
-        if not verified_records:
-            incumbents_released = True
+        return None
+
+    def release_incumbents_after_probe(
+        project_root: Path,
+        label: str,
+        lease_nonce: str,
+    ) -> str | None:
+        """Release checked incumbents only after stdout proof, before spawn."""
+        nonlocal probe_seen, incumbents_released
+        probe_seen = True
+        if incumbents_released:
             return None
 
         failures: list[str] = []
         signal_sent = False
-        for pid in sorted(verified_records):
-            if pid == os.getpid():
-                failures.append(f"refused to signal current process {pid}")
-                continue
+        for pid, record in sorted(verified_records.items()):
             try:
+                # Renewal and stdout proof intervened since preflight: never
+                # signal a reused PID, or one whose identity is now unknown.
+                identity = goalflight_compat.process_start_identity(pid)
+                start_token = (
+                    identity.get("start_token")
+                    if isinstance(identity, dict)
+                    else None
+                )
+                if start_token is None:
+                    if (
+                        goalflight_compat.pid_liveness(pid) is False
+                        or goalflight_compat.pid_is_zombie(pid) is True
+                    ):
+                        continue
+                    failures.append(f"pid {pid} owner is unavailable")
+                    continue
+                if goalflight_wake._start_hash(start_token) != record.start_hash:
+                    continue
                 os.kill(pid, signal.SIGTERM)
                 signal_sent = True
             except ProcessLookupError:
                 continue
-            except OSError as exc:
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 failures.append(f"pid {pid}: {type(exc).__name__}: {exc}")
         if failures and not signal_sent:
             return "existing wake coverage release failed: " + "; ".join(failures)
@@ -9308,7 +9331,8 @@ def cmd_supervise(args) -> int:
                 file=sys.stderr,
             )
 
-        remaining = frozenset(verified_records.values())
+        targets = frozenset(verified_records.values())
+        remaining = targets
         try:
             deadline = time.monotonic() + SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S
             while remaining and time.monotonic() < deadline:
@@ -9352,6 +9376,7 @@ def cmd_supervise(args) -> int:
     result = supervise.cmd_supervise(
         args,
         forwarding_frontier=forwarding_frontier,
+        before_renewal=check_incumbents_before_renewal,
         on_startup_probe=release_incumbents_after_probe,
     )
     if not probe_seen:
