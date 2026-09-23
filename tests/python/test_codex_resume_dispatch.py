@@ -147,6 +147,7 @@ def _stub_detached_runtime(
         "_acquire_capacity",
         lambda *_args, **_kwargs: leases.append("lease-resume") or "lease-resume",
     )
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     monkeypatch.setattr(
         D,
         "_rebuild_codex_resume_home",
@@ -234,6 +235,7 @@ def _stub_forked_runtime(
         return pid
 
     monkeypatch.setattr(D, "_acquire_capacity", acquire)
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
     monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)

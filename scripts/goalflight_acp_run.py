@@ -2142,12 +2142,12 @@ async def spawn_and_handshake_with_retry(
         proc = conn.proc
         retry_error: AcpError | None = None
         try:
-            if stderr_capture is not None:
-                await stderr_capture.attach(conn)
             if on_attempt is not None:
                 maybe = on_attempt(attempt, proc)
                 if inspect.isawaitable(maybe):
                     await maybe
+            if stderr_capture is not None:
+                await stderr_capture.attach(conn)
             try:
                 await conn.initialize(timeout=handshake_timeout)
                 if resume_session_id:
@@ -4293,6 +4293,10 @@ async def _run_acp_dispatch_impl(
 
         try:
             async with StartupGate(cfg.agent):
+                if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+                    raise RuntimeError(
+                        f"capacity lease {lease_id} lost before worker spawn"
+                    )
                 proc, conn = await spawn_and_handshake_with_retry(
                     command,
                     acp_args,

@@ -7545,6 +7545,34 @@ def _classify_local_pre_spawn_attempt(
     return LAUNCH_ATTEMPT_CLASS_UNDETERMINED
 
 
+PINNED_CARRIER_MIXED_VERSION_PREFIX = "mixed_version_pinned_carrier:"
+PINNED_CARRIER_MIXED_VERSION_FIX = (
+    "re-arm / let the drainer restart on the updated skill"
+)
+
+
+def _pinned_carrier_rejected_by_old_dispatcher(
+    proc: subprocess.CompletedProcess,
+    entry: dict,
+) -> bool:
+    """Recognize an old drainer rejecting the v2 seat-holder option."""
+    if not isinstance(entry, dict) or entry.get("schema") != DISPATCH_QUEUE_PINNED_SCHEMA:
+        return False
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    return (
+        "unrecognized arguments" in blob
+        and "--worktree-pin-holder" in blob
+    )
+
+
+def _pinned_carrier_mixed_version_reason(entry: dict) -> str:
+    carrier = str(entry.get("queue_path") or entry.get("dispatch_id") or "unknown")
+    return (
+        f"{PINNED_CARRIER_MIXED_VERSION_PREFIX}{carrier}: "
+        "running dispatcher rejected --worktree-pin-holder"
+    )
+
+
 def _classify_remote_drain_blocked(exc: "_RemoteDrainBlocked") -> str:
     """Classify a parent-side remote drain block.
 
@@ -17326,11 +17354,46 @@ def _drain_queue_once(args) -> dict:
                             pending=not committed,
                         )
                         continue
-                    diagnostic = _pre_spawn_launch_failure_reason(proc)
-                    lease.fail_reason = diagnostic
-                    lease.release_reason = (
-                        f"launch_refused_pre_spawn:{proc.returncode}"
+                    mixed_version = _pinned_carrier_rejected_by_old_dispatcher(
+                        proc, observed_claim
                     )
+                    if mixed_version:
+                        diagnostic = _pinned_carrier_mixed_version_reason(observed_claim)
+                        lease.fail_reason = diagnostic
+                        lease.release_reason = (
+                            f"launch_refused_pre_spawn:{proc.returncode}"
+                        )
+                        prior_reason = str(
+                            observed_claim.get("launch_fail_reason") or ""
+                        )
+                        if not prior_reason.startswith(
+                            PINNED_CARRIER_MIXED_VERSION_PREFIX
+                        ):
+                            attention_item = {
+                                "dispatch_id": dispatch_id,
+                                "state": "queued",
+                                "attention": "mixed_version_pinned_carrier",
+                                "carrier": str(claim),
+                                "reason": diagnostic,
+                                "fix": PINNED_CARRIER_MIXED_VERSION_FIX,
+                            }
+                            drain_acc["attention"].append(attention_item)
+                            _emit_claim_recovery_alert(
+                                {
+                                    "dispatch_id": dispatch_id,
+                                    "action": "attention",
+                                    "reason": "mixed_version_pinned_carrier",
+                                    "carrier": str(claim),
+                                    "detail": diagnostic,
+                                    "fix": PINNED_CARRIER_MIXED_VERSION_FIX,
+                                }
+                            )
+                    else:
+                        diagnostic = _pre_spawn_launch_failure_reason(proc)
+                        lease.fail_reason = diagnostic
+                        lease.release_reason = (
+                            f"launch_refused_pre_spawn:{proc.returncode}"
+                        )
                     attempt_class = _classify_local_pre_spawn_attempt(proc)
                 else:
                     lease.fail_reason = (

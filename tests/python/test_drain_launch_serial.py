@@ -662,6 +662,77 @@ def test_transient_local_pre_spawn_gate_does_not_spend_failure_budget(
     ), queued
 
 
+def test_old_dispatcher_v2_carrier_emits_one_attention_and_backs_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "old-dispatcher-v2-carrier"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    carrier = json.loads(path.read_text(encoding="utf-8"))
+    carrier["schema"] = D.DISPATCH_QUEUE_PINNED_SCHEMA
+    carrier["worktree_pin_holder"] = dispatch_id
+    carrier["worktree_seat"] = "s-1"
+    carrier["worktree_path"] = str(project / "s-1")
+    carrier["worktree_base_sha"] = "a" * 40
+    split = carrier["dispatch_argv"].index("--")
+    carrier["dispatch_argv"][split:split] = [
+        "--worktree-pin-holder",
+        dispatch_id,
+    ]
+    D._write_json_atomic(path, carrier)
+    _write_queued_ledger(path)
+
+    def old_dispatcher(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if not _is_drain_child(argv_list):
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        return subprocess.CompletedProcess(
+            argv_list,
+            2,
+            stdout="",
+            stderr=(
+                "goalflight_dispatch.py: error: unrecognized arguments: "
+                f"--worktree-pin-holder {dispatch_id}\n"
+            ),
+        )
+
+    monkeypatch.setattr(D.subprocess, "run", old_dispatcher)
+    first = D._drain_queue_once(_drain_args(queue))
+    attention = [
+        item
+        for item in first.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert len(attention) == 1, first
+    assert attention[0]["attention"] == "mixed_version_pinned_carrier", attention
+    assert dispatch_id in attention[0]["carrier"], attention
+    assert attention[0]["fix"] == D.PINNED_CARRIER_MIXED_VERSION_FIX, attention
+
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    assert queued.get("launch_attempt_class") == D.LAUNCH_ATTEMPT_CLASS_UNDETERMINED
+    assert queued.get("launch_backoff_until"), queued
+    assert str(queued.get("launch_fail_reason")).startswith(
+        D.PINNED_CARRIER_MIXED_VERSION_PREFIX
+    ), queued
+
+    queued.pop("launch_backoff_until", None)
+    D._write_json_atomic(path, queued)
+    second = D._drain_queue_once(_drain_args(queue))
+    repeated = [
+        item
+        for item in second.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert not repeated, second
+
+
 def test_remote_fleet_gate_does_not_spend_failure_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

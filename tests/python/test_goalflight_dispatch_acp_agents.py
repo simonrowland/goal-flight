@@ -1049,6 +1049,68 @@ def _restore_fake_acp(saved) -> None:
     goalflight_acp_run.validate_acp_dispatch_readiness = old_validate
 
 
+def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        status_json = tmp / "handoff-acp.status.json"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id="handoff-acp",
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        events: list[str] = []
+        real_mark = goalflight_acp_run.goalflight_capacity.mark_lease_spawning
+        real_attach = goalflight_acp_run.attach_worker_to_capacity_lease
+
+        def mark(lease_id: str | None) -> bool:
+            events.append("spawning")
+            return real_mark(lease_id)
+
+        def attach(lease_id: str | None, worker_pid: int, worker_pgid: int | None = None) -> None:
+            events.append("attach")
+            real_attach(lease_id, worker_pid, worker_pgid)
+
+        async def fake_spawn(_command, _args, **kwargs):
+            events.append("spawn")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=kwargs["cwd"],
+                env=kwargs["env"],
+            )
+            await kwargs["on_attempt"](0, proc)
+            return proc, _FakeAcpConn(proc)
+
+        async def fake_prompt(_conn, _text, **_kwargs):
+            return goalflight_acp_run.PromptResult(
+                text="COMPLETE: handoff tested\n",
+                stop_reason="end_turn",
+            )
+
+        with (
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(
+                goalflight_acp_run.goalflight_capacity,
+                "mark_lease_spawning",
+                mark,
+            ),
+            patch.object(goalflight_acp_run, "attach_worker_to_capacity_lease", attach),
+            patch.object(goalflight_acp_run, "spawn_and_handshake_with_retry", fake_spawn),
+            patch.object(goalflight_acp_run, "run_prompt", fake_prompt),
+            patch.object(
+                goalflight_acp_run,
+                "validate_acp_dispatch_readiness",
+                lambda *_args, **_kwargs: None,
+            ),
+        ):
+            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+        assert payload["state"] == "complete", payload
+        assert events[:3] == ["spawning", "spawn", "attach"], events
+
+
 def _run_acp_thread(cfg: SimpleNamespace):
     result: dict[str, object] = {}
 
