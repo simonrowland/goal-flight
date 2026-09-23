@@ -5448,54 +5448,32 @@ def _resume_launch_argv(
         # registry and fail 404, losing the whole context. So: choose a seat
         # that can actually run, then MOVE the session to it.
         configured = set(_configured_account_names(engine))
+        resume_model = record.get("model")
         target = requested or owner_account
-        if not requested and owner_account and owner_account not in configured:
-            target = next(
-                (
-                    candidate
-                    for candidate in sorted(configured)
-                    if not _account_quota_blocked(candidate, engine=engine)
-                    and _grok_account_admission_reason(candidate) is None
-                ),
-                None,
+        if not requested and owner_account:
+            owner_healthy = (
+                owner_account in configured
+                and _seat_probe_says_usable(owner_account, engine) is not False
+                and not _account_quota_blocked(owner_account, engine=engine)
+                and _grok_account_admission_reason(owner_account, model=resume_model) is None
             )
-            if target is None:
-                raise DispatchUsageError(
-                    no_healthy_seat_message(
-                        engine, owner_account, sorted(configured)
-                    )
-                )
-        if (
-            target
-            and owner_account
-            and target == owner_account
-            and (
-                _account_quota_blocked(owner_account, engine=engine)
-                or _grok_account_admission_reason(owner_account) is not None
-            )
-        ):
-            # The owning account is walled. Resume is still possible on any healthy
-            # seat once the session travels with it -- that is the whole point.
-            healthy = [
-                candidate
-                for candidate in _configured_account_names(engine)
-                if candidate != owner_account
-                and not _account_quota_blocked(candidate, engine=engine)
-                and _grok_account_admission_reason(candidate) is None
-            ]
-            if healthy:
-                target = healthy[0]
+            if owner_healthy:
+                target = owner_account
             else:
-                # Every configured account is walled. Launching anyway spends a
-                # dispatch to rediscover the same 402 and re-terminalizes the
-                # parent for nothing. Grok in particular meters a SHARED
-                # "Build usage balance", so an account change cannot help once it
-                # is gone -- only its reset can.
-                raise DispatchUsageError(
-                    no_healthy_seat_message(
-                        engine, owner_account, _configured_account_names(engine)
-                    )
+                target = _select_healthy_grok_account(
+                    model=resume_model,
+                    exclude={owner_account} if owner_account else None,
+                    named_only=True,
                 )
+                if target is None:
+                    # Every configured account is walled or unmeasured. Launching
+                    # anyway spends a dispatch to rediscover the same 402 or auth
+                    # failure and re-terminalizes the parent for nothing.
+                    raise DispatchUsageError(
+                        no_healthy_seat_message(
+                            engine, owner_account or "unknown", sorted(configured)
+                        )
+                    )
         if target and owner_account and target != owner_account:
             try:
                 ok, detail = migrate_seat_session(
@@ -6875,6 +6853,33 @@ def _cursor_account_probe(env: dict[str, str]) -> tuple[bool, str | None]:
 _GROK_SELECTION_UNSET = object()
 
 
+def _select_healthy_grok_account(
+    *,
+    model: str | None = None,
+    exclude: set[str] | None = None,
+    named_only: bool = False,
+) -> str | None:
+    """Select a measured Grok account, applying dispatch admission rules."""
+    try:
+        import grok_seats
+
+        excluded = set(exclude or ())
+        if named_only:
+            excluded.add(grok_seats.HOST_KEY)
+        selected = grok_seats.select_seat(exclude=excluded or None)
+        while selected:
+            if (
+                not _account_quota_blocked(selected, engine="grok")
+                and _grok_account_admission_reason(selected, model=model) is None
+            ):
+                return selected
+            excluded.add(selected)
+            selected = grok_seats.select_seat(exclude=excluded)
+    except BaseException as exc:
+        raise DispatchUsageError("no usable grok seat") from exc
+    return None
+
+
 def grok_selected_account(args) -> str | None:
     """The grok seat auto-selected for an UNPINNED dispatch, or None for host.
 
@@ -6893,29 +6898,11 @@ def grok_selected_account(args) -> str | None:
         return cached
     selected = None
     if not getattr(args, "account", None) and _account_engine(args.agent) == "grok":
-        try:
-            import grok_seats
-
-            selected = grok_seats.select_seat()
-            excluded: set[str] = set()
-            while selected:
-                if _account_quota_blocked(selected, engine="grok"):
-                    excluded.add(selected)
-                elif (
-                    _grok_account_admission_reason(
-                        selected,
-                        model=getattr(args, "model", None),
-                    )
-                    is None
-                ):
-                    break
-                else:
-                    excluded.add(selected)
-                selected = grok_seats.select_seat(exclude=excluded)
-        except BaseException as exc:
-            # An unknown probe is not permission to bill the host account. A
-            # pinned --account bypasses selection; an unpinned launch refuses.
-            raise DispatchUsageError("no usable grok seat") from exc
+        # An unknown probe is not permission to bill the host account. A pinned
+        # --account bypasses selection; an unpinned launch refuses.
+        selected = _select_healthy_grok_account(
+            model=getattr(args, "model", None),
+        )
     args._grok_selected_account = selected
     return selected
 

@@ -128,7 +128,11 @@ def test_walled_account_carries_session_to_healthy_account(
     record = _record(tmp_path)
     _session("old", Path(record["worker_cwd"]))
     monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **kwargs: account == "old")
-    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        D,
+        "_select_healthy_grok_account",
+        lambda **kwargs: "new",
+    )
 
     argv = D._resume_launch_argv(
         _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
@@ -150,7 +154,11 @@ def test_failed_carry_reconstructs_prompt_and_starts_fresh(
     subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
     (worktree / "partial.py").write_text("dirty = True\n", encoding="utf-8")
     monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **kwargs: account == "old")
-    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        D,
+        "_select_healthy_grok_account",
+        lambda **kwargs: "new",
+    )
     monkeypatch.setattr(D, "migrate_seat_session", lambda **kwargs: (False, "fixture carry miss"))
 
     controller_prompt = tmp_path / "controller.md"
@@ -185,7 +193,11 @@ def test_reconstruction_does_not_refuse_with_healthy_account(
     _accounts(tmp_path, "old", "new")
     record = _record(tmp_path)
     monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **kwargs: account == "old")
-    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        D,
+        "_select_healthy_grok_account",
+        lambda **kwargs: "new",
+    )
     monkeypatch.setattr(D, "migrate_seat_session", lambda **kwargs: (False, "missing artifact"))
 
     argv = D._resume_launch_argv(
@@ -195,6 +207,46 @@ def test_reconstruction_does_not_refuse_with_healthy_account(
 
     assert _option(argv, "--account") == "new"
     assert _option(argv, "--resume-mode") == "reconstructed"
+
+
+def test_fallback_uses_measured_selector_not_configured_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accounts(tmp_path, "old", "bad", "good")
+    record = _record(tmp_path)
+    calls: list[dict] = []
+
+    def measured_selector(**kwargs):
+        calls.append(kwargs)
+        return "good"
+
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **kwargs: account == "old")
+    monkeypatch.setattr(D, "_select_healthy_grok_account", measured_selector)
+
+    argv = D._resume_launch_argv(
+        _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
+        resume_args=_resume_args(),
+    )
+
+    assert _option(argv, "--account") == "good"
+    assert calls == [{"model": None, "exclude": {"old"}, "named_only": True}]
+
+
+def test_measured_unhealthy_owner_falls_back_without_ledger_wall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accounts(tmp_path, "old", "good")
+    record = _record(tmp_path)
+    monkeypatch.setattr(D, "_seat_probe_says_usable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **kwargs: "good")
+
+    argv = D._resume_launch_argv(
+        _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
+        resume_args=_resume_args(),
+    )
+
+    assert _option(argv, "--account") == "good"
 
 
 def test_resume_mode_is_carried_into_status_metadata_and_watcher(
