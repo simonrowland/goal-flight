@@ -1341,6 +1341,16 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
     assert frontier["payload"]["truncated"] is True
 
 
+def test_frontier_disabled_mirror_advises_task_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "0")
+    # No projection attributes: disabled mirrors must return before accessing files.
+    frontier = messages._follow_frontier_snapshot(SimpleNamespace())
+    assert frontier["payload"]["state"] == "unavailable"
+    assert frontier["payload"]["detail"] == (
+        "next-task hint unavailable; run goalflight_task.py next"
+    )
+
+
 def test_frontier_reads_only_materialized_projection_and_marks_stale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

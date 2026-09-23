@@ -651,6 +651,57 @@ def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_st
     assert snapshot(tmp_path) == settled
 
 
+@pytest.mark.parametrize("alive", [False, True])
+def test_settle_releases_capacity_only_for_dead_worker(prepared, alive):
+    project, authority, attempt, carrier = prepared
+    assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
+    row = attempt_row(authority)
+    assert ledger.read_record("withdraw-test")["state"] == "queued"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        identity = ledger.process_identity(child.pid)
+        assert identity and identity.get("start_token"), identity
+        capacity.save_state({
+            "leases": {
+                "settle-lease": {
+                    "lease_id": "settle-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "attached",
+                    "project_root": str(project),
+                    "worker_pid": child.pid,
+                    "worker_identity": identity,
+                    "expires_at": capacity.iso(capacity.utc_now() + dt.timedelta(hours=1)),
+                },
+            },
+            "cooldowns": {},
+        })
+        if not alive:
+            child.terminate()
+            child.wait(timeout=10)
+
+        code, result = withdraw()
+        assert code == 0 and result["status"] == "settled", result
+        assert ledger.read_record("withdraw-test")["terminal_state"] == "blocked"
+        assert attempt_row(authority) == row
+        assert not carrier.exists()
+        lease = capacity.load_state()["leases"]["settle-lease"]
+        assert lease["state"] == ("active" if alive else "blocked")
+        if alive:
+            assert child.poll() is None
+            assert "released_at" not in lease
+        else:
+            assert lease["released_at"]
+            assert lease["reason"] == "dispatch_terminal"
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
+
+
 def test_settle_refuses_live_worker_in_parallel_carrier(prepared, claimed):
     _, authority, attempt, carrier = prepared
     assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
