@@ -1946,13 +1946,17 @@ def _clone_or_copy(src: Path, dst: Path) -> None:
 
 
 def _file_matches_bytes(path: Path, data: bytes) -> bool:
-    if not require_regular_or_absent(path) or path.stat().st_size != len(data):
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != len(data):
+            return False
+        with path.open("rb") as source:
+            for offset in range(0, len(data), 1024 * 1024):
+                if source.read(1024 * 1024) != data[offset:offset + 1024 * 1024]:
+                    return False
+            return not source.read(1)
+    except OSError:
         return False
-    with path.open("rb") as source:
-        for offset in range(0, len(data), 1024 * 1024):
-            if source.read(1024 * 1024) != data[offset:offset + 1024 * 1024]:
-                return False
-        return not source.read(1)
 
 
 def _atomic_write_text(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
@@ -2695,6 +2699,7 @@ class TaskStore:
             }
             targets = {target: source for target, source in targets.items() if source.name not in unchanged}
             if not targets:
+                self._clear_publish_marker()
                 if export:
                     self._export_to_project_tree()
                 with contextlib.suppress(Exception):
@@ -2883,7 +2888,7 @@ class TaskStore:
 
     def _prune_backups(self, keep: int = 20) -> None:
         for pattern in ("tasks-*.jsonl", "tasks-data-*.js"):
-            backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.name, reverse=True)
+            backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
             for path in backups[keep:]:
                 with contextlib.suppress(OSError):
                     path.unlink()

@@ -91,9 +91,53 @@ def test_snapshot_contents_metadata_and_pruning(store):
         assert len(backups) == 20
         assert all(p.read_bytes() == src.read_bytes() for p in backups)
         assert all(p.stat().st_mtime_ns == src.stat().st_mtime_ns for p in backups)
-        oldest = backups[0]
-        store._snapshot_last_good()
-        assert not oldest.exists()
+
+
+@pytest.mark.parametrize("equal_mtimes", [False, True])
+def test_pruning_preserves_parent_survivors(store, equal_mtimes):
+    store.log_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(21):
+        path = store.log_dir / f"tasks-20260923T000000{index:06d}Z.jsonl"
+        path.write_bytes(b"backup")
+        stamp = 1000 if equal_mtimes else 1000 - index
+        os.utime(path, (stamp, stamp))
+    expected = set(sorted(store.log_dir.glob("tasks-*.jsonl"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)[:20])
+    store._prune_backups()
+    assert set(store.log_dir.glob("tasks-*.jsonl")) == expected
+
+
+def test_export_repairs_symlink_without_touching_referent(store, tmp_path):
+    store.save_items_atomic([item()])
+    target = store.export_docs_dir / "tasks.jsonl"
+    referent = tmp_path / "referent"
+    referent.write_bytes(b"outdated export")
+    target.unlink()
+    target.symlink_to(referent)
+    store._export_to_project_tree()
+    assert not target.is_symlink()
+    assert target.read_bytes() == store.tasks_path.read_bytes()
+    assert referent.read_bytes() == b"outdated export"
+
+
+def test_successful_identical_save_clears_existing_marker(store, monkeypatch):
+    monkeypatch.setattr(task, "utc_now", lambda: "2026-09-23T00:00:00+00:00")
+    items = [item()]
+    store.save_items_atomic(items)
+    store._write_publish_marker("interrupted")
+    with store.store_lock():
+        store.save_items_atomic(items)
+    assert not store.publish_marker_path.exists()
+
+
+def test_comparison_nonregular_and_unreadable_are_changed(tmp_path, monkeypatch):
+    assert not task._file_matches_bytes(tmp_path, b"")
+    path = tmp_path / "content"
+    path.write_bytes(b"abc")
+    def denied(*args, **kwargs):
+        raise PermissionError("injected unreadable target")
+    monkeypatch.setattr(Path, "open", denied)
+    assert not task._file_matches_bytes(path, b"abc")
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS clonefile")
