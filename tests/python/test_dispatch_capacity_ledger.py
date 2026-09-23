@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_ledger  # noqa: E402
 import goalflight_rate_pressure as rp  # noqa: E402
 import goalflight_watch  # noqa: E402
+import goalflight_worktree_pool  # noqa: E402
 
 
 def _env(tmp: Path) -> dict[str, str]:
@@ -1302,26 +1303,50 @@ def case_worker_dead_state_releases_and_classifies_terminal() -> None:
         _assert_terminal_record_and_lease(env, dispatch_id, "worker_dead")
 
 
-def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
+def case_idle_timeout_live_worker_retains_lease_and_classifies_terminal() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         dispatch_id = "dispatch-idle-timeout"
-        # A cwd equal to the sandbox project root makes the tree probe
-        # skip (cwd_is_canonical_root) and classify_liveness never wedges.
-        # Init a git root so --cwd under it collapses to tmp as project_root
-        # while remaining a distinct worker cwd the probe can scan.
-        worker_cwd = tmp / "worker-cwd"
-        worker_cwd.mkdir()
         subprocess.run(
-            ["git", "init", "-q"],
+            ["git", "init", "-q", "-b", "main"],
             cwd=tmp,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        (tmp / "seed.txt").write_text("idle-timeout fixture\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "seed.txt"],
+            cwd=tmp,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Goal Flight Test",
+                "-c",
+                "user.email=goal-flight-test@example.invalid",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+            cwd=tmp,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        setup_lease = goalflight_worktree_pool.acquire_worktree_seat(
+            tmp,
+            "idle-timeout-seat-setup",
+        )
+        worker_cwd = setup_lease.path
+        setup_lease.release()
         worker_pid = None
         try:
             proc = _run_dispatch(
@@ -1339,12 +1364,17 @@ def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
             status = json.loads((tmp / f"{dispatch_id}.status.json").read_text())
             assert status["state"] == "idle_timeout", status
             assert status.get("tree_probe") == "measured", status
-            _assert_terminal_record_and_lease(env, dispatch_id, "idle_timeout")
+            # Idle timeout is terminal for the dispatch, but the sleeping
+            # worker remains live for re-attachment; its capacity lease must
+            # stay active until that exact worker generation is gone.
+            _assert_terminal_record_and_lease(
+                env, dispatch_id, "idle_timeout", lease_state="active"
+            )
         finally:
             _kill_if_alive(worker_pid)
 
 
-def case_watcher_failure_releases_as_failed() -> None:
+def case_watcher_failure_retains_live_lease_and_records_failure() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -1364,7 +1394,11 @@ def case_watcher_failure_releases_as_failed() -> None:
             worker_pid = _worker_pid_from_stdout(proc.stdout)
             assert proc.returncode == 1, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
             assert '"watcher_exit": 1' in proc.stdout, proc.stdout
-            _assert_terminal_record_and_lease(env, dispatch_id, "failed")
+            # A watcher error does not prove that the sleeping worker is gone;
+            # retain its lease until its exact process generation is dead.
+            _assert_terminal_record_and_lease(
+                env, dispatch_id, "failed", lease_state="active"
+            )
         finally:
             _kill_if_alive(worker_pid)
 
@@ -1432,7 +1466,11 @@ def case_nonzero_watcher_running_status_finalizes_failed() -> None:
         assert row and row.get("state") == "failed", row
         assert row.get("terminal_state") == "error", row
         assert row.get("reason") == "watcher_exit_9", row
-        assert all(lease.get("state") == "failed" for lease in _leases(payload, dispatch_id)), payload
+        # Capacity leases use the terminal-state vocabulary; a dispatch
+        # failure is recorded as the terminal state ``error``.
+        assert all(
+            lease.get("state") == "error" for lease in _leases(payload, dispatch_id)
+        ), payload
 
 
 def case_wait_ignores_stale_terminal_status_for_prior_worker() -> None:
@@ -1733,8 +1771,8 @@ def main() -> None:
     case_dispatch_end_worker_still_alive_flags()
     case_dispatch_id_collision_suffix()
     case_worker_dead_state_releases_and_classifies_terminal()
-    case_idle_timeout_state_releases_and_classifies_terminal()
-    case_watcher_failure_releases_as_failed()
+    case_idle_timeout_live_worker_retains_lease_and_classifies_terminal()
+    case_watcher_failure_retains_live_lease_and_records_failure()
     case_nonzero_watcher_running_status_finalizes_failed()
     case_wait_ignores_stale_terminal_status_for_prior_worker()
     case_post_spawn_registration_failure_still_runs_watcher()
