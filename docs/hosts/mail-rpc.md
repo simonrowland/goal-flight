@@ -8,6 +8,8 @@ does not open a second store on the VPS.
 
 Wake webhooks stay nudge-only. They carry no mail body. See
 [hosts/grok-bot.md](grok-bot.md) (dual doorbell / outbound wake webhook).
+Planes, the single-URL wake gap, and the users-file direction:
+[event-organization.md](../event-organization.md).
 
 ## Endpoints
 

@@ -363,7 +363,9 @@ promptness until something else wakes it.
 
 ## Dual doorbell
 
-Two independent planes, both required for promptness on this host:
+Two independent planes, both required for promptness on this host.
+Organization backlog (journal vs mail vs wake, and the single-URL gap):
+[event-organization.md](../event-organization.md).
 
 1. **Inbox / truth** = the journal on the laptop. `relay` / `advance` are how
    the controller reads. A host that cannot local-exec uses the mail RPC
