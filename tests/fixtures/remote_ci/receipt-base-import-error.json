@@ -1,0 +1,12 @@
+{
+  "schema": "goalflight.remote-ci.receipt.v1",
+  "hostname": "ci-worker.example.invalid",
+  "status": "pass",
+  "returncode": 0,
+  "passed": 11,
+  "failed": 0,
+  "errors": 0,
+  "failing_node_ids": [],
+  "collection_import_errors": ["tests/test_consumer.py"],
+  "first_error_lines": ["ERROR collecting tests/test_consumer.py"]
+}

@@ -86,6 +86,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
 | **dead worker: resume or redispatch** | Dispatch Model | `protocols/dispatch-resume.md`, `scripts/goalflight_dispatch.py resume <id>` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
+| **remote CI runner and matched-pair gate** | Remote CI | `protocols/remote-ci.md`, `docs/remote-ci-runbook.md`, `scripts/goalflight_remote_ci.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
 | resume/compaction | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
 | context discipline | Context Discipline | context-mode, `scripts/goalflight_*.py` |
