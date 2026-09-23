@@ -2665,6 +2665,24 @@ async def _run_acp_dispatch_impl(
             setattr(cfg, "_codex_dispatch_home_resolved", True)
         capacity_account = codex_selected_account
 
+    if (
+        goalflight_ledger.infer_engine(cfg.agent) == "grok"
+        and not getattr(cfg, "account", None)
+    ):
+        try:
+            import goalflight_dispatch
+
+            if not getattr(cfg, "_grok_selection_complete", False):
+                setattr(
+                    cfg,
+                    "_grok_selected_account",
+                    goalflight_dispatch.grok_selected_account(cfg),
+                )
+                setattr(cfg, "_grok_selection_complete", True)
+            capacity_account = getattr(cfg, "_grok_selected_account", None)
+        except ImportError:
+            pass
+
     acquire_args = argparse.Namespace(
         agent=cfg.agent,
         account=capacity_account,

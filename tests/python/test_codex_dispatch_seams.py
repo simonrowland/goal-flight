@@ -908,6 +908,28 @@ def test_acp_capacity_request_keeps_pinned_account_and_model(
     assert capacity_calls[0].model == "gpt-5.6-luna"
 
 
+def test_acp_grok_selection_reaches_capacity_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    selected: list[str] = []
+    monkeypatch.setattr(
+        D,
+        "grok_selected_account",
+        lambda _cfg: selected.append("healthy") or "healthy",
+    )
+    capacity_calls: list[argparse.Namespace] = []
+    _cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        account=None,
+        agent="grok-acp",
+        capacity_calls=capacity_calls,
+    )
+    assert selected == ["healthy"]
+    assert capacity_calls[0].account == "healthy"
+
+
 def test_acp_capacity_uses_selected_account_before_home_resolution(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

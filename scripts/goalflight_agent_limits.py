@@ -90,6 +90,13 @@ DEFAULT_AGENT_CAPS = {
     "paperclip": 2,
 }
 
+# Per-account provider policy is separate from the generic per-pool worker cap.
+# Operators may override this through account_caps.default in the machine-local
+# capacity profile without changing the committed pool baseline.
+DEFAULT_ACCOUNT_CAPS = {
+    "grok": 50,
+}
+
 # Bash-tail and dispatch presets that share one engine/provider concurrency budget.
 AGENT_CAP_POOL: dict[str, str] = {
     "codex-acp": "codex",
@@ -297,7 +304,12 @@ def account_cap(vendor: str, account: str | None = None, *, default: int | None 
         return int(value)
     if default is not None:
         return int(default)
-    return int(DEFAULT_AGENT_CAPS.get(vendor_key, DEFAULT_AGENT_CAPS.get(vendor, 2)))
+    return int(
+        DEFAULT_ACCOUNT_CAPS.get(
+            vendor_key,
+            DEFAULT_AGENT_CAPS.get(vendor_key, DEFAULT_AGENT_CAPS.get(vendor, 2)),
+        )
+    )
 
 
 def model_weight(vendor: str, model: str | None = None) -> float:

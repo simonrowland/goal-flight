@@ -39,9 +39,15 @@ def isolated_capacity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     return tmp_path
 
 
-def _args(*, account: str, model: str | None = None, max_total: int = 20):
+def _args(
+    *,
+    account: str,
+    model: str | None = None,
+    max_total: int = 20,
+    agent: str = "codex",
+):
     return argparse.Namespace(
-        agent="codex",
+        agent=agent,
         account=account,
         model=model,
         dispatch_id=f"dispatch-{account}",
@@ -66,10 +72,18 @@ def _args(*, account: str, model: str | None = None, max_total: int = 20):
     )
 
 
-def _acquire(account: str, *, model: str | None = None, max_total: int = 20):
+def _acquire(
+    account: str,
+    *,
+    model: str | None = None,
+    max_total: int = 20,
+    agent: str = "codex",
+):
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        rc = cap.cmd_acquire(_args(account=account, model=model, max_total=max_total))
+        rc = cap.cmd_acquire(
+            _args(account=account, model=model, max_total=max_total, agent=agent)
+        )
     return rc, json.loads(out.getvalue())
 
 
@@ -97,6 +111,18 @@ def test_accounts_fill_independently_and_machine_ceiling_still_binds(isolated_ca
     assert _acquire("beta", max_total=2)[0] == 0
     rc, payload = _acquire("alpha", max_total=2)
     assert rc == 2 and payload["reason"] == "machine_worker_cap", payload
+
+
+def test_grok_accounts_fill_independently_to_default_account_cap(isolated_capacity):
+    cap.ACCOUNT_CAPS["grok"] = {"default": 50}
+    assert cap.account_cap("grok", "alpha") == 50
+    assert cap.account_cap("grok", "beta") == 50
+    for account in ("alpha", "beta"):
+        for _ in range(50):
+            rc, payload = _acquire(account, max_total=200, agent="grok-code")
+            assert rc == 0, (account, payload)
+    rc, payload = _acquire("alpha", max_total=200, agent="grok-research")
+    assert rc == 2 and payload["reason"] == "account_worker_cap", payload
 
 
 def test_model_weights_sum_against_account_cap(isolated_capacity, monkeypatch):
@@ -138,6 +164,28 @@ def test_legacy_vendor_lease_uses_ledger_account_for_capacity(isolated_capacity,
     assert "codex/default" not in rows
 
 
+def test_legacy_grok_lease_migrates_once_to_ledger_account(isolated_capacity, monkeypatch):
+    cap.ACCOUNT_CAPS["grok"] = {"default": 50}
+    legacy_lease = {
+        "dispatch_id": "legacy-grok-alpha",
+        "agent": "grok-code",
+        "state": "active",
+        "capacity_weight": 1.0,
+    }
+    monkeypatch.setattr(
+        cap,
+        "_dispatch_record_for_lease",
+        lambda lease: {"effective_account": "alpha"}
+        if lease is legacy_lease
+        else None,
+    )
+    rows = cap.account_capacity_rows([legacy_lease])
+    assert rows["grok/alpha"]["active"] == 1
+    assert rows["grok/alpha"]["active_weight"] == 1.0
+    assert rows["grok/alpha"]["cap"] == 50
+    assert "grok/default" not in rows
+
+
 def test_account_cooldown_does_not_block_sibling(isolated_capacity):
     with cap.StateLock():
         state = cap.load_state()
@@ -174,6 +222,37 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     selected, rejected = dispatch.select_codex_account()
     assert selected == "healthy"
     assert rejected == [{"account": "walled", "reason": "walled or quota-blocked"}]
+
+
+def test_walled_grok_account_does_not_block_healthy_account(monkeypatch):
+    import grok_seats
+
+    calls: list[set[str] | None] = []
+
+    def select_seat(*, exclude=None):
+        calls.append(exclude)
+        return "healthy" if exclude == {"walled"} else "walled"
+
+    monkeypatch.setattr(grok_seats, "select_seat", select_seat)
+    monkeypatch.setattr(
+        dispatch, "_account_quota_blocked", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda _agent, *, account, **_kwargs: {
+            "unreadable": False,
+            "account_remaining": 0 if account == "walled" else 50,
+            "request_weight": 1.0,
+            "by_account": {},
+        },
+    )
+
+    selected = dispatch.grok_selected_account(
+        SimpleNamespace(agent="grok-code", account=None, model=None)
+    )
+    assert selected == "healthy"
+    assert calls == [None, {"walled"}]
 
 
 def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monkeypatch, tmp_path):
@@ -275,3 +354,31 @@ def test_status_and_usage_render_account_active_cap(isolated_capacity):
     )
     assert "codex/alpha: active=1" in rendered
     assert "cap=2" in rendered
+
+
+def test_status_and_usage_render_grok_account_active_cap(isolated_capacity):
+    cap.ACCOUNT_CAPS["grok"] = {"default": 50}
+    assert _acquire("alpha", agent="grok-code")[0] == 0
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        rc = cap.main(["status", "--json", "--ram-mb", "65536"])
+    assert rc == 0
+    status = json.loads(output.getvalue())
+    row = status["by_account"]["grok/alpha"]
+    assert row["active"] == 1
+    assert row["cap"] == 50
+    rendered = usage.render_table(
+        [{
+            "provider": "grok",
+            "account": "alpha",
+            "used": "10%",
+            "remaining": "90%",
+            "reset_at": None,
+            "flags": [],
+            "evidence": {},
+        }],
+        now=0,
+        capacity_rows=status["by_account"],
+    )
+    assert "grok/alpha: active=1" in rendered
+    assert "cap=50" in rendered

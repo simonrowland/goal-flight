@@ -871,6 +871,7 @@ ACCOUNT_ENGINE_BY_AGENT = {
     "grok-code": "grok",
     "grok-research": "grok",
     "grok-acp": "grok",
+    "grok-bash-tail": "grok",
     # Kimi is single-account by design; no rotation/profile knob is exposed.
     "cursor": "cursor",
     "cursor-agent": "cursor",
@@ -6539,6 +6540,39 @@ def _account_quota_blocked(
     return False
 
 
+def _grok_account_admission_reason(
+    account: str,
+    *,
+    model: str | None = None,
+) -> str | None:
+    """Return why a selected Grok account lacks capacity headroom.
+
+    An unreadable capacity state stays the acquire path's fail-closed concern;
+    selection may still return the measured healthy seat so the eventual
+    acquire reports the authoritative refusal. A readable full account is
+    excluded here so a healthy sibling can be selected instead.
+    """
+    try:
+        budget = goalflight_capacity.launch_slot_budget(
+            "grok",
+            account=account,
+            model=model,
+        )
+    except (TypeError, ValueError, OSError):
+        return None
+    if budget.get("unreadable"):
+        return None
+    try:
+        remaining = budget.get("account_remaining")
+        request_weight = budget.get("request_weight", 1.0)
+        if remaining is not None and float(remaining) < float(request_weight):
+            row = (budget.get("by_account") or {}).get(f"grok/{account}") or {}
+            return f"capacity {row.get('active_weight', 0)}/{row.get('cap', '?')} weight"
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def _first_unblocked_account(
     engine: str,
     *,
@@ -6610,8 +6644,19 @@ def grok_selected_account(args) -> str | None:
 
             selected = grok_seats.select_seat()
             excluded: set[str] = set()
-            while selected and _account_quota_blocked(selected, engine="grok"):
-                excluded.add(selected)
+            while selected:
+                if _account_quota_blocked(selected, engine="grok"):
+                    excluded.add(selected)
+                elif (
+                    _grok_account_admission_reason(
+                        selected,
+                        model=getattr(args, "model", None),
+                    )
+                    is None
+                ):
+                    break
+                else:
+                    excluded.add(selected)
                 selected = grok_seats.select_seat(exclude=excluded)
         except BaseException as exc:
             # An unknown probe is not permission to bill the host account. A
@@ -18072,6 +18117,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
+        _grok_selected_account=getattr(args, "_grok_selected_account", None),
+        _grok_selection_complete=hasattr(args, "_grok_selected_account"),
         project_root=str(project_root),
         cwd=str(acp_cwd) if acp_cwd is not None else None,
         worktree=acp_worktree,
@@ -19856,6 +19903,8 @@ def main(argv: list[str] | None = None) -> int:
             args._codex_pre_resolved_account = pre_resolved_account
             codex_dispatch_home = pre_resolved_home
             effective_account = pre_resolved_account
+        if _account_engine(args.agent) == "grok" and not getattr(args, "account", None):
+            args._capacity_account = grok_selected_account(args)
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
         except (SystemExit, KeyboardInterrupt) as exc:

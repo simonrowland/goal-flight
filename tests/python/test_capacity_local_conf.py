@@ -55,6 +55,7 @@ def case_absent_conf_keeps_committed_baseline() -> None:
     assert mod.LOCAL_OVERRIDES == {}, mod.LOCAL_OVERRIDES
     assert mod.DEFAULT_AGENT_CAPS["grok"] == 30
     assert mod.DEFAULT_AGENT_CAPS["codex"] == 18
+    assert mod.account_cap("grok", "new-account") == 50
     assert mod.local_hard_cap(40) == 40
     assert mod.local_operating_total() is None
 
