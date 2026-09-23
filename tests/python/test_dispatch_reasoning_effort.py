@@ -91,3 +91,33 @@ def test_unknown_model_and_unreadable_cache(codex_home):
 def test_autoreview_matches_parser_union():
     review = runpy.run_path(str(ROOT / "autoreview/scripts/autoreview"))
     assert review["THINKING_LEVELS_BY_ENGINE"]["codex"] == D.CODEX_REASONING_EFFORTS
+
+
+@pytest.mark.parametrize("agent", ["codex", "codex-acp", "worker"])
+@pytest.mark.parametrize("route", [["--shape", "acp"], ["--interactive"]])
+@pytest.mark.parametrize("effort", sorted(D.CODEX_REASONING_EFFORTS))
+def test_acp_refuses_effort_before_launch_setup(monkeypatch, capsys, agent, route, effort):
+    def unexpected_setup(*_args, **_kwargs):
+        pytest.fail("unsupported ACP effort reached launch setup")
+
+    monkeypatch.setattr(D, "_ensure_assigned_engine_session", unexpected_setup)
+    assert D.main([
+        "--agent", agent, *route, "--model", "gpt-5.5",
+        "--reasoning-effort", effort, "--prompt", "read only",
+    ]) == 64
+    error = capsys.readouterr().err
+    assert "--reasoning-effort is not supported for Codex over ACP" in error
+    assert "--shape bash without --interactive" in error
+
+
+@pytest.mark.parametrize("route", [["--shape", "acp"], ["--interactive"], ["--shape", "bash"]])
+def test_codex_without_effort_reaches_launch_setup(monkeypatch, route):
+    class LaunchSetupReached(Exception):
+        pass
+
+    def stop_before_setup(*_args, **_kwargs):
+        raise LaunchSetupReached
+
+    monkeypatch.setattr(D, "_ensure_assigned_engine_session", stop_before_setup)
+    with pytest.raises(LaunchSetupReached):
+        D.main(["--agent", "codex", *route, "--prompt", "read only"])

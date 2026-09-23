@@ -18356,6 +18356,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                         default=None,
                         help="Codex reasoning effort for this dispatch "
                              f"({', '.join(sorted(CODEX_REASONING_EFFORTS))}). "
+                             "Bash only; unsupported with --shape acp or --interactive. "
                              "Validated against the selected model's models_cache.json; "
                              "fallback: low, medium, high, xhigh. "
                              "Default = whatever the worker CLI config sets, so "
@@ -18676,6 +18677,17 @@ def main(argv: list[str] | None = None) -> int:
     if shape == "auto":
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
+    if (
+        shape == "acp"
+        and args.agent in {"codex", "codex-acp", "worker"}
+        and args.reasoning_effort is not None
+    ):
+        print(
+            "goalflight_dispatch: --reasoning-effort is not supported for Codex over ACP; "
+            "use --agent codex --shape bash without --interactive to set it.",
+            file=sys.stderr,
+        )
+        return 64
     if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
         print(
             "goalflight_dispatch: cursor over acp is blocked pending a fix; use the "
