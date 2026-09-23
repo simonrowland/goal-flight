@@ -819,16 +819,6 @@ def worker_identity_liveness(
     return "live", "worker_identity_match"
 
 
-def _lease_machine_id(lease: dict, data: dict | None = None) -> str:
-    """Return the host that owns a lease, including legacy state-level leases."""
-    recorded = lease.get("machine_id")
-    if recorded not in (None, ""):
-        return str(recorded)
-    if data is not None and data.get("machine_id") not in (None, ""):
-        return str(data["machine_id"])
-    return machine_id()
-
-
 def _lease_is_local(lease: dict, data: dict | None = None) -> bool:
     """Only probe process identities for leases owned by this host.
 
@@ -837,7 +827,8 @@ def _lease_is_local(lease: dict, data: dict | None = None) -> bool:
     drift (network-assigned names), so ``machine_id()`` can differ from the
     stamp written earlier by the same machine. A lease is local when it names
     no machine, names the file's own stamp, or names the current hostname id;
-    only a lease naming some other machine is remote.
+    only a lease naming some other machine is remote. A state directory shared
+    between machines (GOALFLIGHT_STATE_DIR on shared storage) is not supported.
     """
     recorded = lease.get("machine_id")
     if recorded in (None, ""):
