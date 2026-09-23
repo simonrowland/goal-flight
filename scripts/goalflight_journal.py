@@ -40,6 +40,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -132,6 +133,8 @@ MAX_TRANSACTION_OPERATIONS = 128
 MAX_OPERATION_ROWS = 10_000
 MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
+DEFAULT_JOURNAL_RETENTION_S = 30 * 24 * 60 * 60.0
+DEFAULT_JOURNAL_COMPACTION_THRESHOLD_BYTES = 64 * 1024 * 1024
 OUTBOX_MAX_PROJECTION_ATTEMPTS = 3
 OUTBOX_RETRY_BASE_S = 1.0
 WAKE_WEBHOOK_OUTBOX_RETRY_BASE_S = 1.0
@@ -147,6 +150,12 @@ WAKE_WEBHOOK_OUTBOX_FLUSH_LIMIT = 8
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
+
+# Startup validation is a process-level guard, not a claim that an SQLite file
+# can never be corrupted after it was checked. The file identity is part of the
+# key so a restore/replace gets a fresh validation in this process.
+_INTEGRITY_CHECKED_IDENTITIES: set[tuple[str, int, int]] = set()
+_INTEGRITY_CHECK_LOCK = threading.Lock()
 # Writer-capable clients sit on durable launch, lifecycle, and cursor-CAS paths:
 # failing them can poison an id or replay acknowledged-looking mail.  Under 64
 # concurrent writers, successful *construction* measured 0.024-3.725s (N=7,
@@ -1083,6 +1092,16 @@ class Journal:
             jitter_max_s=jitter_max_s,
         )
         self._require_existing_database()
+        # A current schema can be established with a read-only marker probe;
+        # avoid taking the construction lock and running the bootstrap
+        # transaction on every short-lived writer open.
+        if self._schema_is_current_readonly():
+            self._open_validated(
+                created_here=False,
+                busy_deadline_s=None,
+                bootstrap=False,
+            )
+            return
         write_lock, deadline = self._acquire_construction_lock()
         try:
             self._require_existing_database()
@@ -1195,6 +1214,11 @@ class Journal:
         self._persistent_reader = bool(persistent)
         self._reader_connection: sqlite3.Connection | None = None
         self._reader_pid: int | None = None
+        if self._persistent_reader:
+            # Start the holder at construction time. A lazy handle leaves a
+            # window where a short-lived writer can still be SQLite's last
+            # connection and trigger WAL sidecar cleanup.
+            self._connect()
         return self
 
     def _configure(
@@ -1299,13 +1323,94 @@ class Journal:
                 "different database cannot inherit this client's authority."
             )
 
+    def _integrity_cache_key(self) -> tuple[str, int, int]:
+        self._require_existing_database()
+        if self._file_identity is None:
+            raise JournalIOError(f"journal file identity is unavailable: {self.path}")
+        return (str(self.path), self._file_identity[0], self._file_identity[1])
+
+    def _integrity_check_cached(self) -> bool:
+        key = self._integrity_cache_key()
+        with _INTEGRITY_CHECK_LOCK:
+            return key in _INTEGRITY_CHECKED_IDENTITIES
+
+    def _schema_is_current_readonly(self) -> bool:
+        """Read the SQLite schema marker without taking the construction lock."""
+        try:
+            with contextlib.closing(
+                _open_readonly_connection(self.path, timeout=0, isolation_level=None)
+            ) as connection:
+                row = connection.execute("PRAGMA user_version").fetchone()
+                if row is None:
+                    raise JournalIntegrityError(
+                        f"journal schema probe returned no user_version for {self.path}"
+                    )
+                try:
+                    user_version = int(row[0])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise JournalIntegrityError(
+                        f"journal schema probe returned invalid user_version for {self.path}: {row[0]!r}"
+                    ) from exc
+                if user_version != CURRENT_SCHEMA_EPOCH:
+                    return False
+                epoch_row = connection.execute(
+                    """
+                    SELECT schema_epoch, protocol_epoch, registry_epoch,
+                           minimum_reader_epoch, minimum_writer_epoch
+                    FROM journal_epochs WHERE singleton = 1
+                    """
+                ).fetchone()
+                try:
+                    epochs = tuple(int(value) for value in epoch_row) if epoch_row else ()
+                except (TypeError, ValueError, OverflowError):
+                    epochs = ()
+                if epochs != (
+                    CURRENT_SCHEMA_EPOCH,
+                    CURRENT_PROTOCOL_EPOCH,
+                    CURRENT_REGISTRY_EPOCH,
+                    CURRENT_READER_EPOCH,
+                    CURRENT_WRITER_EPOCH,
+                ):
+                    return False
+                outbox_sql_row = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'terminal_outbox'"
+                ).fetchone()
+                if outbox_sql_row is not None and re.search(
+                    r"CHECK\s*\(\s*event_type\s+IN\s*\(\s*'result'\s*,\s*'blocked'\s*\)\s*\)",
+                    str(outbox_sql_row[0]),
+                    flags=re.IGNORECASE,
+                ):
+                    return False
+                identity_row = connection.execute(
+                    "SELECT value FROM journal_meta WHERE key = ?",
+                    (JOURNAL_IDENTITY_KEY,),
+                ).fetchone()
+                if identity_row is None or str(identity_row[0]) != JOURNAL_IDENTITY_VALUE:
+                    return False
+                missing, malformed = self._current_schema_issues(connection)
+        except sqlite3.DatabaseError as exc:
+            if _is_busy(exc):
+                return False
+            if _is_corruption_error(exc):
+                self._raise_integrity_failure(str(exc))
+            raise JournalIOError(
+                f"journal schema probe unavailable/unreadable for {self.path}: {exc}"
+            ) from exc
+        return not missing and not malformed
+
     def _open_validated(
-        self, *, created_here: bool, busy_deadline_s: float | None = None
+        self,
+        *,
+        created_here: bool,
+        busy_deadline_s: float | None = None,
+        bootstrap: bool = True,
     ) -> None:
-        self._startup_integrity_check(busy_deadline_s=busy_deadline_s)
-        self._bootstrap_schema(
-            created_here=created_here, busy_deadline_s=busy_deadline_s
-        )
+        if not self._integrity_check_cached():
+            self._startup_integrity_check(busy_deadline_s=busy_deadline_s)
+        if bootstrap:
+            self._bootstrap_schema(
+                created_here=created_here, busy_deadline_s=busy_deadline_s
+            )
         # Enforced on open even though P1 has only epoch 1.  Reads repeat the
         # fence so a long-lived client cannot outlive a migration unnoticed.
         self._read_with_retry(
@@ -1445,7 +1550,22 @@ class Journal:
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
 
-    def _startup_integrity_check(self, *, busy_deadline_s: float | None = None) -> None:
+    def _startup_integrity_check(
+        self,
+        *,
+        busy_deadline_s: float | None = None,
+        force: bool = False,
+    ) -> None:
+        key = self._integrity_cache_key()
+        with _INTEGRITY_CHECK_LOCK:
+            if not force and key in _INTEGRITY_CHECKED_IDENTITIES:
+                return
+            self._startup_integrity_check_uncached(busy_deadline_s=busy_deadline_s)
+            _INTEGRITY_CHECKED_IDENTITIES.add(key)
+
+    def _startup_integrity_check_uncached(
+        self, *, busy_deadline_s: float | None = None
+    ) -> None:
         started = time.monotonic()
         deadline = (
             started + self.retry_budget_s
@@ -1516,8 +1636,15 @@ class Journal:
                 required = {"journal_meta", "journal_epochs"}
                 if required <= tables:
                     self._assert_identity(connection)
+                    user_version = int(
+                        connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
                     migrated = self._migrate_to_current(connection)
-                    if migrated:
+                    if migrated or user_version != CURRENT_SCHEMA_EPOCH:
+                        self._assert_epoch_fence(connection, for_write=False)
+                        connection.execute(
+                            f"PRAGMA user_version = {CURRENT_SCHEMA_EPOCH}"
+                        )
                         connection.commit()
                     else:
                         self._assert_epoch_fence(connection, for_write=False)
@@ -1592,6 +1719,7 @@ class Journal:
                 self._install_p2_schema(connection)
                 self._install_p3_schema(connection)
                 self._install_p4_schema(connection)
+                connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_EPOCH}")
                 connection.commit()
                 connection.execute("PRAGMA journal_mode = WAL")
                 return
@@ -6225,6 +6353,234 @@ class Journal:
             return stale
 
         return self._domain_write(action)
+
+    def retain_settled_rows(
+        self,
+        *,
+        older_than: str | dt.datetime | None = None,
+        retention_s: float = DEFAULT_JOURNAL_RETENTION_S,
+        batch_size: int = 1000,
+        compact_threshold_bytes: int = DEFAULT_JOURNAL_COMPACTION_THRESHOLD_BYTES,
+    ) -> dict[str, object]:
+        """Delete one bounded batch of settled history and optionally compact it.
+
+        Live attempts, unprojected/quarantined terminal outbox rows, active
+        delivery rows, open attention, and active leases are never candidates.
+        The maintenance caller supplies the retention window; the default is
+        deliberately conservative for an unattended periodic job.
+        """
+        if not 0 < retention_s < float("inf"):
+            raise ValueError("retention_s must be finite and > 0")
+        if not 1 <= batch_size <= MAX_OPERATION_ROWS:
+            raise ValueError(f"batch_size must be between 1 and {MAX_OPERATION_ROWS}")
+        if compact_threshold_bytes < 0:
+            raise ValueError("compact_threshold_bytes must be >= 0")
+        if older_than is None:
+            cutoff = (
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=retention_s)
+            ).isoformat(timespec="seconds")
+        elif isinstance(older_than, dt.datetime):
+            parsed_cutoff = older_than
+            if parsed_cutoff.tzinfo is None:
+                parsed_cutoff = parsed_cutoff.replace(tzinfo=dt.timezone.utc)
+            cutoff = parsed_cutoff.astimezone(dt.timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        else:
+            parsed_cutoff = _parse_utc(older_than)
+            if parsed_cutoff is None:
+                raise ValueError("older_than must be an ISO-8601 UTC timestamp")
+            cutoff = parsed_cutoff.isoformat(timespec="seconds")
+
+        self._startup_integrity_check(force=True)
+
+        def action(connection: sqlite3.Connection) -> dict[str, int]:
+            counts = {
+                "dispatch_attempts": 0,
+                "dispatch_transitions": 0,
+                "terminal_outbox": 0,
+                "delivery_events": 0,
+                "wake_webhook_outbox": 0,
+                "attention_items": 0,
+                "system_attention_items": 0,
+                "listener_coverage": 0,
+                "controller_leases": 0,
+            }
+            attempt_rows = connection.execute(
+                """
+                SELECT a.attempt_id
+                FROM dispatch_attempts AS a
+                WHERE a.lifecycle_state IN ('TERMINAL', 'ABANDONED')
+                  AND a.terminal_at IS NOT NULL
+                  AND a.terminal_at < ?
+                  AND EXISTS (
+                      SELECT 1 FROM terminal_outbox AS o
+                      WHERE o.attempt_id = a.attempt_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM terminal_outbox AS o
+                      WHERE o.attempt_id = a.attempt_id
+                        AND (o.projected_at IS NULL OR o.projection_quarantined_at IS NOT NULL)
+                  )
+                ORDER BY a.terminal_at, a.attempt_id
+                LIMIT ?
+                """,
+                (cutoff, batch_size),
+            ).fetchall()
+            attempt_ids = [str(row[0]) for row in attempt_rows]
+            if attempt_ids:
+                placeholders = ", ".join("?" for _ in attempt_ids)
+                counts["terminal_outbox"] = connection.execute(
+                    f"DELETE FROM terminal_outbox WHERE attempt_id IN ({placeholders})",
+                    attempt_ids,
+                ).rowcount
+                counts["dispatch_transitions"] = connection.execute(
+                    f"DELETE FROM dispatch_transitions WHERE attempt_id IN ({placeholders})",
+                    attempt_ids,
+                ).rowcount
+                counts["dispatch_attempts"] = connection.execute(
+                    f"DELETE FROM dispatch_attempts WHERE attempt_id IN ({placeholders})",
+                    attempt_ids,
+                ).rowcount
+
+            counts["delivery_events"] = connection.execute(
+                """
+                DELETE FROM delivery_events
+                WHERE rowid IN (
+                    SELECT rowid FROM delivery_events
+                    WHERE withdrawn_at IS NOT NULL AND withdrawn_at < ?
+                    ORDER BY withdrawn_at, rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            counts["wake_webhook_outbox"] = connection.execute(
+                """
+                DELETE FROM wake_webhook_outbox
+                WHERE rowid IN (
+                    SELECT rowid FROM wake_webhook_outbox
+                    WHERE (delivered_at IS NOT NULL OR abandoned_at IS NOT NULL)
+                      AND COALESCE(delivered_at, abandoned_at) < ?
+                    ORDER BY COALESCE(delivered_at, abandoned_at), rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            counts["attention_items"] = connection.execute(
+                """
+                DELETE FROM attention_items
+                WHERE rowid IN (
+                    SELECT rowid FROM attention_items
+                    WHERE state = 'RESOLVED' AND resolved_at IS NOT NULL
+                      AND resolved_at < ?
+                    ORDER BY resolved_at, rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            counts["system_attention_items"] = connection.execute(
+                """
+                DELETE FROM system_attention_items
+                WHERE rowid IN (
+                    SELECT rowid FROM system_attention_items
+                    WHERE state = 'RESOLVED' AND resolved_at IS NOT NULL
+                      AND resolved_at < ?
+                    ORDER BY resolved_at, rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            counts["listener_coverage"] = connection.execute(
+                """
+                DELETE FROM listener_coverage
+                WHERE rowid IN (
+                    SELECT rowid FROM listener_coverage
+                    WHERE state = 'EXITED' AND exited_at IS NOT NULL
+                      AND exited_at < ?
+                    ORDER BY exited_at, rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            counts["controller_leases"] = connection.execute(
+                """
+                DELETE FROM controller_leases
+                WHERE rowid IN (
+                    SELECT lease.rowid
+                    FROM controller_leases AS lease
+                    WHERE lease.state != 'ACTIVE'
+                      AND lease.ended_at IS NOT NULL
+                      AND lease.ended_at < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM attention_items AS item
+                          WHERE item.project_root = lease.project_root
+                            AND item.source_label = lease.label
+                            AND item.source_generation = lease.generation
+                            AND item.state = 'OPEN'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM listener_coverage AS coverage
+                          WHERE coverage.project_root = lease.project_root
+                            AND coverage.label = lease.label
+                            AND coverage.lease_generation = lease.generation
+                      )
+                    ORDER BY lease.ended_at, lease.rowid LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            ).rowcount
+            return counts
+
+        result = self._domain_write(action)
+        if not result.committed:
+            return {
+                "cutoff": cutoff,
+                "deleted": {},
+                "compacted": False,
+                "disposition": result.disposition.value,
+                "reason": result.reason,
+            }
+        counts = result.value or {}
+        deleted = sum(counts.values())
+        compacted = False
+        if deleted and self._journal_size_bytes() >= compact_threshold_bytes:
+            compacted = self._compact_journal()
+        return {
+            "cutoff": cutoff,
+            "deleted": counts,
+            "compacted": compacted,
+            "disposition": result.disposition.value,
+        }
+
+    def _journal_size_bytes(self) -> int:
+        total = 0
+        for candidate in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            try:
+                total += candidate.stat().st_size
+            except FileNotFoundError:
+                continue
+        return total
+
+    def _compact_journal(self) -> bool:
+        write_lock, deadline = self._acquire_construction_lock()
+        try:
+            connection = self._connect(busy_deadline_s=deadline)
+            try:
+                checkpoint = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if checkpoint is None or int(checkpoint[0]) != 0:
+                    raise JournalBusy(f"journal checkpoint remained busy: {self.path}")
+                connection.execute("VACUUM")
+                return True
+            finally:
+                connection.close()
+        finally:
+            write_lock.release()
 
     def inspect(self) -> dict[str, object]:
         def action(connection: sqlite3.Connection) -> dict[str, object]:
