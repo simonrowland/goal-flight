@@ -1007,7 +1007,7 @@ def test_cpu_keep_waiting_all_none_is_unknown() -> None:
     assert keep is None and cpu is None, (keep, cpu)
 
 
-def test_cpu_keep_waiting_real_ps_failure_is_unknown() -> None:
+def test_cpu_keep_waiting_uses_native_counter_when_ps_is_unavailable() -> None:
     with tempfile.TemporaryDirectory() as td:
         bindir = Path(td)
         ps = bindir / "ps"
@@ -1032,11 +1032,17 @@ def test_cpu_keep_waiting_real_ps_failure_is_unknown() -> None:
                     sleep=_noop_sleep,
                 )
             )
-            assert keep is None and cpu is None, (keep, cpu)
+            if sys.platform.startswith("linux") or sys.platform == "darwin":
+                assert keep is False and cpu is not None, (keep, cpu)
+            else:
+                assert keep is None and cpu is None, (keep, cpu)
 
             gate = IdleLivenessGate(0.1, hard_wall_s=100.0, now=lambda: 0.0)
             keep, cpu = asyncio.run(gate.keep_waiting(sampler))
-            assert keep is True and cpu is None, (keep, cpu)
+            if sys.platform.startswith("linux") or sys.platform == "darwin":
+                assert keep is False and cpu is not None, (keep, cpu)
+            else:
+                assert keep is True and cpu is None, (keep, cpu)
         finally:
             if previous_path is None:
                 os.environ.pop("PATH", None)

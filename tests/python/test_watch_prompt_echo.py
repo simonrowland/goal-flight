@@ -398,9 +398,9 @@ def case_prompt_ignore_stops_at_first_mismatch() -> None:
 
 
 def case_identity_mismatch_not_alive() -> None:
-    original = goalflight_watch.goalflight_ledger.process_identity
+    original = goalflight_watch._lightweight_process_identity
     try:
-        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+        goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "actual process start",
             "comm": "worker",
@@ -410,16 +410,16 @@ def case_identity_mismatch_not_alive() -> None:
             {"pid": 12345, "lstart": "expected process start", "comm": "worker"},
         )
     finally:
-        goalflight_watch.goalflight_ledger.process_identity = original
+        goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is False, current
     assert reason == "pid_reused_lstart", reason
 
 
 def case_matching_lstart_ignores_comm_form_change() -> None:
-    original = goalflight_watch.goalflight_ledger.process_identity
+    original = goalflight_watch._lightweight_process_identity
     try:
-        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+        goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "Sun May 31 19:28:48 2026",
             "comm": "(grok-0.2.11-maco)",
@@ -429,7 +429,7 @@ def case_matching_lstart_ignores_comm_form_change() -> None:
             {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
         )
     finally:
-        goalflight_watch.goalflight_ledger.process_identity = original
+        goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
     assert reason == "live", reason
@@ -438,9 +438,9 @@ def case_matching_lstart_ignores_comm_form_change() -> None:
 def case_exec_comm_change_with_same_lstart_is_alive() -> None:
     # The launcher records its Python identity before execing the worker CLI.
     # exec preserves pid+lstart while legitimately replacing comm.
-    original = goalflight_watch.goalflight_ledger.process_identity
+    original = goalflight_watch._lightweight_process_identity
     try:
-        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+        goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "lstart": "Sun May 31 19:28:48 2026",
             "comm": "node",
@@ -450,16 +450,16 @@ def case_exec_comm_change_with_same_lstart_is_alive() -> None:
             {"pid": 12345, "lstart": "Sun May 31 19:28:48 2026", "comm": "grok"},
         )
     finally:
-        goalflight_watch.goalflight_ledger.process_identity = original
+        goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
     assert reason == "live", reason
 
 
 def case_missing_lstart_matching_comm_is_inconclusive_alive() -> None:
-    original = goalflight_watch.goalflight_ledger.process_identity
+    original = goalflight_watch._lightweight_process_identity
     try:
-        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+        goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "comm": "(grok-0.2.11-maco)",
         }
@@ -468,16 +468,16 @@ def case_missing_lstart_matching_comm_is_inconclusive_alive() -> None:
             {"pid": 12345, "comm": "grok"},
         )
     finally:
-        goalflight_watch.goalflight_ledger.process_identity = original
+        goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
     assert reason == "identity_inconclusive_missing_expected_current_lstart", reason
 
 
 def case_missing_lstart_unrelated_comm_is_inconclusive_alive() -> None:
-    original = goalflight_watch.goalflight_ledger.process_identity
+    original = goalflight_watch._lightweight_process_identity
     try:
-        goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
+        goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
             "comm": "python",
         }
@@ -486,7 +486,7 @@ def case_missing_lstart_unrelated_comm_is_inconclusive_alive() -> None:
             {"pid": 12345, "comm": "grok"},
         )
     finally:
-        goalflight_watch.goalflight_ledger.process_identity = original
+        goalflight_watch._lightweight_process_identity = original
 
     assert is_alive is True, current
     assert reason == "identity_inconclusive_missing_expected_current_lstart", reason

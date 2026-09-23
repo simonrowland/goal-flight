@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import time
 from typing import Awaitable, Callable
@@ -469,20 +471,71 @@ def cpu_pct_from_cputime_delta(
     return cputime_delta_seconds(before, after) / window_s * 100.0
 
 
-def _pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
-    """One ps sweep, or None when the sample itself is unavailable."""
+def _linux_pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
+    """Read process-group CPU counters from procfs without forking ``ps``."""
     try:
-        output = subprocess.check_output(
-            ["ps", "-A", "-o", "pgid=,pid=,time="],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=2.0,
-        )
-    except (OSError, subprocess.SubprocessError):
+        clock_ticks = float(os.sysconf("SC_CLK_TCK"))
+        proc_entries = os.scandir("/proc")
+    except (OSError, ValueError):
         return None
-    return parse_ps_pgroup_cputime(output, pgid)
+    sample: dict[int, float] = {}
+    try:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = Path(entry.path, "stat").read_text(encoding="utf-8")
+                fields = stat[stat.rfind(")") + 2 :].split()
+                if int(fields[2]) != pgid:
+                    continue
+                cpu_ticks = int(fields[11]) + int(fields[12])
+                sample[int(entry.name)] = cpu_ticks / clock_ticks
+            except (IndexError, OSError, ValueError, ZeroDivisionError):
+                continue
+    finally:
+        proc_entries.close()
+    return sample
+
+
+def _darwin_pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
+    """Read libproc process-group CPU counters without spawning ``ps``."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        snapshot = goalflight_compat.darwin_process_snapshot()
+        if snapshot is None:
+            return None
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pid_rusage.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        )
+        libproc.proc_pid_rusage.restype = ctypes.c_int
+        sample: dict[int, float] = {}
+        for row in snapshot:
+            pid = int(row["pid"])
+            if int(row["pgid"]) != pgid:
+                continue
+            if pid <= 0:
+                continue
+            usage = (ctypes.c_ubyte * 1024)()
+            if libproc.proc_pid_rusage(pid, 4, ctypes.byref(usage)) != 0:
+                continue
+            user_ns, system_ns = struct.unpack_from("=QQ", usage, 16)
+            sample[pid] = (user_ns + system_ns) / 1_000_000_000.0
+        return sample
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
+    """Read native cumulative CPU counters; never fork a process-table probe."""
+    if goalflight_compat.is_linux():
+        return _linux_pgroup_cputime_snapshot(pgid)
+    if goalflight_compat.is_macos():
+        return _darwin_pgroup_cputime_snapshot(pgid)
+    return None
 
 
 def pgroup_cputime_snapshot(pgid_or_pid: int | str | None) -> dict[int, float] | None:
