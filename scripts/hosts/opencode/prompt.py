@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -28,8 +29,6 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
-
 DEFAULT_PORT = 4096
 DEFAULT_MODEL = "litellm/frontier-coder"
 ROUTING_PROMPT = (
@@ -92,8 +91,34 @@ def _health_ok(base: str) -> bool:
         return False
 
 
-def _start_server(port: int, directory: Path, log_path: Path) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
+def default_log_path(port: int) -> Path:
+    return Path(f"/tmp/opencode-serve-{port}.log")
+
+
+def _open_server_log(log_path: Path, *, max_bytes: int = 16 * 1024 * 1024, keep: int = 2):
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    paths = [log_path] + [log_path.with_name(f"{log_path.name}.{i}") for i in range(1, keep + 1)]
+    sizes = []
+    for path in paths:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            sizes.append(None)
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError(f"refusing symlinked log path: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"refusing non-regular log path: {path}")
+        sizes.append(info.st_size)
+    if sizes[0] is not None and sizes[0] > max_bytes:
+        for i in range(keep, 0, -1):
+            if sizes[i - 1] is not None:
+                paths[i - 1].replace(paths[i])
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    return os.fdopen(os.open(log_path, flags, 0o600), "ab")
+
+
+def _start_server(port: int, directory: Path, log_path: Path) -> subprocess.Popen[bytes]:
     cmd = [
         "opencode",
         "serve",
@@ -103,18 +128,11 @@ def _start_server(port: int, directory: Path, log_path: Path) -> tuple[subproces
         "127.0.0.1",
     ]
     env = os.environ.copy()
-    server = subprocess.Popen(
-        cmd, cwd=str(directory), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env=env, start_new_session=True,
-    )
-    assert server.stdout is not None
-    writer = subprocess.Popen(
-        [sys.executable, str(REPO_ROOT / "scripts" / "goalflight_opencode_log_writer.py"), str(log_path)],
-        stdin=server.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    server.stdout.close()
-    return server, writer
+    with _open_server_log(log_path) as output:
+        return subprocess.Popen(
+            cmd, cwd=str(directory), stdout=output, stderr=subprocess.STDOUT,
+            env=env, start_new_session=True,
+        )
 
 
 def _wait_for_health(base: str, timeout_s: float) -> None:
@@ -196,18 +214,15 @@ def prompt_once(
     provider_id, model_id = _parse_model(model)
     started_server = False
     server_proc: subprocess.Popen[bytes] | None = None
-    writer_proc: subprocess.Popen[bytes] | None = None
 
     if not _health_ok(base):
-        server_proc, writer_proc = _start_server(port, directory, log_path)
+        server_proc = _start_server(port, directory, log_path)
         started_server = True
         try:
             _wait_for_health(base, boot_timeout_s)
         except RuntimeError:
             if server_proc.poll() is None:
                 os.killpg(server_proc.pid, signal.SIGTERM)
-            if writer_proc is not None and writer_proc.poll() is None:
-                writer_proc.terminate()
             raise
 
     try:
@@ -252,11 +267,6 @@ def prompt_once(
                 server_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(server_proc.pid, signal.SIGKILL)
-        if started_server and not keep_server and writer_proc is not None:
-            try:
-                writer_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                writer_proc.terminate()
 
 
 def main() -> int:
@@ -269,7 +279,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180.0, help="Seconds to wait for model reply")
     parser.add_argument("--keep-server", action="store_true", help="Leave opencode serve running after success")
     parser.add_argument("--routing-test", action="store_true", help="Run Goal Flight routing smoke test")
-    parser.add_argument("--log", default=str(Path("/tmp/opencode-serve.log")), help="Serve log path when auto-starting")
+    parser.add_argument("--log", help="Serve log path when auto-starting (default: /tmp/opencode-serve-<port>.log)")
     args = parser.parse_args()
 
     _load_litellm_env()
@@ -287,7 +297,7 @@ def main() -> int:
             boot_timeout_s=args.boot_timeout,
             reply_timeout_s=args.timeout,
             keep_server=args.keep_server,
-            log_path=Path(args.log),
+            log_path=Path(args.log) if args.log else default_log_path(args.port),
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
