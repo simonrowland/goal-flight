@@ -5450,6 +5450,8 @@ def _resume_launch_argv(
     if not (isinstance(owner_account, str) and owner_account and owner_account != "default"):
         owner_account = None
     requested = resume_account.strip() if isinstance(resume_account, str) and resume_account.strip() else None
+    resume_mode = "same-account"
+    reconstruction_prompt: Path | None = None
 
     if engine == "codex":
         # Codex carries --codex-resume-home, so the rollout is read from the
@@ -5461,61 +5463,67 @@ def _resume_launch_argv(
         # account without them makes the CLI fall back to its per-account remote
         # registry and fail 404, losing the whole context. So: choose a seat
         # that can actually run, then MOVE the session to it.
+        configured = set(_configured_account_names(engine))
+        resume_model = record.get("model")
         target = requested or owner_account
-        if (
-            target
-            and owner_account
-            and target == owner_account
-            and _account_quota_blocked(owner_account, engine=engine)
-        ):
-            # The owning account is walled. Resume is still possible on any healthy
-            # seat once the session travels with it -- that is the whole point.
-            healthy = [
-                candidate
-                for candidate in _configured_account_names(engine)
-                if candidate != owner_account
-                and not _account_quota_blocked(candidate, engine=engine)
-            ]
-            if healthy:
-                target = healthy[0]
-            else:
-                # Every configured account is walled. Launching anyway spends a
-                # dispatch to rediscover the same 402 and re-terminalizes the
-                # parent for nothing. Grok in particular meters a SHARED
-                # "Build usage balance", so an account change cannot help once it
-                # is gone -- only its reset can.
-                raise DispatchUsageError(
-                    no_healthy_seat_message(
-                        engine, owner_account, _configured_account_names(engine)
-                    )
-                )
-        if target and owner_account and target != owner_account:
-            ok, detail = migrate_seat_session(
-                engine=engine,
-                session_id=source["session_id"],
-                worker_cwd=str(cwd),
-                from_account=owner_account,
-                to_account=target,
+        if not requested and owner_account:
+            owner_healthy = (
+                owner_account in configured
+                and _seat_probe_says_usable(owner_account, engine) is not False
+                and not _account_quota_blocked(owner_account, engine=engine)
+                and _grok_account_admission_reason(owner_account, model=resume_model) is None
             )
+            if owner_healthy:
+                target = owner_account
+            else:
+                target = _select_healthy_grok_account(
+                    model=resume_model,
+                    exclude={owner_account} if owner_account else None,
+                    named_only=True,
+                )
+                if target is None:
+                    # Every configured account is walled or unmeasured. Launching
+                    # anyway spends a dispatch to rediscover the same 402 or auth
+                    # failure and re-terminalizes the parent for nothing.
+                    raise DispatchUsageError(
+                        no_healthy_seat_message(
+                            engine, owner_account or "unknown", sorted(configured)
+                        )
+                    )
+        if target and owner_account and target != owner_account:
+            try:
+                ok, detail = migrate_seat_session(
+                    engine=engine,
+                    session_id=source["session_id"],
+                    worker_cwd=str(cwd),
+                    from_account=owner_account,
+                    to_account=target,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                ok, detail = False, f"session carry failed: {type(exc).__name__}: {exc}"
             print(
                 f"goalflight_dispatch: resume account move {owner_account} -> {target}: {detail}",
                 file=sys.stderr,
             )
-            if not ok:
-                # Could not LOCATE the session to move it. That is an unknown,
-                # not proof the resume is doomed: the layout may differ, or the
-                # CLI may still restore from its own store. Warn and let the
-                # engine give the authoritative answer -- do not refuse on a
-                # read that did not complete. (The measured no-tokens case
-                # above is a different thing and does refuse.)
+            if ok:
+                resume_mode = "carried"
+            else:
+                reconstruction_prompt = _build_grok_reconstruction_prompt(
+                    record,
+                    parent_dispatch_id=str(resume_args.dispatch_id),
+                    child_dispatch_id=child_dispatch_id,
+                    session_id=source["session_id"],
+                    cwd=cwd,
+                    controller_prompt=prompt_path,
+                )
+                resume_mode = "reconstructed"
                 print(
-                    f"goalflight_dispatch: WARN: could not move the {engine} session from "
-                    f"account {owner_account!r} to {target!r} ({detail}). The session lives in "
-                    f"the owning seat's HOME; if the CLI cannot restore it from its own "
-                    f"store the resume will fail and the context is lost. Resume on "
-                    f"{owner_account!r} once its quota resets to keep the context for sure.",
+                    "goalflight_dispatch: Grok session carry was unavailable; "
+                    "using resumed-by-reconstruction",
                     file=sys.stderr,
                 )
+        elif target and owner_account and target == owner_account:
+            resume_mode = "same-account"
         if target:
             replace["--account"] = target
     elif requested:
@@ -5561,6 +5569,21 @@ def _resume_launch_argv(
         )
         + sandbox_strip_options,
     )
+    if source["engine"] == "grok":
+        replace_mode = resume_mode
+        argv = _set_option_before_worker_remainder(
+            argv, "--resume-mode", replace_mode
+        )
+        if resume_mode == "reconstructed":
+            argv = _set_option_before_worker_remainder(
+                argv, "--prompt-file", str(reconstruction_prompt)
+            )
+            argv = _set_option_before_worker_remainder(
+                argv,
+                "--engine-session-id",
+                goalflight_engine_sessions.new_session_id("grok"),
+            )
+            argv = _insert_before_worker_remainder(argv, ["--resume-reconstruction"])
     if "--account" not in replace:
         # Drop a recorded pin onto a now-exhausted (or Codex-rotating) account
         # so default selection can skip recently exhausted accounts.
@@ -6469,9 +6492,117 @@ def migrate_seat_session(
         return [n for n in names if n.endswith(".lock")]
     tmp = dst.with_name(dst.name + ".migrating")
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
-    os.replace(tmp, dst)
+    try:
+        shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
+        os.replace(tmp, dst)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return True, f"migrated {from_account} -> {to_account}: {dst}"
+
+
+_GROK_RECONSTRUCTION_LINES = 60
+
+
+def _read_reconstruction_excerpt(
+    path: Path | None, *, last_lines: int | None = _GROK_RECONSTRUCTION_LINES
+) -> str:
+    if path is None:
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines if last_lines is None else lines[-last_lines:]).strip()
+
+
+def _reconstruction_git_state(cwd: Path) -> str:
+    commands = (
+        ("git status --short", ["git", "status", "--short"]),
+        ("git diff --stat", ["git", "diff", "--stat"]),
+    )
+    sections: list[str] = []
+    for label, command in commands:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            output = (completed.stdout or completed.stderr).strip()
+            sections.append(f"{label}:\n{output or '(clean or unavailable)'}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            sections.append(f"{label}:\n(unavailable: {type(exc).__name__})")
+    return "\n\n".join(sections)
+
+
+def _build_grok_reconstruction_prompt(
+    record: dict,
+    *,
+    parent_dispatch_id: str,
+    child_dispatch_id: str,
+    session_id: str,
+    cwd: Path,
+    controller_prompt: Path,
+) -> Path:
+    """Build the bounded context given to a fresh Grok session after a carry miss."""
+    owner_account = record.get("effective_account") or record.get("account")
+    owner_account = owner_account if isinstance(owner_account, str) else None
+    session_dir = _seat_session_dir(
+        owner_account or "", "grok", str(cwd), session_id
+    )
+    original_prompt = record.get("prompt_path")
+    original_text = _read_reconstruction_excerpt(
+        Path(original_prompt).expanduser() if isinstance(original_prompt, str) else None,
+        last_lines=None,
+    )
+    summary = _read_reconstruction_excerpt(
+        session_dir / "summary.json" if session_dir is not None else None,
+        last_lines=120,
+    )
+    transcript = _read_reconstruction_excerpt(
+        session_dir / "chat_history.jsonl" if session_dir is not None else None,
+    )
+    tail_raw = record.get("stdout_path") or record.get("tail_path")
+    tail = _read_reconstruction_excerpt(
+        Path(tail_raw).expanduser() if isinstance(tail_raw, str) else None,
+    )
+    context = [
+        "RESUMED-BY-RECONSTRUCTION",
+        f"The original Grok session {session_id} could not be carried to the healthy account.",
+        f"Continue the same Goal Flight dispatch lineage; parent dispatch id: {parent_dispatch_id}.",
+        f"The worker is already in the original worktree: {cwd}",
+        "",
+        "## Original worker brief",
+        original_text or "(original brief unavailable; use the controller prompt below)",
+        "",
+        "## Last local Grok session summary",
+        summary or "(no local summary available)",
+        "",
+        "## Last local Grok transcript turns",
+        transcript or "(no local transcript available)",
+        "",
+        "## Last dispatch tail",
+        tail or "(no dispatch tail available)",
+        "",
+        "## Current worktree state",
+        _reconstruction_git_state(cwd),
+        "",
+        "## Controller resume prompt",
+        _read_reconstruction_excerpt(controller_prompt, last_lines=None)
+        or "(no controller resume prompt available)",
+        "",
+        "Reconstruct the next action from this evidence, preserve existing worktree changes, and report that this is a resumed-by-reconstruction attempt.",
+    ]
+    _prepare_private_dispatch_dir()
+    output = _dispatch_base_dir() / f"{child_dispatch_id}.reconstructed.prompt"
+    _atomic_write_private_text(output, "\n".join(context) + "\n")
+    return output
 
 
 def _account_home(account: str, engine: str) -> Path:
@@ -6744,6 +6875,33 @@ def _cursor_account_probe(env: dict[str, str]) -> tuple[bool, str | None]:
 _GROK_SELECTION_UNSET = object()
 
 
+def _select_healthy_grok_account(
+    *,
+    model: str | None = None,
+    exclude: set[str] | None = None,
+    named_only: bool = False,
+) -> str | None:
+    """Select a measured Grok account, applying dispatch admission rules."""
+    try:
+        import grok_seats
+
+        excluded = set(exclude or ())
+        if named_only:
+            excluded.add(grok_seats.HOST_KEY)
+        selected = grok_seats.select_seat(exclude=excluded or None)
+        while selected:
+            if (
+                not _account_quota_blocked(selected, engine="grok")
+                and _grok_account_admission_reason(selected, model=model) is None
+            ):
+                return selected
+            excluded.add(selected)
+            selected = grok_seats.select_seat(exclude=excluded)
+    except BaseException as exc:
+        raise DispatchUsageError("no usable grok seat") from exc
+    return None
+
+
 def grok_selected_account(args) -> str | None:
     """The grok seat auto-selected for an UNPINNED dispatch, or None for host.
 
@@ -6762,29 +6920,11 @@ def grok_selected_account(args) -> str | None:
         return cached
     selected = None
     if not getattr(args, "account", None) and _account_engine(args.agent) == "grok":
-        try:
-            import grok_seats
-
-            selected = grok_seats.select_seat()
-            excluded: set[str] = set()
-            while selected:
-                if _account_quota_blocked(selected, engine="grok"):
-                    excluded.add(selected)
-                elif (
-                    _grok_account_admission_reason(
-                        selected,
-                        model=getattr(args, "model", None),
-                    )
-                    is None
-                ):
-                    break
-                else:
-                    excluded.add(selected)
-                selected = grok_seats.select_seat(exclude=excluded)
-        except BaseException as exc:
-            # An unknown probe is not permission to bill the host account. A
-            # pinned --account bypasses selection; an unpinned launch refuses.
-            raise DispatchUsageError("no usable grok seat") from exc
+        # An unknown probe is not permission to bill the host account. A pinned
+        # --account bypasses selection; an unpinned launch refuses.
+        selected = _select_healthy_grok_account(
+            model=getattr(args, "model", None),
+        )
     args._grok_selected_account = selected
     return selected
 
@@ -7368,6 +7508,8 @@ def _prelaunch_status_metadata(
     parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
     if parent_dispatch_id:
         metadata["parent_dispatch_id"] = parent_dispatch_id
+    if getattr(args, "resume_mode", None):
+        metadata["resume_mode"] = args.resume_mode
     resolved_session_id = (
         codex_session_id
         or _resolved_engine_session_id(args)
@@ -7612,6 +7754,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     codex_home=codex_home or getattr(args, "codex_resume_home", None),
                     codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                     parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                    resume_mode=getattr(args, "resume_mode", None),
                     worker_cwd=(
                         None
                         if state in PRE_WORKER_LEDGER_STATES
@@ -8158,8 +8301,11 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--occupied-worktree-forced": "preserve",
     "--controller-beacon-pid": "preserve",
     "--controller-session-id": "preserve",
+    "--operator-recovery": "preserve",
     "--parent-dispatch-id": "preserve",
     "--engine-session-id": "preserve",
+    "--resume-mode": "strip",
+    "--resume-reconstruction": "strip",
     "--codex-session-id": "preserve",
     "--codex-resume-home": "preserve",
     "--codex-home-owner-dispatch-id": "preserve",
@@ -8167,6 +8313,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--tail": "replace",
     "--status-json": "replace",
     "--foreground": "strip",
+    "--skip-worktree-reset": "inject",
     "--takeover": "strip",
     "--acp-detached-child": "strip",
     "--from-queue": "inject",
@@ -8212,6 +8359,7 @@ _REPLAY_VALUE_OPTIONS = {
     "--controller-session-id",
     "--parent-dispatch-id",
     "--engine-session-id",
+    "--resume-mode",
     "--codex-session-id",
     "--codex-resume-home",
     "--codex-home-owner-dispatch-id",
@@ -9264,6 +9412,7 @@ def _watcher_spawn_argv(
     codex_session_id: str | None = None,
     engine_session_id: str | None = None,
     parent_dispatch_id: str | None = None,
+    resume_mode: str | None = None,
     codex_home_owner_dispatch_id: str | None = None,
     controller_pid: int | None = None,
     controller_session_id: str | None = None,
@@ -9327,6 +9476,8 @@ def _watcher_spawn_argv(
         watch_cmd += ["--engine-session-id", engine_session_id]
     if parent_dispatch_id is not None:
         watch_cmd += ["--parent-dispatch-id", parent_dispatch_id]
+    if resume_mode is not None:
+        watch_cmd += ["--resume-mode", resume_mode]
     if codex_home_owner_dispatch_id is not None:
         watch_cmd += [
             "--codex-home-owner-dispatch-id",
@@ -18300,8 +18451,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         resume_session_id=(
             _resolved_engine_session_id(args)
             if getattr(args, "parent_dispatch_id", None)
+            and not getattr(args, "resume_reconstruction", False)
             else None
         ),
+        resume_mode=getattr(args, "resume_mode", None),
+        resume_reconstruction=bool(getattr(args, "resume_reconstruction", False)),
         parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
         dispatch_id=args.dispatch_id,
         from_queue=bool(getattr(args, "from_queue", False)),
@@ -19063,7 +19217,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         codex_session_id = goalflight_codex_sessions.valid_session_id(
             getattr(args, "codex_session_id", None)
         )
-        if getattr(args, "parent_dispatch_id", None):
+        if getattr(args, "parent_dispatch_id", None) and not getattr(args, "resume_reconstruction", False):
             if codex_session_id is None:
                 raise DispatchUsageError(
                     "codex resume launch requires a recorded session handle"
@@ -19160,7 +19314,10 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += goalflight_engine_sessions.session_argv(
                 "grok",
                 grok_session_id,
-                resume=bool(getattr(args, "parent_dispatch_id", None)),
+                resume=bool(
+                    getattr(args, "parent_dispatch_id", None)
+                    and not getattr(args, "resume_reconstruction", False)
+                ),
             )
         return argv, None
     if args.agent == "moonshot":
@@ -19175,7 +19332,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         extra = (["--model", args.model] if getattr(args, "model", None) else []) \
                 + ["--add-dir", resolved_cwd]
         kimi_session_id = _resolved_engine_session_id(args)
-        if kimi_session_id and getattr(args, "parent_dispatch_id", None):
+        if kimi_session_id and getattr(args, "parent_dispatch_id", None) and not getattr(args, "resume_reconstruction", False):
             extra += goalflight_engine_sessions.session_argv(
                 "moonshot", kimi_session_id, resume=True
             )
@@ -19193,7 +19350,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             "text",
         ]
         cursor_session_id = _resolved_engine_session_id(args)
-        if cursor_session_id and getattr(args, "parent_dispatch_id", None):
+        if cursor_session_id and getattr(args, "parent_dispatch_id", None) and not getattr(args, "resume_reconstruction", False):
             argv += goalflight_engine_sessions.session_argv(
                 "cursor", cursor_session_id, resume=True
             )
@@ -19213,7 +19370,10 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += goalflight_engine_sessions.session_argv(
                 "claude",
                 claude_session_id,
-                resume=bool(getattr(args, "parent_dispatch_id", None)),
+                resume=bool(
+                    getattr(args, "parent_dispatch_id", None)
+                    and not getattr(args, "resume_reconstruction", False)
+                ),
             )
         if model:
             argv += ["--model", str(model)]
@@ -19532,6 +19692,12 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--acp-detached-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--engine-session-id", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--resume-mode",
+        choices=["same-account", "carried", "reconstructed"],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--resume-reconstruction", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--codex-resume-home", help=argparse.SUPPRESS)
     parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
@@ -19985,6 +20151,8 @@ def main(argv: list[str] | None = None) -> int:
         summary_head["task_ids"] = list(args.task_ids)
     if getattr(args, "parent_dispatch_id", None):
         summary_head["parent_dispatch_id"] = args.parent_dispatch_id
+    if getattr(args, "resume_mode", None):
+        summary_head["resume_mode"] = args.resume_mode
     if engine_session_id is not None:
         summary_head["engine_session_id"] = engine_session_id
     if codex_session_id is not None:
@@ -20038,7 +20206,12 @@ def main(argv: list[str] | None = None) -> int:
                         args.codex_session_id,
                         args.dispatch_id,
                     )
-        elif getattr(args, "parent_dispatch_id", None) and resume_engine and engine_session_id:
+        elif (
+            getattr(args, "parent_dispatch_id", None)
+            and resume_engine
+            and engine_session_id
+            and not getattr(args, "resume_reconstruction", False)
+        ):
             with _engine_resume_lock(resume_engine, engine_session_id):
                 _revalidate_resume_claim(
                     parent_dispatch_id=args.parent_dispatch_id,
@@ -20130,6 +20303,7 @@ def main(argv: list[str] | None = None) -> int:
             getattr(args, "parent_dispatch_id", None)
             and resume_engine not in {None, "codex"}
             and engine_session_id
+            and not getattr(args, "resume_reconstruction", False)
         ):
             with _engine_resume_lock(resume_engine, engine_session_id):
                 _revalidate_resume_claim(
@@ -20553,6 +20727,7 @@ def main(argv: list[str] | None = None) -> int:
             codex_session_id=codex_session_id,
             engine_session_id=engine_session_id,
             parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+            resume_mode=getattr(args, "resume_mode", None),
             codex_home_owner_dispatch_id=codex_home_owner_dispatch_id,
             controller_pid=controller_pid,
             controller_session_id=controller_session_id,

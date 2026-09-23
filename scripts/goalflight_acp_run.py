@@ -690,6 +690,7 @@ def _record_acp_ledger_state(
                     logical_session_id=cfg.session_id,
                     engine_session_id=getattr(cfg, "engine_session_id", None)
                     or cfg.session_id,
+                    resume_mode=getattr(cfg, "resume_mode", None),
                     lease_id=lease_id,
                     stdout_path=None,
                     stderr_path=None,
@@ -2467,6 +2468,7 @@ async def _run_acp_dispatch_impl(
         "agent": cfg.agent,
         "priority": getattr(cfg, "priority", "normal"),
         "session_id": cfg.session_id,
+        "resume_mode": getattr(cfg, "resume_mode", None),
         "controller_session_id": controller_session_id,
         "controller_pid": controller_pid,
         "controller_label": controller_label,

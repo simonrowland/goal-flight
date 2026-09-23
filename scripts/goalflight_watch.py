@@ -4488,6 +4488,7 @@ def main() -> int:
     parser.add_argument("--codex-dispatch-home", help=argparse.SUPPRESS)
     parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--engine-session-id", help=argparse.SUPPRESS)
+    parser.add_argument("--resume-mode", help=argparse.SUPPRESS)
     parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--worker-identity-json",
@@ -4619,6 +4620,8 @@ def main() -> int:
             )
         if args.parent_dispatch_id:
             payload["parent_dispatch_id"] = args.parent_dispatch_id
+        if args.resume_mode:
+            payload["resume_mode"] = args.resume_mode
         if engine_session_id is not None:
             payload["engine_session_id"] = engine_session_id
         if codex_session_id is not None:
@@ -4930,6 +4933,8 @@ def main() -> int:
                     }
         if args.parent_dispatch_id:
             payload["parent_dispatch_id"] = args.parent_dispatch_id
+        if args.resume_mode:
+            payload["resume_mode"] = args.resume_mode
         if args.codex_home_owner_dispatch_id:
             payload["codex_home_owner_dispatch_id"] = (
                 args.codex_home_owner_dispatch_id

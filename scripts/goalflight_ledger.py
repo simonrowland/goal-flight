@@ -1450,6 +1450,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "codex_home",
         "codex_home_owner_dispatch_id",
         "parent_dispatch_id",
+        "resume_mode",
     ):
         value = getattr(args, key, None)
         if value:

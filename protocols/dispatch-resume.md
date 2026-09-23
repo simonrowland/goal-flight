@@ -99,6 +99,17 @@ you want to keep, not by what killed the worker.
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
   (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume
   via `session/load` when the handle was recorded.
+- Grok prefers the recorded account for cached-token efficiency, but that is a
+  preference, not a cross-account restriction. If that account is missing,
+  walled, or out of headroom, resume selects a healthy configured Grok account.
+  Grok has no CLI session import command: its local session directory under
+  `~/.grok/sessions/<encoded-cwd>/<id>` is copied to the target account and
+  resumed with the same id (`resume_mode: carried`). If the local artifact is
+  unavailable or cannot be copied, Goal Flight starts a fresh Grok session on
+  the healthy account with a bounded reconstruction containing the original
+  brief, recent transcript/tail, worktree status and diff stat, and controller
+  prompt (`resume_mode: reconstructed`). Same-account resumes record
+  `resume_mode: same-account`.
 - **Reuse, never fork.** Grok and Claude expose `--fork-session`. Resume
   does not pass it. Fork would mint a sibling session and look like a
   silent fresh start. The live-source guard is what prevents attaching to a
@@ -125,13 +136,15 @@ you want to keep, not by what killed the worker.
   A live sibling, or a fresh dispatch on the same task, is still refused.
   `reconcile-outbox` does not clear this hold. Opening a new task row is
   interim and leaves the old id held.
-- Resume refuses honestly when it cannot attach:
+- Resume refuses honestly when it cannot attach or reconstruct:
   - no recorded engine session handle (typical of dispatches that predate
     capture — Grok/Claude now assign at launch; Kimi/cursor harvest after
     the CLI creates the session)
   - missing Codex home/rollout
   - unsupported CLI / unknown engine
-  It must not appear to resume and silently start fresh.
+  A healthy-account Grok cross-account resume is not refused for a missing
+  local artifact; it takes the reconstruction path above. It must not appear
+  to carry a session when it has actually started a reconstructed one.
 
 ## Capture
 
