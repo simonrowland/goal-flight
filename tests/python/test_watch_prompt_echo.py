@@ -632,8 +632,6 @@ def case_live_failed_marker_blocks_not_rate_limited() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         tail = tmp / "tail.txt"
-        worker_cwd = tmp / "worker-cwd"
-        worker_cwd.mkdir()
         tail.write_text(
             "upstream validation failed\n"
             "FAILED: upstream returned rate limit while validating user input\n",
