@@ -175,15 +175,7 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
 
         goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
         try:
-            with (
-                contextlib.chdir(repo),
-                patch.dict(os.environ, env, clear=True),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    side_effect=AssertionError("ACP runner attempted a second seat bind"),
-                ) as inner_bind,
-            ):
+            with contextlib.chdir(repo), patch.dict(os.environ, env, clear=True):
                 outer = dispatch_mod._bind_dispatch_worktree(args)
                 assert outer is not None
                 seat = outer.path
@@ -203,11 +195,11 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
                 args._worktree_seat.release()
 
         assert rc == 0
-        assert inner_bind.call_count == 0
         assert ledger["project_root"] == str(repo.resolve())
         assert ledger["worker_cwd"] == str(seat.resolve())
         assert runner_spawn["cwd"] == str(seat.resolve())
-        assert runner_spawn["pass_fds"] == (seat_fd,)
+        assert seat_fd in runner_spawn["pass_fds"]
+        assert len(runner_spawn["pass_fds"]) == 2
         assert not (seat.parent / "s-2").exists()
 
 
@@ -247,11 +239,7 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
         try:
             with (
                 patch.dict(os.environ, env, clear=True),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    return_value=fake_seat,
-                ) as inner_bind,
+                patch.object(dispatch_mod, "_admit_dispatch_worktree", return_value=fake_seat) as central_admit,
             ):
                 payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
                 ledger = json.loads(
@@ -265,7 +253,7 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
                 fake_seat.release()
 
         assert payload["state"] == "complete"
-        assert inner_bind.call_count == 1
+        assert central_admit.call_count == 1
         assert payload["worker_cwd"] == str(fake_seat.path)
         assert ledger["worker_cwd"] == str(fake_seat.path)
 
@@ -349,13 +337,6 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
                 patch.object(dispatch_mod, "_mark_queue_claim_worker_spawn_intent"),
                 patch.object(dispatch_mod, "_mark_queue_claim_worker_spawned"),
                 patch.object(dispatch_mod, "_release_worktree_occupancy_lock"),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    side_effect=AssertionError(
-                        "detached ACP child attempted a second seat bind"
-                    ),
-                ) as inner_bind,
             ):
                 rc = dispatch_mod._run_acp_detached_launcher(
                     args,
@@ -376,7 +357,6 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
         assert captured["child_cwd"] == str(seat.resolve())
         assert captured["child_worktree"] == "off"
         assert captured["child_payload"]["state"] == "complete"
-        assert inner_bind.call_count == 0
         assert released
         assert args._worktree_seat is None
 
@@ -1067,6 +1047,68 @@ def _restore_fake_acp(saved) -> None:
     goalflight_acp_run.spawn_and_handshake_with_retry = old_spawn
     goalflight_acp_run.run_prompt = old_prompt
     goalflight_acp_run.validate_acp_dispatch_readiness = old_validate
+
+
+def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        status_json = tmp / "handoff-acp.status.json"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id="handoff-acp",
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        events: list[str] = []
+        real_mark = goalflight_acp_run.goalflight_capacity.mark_lease_spawning
+        real_attach = goalflight_acp_run.attach_worker_to_capacity_lease
+
+        def mark(lease_id: str | None) -> bool:
+            events.append("spawning")
+            return real_mark(lease_id)
+
+        def attach(lease_id: str | None, worker_pid: int, worker_pgid: int | None = None) -> None:
+            events.append("attach")
+            real_attach(lease_id, worker_pid, worker_pgid)
+
+        async def fake_spawn(_command, _args, **kwargs):
+            events.append("spawn")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=kwargs["cwd"],
+                env=kwargs["env"],
+            )
+            await kwargs["on_attempt"](0, proc)
+            return proc, _FakeAcpConn(proc)
+
+        async def fake_prompt(_conn, _text, **_kwargs):
+            return goalflight_acp_run.PromptResult(
+                text="COMPLETE: handoff tested\n",
+                stop_reason="end_turn",
+            )
+
+        with (
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(
+                goalflight_acp_run.goalflight_capacity,
+                "mark_lease_spawning",
+                mark,
+            ),
+            patch.object(goalflight_acp_run, "attach_worker_to_capacity_lease", attach),
+            patch.object(goalflight_acp_run, "spawn_and_handshake_with_retry", fake_spawn),
+            patch.object(goalflight_acp_run, "run_prompt", fake_prompt),
+            patch.object(
+                goalflight_acp_run,
+                "validate_acp_dispatch_readiness",
+                lambda *_args, **_kwargs: None,
+            ),
+        ):
+            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+        assert payload["state"] == "complete", payload
+        assert events[:3] == ["spawning", "spawn", "attach"], events
 
 
 def _run_acp_thread(cfg: SimpleNamespace):

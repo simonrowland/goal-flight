@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,6 +147,7 @@ def _stub_detached_runtime(
         "_acquire_capacity",
         lambda *_args, **_kwargs: leases.append("lease-resume") or "lease-resume",
     )
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     monkeypatch.setattr(
         D,
         "_rebuild_codex_resume_home",
@@ -233,6 +235,7 @@ def _stub_forked_runtime(
         return pid
 
     monkeypatch.setattr(D, "_acquire_capacity", acquire)
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
     monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
@@ -1427,6 +1430,97 @@ def test_live_occupancy_holder_still_blocks_resume(
     err = capsys.readouterr().err
     assert "already owned" in err
     assert not L.record_path("live-occ-child").exists()
+
+
+def test_capacity_refused_resume_does_not_bind_recorded_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Capacity refusal precedes exact-seat reattachment and holder rewrite."""
+    for args in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "goalflight-test@example.invalid"],
+        ["git", "config", "user.name", "Goal Flight Test"],
+    ):
+        result = subprocess.run(
+            args,
+            cwd=tmp_path,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for args in (["git", "add", "tracked.txt"], ["git", "commit", "-m", "base"]):
+        result = subprocess.run(
+            args,
+            cwd=tmp_path,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+
+    parent_id = "capacity-seat-parent"
+    child_id = "capacity-seat-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    seat_lease = WP.acquire_worktree_seat(tmp_path, parent_id, base="HEAD")
+    seat = seat_lease.path
+    seat_lease.release()
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "project_root": str(tmp_path),
+            "worker_cwd": str(seat),
+            "dispatch_argv": [
+                "--agent",
+                "codex",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+                "--prompt-file",
+                str(tmp_path / "old.md"),
+            ],
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Resume only after capacity admission.\n", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+
+    def deny_capacity(args, *, project_root, status_json):
+        D.write_status(
+            status_json,
+            {
+                "state": "blocked_capacity",
+                "reason": {"reason": "machine_worker_cap"},
+            },
+        )
+        raise SystemExit(2)
+
+    monkeypatch.setattr(D, "_acquire_capacity", deny_capacity)
+    bind_calls: list[str] = []
+    original_record = D._record_dispatch_worktree
+
+    def record_bind(args, lease):
+        bind_calls.append(str(lease.path))
+        return original_record(args, lease)
+
+    monkeypatch.setattr(D, "_record_dispatch_worktree", record_bind)
+    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_args: child_id)
+
+    with pytest.raises(SystemExit) as exc_info:
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+    assert exc_info.value.code == 2
+    assert bind_calls == []
+    assert json.loads(L.record_path(child_id).read_text(encoding="utf-8"))["state"] == "blocked_capacity"
+    assert not WP.worktree_seat_lock_path(tmp_path, seat.name).exists()
 
 
 def test_parent_child_grandchild_resume_preserves_original_home_owner(

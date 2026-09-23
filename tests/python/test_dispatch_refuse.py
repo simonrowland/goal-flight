@@ -83,7 +83,7 @@ def case_acp_run_refuses_before_side_effects() -> None:
         missing_prompt = tmp / "missing-prompt.md"
         with patch("goalflight_compat.is_windows", return_value=True), \
             patch("goalflight_acp_client.require_acp_sdk", side_effect=AssertionError("SDK check ran")), \
-            patch("goalflight_acp_run.create_and_route_dispatch_worktree", side_effect=AssertionError("worktree created")), \
+            patch("goalflight_dispatch._admit_dispatch_worktree", side_effect=AssertionError("worktree created")), \
             patch("goalflight_acp_run.goalflight_capacity.cmd_acquire", side_effect=AssertionError("capacity lease acquired")):
             with contextlib.redirect_stdout(io.StringIO()):
                 try:

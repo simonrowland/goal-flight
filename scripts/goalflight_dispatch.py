@@ -128,12 +128,24 @@ _ROUTED_SUBCOMMANDS = (
     "dashboard-refresh",
 )
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
+DISPATCH_QUEUE_PINNED_SCHEMA = "goalflight.dispatch-queue.v2"
+# The installed macOS drainer is a fresh process every 60 seconds
+# (protocols/drainer.md and com.goalflight.drain), not a long-lived loop. During
+# a skill update one old process can therefore see one v2 pinned carrier and
+# reject its new flag; its existing pre-worker backoff is bounded and surfaces
+# attention, while the next fresh process uses the current dispatcher. Keep
+# v1 replay compatible forever: old unpinned carriers remain valid input.
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
 # Drain launch-confirmation wait. Per-entry subprocess.run used to use this
 # as a serial timeout, so N hung entries took ~N*45s per pass. The pass
-# budget is one confirmation window; leftover entries stay queued.
+# budget is one admission/setup plus confirmation window; leftover entries
+# stay queued.
 DRAIN_LAUNCH_CONFIRM_S = 45.0
+# The child starts this timer before it acquires capacity and prepares the
+# captive seat. Keep that admission/setup window outside confirmation so a
+# slow checkout under load is not misclassified as a pre-worker failure.
+DRAIN_LAUNCH_PREPARATION_S = 60.0
 DRAIN_LAUNCH_TIMEOUT_FLOOR_S = 20.0
 LAUNCH_BACKOFF_INITIAL_S = 60.0
 LAUNCH_BACKOFF_CAP_S = 900.0
@@ -1716,7 +1728,10 @@ def _project_orientation_preamble(orientation_path: Path) -> str:
 
 
 def _project_root(args) -> Path:
-    return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
+    configured = getattr(args, "project_root", None)
+    return goalflight_task.resolve_project_root(
+        str(configured or getattr(args, "cwd", None) or Path.cwd())
+    )
 
 
 def _worker_cwd(args) -> Path:
@@ -1736,6 +1751,8 @@ def _worker_cwd(args) -> Path:
 
 def _requested_worktree_base(args) -> str | None:
     raw = getattr(args, "worktree", None)
+    if raw in {None, "", "create", "off"}:
+        raw = getattr(args, "worktree_base", None)
     if raw is None:
         return None
     text = str(raw).strip()
@@ -1818,6 +1835,92 @@ def _record_dispatch_worktree(args, lease) -> None:
     args.cwd = str(lease.path)
     args._worktree_base_commit = base_commit
     args._worktree_seat = lease
+    try:
+        _persist_queue_worktree_pin(args, lease, base_commit=base_commit)
+    except Exception:
+        # Do not leave a reset seat live when its retry carrier could not be
+        # pinned. The next drain attempt must either reuse this exact seat or
+        # restore the claim; nearest-base selection is not equivalent.
+        args._worktree_seat = None
+        lease.release()
+        raise
+
+
+def _dispatch_requires_captive_worktree(args) -> bool:
+    """Return whether this launch must bind a pool seat after admission."""
+    if getattr(args, "in_place", False):
+        return False
+    cwd_raw = getattr(args, "cwd", None)
+    if not cwd_raw:
+        return True
+    try:
+        kind = goalflight_worktree_pool.classify_dispatch_cwd(
+            Path(str(cwd_raw)).expanduser().resolve(strict=False),
+            project_root=_project_root(args),
+            controller_label=_controller_ring_label(args, _project_root(args)),
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
+        )
+    except (OSError, goalflight_worktree_pool.WorktreeSeatError):
+        return True
+    # A recorded ring seat is still captive worktree state.  It must be
+    # re-acquired after capacity so a refused resume/retry cannot touch the
+    # seat before admission.  Only an explicit project-root launch is already
+    # bound and therefore needs no post-capacity pool operation.
+    return kind != "in-place"
+
+
+def _persist_queue_worktree_pin(
+    args,
+    lease,
+    *,
+    base_commit: str,
+) -> None:
+    """Keep a prepared queue seat in the carrier for launch retries."""
+    if not (
+        getattr(args, "from_queue", False)
+        and getattr(args, "queue_claim_path", None)
+        and getattr(args, "queue_launch_token", None)
+    ):
+        return
+    claim = Path(str(args.queue_claim_path)).expanduser()
+    try:
+        with _queue_mutation_lock(claim.parent):
+            current = json.loads(claim.read_text(encoding="utf-8"))
+            if not isinstance(current, dict):
+                raise goalflight_worktree_pool.WorktreeSeatError(
+                    f"queue claim {claim} is not an object"
+                )
+            if current.get("queue_launch_token") != args.queue_launch_token:
+                raise goalflight_worktree_pool.WorktreeSeatError(
+                    f"queue claim {claim} launch token changed"
+                )
+            recorded = list(current.get("dispatch_argv") or [])
+            if not recorded:
+                raise goalflight_worktree_pool.WorktreeSeatError(
+                    f"queue claim {claim} has no replay argv"
+                )
+            current["worktree_seat"] = lease.seat_name
+            current["worktree_path"] = str(lease.path)
+            current["worktree_base_sha"] = base_commit
+            current["worktree_pin_holder"] = str(args.dispatch_id)
+            current["schema"] = DISPATCH_QUEUE_PINNED_SCHEMA
+            current["dispatch_argv"] = _reconstruct_launch_argv(
+                recorded,
+                replace={
+                    "--cwd": str(lease.path),
+                    "--worktree-pin-holder": str(args.dispatch_id),
+                },
+                inject=["--skip-seat-reset"],
+            )
+            _write_json_atomic(claim, current)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise goalflight_worktree_pool.WorktreeSeatError(
+            f"could not pin queue worktree for {args.dispatch_id}: {exc}"
+        ) from exc
 
 
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
@@ -1851,6 +1954,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     in_place = bool(getattr(args, "in_place", False))
     cwd_raw = getattr(args, "cwd", None)
     base = _requested_worktree_base(args)
+    force_captive = getattr(args, "worktree", None) == "create"
 
     if in_place:
         if cwd_raw:
@@ -1859,6 +1963,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 cwd,
                 project_root=project_root,
                 controller_label=label,
+                managed_root=(
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
+                    else None
+                ),
             )
             resumed_linked_worktree = bool(
                 skip_reset
@@ -1875,9 +1984,16 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     if cwd_raw:
         cwd = Path(str(cwd_raw)).expanduser().resolve(strict=False)
         kind = goalflight_worktree_pool.classify_dispatch_cwd(
-            cwd, project_root=project_root, controller_label=label
+            cwd,
+            project_root=project_root,
+            controller_label=label,
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
         )
-        if kind == "in-place":
+        if kind == "in-place" and not force_captive:
             return None
         if kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
@@ -1890,23 +2006,42 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 occupy_path=cwd,
                 expected_prior_dispatch_id=(
                     str(parent_dispatch_id) if parent_dispatch_id else None
+                )
+                or (
+                    str(
+                        getattr(args, "worktree_pin_holder", None)
+                        or args.dispatch_id
+                    )
+                    if skip_reset and getattr(args, "from_queue", False)
+                    else None
+                ),
+                managed_root=(
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
+                    else None
                 ),
             )
             _record_dispatch_worktree(args, lease)
             return lease
-        if skip_reset:
+        if kind == "in-place" and force_captive:
+            # ``--worktree create --cwd <project-root>`` is the explicit
+            # captive-seat request used by ACP. Continue through the default
+            # allocator; the project root is only the source repo.
+            cwd_raw = None
+        else:
+            if skip_reset:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded worker cwd {cwd} is not a captive "
+                    f"seat in this controller ring (worktrees/{label}/s-N); "
+                    "refusing to create or choose a replacement seat"
+                )
             raise goalflight_worktree_pool.WorktreeCwdRefused(
-                f"resume refused: recorded worker cwd {cwd} is not a captive "
-                f"seat in this controller ring (worktrees/{label}/s-N); "
-                "refusing to create or choose a replacement seat"
+                f"--cwd {cwd} is not a seat in this controller ring "
+                f"(worktrees/{label}/s-N) and is not the project root. "
+                "Omit --cwd to acquire a captive seat, or pass --in-place "
+                f"for {project_root}. Isolation is not a mode; refusing to "
+                "create that path or git worktree add."
             )
-        raise goalflight_worktree_pool.WorktreeCwdRefused(
-            f"--cwd {cwd} is not a seat in this controller ring "
-            f"(worktrees/{label}/s-N) and is not the project root. "
-            "Omit --cwd to acquire a captive seat, or pass --in-place "
-            f"for {project_root}. Isolation is not a mode; refusing to "
-            "create that path or git worktree add."
-        )
 
     lease = goalflight_worktree_pool.acquire_worktree_seat(
         project_root,
@@ -1914,8 +2049,27 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         base=base,
         controller_label=label,
         reset=not skip_reset,
+        managed_root=(
+            Path(str(args.worktree_root)).expanduser()
+            if getattr(args, "worktree_root", None)
+            else None
+        ),
     )
     _record_dispatch_worktree(args, lease)
+    return lease
+
+
+def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
+    """Bind the worktree only after the caller has admitted capacity.
+
+    Every local launch shape uses this single post-admission hook. Account
+    resolution and capacity acquisition happen before it; a refusal or wait
+    therefore cannot create, reset, or hold a worktree seat.
+    """
+    lease = _bind_dispatch_worktree(args)
+    warning = _prepare_attempt_worktree_occupancy(args)
+    if warning is not None:
+        args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
     return lease
 
 
@@ -3605,6 +3759,10 @@ def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
         if goalflight_ledger.record_is_unreadable(record):
             continue
         state = record.get("state")
+        if state in PRE_WORKER_LEDGER_STATES:
+            # Capacity/pre-launch rows are duplicate-dispatch visibility only;
+            # they do not own a tree until admission has actually bound it.
+            continue
         terminal = goalflight_ledger.terminal_state_for(
             state, record.get("reason") or record.get("error")
         )
@@ -3674,6 +3832,10 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
             unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
             continue
         state = record.get("state")
+        if state in PRE_WORKER_LEDGER_STATES:
+            # A capacity/pre-launch row advertises duplicate identity only;
+            # it cannot own a worktree before admission binds one.
+            continue
         terminal = goalflight_ledger.terminal_state_for(
             state, record.get("reason") or record.get("error")
         )
@@ -3836,6 +3998,10 @@ def _occupancy_unknown_messages(args, detail: str) -> tuple[str, str]:
 def _finish_worktree_occupancy(args, *, refusal: str, forced_warning: str) -> str | None:
     if getattr(args, "occupied_worktree_forced", False):
         return forced_warning
+    # Occupancy is an admission refusal, not a worker attempt.  Callers may
+    # already have published a waiting-capacity mirror, but that mirror must
+    # not survive as a phantom holder after this pre-worker refusal.
+    args._worktree_occupancy_refused = True
     raise DispatchUsageError(refusal)
 
 
@@ -3918,16 +4084,13 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
             args, refusal=refusal, forced_warning=forced_warning
         )
     if occupied is not None and not getattr(args, "from_queue", False):
-        # A queued row occupies with no process. A running/starting/
-        # waiting_capacity row whose holder already died (SIGKILL) leaves
-        # the kernel lock free; dropping the lock we just won would recreate
-        # the dual-launch TOCTOU until the watcher rewrites the ledger.
-        # waiting_capacity is a live dispatcher holding occupancy through
-        # the capacity wait; a killed preclaim is not a holder.
+        # A queued row is no longer an owning claim. A running row whose
+        # holder already died (SIGKILL) leaves the kernel lock free; dropping
+        # the lock we just won would recreate the dual-launch TOCTOU until the
+        # watcher rewrites the ledger. A starting row is post-admission and
+        # remains an owning claim.
         if inherited is None and occupied_state in {
             "running",
-            "starting",
-            "waiting_capacity",
         }:
             _bind_worktree_occupancy_lock(args, lock)
             return None
@@ -7091,7 +7254,11 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     codex_home=codex_home or getattr(args, "codex_resume_home", None),
                     codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                     parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
-                    worker_cwd=str(_worker_cwd(args)),
+                    worker_cwd=(
+                        None
+                        if state in PRE_WORKER_LEDGER_STATES
+                        else str(_worker_cwd(args))
+                    ),
                     dispatch_argv=_canonical_replay_argv(
                         args,
                         _raw_worker_args(args)
@@ -7378,6 +7545,34 @@ def _classify_local_pre_spawn_attempt(
     return LAUNCH_ATTEMPT_CLASS_UNDETERMINED
 
 
+PINNED_CARRIER_MIXED_VERSION_PREFIX = "mixed_version_pinned_carrier:"
+PINNED_CARRIER_MIXED_VERSION_FIX = (
+    "re-arm / let the drainer restart on the updated skill"
+)
+
+
+def _pinned_carrier_rejected_by_old_dispatcher(
+    proc: subprocess.CompletedProcess,
+    entry: dict,
+) -> bool:
+    """Recognize an old drainer rejecting the v2 seat-holder option."""
+    if not isinstance(entry, dict) or entry.get("schema") != DISPATCH_QUEUE_PINNED_SCHEMA:
+        return False
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    return (
+        "unrecognized arguments" in blob
+        and "--worktree-pin-holder" in blob
+    )
+
+
+def _pinned_carrier_mixed_version_reason(entry: dict) -> str:
+    carrier = str(entry.get("queue_path") or entry.get("dispatch_id") or "unknown")
+    return (
+        f"{PINNED_CARRIER_MIXED_VERSION_PREFIX}{carrier}: "
+        "running dispatcher rejected --worktree-pin-holder"
+    )
+
+
 def _classify_remote_drain_blocked(exc: "_RemoteDrainBlocked") -> str:
     """Classify a parent-side remote drain block.
 
@@ -7565,6 +7760,8 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--prompt": "preserve",
     "--task": "preserve",
     "--cwd": "preserve",
+    "--worktree-root": "preserve",
+    "--worktree-pin-holder": "preserve",
     "--worktree": "preserve",
     "--at": "preserve",
     "--in-place": "preserve",
@@ -7627,6 +7824,8 @@ _REPLAY_VALUE_OPTIONS = {
     "--prompt",
     "--task",
     "--cwd",
+    "--worktree-root",
+    "--worktree-pin-holder",
     "--worktree",
     "--at",
     "--model",
@@ -7800,10 +7999,14 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
     worktree_base = _requested_worktree_base(args)
     if worktree_base:
         argv += ["--worktree", worktree_base]
+    if getattr(args, "worktree_root", None):
+        argv += ["--worktree-root", str(args.worktree_root)]
     if getattr(args, "in_place", False):
         argv.append("--in-place")
     if getattr(args, "skip_seat_reset", False):
         argv.append("--skip-seat-reset")
+    if getattr(args, "worktree_pin_holder", None):
+        argv += ["--worktree-pin-holder", str(args.worktree_pin_holder)]
     if args.capacity_wait_s is not None:
         argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
     if args.account:
@@ -8976,6 +9179,25 @@ def _finish_ledger(
     if code != 0:
         raise RuntimeError(f"journal terminal emitter exited {code} for {dispatch_id}")
     _maybe_mark_grok_quota_exhausted(dispatch_id, state)
+
+
+def _discard_preworker_ledger(args) -> None:
+    """Remove a mirror created before an occupancy admission refusal.
+
+    The journal remains the durable lifecycle authority.  The runs.d mirror is
+    only a launch projection; retaining it after no worker was admitted makes
+    a refused resume look like a live worktree holder to recovery/status code.
+    """
+    dispatch_id = str(getattr(args, "dispatch_id", "") or "")
+    if not dispatch_id:
+        return
+    try:
+        with goalflight_ledger.StateLock():
+            goalflight_ledger.record_path(dispatch_id, create=False).unlink(
+                missing_ok=True
+            )
+    except (OSError, ValueError):
+        return
 
 
 def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> None:
@@ -15237,6 +15459,13 @@ def _requeue_child_entry(
     dispatch_argv = _set_option_before_worker_remainder(
         dispatch_argv, "--status-json", str(status_json)
     )
+    # A retry with a new dispatch id cannot satisfy the parent's seat lock.
+    # Drop the old pin and let normal post-capacity admission choose and bind
+    # a seat for the child.
+    dispatch_argv = _reconstruct_launch_argv(
+        dispatch_argv,
+        strip_options=("--cwd", "--worktree-pin-holder"),
+    )
     now = goalflight_ledger.utc_now()
     child_created_at = created_at if isinstance(created_at, str) and created_at.strip() else now
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
@@ -15254,6 +15483,14 @@ def _requeue_child_entry(
             "requeued_from": requeued_from,
         }
     )
+    for key in (
+        "cwd",
+        "worktree_path",
+        "worktree_seat",
+        "worktree_base_sha",
+        "worktree_pin_holder",
+    ):
+        request.pop(key, None)
     child.update(
         {
             "schema": DISPATCH_QUEUE_SCHEMA,
@@ -15276,6 +15513,10 @@ def _requeue_child_entry(
         "restore_reason",
         "claim_recovery_count",
         "orphan_first_seen_at",
+        "worktree_seat",
+        "worktree_path",
+        "worktree_base_sha",
+        "worktree_pin_holder",
     ):
         child.pop(key, None)
     if not_before:
@@ -15814,6 +16055,23 @@ class _DrainClaimGuard:
                     failure_count=failure_count,
                 )
                 if committed:
+                    attention = {
+                        "dispatch_id": self.dispatch_id,
+                        "state": "failed",
+                        "attention": "launch_attempt_limit_exceeded",
+                        "failure_count": failure_count,
+                        "reason": terminal_reason,
+                    }
+                    self.acc.setdefault("attention", []).append(attention)
+                    _emit_claim_recovery_alert(
+                        {
+                            "dispatch_id": self.dispatch_id,
+                            "action": "attention",
+                            "reason": "launch_attempt_limit_exceeded",
+                            "failure_count": failure_count,
+                            "detail": terminal_reason,
+                        }
+                    )
                     self.acc["failed"] += 1
                     self.acc["details"].append(
                         {
@@ -15969,7 +16227,9 @@ def _note_drain_journal_skip(
 def _drain_launch_timeout_s(args) -> float:
     return max(
         DRAIN_LAUNCH_TIMEOUT_FLOOR_S,
-        float(getattr(args, "capacity_wait_s", 0.0) or 0.0) + DRAIN_LAUNCH_CONFIRM_S,
+        float(getattr(args, "capacity_wait_s", 0.0) or 0.0)
+        + DRAIN_LAUNCH_PREPARATION_S
+        + DRAIN_LAUNCH_CONFIRM_S,
     )
 
 
@@ -16035,8 +16295,9 @@ def _launch_attempt_consumed_budget(
     returns False: a millisecond refusal still consumed a drain pass.
 
     Derivation of material_s:
-      production pass_budget ≈ DRAIN_LAUNCH_CONFIRM_S (45s)
-        0.25 * 45 = 11.25; min(1.0, max(0.05, 11.25)) = 1.0s
+      production pass_budget ≈ DRAIN_LAUNCH_PREPARATION_S
+        + DRAIN_LAUNCH_CONFIRM_S (105s)
+        0.25 * 105 = 26.25; min(1.0, max(0.05, 26.25)) = 1.0s
       test pass_budget 0.40s
         0.25 * 0.40 = 0.10; min(1.0, max(0.05, 0.10)) = 0.10s
     A handshake that fails after ≥1s in production (or ≥0.10s in the probe-D
@@ -16703,6 +16964,7 @@ def _drain_queue_once(args) -> dict:
         "skipped_projects_busy": set(),
         "skipped_projects_error": set(),
         "details": details,
+        "attention": [],
         "launched_task_ids": set(),
     }
     timeout_s = _drain_launch_timeout_s(args)
@@ -17139,11 +17401,46 @@ def _drain_queue_once(args) -> dict:
                             pending=not committed,
                         )
                         continue
-                    diagnostic = _pre_spawn_launch_failure_reason(proc)
-                    lease.fail_reason = diagnostic
-                    lease.release_reason = (
-                        f"launch_refused_pre_spawn:{proc.returncode}"
+                    mixed_version = _pinned_carrier_rejected_by_old_dispatcher(
+                        proc, observed_claim
                     )
+                    if mixed_version:
+                        diagnostic = _pinned_carrier_mixed_version_reason(observed_claim)
+                        lease.fail_reason = diagnostic
+                        lease.release_reason = (
+                            f"launch_refused_pre_spawn:{proc.returncode}"
+                        )
+                        prior_reason = str(
+                            observed_claim.get("launch_fail_reason") or ""
+                        )
+                        if not prior_reason.startswith(
+                            PINNED_CARRIER_MIXED_VERSION_PREFIX
+                        ):
+                            attention_item = {
+                                "dispatch_id": dispatch_id,
+                                "state": "queued",
+                                "attention": "mixed_version_pinned_carrier",
+                                "carrier": str(claim),
+                                "reason": diagnostic,
+                                "fix": PINNED_CARRIER_MIXED_VERSION_FIX,
+                            }
+                            drain_acc["attention"].append(attention_item)
+                            _emit_claim_recovery_alert(
+                                {
+                                    "dispatch_id": dispatch_id,
+                                    "action": "attention",
+                                    "reason": "mixed_version_pinned_carrier",
+                                    "carrier": str(claim),
+                                    "detail": diagnostic,
+                                    "fix": PINNED_CARRIER_MIXED_VERSION_FIX,
+                                }
+                            )
+                    else:
+                        diagnostic = _pre_spawn_launch_failure_reason(proc)
+                        lease.fail_reason = diagnostic
+                        lease.release_reason = (
+                            f"launch_refused_pre_spawn:{proc.returncode}"
+                        )
                     attempt_class = _classify_local_pre_spawn_attempt(proc)
                 else:
                     lease.fail_reason = (
@@ -17185,6 +17482,7 @@ def _drain_queue_once(args) -> dict:
     timing["launch_s"] = round(time.monotonic() - t_launch, 3)
     timing["journal_s"] = round(float(timing["journal_s"]), 3)
     timing["pass_s"] = round(time.monotonic() - pass_started, 3)
+    attention.extend(drain_acc.get("attention") or [])
     payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
@@ -17538,14 +17836,19 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         getattr(args, "_worktree_seat", None) is not None
         or _inherited_seat_lock_present()
     )
+    deferred_worktree = (
+        _dispatch_requires_captive_worktree(args) and not outer_seat_bound
+    )
+    if deferred_worktree and requested_worktree_base is None:
+        requested_worktree_base = goalflight_worktree_pool.default_seat_base(project_root)
     acp_cwd = (
         _worker_cwd(args)
-        if outer_seat_bound or not requested_worktree_base
+        if outer_seat_bound
         else project_root
     )
-    acp_worktree = "off" if outer_seat_bound else (
-        "create" if requested_worktree_base else "off"
-    )
+    if deferred_worktree and not outer_seat_bound:
+        acp_cwd = None
+    acp_worktree = "create" if deferred_worktree else "off"
     prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
     orientation_path = _project_orientation_path(
         project_root,
@@ -17588,9 +17891,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         install_slot=None,
         account=getattr(args, "account", None),
         project_root=str(project_root),
-        cwd=str(acp_cwd),
+        cwd=str(acp_cwd) if acp_cwd is not None else None,
         worktree=acp_worktree,
         worktree_base=requested_worktree_base or "HEAD",
+        worktree_root=getattr(args, "worktree_root", None),
+        worktree_pin_holder=getattr(args, "worktree_pin_holder", None),
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -17599,6 +17904,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         ),
         parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
         dispatch_id=args.dispatch_id,
+        from_queue=bool(getattr(args, "from_queue", False)),
+        queue_claim_path=getattr(args, "queue_claim_path", None),
         task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
         # ACP and bash use the same inline-wait policy, including lane defaults
@@ -17645,7 +17952,10 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
         steer_file=str(_steer_file(args.dispatch_id)),
         queue_launch_token=getattr(args, "queue_launch_token", None),
+        skip_seat_reset=bool(getattr(args, "skip_seat_reset", False)),
+        in_place=bool(getattr(args, "in_place", False)),
         request_envelope=_queue_request_envelope(args),
+        worktree_bind_after_capacity=deferred_worktree,
         controller_session_id=_controller_session_id(args),
         controller_pid=_controller_pid(args),
         controller_label=_controller_label(args),
@@ -18600,6 +18910,10 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         default=False,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--worktree-root", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worktree-pin-holder", default=None, help=argparse.SUPPRESS
+    )
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
@@ -19010,31 +19324,9 @@ def main(argv: list[str] | None = None) -> int:
                 _validate_resume_source(
                     args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
                 )
-            # Before the seat bind. This gate reads the ledger and the task
-            # store, not the seat, and a refusal must not become the occupant.
+            # This gate reads the ledger and task store, not the seat. Capacity
+            # admission in the ACP runner binds the seat only afterward.
             _refuse_launch_blocked_by_completion_authority(args)
-            try:
-                _bind_dispatch_worktree(args)
-            except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
-                print(f"goalflight_dispatch: {e}", file=sys.stderr)
-                print(
-                    "goalflight_dispatch: refusing to git worktree add; "
-                    "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
-                    file=sys.stderr,
-                )
-                return 2
-            except goalflight_worktree_pool.WorktreeSeatError as e:
-                print(
-                    f"goalflight_dispatch: worktree seat error: {e}",
-                    file=sys.stderr,
-                )
-                return 1
-            occupancy_warning = _prepare_attempt_worktree_occupancy(args)
-            if occupancy_warning is not None:
-                args.dispatch_warnings = [
-                    *getattr(args, "dispatch_warnings", []),
-                    occupancy_warning,
-                ]
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -19114,14 +19406,9 @@ def main(argv: list[str] | None = None) -> int:
             _validate_resume_source(
                 args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
             )
-        # Before the seat bind. Occupancy-forced is a worktree hatch and does
-        # not bypass this: a same-task sibling still refuses, and a refusal
-        # must not rewrite the seat occupant.
+        # Occupancy-forced is a worktree hatch and does not bypass this:
+        # a same-task sibling still refuses before admission.
         _refuse_launch_blocked_by_completion_authority(args)
-        _bind_dispatch_worktree(args)
-        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
-        if occupancy_warning is not None:
-            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(
@@ -19489,8 +19776,8 @@ def main(argv: list[str] | None = None) -> int:
             if codex_dispatch_home is not None:
                 codex_env["CODEX_HOME"] = codex_dispatch_home
             _validate_codex_reasoning_effort(args, codex_env)
+        worktree_seat = _admit_dispatch_worktree(args)
         request_envelope = _queue_request_envelope(args)
-        worktree_seat = _bind_dispatch_worktree(args)
         if worktree_seat is not None:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)
             summary_head["worktree_seat"] = worktree_seat.seat_name
@@ -19948,6 +20235,12 @@ def main(argv: list[str] | None = None) -> int:
         if worktree_seat is not None:
             worktree_seat.release()
             worktree_seat = None
+        if (
+            getattr(args, "_worktree_occupancy_refused", False)
+            and not worker_spawn_attempted
+        ):
+            _discard_preworker_ledger(args)
+            ledger_recorded = False
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)

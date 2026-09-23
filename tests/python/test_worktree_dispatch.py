@@ -33,6 +33,7 @@ os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
 
 import goalflight_acp_run
 import goalflight_capacity
+import goalflight_dispatch
 import goalflight_doctor
 import goalflight_worktree_pool
 
@@ -95,18 +96,28 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "2"
             repo = make_repo(root)
 
-            args_one = argparse.Namespace(cwd=str(repo))
-            args_two = argparse.Namespace(cwd=str(repo))
-            lease_one = goalflight_acp_run.create_and_route_dispatch_worktree(
-                args_one,
-                repo,
-                "acp-test-one",
-            )
-            lease_two = goalflight_acp_run.create_and_route_dispatch_worktree(
-                args_two,
-                repo,
-                "acp-test-two",
-            )
+            def admission_args(dispatch_id: str) -> argparse.Namespace:
+                return argparse.Namespace(
+                    cwd=str(repo),
+                    project_root=str(repo),
+                    worktree="create",
+                    worktree_base=None,
+                    worktree_root=None,
+                    controller_label=None,
+                    dispatch_id=dispatch_id,
+                    skip_seat_reset=False,
+                    in_place=False,
+                    from_queue=False,
+                    dispatch_warnings=[],
+                    occupied_worktree_forced=False,
+                )
+
+            args_one = admission_args("acp-test-one")
+            args_two = admission_args("acp-test-two")
+            lease_one = goalflight_dispatch._admit_dispatch_worktree(args_one)
+            lease_two = goalflight_dispatch._admit_dispatch_worktree(args_two)
+            assert lease_one is not None
+            assert lease_two is not None
             wt_one = lease_one.path
             wt_two = lease_two.path
 
@@ -121,8 +132,8 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             assert_true("first under captive ring", wt_one.parent == ring)
             assert_true("second under captive ring", wt_two.parent == ring)
             assert_true("captive seat names", {wt_one.name, wt_two.name} == {"s-1", "s-2"})
-            assert_true("first cfg cwd unchanged", args_one.cwd == str(repo))
-            assert_true("second cfg cwd unchanged", args_two.cwd == str(repo))
+            assert_true("first cfg cwd admitted seat", args_one.cwd == str(wt_one))
+            assert_true("second cfg cwd admitted seat", args_two.cwd == str(wt_two))
 
             (wt_one / "tracked.txt").write_text("worker one\n")
             (wt_two / "tracked.txt").write_text("worker two\n")
@@ -144,6 +155,8 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
 
             git(wt_one, "reset", "--hard")
             git(wt_two, "reset", "--hard")
+            goalflight_dispatch._release_worktree_occupancy_lock(args_one)
+            goalflight_dispatch._release_worktree_occupancy_lock(args_two)
             lease_one.release()
             lease_two.release()
             git(repo, "worktree", "remove", "--force", str(wt_one))
@@ -417,7 +430,10 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             assert_true("worktree left on disk", worktree_path.is_dir())
             assert_true("worker spawned in worktree", spawn_calls[0]["cwd"] == str(worktree_path))
             inherited_fds = spawn_calls[0]["pass_fds"]
-            assert_true("worker inherits seat lock", len(inherited_fds) == 1)
+            seat_fd = int(
+                spawn_calls[0]["env"][goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV]
+            )
+            assert_true("worker inherits seat lock", seat_fd in inherited_fds)
 
             state = goalflight_capacity.load_state()
             leases = list(state.get("leases", {}).values())

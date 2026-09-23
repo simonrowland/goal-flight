@@ -780,9 +780,9 @@ def test_matching_project_root_without_cwd_skips_when_identity_not_live() -> Non
 def test_different_project_root_with_matching_cwd_still_occupies() -> None:
     """Linked/shared worktrees: matching worker_cwd occupies even if root differs.
 
-    Queued (ledger-only claim) rather than running: a running row whose
+    Starting (post-admission, pre-spawn) rather than running: a running row whose
     worker is gone yields the kernel lock, and the SIGKILL recovery path
-    then proceeds. Occupancy of this path is the queued row.
+    then proceeds. Occupancy of this path is the starting row.
     """
     with _temp_dir() as td:
         tmp = Path(td)
@@ -792,7 +792,7 @@ def test_different_project_root_with_matching_cwd_still_occupies() -> None:
         _write_runs_record(
             tmp,
             "linked-cwd",
-            state="queued",
+            state="starting",
             worker_cwd=str(tree.resolve()),
             project_root="/unrelated/other-project",
         )
@@ -812,7 +812,7 @@ def test_cwdless_field_with_argv_cwd_matching_target_still_blocks() -> None:
         _write_runs_record(
             tmp,
             "argv-cwd",
-            state="queued",
+            state="starting",
             worker_cwd=None,
             dispatch_argv=["--cwd", str(tree.resolve()), "--agent", "test"],
         )
@@ -840,7 +840,7 @@ def test_argv_cwd_and_request_cwd_disagree_occupy_both_trees() -> None:
         _write_runs_record(
             tmp,
             "split-cwd",
-            state="queued",
+            state="starting",
             worker_cwd=None,
             dispatch_argv=["--cwd", str(tree_a.resolve()), "--agent", "test"],
             request={"cwd": str(tree_b.resolve())},
@@ -877,7 +877,7 @@ def test_relative_worker_cwd_resolved_against_project_root_occupies() -> None:
         _write_runs_record(
             tmp,
             "rel-cwd",
-            state="queued",
+            state="starting",
             worker_cwd="tree",
             project_root=str(parent.resolve()),
         )
@@ -899,7 +899,7 @@ def test_cwd_after_double_dash_in_argv_is_path_evidence() -> None:
         _write_runs_record(
             tmp,
             "argv-after",
-            state="queued",
+            state="starting",
             worker_cwd=None,
             dispatch_argv=["--agent", "test", "--", "--cwd", str(tree.resolve())],
         )
@@ -945,8 +945,8 @@ def test_live_cwdless_matching_project_root_second_writer_is_refused() -> None:
         assert not _ledger_record(tmp, "after-live-cwdless"), refused.stderr
 
 
-def test_synthetic_queued_record_with_target_cwd_still_blocks() -> None:
-    """Control: a ledger-only claim whose worker_cwd is the target occupies it."""
+def test_synthetic_starting_record_with_target_cwd_still_blocks() -> None:
+    """A post-admission starting row whose worker_cwd is the target occupies it."""
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -955,7 +955,7 @@ def test_synthetic_queued_record_with_target_cwd_still_blocks() -> None:
         _write_runs_record(
             tmp,
             "synth-cwd",
-            state="queued",
+            state="starting",
             worker_cwd=str(tree.resolve()),
         )
         refused = _run(_dispatch_cmd(tmp, tree, "synth-second", _quick_writer("synth-second")), env)

@@ -158,6 +158,20 @@ def _finalize_capacity_after_cleanup(
     """Release only after confirmed group death; otherwise retain visibly."""
     if not lease_id:
         return
+    if worker_pid is None:
+        # ACP can fail after reservation but before the adapter spawn (for
+        # example, worktree admission or sandbox preparation). Mark that
+        # launcher-owned proof before cmd_release; a plain reserved lease is
+        # intentionally protected because it may still have crossed spawn.
+        try:
+            goalflight_capacity.mark_lease_spawn_failed(
+                lease_id,
+                reason=str(reason or "spawn_failed"),
+            )
+        except Exception as exc:
+            payload["capacity_spawn_failure_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
     release_confirmed = (
         worker_pid is None
         or (
@@ -656,10 +670,10 @@ def _record_acp_ledger_state(
                     ),
                     transport="acp",
                     project_root=str(project_root),
-                    worker_cwd=str(
-                        worker_cwd
-                        or getattr(cfg, "cwd", None)
-                        or project_root
+                    worker_cwd=(
+                        None
+                        if state in {"queued", "waiting_capacity", "submitted", "claimed"}
+                        else str(worker_cwd or getattr(cfg, "cwd", None) or project_root)
                     ),
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
@@ -1801,22 +1815,6 @@ def status_filename_segment(dispatch_id: str) -> str:
     return segment or "invalid-dispatch"
 
 
-def create_and_route_dispatch_worktree(
-    cfg: argparse.Namespace,
-    project_root: Path,
-    dispatch_id: str,
-) -> goalflight_worktree_pool.WorktreeSeatLease:
-    """Acquire and prepare one reusable worktree seat for a dispatch."""
-    configured_root = getattr(cfg, "worktree_root", None)
-    return goalflight_worktree_pool.acquire_worktree_seat(
-        project_root,
-        dispatch_id,
-        base=str(getattr(cfg, "worktree_base", None) or "HEAD"),
-        managed_root=Path(configured_root) if configured_root else None,
-        controller_label=getattr(cfg, "controller_label", None),
-    )
-
-
 def _event_kind(event: dict) -> str:
     if "_prompt_result" in event:
         return "prompt_result"
@@ -2144,12 +2142,12 @@ async def spawn_and_handshake_with_retry(
         proc = conn.proc
         retry_error: AcpError | None = None
         try:
-            if stderr_capture is not None:
-                await stderr_capture.attach(conn)
             if on_attempt is not None:
                 maybe = on_attempt(attempt, proc)
                 if inspect.isawaitable(maybe):
                     await maybe
+            if stderr_capture is not None:
+                await stderr_capture.attach(conn)
             try:
                 await conn.initialize(timeout=handshake_timeout)
                 if resume_session_id:
@@ -2277,7 +2275,9 @@ async def _run_acp_dispatch_impl(
     if progress_stall_s is None:
         progress_stall_s = 300.0
     stall_kill = bool(getattr(cfg, "stall_kill", False))
-    worker_cwd = cfg.cwd
+    worker_cwd = getattr(cfg, "cwd", None) or str(
+        getattr(cfg, "project_root", None) or Path.cwd()
+    )
     manifest_profile, manifest_remote_turn_silence_s = adapter_liveness_config(cfg.agent)
     liveness_profile = getattr(cfg, "liveness_profile", None) or manifest_profile
     if liveness_profile not in LIVENESS_PROFILES:
@@ -4137,40 +4137,59 @@ async def _run_acp_dispatch_impl(
             if not context_mode_defined:
                 cfg.context_mode = "enabled"
 
-    cleanup_ghosts()
-    record_ledger_state(worker_pid=None, state="starting")
-    ledger_recorded = True
     try:
-        if worktree_mode == "create":
-            try:
-                worktree_seat = create_and_route_dispatch_worktree(
-                    cfg, project_root, dispatch_id
+        cleanup_ghosts()
+        try:
+            import goalflight_dispatch
+
+            # Every ACP shape binds only after account/capacity admission. The
+            # central hook also handles in-place launches and occupancy locking.
+            worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+            if worktree_mode == "create":
+                if worktree_seat is None:
+                    raise goalflight_worktree_pool.WorktreeSeatError(
+                        "central admission did not return a worktree seat"
+                    )
+                spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                    worktree_seat.fileno()
                 )
-            except Exception as e:
+                occupancy_fd = os.environ.get(
+                    goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                )
+                if occupancy_fd:
+                    spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
+                worker_cwd = str(worktree_seat.path)
+                prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
+                attach_worktree_to_lease(worktree_seat.path)
+                command, acp_args = agent_command(
+                    cfg.agent,
+                    model=getattr(cfg, "model", None),
+                )
+                acp_args = _codex_workspace_write_acp_args(
+                    cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
+                )
                 await update_status(
-                    state="failed_worktree",
-                    ok=False,
-                    error=f"{type(e).__name__}: {e}",
+                    state="worktree_created",
+                    worker_cwd=worker_cwd,
+                    worktree_path=str(worktree_seat.path),
+                    worktree_seat=worktree_seat.seat_name,
+                    worktree_branch=worktree_seat.branch,
+                    quarantine_branch=worktree_seat.quarantine_branch,
                 )
-                return payload
-            worker_cwd = str(worktree_seat.path)
-            prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
-            attach_worktree_to_lease(worktree_seat.path)
-            command, acp_args = agent_command(
-                cfg.agent,
-                model=getattr(cfg, "model", None),
-            )
-            acp_args = _codex_workspace_write_acp_args(
-                cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
-            )
+            record_ledger_state(worker_pid=None, state="starting")
+            ledger_recorded = True
+        except Exception as e:
+            if getattr(cfg, "_worktree_occupancy_refused", False):
+                goalflight_dispatch._discard_preworker_ledger(cfg)
+            if worktree_seat is not None:
+                worktree_seat.release()
+                worktree_seat = None
             await update_status(
-                state="worktree_created",
-                worker_cwd=worker_cwd,
-                worktree_path=str(worktree_seat.path),
-                worktree_seat=worktree_seat.seat_name,
-                worktree_branch=worktree_seat.branch,
-                quarantine_branch=worktree_seat.quarantine_branch,
+                state="failed_worktree",
+                ok=False,
+                error=f"{type(e).__name__}: {e}",
             )
+            return payload
         goalflight_cursor.isolate_context_mode(
             cfg.agent, spawn_env, cwd=worker_cwd, dispatch_id=dispatch_id,
         )
@@ -4274,6 +4293,10 @@ async def _run_acp_dispatch_impl(
 
         try:
             async with StartupGate(cfg.agent):
+                if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+                    raise RuntimeError(
+                        f"capacity lease {lease_id} lost before worker spawn"
+                    )
                 proc, conn = await spawn_and_handshake_with_retry(
                     command,
                     acp_args,
