@@ -2637,18 +2637,32 @@ async def _run_acp_dispatch_impl(
         and not capacity_account
     ):
         account_rejections: list[dict[str, str]] = []
+        pre_resolved_home = None
+        pre_resolved_account = None
+        pre_resolved = False
         try:
             import goalflight_dispatch
         except ImportError:
             goalflight_dispatch = None
         if goalflight_dispatch is not None:
-            codex_selected_account, account_rejections = (
-                goalflight_dispatch.select_codex_account(
-                    model=getattr(cfg, "model", None)
-                )
+            (
+                codex_selected_account,
+                account_rejections,
+                pre_resolved_home,
+                pre_resolved_account,
+                pre_resolved,
+            ) = goalflight_dispatch._prepare_codex_account_for_capacity(
+                project_root,
+                dispatch_id,
+                model=getattr(cfg, "model", None),
             )
         setattr(cfg, "_codex_selected_account", codex_selected_account)
         setattr(cfg, "_codex_account_rejections", account_rejections)
+        setattr(cfg, "_codex_account_pre_resolved", pre_resolved)
+        setattr(cfg, "_codex_pre_resolved_home", pre_resolved_home)
+        setattr(cfg, "_codex_pre_resolved_account", pre_resolved_account)
+        if pre_resolved_home is not None:
+            setattr(cfg, "_codex_dispatch_home_resolved", True)
         capacity_account = codex_selected_account
 
     acquire_args = argparse.Namespace(
@@ -4137,16 +4151,22 @@ async def _run_acp_dispatch_impl(
             dispatch_module = None
         codex_home = None
         if dispatch_module is not None:
-            try:
-                codex_home, effective_account = dispatch_module.resolve_codex_home(
-                    project_root,
-                    getattr(cfg, "_codex_selected_account", None)
-                    or getattr(cfg, "account", None),
-                    dispatch_id,
-                    model=getattr(cfg, "model", None),
+            if getattr(cfg, "_codex_account_pre_resolved", False):
+                codex_home = getattr(cfg, "_codex_pre_resolved_home", None)
+                effective_account = getattr(
+                    cfg, "_codex_pre_resolved_account", None
                 )
-            except BaseException:
-                codex_home, effective_account = None, None
+            else:
+                try:
+                    codex_home, effective_account = dispatch_module.resolve_codex_home(
+                        project_root,
+                        getattr(cfg, "_codex_selected_account", None)
+                        or getattr(cfg, "account", None),
+                        dispatch_id,
+                        model=getattr(cfg, "model", None),
+                    )
+                except BaseException:
+                    codex_home, effective_account = None, None
         if codex_home is not None:
             spawn_env["CODEX_HOME"] = codex_home
             setattr(cfg, "_codex_dispatch_home_resolved", True)

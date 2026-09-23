@@ -6943,6 +6943,44 @@ def resolve_codex_home(
     return None, "host"
 
 
+def _prepare_codex_account_for_capacity(
+    project_root: Path | str,
+    dispatch_id: str,
+    *,
+    model: str | None = None,
+) -> tuple[
+    str | None,
+    list[dict[str, str]],
+    str | None,
+    str | None,
+    bool,
+]:
+    """Select the complete unpinned account before capacity admission.
+
+    Configured account homes are selected directly. When none are discoverable,
+    the optional resolver is the only source of an account, so resolve it before
+    admission and retain the result for the launch phase. Otherwise capacity
+    would be charged to ``default`` before the resolver-selected account starts.
+    """
+    selected, rejected = select_codex_account(model=model)
+    if selected:
+        return selected, rejected, None, None, False
+
+    try:
+        home, effective_account = resolve_codex_home(
+            project_root,
+            None,
+            dispatch_id,
+            model=model,
+        )
+    except BaseException:
+        home, effective_account = None, None
+    capacity_account = (
+        None if effective_account in {None, "host"} else effective_account
+    )
+    return capacity_account, rejected, home, effective_account, True
+
+
 def cleanup_codex_dispatch_home(dispatch_id: str) -> None:
     """Best-effort cleanup through the same guarded optional-library seam."""
     api = _codex_seat_api()
@@ -19799,12 +19837,25 @@ def main(argv: list[str] | None = None) -> int:
             and not getattr(args, "account", None)
             and not getattr(args, "_codex_selected_account", None)
         ):
-            selected_account, selection_rejections = select_codex_account(
-                model=getattr(args, "model", None)
+            (
+                selected_account,
+                selection_rejections,
+                pre_resolved_home,
+                pre_resolved_account,
+                pre_resolved,
+            ) = _prepare_codex_account_for_capacity(
+                project_root,
+                args.dispatch_id,
+                model=getattr(args, "model", None),
             )
             args._codex_selected_account = selected_account
             args._capacity_account = selected_account
             args._codex_account_rejections = selection_rejections
+            args._codex_account_pre_resolved = pre_resolved
+            args._codex_pre_resolved_home = pre_resolved_home
+            args._codex_pre_resolved_account = pre_resolved_account
+            codex_dispatch_home = pre_resolved_home
+            effective_account = pre_resolved_account
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
         except (SystemExit, KeyboardInterrupt) as exc:
@@ -19919,16 +19970,24 @@ def main(argv: list[str] | None = None) -> int:
                             )
                         )
             else:
-                try:
-                    codex_dispatch_home, effective_account = resolve_codex_home(
-                        project_root,
-                        getattr(args, "_codex_selected_account", None)
-                        or args.account,
-                        args.dispatch_id,
-                        model=getattr(args, "model", None),
+                if getattr(args, "_codex_account_pre_resolved", False):
+                    codex_dispatch_home = getattr(
+                        args, "_codex_pre_resolved_home", None
                     )
-                except BaseException:
-                    codex_dispatch_home, effective_account = None, None
+                    effective_account = getattr(
+                        args, "_codex_pre_resolved_account", None
+                    )
+                else:
+                    try:
+                        codex_dispatch_home, effective_account = resolve_codex_home(
+                            project_root,
+                            getattr(args, "_codex_selected_account", None)
+                            or args.account,
+                            args.dispatch_id,
+                            model=getattr(args, "model", None),
+                        )
+                    except BaseException:
+                        codex_dispatch_home, effective_account = None, None
                 if codex_dispatch_home is None and effective_account is None:
                     canonical_home = goalflight_codex_sessions.canonical_account_home(
                         getattr(args, "account", None)
