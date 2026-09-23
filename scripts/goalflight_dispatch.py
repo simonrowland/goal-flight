@@ -2024,20 +2024,24 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             _record_dispatch_worktree(args, lease)
             return lease
         if kind == "in-place" and force_captive:
-            pass
-        elif skip_reset:
+            # ``--worktree create --cwd <project-root>`` is the explicit
+            # captive-seat request used by ACP. Continue through the default
+            # allocator; the project root is only the source repo.
+            cwd_raw = None
+        else:
+            if skip_reset:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded worker cwd {cwd} is not a captive "
+                    f"seat in this controller ring (worktrees/{label}/s-N); "
+                    "refusing to create or choose a replacement seat"
+                )
             raise goalflight_worktree_pool.WorktreeCwdRefused(
-                f"resume refused: recorded worker cwd {cwd} is not a captive "
-                f"seat in this controller ring (worktrees/{label}/s-N); "
-                "refusing to create or choose a replacement seat"
+                f"--cwd {cwd} is not a seat in this controller ring "
+                f"(worktrees/{label}/s-N) and is not the project root. "
+                "Omit --cwd to acquire a captive seat, or pass --in-place "
+                f"for {project_root}. Isolation is not a mode; refusing to "
+                "create that path or git worktree add."
             )
-        raise goalflight_worktree_pool.WorktreeCwdRefused(
-            f"--cwd {cwd} is not a seat in this controller ring "
-            f"(worktrees/{label}/s-N) and is not the project root. "
-            "Omit --cwd to acquire a captive seat, or pass --in-place "
-            f"for {project_root}. Isolation is not a mode; refusing to "
-            "create that path or git worktree add."
-        )
 
     lease = goalflight_worktree_pool.acquire_worktree_seat(
         project_root,

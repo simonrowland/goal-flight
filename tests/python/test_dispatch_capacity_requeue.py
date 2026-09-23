@@ -603,7 +603,7 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
         assert [event[0] for event in events] == ["spawning", "spawn_failed"], events
         lease = next(row for row in lease_rows if row.get("dispatch_id") == dispatch_id)
         assert lease.get("launch_state") == "spawn_failed", lease
-        assert lease.get("state") == "failed", lease
+        assert lease.get("state") == "error", lease
 
 
 def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
