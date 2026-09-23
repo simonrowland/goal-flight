@@ -158,6 +158,20 @@ incremented when meaningful skill behaviour changes.
   not basename: an ad-hoc tree named `wt-N` is litter. Unknown registration
   retains. A retain reason for an identity-live terminal row says
   identity-live, not "non-terminal".
+- `goalflight_trace_archive.py` copies selected finished-dispatch tails from
+  volatile `/tmp` dispatch state into gitignored
+  `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that
+  emitted a worker marker or named a findings path, caps oversized tails
+  (head+tail, dropped middle recorded), and drops steer mailboxes, watcher
+  logs, empty/capacity-blocked noise, and the unattended 7.1 GB `/tmp`
+  backlog. Tails are untrusted; this tool never `git add`s. Going-forward
+  hook is `goalflight_ledger.cmd_finish`. Sweep a backlog with
+  `--source-dir --apply`. Archived tails are unreviewed worker output.
+  Credential-shaped material is redacted at copy time with a named marker
+  and a per-tail count; this tool refuses to `git add`. The drop list
+  (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
+  tail-middle, historical `/tmp` backlog) is in the module docstring and
+  CLI help.
 - `goalflight_dispatch.py drain --dispatch-id <id>` (repeatable) launches only
   the named queued envelope(s). A controller can drain its own work without
   walking the shared cross-project queue.
