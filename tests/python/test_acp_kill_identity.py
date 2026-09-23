@@ -8,6 +8,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("asserts POSIX bash process identity strings")
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -47,7 +48,8 @@ def case_unavailable_meta_preserves_kill_fallthrough() -> None:
     assert _same_process(live, None) is True
 
 
-def case_windows_cleanup_skips_bare_pidfile_pid() -> None:
+def case_windows_cleanup_preserves_legacy_pidfile_without_identity() -> None:
+    """Mixed-version pidfiles stay as evidence when ownership is unknown."""
     with tempfile.TemporaryDirectory() as td:
         pid_dir = Path(td)
         stale = pid_dir / "999999.jsonl"
@@ -61,14 +63,13 @@ def case_windows_cleanup_skips_bare_pidfile_pid() -> None:
             patch("goalflight_compat.is_windows", return_value=True), \
             patch("goalflight_compat.pid_liveness", side_effect=lambda pid: pid == 12345), \
             patch("goalflight_compat.pid_alive", side_effect=fake_pid_alive), \
-            patch("goalflight_compat.kill_pid", side_effect=AssertionError("bare reused pid killed")), \
-            patch("goalflight_acp_client.log.warning") as warn:
+            patch("goalflight_compat.kill_pid", side_effect=AssertionError("bare reused pid killed")):
             killed = goalflight_acp_client.cleanup_ghosts()
-            missing_identity_unlinked = not stale.exists()
-            warned = warn.called
+            missing_identity_preserved = stale.exists()
     assert killed == 0
-    assert missing_identity_unlinked
-    assert warned
+    # Legacy pidfiles lack controller/creation identity; preserve them during
+    # the mixed-version window so a later identity-aware sweep can decide.
+    assert missing_identity_preserved
 
 
 def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
@@ -90,6 +91,7 @@ def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
                     "pid": 12345,
                     "agent": "codex-acp",
                     "creation_time": "same",
+                    "controller_identity": {"pid": 999999, "start_token": "controller"},
                 }
             )
             + "\n",
@@ -104,6 +106,10 @@ def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
         with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
             patch("goalflight_acp_client._ps_meta", return_value=None), \
             patch("goalflight_compat.is_windows", return_value=True), \
+            patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": 999999, "start_token": "new-controller"},
+            ), \
             patch("goalflight_compat.pid_liveness", return_value=None), \
             patch("goalflight_compat.pid_alive", side_effect=lambda pid: pid == 12345), \
             patch("goalflight_compat.kill_pid", side_effect=fake_kill):
@@ -112,6 +118,44 @@ def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
     assert killed == 0
     assert kills == []
     assert preserved
+
+
+def case_windows_cleanup_preserves_live_pidfile_without_creation_identity() -> None:
+    """A live Windows PID without creation identity remains recovery evidence."""
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        tracked = pid_dir / "999999.jsonl"
+        tracked.write_text(
+            json.dumps(
+                {
+                    "pid": 12345,
+                    "agent": "codex-acp",
+                    "controller_identity": {
+                        "pid": 999999,
+                        "start_token": "old-controller",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+            patch("goalflight_acp_client._ps_meta", return_value=None), \
+            patch("goalflight_compat.is_windows", return_value=True), \
+            patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": 999999, "start_token": "new-controller"},
+            ), \
+            patch("goalflight_compat.pid_liveness", return_value=True), \
+            patch("goalflight_compat.pid_alive", return_value=True), \
+            patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("live PID without identity must not be killed"),
+            ):
+            killed = goalflight_acp_client.cleanup_ghosts()
+        preserved = tracked.exists()
+    assert killed == 0
+    assert preserved, "unknown Windows identity must preserve the pidfile"
 
 
 def case_windows_cleanup_kills_confirmed_live_identity() -> None:
@@ -125,6 +169,7 @@ def case_windows_cleanup_kills_confirmed_live_identity() -> None:
                     "pid": 12345,
                     "agent": "codex-acp",
                     "creation_time": "same",
+                    "controller_identity": {"pid": 999999, "start_token": "controller"},
                 }
             )
             + "\n",
@@ -134,6 +179,10 @@ def case_windows_cleanup_kills_confirmed_live_identity() -> None:
         with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
             patch("goalflight_acp_client._ps_meta", return_value=None), \
             patch("goalflight_compat.is_windows", return_value=True), \
+            patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": 999999, "start_token": "new-controller"},
+            ), \
             patch("goalflight_compat.pid_liveness", side_effect=lambda pid: True if pid == 12345 else False), \
             patch("goalflight_compat.pid_alive", side_effect=lambda pid: pid == 12345), \
             patch("goalflight_compat.kill_pid", return_value=True) as kill:
@@ -155,6 +204,7 @@ def case_windows_cleanup_unlinks_confirmed_dead_pid() -> None:
                     "pid": 12345,
                     "agent": "codex-acp",
                     "creation_time": "same",
+                    "controller_identity": {"pid": 999999, "start_token": "controller"},
                 }
             )
             + "\n",
@@ -164,6 +214,10 @@ def case_windows_cleanup_unlinks_confirmed_dead_pid() -> None:
         with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
             patch("goalflight_acp_client._ps_meta", return_value=None), \
             patch("goalflight_compat.is_windows", return_value=True), \
+            patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": 999999, "start_token": "new-controller"},
+            ), \
             patch("goalflight_compat.pid_liveness", return_value=False), \
             patch("goalflight_compat.pid_alive", return_value=False), \
             patch(
@@ -209,6 +263,67 @@ def case_posix_cleanup_preserves_live_legacy_pidfile() -> None:
 
     assert killed == 0
     assert preserved
+
+
+def case_posix_cleanup_preserves_pidfile_when_worker_identity_is_dead() -> None:
+    """A non-signal dead/unknown identity retains a live group as evidence."""
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        worker_identity = goalflight_ledger.process_identity(worker.pid)
+        assert worker_identity and worker_identity.get("start_token"), worker_identity
+        with tempfile.TemporaryDirectory() as td:
+            pid_dir = Path(td)
+            controller_pid = 999999
+            pidfile = pid_dir / f"{controller_pid}.jsonl"
+            pidfile.write_text(
+                json.dumps(
+                    {
+                        "pid": worker.pid,
+                        "pgid": worker.pid,
+                        "controller_pid": controller_pid,
+                        "controller_identity": {
+                            "pid": controller_pid,
+                            "start_token": "old-controller",
+                        },
+                        "worker_identity": worker_identity,
+                        "agent": "codex-acp",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+                "goalflight_acp_client._list_posix_process_rows", return_value=[]
+            ), patch(
+                "goalflight_acp_client._claude_acp_shim_executable_paths",
+                return_value=set(),
+            ), patch(
+                "goalflight_acp_client.reap_orphaned_acp_shims",
+                return_value={"reaped": []},
+            ), patch(
+                "goalflight_acp_client.reap_quota_stuck_workers",
+                return_value={"reaped": []},
+            ), patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": controller_pid, "start_token": "new-controller"},
+            ), patch(
+                "goalflight_acp_client.goalflight_ledger.process_identity",
+                return_value=None,
+            ), patch(
+                "goalflight_acp_client.goalflight_compat.kill_pid",
+                side_effect=AssertionError("unknown worker identity must not signal"),
+            ):
+                killed = goalflight_acp_client.cleanup_ghosts()
+            assert killed == 0
+            assert pidfile.exists(), "live group evidence must be preserved"
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker.pid), goalflight_acp_client.signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            worker.wait(timeout=5)
 
 
 def case_indeterminate_connection_kill_retains_tracking() -> None:
@@ -1207,11 +1322,13 @@ def main() -> None:
     case_exec_comm_change_keeps_identity()
     case_pid_reuse_lstart_change_is_different()
     case_unavailable_meta_preserves_kill_fallthrough()
-    case_windows_cleanup_skips_bare_pidfile_pid()
+    case_windows_cleanup_preserves_legacy_pidfile_without_identity()
     case_windows_cleanup_does_not_kill_indeterminate_pid()
+    case_windows_cleanup_preserves_live_pidfile_without_creation_identity()
     case_windows_cleanup_kills_confirmed_live_identity()
     case_windows_cleanup_unlinks_confirmed_dead_pid()
     case_posix_cleanup_preserves_live_legacy_pidfile()
+    case_posix_cleanup_preserves_pidfile_when_worker_identity_is_dead()
     case_indeterminate_connection_kill_retains_tracking()
     case_connection_fallback_refuses_reused_pid()
     case_hard_signal_reap_deadline_retains_live_scope()

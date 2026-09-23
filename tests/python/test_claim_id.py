@@ -105,6 +105,41 @@ def test_claim_creates_the_file_so_the_slot_is_held(tmp_path: Path) -> None:
     assert other.name != p.name
 
 
+def test_raced_existing_artifact_releases_marker_and_advances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path race cannot return an artifact owned by another caller."""
+    real_open = claim_id.os.open
+
+    def race_open(path, flags, mode=0o777):
+        path = Path(path)
+        if path.name == "SC-01-a.md" and not path.exists():
+            path.write_text("another caller\n")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(claim_id, "existing_ids", lambda *_args: set())
+    monkeypatch.setattr(claim_id.os, "open", race_open)
+    claimed = claim_id.claim(tmp_path, prefix="SC", suffix="-a.md", start=1)
+    assert claimed.name == "SC-02-a.md"
+    assert not (tmp_path / ".claims" / "SC-01").exists()
+
+
+def test_artifact_failure_does_not_leave_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = claim_id.os.open
+
+    def fail_artifact(path, flags, mode=0o777):
+        if Path(path).name == "SC-01-a.md":
+            raise OSError("injected artifact failure")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(claim_id.os, "open", fail_artifact)
+    with pytest.raises(OSError, match="injected artifact failure"):
+        claim_id.claim(tmp_path, prefix="SC", suffix="-a.md")
+    assert not (tmp_path / ".claims" / "SC-01").exists()
+
+
 def test_other_prefixes_are_untouched(tmp_path: Path) -> None:
     (tmp_path / "BUG-09-x.md").write_text("")
     assert claim_id.claim(tmp_path, prefix="SC", suffix="-a.md").name == "SC-01-a.md"

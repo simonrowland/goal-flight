@@ -298,6 +298,34 @@ def _controller_process_identity(pid: int) -> dict | None:
     return {"pid": snapshot["pid"], "start_token": snapshot["start_token"]}
 
 
+def _session_owner_liveness(session: dict) -> bool | None:
+    """Match a queue owner by PID and start token, or return unknown.
+
+    Legacy queue records without a token are intentionally unknown: a live PID
+    is not evidence that it is the same controller generation.
+    """
+    try:
+        pid = int(session.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    expected = session.get("process_identity")
+    expected_start = (
+        expected.get("start_token")
+        if isinstance(expected, dict)
+        else session.get("process_start_token")
+    )
+    if not expected_start:
+        return None
+    current = _controller_process_identity(pid)
+    if current is None:
+        liveness = goalflight_compat.pid_liveness(pid)
+        return False if liveness is False else None
+    return (
+        current.get("pid") == pid
+        and current.get("start_token") == expected_start
+    )
+
+
 def _controller_process_ancestry(pid: int | None = None) -> tuple[dict, ...]:
     """Measure the helper-to-root process chain without invoking ``ps``."""
     current = os.getpid() if pid is None else pid
@@ -2434,11 +2462,13 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _file_lock(path):
         data: dict[str, dict] = {}
+        changed = not path.exists()
         if path.exists():
             try:
                 raw = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
                 raw = None
+                changed = True
             # Back-compat: previous shape was a single record without a pid map.
             # If we find that, migrate it under its own pid key.
             if isinstance(raw, dict):
@@ -2446,9 +2476,11 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
                     isinstance(v, dict) for v in raw.values()
                 ):
                     data = {str(raw.get("pid")): raw}
+                    changed = True
                 else:
                     # Map-shape: keys are pid strings, values are records.
                     data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+                    changed = changed or data != raw
         key = str(pid)
         if key in data:
             # Existing record for this PID — return it as-is. Pruning of
@@ -2457,20 +2489,56 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
             # (which is hot — runs on every CLI invocation in a goal-flight
             # terminal).
             result = data[key]
+            measured_identity = _controller_process_identity(pid)
+            stored_identity = result.get("process_identity")
+            stored_token = (
+                stored_identity.get("start_token")
+                if isinstance(stored_identity, dict)
+                else None
+            )
+            measured_token = (
+                measured_identity.get("start_token")
+                if isinstance(measured_identity, dict)
+                else None
+            )
+            if stored_token and measured_token and stored_token != measured_token:
+                # The PID slot survived, but the process generation did not.
+                # Start a new session rather than letting claim/release trust
+                # the old session id across PID reuse.
+                result = {
+                    "id": str(uuid.uuid4()),
+                    "pid": pid,
+                    "started_at": _now_iso(),
+                    "hostname": socket.gethostname(),
+                    "process_identity": measured_identity,
+                }
+                data[key] = result
+                changed = True
+            elif not stored_token and measured_identity is not None:
+                result = {**result, "process_identity": measured_identity}
+                data[key] = result
+                changed = True
+            elif stored_token and measured_identity is None:
+                # Preserve the stored record on disk, but do not hand an
+                # unverified generation to claim/release as if it were live.
+                result = {**result, "process_identity": None}
         else:
             result = {
                 "id": str(uuid.uuid4()),
                 "pid": pid,
                 "started_at": _now_iso(),
                 "hostname": socket.gethostname(),
+                "process_identity": _controller_process_identity(pid),
             }
             data[key] = result
-        # Atomic write via unique temp file rename. Unique suffix prevents
-        # concurrent ensure_session()s from clobbering each other's temp
-        # files (lock-serialized but defensive).
-        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(path)
+            changed = True
+        if changed:
+            # Atomic write via unique temp file rename. Unique suffix prevents
+            # concurrent ensure_session()s from clobbering each other's temp
+            # files (lock-serialized but defensive).
+            tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            tmp.replace(path)
     return result
 
 
@@ -3101,13 +3169,17 @@ def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool
         if not front:
             return False, f"queue {queue.name} has no frontmatter to stamp into"
         session = ensure_session(project_root)
+        identity = session.get("process_identity")
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return False, "controller process identity unavailable; refusing to claim"
         current = front.get("current_session")
         if isinstance(current, dict) and current.get("id") and current.get("id") != session["id"]:
-            owner_alive = _pid_alive(current.get("pid"))
-            if owner_alive and not force:
+            owner_liveness = _session_owner_liveness(current)
+            if owner_liveness is not False and not force:
                 return False, (
                     f"queue already claimed by session {current.get('id')} "
-                    f"(pid {current.get('pid')} alive); pass --force to take over"
+                    f"(pid {current.get('pid')} identity {('live' if owner_liveness else 'unknown')}); "
+                    "pass --force to take over"
                 )
         history = list(front.get("session_history") or [])
         history.append({
@@ -3117,12 +3189,22 @@ def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool
             "claimed_at": _now_iso(),
             "ended_at": None,
             "ended_reason": None,
+            "process_start_token": (
+                (session.get("process_identity") or {}).get("start_token")
+                if isinstance(session.get("process_identity"), dict)
+                else None
+            ),
         })
         front["current_session"] = {
             "id": session["id"],
             "pid": session["pid"],
             "started_at": session["started_at"],
             "hostname": session["hostname"],
+            "process_start_token": (
+                (session.get("process_identity") or {}).get("start_token")
+                if isinstance(session.get("process_identity"), dict)
+                else None
+            ),
         }
         front["session_history"] = history
         front["last-touched"] = _now_iso()
@@ -3146,6 +3228,7 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
     --force-release-stale or claim --force to take over instead.
     """
     msgs: list[str] = []
+    refused = False
     if queue is not None and queue.exists():
         resolved = _validate_queue_in_project(project_root, queue)
         if resolved is None:
@@ -3164,6 +3247,18 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
                             f"this terminal's session ({my_session['id']}); "
                             "refusing to release. Use --force-release-stale "
                             "or claim --force to take over."
+                        )
+                    current_token = current.get("process_start_token")
+                    my_identity = my_session.get("process_identity")
+                    my_token = (
+                        my_identity.get("start_token")
+                        if isinstance(my_identity, dict)
+                        else None
+                    )
+                    if not current_token or not my_token or current_token != my_token:
+                        return False, (
+                            "queue current_session process identity is not this "
+                            "terminal generation; refusing to release"
                         )
                 history = list(front.get("session_history") or [])
                 if isinstance(current, dict) and current.get("id"):
@@ -3193,17 +3288,32 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
                     isinstance(v, dict) for v in raw.values()
                 ):
                     # Old single-record shape (back-compat) — drop the whole file.
-                    sf.unlink()
-                    msgs.append("cleared session file (back-compat)")
+                    if _session_owner_liveness(raw) is True:
+                        sf.unlink()
+                        msgs.append("cleared session file (back-compat)")
+                    else:
+                        refused = True
+                        msgs.append(
+                            "refused to clear session file: process identity mismatch"
+                        )
                 else:
                     # Map shape: remove only this pid's slot.
                     if my_pid in raw:
-                        del raw[my_pid]
-                    if raw:
-                        _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
-                    else:
-                        sf.unlink()
-                    msgs.append("cleared this terminal's session slot")
+                        slot = raw[my_pid]
+                        if not isinstance(slot, dict) or _session_owner_liveness(slot) is not True:
+                            refused = True
+                            msgs.append(
+                                "refused to clear session slot: process identity mismatch"
+                            )
+                        else:
+                            del raw[my_pid]
+                            if raw:
+                                _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
+                            else:
+                                sf.unlink()
+                            msgs.append("cleared this terminal's session slot")
+    if refused:
+        return False, "; ".join(msgs)
     if not msgs:
         return False, "nothing to release"
     return True, "; ".join(msgs)
@@ -3217,7 +3327,7 @@ def force_release_stale(project_root: Path) -> tuple[int, list[str]]:
         with _file_lock(queue):
             front, body = _parse_frontmatter(queue.read_text())
             current = front.get("current_session")
-            if isinstance(current, dict) and current.get("pid") and not _pid_alive(current.get("pid")):
+            if isinstance(current, dict) and current.get("pid") and _session_owner_liveness(current) is False:
                 history = list(front.get("session_history") or [])
                 for entry in reversed(history):
                     if isinstance(entry, dict) and entry.get("id") == current.get("id") and entry.get("ended_at") is None:

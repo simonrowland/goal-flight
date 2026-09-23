@@ -21,6 +21,7 @@ generation for a dead one. Everything below is shaped so that a question we
 cannot answer yields `known=False` and the caller kills nothing:
 
 * the process table cannot be read      -> unknown, refuse
+* a listener's lease nonce cannot be read in full -> unknown, refuse
 * the lease records cannot be read      -> unknown, refuse
   (this one matters most: an empty "known nonces" set would make EVERY
   listener look orphaned, so a journal that is merely busy would otherwise
@@ -32,8 +33,10 @@ cannot answer yields `known=False` and the caller kills nothing:
 
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -43,6 +46,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat
 import goalflight_journal
 import goalflight_wake
 
@@ -51,10 +55,91 @@ PS_TIMEOUT_S = 15.0
 # Between SIGTERM and the liveness re-check. Listeners exit on the signal; this
 # only has to cover process teardown, not any work they might be doing.
 TERM_GRACE_S = 0.5
+_LISTENER_COMMANDS = frozenset({"listen", "listen-auto", "follow", "supervise"})
 
 
-def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | None:
-    """{lease_nonce: [pid, ...]} FOR THIS PROJECT, or None if ps cannot be read.
+def _process_argv(pid: int) -> list[str] | None:
+    """Read one process's argv without flattening argument boundaries."""
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        if not raw:
+            return None
+        fields = raw.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        try:
+            return [os.fsdecode(field) for field in fields]
+        except UnicodeDecodeError:
+            return None
+
+    if sys.platform == "darwin":
+        # KERN_PROCARGS2 returns: argc, executable path, NUL padding, argv[0..argc-1],
+        # followed by the environment. Unlike ps(1)'s args column, this keeps
+        # every argument as a distinct value, including roots containing spaces.
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            sysctl = libc.sysctl
+            sysctl.argtypes = [
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            sysctl.restype = ctypes.c_int
+            mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+            # A short buffer can succeed with only the TAIL of argv/environment.
+            # Query the required capacity first; an ENOMEM retry cannot fix that.
+            size = ctypes.c_size_t()
+            if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+                return None
+            buffer = (ctypes.c_ubyte * size.value)()
+            actual = ctypes.c_size_t(size.value)
+            if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) != 0:
+                return None
+            if not 4 <= actual.value <= size.value:
+                return None
+            raw = bytes(buffer[: actual.value])
+            argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+            if not 0 < argc < 65536:
+                return None
+            exec_end = raw.find(b"\0", 4)
+            if exec_end < 0:
+                return None
+            argv_start = exec_end + 1
+            while argv_start < len(raw) and raw[argv_start] == 0:
+                argv_start += 1
+            # Padding and an empty argv[0] are indistinguishable. If skipping
+            # them leaves fewer than argc terminated strings, refuse the
+            # ambiguous result rather than returning shifted/incomplete argv.
+            fields = raw[argv_start:].split(b"\0")
+            if len(fields) - 1 < argc:
+                return None
+            argv = [os.fsdecode(field) for field in fields[:argc]]
+            # Candidates are pre-filtered to Python interpreters, so a real
+            # argv[0] names Python. Anything else means the padding skip ate an
+            # empty argv[0] and shifted the list: refuse it as unknown.
+            if not argv or "python" not in os.path.basename(argv[0]).lower():
+                return None
+            return argv
+        except (OSError, AttributeError, TypeError, ValueError):
+            return None
+        return None
+
+    return None
+
+
+def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, object]]] | None:
+    """{lease_nonce: [{pid, start_token}, ...]} FOR THIS PROJECT.
+
+    Each candidate carries a start token captured in the same enumeration pass;
+    a PID without a proven generation is never actionable.
 
     ★ The project filter is load-bearing, not tidiness. The process table is
     machine-wide while lease records are per-project, so an unscoped listing
@@ -66,53 +151,84 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | No
     decide the verdict, or the predicate is answering a different question than
     the one asked.
 
-    None means "we could not look" and must never be read as "none found".
+    None means "we could not look, or a listener argv was incomplete" and must
+    never be read as "none found".
     """
     try:
         wanted = Path(project_root).expanduser().resolve(strict=False)
     except OSError:
         return None
     try:
-        listing = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,args="],
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,uid=,comm="],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return None
+        listing = result.stdout
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    if not isinstance(listing, str):
         return None
 
-    found: dict[str, list[int]] = {}
+    try:
+        current_uid = os.getuid()
+    except AttributeError:
+        return None
+
+    found: dict[str, list[dict[str, object]]] = {}
     for line in listing.splitlines():
-        head, _, rest = line.strip().partition(" ")
-        if not head.isdigit() or not rest:
+        columns = line.split(None, 2)
+        if len(columns) != 3 or not columns[0].isdigit() or not columns[1].isdigit():
             continue
-        parts = rest.split()
-        if not any(goalflight_wake._is_messages_argv_name(p) for p in parts):
+        pid = int(columns[0])
+        if int(columns[1]) != current_uid or not goalflight_wake._is_python_interpreter(
+            columns[2]
+        ):
+            continue
+        identity = goalflight_compat.process_start_identity(pid)
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return None
+        start_token = str(identity["start_token"])
+        argv = _process_argv(pid)
+        if argv is None:
+            return None
+        after_argv = goalflight_compat.process_start_identity(pid)
+        if (
+            not isinstance(after_argv, dict)
+            or not after_argv.get("start_token")
+            or str(after_argv["start_token"]) != start_token
+        ):
+            return None
+        if argv == []:
+            continue
+        classification, fields = goalflight_wake._probe_messages_argv(
+            shlex.join(argv), commands=_LISTENER_COMMANDS
+        )
+        if classification == goalflight_wake._SUPERVISE_ARGV_UNKNOWN:
+            return None
+        if classification != goalflight_wake._SUPERVISE_ARGV_MATCH or fields is None:
             continue
         # Same-project only. A listener that does not say which project it
-        # serves cannot be attributed, so it is never reapable.
-        root = None
-        for index, part in enumerate(parts):
-            if part == "--project-root" and index + 1 < len(parts):
-                root = parts[index + 1]
-                break
+        # serves cannot be attributed, so the process table is not trustworthy.
+        root = fields.get("project_root")
         if not root:
-            continue
+            return None
         try:
             if Path(root).expanduser().resolve(strict=False) != wanted:
                 continue
         except OSError:
-            continue
-        nonce = None
-        for index, part in enumerate(parts):
-            if part == "--lease-nonce" and index + 1 < len(parts):
-                nonce = parts[index + 1]
-                break
+            return None
+        nonce = fields.get("lease_nonce")
         if not nonce:
-            # Unattributable: it may belong to a live generation. Never reapable.
-            continue
-        found.setdefault(nonce, []).append(int(head))
+            # A truncated or unreadable nonce may belong to a live generation.
+            # Do not let any other listener become reapable from this scan.
+            return None
+        found.setdefault(nonce, []).append(
+            {"pid": pid, "start_token": start_token}
+        )
     return found
 
 
@@ -170,12 +286,14 @@ def orphaned_listeners(
     if current_nonce:
         live.add(current_nonce)
     orphan_nonces = sorted(n for n in by_nonce if n not in live)
-    orphan_pids = [pid for n in orphan_nonces for pid in by_nonce[n]]
+    orphan_records = [record for n in orphan_nonces for record in by_nonce[n]]
+    orphan_pids = [int(record["pid"]) for record in orphan_records]
     return {
         "known": True,
         "listeners": sum(len(v) for v in by_nonce.values()),
         "generations": len(by_nonce),
         "orphans": orphan_pids,
+        "orphan_records": orphan_records,
         "orphan_generations": orphan_nonces,
     }
 
@@ -201,12 +319,15 @@ def _liveness(pids: list[int]) -> dict[int, bool | None]:
     if not pids:
         return {}
     try:
-        listing = subprocess.run(
+        result = subprocess.run(
             ["ps", "-o", "pid=,state=", "-p", ",".join(str(p) for p in pids)],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
-        ).stdout
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return {pid: None for pid in pids}
+        listing = result.stdout
     except (OSError, subprocess.SubprocessError):
         return {pid: None for pid in pids}
     # ps omits pids that no longer exist, so absence here is a measured exit.
@@ -240,14 +361,38 @@ def reap_orphaned_listeners(
             "detail": report,
         }
 
-    targets = [pid for pid in report["orphans"] if pid not in _protected_pids()]
+    protected = _protected_pids()
+    targets = [
+        record
+        for record in report.get("orphan_records", [])
+        if isinstance(record, dict)
+        and isinstance(record.get("pid"), int)
+        and isinstance(record.get("start_token"), str)
+        and record["start_token"]
+        and record["pid"] not in protected
+    ]
     if dry_run:
-        return {"reaped": 0, "would_reap": targets, "detail": report}
+        return {
+            "reaped": 0,
+            "would_reap": [record["pid"] for record in targets],
+            "detail": report,
+        }
 
     reaped: list[int] = []
     stubborn: list[dict] = []
     signalled: list[int] = []
-    for pid in targets:
+    refused_identity: list[dict[str, object]] = []
+    for record in targets:
+        pid = int(record["pid"])
+        current = goalflight_compat.process_start_identity(pid)
+        if (
+            not isinstance(current, dict)
+            or not current.get("start_token")
+            or current.get("pid") != pid
+            or str(current["start_token"]) != record["start_token"]
+        ):
+            refused_identity.append({"pid": pid, "why": "identity-unverified"})
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -274,6 +419,8 @@ def reap_orphaned_listeners(
         "generations": report["orphan_generations"],
         "detail": report,
     }
+    if refused_identity:
+        result["refused_identity"] = refused_identity
     if stubborn:
         result["stubborn"] = stubborn
     return result

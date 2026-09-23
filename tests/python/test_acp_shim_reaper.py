@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -253,7 +254,9 @@ def case_terminate_helper_escalates_surviving_group_after_leader_exit() -> None:
     with patch("goalflight_compat.is_windows", return_value=False), patch(
         "goalflight_acp_client.os.killpg",
         side_effect=lambda pgid, sig: signals.append((pgid, sig)),
-    ), patch("goalflight_acp_client._pgid_alive", return_value=True):
+    ), patch("goalflight_acp_client._pgid_alive", return_value=True), patch(
+        "goalflight_acp_client._termination_targets_live", return_value=False
+    ):
         action = goalflight_acp_client._terminate_process_group(
             101,
             pid=101,
@@ -427,6 +430,120 @@ def case_cleanup_ghosts_runs_shim_reaper_when_pidfile_dir_missing() -> None:
     reap.assert_called_once()
 
 
+def case_cleanup_ghosts_shares_process_snapshot() -> None:
+    rows = [{"pid": 101, "ppid": 1, "comm": "worker", "age_s": 1200.0}]
+    with tempfile.TemporaryDirectory() as td:
+        with patch("goalflight_acp_client._PIDFILE_DIR", Path(td)), patch(
+            "goalflight_acp_client._list_posix_process_rows", return_value=rows
+        ) as snapshot, patch(
+            "goalflight_acp_client._claude_acp_shim_executable_paths", return_value={}
+        ) as paths, patch(
+            "goalflight_acp_client.reap_orphaned_acp_shims", return_value={"reaped": []}
+        ) as shims, patch(
+            "goalflight_acp_client.reap_quota_stuck_workers", return_value={"reaped": []}
+        ) as quota:
+            assert goalflight_acp_client.cleanup_ghosts() == 0
+    snapshot.assert_called_once_with()
+    paths.assert_called_once_with()
+    assert shims.call_args.kwargs["process_rows"] is rows
+    assert quota.call_args.kwargs["process_rows"] is rows
+
+
+def case_cleanup_ghosts_does_not_pin_reused_controller_pid() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        pidfile = pid_dir / "4242.jsonl"
+        pidfile.write_text(
+            '{"pid": 4343, "controller_pid": 4242, '
+            '"controller_identity": {"pid": 4242, "start_token": "old-controller"}, '
+            '"worker_identity": {"pid": 4343, "start_token": "old-worker"}}\n',
+            encoding="utf-8",
+        )
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+            "goalflight_acp_client._list_posix_process_rows", return_value=[]
+        ), patch(
+            "goalflight_acp_client._claude_acp_shim_executable_paths", return_value={}
+        ), patch(
+            "goalflight_acp_client.goalflight_compat.process_start_identity",
+            return_value={"pid": 4242, "start_token": "new-controller"},
+        ), patch(
+            "goalflight_acp_client.goalflight_ledger.process_identity", return_value=None
+        ):
+            assert goalflight_acp_client.cleanup_ghosts() == 0
+        assert not pidfile.exists()
+
+
+def case_cleanup_ghosts_preserves_pidfile_when_controller_identity_unknown() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        pidfile = pid_dir / "4242.jsonl"
+        pidfile.write_text(
+            '{"pid": 4343, "controller_pid": 4242, '
+            '"controller_identity": {"pid": 4242, "start_token": "old-controller"}, '
+            '"worker_identity": {"pid": 4343, "start_token": "old-worker"}}\n',
+            encoding="utf-8",
+        )
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+            "goalflight_acp_client._list_posix_process_rows", return_value=[]
+        ), patch(
+            "goalflight_acp_client._claude_acp_shim_executable_paths", return_value={}
+        ), patch(
+            "goalflight_acp_client.goalflight_compat.process_start_identity",
+            return_value=None,
+        ), patch(
+            "goalflight_acp_client.goalflight_ledger.process_identity",
+            side_effect=AssertionError("unknown controller must stop before worker kill"),
+        ), patch(
+            "goalflight_acp_client.goalflight_compat.kill_pid",
+            side_effect=AssertionError("unknown controller must not signal"),
+        ):
+            assert goalflight_acp_client.cleanup_ghosts() == 0
+        assert pidfile.exists(), "unknown controller identity is retained as evidence"
+
+
+def case_terminate_helper_uses_one_final_ps_confirmation() -> None:
+    signals: list[tuple[int, int]] = []
+    completed = goalflight_acp_client.subprocess.CompletedProcess(
+        args=["ps"], returncode=0, stdout="101 101 S\n"
+    )
+    with patch("goalflight_compat.is_windows", return_value=False), patch(
+        "goalflight_acp_client.os.killpg",
+        side_effect=lambda pgid, sig: signals.append((pgid, sig)),
+    ), patch("goalflight_acp_client._pgid_alive", return_value=True), patch(
+        "goalflight_acp_client.subprocess.run", return_value=completed
+    ) as ps_probe, patch(
+        "goalflight_acp_client.time.monotonic", side_effect=[0.0, 0.0, 2.0, 3.0]
+    ), patch("goalflight_acp_client.time.sleep"):
+        goalflight_acp_client._terminate_process_group(
+            101,
+            pid=101,
+            expected_identity=_identity(101),
+            identity_probe=lambda _pid: _identity(101),
+            grace_s=0,
+        )
+    assert signals == [
+        (101, goalflight_acp_client.signal.SIGTERM),
+        (101, goalflight_acp_client.signal.SIGKILL),
+    ]
+    assert ps_probe.call_count == 1, "post-kill teardown must use one final ps probe"
+
+
+def case_npm_root_is_cached_per_process() -> None:
+    goalflight_acp_client._npm_root_global.cache_clear()
+    calls: list[list[str]] = []
+    completed = goalflight_acp_client.subprocess.CompletedProcess(
+        args=["npm", "root", "-g"], returncode=0, stdout="/global/node_modules\n"
+    )
+    with patch(
+        "goalflight_acp_client.subprocess.run",
+        side_effect=lambda args, **_kwargs: calls.append(list(args)) or completed,
+    ):
+        first = goalflight_acp_client._npm_root_global("npm")
+        second = goalflight_acp_client._npm_root_global("npm")
+    assert first == second == Path("/global/node_modules")
+    assert calls == [["npm", "root", "-g"]]
+
+
 def main() -> None:
     case_reaper_selects_only_qualifying_orphans()
     case_reaper_does_not_reap_foreign_editor_orphan()
@@ -445,6 +562,11 @@ def main() -> None:
     case_reaper_opt_out_is_noop()
     case_count_orphans_ignores_ttl()
     case_cleanup_ghosts_runs_shim_reaper_when_pidfile_dir_missing()
+    case_cleanup_ghosts_shares_process_snapshot()
+    case_cleanup_ghosts_does_not_pin_reused_controller_pid()
+    case_cleanup_ghosts_preserves_pidfile_when_controller_identity_unknown()
+    case_terminate_helper_uses_one_final_ps_confirmation()
+    case_npm_root_is_cached_per_process()
     print("OK: ACP shim reaper tests pass")
 
 
