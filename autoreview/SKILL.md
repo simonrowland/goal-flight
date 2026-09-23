@@ -134,7 +134,8 @@ Inline syntax is also supported:
 ```
 
 Codex maps thinking to `model_reasoning_effort` and accepts `low`, `medium`,
-`high`, or `xhigh`. Claude maps thinking to `--effort` and also accepts `max`.
+`high`, `xhigh`, `max`, or `ultra` (support depends on the selected model).
+Claude maps thinking to `--effort` and accepts through `max`.
 Engines without a real thinking knob reject `--thinking`.
 
 ## Context Efficiency

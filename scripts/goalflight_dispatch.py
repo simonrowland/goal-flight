@@ -502,7 +502,8 @@ OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
 # Codex's accepted reasoning-effort levels. Same set autoreview validates
 # against (autoreview/scripts/autoreview), kept in one shape so a level that
 # works there works here.
-CODEX_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+CODEX_FALLBACK_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+CODEX_REASONING_EFFORTS = CODEX_FALLBACK_REASONING_EFFORTS | {"max", "ultra"}
 
 
 def _parse_reasoning_effort(value: str) -> str:
@@ -6665,6 +6666,53 @@ def codex_context_mode_defined(env: dict[str, str]) -> bool:
     except (OSError, UnicodeError):
         return False
     return _CONTEXT_MODE_TABLE_RE.search(config) is not None
+
+
+def _validate_codex_reasoning_effort(args, env: dict[str, str]) -> None:
+    """Validate against the actual launch home, including isolated dispatch homes."""
+    effort = getattr(args, "reasoning_effort", None)
+    if args.agent != "codex" or not effort:
+        return
+    raw_home = env.get("CODEX_HOME")
+    home = Path(raw_home).expanduser() if raw_home else Path.home() / ".codex"
+    model = getattr(args, "model", None)
+    if not model:
+        try:
+            import tomllib
+
+            config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+            profile = config.get("profiles", {}).get(config.get("profile"), {})
+            model = profile.get("model") or config.get("model")
+        except (ImportError, OSError, ValueError, AttributeError, TypeError):
+            pass
+    levels = CODEX_FALLBACK_REASONING_EFFORTS
+    fallback = True
+    try:
+        cache = json.loads((home / "models_cache.json").read_text(encoding="utf-8"))
+        models = cache["models"]
+        if not model:
+            # Codex's catalog default is the first model in priority order.
+            model = min(models, key=lambda entry: entry["priority"])["slug"]
+        entry = next(entry for entry in models if entry["slug"] == model)
+        supported = entry["supported_reasoning_levels"]
+        if supported and all(
+            isinstance(item, dict) and isinstance(item.get("effort"), str)
+            and item["effort"] for item in supported
+        ):
+            levels = {item["effort"] for item in supported}
+            fallback = False
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        pass
+    if effort not in levels:
+        source = (
+            "; using fallback static set (models cache missing, unreadable, "
+            "or no usable entry for this model)" if fallback else ""
+        )
+        raise DispatchUsageError(
+            f"reasoning effort {effort!r} is not supported for Codex model "
+            f"{model or '<default>'!r}; supported levels: "
+            + ", ".join(sorted(levels)) + source
+        )
 
 
 def _guard_codex_context_mode_disable(
@@ -18308,6 +18356,8 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                         default=None,
                         help="Codex reasoning effort for this dispatch "
                              f"({', '.join(sorted(CODEX_REASONING_EFFORTS))}). "
+                             "Validated against the selected model's models_cache.json; "
+                             "fallback: low, medium, high, xhigh. "
                              "Default = whatever the worker CLI config sets, so "
                              "the machine keeps one source of truth for the "
                              "default; pass this to raise a single dispatch.")
@@ -19170,6 +19220,11 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         codex_dispatch_home = str(canonical_home)
                         effective_account = args.account
+        if not raw:
+            codex_env = {**os.environ, **account_env}
+            if codex_dispatch_home is not None:
+                codex_env["CODEX_HOME"] = codex_dispatch_home
+            _validate_codex_reasoning_effort(args, codex_env)
         request_envelope = _queue_request_envelope(args)
         worktree_seat = _bind_dispatch_worktree(args)
         if worktree_seat is not None:
