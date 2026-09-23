@@ -1973,7 +1973,11 @@ def test_supervise_migration_never_signals_caller_process_group(
     monkeypatch.setattr(
         messages.goalflight_compat,
         "process_start_identity",
-        lambda _pid: {"start_token": "caller-start"},
+        lambda _pid, **kwargs: (
+            {"start_token": "caller-start", "ppid": 1}
+            if kwargs.get("include_ancestry")
+            else {"start_token": "caller-start"}
+        ),
     )
     monkeypatch.setattr(messages.os, "getppid", lambda: 12345)
     monkeypatch.setattr(messages.os, "getpgid", lambda _pid: 77)
@@ -2004,6 +2008,77 @@ def test_supervise_migration_never_signals_caller_process_group(
 
     assert result == 0
     assert captured["before_renewal"] is not None
+    assert killed == []
+
+
+def test_supervise_migration_never_signals_caller_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller ancestor is unsafe even when it has a different process group."""
+    record = wake.WaiterRecord(
+        kind=wake.WATCHDOG_KIND,
+        label_hash="label",
+        pid=54321,
+        start_hash=wake._start_hash("ancestor-start"),
+        instance_id="a" * 32,
+        path=tmp_path / "watchdog.lock",
+        generation_hash="generation",
+    )
+    identities = {
+        90000: {"start_token": "self-start", "ppid": 70000},
+        70000: {"start_token": "caller-start", "ppid": 54321},
+        54321: {"start_token": "ancestor-start", "ppid": 1},
+    }
+    captured: dict[str, object] = {}
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        messages.goalflight_wake,
+        "live_waiters",
+        lambda *args, **kwargs: [record],
+    )
+    monkeypatch.setattr(
+        messages.goalflight_compat,
+        "process_start_identity",
+        lambda pid, **kwargs: identities[pid],
+    )
+    monkeypatch.setattr(messages.os, "getpid", lambda: 90000)
+    monkeypatch.setattr(messages.os, "getppid", lambda: 70000)
+    monkeypatch.setattr(
+        messages.os,
+        "getpgid",
+        lambda pid: {70000: 77, 54321: 88}[pid],
+    )
+    monkeypatch.setattr(
+        messages.os,
+        "kill",
+        lambda pid, signum: killed.append((pid, signum)),
+    )
+
+    def fake_cmd_supervise(args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        root = Path(args.project_root)  # type: ignore[attr-defined]
+        before = kwargs["before_renewal"]
+        on_probe = kwargs["on_startup_probe"]
+        assert callable(before) and callable(on_probe)
+        before_result = before(root, "label", "nonce")
+        captured["before_result"] = before_result
+        captured["probe_result"] = on_probe(root, "label", "nonce")
+        return 0
+
+    monkeypatch.setattr(supervise, "cmd_supervise", fake_cmd_supervise)
+    result = messages.cmd_supervise(
+        SimpleNamespace(
+            project_root=str(tmp_path),
+            controller_label="label",
+            lease_nonce="nonce",
+        )
+    )
+
+    assert result == 0
+    assert "caller ancestor" in str(captured["before_result"])
+    assert captured["probe_result"] is None
     assert killed == []
 
 

@@ -9521,6 +9521,42 @@ def _pid_in_caller_process_group(pid: int) -> bool | None:
     return target_pgid == caller_pgid
 
 
+def _pid_in_caller_ancestry(pid: int) -> bool | None:
+    """Return whether *pid* is this supervisor or one of its ancestors.
+
+    The PPID chain is read from the same native process identity probe used for
+    start-token validation.  Missing ancestry evidence is UNKNOWN, never proof
+    that a candidate is safe to signal.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    current_pid = os.getpid()
+    seen: set[int] = set()
+    while True:
+        if current_pid == pid:
+            return True
+        if current_pid == 1:
+            return False
+        if current_pid in seen:
+            return None
+        seen.add(current_pid)
+        identity = goalflight_compat.process_start_identity(
+            current_pid,
+            include_ancestry=True,
+        )
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return None
+        parent_pid = identity.get("ppid")
+        if (
+            isinstance(parent_pid, bool)
+            or not isinstance(parent_pid, int)
+            or parent_pid <= 0
+            or parent_pid == current_pid
+        ):
+            return None
+        current_pid = parent_pid
+
+
 def cmd_supervise(args) -> int:
     """One tracked task that owns the persistent wake pool."""
     import goalflight_wake_supervise as supervise
@@ -9607,6 +9643,17 @@ def cmd_supervise(args) -> int:
                 if goalflight_wake._start_hash(start_token) == record.start_hash:
                     if pid == os.getpid():
                         return f"refused to signal current process {pid}; coverage retained"
+                    caller_ancestry = _pid_in_caller_ancestry(pid)
+                    if caller_ancestry is None:
+                        identity_unknown.append(
+                            f"pid {pid} caller ancestry is unavailable"
+                        )
+                        continue
+                    if caller_ancestry:
+                        identity_unknown.append(
+                            f"pid {pid} is the caller or a caller ancestor"
+                        )
+                        continue
                     caller_group = _pid_in_caller_process_group(pid)
                     if caller_group is None:
                         identity_unknown.append(
@@ -9660,6 +9707,13 @@ def cmd_supervise(args) -> int:
                     failures.append(f"pid {pid} owner is unavailable")
                     continue
                 if goalflight_wake._start_hash(start_token) != record.start_hash:
+                    continue
+                caller_ancestry = _pid_in_caller_ancestry(pid)
+                if caller_ancestry is None:
+                    failures.append(f"pid {pid} caller ancestry is unavailable")
+                    continue
+                if caller_ancestry:
+                    failures.append(f"pid {pid} is the caller or a caller ancestor")
                     continue
                 caller_group = _pid_in_caller_process_group(pid)
                 if caller_group is None:
