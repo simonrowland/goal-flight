@@ -2793,6 +2793,24 @@ def _gate_journal_connects(
     return hits
 
 
+def _count_journal_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+) -> list[str]:
+    """Count reader and writer opens at sqlite3's shared journal seam."""
+    journal_uri = journal.resolve_journal_path(project).as_uri()
+    real_connect = journal.sqlite3.connect
+    opens: list[str] = []
+
+    def counted_connect(database: object, *args: object, **kwargs: object):
+        if str(database).startswith(journal_uri):
+            opens.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal.sqlite3, "connect", counted_connect)
+    return opens
+
+
 class _QueryBusyConnection:
     """Connection proxy that injects busy only after _connect setup succeeds."""
 
@@ -2973,8 +2991,12 @@ def test_idle_listener_does_not_write_journal_each_poll(isolated) -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
-def test_listener_start_to_exit_writes_are_bounded(isolated) -> None:
+def test_listener_start_to_exit_writes_are_bounded(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     project, env, lease = isolated
+    opens = _count_journal_connects(monkeypatch, project)
     command = _backup_command(project, lease, timeout_s=3)
     command.remove("--report-pending")
     listener = subprocess.Popen(
@@ -2987,6 +3009,7 @@ def test_listener_start_to_exit_writes_are_bounded(isolated) -> None:
     total_written = None
     try:
         _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+        time.sleep(0.15)
         _release_lease(project, lease)
         assert listener.stdout is not None
         exit_record = _JsonLineReader(listener.stdout).read(timeout_s=5)[1]
@@ -3002,6 +3025,9 @@ def test_listener_start_to_exit_writes_are_bounded(isolated) -> None:
     assert listener.returncode == 3, (
         f"unexpected listener exit {listener.returncode}; "
         f"stdout={stdout!r}; stderr={stderr!r}"
+    )
+    assert len(opens) <= 4, (
+        f"listener opened {len(opens)} journal connections: {opens!r}"
     )
     assert total_written < 1024 * 1024, (
         f"listener start-to-exit wrote {total_written} bytes"
@@ -3024,15 +3050,7 @@ def test_idle_listener_reuses_journal_connection(
         report_pending=False,
         watch_follow=False,
     )
-    opens = 0
-    real_connect = journal._sqlite_connect
-
-    def counted_connect(*args, **kwargs):
-        nonlocal opens
-        opens += 1
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(journal, "_sqlite_connect", counted_connect)
+    opens = _count_journal_connects(monkeypatch, project)
     monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
     monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
     stdout = io.StringIO()
@@ -3048,14 +3066,16 @@ def test_idle_listener_reuses_journal_connection(
     try:
         _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
         time.sleep(0.15)
-        opens_at_arm = opens
+        opens_at_arm = len(opens)
         time.sleep(0.2)
+        opens_after_idle = len(opens)
     finally:
         thread.join(timeout=5)
     assert not thread.is_alive()
     assert result == [1], stderr.getvalue()
     assert opens_at_arm <= 8
-    assert opens == opens_at_arm
+    assert opens_after_idle == opens_at_arm
+    assert len(opens) <= 8
 
 
 def test_pending_unclaimed_ring_obeys_poll_interval(
@@ -3313,6 +3333,68 @@ def test_listen_coverage_arm_exits_promptly_when_journal_vanishes(
     assert results == [2]
     assert "journal-unavailable" in cap.stderr
     assert "listener degraded" not in cap.stderr
+
+
+def test_listen_finishes_when_restored_journal_replaces_live_path(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    """A validated restore must not strand the listener coverage row ARMED."""
+    project, env, lease = isolated
+    command = _backup_command(project, lease, timeout_s=60)
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    snapshot = tmp_path / "restored-journal.sqlite3"
+    coverage = None
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+
+        def coverage_is_armed() -> bool:
+            nonlocal coverage
+            observed = journal.Journal(project).active_coverage(lease.label)
+            if observed is None or observed["state"] != journal.COVERAGE_ARMED:
+                return False
+            coverage = observed
+            return True
+
+        wait_until(
+            coverage_is_armed,
+            timeout_s=15,
+            interval_s=0.01,
+            message="listener coverage arm",
+        )
+        assert coverage is not None
+        path = journal.resolve_journal_path(project)
+        with sqlite3.connect(path) as source, sqlite3.connect(snapshot) as target:
+            source.backup(target)
+        os.replace(snapshot, path)
+
+        stdout, stderr = listener.communicate(timeout=15)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        if listener.poll() is None:
+            listener.wait(timeout=5)
+
+    assert listener.returncode == 2, (stdout, stderr)
+    records = [
+        json.loads(line)
+        for line in stdout.decode().splitlines()
+        if line.strip()
+    ]
+    exits = [record for record in records if record.get("kind") == "exit"]
+    assert len(exits) == 1, (stdout, stderr)
+    assert exits[0]["reason"] == "journal-unavailable", exits[0]
+    assert "journal database was replaced" in exits[0]["detail"]
+    restored = journal.Journal(project).coverage(str(coverage["coverage_id"]))
+    assert restored is not None
+    assert restored["state"] == journal.COVERAGE_EXITED
+    assert restored["exit_reason"] == "journal-unavailable"
 
 
 def test_listen_coverage_arm_keeps_journal_io_failure_fatal(

@@ -8741,7 +8741,13 @@ def cmd_listen(args) -> int:
             if hint:
                 print(hint, file=sys.stderr)
 
-    def finish(reason: str, *, code: int, detail: str | None = None) -> int:
+    def finish(
+        reason: str,
+        *,
+        code: int,
+        detail: str | None = None,
+        reopen_for_exit: bool = False,
+    ) -> int:
         payload = {
             "kind": "exit",
             "reason": reason,
@@ -8749,7 +8755,18 @@ def cmd_listen(args) -> int:
             "detail": detail,
         }
         try:
-            exited = authority.exit_listener(coverage_id, reason=reason)
+            exit_authority = authority
+            if reopen_for_exit:
+                # The old writer is fenced to the inode that was replaced. A
+                # validated fresh writer can close the copied coverage row when
+                # the replacement is a usable restore; otherwise finish still
+                # emits its exit record with the write failure attached.
+                exit_authority = goalflight_journal.Journal(
+                    project_root,
+                    retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+                    open_retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+                )
+            exited = exit_authority.exit_listener(coverage_id, reason=reason)
             if not exited.committed:
                 payload["coverage_exit_error"] = (
                     exited.reason or "coverage exit CAS lost"
@@ -9358,6 +9375,15 @@ def cmd_listen(args) -> int:
                     file=sys.stderr,
                 )
             wakeable_items = False
+        except goalflight_journal.JournalIntegrityError as exc:
+            if "journal database was replaced at " not in str(exc):
+                raise
+            return finish(
+                "journal-unavailable",
+                code=2,
+                detail=str(exc),
+                reopen_for_exit=True,
+            )
         except goalflight_journal.JournalError:
             raise
         except ValueError as exc:
