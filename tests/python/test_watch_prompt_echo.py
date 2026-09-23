@@ -64,8 +64,9 @@ def _watcher_command(
     dispatch_id: str,
     poll_secs: str,
     max_idle_secs: str,
+    worker_cwd: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(WATCH),
         "--pid",
@@ -82,6 +83,9 @@ def _watcher_command(
         max_idle_secs,
         "--stay-after-terminal",
     ]
+    if worker_cwd is not None:
+        command += ["--worker-cwd", str(worker_cwd)]
+    return command
 
 
 def _run_watcher(
@@ -95,6 +99,7 @@ def _run_watcher(
     max_idle_secs: str = "30",
     dispatch_id: str | None = None,
     project_root: Path | None = None,
+    worker_cwd: Path | None = None,
     task_ids: str | None = None,
     agent: str | None = None,
 ):
@@ -117,6 +122,7 @@ def _run_watcher(
         dispatch_id=dispatch_id,
         poll_secs=poll_secs,
         max_idle_secs=max_idle_secs,
+        worker_cwd=worker_cwd,
     )
     if project_root is not None:
         cmd += ["--project-root", str(project_root)]
@@ -402,7 +408,7 @@ def case_identity_mismatch_not_alive() -> None:
     try:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
-            "lstart": "actual process start",
+            "lstart": "expected process start",
             "start_token": "actual-token",
             "comm": "worker",
         }
@@ -563,6 +569,8 @@ def case_mid_output_marker_ignored() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         tail = tmp / "tail.txt"
+        worker_cwd = tmp / "worker-cwd"
+        worker_cwd.mkdir()
         # mid-output RESULT (as if cat or printf of data) + fenced example + more content:
         # marker is present but not last nonempty line -> watcher must ignore for terminal.
         tail.write_text(
@@ -572,14 +580,22 @@ def case_mid_output_marker_ignored() -> None:
             "still more output after the would-be markers\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            cwd=worker_cwd,
+            start_new_session=True,
+        )
         try:
             identity = goalflight_watch._lightweight_process_identity(worker.pid) or {
                 "pid": worker.pid
             }
             rc, elapsed, term, _ = _run_watcher(
                 tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
-                identity=identity, poll_secs="0.2", max_idle_secs="1",
+                identity=identity,
+                project_root=ROOT,
+                worker_cwd=worker_cwd,
+                poll_secs="0.2",
+                max_idle_secs="1",
             )
         finally:
             worker.terminate()
@@ -652,17 +668,30 @@ def case_ready_terminal_marker() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         tail = tmp / "tail.txt"
+        worker_cwd = tmp / "worker-cwd"
+        worker_cwd.mkdir()
         tail.write_text(
             "TL;DR: audit done\n"
             "READY: docs-private/research/2026-06-03-audit/findings.md\n"
             "more output after READY (not terminal)\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            cwd=worker_cwd,
+            start_new_session=True,
+        )
         try:
+            identity = goalflight_watch._lightweight_process_identity(worker.pid) or {
+                "pid": worker.pid
+            }
             rc, elapsed, term, _ = _run_watcher(
                 tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
-                poll_secs="0.2", max_idle_secs="1",
+                identity=identity,
+                project_root=ROOT,
+                worker_cwd=worker_cwd,
+                poll_secs="0.2",
+                max_idle_secs="1",
             )
         finally:
             worker.terminate()

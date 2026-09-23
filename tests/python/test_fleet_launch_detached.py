@@ -712,7 +712,7 @@ def test_recovery_reclaims_reused_pid_owner_lock() -> None:
                 return {
                     "pid": pid,
                     "start_token": "linux:boot:7779-new",
-                    "lstart": "Thu Jun 11 12:00:01 2026",
+                    "lstart": "Thu Jun 11 12:00:00 2026",
                     "comm": "python3",
                 }
             return {"pid": pid, "lstart": "Thu Jun 11 12:00:02 2026", "comm": "python3"}
@@ -771,7 +771,7 @@ def test_recovery_live_owner_lock_refuses() -> None:
         assert_true("warn reason", "recovery_already_in_progress" in stderr.getvalue())
 
 
-def test_recovery_reclaims_stale_unresolvable_owner_lock() -> None:
+def test_recovery_preserves_stale_unresolvable_owner_lock() -> None:
     dispatch_id = "acp-recover-stale-lock-owner"
     prompt_text = "retry prompt"
     old_created = datetime.now(timezone.utc) - timedelta(
@@ -794,21 +794,17 @@ def test_recovery_reclaims_stale_unresolvable_owner_lock() -> None:
             },
         )
         args = _args(state_dir, dispatch_id, prompt_text, recover=True)
-        stdout = io.StringIO()
+        stderr = io.StringIO()
 
         def fake_identity(pid: int) -> dict[str, Any] | None:
             return {"pid": pid, "lstart": "Thu Jun 11 12:00:01 2026", "comm": "python3"}
 
-        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stdout(stdout):
+        with patched_process_identity(fake_identity), patched_spawn() as calls, redirect_stderr(stderr):
             code = fleet_launch._launch(args)
-        marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
-        assert_true("launch ok", code == 0)
-        assert_true("spawn once", len(calls) == 1)
-        assert_true(
-            "stale lock reclaimed",
-            marker.get("reclaimed_recovery_lock") == "owner_no_pid_stale_created_at",
-        )
-        assert_true("recovery lock cleared", not lock_path.exists())
+        assert_true("refused", code == 17)
+        assert_true("no second spawn", len(calls) == 0)
+        assert_true("stale unknown-owner lock preserved", lock_path.exists())
+        assert_true("warn reason", "recovery_already_in_progress" in stderr.getvalue())
 
 
 def test_ensure_local_bin_prepends_when_absent() -> None:
@@ -918,7 +914,7 @@ def main() -> None:
         test_recovery_reclaims_dead_owner_lock,
         test_recovery_reclaims_reused_pid_owner_lock,
         test_recovery_live_owner_lock_refuses,
-        test_recovery_reclaims_stale_unresolvable_owner_lock,
+        test_recovery_preserves_stale_unresolvable_owner_lock,
     ]
     for test in tests:
         test()

@@ -393,13 +393,11 @@ def _reclaim_recovery_lock_if_allowed(path: Path) -> tuple[bool, str]:
     payload = parsed if isinstance(parsed, dict) else {}
 
     live, live_reason = _recovery_lock_owner_live(payload)
-    stale, stale_reason = _recovery_lock_stale(path, payload)
+    _, stale_reason = _recovery_lock_stale(path, payload)
     if live is True:
         return False, "owner_live"
     if live is False:
         reclaim_reason = f"owner_{live_reason}"
-    elif stale:
-        reclaim_reason = f"owner_{live_reason}_{stale_reason}"
     else:
         return False, f"owner_{live_reason}_{stale_reason}"
 
