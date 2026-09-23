@@ -64,6 +64,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 from typing import Any
 
@@ -72,6 +73,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import goalflight_output_redact  # noqa: E402
+import goalflight_dispatch_states  # noqa: E402
 
 
 SCHEMA = "goalflight.trace-archive.v1"
@@ -348,6 +350,250 @@ def archive_finished_dispatch(
             "reason": f"archive write failed ({exc.__class__.__name__}: {exc})",
             "dest": str(dest),
         }
+
+
+def ensure_receipt(
+    record: dict[str, Any],
+    *,
+    apply: bool = True,
+    project_root: Path | None = None,
+) -> dict[str, Any]:
+    """Create a small terminal receipt when no worker tail is worth keeping."""
+
+    root_raw = project_root or record.get("project_root")
+    dispatch_id = record.get("dispatch_id")
+    if not isinstance(root_raw, (str, Path)) or not str(root_raw).strip() or not dispatch_id:
+        return {"ok": False, "keep": True, "reason": "missing_receipt_identity"}
+    root = Path(str(root_raw)).expanduser().resolve(strict=False)
+    dest = _dest_dir(root, record)
+    result = {"ok": True, "keep": True, "apply": bool(apply), "dest": str(dest), "dispatch_id": str(dispatch_id)}
+    if not apply:
+        return result
+    try:
+        dest.mkdir(parents=True, exist_ok=True, mode=0o700)
+        receipt = dest / "RECEIPT.json"
+        if not receipt.exists():
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": "goalflight.trace-receipt.v1",
+                        "dispatch_id": str(dispatch_id),
+                        "state": record.get("state"),
+                        "terminal_state": record.get("terminal_state"),
+                        "ended_at": record.get("ended_at"),
+                        "project_root": str(root),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(receipt, 0o600)
+        manifest = dest / "MANIFEST.json"
+        if not manifest.exists():
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": "goalflight.trace-receipt.v1",
+                        "dispatch_id": str(dispatch_id),
+                        "kind": "terminal_receipt",
+                        "kept": ["RECEIPT.json", "MANIFEST.json"],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(manifest, 0o600)
+    except OSError as exc:
+        return {**result, "ok": False, "reason": f"receipt_write_failed:{type(exc).__name__}"}
+    return result
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    try:
+        stat = path.lstat()
+    except OSError:
+        return 0
+    if path.is_symlink():
+        return 0
+    blocks = getattr(stat, "st_blocks", None)
+    if path.is_file():
+        return int(blocks * 512 if blocks is not None else stat.st_size)
+    if not path.is_dir():
+        return 0
+    try:
+        for child in path.iterdir():
+            total += _tree_bytes(child)
+    except OSError:
+        return 0
+    return total
+
+
+def _archive_terminal_time(record: dict[str, Any]) -> dt.datetime | None:
+    for key in ("ended_at", "finished_at", "terminal_at", "updated_at"):
+        value = record.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return dt.datetime.fromtimestamp(value, dt.timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                continue
+        if isinstance(value, str):
+            parsed = value.replace("Z", "+00:00")
+            try:
+                instant = dt.datetime.fromisoformat(parsed)
+            except ValueError:
+                continue
+            return instant.replace(tzinfo=dt.timezone.utc) if instant.tzinfo is None else instant.astimezone(dt.timezone.utc)
+    return None
+
+
+def _archive_identity_ok(
+    record: dict[str, Any],
+    identity_probe: Any,
+) -> tuple[bool, str]:
+    saw_process = False
+    for pid_key, identity_key in (
+        ("worker_pid", "worker_identity"),
+        ("watcher_pid", "watcher_identity"),
+        ("waiter_pid", "waiter_identity"),
+        ("wait_pid", "wait_identity"),
+        ("controller_pid", "controller_identity"),
+    ):
+        raw_pid = record.get(pid_key)
+        if raw_pid is None:
+            continue
+        saw_process = True
+        try:
+            state, reason = identity_probe(int(raw_pid), record.get(identity_key))
+        except Exception as exc:
+            return False, f"identity_probe_error:{type(exc).__name__}"
+        if state != "dead":
+            return False, f"{pid_key}:{state}:{reason}"
+    if not saw_process:
+        return False, "no_recorded_process"
+    return True, "all_recorded_processes_dead"
+
+
+def retain_archives(
+    root: Path,
+    *,
+    records: dict[str, dict[str, Any]],
+    now: dt.datetime,
+    retention: dt.timedelta,
+    max_bytes: int,
+    apply: bool = False,
+    identity_probe: Any,
+) -> dict[str, Any]:
+    """Retain terminal trace archives by age and total allocated bytes.
+
+    Unknown archives and pinned archives are always retained.  Candidates are
+    selected only when their complete ledger row is terminal, old, and every
+    recorded process identity is known dead.  The oldest eligible archives are
+    removed first when either policy would otherwise be exceeded.
+    """
+
+    before = _tree_bytes(root) if root.exists() else 0
+    rows: list[dict[str, Any]] = []
+    candidates: list[tuple[dt.datetime, Path, int, dict[str, Any]]] = []
+    if root.is_dir() and not root.is_symlink():
+        try:
+            archive_dirs = [
+                child
+                for day in root.iterdir()
+                if day.is_dir() and not day.is_symlink()
+                for child in day.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            ]
+        except OSError:
+            archive_dirs = []
+        for path in sorted(archive_dirs):
+            manifest_path = path / "MANIFEST.json"
+            dispatch_id = path.name
+            manifest: dict[str, Any] = {}
+            try:
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    manifest = loaded
+                    dispatch_id = str(loaded.get("dispatch_id") or dispatch_id)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                rows.append({"path": str(path), "eligible": False, "deleted": False, "reason": "manifest_unknown"})
+                continue
+            size = _tree_bytes(path)
+            record = records.get(dispatch_id)
+            pinned = manifest.get("pinned") is True or (path / "PINNED").is_file()
+            if pinned:
+                rows.append({"path": str(path), "dispatch_id": dispatch_id, "bytes": size, "eligible": False, "deleted": False, "reason": "pinned"})
+                continue
+            if record is None:
+                rows.append({"path": str(path), "dispatch_id": dispatch_id, "bytes": size, "eligible": False, "deleted": False, "reason": "unknown_dispatch"})
+                continue
+            state = record.get("terminal_state") or record.get("state")
+            ended = _archive_terminal_time(record)
+            if not goalflight_dispatch_states.is_terminal_state(state):
+                reason = "non_terminal"
+            elif ended is None:
+                reason = "missing_or_invalid_terminal_time"
+            elif now - ended < retention:
+                reason = "inside_retention"
+            else:
+                identity_ok, identity_reason = _archive_identity_ok(record, identity_probe)
+                if not identity_ok:
+                    reason = f"unknown_or_live_process:{identity_reason}"
+                else:
+                    candidates.append((ended, path, size, record))
+                    continue
+            rows.append({"path": str(path), "dispatch_id": dispatch_id, "bytes": size, "eligible": False, "deleted": False, "reason": reason})
+
+    # Age retention is always applied.  If the byte cap is exceeded, consume
+    # additional old eligible archives in the same order; recent/pinned/
+    # unknown data is never selected merely because the cap is tight.
+    candidates.sort(key=lambda item: (item[0], str(item[1])))
+    selected: set[Path] = set()
+    running = before
+    for _ended, path, size, _record in candidates:
+        if running > max_bytes or _ended + retention <= now:
+            selected.add(path)
+            running -= size
+    for _ended, path, size, record in candidates:
+        eligible = path in selected
+        deleted = bool(eligible and apply and path.exists() and not path.is_symlink())
+        if deleted:
+            identity_ok, identity_reason = _archive_identity_ok(record, identity_probe)
+            if not identity_ok:
+                eligible = False
+                deleted = False
+                reason = f"changed_before_delete:{identity_reason}"
+            else:
+                try:
+                    shutil.rmtree(path)
+                except OSError:
+                    deleted = False
+                reason = "terminal_past_retention" if deleted else "delete_failed"
+        else:
+            reason = "terminal_past_retention" if eligible else "keep_within_policy"
+        rows.append({
+            "path": str(path),
+            "dispatch_id": record.get("dispatch_id"),
+            "bytes": size,
+            "eligible": eligible,
+            "deleted": deleted,
+            "reason": reason,
+        })
+    after = _tree_bytes(root) if root.exists() else 0
+    if not apply:
+        after = max(0, before - sum(size for _ended, _path, size, _record in candidates if _path in selected))
+    return {
+        "root": str(root),
+        "before_bytes": before,
+        "after_bytes": after,
+        "reclaimed_bytes": max(0, before - after),
+        "max_bytes": max_bytes,
+        "files": rows,
+    }
 
 
 def _iter_source_records(source_dir: Path) -> list[dict[str, Any]]:

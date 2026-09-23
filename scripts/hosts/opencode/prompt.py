@@ -28,6 +28,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from goalflight_maintenance import rotate_log  # noqa: E402
+
+
 DEFAULT_PORT = 4096
 DEFAULT_MODEL = "litellm/frontier-coder"
 ROUTING_PROMPT = (
@@ -92,6 +97,9 @@ def _health_ok(base: str) -> bool:
 
 def _start_server(port: int, directory: Path, log_path: Path) -> subprocess.Popen[bytes]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # OpenCode reopens this path only when a new server starts.  Rotate before
+    # opening it so repeated one-shot prompts cannot grow one unbounded log.
+    rotate_log(log_path)
     log_file = log_path.open("ab")
     cmd = [
         "opencode",

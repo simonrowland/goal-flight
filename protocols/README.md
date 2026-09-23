@@ -28,6 +28,7 @@ protocol files carry the detailed operating procedures.
 | `review-mining.md` | a NEW bug class is caught (mint + backwards sweep), or archiving review verdicts |
 | `lane-fill-bug-sweep.md` | running a multi-worker bug sweep (audit → harvest → consolidate → adversarial verify → grouped fixes) without saturating controller context |
 | `drainer.md` | installing or operating the out-of-session launchd/systemd dispatch queue drainer |
+| `maintenance.md` | installing or operating the standalone hourly artifact-retention job |
 | `fleet-console-producer.md` | scheduling or operating the bounded, non-overlapping fleet-console data producers |
 
 ## Legacy
