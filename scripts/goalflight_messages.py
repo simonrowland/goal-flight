@@ -9128,6 +9128,7 @@ def cmd_listen(args) -> int:
 
     observed_data_version: int | None = None
     observed_lease = None
+    peek_needed = True
     while True:
         parent_result = parent_exit()
         if parent_result is not None:
@@ -9282,7 +9283,7 @@ def cmd_listen(args) -> int:
                 if claim_state != "already-claimed":
                     return finish_watchdog_dead(claim_state=claim_state)
             wakeable_items = False
-            if journal_changed:
+            if journal_changed or peek_needed:
                 # With an arm-time backlog the cheap limit-1 peek would forever
                 # see the oldest (already-reported) item; peek wide and ring only
                 # for events beyond the arm-time high-water.
@@ -9316,6 +9317,7 @@ def cmd_listen(args) -> int:
                         lease_nonce=nonce,
                     )
                 )
+                peek_needed = wakeable_items
                 if wakeable_items and not args.json:
                     # The non-JSON listener is the controller: it prints every
                     # buffered item before exiting. Materialize those envelopes
@@ -9413,6 +9415,10 @@ def cmd_listen(args) -> int:
                     detail=f"listener ring stamp unavailable: {exc}",
                 )
             if not ring_claimed:
+                # The ring stamp is external to SQLite. A sibling releasing it
+                # cannot change data_version, so preserve the pending peek even
+                # when the journal itself remains unchanged.
+                peek_needed = True
                 retry_result = wait_for_next_poll()
                 if retry_result is not None:
                     return retry_result

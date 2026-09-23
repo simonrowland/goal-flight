@@ -1235,7 +1235,7 @@ def test_listener_survives_present_journal_open_failure_and_times_out(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _env, lease = isolated
-    real_connect = journal.sqlite3.connect
+    real_connect = journal._sqlite_connect
     failed_opens = 0
 
     def fail_first_rw_open(database: object, *args: object, **kwargs: object):
@@ -1245,7 +1245,7 @@ def test_listener_survives_present_journal_open_failure_and_times_out(
             raise sqlite3.OperationalError("unable to open database file")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
+    monkeypatch.setattr(journal, "_sqlite_connect", fail_first_rw_open)
     result = messages._run_cli(
         [
             "listen",
@@ -2688,7 +2688,7 @@ def test_supervised_watchdog_stdout_loss_during_orphan_grace_restarts_supervisor
 
 # --- b-214: a transient journal-busy must not kill a persistent listener ---
 #
-# The busy condition is injected deterministically by gating sqlite3.connect on
+# The busy condition is injected deterministically by gating _sqlite_connect on
 # the temp journal's URI (the same injection style as
 # test_listener_survives_present_journal_open_failure_and_times_out), so the
 # tests drive goalflight_journal._connect's real _is_busy/_retry_delay path —
@@ -2778,9 +2778,9 @@ def _gate_journal_connects(
     project: Path,
     gate: threading.Event,
 ) -> list[str]:
-    """While `gate` is set, every fresh connect to this journal reports busy."""
+    """While `gate` is set, every fresh journal connection reports busy."""
     journal_uri = journal.resolve_journal_path(project).as_uri()
-    real_connect = journal.sqlite3.connect
+    real_connect = journal._sqlite_connect
     hits: list[str] = []
 
     def gated_connect(database: object, *args: object, **kwargs: object):
@@ -2789,25 +2789,29 @@ def _gate_journal_connects(
             raise sqlite3.OperationalError("database is locked")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(journal.sqlite3, "connect", gated_connect)
+    monkeypatch.setattr(journal, "_sqlite_connect", gated_connect)
     return hits
 
 
 def _count_journal_connects(
     monkeypatch: pytest.MonkeyPatch,
     project: Path,
+    *,
+    phase: threading.Event | None = None,
 ) -> list[str]:
-    """Count reader and writer opens at sqlite3's shared journal seam."""
+    """Count journal opens at the shared connection seam during ``phase``."""
     journal_uri = journal.resolve_journal_path(project).as_uri()
-    real_connect = journal.sqlite3.connect
+    real_connect = journal._sqlite_connect
     opens: list[str] = []
 
     def counted_connect(database: object, *args: object, **kwargs: object):
-        if str(database).startswith(journal_uri):
+        if str(database).startswith(journal_uri) and (
+            phase is None or phase.is_set()
+        ):
             opens.append(str(database))
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(journal.sqlite3, "connect", counted_connect)
+    monkeypatch.setattr(journal, "_sqlite_connect", counted_connect)
     return opens
 
 
@@ -2993,10 +2997,12 @@ def test_idle_listener_does_not_write_journal_each_poll(isolated) -> None:
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
 def test_listener_start_to_exit_writes_are_bounded(
     isolated,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     project, env, lease = isolated
-    opens = _count_journal_connects(monkeypatch, project)
+    counter = tmp_path / "listener-connects.log"
+    env = dict(env)
+    env["GOALFLIGHT_TEST_SQLITE_CONNECT_COUNTER"] = str(counter)
     command = _backup_command(project, lease, timeout_s=3)
     command.remove("--report-pending")
     listener = subprocess.Popen(
@@ -3026,8 +3032,15 @@ def test_listener_start_to_exit_writes_are_bounded(
         f"unexpected listener exit {listener.returncode}; "
         f"stdout={stdout!r}; stderr={stderr!r}"
     )
-    assert len(opens) <= 4, (
-        f"listener opened {len(opens)} journal connections: {opens!r}"
+    entries = counter.read_text(encoding="utf-8").splitlines()
+    child_pids = {int(entry.split("\t", 1)[0]) for entry in entries}
+    reader_entries = [entry for entry in entries if "?mode=ro" in entry]
+    assert child_pids == {listener.pid}, (
+        f"counter did not observe the listener child: {entries!r}"
+    )
+    assert 1 <= len(reader_entries) <= 4, (
+        f"listener opened {len(reader_entries)} readonly journal connections: "
+        f"{reader_entries!r}"
     )
     assert total_written < 1024 * 1024, (
         f"listener start-to-exit wrote {total_written} bytes"
@@ -3045,12 +3058,30 @@ def test_idle_listener_reuses_journal_connection(
         lease_nonce=lease.nonce,
         poll_secs=0.01,
         listener_slots=2,
-        timeout_s=0.5,
+        timeout_s=5.0,
         json=True,
         report_pending=False,
         watch_follow=False,
     )
-    opens = _count_journal_connects(monkeypatch, project)
+    poll_phase = threading.Event()
+    poll_count = 0
+    reader_ready = threading.Event()
+    polls_ready = threading.Event()
+    real_data_version = journal.Journal._data_version
+
+    def counted_data_version(authority):
+        nonlocal poll_count
+        version = real_data_version(authority)
+        if not reader_ready.is_set():
+            reader_ready.set()
+        elif poll_phase.is_set():
+            poll_count += 1
+            if poll_count >= 5:
+                polls_ready.set()
+        return version
+
+    monkeypatch.setattr(journal.Journal, "_data_version", counted_data_version)
+    opens = _count_journal_connects(monkeypatch, project, phase=poll_phase)
     monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
     monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
     stdout = io.StringIO()
@@ -3065,17 +3096,21 @@ def test_idle_listener_reuses_journal_connection(
     thread.start()
     try:
         _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
-        time.sleep(0.15)
-        opens_at_arm = len(opens)
-        time.sleep(0.2)
+        assert reader_ready.wait(5), "listener did not establish its reader"
+        poll_phase.set()
+        assert polls_ready.wait(5), f"listener did not reach poll phase: {poll_count}"
         opens_after_idle = len(opens)
     finally:
+        poll_phase.clear()
+        if thread.is_alive():
+            _release_lease(project, lease)
         thread.join(timeout=5)
     assert not thread.is_alive()
-    assert result == [1], stderr.getvalue()
-    assert opens_at_arm <= 8
-    assert opens_after_idle == opens_at_arm
-    assert len(opens) <= 8
+    assert result == [3], stderr.getvalue()
+    assert opens_after_idle == 0, (
+        f"idle poll phase opened {opens_after_idle} journal connections: "
+        f"{opens!r}"
+    )
 
 
 def test_pending_unclaimed_ring_obeys_poll_interval(
@@ -3136,6 +3171,68 @@ def test_pending_unclaimed_ring_obeys_poll_interval(
     assert result == [1], stderr.getvalue()
     assert after_event > before_event
     assert after_event - before_event <= 5
+
+
+def test_pending_ring_retries_after_failed_claim(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    poll_secs = 0.05
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=poll_secs,
+        listener_slots=2,
+        timeout_s=2.0,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    claim_calls: list[float] = []
+
+    def claim_ring(*_args: object, **_kwargs: object) -> bool:
+        claim_calls.append(time.monotonic())
+        return len(claim_calls) > 1
+
+    monkeypatch.setattr(wake, "claim_ring", claim_ring)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        messages.post_message(
+            dispatch_id="retry-after-ring-claim",
+            msg_type="controller-notice",
+            payload={"text": "ring release must be observed"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        thread.join(timeout=5)
+    finally:
+        if thread.is_alive():
+            _release_lease(project, lease)
+            thread.join(timeout=5)
+
+    assert not thread.is_alive(), stderr.getvalue()
+    assert result == [0], stderr.getvalue()
+    assert len(claim_calls) == 2, claim_calls
+    assert claim_calls[1] - claim_calls[0] <= poll_secs * 2, claim_calls
+    assert json.loads(stdout.getvalue())["kind"] == "ring"
 
 
 def test_follow_survives_busy_during_constructor_startup(
@@ -3816,6 +3913,23 @@ def test_listen_survives_transient_journal_busy(
         if busy_stage == "connect"
         else _gate_journal_queries(monkeypatch, project, gate)
     )
+    if busy_stage == "connect":
+        real_data_version = journal.Journal._data_version
+
+        def reconnect_reader_before_data_version(authority):
+            if gate.is_set():
+                connection = getattr(authority, "_reader_connection", None)
+                if connection is not None:
+                    connection.close()
+                    authority._reader_connection = None
+                    authority._reader_pid = None
+            return real_data_version(authority)
+
+        monkeypatch.setattr(
+            journal.Journal,
+            "_data_version",
+            reconnect_reader_before_data_version,
+        )
     cap = _LiveCapture(capsys)
 
     thread, results = _run_in_thread(

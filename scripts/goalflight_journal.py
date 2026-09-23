@@ -879,7 +879,14 @@ def _sqlite_connect(
     timeout: float = 5.0,
     isolation_level: str | None = "",
 ) -> sqlite3.Connection:
-    """Small injection seam for deterministic readonly-open failure tests."""
+    """Shared connection seam for deterministic journal-open tests."""
+    counter_path = os.environ.get("GOALFLIGHT_TEST_SQLITE_CONNECT_COUNTER", "").strip()
+    if counter_path:
+        try:
+            with open(counter_path, "a", encoding="utf-8") as counter:
+                counter.write(f"{os.getpid()}\t{database}\n")
+        except OSError:
+            pass
     return sqlite3.connect(
         database,
         uri=uri,
@@ -1358,7 +1365,7 @@ class Journal:
                         isolation_level=None,
                     )
                 else:
-                    connection = sqlite3.connect(
+                    connection = _sqlite_connect(
                         self.path.as_uri() + "?mode=rw",
                         uri=True,
                         timeout=0,
