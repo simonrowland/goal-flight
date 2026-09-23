@@ -5733,7 +5733,16 @@ class Journal:
                 idempotent=False,
             )
 
-        return self._domain_write(action)
+        result = self._domain_write(action)
+        if result.committed and result.value is not None:
+            # Outside the journal transaction: a cleanup failure cannot undo
+            # terminal authority. Idempotent observations retry the release.
+            import goalflight_capacity
+
+            goalflight_capacity.release_terminal_dispatch(
+                result.value.dispatch_id, result.value.terminal_state,
+            )
+        return result
 
     def commit_expired_attempt(
         self,

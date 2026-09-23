@@ -230,6 +230,8 @@ def acquire_with_wait(
                 and now < deadline
             )
             if not can_wait:
+                if payload.get("decision") == "wait" and deadline is not None:
+                    payload = {**payload, "reason": "budget_exhausted", "capacity_reason": payload.get("reason")}
                 return payload
             remaining_s = max(0.0, deadline - now)
             if on_wait is not None:
@@ -288,6 +290,8 @@ async def acquire_with_wait_async(
                 and now < deadline
             )
             if not can_wait:
+                if payload.get("decision") == "wait" and deadline is not None:
+                    payload = {**payload, "reason": "budget_exhausted", "capacity_reason": payload.get("reason")}
                 return payload
             remaining_s = max(0.0, deadline - now)
             if on_wait is not None:
@@ -1425,6 +1429,16 @@ def cmd_release(args: argparse.Namespace) -> int:
         if not lease:
             print(json.dumps({"ok": False, "reason": "missing_lease", "lease_id": args.lease_id}, sort_keys=True))
             return 1
+        if lease.get("state") in TERMINAL_LEASE_STATES:
+            print(json.dumps({"ok": True, "lease_id": args.lease_id, "state": lease["state"]}, sort_keys=True))
+            return 0
+        if lease.get("worker_pid") and (
+            _pid_holds_capacity(lease["worker_pid"], lease)
+            or attached_worker_group_holds_capacity(lease)
+            or retained_live_scope_holds_capacity(lease)
+        ):
+            print(json.dumps({"ok": False, "reason": "worker_alive", "lease_id": args.lease_id}, sort_keys=True))
+            return 1
         lease["state"] = args.state
         lease["released_at"] = iso()
         if args.reason:
@@ -1471,12 +1485,62 @@ def pid_alive(pid: int | None) -> bool:
     return goalflight_compat.pid_alive(pid)
 
 
+def _terminal_worker_gone(lease: dict, record: dict | None) -> bool:
+    """Terminal authority alone never proves a worker or its group has exited."""
+    import goalflight_ledger
+
+    worker = dict(lease)
+    if record and record.get("worker_pid"):
+        if goalflight_ledger.worker_identity_liveness(record)[0] != "dead":
+            return False
+        # The ledger can retain the identity even if lease attach failed.
+        if not worker.get("worker_pid") or worker["worker_pid"] == record["worker_pid"]:
+            worker.update({key: record[key] for key in ("worker_pid", "worker_identity", "worker_pgid") if record.get(key)})
+    if not worker.get("worker_pid"):
+        return False
+    live = _probe_pid_liveness(worker["worker_pid"])
+    if live is not False and not (live is True and _pid_generation_matches(worker["worker_pid"], worker) is False):
+        return False
+    return not (
+        attached_worker_group_holds_capacity(worker)
+        or retained_live_scope_holds_capacity(worker)
+    )
+
+
+def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
+    """Idempotent post-commit cleanup, retried by terminal observers/reconcile."""
+    import goalflight_ledger
+
+    with StateLock():
+        data = load_state()
+        candidates = [lease for lease in data.get("leases", {}).values()
+                      if lease.get("dispatch_id") == dispatch_id and lease.get("state") == "active"]
+        if not candidates:
+            return
+        record = goalflight_ledger.read_record(dispatch_id)
+        changed = False
+        for lease in candidates:
+            if _terminal_worker_gone(lease, record):
+                lease.update(state=state, released_at=iso(), reason="dispatch_terminal")
+                changed = True
+        if changed:
+            save_state(data)
+
+
 def stale_active_leases(data: dict) -> list[dict]:
     """Active leases with no live worker, controller, or pre-attach claimant."""
     stale: list[dict] = []
     for lease in active_leases(data):
         if retained_live_scope_holds_capacity(lease):
             continue
+        if lease.get("dispatch_id"):
+            import goalflight_ledger
+
+            record = goalflight_ledger.read_record(str(lease["dispatch_id"]))
+            if (record and goalflight_ledger._terminal_key(record) in dispatch_states.TERMINAL_STATES
+                    and _terminal_worker_gone(lease, record)):
+                stale.append(lease)
+                continue
         controller_pid = lease.get("controller_pid")
         worker_pid = lease.get("worker_pid")
         if worker_pid is not None:
