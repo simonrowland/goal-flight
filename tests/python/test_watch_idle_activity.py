@@ -1145,6 +1145,7 @@ def test_failed_descendant_walk_does_not_idle_kill(tmp_path: Path) -> None:
     try:
         env = _watcher_env(tmp_path)
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        env["GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES"] = "1"
         env["PATH"] = str(_descendant_ps_fail_bindir(tmp_path)) + os.pathsep + env.get(
             "PATH", ""
         )
@@ -1448,22 +1449,19 @@ def test_live_descendant_survives_indeterminate_outer_bound(tmp_path: Path) -> N
             text=True,
             env=env,
         )
-        # Wait until the watcher itself has passed the outer bound with a
-        # positive descendant count. A 2s wall-clock sleep could end before
-        # seconds_since_event reached 1.2s, so reverting the classifier hunk
-        # used to leave this test green.
+        # The compatibility sidecar is change-driven, so its observation
+        # timestamp intentionally stops advancing while this state is
+        # unchanged. The live descendant count and process identity are the
+        # liveness evidence; do not use a heartbeat field as a lease.
         deadline = time.monotonic() + 8.0
         payload = {}
         while time.monotonic() < deadline:
             payload = _read_status(status)
-            sse = payload.get("seconds_since_event")
             if watcher.poll() is not None:
                 break
             if (
                 payload.get("liveness_state") == "running_quiet"
                 and int(payload.get("live_descendants") or 0) >= 1
-                and sse is not None
-                and float(sse) >= 1.2
             ):
                 break
             time.sleep(0.05)
@@ -1480,7 +1478,6 @@ def test_live_descendant_survives_indeterminate_outer_bound(tmp_path: Path) -> N
             "liveness_indeterminate",
         }, payload
         assert int(payload.get("live_descendants") or 0) >= 1, payload
-        assert float(payload.get("seconds_since_event") or 0) >= 1.2, payload
         assert worker.poll() is None, payload
         assert goalflight_compat.pid_alive(child_pid), child_pid
     finally:
@@ -1514,7 +1511,9 @@ def test_post_terminal_unknown_probes_release_managed_capacity(
         for key, value in env.items():
             monkeypatch.setenv(key, value)
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        env["GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES"] = "1"
         monkeypatch.setenv("GOALFLIGHT_TEST_PGROUP_CPU_PCT", "0.0")
+        monkeypatch.setenv("GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES", "1")
         env["PATH"] = str(_descendant_ps_fail_bindir(tmp_path)) + os.pathsep + env.get(
             "PATH", ""
         )
@@ -1609,6 +1608,7 @@ def test_indeterminate_give_up_is_not_idle_timeout(tmp_path: Path) -> None:
     try:
         env = _watcher_env(tmp_path)
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        env["GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES"] = "1"
         env["PATH"] = str(_descendant_ps_fail_bindir(tmp_path)) + os.pathsep + env.get(
             "PATH", ""
         )

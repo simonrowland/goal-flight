@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 import pytest
 
@@ -111,6 +112,8 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
         with _isolated_env(tmp):
             running_tail = tmp / "running.tail"
             running_tail.write_text("STATUS: running\n" + ("x" * 250) + "\n", encoding="utf-8")
+            old_activity = time.time() - 42.0
+            os.utime(running_tail, (old_activity, old_activity))
             running_status = tmp / "running.status.json"
             running_status.write_text(
                 json.dumps(
@@ -184,7 +187,7 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
         assert payload["counts"]["worker_finished"] == 1
         by_id = {row["dispatch_id"]: row for row in payload["dispatches"]}
         assert by_id["running-one"]["task_ids"] == ["t-001", "b-001"]
-        assert by_id["running-one"]["idle_s"] == 4.2
+        assert 40.0 <= by_id["running-one"]["idle_s"] <= 45.0
         assert len(by_id["running-one"]["tail_last_line"]) == 200
         assert by_id["done-one"]["marker"] == {
             "kind": "COMPLETE",

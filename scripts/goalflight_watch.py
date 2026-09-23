@@ -7,12 +7,14 @@ import argparse
 import atexit
 from collections import deque
 import contextlib
+import ctypes
 import io
 import itertools
 import json
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -331,6 +333,8 @@ _TREE_SKIP_DIR_NAMES = frozenset(
 POST_TERMINAL_EXIT_GRACE_SECS = 6.0
 BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
 TRACE_RESOLUTION_RETRY_SECS = 300.0
+TRACE_RESOLUTION_INITIAL_BACKOFF_S = 2.0
+TRACE_RESOLUTION_MAX_BACKOFF_S = 60.0
 TRACE_LSOF_TIMEOUT_SECS = 1.0
 TRACE_LONG_RUNNING_SECS = 12 * 60 * 60.0
 TRACE_REVIEW_SECS = 48 * 60 * 60.0
@@ -940,6 +944,45 @@ def _parse_descendant_ps_rows(ps_output: str) -> list[tuple[int, int, str | None
     return rows
 
 
+def _native_process_rows() -> list[tuple[int, int, str | None]] | None:
+    """Read PID/PPID/state rows in-process on supported POSIX hosts."""
+    if (
+        goalflight_compat.allowed_env_override(
+            "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES", "", test_mode=True
+        )
+        == "1"
+    ):
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return None
+        rows: list[tuple[int, int, str | None]] = []
+        try:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat = Path(entry.path, "stat").read_text(encoding="utf-8")
+                    fields = stat[stat.rfind(")") + 2 :].split()
+                    rows.append((int(entry.name), int(fields[1]), fields[0]))
+                except (IndexError, OSError, ValueError):
+                    continue
+        finally:
+            entries.close()
+        return rows
+    if sys.platform == "darwin":
+        snapshot = goalflight_compat.darwin_process_snapshot()
+        if snapshot is None:
+            return None
+        return [
+            (row["pid"], row["ppid"], "Z" if row["status"] == 5 else "R")
+            for row in snapshot
+        ]
+    return None
+
+
 def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, ...]:
     found: list[int] = []
     pending = [pid]
@@ -953,6 +996,16 @@ def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, .
 
 
 def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
+    if ps_runner is None:
+        rows = _native_process_rows()
+        if rows is not None:
+            return _walk_process_tree(
+                pid,
+                _parse_ppid_children("\n".join(
+                    f"{child_pid} {ppid}" for child_pid, ppid, _state in rows
+                )),
+            )
+        return (pid,)
     runner = ps_runner or subprocess.run
     try:
         proc = runner(
@@ -968,6 +1021,122 @@ def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
         return (pid,)
 
 
+def _native_open_file_paths(pid: int) -> list[Path]:
+    """Return files held by ``pid`` without forking ``lsof``."""
+    if sys.platform.startswith("linux"):
+        paths: list[Path] = []
+        try:
+            descriptors = Path(f"/proc/{pid}/fd").iterdir()
+        except OSError:
+            return paths
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if target.endswith(" (deleted)"):
+                target = target[:-10]
+            if target.startswith("/"):
+                paths.append(Path(target))
+        return paths
+    if sys.platform != "darwin":
+        return []
+    try:
+        class ProcFileInfo(ctypes.Structure):
+            _fields_ = [
+                ("openflags", ctypes.c_uint32),
+                ("status", ctypes.c_uint32),
+                ("offset", ctypes.c_int64),
+                ("file_type", ctypes.c_int32),
+                ("guardflags", ctypes.c_uint32),
+            ]
+
+        class VinfoStat(ctypes.Structure):
+            _fields_ = [
+                ("dev", ctypes.c_uint32),
+                ("mode", ctypes.c_uint16),
+                ("nlink", ctypes.c_uint16),
+                ("ino", ctypes.c_uint64),
+                ("uid", ctypes.c_uint32),
+                ("gid", ctypes.c_uint32),
+                ("atime", ctypes.c_int64),
+                ("atimensec", ctypes.c_int64),
+                ("mtime", ctypes.c_int64),
+                ("mtimensec", ctypes.c_int64),
+                ("ctime", ctypes.c_int64),
+                ("ctimensec", ctypes.c_int64),
+                ("birthtime", ctypes.c_int64),
+                ("birthtimensec", ctypes.c_int64),
+                ("size", ctypes.c_int64),
+                ("blocks", ctypes.c_int64),
+                ("blksize", ctypes.c_int32),
+                ("flags", ctypes.c_uint32),
+                ("generation", ctypes.c_uint32),
+                ("rdev", ctypes.c_uint32),
+                ("qspare1", ctypes.c_int64),
+                ("qspare2", ctypes.c_int64),
+            ]
+
+        class VnodeInfo(ctypes.Structure):
+            _fields_ = [
+                ("stat", VinfoStat),
+                ("vnode_type", ctypes.c_int),
+                ("padding", ctypes.c_int),
+                ("fsid", ctypes.c_int32 * 2),
+            ]
+
+        class ProcFdInfo(ctypes.Structure):
+            _fields_ = [("fd", ctypes.c_int32), ("fd_type", ctypes.c_uint32)]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        libproc.proc_pidfdinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_pidfdinfo.restype = ctypes.c_int
+        fd_size = ctypes.sizeof(ProcFdInfo)
+        capacity = 4096
+        while True:
+            fd_buffer = (ctypes.c_ubyte * capacity)()
+            byte_count = libproc.proc_pidinfo(
+                pid, 1, 0, ctypes.byref(fd_buffer), capacity
+            )
+            if byte_count < capacity:
+                break
+            capacity *= 2
+            if capacity > 131072:
+                return []
+        path_offset = ctypes.sizeof(ProcFileInfo) + ctypes.sizeof(VnodeInfo)
+        result: list[Path] = []
+        for offset in range(0, max(0, byte_count - fd_size + 1), fd_size):
+            fd_info = ProcFdInfo.from_buffer_copy(fd_buffer, offset)
+            if fd_info.fd_type != 1:
+                continue
+            path_buffer = (ctypes.c_ubyte * (path_offset + 1024))()
+            if libproc.proc_pidfdinfo(
+                pid, fd_info.fd, 2, ctypes.byref(path_buffer), len(path_buffer)
+            ) <= path_offset:
+                continue
+            raw_path = bytes(path_buffer)[path_offset : path_offset + 1024]
+            value = raw_path.split(b"\0", 1)[0]
+            if value:
+                result.append(Path(value.decode("utf-8", errors="replace")))
+        return result
+    except (AttributeError, OSError, TypeError, ValueError):
+        return []
+
+
 def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
     """Live descendants of ``pid``, excluding itself.
 
@@ -975,7 +1144,21 @@ def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
     no *live* children. Zombie/defunct rows are not live work. Callers must
     not treat None as idle: a failed ``ps`` must stay unknown, never zero.
     """
-    runner = ps_runner or subprocess.run
+    if ps_runner is None:
+        rows = _native_process_rows()
+        if rows is not None:
+            if pid not in {child_pid for child_pid, _ppid, _state in rows}:
+                return None
+            children: dict[int, list[int]] = {}
+            for child_pid, ppid, state in rows:
+                if _is_zombie_or_defunct_state(state):
+                    continue
+                children.setdefault(ppid, []).append(child_pid)
+            tree = _walk_process_tree(pid, children)
+            return max(0, len(tree) - 1)
+        runner = subprocess.run
+    else:
+        runner = ps_runner
     try:
         proc = runner(
             ["ps", "-axo", PS_LIVE_DESCENDANT_FORMAT],
@@ -1012,8 +1195,16 @@ def _trace_from_lsof(
     lsof_runner=None,
     ps_runner=None,
 ) -> Path | None:
-    runner = lsof_runner or wedge_watch.run_lsof
     pids = _worker_process_tree(pid, ps_runner=ps_runner)
+    if lsof_runner is None and ps_runner is None:
+        candidates = [
+            path
+            for process_pid in pids
+            for path in _native_open_file_paths(process_pid)
+            if _path_under_known_trace_root(path, roots) and path.is_file()
+        ]
+        return max(candidates, key=lambda path: (path.stat().st_mtime, str(path))) if candidates else None
+    runner = lsof_runner or wedge_watch.run_lsof
     try:
         proc = runner(
             ["lsof", "-Fn", "-p", ",".join(str(value) for value in pids)],
@@ -1071,6 +1262,8 @@ class TraceLiveness:
         self.path = None
         self.engine_session_id = None
         self.session_roots = ()
+        self._next_resolve_mono: float | None = None
+        self._resolve_backoff_s = TRACE_RESOLUTION_INITIAL_BACKOFF_S
         self.set_engine_session_id(engine_session_id)
         if cached_path:
             candidate = Path(cached_path)
@@ -1090,10 +1283,25 @@ class TraceLiveness:
         self.path = None
         self.started_mono = active_monotonic()
         self.session_roots = ()
+        self._next_resolve_mono = None
+        self._resolve_backoff_s = TRACE_RESOLUTION_INITIAL_BACKOFF_S
 
     def _resolve(self, now_mono: float) -> None:
-        if self.path is not None or now_mono - self.started_mono > self.retry_secs:
+        if self.path is not None:
             return
+        if self._next_resolve_mono is not None and now_mono < self._next_resolve_mono:
+            return
+        # Keep looking after the normal retry horizon. Once the exponential
+        # schedule reaches its horizon, every attempt is already capped at the
+        # bounded low-frequency interval; stopping here creates a hole when a
+        # trace appears just before the next scheduled retry.
+        if self.retry_secs > 0 and now_mono - self.started_mono >= self.retry_secs:
+            self._resolve_backoff_s = TRACE_RESOLUTION_MAX_BACKOFF_S
+        self._next_resolve_mono = now_mono + self._resolve_backoff_s
+        self._resolve_backoff_s = min(
+            TRACE_RESOLUTION_MAX_BACKOFF_S,
+            self._resolve_backoff_s * 2.0,
+        )
         if self.engine_session_id:
             self.session_roots = tuple(goalflight_engine_sessions.session_trace_dirs(
                 self.engine, home=self.home, worker_cwd=self.worker_cwd,
@@ -1688,6 +1896,41 @@ def _finish_existing_ledger(
             codex_session_id=codex_session_id,
         )
         goalflight_cursor.cleanup_dispatch_data(dispatch_id)
+
+
+_STATUS_POLL_OBSERVATION_FIELDS = frozenset(
+    {
+        # These fields describe the last observation, not a liveness lease.
+        # The watcher PID/process identity is the liveness authority.
+        "updated_at",
+        "seconds_since_event",
+        "pgroup_cpu_pct",
+        "idle_tree_age_s",
+        # Wedge sampling carries rolling counters and formatted ages. Its
+        # verdict/evidence is published separately when the candidate state
+        # changes; persisting the rolling sample would recreate per-poll churn.
+        "wedge_watch",
+        "wedge_status_line",
+        "wedge_evidence",
+    }
+)
+
+
+def _status_payload_changed(previous: dict | None, payload: dict) -> bool:
+    """Whether a status write changes consumer-visible dispatch state."""
+    if previous is None:
+        return True
+    before = {
+        key: value
+        for key, value in previous.items()
+        if key not in _STATUS_POLL_OBSERVATION_FIELDS
+    }
+    after = {
+        key: value
+        for key, value in payload.items()
+        if key not in _STATUS_POLL_OBSERVATION_FIELDS
+    }
+    return before != after
 
 
 def _status_snapshot(payload: dict) -> dict:
@@ -2315,10 +2558,156 @@ def _load_identity(raw: str | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool, str, dict | None]:
+def _lightweight_process_identity(pid: int | None) -> dict | None:
+    """Read process liveness and generation without forking a process probe.
+
+    The watcher already has the launcher's PID/start token. ``kill(pid, 0)``
+    plus the platform-native start-token probe preserves that identity check
+    while avoiding the ledger helper's five-field ``ps`` sweep on every poll.
+    """
+    if not pid:
+        return None
+    liveness = goalflight_compat.pid_liveness(pid)
+    if liveness is False:
+        return None
+    if liveness is None:
+        return {
+            "pid": pid,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": "pid_probe_error",
+        }
+    try:
+        start_identity = goalflight_compat.process_start_identity(pid)
+    except Exception:
+        start_identity = None
+    if isinstance(start_identity, dict):
+        return {"pid": pid, **start_identity}
+    return {
+        "pid": pid,
+        "identity_available": False,
+        "identity_source": "pid_probe_only",
+    }
+
+
+class _WorkerProcessProbe:
+    """Observe one worker without forking a process-table command per poll."""
+
+    def __init__(self, pid: int, expected_identity: dict | None):
+        self.pid = int(pid)
+        self.expected_identity = expected_identity
+        self._pidfd: int | None = None
+        self._kqueue = None
+        self._exited = False
+        self._identity_checked = False
+        self._identity_result: tuple[bool, str, dict | None] | None = None
+        if sys.platform.startswith("linux"):
+            pidfd_open = getattr(os, "pidfd_open", None)
+            if pidfd_open is not None:
+                try:
+                    self._pidfd = int(pidfd_open(self.pid, 0))
+                except OSError:
+                    self._pidfd = None
+        elif sys.platform == "darwin":
+            kqueue = None
+            try:
+                kqueue = select.kqueue()
+                event = select.kevent(
+                    self.pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                kqueue.control([event], 0, 0)
+                self._kqueue = kqueue
+            except (AttributeError, OSError, TypeError, ValueError):
+                if kqueue is not None:
+                    with contextlib.suppress(Exception):
+                        kqueue.close()
+
+    def _exit_event_seen(self) -> bool:
+        if self._exited:
+            return True
+        if self._pidfd is not None:
+            try:
+                ready, _writeable, _errors = select.select([self._pidfd], [], [], 0)
+            except (OSError, ValueError):
+                ready = []
+            if ready:
+                self._exited = True
+        elif self._kqueue is not None:
+            try:
+                if self._kqueue.control(None, 1, 0):
+                    self._exited = True
+            except (OSError, ValueError):
+                pass
+        return self._exited
+
+    def sample(self) -> tuple[bool, str, dict | None]:
+        if self._pidfd is not None or self._kqueue is not None:
+            # The native exit observer is generation-safe only after the PID
+            # opened at watcher startup matches the launcher's identity token.
+            # Perform that comparison once; the descriptor/event handles later
+            # liveness without another process-table or identity probe.
+            if not self._identity_checked:
+                current = _lightweight_process_identity(self.pid)
+                alive, reason = goalflight_ledger.compare_process_identities(
+                    self.pid, self.expected_identity, current
+                )
+                self._identity_result = (alive, reason, current)
+                self._identity_checked = True
+            if self._identity_result is not None:
+                if self._identity_result[1] == "identity_indeterminate":
+                    return self._identity_result
+                if not self._identity_result[0]:
+                    return self._identity_result
+        if self._exit_event_seen():
+            return False, "dead", None
+        liveness = goalflight_compat.pid_liveness(self.pid)
+        if liveness is False:
+            self._exited = True
+            return False, "dead", None
+        if liveness is None:
+            return True, "identity_indeterminate", {
+                "pid": self.pid,
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "pid_probe_error",
+            }
+        if self._pidfd is not None or self._kqueue is not None:
+            # The descriptor/event is tied to this process generation. The
+            # startup token remains available in status without re-reading it.
+            return True, "live", dict(self.expected_identity or {"pid": self.pid})
+        current = _lightweight_process_identity(self.pid)
+        is_alive, reason = goalflight_ledger.compare_process_identities(
+            self.pid, self.expected_identity, current
+        )
+        return is_alive, reason, current
+
+    def close(self) -> None:
+        if self._pidfd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._pidfd)
+            self._pidfd = None
+        if self._kqueue is not None:
+            with contextlib.suppress(OSError):
+                self._kqueue.close()
+            self._kqueue = None
+
+
+_ACTIVE_WORKER_PROCESS_PROBE: _WorkerProcessProbe | None = None
+
+
+def worker_alive(
+    pid: int | None,
+    expected_identity: dict | None,
+) -> tuple[bool, str, dict | None]:
     if not pid:
         return False, "no_pid", None
-    current = goalflight_ledger.process_identity(pid)
+    process_probe = _ACTIVE_WORKER_PROCESS_PROBE
+    if process_probe is not None:
+        return process_probe.sample()
+    current = _lightweight_process_identity(pid)
     is_alive, reason = goalflight_ledger.compare_process_identities(
         int(pid), expected_identity, current
     )
@@ -4009,6 +4398,7 @@ def _dispatch_record_is_nonterminal(dispatch_id: str) -> bool | None:
 
 
 def main() -> int:
+    global _ACTIVE_WORKER_PROCESS_PROBE
     parser = argparse.ArgumentParser(description="goal-flight compact log watcher")
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--tail", required=True)
@@ -4168,7 +4558,17 @@ def main() -> int:
         # Direct legacy callers may omit the launcher's identity token. Pin the
         # identity observed at watcher startup so the later outer-wall cleanup
         # cannot signal a PID that was reused during the watch.
-        expected_identity = goalflight_ledger.process_identity(args.pid)
+        expected_identity = _lightweight_process_identity(args.pid)
+    worker_process_probe = _WorkerProcessProbe(args.pid, expected_identity)
+    _ACTIVE_WORKER_PROCESS_PROBE = worker_process_probe
+
+    def release_worker_probe() -> None:
+        global _ACTIVE_WORKER_PROCESS_PROBE
+        worker_process_probe.close()
+        if _ACTIVE_WORKER_PROCESS_PROBE is worker_process_probe:
+            _ACTIVE_WORKER_PROCESS_PROBE = None
+
+    atexit.register(release_worker_probe)
     task_ids = _split_task_ids(args.task_ids)
     task_project_root = goalflight_task.resolve_project_root(args.project_root)
 
@@ -4222,6 +4622,7 @@ def main() -> int:
             payload["codex_home"] = str(codex_home)
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
+        release_worker_probe()
         return 4
     tail_scanner = IncrementalTailScanner(
         tail,
@@ -4274,6 +4675,11 @@ def main() -> int:
     tracked_worker_pgid = args.pgid or process_group_id(args.pid)
     pgid = tracked_worker_pgid or args.pid
     prior_status = _read_json_object(status_path) if status_existed_at_startup else None
+    # Treat an existing sidecar as the last published snapshot. The first
+    # loop still publishes a real state transition (for example, starting ->
+    # running), but an attached quiet watcher does not rewrite an unchanged
+    # sidecar merely to refresh a heartbeat timestamp.
+    last_payload = dict(prior_status) if isinstance(prior_status, dict) else None
     dispatch_record = _load_dispatch_record(args.dispatch_id)
     tree_leg = resolve_wedge_tree_leg(
         dispatch_record,
@@ -4302,7 +4708,6 @@ def main() -> int:
     tail_size_samples: deque[tuple[float, int]] = deque()
     pgid = args.pgid or process_group_id(args.pid) or args.pid
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
-    last_payload: dict | None = None
     terminal_seen: dict | None = None
     terminal_seen_at: float | None = None
     terminal_seen_size: int | None = None
@@ -4577,7 +4982,17 @@ def main() -> int:
         terminal_error = None
         if task_ids:
             payload["task_ids"] = list(task_ids)
-            if not working_breadcrumb_written:
+        if isinstance(last_payload, dict) and last_payload.get("epoch") is not None:
+            # write_status adds the stable lineage token in-place. Carry it
+            # into the next candidate so that token presence is not mistaken
+            # for a real state change on every poll.
+            payload.setdefault("epoch", last_payload["epoch"])
+        status_changed = (
+            not status_path.exists()
+            or _status_payload_changed(last_payload, payload)
+        )
+        if task_ids:
+            if not working_breadcrumb_written and status_changed:
                 # Working breadcrumbs are advisory. Terminal breadcrumbs are
                 # load-bearing for status after volatile dispatch state is reaped.
                 working_payload = {**payload, "state": "working"}
@@ -4587,7 +5002,7 @@ def main() -> int:
                 working_error = append_task_breadcrumb("working", working_payload)
                 if working_error:
                     payload["task_breadcrumb_error"] = working_error
-            if terminal_write:
+            if terminal_write and status_changed:
                 terminal_error = append_task_breadcrumb(_task_state_for_terminal(payload.get("state")), payload)
                 if terminal_error:
                     payload["task_breadcrumb_error"] = terminal_error
@@ -4678,8 +5093,9 @@ def main() -> int:
             dispatch_retired = True
             final_status_written = True
             return {"type": "DispatchRetired", "message": "status recreation refused"}
-        write_status(status_path, payload)
-        last_payload = dict(payload)
+        if status_changed:
+            write_status(status_path, payload)
+            last_payload = dict(payload)
         if terminal_write and not ledger_error:
             final_status_written = True
         return terminal_error or ledger_error
@@ -4706,7 +5122,9 @@ def main() -> int:
         if final_status_written:
             return
         now = time.time()
-        worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
+        worker_is_alive, identity_reason, current_identity = worker_alive(
+            args.pid, expected_identity
+        )
         if worker_is_alive:
             current_pgid = args.pgid or process_group_id(args.pid) or pgid
             cpu_pct = pgroup_cpu_pct(current_pgid)
@@ -4949,15 +5367,22 @@ def main() -> int:
             # is genuinely re-emitted at a new byte offset.
             terminal = None
             scan.terminal = None
-        worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
+        worker_is_alive, identity_reason, current_identity = worker_alive(
+            args.pid, expected_identity
+        )
         cpu_delta_s: float | None = None
         sample_interval_s: float | None = None
+        idle_window_expired = (
+            worker_is_alive
+            and args.max_idle_secs > 0
+            and seconds_since_event >= args.max_idle_secs
+        )
         if worker_is_alive:
             tracked_worker_pgid = args.pgid or process_group_id(args.pid)
             pgid = tracked_worker_pgid or pgid
-            # Idle-timeout still needs a rate. Watchlist CPU-seconds are
-            # sampled later, and only for workers past probation.
-            cpu_pct = pgroup_cpu_pct(pgid)
+            # A fresh tail/event keeps the worker live without a process-table
+            # sweep. Sample CPU only when the idle classifier can use it.
+            cpu_pct = pgroup_cpu_pct(pgid) if idle_window_expired else None
         else:
             cpu_pct = 0.0
             prev_cputime_sample = None
@@ -4966,11 +5391,6 @@ def main() -> int:
         live_descendants: int | None = None
         idle_tree_age_s: float | None = None
         tree_probe = TREE_PROBE_SKIPPED
-        idle_window_expired = (
-            worker_is_alive
-            and args.max_idle_secs > 0
-            and seconds_since_event >= args.max_idle_secs
-        )
         # Extra activity is consulted when the idle window has expired and
         # CPU is idle *or unknown*. A busy group already vetoes. Failed
         # descendant/mtime samples stay None/unavailable so classify_liveness
@@ -5768,8 +6188,10 @@ def main() -> int:
             f"are absent for {args.dispatch_id}",
             flush=True,
         )
+        release_worker_probe()
         return 0
     print(json.dumps({"state": payload["state"], "reason": exit_reason, "status_path": str(status_path)}, sort_keys=True))
+    release_worker_probe()
     return exit_code
 
 

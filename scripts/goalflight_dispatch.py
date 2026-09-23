@@ -2173,6 +2173,10 @@ def _dashboard_refresh_identity_matches(recorded: object, current: object, proje
         return False
     if not recorded.get("identity_available", True) or not current.get("identity_available", True):
         return False
+    if not recorded.get("start_token") or not current.get("start_token"):
+        return False
+    if recorded.get("start_token") != current.get("start_token"):
+        return False
     for key in ("lstart", "comm"):
         if not recorded.get(key) or not current.get(key) or recorded.get(key) != current.get(key):
             return False
@@ -4205,6 +4209,8 @@ def _worker_liveness_warning(record: dict) -> str | None:
     matched, reason = goalflight_ledger.compare_process_identities(
         int(pid), prior, current
     )
+    if reason == "identity_indeterminate":
+        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
     if not matched:
         return (
             f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
@@ -8879,7 +8885,7 @@ def _identity_token(identity: dict | None) -> dict | None:
 
 def _watch_identity_token(identity: dict | None) -> dict | None:
     token = _identity_token(identity)
-    if token and (token.get("start_token") or token.get("lstart")):
+    if token and token.get("start_token"):
         return token
     return None
 
@@ -9033,6 +9039,9 @@ def _write_pidfile(
         "agent": f"{args.agent}-bash-tail",
         "session_id": args.dispatch_id,
     }
+    worker_identity = _identity_token(ident)
+    if worker_identity and worker_identity.get("start_token"):
+        entry["worker_identity"] = worker_identity
     if detached:
         entry["detached"] = True
     pidfile.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
@@ -10355,10 +10364,10 @@ def _dispatch_record_has_live_nonterminal_worker(record: dict | None) -> bool:
     if _dispatch_record_is_terminal(record):
         return False
     try:
-        ok, _reason = goalflight_ledger.identity_matches(record)
+        ok, reason = goalflight_ledger.identity_matches(record)
     except Exception:
         return False
-    return ok
+    return ok and reason != "identity_indeterminate"
 
 
 def _dispatch_has_worker_record(

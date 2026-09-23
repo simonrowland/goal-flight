@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_compat  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_status  # noqa: E402
 
 
 class _Func:
@@ -271,6 +272,54 @@ def case_ledger_windows_identity_indeterminate_not_expected_live() -> None:
         assert goalflight_ledger.classify({"worker_pid": os.getpid(), "worker_identity": ident}) == "identity_indeterminate"
 
 
+def case_lstart_only_identity_is_unknown() -> None:
+    pid = os.getpid()
+    current = {"pid": pid, "lstart": "same-second-start", "start_token": "current-token"}
+    record = {
+        "worker_pid": pid,
+        "worker_identity": {"pid": pid, "lstart": current["lstart"]},
+    }
+    with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_status.worker_process_identity_liveness(record) is None
+        assert goalflight_ledger.worker_identity_liveness(record) == (
+            "unknown",
+            "identity_indeterminate",
+        )
+
+
+def case_legacy_lstart_mismatch_is_pid_reuse_for_status_only() -> None:
+    pid = os.getpid()
+    current = {"pid": pid, "lstart": "current-start", "start_token": "current-token"}
+    record = {
+        "dispatch_id": "legacy-reuse",
+        "state": "watcher_stopped",
+        "classification": "watcher_stopped",
+        "worker_pid": pid,
+        "worker_identity": {"pid": pid, "lstart": "prior-start"},
+    }
+    with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_ledger.worker_identity_liveness(record) == (
+            "dead",
+            "pid_reused_lstart",
+        )
+        assert goalflight_status.worker_process_identity_liveness(record) is False
+
+
+def case_legacy_lstart_match_keeps_status_running_without_ownership() -> None:
+    pid = os.getpid()
+    current = {"pid": pid, "lstart": "same-second-start", "start_token": "current-token"}
+    record = {
+        "dispatch_id": "legacy-live",
+        "state": "watcher_stopped",
+        "classification": "watcher_stopped",
+        "worker_pid": pid,
+        "worker_identity": {"pid": pid, "lstart": current["lstart"]},
+    }
+    with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_status.worker_process_identity_liveness(record) is None
+        assert goalflight_status.done_code(record) == 1
+
+
 def main() -> None:
     case_windows_pid_alive_does_not_call_os_kill()
     case_windows_access_denied_means_alive()
@@ -287,6 +336,9 @@ def main() -> None:
     case_live_ps_missing_lstart_classifies_indeterminate()
     case_reaped_pid_still_classifies_dead()
     case_ledger_windows_identity_indeterminate_not_expected_live()
+    case_lstart_only_identity_is_unknown()
+    case_legacy_lstart_mismatch_is_pid_reuse_for_status_only()
+    case_legacy_lstart_match_keeps_status_running_without_ownership()
     print("OK: pid probe tests pass")
 
 

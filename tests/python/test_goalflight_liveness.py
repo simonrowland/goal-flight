@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -1007,7 +1008,7 @@ def test_cpu_keep_waiting_all_none_is_unknown() -> None:
     assert keep is None and cpu is None, (keep, cpu)
 
 
-def test_cpu_keep_waiting_real_ps_failure_is_unknown() -> None:
+def test_cpu_keep_waiting_uses_native_counter_when_ps_is_unavailable() -> None:
     with tempfile.TemporaryDirectory() as td:
         bindir = Path(td)
         ps = bindir / "ps"
@@ -1032,11 +1033,17 @@ def test_cpu_keep_waiting_real_ps_failure_is_unknown() -> None:
                     sleep=_noop_sleep,
                 )
             )
-            assert keep is None and cpu is None, (keep, cpu)
+            if sys.platform.startswith("linux") or sys.platform == "darwin":
+                assert keep is False and cpu is not None, (keep, cpu)
+            else:
+                assert keep is None and cpu is None, (keep, cpu)
 
             gate = IdleLivenessGate(0.1, hard_wall_s=100.0, now=lambda: 0.0)
             keep, cpu = asyncio.run(gate.keep_waiting(sampler))
-            assert keep is True and cpu is None, (keep, cpu)
+            if sys.platform.startswith("linux") or sys.platform == "darwin":
+                assert keep is False and cpu is not None, (keep, cpu)
+            else:
+                assert keep is True and cpu is None, (keep, cpu)
         finally:
             if previous_path is None:
                 os.environ.pop("PATH", None)
@@ -1289,6 +1296,78 @@ def test_pgroup_cpu_pct_measures_now_not_a_decaying_average() -> None:
 def test_pgroup_cpu_pct_returns_float_or_none() -> None:
     sample = pgroup_cpu_pct(1)
     assert sample is None or isinstance(sample, float), sample
+
+
+def test_darwin_all_proc_rusage_failures_are_unknown(monkeypatch) -> None:
+    class FailingRusage:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _pid, _flavor, _usage):
+            return 1
+
+    monkeypatch.setattr(goalflight_liveness.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        goalflight_liveness.goalflight_compat,
+        "darwin_process_snapshot",
+        lambda: [{"pid": 123, "pgid": 123}],
+    )
+    monkeypatch.setattr(
+        goalflight_liveness.ctypes,
+        "CDLL",
+        lambda _path: SimpleNamespace(proc_pid_rusage=FailingRusage()),
+    )
+    assert goalflight_liveness._darwin_pgroup_cputime_snapshot(123) is None
+
+
+def test_linux_all_proc_stat_failures_are_unknown(monkeypatch) -> None:
+    class DeniedEntry:
+        name = "123"
+        path = "/proc/123"
+
+    class DeniedScan:
+        def __iter__(self):
+            return iter((DeniedEntry(),))
+
+        def close(self):
+            return None
+
+    class DeniedPath:
+        def __init__(self, *_parts):
+            pass
+
+        def read_text(self, **_kwargs):
+            raise PermissionError("proc denied")
+
+    monkeypatch.setattr(goalflight_liveness.os, "scandir", lambda _path: DeniedScan())
+    monkeypatch.setattr(goalflight_liveness, "Path", DeniedPath)
+    assert goalflight_liveness._linux_pgroup_cputime_snapshot(123) is None
+
+
+def test_darwin_all_process_rows_denied_are_unknown(monkeypatch) -> None:
+    import ctypes
+
+    class ProcFn:
+        argtypes = None
+        restype = None
+
+        def __init__(self, impl):
+            self.impl = impl
+
+        def __call__(self, *args):
+            return self.impl(*args)
+
+    def listpids(_type, _type2, buffer, _size):
+        buffer[0] = 123
+        return ctypes.sizeof(ctypes.c_int)
+
+    libproc = SimpleNamespace(
+        proc_listpids=ProcFn(listpids),
+        proc_pidinfo=ProcFn(lambda *_args: 0),
+    )
+    monkeypatch.setattr(goalflight_liveness.goalflight_compat.sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path: libproc)
+    assert goalflight_liveness.goalflight_compat.darwin_process_snapshot() is None
 
 
 @skipif(os.name == "nt", reason="POSIX watcher process-group CPU sampler")

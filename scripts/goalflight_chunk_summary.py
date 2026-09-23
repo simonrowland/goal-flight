@@ -209,10 +209,10 @@ def runtime_record(
     return combined or None
 
 
-def worker_alive_at_read_time(record: dict[str, Any] | None) -> bool:
+def worker_alive_at_read_time(record: dict[str, Any] | None) -> bool | None:
     if not record:
         return False
-    return goalflight_status._wait_worker_confirmed_alive(record)
+    return goalflight_status.worker_process_identity_liveness(record)
 
 
 def normalize_state(
@@ -263,17 +263,29 @@ def normalize_state(
 
 
 def latest_timestamp(record: dict[str, Any] | None, status: dict[str, Any] | None, lease: dict[str, Any] | None) -> Any:
-    if status:
-        if status.get("seconds_since_event") is not None:
-            return dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=float(status["seconds_since_event"]))
-        for key in ("updated_at", "ended_at", "started_at"):
-            if status.get(key) is not None:
-                return status[key]
+    for source in (status, record, lease):
+        if not isinstance(source, dict):
+            continue
+        for key in ("tail_path", "stdout_path", "stderr_path", "trace_path"):
+            path = source.get(key)
+            if not path:
+                continue
+            try:
+                return dt.datetime.fromtimestamp(
+                    Path(str(path)).expanduser().stat().st_mtime,
+                    tz=dt.timezone.utc,
+                )
+            except (OSError, ValueError):
+                continue
     for source in (record, lease):
         if source:
-            for key in ("updated_at", "ended_at", "released_at", "started_at"):
+            for key in ("ended_at", "released_at", "updated_at", "started_at"):
                 if source.get(key) is not None:
                     return source[key]
+    if status:
+        for key in ("ended_at", "started_at"):
+            if status.get(key) is not None:
+                return status[key]
     return None
 
 
@@ -298,7 +310,7 @@ def choose_record(slug: str, records: list[dict[str, Any]], leases: list[dict[st
 
 def decision_hint(
     state: str,
-    worker_live: bool,
+    worker_live: bool | None,
     mins: int | None,
     *,
     retryable: bool = False,
@@ -308,8 +320,6 @@ def decision_hint(
         return "done"
     if state == "missing":
         return "investigate"
-    if state == "wedged":
-        return "takeover"
     if state == "failed":
         if retry_policy:
             mode = retry_policy.get("mode")
@@ -324,6 +334,12 @@ def decision_hint(
         if retryable:
             return "cooldown_retry"
         return "investigate"
+    # A failed record keeps its retry hint (a launch-time quota wall leaves no
+    # pid). For everything else, unknown liveness must never become takeover.
+    if worker_live is None:
+        return "unknown"
+    if state == "wedged":
+        return "takeover"
     if not worker_live:
         return "takeover"
     if mins is not None and mins > 30:

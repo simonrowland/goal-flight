@@ -899,6 +899,42 @@ def test_ssh_identity_legacy_fallback_rejects_reused_fine_token() -> None:
     assert_true("mismatch reason retained", result.error == "pid_reused_start_token")
 
 
+def test_ssh_identity_legacy_fallback_keeps_lstart_only_unknown() -> None:
+    identity = {
+        "pid": 4321,
+        "lstart": "Wed May 20 17:55:24 2026",
+        "comm": "node",
+    }
+    calls = 0
+
+    def capture_runner(_argv: list[str]) -> tuple[int, str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                2,
+                "",
+                "error: unrecognized arguments: --expected-identity-b64 value",
+            )
+        return 0, json.dumps({"alive": True, "identity": identity}), ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        node_entry = fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"]
+        result = fleet_watch.SshFleetWatchTransport(
+            runner=capture_runner, fleet_dir=fleet_dir
+        ).check_remote_identity(
+            node_id="build-1",
+            node_entry=node_entry,
+            receipt={"remote_pid": 4321, "remote_identity": identity},
+        )
+
+    assert_true("two ssh attempts", calls == 2)
+    assert_true("lstart-only identity is unknown", not result.ok)
+    assert_true("unknown reason retained", "fine start token" in (result.error or ""))
+
+
 def test_until_terminal_running_to_terminal() -> None:
     dispatch_id = "acp-watch-until-terminal"
     with tempfile.TemporaryDirectory() as td:

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Iterable
 
@@ -16,7 +15,6 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_status
 
 BUSY_EXIT = 3
-STATUS_ACTIVITY_GRACE_S = 300.0
 
 _CLI_AGENT_LABELS: dict[str, set[str]] = {
     "codex": {"codex", "codex-acp"},
@@ -67,22 +65,6 @@ def _live_dispatch_row(record: dict) -> dict:
     }
 
 
-def _has_worker_pid(record: dict) -> bool:
-    return bool(record.get("worker_pid"))
-
-
-def _has_recent_status_evidence(record: dict) -> bool:
-    status_path = record.get("status_path")
-    if not status_path:
-        return False
-    try:
-        mtime = Path(status_path).stat().st_mtime
-    except OSError:
-        return False
-    age_s = max(0.0, time.time() - mtime)
-    return age_s <= STATUS_ACTIVITY_GRACE_S
-
-
 def _counts_as_in_flight(record: dict) -> bool:
     """Return true only for live or genuinely ambiguous dispatch rows."""
     cls = _norm(record.get("classification") or record.get("state") or "unknown")
@@ -90,13 +72,15 @@ def _counts_as_in_flight(record: dict) -> bool:
     if code == 1:
         if cls in {"queued_capacity", "waiting_capacity"}:
             return True
-        return _has_worker_pid(record) or _has_recent_status_evidence(record)
+        return True
     if code == 0:
         return False
 
     if cls.startswith("stale_"):
         return False
-    return _has_worker_pid(record) or _has_recent_status_evidence(record)
+    # No pid is UNKNOWN/POSSIBLY LIVE. Quiet status files are not a death
+    # signal, especially during mixed-version watcher upgrades.
+    return True
 
 
 def live_dispatches(agent: str | None = None) -> list[dict]:

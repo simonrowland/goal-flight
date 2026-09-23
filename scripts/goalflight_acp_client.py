@@ -346,18 +346,6 @@ def _normalize_lstart(value: str) -> str:
     return " ".join(value.split())
 
 
-def _same_process(
-    started_meta: tuple[str, str] | None,
-    live_meta: tuple[str, str] | None,
-) -> bool:
-    """Return false only when a live process has a different start time."""
-    return (
-        started_meta is None
-        or live_meta is None
-        or _normalize_lstart(started_meta[0]) == _normalize_lstart(live_meta[0])
-    )
-
-
 def _identity_token(identity: dict[str, Any] | None) -> dict[str, Any] | None:
     if not identity:
         return None
@@ -674,9 +662,10 @@ def cleanup_ghosts(
                             )
                         )
                     else:
-                        protected_live = meta is not None and _same_process(
-                            recorded_meta, meta
-                        )
+                        # Legacy pidfiles have no generation token. A live PID
+                        # is still preserved as unknown; it is never treated
+                        # as identity-confirmed for a destructive action.
+                        protected_live = goalflight_compat.pid_alive(pid)
                     if (is_bash_tail or controller_pid is None) and meta is None:
                         # Bash-tail and unowned entries lack an explicit reapable
                         # transition. When ps identity is unavailable, kill(0)
@@ -731,18 +720,10 @@ def cleanup_ghosts(
             recorded_identity = entry.get("worker_identity")
             if not isinstance(recorded_identity, dict):
                 skipped_stale += 1
-                live_meta = _ps_meta(pid)
-                recorded_lstart = entry.get("started_at")
-                recorded_comm = entry.get("cmd")
-                recorded_meta = (
-                    (recorded_lstart, recorded_comm)
-                    if isinstance(recorded_lstart, str)
-                    and isinstance(recorded_comm, str)
-                    else None
-                )
-                if goalflight_compat.pid_alive(pid) and _same_process(
-                    recorded_meta, live_meta
-                ):
+                # Legacy lstart-only pidfiles cannot confirm a PID generation.
+                # Preserve a currently live PID as unknown so cleanup never
+                # discards re-attach metadata or authorizes a kill.
+                if goalflight_compat.pid_alive(pid):
                     preserve_pidfile = True
                 elif group_not_proven_gone():
                     preserve_pidfile = True

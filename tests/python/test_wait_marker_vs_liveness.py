@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""A terminal marker must not outrank a confirmed-live worker.
+"""A validated completion marker ends the wait even if teardown lingers.
 
-Live failure this pins: `--wait` reported `1/1 terminal ... [COMPLETE]` for a
-worker that was still running. Its status file carried
-`{"kind": "COMPLETE", "line": 678, "text": ""}` -- produced by the bare sign-off
-pattern matching `done`, the loop terminator of a shell script the worker had
-echoed into its own tail -- while `state` was `running` and `worker_alive` true.
+This pins the round-4 rule: `--wait` ends when a validated success marker is
+present, even if the worker remains alive briefly for teardown. Liveness still
+controls destructive actions. Non-final marker observations remain diagnostic.
 
-The watcher was not fooled; it kept the run `running`. Only `done_code` was: it
-returned 0 on the marker before consulting liveness at all. A controller acting
-on that verdict gates, commits and pushes unfinished work.
-
-Rule: a marker never outranks CONFIRMED liveness. Unconfirmed liveness keeps the
-marker verdict, because failing to observe a process is not evidence it lives --
-the opposite choice would convert every unobservable worker into a hang.
+The watcher may keep a worker alive briefly for teardown, but a validated
+completion marker is still terminal for `--wait`. Liveness continues to gate
+destructive kill/reclaim/takeover actions. Non-final markers remain diagnostic.
 """
 
 from __future__ import annotations
@@ -83,14 +77,14 @@ def _record_with_marker(
     return record
 
 
-def case_marker_does_not_beat_a_live_worker() -> None:
+def case_marker_ends_wait_for_a_live_worker() -> None:
     with tempfile.TemporaryDirectory() as td:
         record = _record_with_marker(Path(td), pid=os.getpid(), state="running")
         # os.getpid() is this test process: definitively alive.
         code = goalflight_status.done_code(record, worker_alive=True)
         assert_true(
-            "confirmed-live worker with a COMPLETE marker is NOT done",
-            code == 1,
+            "confirmed-live worker with a COMPLETE marker is done",
+            code == 0,
         )
 
 
@@ -198,21 +192,16 @@ def case_a_nonfinal_attention_marker_does_not_end_the_wait() -> None:
             )
 
 
-def case_completion_markers_still_lose_to_a_live_worker() -> None:
-    """The other half of the split -- guards against over-correcting.
-
-    Widening the attention set to cover COMPLETE/READY/RESULT/FAILED would make
-    every mid-run marker echo report a working worker as finished, which is the
-    false-done bug the liveness rule was added to fix.
-    """
+def case_completion_markers_end_wait_for_a_live_worker() -> None:
+    """Validated completion markers are terminal despite lingering teardown."""
     for kind in ("COMPLETE", "READY", "RESULT"):
         with tempfile.TemporaryDirectory() as td:
             record = _record_with_marker(
                 Path(td), pid=os.getpid(), state="running", kind=kind
             )
             assert_true(
-                f"live worker with a {kind} marker is NOT terminal",
-                goalflight_status.done_code(record, worker_alive=True) == 1,
+                f"live worker with a {kind} marker is terminal",
+                goalflight_status.done_code(record, worker_alive=True) == 0,
             )
 
 
@@ -274,13 +263,13 @@ def case_explicitly_indeterminate_identity_is_neither_alive_nor_dead() -> None:
 
 
 def main() -> None:
-    case_marker_does_not_beat_a_live_worker()
+    case_marker_ends_wait_for_a_live_worker()
     case_marker_resolves_a_dead_worker()
     case_foreign_marker_does_not_resolve_a_dead_worker()
     case_attention_markers_wake_the_controller_while_the_worker_lives()
     case_acp_park_states_wake_the_controller()
     case_a_nonfinal_attention_marker_does_not_end_the_wait()
-    case_completion_markers_still_lose_to_a_live_worker()
+    case_completion_markers_end_wait_for_a_live_worker()
     case_unconfirmed_liveness_keeps_the_marker_verdict()
     case_pid_only_live_process_is_indeterminate_and_marker_resolves()
     case_explicitly_indeterminate_identity_is_neither_alive_nor_dead()

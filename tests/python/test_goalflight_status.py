@@ -244,7 +244,7 @@ def test_done_code() -> None:
         "detached": True,
         "agent": "codex",
         "worker_pid": 444,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:444:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
         "project_root": "/repo/A",
         "started_at": S.goalflight_ledger.utc_now(),
     }
@@ -308,7 +308,7 @@ def test_done_code() -> None:
     }
     timeout_raw = {
         **timeout_summary,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -345,7 +345,7 @@ def test_done_code() -> None:
     }
     watcher_raw = {
         **watcher_summary,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {"start_token": "test:444:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
     }
     orig_read_records = S.goalflight_ledger.read_records
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -413,7 +413,7 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
             "terminal_state": "unknown",
             "agent": "codex",
             "worker_pid": 999999,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:999:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
             "stdout_path": str(tail),
             "started_at": started,
         }
@@ -535,7 +535,7 @@ def test_idle_timeout_live_hint_rendered() -> None:
             "agent": "codex",
             "worker_pid": 333,
             "worker_still_alive": True,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
             "status_path": "/tmp/timeout-live.json",
         }
     )
@@ -1138,7 +1138,7 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
             "agent": "codex",
             "worker_pid": 333,
             "worker_still_alive": True,
-            "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+            "worker_identity": {"start_token": "test:333:generation-1", "lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
         }
     )
     orig_identity_matches = S.goalflight_ledger.identity_matches
@@ -1158,6 +1158,40 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
 
+def test_dashboard_idle_age_reads_tail_mtime_not_watcher_seconds(tmp_path) -> None:
+    tail = tmp_path / "worker.tail"
+    tail.write_text("activity\n", encoding="utf-8")
+    now = time.time()
+    os.utime(tail, (now - 17.0, now - 17.0))
+    status_path = tmp_path / "worker.status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": "activity-age",
+                "tail_path": str(tail),
+                "seconds_since_event": 9999.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = S._dashboard_status_records
+    S._dashboard_status_records = lambda _root: [
+        {
+            "dispatch_id": "activity-age",
+            "project_root": "/repo",
+            "classification": "expected_live",
+            "status_path": str(status_path),
+            "stdout_path": str(tail),
+        }
+    ]
+    try:
+        dispatch = S.dashboard_status_payload("/repo")["dispatches"][0]
+    finally:
+        S._dashboard_status_records = original
+    check("dashboard idle age uses tail activity", 10.0 <= dispatch["idle_s"] <= 30.0)
+    check("dashboard idle age ignores watcher heartbeat", dispatch["idle_s"] != 9999.0)
+
+
 def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         status_path = Path(tmp) / "drain-live.status.json"
@@ -1171,6 +1205,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                     "worker_alive": True,
                     "expected_worker_identity": {
                         "pid": 4242,
+                        "start_token": "test:4242:generation-1",
                         "lstart": "Thu Jul  2 17:53:52 2026",
                         "comm": "node",
                     },
@@ -1194,6 +1229,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                         "worker_pid": 4242,
                         "worker_identity": {
                             "pid": 4242,
+                            "start_token": "test:4242:generation-1",
                             "lstart": "Thu Jul  2 17:53:52 2026",
                             "comm": "node",
                         },
@@ -1260,6 +1296,7 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
                     "worker_alive": False,
                     "expected_worker_identity": {
                         "pid": 4242,
+                        "start_token": "test:4242:generation-1",
                         "lstart": "Thu Jul  2 17:53:52 2026",
                         "comm": "node",
                     },
@@ -1283,6 +1320,7 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
                         "worker_pid": 4242,
                         "worker_identity": {
                             "pid": 4242,
+                            "start_token": "test:4242:generation-1",
                             "lstart": "Thu Jul  2 17:53:52 2026",
                             "comm": "node",
                         },

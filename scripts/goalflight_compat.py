@@ -69,6 +69,7 @@ __all__ = [
     "pid_liveness",
     "pid_alive",
     "pid_is_zombie",
+    "darwin_process_snapshot",
     "process_identity_matches",
     "windows_process_identity",
     "kill_pid",
@@ -1133,6 +1134,94 @@ def _darwin_process_bsd_info(pid: int) -> dict[str, int] | None:
             "start_tvsec": int(info.pbi_start_tvsec),
             "start_tvusec": int(info.pbi_start_tvusec),
         }
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def darwin_process_snapshot() -> list[dict[str, int]] | None:
+    """Return Darwin process parent/status rows without invoking ``ps``."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_listpids.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_listpids.restype = ctypes.c_int
+        libproc.proc_pidinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        capacity = 4096
+        while True:
+            pid_buffer = (ctypes.c_int * capacity)()
+            byte_count = libproc.proc_listpids(
+                1, 0, pid_buffer, ctypes.sizeof(pid_buffer)
+            )
+            if byte_count < ctypes.sizeof(pid_buffer):
+                break
+            capacity *= 2
+            if capacity > 131072:
+                return None
+        rows: list[dict[str, int]] = []
+        listed_pids = 0
+        for index in range(max(0, byte_count // ctypes.sizeof(ctypes.c_int))):
+            pid = int(pid_buffer[index])
+            if pid <= 0:
+                continue
+            listed_pids += 1
+            info = ProcBsdInfo()
+            if libproc.proc_pidinfo(
+                pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
+            ) != ctypes.sizeof(info):
+                continue
+            rows.append(
+                {
+                    "pid": int(info.pbi_pid),
+                    "ppid": int(info.pbi_ppid),
+                    "pgid": int(info.pbi_pgid),
+                    "status": int(info.pbi_status),
+                }
+            )
+        # A non-empty process list with no readable rows means the process
+        # table probe was denied or failed for every candidate. Do not turn
+        # that absence of evidence into an empty, idle-looking snapshot.
+        return rows if rows or not listed_pids else None
     except (AttributeError, OSError, TypeError, ValueError):
         return None
 

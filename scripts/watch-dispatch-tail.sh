@@ -603,13 +603,41 @@ prev_loop_ts=$(date +%s)
 
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s total_runtime=${TOTAL_RUNTIME_SECS}s"
 
+# Marker parsing is content-dependent. Keep its result while the tail's
+# filesystem identity is unchanged; equal-size rewrites (including rotation)
+# must invalidate the cache without rereading the whole tail.
+marker_cache_identity="__unset__"
+marker_cache_value=""
+
 terminal_marker_seen() {
   [ -f "$TAIL_PATH" ] || return 1
+  # Size and a trailing excerpt are insufficient: an equal-size in-place rewrite
+  # can change a marker before that excerpt. Use the full filesystem identity
+  # tuple so every inode, size, or nanosecond timestamp change re-scans.
+  local marker_identity
+  marker_identity=$(python3 - "$TAIL_PATH" <<'PY'
+import os
+import sys
+
+try:
+    stat = os.stat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+print(f"{stat.st_ino} {stat.st_size} {stat.st_mtime_ns}")
+PY
+  ) || return 1
+  if [ "$marker_cache_identity" = "$marker_identity" ]; then
+    [ -n "$marker_cache_value" ] || return 1
+    printf '%s\n' "$marker_cache_value"
+    return 0
+  fi
+  marker_cache_identity="$marker_identity"
+  marker_cache_value=""
   if [ "$MARKER_RE" != "$DEFAULT_MARKER_RE" ]; then
     # A custom regex is an additional filter, never an alternate identity
     # grammar. The shared parser must first bind the terminal payload to this
     # dispatch, so a foreign marker cannot ride through the legacy override.
-    PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$MARKER_RE" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
+    marker_output=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$MARKER_RE" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
 import pathlib
 import re
 import sys
@@ -641,9 +669,15 @@ if marker and marker_re.search(raw_line.strip()):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
-    return $?
+    )
+    marker_rc=$?
+    if [ "$marker_rc" -eq 0 ]; then
+      marker_cache_value="$marker_output"
+      printf '%s\n' "$marker_output"
+    fi
+    return "$marker_rc"
   fi
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
+  marker_output=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
 import pathlib
 import sys
 
@@ -670,6 +704,13 @@ if marker:
     raise SystemExit(0)
 raise SystemExit(1)
 PY
+  )
+  marker_rc=$?
+  if [ "$marker_rc" -eq 0 ]; then
+    marker_cache_value="$marker_output"
+    printf '%s\n' "$marker_output"
+  fi
+  return "$marker_rc"
 }
 
 final_terminal_marker() {

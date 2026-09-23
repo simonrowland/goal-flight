@@ -27,25 +27,6 @@ import goalflight_acp_run  # noqa: E402
 import goalflight_capacity  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import acp_pool  # noqa: E402
-from goalflight_acp_client import _same_process  # noqa: E402
-
-
-def case_exec_comm_change_keeps_identity() -> None:
-    started = ("Wed May 20 17:55:24 2026", "bash")
-    live = ("Wed May 20 17:55:24 2026", "/Users/example/.local/bin/cursor-agent")
-    assert _same_process(started, live) is True
-
-
-def case_pid_reuse_lstart_change_is_different() -> None:
-    started = ("Wed May 20 17:55:24 2026", "cursor-agent")
-    live = ("Wed May 20 17:55:25 2026", "cursor-agent")
-    assert _same_process(started, live) is False
-
-
-def case_unavailable_meta_preserves_kill_fallthrough() -> None:
-    live = ("Wed May 20 17:55:24 2026", "cursor-agent")
-    assert _same_process(None, live) is True
-    assert _same_process(live, None) is True
 
 
 def case_windows_cleanup_preserves_legacy_pidfile_without_identity() -> None:
@@ -70,6 +51,11 @@ def case_windows_cleanup_preserves_legacy_pidfile_without_identity() -> None:
     # Legacy pidfiles lack controller/creation identity; preserve them during
     # the mixed-version window so a later identity-aware sweep can decide.
     assert missing_identity_preserved
+
+
+def case_windows_cleanup_skips_bare_pidfile_pid() -> None:
+    """Compatibility name for the mixed-version bare-pidfile regression."""
+    case_windows_cleanup_preserves_legacy_pidfile_without_identity()
 
 
 def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
@@ -1319,10 +1305,8 @@ def case_atexit_pool_kill_requires_fine_identity() -> None:
 
 
 def main() -> None:
-    case_exec_comm_change_keeps_identity()
-    case_pid_reuse_lstart_change_is_different()
-    case_unavailable_meta_preserves_kill_fallthrough()
     case_windows_cleanup_preserves_legacy_pidfile_without_identity()
+    case_windows_cleanup_skips_bare_pidfile_pid()
     case_windows_cleanup_does_not_kill_indeterminate_pid()
     case_windows_cleanup_preserves_live_pidfile_without_creation_identity()
     case_windows_cleanup_kills_confirmed_live_identity()
@@ -1343,7 +1327,7 @@ def main() -> None:
     case_initial_lease_attach_failure_cleans_before_running()
     case_group_kill_can_disable_unchecked_pid_fallback()
     case_atexit_pool_kill_requires_fine_identity()
-    print("OK: 22 ACP kill identity tests pass")
+    print("OK: 19 ACP kill identity tests pass")
 
 
 if __name__ == "__main__":
