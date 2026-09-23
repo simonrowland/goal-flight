@@ -3142,14 +3142,133 @@ def _nonterminal_dispatch_reuse_reason(
     )
 
 
+# A resume chain longer than this is corrupt. Stop and leave any further
+# ancestor holding, rather than looping.
+_RESUME_LINEAGE_WALK_LIMIT = 64
+
+
+def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
+    """Dispatch ids whose rows must not block a resume of this parent.
+
+    The resume continues the same attempt, so the parent and every ancestor
+    linked by ``parent_dispatch_id`` cannot supersede it. A sibling that is
+    not on this chain still holds. Live or indeterminate sources are refused
+    by the resume liveness probe, not by omitting them here.
+    """
+    exempt: list[str] = []
+    seen: set[str] = set()
+    current = str(parent_dispatch_id or "").strip()
+    for _ in range(_RESUME_LINEAGE_WALK_LIMIT):
+        if not current or current in seen:
+            break
+        seen.add(current)
+        exempt.append(current)
+        try:
+            record = _find_dispatch_record(current)
+        except Exception:
+            break
+        if not isinstance(record, dict):
+            break
+        current = str(record.get("parent_dispatch_id") or "").strip()
+    return exempt
+
+
 def _launch_authority_entry(args) -> dict:
-    return {
+    entry = {
         "dispatch_id": str(getattr(args, "dispatch_id", "") or ""),
         "task_ids": list(getattr(args, "task_ids", []) or []),
         "project_root": str(_project_root(args)),
         "created_at": goalflight_ledger.utc_now(),
         "dispatch_argv": list(getattr(args, "_original_argv", None) or []),
     }
+    parent = str(getattr(args, "parent_dispatch_id", None) or "").strip()
+    if parent:
+        # Only the resume launch check exempts lineage. Restore, reconcile,
+        # and drain call the ledger scan without this key.
+        entry["resume_lineage_exempt_ids"] = _resume_lineage_dispatch_ids(parent)
+    return entry
+
+
+_SELF_HELD_LEDGER_STATES = frozenset({"worker_dead", "superseded", "abandoned"})
+_DIAGNOSTIC_ROW_RE = re.compile(
+    r'dispatch_id=("(?:\\.|[^"\\])*") state=("(?:\\.|[^"\\])*"|null)'
+)
+
+
+def _blocking_rows_from_diagnostics(
+    diagnostics: list[str],
+) -> tuple[list[tuple[str, str]], bool]:
+    """Per-record states from the deciding read, plus a publication failure.
+
+    The refusal JSON ``state`` is synthetic (``worker_dead`` for every partial
+    hold). Only these lines name the blocking row.
+    """
+    rows: list[tuple[str, str]] = []
+    publication_failed = False
+    for line in diagnostics:
+        if line.startswith("terminal publication FAILED"):
+            publication_failed = True
+            continue
+        match = _DIAGNOSTIC_ROW_RE.search(line)
+        if match is None:
+            continue
+        try:
+            dispatch_id = json.loads(match.group(1))
+            state = json.loads(match.group(2))
+        except json.JSONDecodeError:
+            continue
+        if dispatch_id:
+            rows.append((str(dispatch_id), str(state or "")))
+    return rows, publication_failed
+
+
+def _reconcile_outbox_guidance(project_root: str) -> str:
+    return (
+        "Resolve any reported terminal publication failure first; journal "
+        "upgrades require owner-approved migration. Reconcile stopped work with "
+        + shlex.join([sys.executable, str(Path(__file__).with_name("goalflight_ledger.py"))])
+        + " reconcile-outbox --project-root "
+        + shlex.quote(project_root)
+        + "; this projects committed terminal evidence without manual ledger edits. For partial "
+        "supersession, reconcile stopped work or wait for active siblings, "
+        "then dispatch only remaining task IDs."
+    )
+
+
+def _completion_refusal_guidance(diagnostics: list[str], project_root: str) -> str:
+    """Remedy text keyed on the blocking rows, not the synthetic decision state.
+
+    A ``worker_dead`` / ``superseded`` / ``abandoned`` row is the hold. Resume
+    of that dispatch is the recovery; reconcile-outbox does not clear it.
+    A live sibling keeps the wait guidance. Reconcile stays only where a
+    terminal publication actually failed, or where the blocker is not one of
+    those self-held rows.
+    """
+    rows, publication_failed = _blocking_rows_from_diagnostics(diagnostics)
+    held = [(did, state) for did, state in rows if state in _SELF_HELD_LEDGER_STATES]
+    live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
+    if held and not live:
+        named = ", ".join(f"{did} state={state}" for did, state in held)
+        text = (
+            "The hold is the ledger row "
+            f"({named}). Resume that dispatch; a later resume in the same "
+            "chain is the same attempt. A fresh dispatch on this task stays "
+            "refused. Opening a new task row is interim and leaves the old id held."
+        )
+        if publication_failed:
+            text += "\n" + _reconcile_outbox_guidance(project_root)
+        return text
+    if held and live:
+        named = ", ".join(f"{did} state={state}" for did, state in held)
+        text = (
+            f"Dead rows ({named}) do not block their own resume, but a live "
+            "sibling still holds this task. Wait for active siblings, or "
+            "dispatch only remaining task IDs."
+        )
+        if publication_failed:
+            text += "\n" + _reconcile_outbox_guidance(project_root)
+        return text
+    return _reconcile_outbox_guidance(project_root)
 
 
 def _refuse_launch_blocked_by_completion_authority(args) -> None:
@@ -3177,14 +3296,8 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
             f"goalflight_dispatch: {message}; "
             f"entry.created_at={json.dumps(entry.get('created_at'))}\n"
             + "\n".join(diagnostics)
-            + "\nResolve any reported terminal publication failure first; journal "
-            "upgrades require owner-approved migration. Reconcile stopped work with "
-            + shlex.join([sys.executable, str(Path(__file__).with_name("goalflight_ledger.py"))])
-            + " reconcile-outbox --project-root "
-            + shlex.quote(str(entry["project_root"]))
-            + "; this projects committed terminal evidence without manual ledger edits. For partial "
-            "supersession, reconcile stopped work or wait for active siblings, "
-            "then dispatch only remaining task IDs.",
+            + "\n"
+            + _completion_refusal_guidance(diagnostics, str(entry["project_root"])),
             file=sys.stderr,
         )
     print(
@@ -10083,6 +10196,7 @@ def _ledger_task_ids_advanced(
     entry_created_timestamp_s: float | None = None,
     self_project_root: object | None = None,
     diagnostics: list[str] | None = None,
+    exempt_dispatch_ids: set[str] | None = None,
 ) -> tuple[int, int, str]:
     """Return counts plus the typed reason ledger authority is inconclusive.
 
@@ -10107,7 +10221,10 @@ def _ledger_task_ids_advanced(
             # Placeholder has no task_ids. Skipping it would treat a corrupt
             # prior completion as "no completion" and launch a duplicate.
             return 0, 0, "ledger_unavailable"
-        if str(record.get("dispatch_id") or "") == self_dispatch_id:
+        record_dispatch_id = str(record.get("dispatch_id") or "")
+        if record_dispatch_id == self_dispatch_id or (
+            exempt_dispatch_ids is not None and record_dispatch_id in exempt_dispatch_ids
+        ):
             continue
         rec_ids = set(_entry_task_ids(None, record))
         overlap = wanted & rec_ids
@@ -10183,11 +10300,17 @@ def _ledger_task_ids_advanced(
             continue
         if diagnostics is not None:
             dispatch_id = str(record.get("dispatch_id") or "")
+            seat = record.get("worker_cwd")
+            seat_field = (
+                f" worker_cwd={json.dumps(seat)}"
+                if isinstance(seat, str) and seat
+                else ""
+            )
             diagnostics.append(
                 f"ledger record={goalflight_ledger.record_path(dispatch_id, create=False)} "
                 f"task_ids={json.dumps(sorted(overlap))} "
                 f"dispatch_id={json.dumps(dispatch_id)} state={json.dumps(state)} "
-                f"terminal_state={json.dumps(terminal)} "
+                f"terminal_state={json.dumps(terminal)}{seat_field} "
                 f"ended_at={json.dumps(record.get('ended_at'))} order={completion_order}"
             )
             status, _status_evidence = _abandoned_status_payload(record)
@@ -10279,12 +10402,17 @@ def _linked_task_truth_detail(
 
     self_id = str(entry.get("dispatch_id") or (record or {}).get("dispatch_id") or "")
     self_root = _entry_owner_fields(entry, record)[1]
+    raw_exempt = entry.get("resume_lineage_exempt_ids") if isinstance(entry, dict) else None
+    exempt_ids = None
+    if isinstance(raw_exempt, (list, tuple, set)):
+        exempt_ids = {str(item) for item in raw_exempt if str(item).strip()}
     ledger_complete, ledger_advanced, ledger_issue = _ledger_task_ids_advanced(
         task_ids,
         self_dispatch_id=self_id,
         entry_created_timestamp_s=entry_created_timestamp_s,
         self_project_root=self_root,
         diagnostics=diagnostics,
+        exempt_dispatch_ids=exempt_ids,
     )
 
     # Prefer explicit store truth when every linked id is present and complete.
@@ -18373,6 +18501,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+            # Direct resume launches must validate before exempting lineage or
+            # binding a seat; claim-boundary validation remains under its lock.
+            if args.parent_dispatch_id:
+                _validate_resume_source(
+                    args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+                )
+            # Before the seat bind. This gate reads the ledger and the task
+            # store, not the seat, and a refusal must not become the occupant.
+            _refuse_launch_blocked_by_completion_authority(args)
             try:
                 _bind_dispatch_worktree(args)
             except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
@@ -18395,7 +18532,6 @@ def main(argv: list[str] | None = None) -> int:
                     *getattr(args, "dispatch_warnings", []),
                     occupancy_warning,
                 ]
-            _refuse_launch_blocked_by_completion_authority(args)
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -18470,14 +18606,19 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue,
         )
+        # Validate direct resumes before lineage exemption and seat mutation.
+        if args.parent_dispatch_id:
+            _validate_resume_source(
+                args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+            )
+        # Before the seat bind. Occupancy-forced is a worktree hatch and does
+        # not bypass this: a same-task sibling still refuses, and a refusal
+        # must not rewrite the seat occupant.
+        _refuse_launch_blocked_by_completion_authority(args)
         _bind_dispatch_worktree(args)
         occupancy_warning = _prepare_attempt_worktree_occupancy(args)
         if occupancy_warning is not None:
             dispatch_warnings = [*dispatch_warnings, occupancy_warning]
-        # Occupancy-forced is a worktree hatch. Same-task live siblings still
-        # refuse here so a second direct launch cannot spawn just because the
-        # tree lock was waived.
-        _refuse_launch_blocked_by_completion_authority(args)
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(

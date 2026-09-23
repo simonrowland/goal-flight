@@ -1539,6 +1539,56 @@ def test_resume_fails_honestly_without_fresh_dispatch(
     assert capsys.readouterr().err == expected
 
 
+def test_resume_refuses_worker_dead_source_whose_pid_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CONTROL: a dead label with a live pid is still the two-writer case.
+
+    The lineage exemption must not become a way past the liveness probe.
+    """
+    parent_id = "dead-but-live"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        home=home,
+    )
+    record.update(
+        {
+            "state": "worker_dead",
+            "terminal_state": "worker_dead",
+            "worker_pid": 43210,
+            "worker_identity": {
+                "pid": 43210,
+                "lstart": "Mon Jul 28 12:00:00 2026",
+                "comm": "codex",
+            },
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Apply revisions.", encoding="utf-8")
+    monkeypatch.setattr(L, "identity_matches", lambda _record: (True, "live"))
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a live pid must not allocate a child dispatch"
+        ),
+    )
+
+    rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
+
+    assert rc == 64
+    assert capsys.readouterr().err == (
+        "goalflight_dispatch: dispatch dead-but-live is still live; "
+        "wait for terminal before resume\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("identity_result", "expected"),
     [
