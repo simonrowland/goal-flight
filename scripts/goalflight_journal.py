@@ -5737,11 +5737,18 @@ class Journal:
         if result.committed and result.value is not None:
             # Outside the journal transaction: a cleanup failure cannot undo
             # terminal authority. Idempotent observations retry the release.
-            import goalflight_capacity
+            try:
+                import goalflight_capacity
 
-            goalflight_capacity.release_terminal_dispatch(
-                result.value.dispatch_id, result.value.terminal_state,
-            )
+                goalflight_capacity.release_terminal_dispatch(
+                    result.value.dispatch_id, result.value.terminal_state,
+                )
+            except Exception as exc:
+                print(
+                    "goalflight_journal: terminal capacity cleanup deferred: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         return result
 
     def commit_expired_attempt(

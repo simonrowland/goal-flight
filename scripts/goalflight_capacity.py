@@ -718,6 +718,44 @@ def _pid_generation_matches(pid: object, lease: dict) -> bool | None:
     return current_token == expected_token
 
 
+def _worker_lease_view(lease: dict, record: dict | None = None) -> dict:
+    """Combine capacity and ledger worker identity without controller fallbacks."""
+    worker = dict(lease)
+    if record:
+        for key in ("worker_pid", "worker_identity", "worker_pgid"):
+            if worker.get(key) is None and record.get(key) is not None:
+                worker[key] = record[key]
+    return worker
+
+
+def worker_identity_liveness(
+    lease: dict,
+    record: dict | None = None,
+) -> tuple[str, str]:
+    """Classify the recorded worker as ``live``, ``dead`` or ``unknown``.
+
+    A dead PID or a live PID with a different start token proves the recorded
+    worker is gone.  A missing token or an unprobeable process is unknown and
+    must retain capacity; controller and claimant identities are irrelevant
+    once a worker has been attached.
+    """
+    worker = _worker_lease_view(lease, record)
+    worker_pid = worker.get("worker_pid")
+    if worker_pid is None:
+        return "unknown", "no_worker_identity"
+    live = _probe_pid_liveness(worker_pid)
+    if live is False:
+        return "dead", "pid_absent"
+    if live is None:
+        return "unknown", "worker_pid_probe_unavailable"
+    generation_matches = _pid_generation_matches(worker_pid, worker)
+    if generation_matches is False:
+        return "dead", "pid_reused_start_token"
+    if generation_matches is None:
+        return "unknown", "worker_start_token_unavailable"
+    return "live", "worker_identity_match"
+
+
 def _pid_holds_capacity(
     pid: object,
     lease: dict,
@@ -863,23 +901,22 @@ def _lease_pids_dead(lease: dict) -> bool:
     one with a live pid is still consuming RAM and must not be evicted by a
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
-    An indeterminate worker/controller probe is bounded. An unprobeable
+    An indeterminate worker identity is never dead. An unprobeable
     pre-attach claimant is never dead: age is not a negative liveness
     observation, and converting unknown into TTL expiry would free the slot
     for a second worker against the same reservation.
     """
-    if (
-        retained_live_scope_holds_capacity(lease)
-        or attached_worker_group_holds_capacity(lease)
-    ):
+    if retained_live_scope_holds_capacity(lease):
         return False
     if _pre_attach_claimant_liveness(lease) is None:
         return False
     worker_pid = lease.get("worker_pid")
-    claimant_pid = lease.get("claimant_pid") if worker_pid is None else None
+    if worker_pid is not None:
+        liveness, _ = worker_identity_liveness(lease)
+        return liveness == "dead" and not attached_worker_group_holds_capacity(lease)
+    claimant_pid = lease.get("claimant_pid")
     return (
-        not _pid_holds_capacity(worker_pid, lease)
-        and not _pid_holds_capacity(lease.get("controller_pid"), lease)
+        not _pid_holds_capacity(lease.get("controller_pid"), lease)
         and not _pid_holds_capacity(claimant_pid, lease)
     )
 
@@ -1352,6 +1389,22 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             1 for lease in leases if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
         )
         total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
+        capacity_full = (
+            len(leases) >= lane_max_total
+            or agent_count >= lane_agent_cap
+            or (
+                bool(prof["ram_mb"])
+                and total_rss + rss_mb > max(0, prof["ram_mb"] - prof["controller_reserve_mb"])
+            )
+        )
+        if capacity_full and reclaim_stale_leases(data):
+            leases = active_leases(data)
+            agent_count = sum(
+                1
+                for lease in leases
+                if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
+            )
+            total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         if len(leases) >= lane_max_total:
             payload = {
                 "decision": "wait",
@@ -1433,7 +1486,7 @@ def cmd_release(args: argparse.Namespace) -> int:
             print(json.dumps({"ok": True, "lease_id": args.lease_id, "state": lease["state"]}, sort_keys=True))
             return 0
         if lease.get("worker_pid") and (
-            _pid_holds_capacity(lease["worker_pid"], lease)
+            worker_identity_liveness(lease)[0] != "dead"
             or attached_worker_group_holds_capacity(lease)
             or retained_live_scope_holds_capacity(lease)
         ):
@@ -1485,21 +1538,17 @@ def pid_alive(pid: int | None) -> bool:
     return goalflight_compat.pid_alive(pid)
 
 
-def _terminal_worker_gone(lease: dict, record: dict | None) -> bool:
-    """Terminal authority alone never proves a worker or its group has exited."""
-    import goalflight_ledger
+def _terminal_worker_gone(lease: dict, record: dict | None = None) -> bool:
+    """Whether the recorded worker and any retained group are gone.
 
-    worker = dict(lease)
-    if record and record.get("worker_pid"):
-        if goalflight_ledger.worker_identity_liveness(record)[0] != "dead":
-            return False
-        # The ledger can retain the identity even if lease attach failed.
-        if not worker.get("worker_pid") or worker["worker_pid"] == record["worker_pid"]:
-            worker.update({key: record[key] for key in ("worker_pid", "worker_identity", "worker_pgid") if record.get(key)})
-    if not worker.get("worker_pid"):
-        return False
-    live = _probe_pid_liveness(worker["worker_pid"])
-    if live is not False and not (live is True and _pid_generation_matches(worker["worker_pid"], worker) is False):
+    The lease is the terminal hook's authoritative worker record.  The ledger
+    fallback is only for ``release-stale`` repairing a lease whose worker
+    attach never persisted; it must not make a live or unprobeable worker
+    reclaimable.
+    """
+    worker = _worker_lease_view(lease, record)
+    liveness, _ = worker_identity_liveness(worker)
+    if liveness != "dead":
         return False
     return not (
         attached_worker_group_holds_capacity(worker)
@@ -1509,18 +1558,15 @@ def _terminal_worker_gone(lease: dict, record: dict | None) -> bool:
 
 def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
     """Idempotent post-commit cleanup, retried by terminal observers/reconcile."""
-    import goalflight_ledger
-
     with StateLock():
         data = load_state()
         candidates = [lease for lease in data.get("leases", {}).values()
                       if lease.get("dispatch_id") == dispatch_id and lease.get("state") == "active"]
         if not candidates:
             return
-        record = goalflight_ledger.read_record(dispatch_id)
         changed = False
         for lease in candidates:
-            if _terminal_worker_gone(lease, record):
+            if _terminal_worker_gone(lease):
                 lease.update(state=state, released_at=iso(), reason="dispatch_terminal")
                 changed = True
         if changed:
@@ -1528,11 +1574,12 @@ def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
 
 
 def stale_active_leases(data: dict) -> list[dict]:
-    """Active leases with no live worker, controller, or pre-attach claimant."""
+    """Active leases whose worker/claimant identity proves the holder gone."""
     stale: list[dict] = []
     for lease in active_leases(data):
         if retained_live_scope_holds_capacity(lease):
             continue
+        record = None
         if lease.get("dispatch_id"):
             import goalflight_ledger
 
@@ -1541,15 +1588,14 @@ def stale_active_leases(data: dict) -> list[dict]:
                     and _terminal_worker_gone(lease, record)):
                 stale.append(lease)
                 continue
+        worker = _worker_lease_view(lease, record)
         controller_pid = lease.get("controller_pid")
-        worker_pid = lease.get("worker_pid")
+        worker_pid = worker.get("worker_pid")
         if worker_pid is not None:
-            if lease.get("worker_pgid"):
-                if attached_worker_group_holds_capacity(lease):
-                    continue
-                stale.append(lease)
+            liveness, _ = worker_identity_liveness(worker)
+            if liveness != "dead":
                 continue
-            if _pid_holds_capacity(worker_pid, lease):
+            if attached_worker_group_holds_capacity(worker):
                 continue
             stale.append(lease)
             continue
@@ -1585,33 +1631,67 @@ def stale_active_leases(data: dict) -> list[dict]:
     return stale
 
 
-def cmd_release_stale(args: argparse.Namespace) -> int:
+def _reclaim_active_leases(
+    data: dict,
+    candidates: list[dict],
+    *,
+    state: str,
+    reason: str,
+) -> list[str]:
+    """Mark already-classified stale leases terminal in the supplied view."""
     released: list[str] = []
+    for lease in candidates:
+        lease_id = lease.get("lease_id")
+        if not lease_id:
+            continue
+        entry = data.get("leases", {}).get(lease_id)
+        if not entry or entry.get("state") != "active":
+            continue
+        entry["state"] = state
+        entry["released_at"] = iso()
+        entry["reason"] = reason
+        released.append(str(lease_id))
+    return released
+
+
+def reclaim_stale_leases(
+    data: dict,
+    *,
+    state: str = "expired",
+    reason: str = "capacity_backstop",
+    include_unknown_claimant: bool = False,
+) -> list[str]:
+    """Reclaim provably stale holders without treating unknown as dead."""
+    candidates = list(stale_active_leases(data))
+    if include_unknown_claimant:
+        seen = {str(lease.get("lease_id")) for lease in candidates if lease.get("lease_id")}
+        for lease in unknown_claimant_leases(data):
+            lease_id = lease.get("lease_id")
+            if lease_id and str(lease_id) not in seen:
+                candidates.append(lease)
+                seen.add(str(lease_id))
+    return _reclaim_active_leases(
+        data,
+        candidates,
+        state=state,
+        reason=reason,
+    )
+
+
+def cmd_release_stale(args: argparse.Namespace) -> int:
     include_unknown = bool(getattr(args, "include_unknown_claimant", False))
     with StateLock():
         data = load_state()
         prune_state(data)
-        candidates = list(stale_active_leases(data))
-        if include_unknown:
-            seen = {str(lease.get("lease_id")) for lease in candidates if lease.get("lease_id")}
-            for lease in unknown_claimant_leases(data):
-                lease_id = lease.get("lease_id")
-                if lease_id and str(lease_id) not in seen:
-                    candidates.append(lease)
-                    seen.add(str(lease_id))
-        for lease in candidates:
-            lease_id = lease.get("lease_id")
-            if not lease_id:
-                continue
-            entry = data.get("leases", {}).get(lease_id)
-            if not entry:
-                continue
-            entry["state"] = args.state
-            entry["released_at"] = iso()
-            entry["reason"] = args.reason
-            if not args.keep:
+        released = reclaim_stale_leases(
+            data,
+            state=args.state,
+            reason=args.reason,
+            include_unknown_claimant=include_unknown,
+        )
+        if not args.keep:
+            for lease_id in released:
                 data.get("leases", {}).pop(lease_id, None)
-            released.append(str(lease_id))
         save_state(data)
     payload = {"ok": True, "released": released, "count": len(released)}
     print(json.dumps(payload, sort_keys=True))
@@ -1622,8 +1702,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     # Status is a READ. It computes a pruned VIEW for display but never
     # persists, so a frequent status poll can't evict a live lease (capacity.json
     # is shared across sibling projects; persisting a prune here would let any
-    # poller race-flip another project's lease). Active-lease reclaim is the
-    # job of `release-stale`, which is liveness-gated by design.
+    # poller race-flip another project's lease. The view still applies the
+    # categorical worker-identity backstop so status can expose freed slots.
     with StateLock():
         try:
             data = load_state()
@@ -1639,6 +1719,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print(f"capacity: unreadable: {exc}", file=sys.stderr)
             return 1
     prune_state(data)
+    reclaim_stale_leases(data)
     pressure = current_rate_pressure(args)
     unknown_claimant = unknown_claimant_leases(data)
     payload = {

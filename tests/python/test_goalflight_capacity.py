@@ -467,12 +467,12 @@ def case_status_still_reclaims_dead_lease_in_view(state_dir: Path) -> None:
     )
 
 
-def case_indeterminate_holder_bounded_not_indefinite() -> None:
-    """F1: EPERM worker_pid is protected only inside INDETERMINATE_LIVE_RETENTION_S.
+def case_indeterminate_holder_unknown_is_not_reclaimed() -> None:
+    """F1: an EPERM worker identity stays held because unknown is not dead.
 
-    Induces the real condition (worker_pid=1, expires_at in the past). Both
-    halves: not reclaimed immediately, reclaimed after the bound. Boolean
-    pid_alive stays True for the same pid; reclaim consults pid_liveness.
+    Induces the real condition (worker_pid=1, expires_at in the past). The
+    boolean pid probe stays conservative while the categorical worker
+    identity probe refuses to reclaim without a definitive answer.
     """
     foreign = _indeterminate_foreign_pid()
     dead_controller = _dead_pid()
@@ -500,20 +500,14 @@ def case_indeterminate_holder_bounded_not_indefinite() -> None:
     aged["expires_at"] = cap.iso(
         now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 60)
     )
-    aged_for_stale = dict(aged)
     aged_data = {"leases": {aged["lease_id"]: aged}, "cooldowns": {}}
-    assert aged_for_stale in cap.stale_active_leases(
-        {"leases": {aged_for_stale["lease_id"]: aged_for_stale}, "cooldowns": {}}
-    ), "indeterminate holder past the retention window was not classified stale"
+    assert aged not in cap.stale_active_leases(aged_data), (
+        "indeterminate worker identity was reclaimed without proof of death"
+    )
     cap.prune_state(aged_data)
     survivor = aged_data["leases"].get(aged["lease_id"])
-    if survivor is not None:
-        assert survivor["state"] == "expired", (
-            f"indeterminate holder past retention not expired "
-            f"(state={survivor['state']!r})"
-        )
-    assert cap.active_leases(aged_data) == [], (
-        "indeterminate holder past retention still counted active"
+    assert survivor is not None and survivor["state"] == "active", (
+        "indeterminate worker identity was TTL-expired without proof of death"
     )
 
 
@@ -622,8 +616,8 @@ def case_dead_attached_group_without_identity_is_stale() -> None:
     assert cap.active_leases(data) == []
 
 
-def case_indeterminate_missing_clocks_starts_bounded_retention() -> None:
-    """No PID verdict + no clocks holds now, then expires from first sight."""
+def case_indeterminate_missing_identity_stays_unknown() -> None:
+    """No worker identity verdict stays held even after a clock is added."""
     foreign = _indeterminate_foreign_pid()
     lease = {
         "lease_id": "clockless-indeterminate",
@@ -636,15 +630,8 @@ def case_indeterminate_missing_clocks_starts_bounded_retention() -> None:
     assert lease not in cap.stale_active_leases(data), (
         "indeterminate clockless lease was released without proof of death"
     )
-    first_seen = cap.parse_iso(lease.get("liveness_unknown_since"))
-    assert first_seen is not None, lease
-
-    lease["liveness_unknown_since"] = cap.iso(
-        first_seen
-        - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 1)
-    )
-    assert lease in cap.stale_active_leases(data), (
-        "persisted first-unknown clock refreshed instead of bounding retention"
+    assert lease not in cap.stale_active_leases(data), (
+        "repeated unknown worker identity incorrectly authorized reclamation"
     )
 
     dead = dict(lease)
@@ -684,12 +671,13 @@ def case_live_worker_survives_past_indeterminate_retention() -> None:
         worker.wait()
 
 
-def case_unprobeable_retained_scope_reclaims_after_until() -> None:
-    """Watcher retain path: elapsed until + unprobeable pgid is reclaimable.
+def case_unprobeable_retained_scope_stays_unknown() -> None:
+    """Watcher retain path never reclaims an unprobeable worker identity.
 
     ``accounted_live_pgid=1`` is not a stubbed None: ``_process_group_liveness``
     refuses pgid<=1. Combined with a past ``accounted_live_until``, the existing
-    retain predicate must stop holding. A still-open until keeps the hold.
+    retain predicate stops holding, but the worker identity still protects the
+    lease. A still-open until keeps the retained scope hold as well.
     Confirmed-live groups still hold after the same until (watch idle tests).
     """
     now = cap.utc_now()
@@ -707,12 +695,11 @@ def case_unprobeable_retained_scope_reclaims_after_until() -> None:
     }
     assert not cap.retained_live_scope_holds_capacity(lease)
     data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
-    assert lease in cap.stale_active_leases(data), lease
+    assert lease not in cap.stale_active_leases(data), lease
     cap.prune_state(data)
     survivor = data["leases"].get(lease["lease_id"])
-    if survivor is not None:
-        assert survivor["state"] == "expired", survivor
-    assert cap.active_leases(data) == []
+    assert survivor is not None and survivor["state"] == "active", survivor
+    assert cap.active_leases(data) == [lease]
 
     still_open = dict(lease)
     still_open["state"] = "active"
@@ -763,8 +750,8 @@ def case_in_ttl_indeterminate_holder_is_bounded_from_started_at() -> None:
         "expires_at": cap.iso(now + dt.timedelta(hours=10)),
     }
     aged_data = {"leases": {aged["lease_id"]: aged}, "cooldowns": {}}
-    assert aged in cap.stale_active_leases(aged_data), (
-        "in-TTL indeterminate holder past started_at+retention was not stale"
+    assert aged not in cap.stale_active_leases(aged_data), (
+        "in-TTL unknown worker identity was reclaimed without proof of death"
     )
     cap.prune_state(aged_data)
     survivor = aged_data["leases"].get(aged["lease_id"])
@@ -1933,14 +1920,14 @@ def main() -> None:
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
     case_rate_limited_retained_lease_pruned()
-    case_indeterminate_holder_bounded_not_indefinite()
+    case_indeterminate_holder_unknown_is_not_reclaimed()
     case_pid_reuse_identity_mismatch_is_stale()
     case_pid_reuse_identity_mismatch_without_pgid_is_stale()
     case_live_schema_without_token_holds_past_retention()
     case_dead_attached_group_without_identity_is_stale()
-    case_indeterminate_missing_clocks_starts_bounded_retention()
+    case_indeterminate_missing_identity_stays_unknown()
     case_live_worker_survives_past_indeterminate_retention()
-    case_unprobeable_retained_scope_reclaims_after_until()
+    case_unprobeable_retained_scope_stays_unknown()
     case_in_ttl_indeterminate_holder_is_bounded_from_started_at()
     case_dead_worker_reclaimed_inside_indeterminate_retention()
     case_stale_active_leases_live_worker_not_stale_with_dead_controller()
