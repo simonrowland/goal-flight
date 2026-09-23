@@ -1323,7 +1323,9 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
 
 def test_frontier_reads_only_materialized_projection_and_marks_stale(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     projection = tmp_path / "tasks-data.js"
     projection.write_text(
         "// generated\nwindow.GF_ITEMS = "

@@ -1,9 +1,11 @@
 """Write-cost regressions; all stores and machine state are pytest-isolated."""
 import ctypes
+import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 
 import pytest
 
@@ -12,7 +14,9 @@ import goalflight_task as task
 
 
 @pytest.fixture
-def store(tmp_path):
+def store(tmp_path, monkeypatch):
+    # Existing write-cost cases exercise the opt-in mirror contract.
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     project = tmp_path / "project"
     project.mkdir()
     return task.TaskStore(project)
@@ -140,6 +144,96 @@ def test_comparison_nonregular_and_unreadable_are_changed(tmp_path, monkeypatch)
     assert not task._file_matches_bytes(path, b"abc")
 
 
+def test_dashboard_off_by_default_preserves_existing_mirrors(store, monkeypatch):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    monkeypatch.setattr(task, "CHECKER", store.project_root / "nonexistent-checker.js")
+    monkeypatch.setattr(task, "_items_data_js", lambda *a: pytest.fail("generated disabled mirror"))
+    store.save_items_atomic([item()])
+    assert not store.data_js_path.exists()
+    exported = store.export_dashboard_dir / "tasks-data.js"
+    assert not exported.exists()
+    # Existing mirrors (even invalid ones) are left for the operator to remove.
+    for path in (store.data_js_path, exported):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale mirror")
+    before = {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in (store.data_js_path, exported)}
+    store.mutate_items(lambda rows: rows[0].update(title="Changed"))
+    store._write_publish_marker("interrupted")
+    assert "dashboard/tasks-data.js" not in json.loads(store.publish_marker_path.read_text())["artifacts"]
+    store._recover_interrupted_publish()
+    assert not store.publish_marker_path.exists()
+    assert before == {p: (p.stat().st_ino, p.stat().st_mtime_ns) for p in before}
+    assert all(p.read_bytes() == b"stale mirror" for p in before)
+    assert len(list(store.log_dir.glob("tasks-*.jsonl"))) == 1
+    assert not list(store.log_dir.glob("tasks-data-*.js"))
+
+
+def test_dashboard_opt_in_restores_exact_output(store, monkeypatch):
+    monkeypatch.setattr(task, "utc_now", lambda: "2026-09-23T00:00:00+00:00")
+    items = [item()]
+    expected = task._items_data_js(store._mirror_items_for_script(items)).encode()
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.save_items_atomic(items)
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
+    store.mutate_items(lambda rows: None, allow_invalid_live_mirror=True)
+    assert store.data_js_path.read_bytes() == expected
+    assert (store.export_dashboard_dir / "tasks-data.js").read_bytes() == expected
+
+
+def test_dashboard_disabled_readers(store, monkeypatch, capsys):
+    import goalflight_doctor as doctor
+    import goalflight_dispatch as dispatch
+    import goalflight_messages as messages
+    import goalflight_setup as setup
+
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.save_items_atomic([item()])
+    hint = "GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1"
+    assert hint in doctor._check_tasks_mirror(store.project_root, task.ROOT)["skipped"]
+    assert "tasks-data.js" not in doctor.canonical_dashboard_files(task.ROOT)
+    assert dispatch._cmd_dashboard_refresh(["--project-root", str(store.project_root)]) == 0
+    assert hint in capsys.readouterr().out
+    frontier = messages._follow_frontier_snapshot(store)
+    assert frontier["payload"]["state"] == "unavailable"
+    assert hint in frontier["payload"]["detail"]
+    plan = setup.scaffold_project_state(task.ROOT, store.project_root)
+    assert "dashboard/tasks-data.js" not in plan["would_create_files"]
+    setup.scaffold_project_state(task.ROOT, store.project_root, apply=True)
+    assert not (store.export_dashboard_dir / "tasks-data.js").exists()
+    layout = doctor.check_project_state_layout(store.project_root, task.ROOT)
+    assert "dashboard/tasks-data.js" not in layout["missing_files"]
+    result = subprocess.run(["node", str(task.CHECKER), str(store.docs_dir)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert hint in result.stdout
+    status = subprocess.run([sys.executable, str(task.ROOT / "goalflight_task.py"),
+                             "--project-root", str(store.project_root), "status", "--json"],
+                            capture_output=True, text=True)
+    assert status.returncode == 0, status.stderr
+    assert hint in status.stderr
+    assert json.loads(status.stdout)["items"][0]["id"] == "t-001"
+
+
+def test_dashboard_off_legacy_snapshot_recovery(store, monkeypatch):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    legacy_log = store.export_docs_dir / "log"
+    legacy_log.mkdir(parents=True)
+    (legacy_log / "tasks-20260923.jsonl").write_text(task._items_jsonl([item()]))
+    store.mutate_items(lambda rows: rows[0].update(title="Recovered"))
+    assert store.load_items()[0]["title"] == "Recovered"
+    assert not store.data_js_path.exists()
+    assert not (store.export_dashboard_dir / "tasks-data.js").exists()
+
+
+def test_dashboard_off_still_rejects_invalid_canonical_store(store, monkeypatch):
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    store.save_items_atomic([item()])
+    store.tasks_path.write_bytes(b"invalid json\n")
+    with pytest.raises(task.TaskError):
+        store.mutate_items(lambda rows: pytest.fail("mutated invalid store"))
+    assert store.tasks_path.read_bytes() == b"invalid json\n"
+    assert not list(store.log_dir.glob("tasks-*.jsonl"))
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS clonefile")
 @pytest.mark.parametrize("failure", [False, True])
 def test_clonefile_path_and_fallback(tmp_path, monkeypatch, failure):
@@ -249,3 +343,11 @@ def test_mutation_disk_write_cost(store, monkeypatch):
         print(f"{label}/{path.relative_to(base)}: {size} bytes")
     assert before > 0
     assert after < before * 0.8
+    monkeypatch.delenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED")
+    published.clear()
+    start = written()
+    store.mutate_items(mutate)
+    disabled = written() - start
+    print(f"diskio_byteswritten original={before} optimized_mirror_on={after} mirror_off={disabled}")
+    assert disabled < after * 0.6
+    assert all(path.name != "tasks-data.js" for path, _size in published)

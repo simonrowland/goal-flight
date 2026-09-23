@@ -59,7 +59,7 @@ docs-private/
 
 dashboard/
   gf.js                       # shared static renderer
-  tasks-data.js               # generated browser mirror of docs-private/tasks.jsonl
+  tasks-data.js               # optional browser mirror; off by default
   index.html                  # static dashboard
   tickets.html  ticket.html   # ticket list/detail views
   current-activity.html       # active work view
@@ -70,7 +70,9 @@ dashboard/
 `tasks.jsonl` is canonical (ADR-002/004): `task-decomposition.md` /
 `tasks-done.md` / `bug-backlog.md` / `bugs-done.md` are GENERATED snapshots,
 while the static client-side views in repo-root `dashboard/` render over
-`dashboard/tasks-data.js`. Add/edit tasks via `goalflight_task.py` (don't hand-edit
+`dashboard/tasks-data.js` when `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1` is set.
+The mirror is off by default; enable it and run `goalflight_task.py sync` to
+create it. Disabled exports leave existing mirror files untouched. Add/edit tasks via `goalflight_task.py` (don't hand-edit
 generated snapshots). A task lives in exactly one derived state; `done` marks
 DONE/awaiting-review and `accept` moves it to DONE-REVIEWED. Bugs follow the
 same split. Status is machine-owned — see [task-lifecycle.md](task-lifecycle.md).
@@ -115,7 +117,8 @@ Bug INSTANCES stay project-local; bug SHAPES are shared.
 - `init` scaffolds the layout from `templates/state-skeleton/` (stubs present-even-
   if-empty; the RESUME-NOTES pin comes from `templates/resume-notes.md`); `doctor`
   checks the tree + the AGENTS.md pin; `goalflight_task.py sync` emits
-  `dashboard/tasks-data.js` plus markdown snapshots under `docs-private/`.
+  markdown snapshots under `docs-private/` plus `dashboard/tasks-data.js`
+  when `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`.
   Static HTML views in `dashboard/` render client-side from the mirror;
   `docs-private/questions-for-user.md` remains the human source for decision
   prose while `dashboard/questions-for-user.html` renders open decision items

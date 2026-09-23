@@ -245,6 +245,15 @@ def _nudges_disabled() -> bool:
     return os.environ.get("GOALFLIGHT_DISABLE_NUDGES", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+DASHBOARD_EXPORT_DISABLED = (
+    "Dashboard mirror disabled; enable with GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1 and run goalflight_task.py sync."
+)
+
+
+def _dashboard_export_enabled() -> bool:
+    return os.environ.get("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class TaskError(Exception):
     """User-facing task-store failure."""
 
@@ -1994,6 +2003,8 @@ def _atomic_write_bytes(path: Path, data: bytes, *, prefix: str = ".tmp-") -> No
 
 
 def _run_checker(store_dir: Path, dashboard_dir: Path | None = None) -> None:
+    if not _dashboard_export_enabled():
+        return
     node = shutil.which("node")
     if not node:
         raise TaskError("scripts/check_tasks_mirror.js: node not found; refusing to write without strict mirror validation")
@@ -2439,15 +2450,18 @@ class TaskStore:
 
     def _ensure_export_dirs_for_write(self) -> None:
         for path, label in ((self.export_docs_dir, "docs-private"), (self.export_dashboard_dir, "dashboard")):
+            if label == "dashboard" and not _dashboard_export_enabled():
+                continue
             self._require_export_dir_safe(path, label)
             path.mkdir(parents=True, exist_ok=True)
             self._require_export_dir_safe(path, label)
 
     def _ensure_state_dirs_for_write(self) -> None:
         self._ensure_docs_dir_for_write()
-        self._require_state_dir_safe(self.dashboard_dir, "dashboard")
-        self.dashboard_dir.mkdir(parents=True, exist_ok=True)
-        self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+        if _dashboard_export_enabled():
+            self._require_state_dir_safe(self.dashboard_dir, "dashboard")
+            self.dashboard_dir.mkdir(parents=True, exist_ok=True)
+            self._require_state_dir_safe(self.dashboard_dir, "dashboard")
         # Validate the project-tree export targets up front so a symlinked
         # docs-private/dashboard fails the whole write before anything leaks.
         self._ensure_export_dirs_for_write()
@@ -2526,6 +2540,8 @@ class TaskStore:
                 for name in names
                 if name.startswith("tasks-") and name.endswith(".jsonl")
             ]
+            if paths and not _dashboard_export_enabled():
+                print(DASHBOARD_EXPORT_DISABLED, file=sys.stderr)
             return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError as exc:
             raise TaskError(
@@ -2580,10 +2596,11 @@ class TaskStore:
 
     def _write_store_moved_pointer(self) -> None:
         pointer = self.export_docs_dir / "STORE-MOVED.txt"
+        exports = "tasks.jsonl / tasks-data.js / *.md" if _dashboard_export_enabled() else "tasks.jsonl / *.md"
         text = (
             "goal-flight: the canonical task store moved OUT of this (possibly synced) tree.\n"
             f"Canonical store: {self.store_dir}\n\n"
-            "tasks.jsonl / tasks-data.js / *.md here are now a one-way generated EXPORT.\n"
+            f"{exports} here are now a one-way generated EXPORT.\n"
             "Edit tasks only through the goal-flight tooling; do not hand-edit these files.\n"
             "tasks.jsonl.migrated-<stamp> is a one-time pre-migration backup (delete once verified).\n"
         )
@@ -2691,7 +2708,7 @@ class TaskStore:
             _run_checker(staging)
             targets = {
                 self.tasks_path: staging / "tasks.jsonl",
-                self.data_js_path: staging / "tasks-data.js",
+                **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),
                 self.task_decomposition_path: staging / "task-decomposition.md",
                 self.tasks_done_path: staging / "tasks-done.md",
                 self.bug_backlog_path: staging / "bug-backlog.md",
@@ -2712,7 +2729,8 @@ class TaskStore:
                 for target, source in targets.items():
                     source.replace(target)
                 _fsync_dir(self.docs_dir)
-                _fsync_dir(self.dashboard_dir)
+                if _dashboard_export_enabled():
+                    _fsync_dir(self.dashboard_dir)
             except OSError:
                 for target, data in old_bytes.items():
                     self._restore_bytes(target, data)
@@ -2741,7 +2759,7 @@ class TaskStore:
         (including a sync daemon racing these copies) never corrupts the store."""
         exports = [
             (self.tasks_path, self.export_docs_dir / "tasks.jsonl"),
-            (self.data_js_path, self.export_dashboard_dir / "tasks-data.js"),
+            *([(self.data_js_path, self.export_dashboard_dir / "tasks-data.js")] if _dashboard_export_enabled() else []),
             (self.task_decomposition_path, self.export_docs_dir / "task-decomposition.md"),
             (self.tasks_done_path, self.export_docs_dir / "tasks-done.md"),
             (self.bug_backlog_path, self.export_docs_dir / "bug-backlog.md"),
@@ -2749,7 +2767,8 @@ class TaskStore:
         ]
         try:
             self.export_docs_dir.mkdir(parents=True, exist_ok=True)
-            self.export_dashboard_dir.mkdir(parents=True, exist_ok=True)
+            if _dashboard_export_enabled():
+                self.export_dashboard_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             print(f"goalflight_task: task-store export skipped (mkdir failed: {exc})", file=sys.stderr)
             return
@@ -2778,7 +2797,7 @@ class TaskStore:
     def _write_staged_generation(self, staging: Path, items: list[dict[str, Any]]) -> set[str]:
         contents = {
             "tasks.jsonl": _items_jsonl(items),
-            "tasks-data.js": _items_data_js(self._mirror_items_for_script(items)),
+            **({"tasks-data.js": _items_data_js(self._mirror_items_for_script(items))} if _dashboard_export_enabled() else {}),
             **self.generated_markdown(items),
         }
         unchanged: set[str] = set()
@@ -2815,7 +2834,7 @@ class TaskStore:
             "canonical": "tasks.jsonl",
             "artifacts": [
                 "tasks.jsonl",
-                "dashboard/tasks-data.js",
+                *(["dashboard/tasks-data.js"] if _dashboard_export_enabled() else []),
                 "task-decomposition.md",
                 "tasks-done.md",
                 "bug-backlog.md",
@@ -2839,6 +2858,8 @@ class TaskStore:
     def _recover_interrupted_publish_locked(self) -> None:
         if not require_regular_or_absent(self.publish_marker_path):
             return
+        if not _dashboard_export_enabled():
+            print(DASHBOARD_EXPORT_DISABLED, file=sys.stderr)
         if not require_regular_or_absent(self.tasks_path):
             raise TaskError(f"{self.publish_marker_path}: interrupted task publish cannot recover because tasks.jsonl is missing")
         items, _ = _parse_jsonl(self.tasks_path)
@@ -2850,7 +2871,7 @@ class TaskStore:
             _run_checker(staging)
             for target, source in {
                 self.tasks_path: staging / "tasks.jsonl",
-                self.data_js_path: staging / "tasks-data.js",
+                **({self.data_js_path: staging / "tasks-data.js"} if _dashboard_export_enabled() else {}),
                 self.task_decomposition_path: staging / "task-decomposition.md",
                 self.tasks_done_path: staging / "tasks-done.md",
                 self.bug_backlog_path: staging / "bug-backlog.md",
@@ -2858,14 +2879,16 @@ class TaskStore:
             }.items():
                 source.replace(target)
             _fsync_dir(self.docs_dir)
-            _fsync_dir(self.dashboard_dir)
+            if _dashboard_export_enabled():
+                _fsync_dir(self.dashboard_dir)
             self._clear_publish_marker()
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
     def _snapshot_last_good(self, *, require_valid: bool = True) -> None:
         tasks_exists = require_regular_or_absent(self.tasks_path)
-        data_exists = require_regular_or_absent(self.data_js_path)
+        mirror_enabled = _dashboard_export_enabled()
+        data_exists = require_regular_or_absent(self.data_js_path) if mirror_enabled else tasks_exists
         if not tasks_exists and not data_exists:
             return
         if not tasks_exists or not data_exists:
@@ -2873,7 +2896,11 @@ class TaskStore:
                 return
             raise TaskError(f"{self.store_dir}: missing docs-private/tasks.jsonl or dashboard/tasks-data.js; refusing mutation without a valid last-known-good pair")
         try:
-            _run_checker(self.docs_dir, self.dashboard_dir)
+            if mirror_enabled:
+                _run_checker(self.docs_dir, self.dashboard_dir)
+            else:
+                items, _ = _parse_jsonl(self.tasks_path)
+                _validate_items_for_write(items)
         except TaskError:
             if require_valid:
                 raise
@@ -2881,13 +2908,15 @@ class TaskStore:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         require_regular_file(self.tasks_path)
-        require_regular_file(self.data_js_path)
+        if mirror_enabled:
+            require_regular_file(self.data_js_path)
         _clone_or_copy(self.tasks_path, self.log_dir / f"tasks-{stamp}.jsonl")
-        _clone_or_copy(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
+        if mirror_enabled:
+            _clone_or_copy(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
         self._prune_backups()
 
     def _prune_backups(self, keep: int = 20) -> None:
-        for pattern in ("tasks-*.jsonl", "tasks-data-*.js"):
+        for pattern in ("tasks-*.jsonl", "tasks-data-*.js") if _dashboard_export_enabled() else ("tasks-*.jsonl",):
             backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
             for path in backups[keep:]:
                 with contextlib.suppress(OSError):
@@ -5295,6 +5324,8 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
 
 
 def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
+    if not _dashboard_export_enabled():
+        print(DASHBOARD_EXPORT_DISABLED, file=sys.stderr)
     rows = store.derived_rows()
     if args.json:
         payload = {"project_root": str(store.project_root), "items": rows}
@@ -5320,7 +5351,10 @@ def _cmd_sync(store: TaskStore, args: argparse.Namespace) -> int:
         return store.sync_dispatch_breadcrumbs(items, actor)
 
     changed = store.mutate_items(update, allow_invalid_live_mirror=True)
-    print(f"OK: synced tasks-data.js and generated markdown views ({changed} dispatch breadcrumb updates)")
+    views = "tasks-data.js and generated markdown views" if _dashboard_export_enabled() else "generated markdown views"
+    print(f"OK: synced {views} ({changed} dispatch breadcrumb updates)")
+    if not _dashboard_export_enabled():
+        print(DASHBOARD_EXPORT_DISABLED)
     return 0
 
 
@@ -5749,7 +5783,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync = sub.add_parser(
         "sync",
-        help="Write tasks-data.js and sync project-scoped dispatch breadcrumbs.",
+        help="Sync dispatch breadcrumbs and generated views (tasks-data.js requires GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1).",
         epilog="example: goalflight_task.py sync",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

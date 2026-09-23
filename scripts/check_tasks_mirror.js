@@ -202,6 +202,10 @@ function assertMirrorDerivedStatus(items, file) {
 }
 
 function main() {
+  if (!["1", "true", "yes", "on"].includes((process.env.GOALFLIGHT_DASHBOARD_EXPORT_ENABLED || "").trim().toLowerCase())) {
+    console.log("Dashboard mirror disabled; enable with GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1 and run goalflight_task.py sync.");
+    return;
+  }
   const storeDir = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_DIR;
   const dashboardDir = process.argv[3] ? path.resolve(process.argv[3]) : storeDir;
   const jsonlPath = path.join(storeDir, "tasks.jsonl");

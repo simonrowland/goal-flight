@@ -886,6 +886,12 @@
 
     // Brand every view with the repo name (tab title + top-of-main banner).
     applyRepoBranding();
+    if (!Array.isArray(global.GF_ITEMS) && global.document) {
+      var notice = global.document.createElement("p");
+      notice.setAttribute("role", "status");
+      notice.textContent = "Dashboard mirror unavailable (disabled by default); enable with GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1 and run goalflight_task.py sync.";
+      (global.document.querySelector("main") || global.document.body).prepend(notice);
+    }
 
     function loadAndMaybeRender(force) {
       var res = snapshot();

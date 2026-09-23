@@ -474,7 +474,10 @@ SIGKILL cannot be caught, so it cannot produce the supervisor exit hint.
 
 The heartbeat path never calls `goalflight_task.py next` or `TaskStore.next_frontier`:
 those surfaces may repair publishes, scan the global dispatch ledger, and emit task
-nudges. `follow` reads only the already-materialized `tasks-data.js` projection. If
+nudges. `follow` reads only the already-materialized `tasks-data.js` projection.
+Mirror export defaults off; the frontier then reports `unavailable` with a
+one-line hint to set `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1` and run
+`goalflight_task.py sync`. Canonical task queries remain available. If
 the canonical task file is newer than that projection, the frontier is structurally
 tagged `state: stale`; otherwise it says `state: projected`, never authoritative
 `ready`, because dispatch-ledger changes can outpace the generated view. The record

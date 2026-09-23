@@ -625,6 +625,8 @@ def scaffold_project_state(
     view_manifest_updates: list[dict[str, str]] = []
     messages: list[str] = []
 
+    task_module = _load_goalflight_task_module()
+
     dirs = [docs_private, dashboard] + [docs_private / rel for rel in goalflight_doctor.CANONICAL_STATE_DIRS]
     for path in dirs:
         _validate_scaffold_state_dir(target_project, path)
@@ -638,6 +640,9 @@ def scaffold_project_state(
             continue
         rel = source.relative_to(skeleton)
         rel_key = rel.as_posix()
+        if rel_key == "tasks-data.js" and not task_module._dashboard_export_enabled():
+            messages.append(task_module.DASHBOARD_EXPORT_DISABLED)
+            continue
         dest_root = dashboard if rel_key in goalflight_doctor.DASHBOARD_ASSETS else docs_private
         dest = dest_root / rel
         rel_out = _relative_to_project(target_project, dest)

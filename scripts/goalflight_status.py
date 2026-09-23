@@ -3180,6 +3180,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.export_dashboard is not None:
         export_dashboard_status(project_root, args.export_dashboard or None)
+        if not goalflight_task._dashboard_export_enabled():
+            print(goalflight_task.DASHBOARD_EXPORT_DISABLED)
         return 0
 
     if args.wait:
