@@ -431,7 +431,7 @@ def test_dashboard_disabled_readers(store, monkeypatch, capsys):
     assert hint in capsys.readouterr().out
     frontier = messages._follow_frontier_snapshot(store)
     assert frontier["payload"]["state"] == "unavailable"
-    assert hint in frontier["payload"]["detail"]
+    assert "next-task hint unavailable" in frontier["payload"]["detail"]
     plan = setup.scaffold_project_state(task.ROOT, store.project_root)
     assert "dashboard/tasks-data.js" not in plan["would_create_files"]
     setup.scaffold_project_state(task.ROOT, store.project_root, apply=True)

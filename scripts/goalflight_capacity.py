@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -362,16 +363,48 @@ def lock_path() -> Path:
     return state_dir() / "capacity.lock"
 
 
+_STATE_LOCK_HELD = threading.local()
+
+
 class StateLock:
+    """Exclusive capacity-state lock, re-entrant within one thread.
+
+    flock(2) locks an open file description, so a second open() of the same
+    lock file in a thread that already holds it blocks forever. Terminal
+    commits release capacity (release_terminal_dispatch) while callers such as
+    abandoned-dispatch reconciliation already hold this lock to keep their
+    capacity evaluation and commit atomic; re-entry makes that nesting safe.
+    Other threads and processes still exclude each other via their own fds.
+
+    Callers holding this lock across a nested acquire must not save_state a
+    copy they loaded before the nested call; that would clobber the inner
+    holder's write. Today every nesting outer holder only reads.
+    """
+
     def __enter__(self):
+        depth = getattr(_STATE_LOCK_HELD, "depth", 0)
+        if depth:
+            _STATE_LOCK_HELD.depth = depth + 1
+            return self
         lock_path().parent.mkdir(parents=True, exist_ok=True)
-        self._fh = lock_path().open("w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        fh = lock_path().open("w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except BaseException:
+            fh.close()
+            raise
+        _STATE_LOCK_HELD.fh = fh
+        _STATE_LOCK_HELD.depth = 1
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+        _STATE_LOCK_HELD.depth -= 1
+        if _STATE_LOCK_HELD.depth:
+            return
+        fh = _STATE_LOCK_HELD.fh
+        _STATE_LOCK_HELD.fh = None
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def _empty_state() -> dict:

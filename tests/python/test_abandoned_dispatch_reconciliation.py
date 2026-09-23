@@ -193,6 +193,9 @@ def _stub_resume_runtime(
     monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
     monkeypatch.setattr(D, "_resolve_account_env", lambda _args: {})
     monkeypatch.setattr(D, "_acquire_capacity", lambda *_args, **_kwargs: "lease-resume")
+    # The fake lease is never written to capacity state, so the launcher's
+    # "lease still held before spawn" check must be faked alongside it.
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     monkeypatch.setattr(
         D,
         "_rebuild_codex_resume_home",

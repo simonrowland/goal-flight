@@ -2644,6 +2644,7 @@ class _WorkerProcessProbe:
         return self._exited
 
     def sample(self) -> tuple[bool, str, dict | None]:
+        indeterminate: tuple[bool, str, dict | None] | None = None
         if self._pidfd is not None or self._kqueue is not None:
             # The native exit observer is generation-safe only after the PID
             # opened at watcher startup matches the launcher's identity token.
@@ -2657,10 +2658,12 @@ class _WorkerProcessProbe:
                 self._identity_result = (alive, reason, current)
                 self._identity_checked = True
             if self._identity_result is not None:
-                if self._identity_result[1] == "identity_indeterminate":
-                    return self._identity_result
                 if not self._identity_result[0]:
                     return self._identity_result
+                if self._identity_result[1] == "identity_indeterminate":
+                    # An unproven generation never reports "live", but it must
+                    # not mask the exit either: keep observing the descriptor.
+                    indeterminate = self._identity_result
         if self._exit_event_seen():
             return False, "dead", None
         liveness = goalflight_compat.pid_liveness(self.pid)
@@ -2677,6 +2680,8 @@ class _WorkerProcessProbe:
         if self._pidfd is not None or self._kqueue is not None:
             # The descriptor/event is tied to this process generation. The
             # startup token remains available in status without re-reading it.
+            if indeterminate is not None:
+                return indeterminate
             return True, "live", dict(self.expected_identity or {"pid": self.pid})
         current = _lightweight_process_identity(self.pid)
         is_alive, reason = goalflight_ledger.compare_process_identities(

@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -131,6 +132,33 @@ def test_worker_probe_reuses_native_exit_observer(monkeypatch: pytest.MonkeyPatc
             assert identity == expected
     finally:
         probe.close()
+
+
+def test_worker_probe_without_start_token_still_observes_exit() -> None:
+    # A pin with no start token (the watcher's own probe failed) cannot prove
+    # the generation, so it never reports "live" -- but the native exit
+    # observer must still report the worker dead once it exits.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    expected = {
+        "pid": child.pid,
+        "identity_available": False,
+        "identity_source": "pid_probe_only",
+    }
+    probe = watch._WorkerProcessProbe(child.pid, expected)
+    try:
+        if probe._pidfd is None and probe._kqueue is None:
+            pytest.skip("native pid exit observer unavailable")
+        alive, reason, _identity = probe.sample()
+        assert alive and reason == "identity_indeterminate"
+        child.kill()
+        child.wait()
+        alive, reason, _identity = probe.sample()
+        assert not alive and reason == "dead"
+    finally:
+        probe.close()
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def test_native_cpu_sample_does_not_spawn_process_table_probe(

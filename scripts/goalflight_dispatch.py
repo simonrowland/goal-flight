@@ -17971,7 +17971,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         controller_label=_controller_label(args),
         unregistered_forced=bool(getattr(args, "unregistered_forced", False)),
         occupied_worktree_forced=bool(getattr(args, "occupied_worktree_forced", False)),
-        tail=str(Path(args.tail) if args.tail else (base or _dispatch_base_dir()) / f"{args.dispatch_id}.tail"),
+        tail=str(
+            Path(tail_arg)
+            if (tail_arg := getattr(args, "tail", None))
+            else (base or _dispatch_base_dir()) / f"{args.dispatch_id}.tail"
+        ),
         _controller_registration_script="goalflight_acp_run.py",
         cpu_epsilon=0.1,
         json=False,

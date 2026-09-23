@@ -562,3 +562,28 @@ def test_real_sigint_interrupts():
         )
     assert caught.value.signum == signal.SIGINT
     assert caught.value.exit_code == 130
+
+
+def test_state_lock_reenters_in_one_thread_and_excludes_other_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A terminal commit releases capacity while abandoned-dispatch
+    # reconciliation already holds the lock; a second flock on a fresh fd in
+    # the same thread used to block forever.
+    import threading
+
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    entered = threading.Event()
+
+    def contender() -> None:
+        with cap.StateLock():
+            entered.set()
+
+    with cap.StateLock():
+        with cap.StateLock():
+            pass
+        other = threading.Thread(target=contender, daemon=True)
+        other.start()
+        assert not entered.wait(0.3), "another thread must not enter while held"
+    assert entered.wait(5), "lock must be free once the outer holder exits"
+    other.join(5)

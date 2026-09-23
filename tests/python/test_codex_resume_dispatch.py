@@ -458,8 +458,10 @@ def test_canonical_home_launch_harvests_handle_and_validates_resume(
     )
     watcher_argv = list(watcher["argv"][1:])
     watcher_argv[watcher_argv.index("--pid") + 1] = "99999999"
-    identity_index = watcher_argv.index("--worker-identity-json")
-    del watcher_argv[identity_index : identity_index + 2]
+    # The launcher forwards only start_token identities (an lstart-only pin
+    # would hold the watcher's exit observer indeterminate); this fixture's
+    # worker has none, so the watcher pins its own startup identity.
+    assert "--worker-identity-json" not in watcher_argv
     monkeypatch.setattr(sys, "argv", watcher_argv)
 
     assert W.main() != 0
