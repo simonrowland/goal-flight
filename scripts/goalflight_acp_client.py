@@ -499,6 +499,13 @@ CLAUDE_ACP_SHIM_BASENAME = "claude-code-cli-acp"
 DEFAULT_SHIM_ORPHAN_TTL_S = 600.0
 _SHIM_REAP_GRACE_S = 5.0
 _SHIM_REAP_POST_KILL_GRACE_S = 1.0
+_SHIM_REAP_POLL_S = 0.05
+# A non-advancing monotonic clock, or a PGID that remains visible after
+# SIGKILL (for example while an uninterruptible member is stuck), must not let
+# either grace loop spin forever. The poll caps are independent of the clock;
+# a target still live at the cap is reported as stubborn and left unreaped.
+_SHIM_REAP_MAX_GRACE_POLLS = 100
+_SHIM_REAP_MAX_POST_KILL_GRACE_POLLS = 20
 DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S = 2.0
 # Dedicated provenance marker injected into every goal-flight-launched shim's
 # environment (see spawn_acp_connection). The reaper DEFAULT-DENIES any orphan
@@ -1261,6 +1268,17 @@ def _terminate_process_group(
             worker_pid, expected_identity, probe(worker_pid)
         )
 
+    def wait_for_group_exit(
+        deadline: float, max_polls: int
+    ) -> bool:
+        for _ in range(max_polls):
+            if time.monotonic() >= deadline:
+                return _pgid_alive(target)
+            if not _pgid_alive(target):
+                return False
+            time.sleep(_SHIM_REAP_POLL_S)
+        return _pgid_alive(target)
+
     identity_ok, identity_reason = identity_status()
     if not identity_ok:
         return f"skip_identity:{identity_reason}"
@@ -1279,11 +1297,8 @@ def _terminate_process_group(
             os.kill(worker_pid, signal.SIGTERM)
             actions.append("SIGTERM(pid)")
     deadline = time.monotonic() + grace_s
-    while time.monotonic() < deadline:
-        if not _pgid_alive(target):
-            break
-        time.sleep(0.05)
-    if _pgid_alive(target):
+    still_alive = wait_for_group_exit(deadline, _SHIM_REAP_MAX_GRACE_POLLS)
+    if still_alive:
         identity_ok, identity_reason = identity_status()
         leader_exited = identity_reason == "dead"
         if not identity_ok and not (leader_exited and group_term_sent):
@@ -1312,16 +1327,20 @@ def _terminate_process_group(
                 actions.append("SIGKILL(pid)")
     if any(action.startswith("SIGKILL") for action in actions):
         deadline = time.monotonic() + _SHIM_REAP_POST_KILL_GRACE_S
-        while time.monotonic() < deadline:
-            if not _pgid_alive(target):
-                break
-            time.sleep(0.05)
-        if _pgid_alive(target):
+        still_alive = wait_for_group_exit(
+            deadline, _SHIM_REAP_MAX_POST_KILL_GRACE_POLLS
+        )
+        if still_alive:
             # Intermediate killpg(0) probes are cheap and bounded. Only the
             # deadline confirmation needs the process table, and it must happen
             # once so a stubborn group cannot turn a one-second grace into a
             # 20 Hz ps storm.
-            _termination_targets_live(pid=worker_pid, pgid=target)
+            if _termination_targets_live(pid=worker_pid, pgid=target):
+                actions.append("stubborn")
+                log.warning(
+                    "process group pgid=%d survived SIGKILL grace; leaving it unreaped",
+                    target,
+                )
     return "+".join(actions) if actions else "noop"
 
 

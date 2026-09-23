@@ -414,12 +414,22 @@ def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
     original_alive = acp._pgid_alive
     original_targets_live = acp._termination_targets_live
     original_monotonic = acp.time.monotonic
+    original_sleep = acp.time.sleep
     try:
         acp.os.killpg = lambda pgid, sig: calls.append((pgid, sig))  # type: ignore[assignment]
         acp._pgid_alive = lambda pgid: True  # type: ignore[assignment]
-        acp._termination_targets_live = lambda **_kwargs: False  # type: ignore[assignment]
-        ticks = iter([100.0, 106.0])
-        acp.time.monotonic = lambda: next(ticks, 106.0)  # type: ignore[assignment]
+        acp._termination_targets_live = lambda **_kwargs: True  # type: ignore[assignment]
+        clock_calls = 0
+
+        def frozen_clock() -> float:
+            nonlocal clock_calls
+            clock_calls += 1
+            if clock_calls > acp._SHIM_REAP_MAX_POST_KILL_GRACE_POLLS + 3:
+                raise AssertionError("termination grace clock did not advance")
+            return 100.0 if clock_calls == 1 else 106.0
+
+        acp.time.monotonic = frozen_clock  # type: ignore[assignment]
+        acp.time.sleep = lambda _seconds: None  # type: ignore[assignment]
         expected = worker_identity(777)
         action = acp._terminate_quota_process_group(
             777,
@@ -431,7 +441,8 @@ def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
         acp._pgid_alive = original_alive  # type: ignore[assignment]
         acp._termination_targets_live = original_targets_live  # type: ignore[assignment]
         acp.time.monotonic = original_monotonic  # type: ignore[assignment]
-    assert_eq("quota reap escalation action", action, "SIGTERM+SIGKILL")
+        acp.time.sleep = original_sleep  # type: ignore[assignment]
+    assert_eq("quota reap escalation action", action, "SIGTERM+SIGKILL+stubborn")
     assert_eq("quota reap escalation signals", calls, [(777, signal.SIGTERM), (777, signal.SIGKILL)])
 
 
