@@ -94,8 +94,9 @@ Rules the loader enforces:
   **403**.
 - `project_root` is optional but must be absolute when set. The loader freezes
   the journal's canonical root (including linked and managed worktrees).
-  Requests are refused if that root changes after startup. A different
-  delivery project is **403**, including explicit controller, payload, and
+  Each request is refused if that root has changed since startup (checked
+  before the request runs; see Trust boundary below). A different delivery
+  project is **403**, including explicit controller, payload, and
   dispatch-ledger destinations. When omitted, `GOALFLIGHT_PROJECT_ROOT`, if
   set, supplies the same absolute pin.
 - **Without either root, a bearer can name any checkout on the journal host.**
@@ -123,6 +124,24 @@ Point each bot at the same URL and its own token:
 - `MAIL_RPC_TOKEN` — that user's token, stored as a Grok secret
 
 Clients do not learn about other users.
+
+### Trust boundary
+
+Project confinement protects against what a bearer can send in a request:
+labels, project roots, payload fields, and dispatch ids. It does not protect
+against someone who can change the journal host's filesystem.
+
+The daemon checks a user's pinned root before each request, and the CLI child
+then resolves that path again to open the journal. Someone who replaces a
+project directory with a symlink to another project in that window can make a
+relay read that other project's mailbox.
+
+Doing that already requires write access to the directories that hold the
+journals. With that access, the other journal can be read straight from disk.
+So the whole path is part of the trusted base: the users file, its containing
+directory, the project checkouts, and the goal-flight state directories. Run
+the daemon as the account that owns them, and do not give other local accounts
+write access to any of them.
 
 ## Provisioning
 
