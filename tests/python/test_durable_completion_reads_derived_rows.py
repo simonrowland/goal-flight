@@ -229,6 +229,51 @@ def _find_in(records):
     return find
 
 
+@pytest.mark.parametrize("shape", ["bash", "acp"])
+@pytest.mark.parametrize("state", ["running", "worker_dead"])
+@pytest.mark.parametrize("identity", [(True, "live"), (False, "identity_indeterminate")])
+def test_direct_resume_refuses_unproven_dead_parent_before_bind(
+    launch_authority, monkeypatch, capsys, shape, state, identity,
+):
+    args, store, row, records = launch_authority
+    row["id"] = "t-212"
+    args.task_ids = [row["id"]]
+    _open_the_task(store, row)
+    records.append(_dead_record(
+        args, "resume-parent", state=state, agent="claude", worker_pid=43210,
+        terminal_state="worker_dead" if state == "worker_dead" else "unknown",
+    ))
+    monkeypatch.setattr(D, "_find_dispatch_record", _find_in(records))
+    monkeypatch.setattr(D.goalflight_ledger, "read_records", lambda: records)
+    monkeypatch.setattr(D.goalflight_ledger, "identity_matches", lambda _: identity)
+    monkeypatch.setattr(D, "_stamp_controller_session", lambda *a: {})
+    monkeypatch.setattr(D, "_resolve_account_env", lambda *a: {})
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda *a: {})
+    monkeypatch.setattr(D, "_validate_claude_auth_before_attempt", lambda *a: None)
+    events = []
+
+    def unexpected_bind(*a):
+        events.append("bind")
+        pytest.fail("resume source was not validated before seat bind")
+
+    monkeypatch.setattr(D, "_bind_dispatch_worktree", unexpected_bind)
+    monkeypatch.setattr(D, "_run_acp_shape", lambda *a, **kw: events.append("launch"))
+    monkeypatch.chdir(args.project_root)
+
+    rc = D.main([
+        "--agent", "claude", "--shape", shape, "--unregistered-forced",
+        "--dispatch-id", "resume-child", "--task", row["id"],
+        "--parent-dispatch-id", "resume-parent",
+        "--engine-session-id", "12345678-1234-4abc-8def-1234567890ab",
+        "--cwd", args.project_root, "--prompt", "continue", "--launch-detached",
+    ])
+
+    assert rc == 64
+    assert events == []
+    error = capsys.readouterr().err
+    assert "still live" in error if identity[0] else "liveness is indeterminate" in error
+
+
 def test_resume_of_dead_parent_passes_its_own_hold(launch_authority, monkeypatch):
     """A resume is not blocked by the dead row it is continuing."""
     args, store, row, records = launch_authority

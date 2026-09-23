@@ -18501,6 +18501,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+            # Direct resume launches must validate before exempting lineage or
+            # binding a seat; claim-boundary validation remains under its lock.
+            if args.parent_dispatch_id:
+                _validate_resume_source(
+                    args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+                )
             # Before the seat bind. This gate reads the ledger and the task
             # store, not the seat, and a refusal must not become the occupant.
             _refuse_launch_blocked_by_completion_authority(args)
@@ -18600,6 +18606,11 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue,
         )
+        # Validate direct resumes before lineage exemption and seat mutation.
+        if args.parent_dispatch_id:
+            _validate_resume_source(
+                args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+            )
         # Before the seat bind. Occupancy-forced is a worktree hatch and does
         # not bypass this: a same-task sibling still refuses, and a refusal
         # must not rewrite the seat occupant.
