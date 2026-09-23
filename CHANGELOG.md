@@ -6,6 +6,8 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-09-23
+
 ### Added
 
 - Journal-host mail RPC (`scripts/goalflight_mail_rpc.py`) so a Grok Bot
@@ -20,10 +22,39 @@ incremented when meaningful skill behaviour changes.
   restart them). Opted-in old processes may log refused task-store mutations
   after the dashboard mirror is disabled; canonical task data remains intact. Old watchers that permit mirror repair can regenerate the full mirror
   until they finish or restart.
-- Worker dispatch now launches immediately and reports capacity refusal as
-  `blocked_capacity` / `DISPATCH-BLOCKED` with a nonzero exit. New durable-queue
-  producers and the bulk frontier dispatcher were removed; the drain consumer
-  remains available to finish the pre-existing backlog.
+
+### Fixed
+
+- Wake-pool contention loop: unreadable follow/journal state is no longer
+  treated as `listener-dead` with `backup_required` / `rearm_command`.
+  `--listener-slots` is a live-depth ceiling again; extras that would
+  exceed the cap fail closed as contention protection, not a ring.
+  `supervise` still only respawns its configured slots (it does not
+  mint extra backups from a `listener-dead` passthrough). Before acting
+  on `listener-dead`, positive control is `relay --new`.
+
+### Changed
+- Listener polling no longer busy-loops or writes to the journal on every poll.
+- Each listener keeps one long-lived journal connection and uses cached integrity validation during polling.
+- Task-store saves clone snapshots and skips unchanged rewrites; dashboard mirror export is disabled by default.
+- Capacity reservations release at terminal transitions; owners can release their own reservations, and local reservations tolerate host-name changes.
+- Server logs rotate with bounded per-port files.
+- Admission checks capacity before worktree ownership; queued rows never own worktrees.
+- Watcher polling uses read-only checks and native liveness; it no longer rewrites state or spawns processes per poll.
+
+### Fixed
+- Occupancy refusals exit with status 64.
+- The capacity lock is re-entrant per thread, preventing self-deadlock in nested lock use.
+
+### Deferred
+
+- Dispatch-artifact retention is deferred until the worktree GC design covers
+  dry-run, re-verification, and resume-aware cleanup together.
+
+## [1.7.0] - 2026-09-13
+
+### Changed
+
 - Default `goalflight_messages.py supervise` stdout is terse and Monitor-safe.
   Do not grep the feed. Quiet generations emit one owned
   stream/backup/watchdog arm line, then only actionable wakes (new
@@ -64,13 +95,6 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
-- Wake-pool contention loop: unreadable follow/journal state is no longer
-  treated as `listener-dead` with `backup_required` / `rearm_command`.
-  `--listener-slots` is a live-depth ceiling again; extras that would
-  exceed the cap fail closed as contention protection, not a ring.
-  `supervise` still only respawns its configured slots (it does not
-  mint extra backups from a `listener-dead` passthrough). Before acting
-  on `listener-dead`, positive control is `relay --new`.
 - `goalflight_dispatch.py resume` reattaches to the existing worktree instead
   of acquiring a sibling pooled seat, so quota-exhausted / dead / plan-approval
   pauses continue in place. `--account` is honored; default seat order skips
@@ -82,12 +106,6 @@ incremented when meaningful skill behaviour changes.
   the worker in `sandbox-exec`. cursor-cli has no read-only primitive; the
   runner does not pass a refused cursor sandbox flag. Moonshot (`--agent
   moonshot`) is unchanged. Linux/other hosts still refuse the flag.
-- `supervise` backlog cap keys on envelope identity, not raw line count.
-  Duplicate copies of one cursor snapshot still collapse as `cursor-lag` /
-  `child-backlog`. Distinct envelopes (new cursor versions, unique headlines,
-  a later `kind=ring`) still forward past eight copies. Distinct volume itself
-  is bounded as `distinct-withheld`, which names how many new envelopes were
-  held and that `relay --drain` retrieves them.
 
 ### Added
 
@@ -136,6 +154,32 @@ incremented when meaningful skill behaviour changes.
   another session to check mail. No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
+- `goalflight_messages.py post` accepts `--text-file PATH` (`-` / `/dev/stdin`
+  for a heredoc) so mail bodies with quotes, backticks, or `$()` never pass
+  through argv. `--text` remains for short strings. `--type` help lists the
+  working set only; `advisory` and junk-drawer aliases bounce with
+  `controller-notice --to-controller LABEL`.
+
+## [1.6.0] - 2026-08-31
+
+### Changed
+
+- Worker dispatch now launches immediately and reports capacity refusal as
+  `blocked_capacity` / `DISPATCH-BLOCKED` with a nonzero exit. New durable-queue
+  producers and the bulk frontier dispatcher were removed; the drain consumer
+  remains available to finish the pre-existing backlog.
+
+### Fixed
+
+- `supervise` backlog cap keys on envelope identity, not raw line count.
+  Duplicate copies of one cursor snapshot still collapse as `cursor-lag` /
+  `child-backlog`. Distinct envelopes (new cursor versions, unique headlines,
+  a later `kind=ring`) still forward past eight copies. Distinct volume itself
+  is bounded as `distinct-withheld`, which names how many new envelopes were
+  held and that `relay --drain` retrieves them.
+
+### Added
+
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
   idle longer than a data-derived probation (1080s, above p99=965.7s of
@@ -179,11 +223,6 @@ incremented when meaningful skill behaviour changes.
 - `goalflight_dispatch.py drain --dispatch-id <id>` (repeatable) launches only
   the named queued envelope(s). A controller can drain its own work without
   walking the shared cross-project queue.
-- `goalflight_messages.py post` accepts `--text-file PATH` (`-` / `/dev/stdin`
-  for a heredoc) so mail bodies with quotes, backticks, or `$()` never pass
-  through argv. `--text` remains for short strings. `--type` help lists the
-  working set only; `advisory` and junk-drawer aliases bounce with
-  `controller-notice --to-controller LABEL`.
 
 ### Changed
 
@@ -462,6 +501,7 @@ incremented when meaningful skill behaviour changes.
   safety flag does not.
 - `--os-sandbox` help names ACP honouring as a refusal axis, not
   bash-codex-only.
+
 ### Added
 
 - **Watch-layer `worker_stalled_candidate` detector for an alive-but-stuck
@@ -489,10 +529,6 @@ incremented when meaningful skill behaviour changes.
   candidate announcement persist in the status sidecar so a watcher
   restart does not reset the window or re-announce.
 
-### Deferred
-
-- Dispatch-artifact retention is deferred until the worktree GC design covers
-  dry-run, re-verification, and resume-aware cleanup together.
 
 ## [1.5.1] - 2026-08-23
 

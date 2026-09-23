@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.6.0
+version: 1.7.1
 description: "Use when the user invokes /goal-flight or asks for Goal Flight to plan, dispatch, review, recover, or resume a long-running orchestrated repository run from file-backed state."
 when_to_use: "User invoked /goal-flight, or asked to start, resume, or recover a Goal Flight orchestrated run. Not for generic coding or one-off edits."
 disable-model-invocation: true
