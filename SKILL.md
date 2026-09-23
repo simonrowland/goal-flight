@@ -242,8 +242,9 @@ per-dispatch homes), using `--model` or the configured/catalog default.
 Missing, unreadable, or unmatched cache entries fall back to `low`, `medium`,
 `high`, `xhigh`; refusals name this fallback and list supported levels.
 The flag is preserve-class, so a resumed dispatch keeps its requested level.
-Codex accepts this flag only on the bash route; `--shape acp` and
-`--interactive` refuse it rather than silently dropping the setting.
+The flag needs `--agent codex` on the bash route with no raw `--` command;
+every other agent, shape, `--interactive`, or raw command refuses it rather
+than silently dropping the setting.
 
 ## Hard Invariants
 
