@@ -44,6 +44,7 @@ def _claim(project: Path, label: str) -> None:
 def mail_server(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", LABEL)
+    monkeypatch.delenv(rpc.USERS_FILE_ENV, raising=False)
     monkeypatch.delenv(rpc.BIND_ENV, raising=False)
     monkeypatch.delenv(rpc.ALLOW_PUBLIC_BIND_ENV, raising=False)
     config = rpc.load_config()
@@ -63,6 +64,7 @@ def mail_server(monkeypatch: pytest.MonkeyPatch):
 
 def test_default_bind_and_public_bind_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    monkeypatch.delenv(rpc.USERS_FILE_ENV, raising=False)
     monkeypatch.delenv(rpc.BIND_ENV, raising=False)
     monkeypatch.delenv(rpc.ALLOW_PUBLIC_BIND_ENV, raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
@@ -191,6 +193,438 @@ def test_drain_other_controller_forbidden(mail_server: str, tmp_path: Path) -> N
     assert denied["error"] == "forbidden"
     assert "different controller" in str(denied.get("detail") or "")
     assert "items" not in denied
+
+
+TOKEN_A = "mail-rpc-user-a-token-0123456789abcdef"
+TOKEN_B = "mail-rpc-user-b-token-0123456789abcdef"
+LEGACY_TOKEN = "mail-rpc-legacy-token-0123456789abcd"
+
+
+def _users_file(tmp_path: Path, users: list[dict[str, str]]) -> Path:
+    path = tmp_path / "mail-rpc.users.json"
+    path.write_text(json.dumps({"users": users}), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def _clear_daemon_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    missing = tmp_path / "no-default-users.json"
+    monkeypatch.delenv(rpc.TOKEN_ENV, raising=False)
+    monkeypatch.delenv(rpc.USERS_FILE_ENV, raising=False)
+    monkeypatch.delenv(rpc.BIND_ENV, raising=False)
+    monkeypatch.delenv(rpc.ALLOW_PUBLIC_BIND_ENV, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_PROJECT_ROOT", raising=False)
+    monkeypatch.setattr(rpc, "default_users_file", lambda: missing)
+
+
+def _serve(config: rpc.MailRpcConfig):
+    server = rpc.MailRpcServer(("127.0.0.1", 0), config)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    return server, thread, f"http://{host}:{port}"
+
+
+def _stop(server: rpc.MailRpcServer, thread: threading.Thread) -> None:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
+def test_users_file_confines_each_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _project(tmp_path)
+    other_root = tmp_path / "other-checkout"
+    other_root.mkdir()
+    _claim(project, LABEL)
+    _claim(project, OTHER)
+    users = _users_file(
+        tmp_path,
+        [
+            {
+                "token": TOKEN_A,
+                "controller_label": LABEL,
+                "project_root": str(project),
+            },
+            {
+                "token": TOKEN_B,
+                "controller_label": OTHER,
+                "project_root": str(project),
+            },
+        ],
+    )
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    # A leftover single-token pin must not apply to every user, and must not
+    # be accepted as a bearer once the users file is selected.
+    monkeypatch.setenv(rpc.TOKEN_ENV, LEGACY_TOKEN)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "not a valid label")
+    config = rpc.load_config()
+    assert config.users_from_file is True
+    assert [user.controller_label for user in config.users] == [LABEL, OTHER]
+    assert LEGACY_TOKEN not in repr(config)
+    assert TOKEN_A not in repr(config)
+    server, thread, url = _serve(config)
+    monkeypatch.setenv("GOALFLIGHT_MAIL_RPC_URL", url)
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
+    try:
+        status, health = rpc.client_call("/v1/health", method="GET")
+        assert status == 200
+        assert health == {"ok": True, "service": rpc.SERVICE_NAME}
+        assert "users" not in health
+
+        monkeypatch.setenv(rpc.TOKEN_ENV, LEGACY_TOKEN)
+        status, legacy = rpc.client_call("/v1/relay", {}, label="")
+        assert status == 401
+        assert legacy.get("error") == "unauthorized"
+        assert "detail" not in legacy
+
+        monkeypatch.setenv(rpc.TOKEN_ENV, "wrong-token-value-0123456789")
+        status, denied = rpc.client_call("/v1/post", {"type": "controller-notice"}, label="")
+        assert status == 401
+        assert denied.get("error") == "unauthorized"
+        assert TOKEN_A not in json.dumps(denied)
+        assert TOKEN_B not in json.dumps(denied)
+
+        monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN_A)
+        status, posted = rpc.client_call(
+            "/v1/post",
+            {
+                "dispatch_id": "mail-rpc-a",
+                "type": "controller-notice",
+                "to_controller": LABEL,
+                "text": "for label a",
+                "project_root": str(project),
+                "controller_project_root": str(project),
+            },
+            label="",
+        )
+        assert status == 200, posted
+
+        status, forged = rpc.client_call(
+            "/v1/post",
+            {
+                "dispatch_id": "mail-rpc-forged",
+                "type": "controller-notice",
+                "to_controller": OTHER,
+                "text": "not from a",
+                "project_root": str(project),
+                "controller_label": OTHER,
+            },
+            label="",
+        )
+        assert status == 403, forged
+        assert "items" not in forged
+
+        status, other_checkout = rpc.client_call(
+            "/v1/post",
+            {
+                "dispatch_id": "mail-rpc-other-root",
+                "type": "controller-notice",
+                "to_controller": OTHER,
+                "text": "wrong checkout",
+                "project_root": str(project),
+                "controller_project_root": str(other_root),
+            },
+            label="",
+        )
+        assert status == 403, other_checkout
+        assert "different checkout" in str(other_checkout.get("detail") or "")
+
+        status, crossed = rpc.client_call(
+            "/v1/relay",
+            {"project_root": str(project), "controller_label": OTHER},
+            label=OTHER,
+        )
+        assert status == 403, crossed
+        assert crossed["error"] == "forbidden"
+        assert "different controller" in str(crossed.get("detail") or "")
+        assert "items" not in crossed
+
+        status, wrong_root = rpc.client_call(
+            "/v1/relay",
+            {"project_root": str(other_root)},
+            label="",
+        )
+        assert status == 403, wrong_root
+        assert "different checkout" in str(wrong_root.get("detail") or "")
+
+        monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN_B)
+        status, peeked = rpc.client_call(
+            "/v1/relay",
+            {"project_root": str(project)},
+            label="",
+        )
+        assert status == 200, peeked
+        assert peeked["result"]["items"] == []
+
+        monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN_A)
+        status, own = rpc.client_call(
+            "/v1/relay",
+            {"project_root": str(project)},
+            label=LABEL,
+        )
+        assert status == 200, own
+        assert any(item.get("dispatch_id") == "mail-rpc-a" for item in own["result"]["items"])
+    finally:
+        _stop(server, thread)
+
+
+def test_legacy_token_ignores_default_users_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _project(tmp_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    users = _users_file(
+        tmp_path,
+        [{"token": TOKEN_A, "controller_label": OTHER, "project_root": str(other)}],
+    )
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(rpc, "default_users_file", lambda: users)
+    monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", LABEL)
+    monkeypatch.setenv("GOALFLIGHT_PROJECT_ROOT", str(project))
+    config = rpc.load_config()
+    assert config.users_from_file is False
+    assert len(config.users) == 1
+    assert config.users[0].controller_label == LABEL
+    assert config.users[0].pin_project_root is False
+    assert rpc.token_matches(f"Bearer {TOKEN}", TOKEN)
+    assert rpc.authenticate(f"Bearer {TOKEN}", config).controller_label == LABEL
+    with pytest.raises(rpc.Unauthorized):
+        rpc.authenticate(f"Bearer {TOKEN_A}", config)
+    # Request path still wins in single-token mode.
+    assert rpc.resolve_project_root(str(other), config, config.users[0]) == other
+    assert rpc.resolve_project_root(None, config, config.users[0]) == project
+
+
+def test_default_users_file_when_token_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _project(tmp_path)
+    global_root = tmp_path / "global-checkout"
+    global_root.mkdir()
+    users = _users_file(
+        tmp_path,
+        [
+            {"token": TOKEN_A, "controller_label": LABEL, "project_root": str(project)},
+            {"token": TOKEN_B, "controller_label": OTHER},
+        ],
+    )
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(rpc, "default_users_file", lambda: users)
+    monkeypatch.setenv("GOALFLIGHT_PROJECT_ROOT", str(global_root))
+    config = rpc.load_config()
+    assert config.users_from_file is True
+    pinned, fallback = config.users
+    assert pinned.project_root == str(project)
+    assert pinned.pin_project_root is True
+    assert fallback.project_root == ""
+    assert fallback.pin_project_root is True
+    assert rpc.resolve_project_root(None, config, pinned) == project.resolve()
+    assert rpc.resolve_project_root(str(project), config, pinned) == project.resolve()
+    with pytest.raises(rpc.Forbidden, match="different checkout"):
+        rpc.resolve_project_root(str(global_root), config, pinned)
+    with pytest.raises(rpc.Forbidden, match="different checkout"):
+        rpc.resolve_project_root(str(tmp_path / "missing-checkout"), config, pinned)
+    assert rpc.resolve_project_root(None, config, fallback) == global_root.resolve()
+    with pytest.raises(rpc.Forbidden, match="different checkout"):
+        rpc.resolve_project_root(str(project), config, fallback)
+
+
+def test_users_file_rejects_bad_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_daemon_env(monkeypatch, tmp_path)
+    cases: list[tuple[object, str]] = [
+        ({"users": []}, "non-empty"),
+        ({"users": [{"token": "short", "controller_label": LABEL}]}, "at least"),
+        ({"users": [{"token": TOKEN_A}]}, "controller_label is required"),
+        (
+            {"users": [{"token": TOKEN_A, "controller_label": "bad label"}]},
+            "bounded identity",
+        ),
+        (
+            {
+                "users": [
+                    {"token": TOKEN_A, "controller_label": LABEL},
+                    {"token": TOKEN_A, "controller_label": OTHER},
+                ]
+            },
+            "duplicates",
+        ),
+        (
+            {"users": [{"token": TOKEN_A, "controller_label": LABEL, "extra": "no"}]},
+            "unknown keys",
+        ),
+        ([], "users array"),
+    ]
+    for payload, match in cases:
+        path = tmp_path / "users.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        path.chmod(0o600)
+        monkeypatch.setenv(rpc.USERS_FILE_ENV, str(path))
+        with pytest.raises(rpc.MailRpcError, match=match) as caught:
+            rpc.load_config()
+        assert TOKEN_A not in str(caught.value)
+
+    loose = _users_file(
+        tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}]
+    )
+    loose.chmod(0o644)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(loose))
+    with pytest.raises(rpc.MailRpcError, match="chmod 600"):
+        rpc.load_config()
+
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(tmp_path / "missing-users.json"))
+    with pytest.raises(rpc.MailRpcError, match="not a file"):
+        rpc.load_config()
+
+
+def test_file_user_without_roots_still_accepts_the_request_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _project(tmp_path)
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    config = rpc.load_config()
+    user = config.users[0]
+    assert user.pin_project_root is False
+    assert rpc.resolve_project_root(str(project), config, user) == project
+    assert rpc.resolve_project_root(str(other), config, user) == other
+
+
+def test_legacy_load_config_without_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    config = rpc.load_config()
+    assert config.users_from_file is False
+    assert config.users[0].controller_label == ""
+    assert rpc.resolve_identity(config.users[0], header_label=LABEL) == LABEL
+
+
+def test_pinned_relative_project_root_stays_the_authorized_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkout = tmp_path / "proj"
+    nested = checkout / "proj"
+    checkout.mkdir()
+    nested.mkdir()
+    monkeypatch.chdir(tmp_path)
+    user = rpc.MailRpcUser(
+        token_digest=b"\x02" * 32,
+        controller_label=LABEL,
+        project_root="proj",
+        pin_project_root=True,
+    )
+    config = rpc.MailRpcConfig(
+        users=(user,),
+        bind_host="127.0.0.1",
+        bind_port=8787,
+        project_root="",
+        users_from_file=True,
+    )
+    found = rpc.resolve_project_root(None, config, user)
+    assert found == checkout.resolve()
+    assert found.is_absolute()
+
+
+def test_relative_controller_project_root_stays_on_the_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkout = tmp_path / "proj-a"
+    nested = checkout / "proj-a"
+    checkout.mkdir()
+    nested.mkdir()
+    _claim(checkout, LABEL)
+    monkeypatch.chdir(tmp_path)
+    users = _users_file(
+        tmp_path,
+        [
+            {
+                "token": TOKEN_A,
+                "controller_label": LABEL,
+                "project_root": str(checkout),
+            }
+        ],
+    )
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    config = rpc.load_config()
+    server, thread, url = _serve(config)
+    monkeypatch.setenv("GOALFLIGHT_MAIL_RPC_URL", url)
+    monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN_A)
+    try:
+        status, posted = rpc.client_call(
+            "/v1/post",
+            {
+                "dispatch_id": "mail-rpc-rel",
+                "type": "controller-notice",
+                "to_controller": LABEL,
+                "text": "stay on the pin",
+                "controller_project_root": "proj-a",
+            },
+            label="",
+        )
+        assert status == 200, posted
+        status, peeked = rpc.client_call(
+            "/v1/relay",
+            {"project_root": str(checkout)},
+            label="",
+        )
+        assert status == 200, peeked
+        assert any(
+            item.get("dispatch_id") == "mail-rpc-rel" for item in peeked["result"]["items"]
+        )
+        code, stdout, stderr = rpc.run_messages(
+            [
+                "relay",
+                "--json",
+                "--new",
+                "--project-root",
+                str(nested),
+                "--controller-label",
+                LABEL,
+            ],
+            identity=LABEL,
+            cwd=nested,
+            timeout_s=30,
+        )
+        assert "mail-rpc-rel" not in stdout
+        assert "mail-rpc-rel" not in stderr
+        if code == 0:
+            assert json.loads(stdout).get("items") == []
+    finally:
+        _stop(server, thread)
+
+
+def test_legacy_unpinned_label_still_comes_from_the_request() -> None:
+    user = rpc.MailRpcUser(
+        token_digest=b"\x00" * 32,
+        controller_label="",
+        project_root="",
+        pin_project_root=False,
+    )
+    assert rpc.resolve_identity(user, header_label=LABEL) == LABEL
+    with pytest.raises(rpc.MailRpcError, match="controller label required"):
+        rpc.resolve_identity(user, header_label=None)
+    pinned = rpc.MailRpcUser(
+        token_digest=b"\x01" * 32,
+        controller_label=LABEL,
+        project_root="",
+        pin_project_root=False,
+    )
+    assert rpc.resolve_identity(pinned, header_label=None) == LABEL
+    with pytest.raises(rpc.Forbidden, match="different controller"):
+        rpc.resolve_identity(pinned, header_label=OTHER)
 
 
 def _request_without_auth(path: str, body: dict[str, object]) -> tuple[int, dict[str, object]]:

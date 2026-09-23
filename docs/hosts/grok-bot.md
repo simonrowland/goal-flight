@@ -391,9 +391,12 @@ nudge: it does not carry mail bodies.
 
 Provisioning (generate the token on the journal host, run the daemon, set
 Grok secret-request env `MAIL_RPC_URL` / `MAIL_RPC_TOKEN`) is
-[mail-rpc.md](mail-rpc.md). Startup prompts name those env vars and
+[mail-rpc.md](mail-rpc.md). Several bots share one daemon and one bind:
+each token in the users file is pinned to one controller label. A second
+port per bot is not required. Startup prompts name those env vars and
 `docs/hosts/mail-rpc.md` only. Never paste token values into chat.
-Template: `configs/grok-bot/mail-rpc.env.example`.
+Templates: `configs/grok-bot/mail-rpc.env.example`,
+`configs/grok-bot/mail-rpc.users.json.example`.
 
 ## Optional outbound wake webhook
 

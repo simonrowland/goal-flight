@@ -13,6 +13,11 @@ incremented when meaningful skill behaviour changes.
   over Tailscale or loopback. Bearer auth, default bind `127.0.0.1:8787`,
   public `0.0.0.0` / `::` refused without an explicit opt-in. Wake webhooks
   stay nudge-only. See `docs/hosts/mail-rpc.md`.
+- Mail RPC users file so several controllers share one daemon and one bind.
+  Each bearer is pinned to one `controller_label` and an optional
+  `project_root`. `GOALFLIGHT_MAIL_RPC_USERS_FILE` wins over the legacy
+  single token; with that variable unset, `GOALFLIGHT_MAIL_RPC_TOKEN` behaves
+  as before. See `docs/hosts/mail-rpc.md`.
 
 ### Changed
 
