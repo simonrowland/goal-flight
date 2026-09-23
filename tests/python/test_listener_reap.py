@@ -150,6 +150,35 @@ def test_nonzero_process_listing_refuses_even_with_matching_stdout(monkeypatch) 
     assert out["detail"]["known"] is False, out
 
 
+def test_truncated_listener_argv_refuses_the_entire_scan(monkeypatch) -> None:
+    """A clipped nonce must not leave other listeners actionable."""
+    listing = (
+        "  101 python3 /s/goalflight_messages.py listen "
+        "--project-root /repos/mine --lease-nonce\n"
+        "  102 python3 /s/goalflight_messages.py listen "
+        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, *args, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=listing, stderr="")
+
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
+    monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: {LIVE})
+    monkeypatch.setattr(R, "_liveness", lambda _pids: {})
+    killed: list[int] = []
+    monkeypatch.setattr(R.os, "kill", lambda pid, sig: killed.append(pid))
+
+    assert R.listener_processes_by_nonce(Path("/repos/mine")) is None
+    out = R.reap_orphaned_listeners(Path("/repos/mine"))
+
+    assert calls[0][1] == "-axww", calls
+    assert killed == [] and out["reaped"] == 0, out
+    assert out["detail"]["known"] is False, out
+
+
 def test_own_pid_is_protected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         R, "listener_processes_by_nonce", _fake_ps({DEAD: [os.getpid()]})
@@ -244,7 +273,6 @@ def test_listeners_of_other_projects_are_never_enumerated(monkeypatch) -> None:
     listing = (
         "  101 python3 /s/goalflight_messages.py supervise --project-root /repos/mine  --lease-nonce " + DEAD + "\n"
         "  102 python3 /s/goalflight_messages.py listen    --project-root /repos/other --lease-nonce " + DEAD + "\n"
-        "  103 python3 /s/goalflight_messages.py listen    --lease-nonce " + DEAD + "\n"
     )
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()

@@ -21,6 +21,7 @@ generation for a dead one. Everything below is shaped so that a question we
 cannot answer yields `known=False` and the caller kills nothing:
 
 * the process table cannot be read      -> unknown, refuse
+* a listener's lease nonce cannot be read in full -> unknown, refuse
 * the lease records cannot be read      -> unknown, refuse
   (this one matters most: an empty "known nonces" set would make EVERY
   listener look orphaned, so a journal that is merely busy would otherwise
@@ -71,7 +72,8 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
     decide the verdict, or the predicate is answering a different question than
     the one asked.
 
-    None means "we could not look" and must never be read as "none found".
+    None means "we could not look, or a listener argv was incomplete" and must
+    never be read as "none found".
     """
     try:
         wanted = Path(project_root).expanduser().resolve(strict=False)
@@ -79,7 +81,7 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
         return None
     try:
         result = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,args="],
+            ["ps", "-axww", "-o", "pid=,args="],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
@@ -87,7 +89,9 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
         if getattr(result, "returncode", 0) != 0:
             return None
         listing = result.stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    if not isinstance(listing, str):
         return None
 
     found: dict[str, list[dict[str, object]]] = {}
@@ -98,22 +102,25 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
         classification, fields = goalflight_wake._probe_messages_argv(
             rest, commands=_LISTENER_COMMANDS
         )
+        if classification == goalflight_wake._SUPERVISE_ARGV_UNKNOWN:
+            return None
         if classification != goalflight_wake._SUPERVISE_ARGV_MATCH or fields is None:
             continue
         # Same-project only. A listener that does not say which project it
-        # serves cannot be attributed, so it is never reapable.
+        # serves cannot be attributed, so the process table is not trustworthy.
         root = fields.get("project_root")
         if not root:
-            continue
+            return None
         try:
             if Path(root).expanduser().resolve(strict=False) != wanted:
                 continue
         except OSError:
-            continue
+            return None
         nonce = fields.get("lease_nonce")
         if not nonce:
-            # Unattributable: it may belong to a live generation. Never reapable.
-            continue
+            # A truncated or unreadable nonce may belong to a live generation.
+            # Do not let any other listener become reapable from this scan.
+            return None
         identity = goalflight_compat.process_start_identity(int(head))
         if not isinstance(identity, dict) or not identity.get("start_token"):
             # PID/argv alone is not ownership. A failed or incomplete identity
