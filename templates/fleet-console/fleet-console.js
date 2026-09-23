@@ -895,9 +895,67 @@
     );
   }
 
+  // v2 history is an append-only log: one GF_HISTORY_ROWS.push({...}); line per
+  // row, written without rewriting the file (the v1 single object was rewritten
+  // in full on every terminal dispatch). The grouped, newest-first view is built
+  // here, matching _assemble in goalflight_fleet_console_history.py: first row
+  // per (project, dispatch) wins, and a torn or damaged line is skipped.
+  var HISTORY_LOG_MARK = "// goalflight.fleet-console.history-log.v2";
+  var HISTORY_ROW_PREFIX = "GF_HISTORY_ROWS.push(";
+
+  function compareHistoryNewestFirst(a, b) {
+    var x = String(a.ended_at || a.started_at || "");
+    var y = String(b.ended_at || b.started_at || "");
+    if (x !== y) return x < y ? 1 : -1;
+    var p = String(a.dispatch_id || "");
+    var q = String(b.dispatch_id || "");
+    if (p !== q) return p < q ? 1 : -1;
+    return 0;
+  }
+
+  function assembleHistoryLog(source) {
+    var projects = Object.create(null);
+    var seen = Object.create(null);
+    var updatedAt = null;
+    source.split("\n").forEach(function (line) {
+      if (line.indexOf(HISTORY_ROW_PREFIX) !== 0 || line.slice(-2) !== ");") return;
+      var record;
+      try {
+        record = JSON.parse(line.slice(HISTORY_ROW_PREFIX.length, -2));
+      } catch (error) {
+        return;
+      }
+      if (!record || typeof record.project_id !== "string" || !record.row ||
+          typeof record.row.dispatch_id !== "string") return;
+      var key = JSON.stringify([record.project_id, record.row.dispatch_id]);
+      if (seen[key]) return;
+      seen[key] = true;
+      var project = projects[record.project_id];
+      if (!project) {
+        project = projects[record.project_id] = {
+          project_id: record.project_id, name: record.name || "project", workers: []
+        };
+      }
+      project.workers.push(record.row);
+      if (typeof record.recorded_at === "string" &&
+          (updatedAt === null || record.recorded_at > updatedAt)) updatedAt = record.recorded_at;
+    });
+    return {
+      schema: "goalflight.fleet-console.history.v1",
+      updated_at: updatedAt,
+      projects: Object.keys(projects).sort().map(function (id) {
+        projects[id].workers.sort(compareHistoryNewestFirst);
+        return projects[id];
+      })
+    };
+  }
+
   function parseHistoryScript(text) {
+    var raw = String(text || "");
+    var mark = raw.indexOf(HISTORY_LOG_MARK);
+    if (mark >= 0 && mark < 200) return assembleHistoryLog(raw);
     var prefix = "window.GF_HISTORY = ";
-    var source = String(text || "").trim();
+    var source = raw.trim();
     var start = source.indexOf(prefix);
     if (start < 0 || source.charAt(source.length - 1) !== ";") throw new Error("history schema wrapper missing");
     var payload = JSON.parse(source.slice(start + prefix.length, -1));
@@ -1933,6 +1991,7 @@
   }
 
   window.GFFleetConsole = {
+    parseHistoryScript: parseHistoryScript,
     ageBucket: ageFrom,
     freshnessLimitMs: freshnessLimitMs,
     planeState: planeState,

@@ -2792,6 +2792,201 @@ def test_history_catch_up_publishes_missed_terminals_in_one_batch() -> None:
     )
 
 
+def _append_history_record(index: int, project_root: Path) -> dict:
+    return {
+        "dispatch_id": f"append-{index}",
+        "project_root": str(project_root),
+        "agent": "codex",
+        "state": "complete",
+        "terminal_state": "complete",
+        "ended_at": f"2026-09-22T20:{index:02d}:00+00:00",
+    }
+
+
+def test_history_projection_appends_without_rewriting_prior_rows() -> None:
+    """A terminal dispatch appends its row; it must not rewrite the file.
+
+    The v1 format re-read, re-sorted and rewrote the whole history on every
+    terminal dispatch: 54 MB per event on the owner's laptop, a sustained
+    ~2.5 MB/s of disk writes (b-379). Rows never change once recorded, so a new
+    row must leave every earlier byte where it was, in the same file.
+    """
+    history_module = F.goalflight_fleet_console_history
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "console"
+        project = root / "project"
+        history_module.catch_up(
+            [_append_history_record(index, project) for index in range(5)],
+            output_dir=output_dir,
+        )
+        target = output_dir / "history-data.js"
+        before = target.read_bytes()
+        inode_before = target.stat().st_ino
+        with mock.patch.object(
+            history_module,
+            "_publish",
+            side_effect=AssertionError("whole-file rewrite on a terminal event"),
+        ):
+            appended = history_module.project_terminal(
+                _append_history_record(7, project), output_dir=output_dir
+            )
+        after = target.read_bytes()
+        inode_after = target.stat().st_ino
+        payload = history_module._read_payload(target)
+    ids = [row["dispatch_id"] for row in payload["projects"][0]["workers"]]
+    assert_true("new terminal row is projected", appended is True)
+    assert_true(
+        "earlier bytes are untouched (pure append)",
+        after.startswith(before) and len(after) > len(before),
+    )
+    assert_true("file is appended in place, not replaced", inode_after == inode_before)
+    assert_true("assembled view holds every row", len(ids) == 6 and "append-7" in ids)
+    assert_true("assembled view stays newest-first", ids[0] == "append-7")
+
+
+def test_history_reprojection_appends_nothing() -> None:
+    """Catch-up re-offers every record hourly; already-recorded rows add no bytes."""
+    history_module = F.goalflight_fleet_console_history
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "console"
+        project = root / "project"
+        records = [_append_history_record(index, project) for index in range(4)]
+        history_module.catch_up(records, output_dir=output_dir)
+        target = output_dir / "history-data.js"
+        size_before = target.stat().st_size
+        again = history_module.catch_up(records, output_dir=output_dir)
+        single = history_module.project_terminal(records[2], output_dir=output_dir)
+        size_after = target.stat().st_size
+    assert_true("re-projected catch-up records nothing new", again["history"] == 0)
+    assert_true("re-projected single record is a no-op", single is False)
+    assert_true("no bytes appended for known rows", size_after == size_before)
+
+
+def test_history_torn_trailing_line_is_sealed_not_propagated() -> None:
+    """A crash mid-append leaves a partial last line; the next row must survive it."""
+    history_module = F.goalflight_fleet_console_history
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "console"
+        project = root / "project"
+        history_module.catch_up(
+            [_append_history_record(index, project) for index in range(3)],
+            output_dir=output_dir,
+        )
+        target = output_dir / "history-data.js"
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write('GF_HISTORY_ROWS.push({"project_id":"torn')  # no newline
+        history_module.project_terminal(
+            _append_history_record(9, project), output_dir=output_dir
+        )
+        payload = history_module._read_payload(target)
+    ids = sorted(row["dispatch_id"] for row in payload["projects"][0]["workers"])
+    assert_true(
+        "earlier rows and the new row survive a torn line",
+        ids == ["append-0", "append-1", "append-2", "append-9"],
+    )
+
+
+def test_history_v1_file_migrates_once_then_appends() -> None:
+    """An existing single-object history converts once, losing no rows."""
+    history_module = F.goalflight_fleet_console_history
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "console"
+        output_dir.mkdir()
+        project = root / "project"
+        pid = history_module.project_id(str(project))
+        legacy_rows = [
+            history_module.history_worker_row(_append_history_record(index, project))
+            for index in (1, 2)
+        ]
+        legacy = {
+            "schema": history_module.HISTORY_SCHEMA,
+            "updated_at": "2026-09-22T20:05:00+00:00",
+            "projects": [{"project_id": pid, "name": "project", "workers": legacy_rows}],
+        }
+        target = output_dir / "history-data.js"
+        target.write_text(
+            history_module._SCRIPT_PREFIX + json.dumps(legacy) + ";\n", encoding="utf-8"
+        )
+        history_module.project_terminal(
+            _append_history_record(3, project), output_dir=output_dir
+        )
+        migrated = target.read_bytes()
+        history_module.project_terminal(
+            _append_history_record(4, project), output_dir=output_dir
+        )
+        after = target.read_bytes()
+        payload = history_module._read_payload(target)
+    ids = sorted(row["dispatch_id"] for row in payload["projects"][0]["workers"])
+    assert_true(
+        "legacy rows and new rows all present",
+        ids == ["append-1", "append-2", "append-3", "append-4"],
+    )
+    assert_true("after migration, the next row is a pure append", after.startswith(migrated))
+
+
+def test_history_catch_up_repairs_an_index_that_runs_ahead_of_the_log() -> None:
+    """The index is only a cache of the log; catch-up must not trust a stale one.
+
+    If the index lists rows the log lacks (crash mid-migration, power loss with
+    neither file flushed, a restored log), trusting it would skip those rows
+    for good. Reproduced in review: log truncated to its header, index kept.
+    """
+    history_module = F.goalflight_fleet_console_history
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output_dir = root / "console"
+        project = root / "project"
+        records = [_append_history_record(index, project) for index in range(3)]
+        history_module.catch_up(records, output_dir=output_dir)
+        target = output_dir / "history-data.js"
+        target.write_text(history_module._LOG_HEADER, encoding="utf-8")  # rows lost
+        result = history_module.catch_up(records, output_dir=output_dir)
+        payload = history_module._read_payload(target)
+    ids = sorted(row["dispatch_id"] for row in payload["projects"][0]["workers"])
+    assert_true("catch-up re-appends rows the stale index claimed", result["history"] == 3)
+    assert_true("history is whole again", ids == ["append-0", "append-1", "append-2"])
+
+
+def test_history_reader_dedupes_splits_like_js_and_reports_updated_at() -> None:
+    """Python assembly must match the console's JS reader on the same bytes."""
+    history_module = F.goalflight_fleet_console_history
+    line = lambda pid, did, ended, recorded: history_module._record_line(  # noqa: E731
+        {
+            "project_id": pid,
+            "name": pid,
+            "recorded_at": recorded,
+            "row": {"dispatch_id": did, "ended_at": ended},
+        }
+    )
+    text = (
+        history_module._LOG_HEADER
+        + line("p", "older", "2030-01-01T00:01:00Z", "2030-01-01T00:00:01Z")
+        + line("p", "newer", "2030-01-01T00:05:00Z", "2030-01-01T00:00:02Z")
+        + line("p", "older", "2030-01-01T00:09:00Z", "2030-01-01T00:00:09Z")
+        # U+0085 inside a JSON string: str.splitlines() would break the line here.
+        + line("p\x85x", "nel", "2030-01-01T00:03:00Z", "2030-01-01T00:00:03Z")
+    )
+    view = history_module._assemble(history_module._log_records(text))
+    by_id = {project["project_id"]: project for project in view["projects"]}
+    assert_true(
+        "first row per dispatch wins, newest first",
+        [row["dispatch_id"] for row in by_id["p"]["workers"]] == ["newer", "older"]
+        and by_id["p"]["workers"][1]["ended_at"] == "2030-01-01T00:01:00Z",
+    )
+    assert_true("a row containing U+0085 is not split away", "p\x85x" in by_id)
+    # A dropped duplicate does not change the view, so it must not move
+    # updated_at either (the JS reader likewise skips seen keys first): the
+    # latest KEPT row is "nel" at ...03, not the discarded re-append at ...09.
+    assert_true(
+        "updated_at is the latest recorded_at among kept rows",
+        view["updated_at"] == "2030-01-01T00:00:03Z",
+    )
+
+
 def test_history_hooks_require_explicit_console_opt_in() -> None:
     history_module = F.goalflight_fleet_console_history
     with tempfile.TemporaryDirectory() as td:
