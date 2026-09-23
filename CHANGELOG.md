@@ -30,6 +30,8 @@ incremented when meaningful skill behaviour changes.
 - Server logs rotate with bounded per-port files.
 - Admission checks capacity before worktree ownership; queued rows never own worktrees.
 - Watcher polling uses read-only checks and native liveness; it no longer rewrites state or spawns processes per poll.
+- Capacity is enforced per provider account as well as per engine pool (codex 30 and grok 50 sessions per account by default; configurable in the machine-local capacity profile). Existing engine-wide reservations migrate to their accounts.
+- Dispatch-ledger status reads recent records and archives old ones instead of rereading full history; liveness probing is combined and retries back off.
 
 ### Fixed
 
