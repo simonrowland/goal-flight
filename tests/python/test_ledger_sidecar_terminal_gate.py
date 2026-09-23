@@ -332,6 +332,20 @@ def test_pending_sidecar_settles_only_after_worker_death(
     project.mkdir()
     dispatch_id = "pending-worker"
     worker = spawn_worker() if liveness != "unknown" or denied_probe else None
+    if worker and liveness == "live":
+        # Seed both the recorded and reconciled identities with deterministic
+        # process-table fields; the native start token still comes from the
+        # real child and protects the generation comparison.
+        stable_fields = {
+            "ppid": "1",
+            "pgid": str(worker.pid),
+            "lstart": "Wed Sep 23 12:34:56 2026",
+            "comm": "python3",
+            "args": "python3 -c import time; time.sleep(600)",
+        }
+        monkeypatch.setattr(
+            ledger, "_ps_identity", lambda _pid: (stable_fields, True)
+        )
     identity = ledger.process_identity(worker.pid) if worker else None
     if worker:
         assert identity, "precondition: live child has a process identity"
@@ -371,6 +385,7 @@ def test_pending_sidecar_settles_only_after_worker_death(
         assert worker is not None
         original_kill = os.kill
         original_check_output = subprocess.check_output
+        probe_calls: list[list[str]] = []
 
         def denied_kill(pid, sig):
             if pid == worker.pid and sig == 0:
@@ -378,7 +393,11 @@ def test_pending_sidecar_settles_only_after_worker_death(
             return original_kill(pid, sig)
 
         def denied_ps(command, *args, **kwargs):
-            if command[:3] == ["ps", "-p", str(worker.pid)]:
+            if (
+                command[:2] == ["ps", "-o"]
+                and command[-2:] == ["-p", str(worker.pid)]
+            ):
+                probe_calls.append(command)
                 if denied_probe == "ps_exit":
                     raise subprocess.CalledProcessError(
                         1, command, stderr="ps: Operation not permitted"
@@ -390,8 +409,9 @@ def test_pending_sidecar_settles_only_after_worker_death(
             monkeypatch.setattr(os, "kill", denied_kill)
         else:
             monkeypatch.setattr(subprocess, "check_output", denied_ps)
-
     reconciled = _reconcile(project)
+    if denied_probe and denied_probe != "kill" and not already_terminal:
+        assert probe_calls, "the combined ps probe must be forced through the stub"
     settled = json.loads(status_path.read_text())
     if liveness != "dead":
         assert settled == pending, "live/unknown worker must retain pending sidecar"

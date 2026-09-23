@@ -220,7 +220,10 @@ def _capped_backoff_s(initial_s: float, attempt: int, *, cap_s: float) -> float:
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
-    liveness = goalflight_compat.pid_liveness(pid)
+    try:
+        liveness = goalflight_compat.pid_liveness(pid)
+    except (OSError, subprocess.SubprocessError):
+        liveness = None
     if liveness is False:
         return None
     if liveness is None:
@@ -230,7 +233,13 @@ def process_identity(pid: int | None) -> dict | None:
             "identity_probe_error": True,
             "identity_source": "pid_probe_error",
         }
-    start_identity = goalflight_compat.process_start_identity(pid)
+    try:
+        start_identity = goalflight_compat.process_start_identity(pid)
+    except (OSError, subprocess.SubprocessError):
+        # A native start-token probe is evidence, not authority. If its
+        # platform probe is denied or fails, retain the combined ps probe and
+        # let identity comparison classify the missing token as UNKNOWN.
+        start_identity = None
     start_token = (
         start_identity.get("start_token") if isinstance(start_identity, dict) else None
     )
@@ -246,7 +255,10 @@ def process_identity(pid: int | None) -> dict | None:
         if start_token:
             ident["start_token"] = start_token
         return ident
-    liveness = goalflight_compat.pid_liveness(pid)
+    try:
+        liveness = goalflight_compat.pid_liveness(pid)
+    except (OSError, subprocess.SubprocessError):
+        liveness = None
     if liveness is False:
         return None
     if liveness is None:
