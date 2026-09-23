@@ -320,10 +320,6 @@ def decision_hint(
         return "done"
     if state == "missing":
         return "investigate"
-    if worker_live is None:
-        return "unknown"
-    if state == "wedged":
-        return "takeover"
     if state == "failed":
         if retry_policy:
             mode = retry_policy.get("mode")
@@ -338,6 +334,12 @@ def decision_hint(
         if retryable:
             return "cooldown_retry"
         return "investigate"
+    # A failed record keeps its retry hint (a launch-time quota wall leaves no
+    # pid). For everything else, unknown liveness must never become takeover.
+    if worker_live is None:
+        return "unknown"
+    if state == "wedged":
+        return "takeover"
     if not worker_live:
         return "takeover"
     if mins is not None and mins > 30:

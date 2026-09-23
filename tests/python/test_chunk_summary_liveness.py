@@ -156,6 +156,13 @@ def test_unknown_liveness_does_not_suggest_takeover() -> None:
         assert_eq(f"unknown {state} liveness hint", summary.decision_hint(state, None, 1), "unknown")
 
 
+def test_failed_record_without_pid_keeps_retry_hint() -> None:
+    """A launch-time quota wall leaves no pid; unknown liveness must not hide the retry."""
+    policy = {"mode": "retry_after_reset", "eligible": True}
+    assert_eq("failed + unknown keeps retry", summary.decision_hint("failed", None, 1, retry_policy=policy), "retry_now")
+    assert_eq("failed + unknown retryable", summary.decision_hint("failed", None, 1, retryable=True), "cooldown_retry")
+
+
 def test_confirmed_live_worker_with_scraped_complete_is_done() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-summary-live-marker-") as d:
         base = Path(d)
@@ -375,6 +382,8 @@ def main() -> None:
         test_dead_worker_complete_tail_reads_complete,
         test_recycled_pid_identity_mismatch_is_not_alive,
         test_missing_identity_does_not_claim_pid_ownership,
+        test_unknown_liveness_does_not_suggest_takeover,
+        test_failed_record_without_pid_keeps_retry_hint,
         test_confirmed_live_worker_with_scraped_complete_is_done,
         test_summary_agrees_with_status_tail_reconciled_complete,
     ]

@@ -279,8 +279,8 @@ def case_lstart_only_identity_is_unknown() -> None:
         "worker_pid": pid,
         "worker_identity": {"pid": pid, "lstart": current["lstart"]},
     }
-    assert goalflight_status.worker_process_identity_liveness(record) is None
     with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_status.worker_process_identity_liveness(record) is None
         assert goalflight_ledger.worker_identity_liveness(record) == (
             "unknown",
             "identity_indeterminate",

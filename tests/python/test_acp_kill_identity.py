@@ -27,25 +27,6 @@ import goalflight_acp_run  # noqa: E402
 import goalflight_capacity  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import acp_pool  # noqa: E402
-from goalflight_acp_client import _same_process  # noqa: E402
-
-
-def case_exec_comm_change_keeps_identity() -> None:
-    started = ("Wed May 20 17:55:24 2026", "bash")
-    live = ("Wed May 20 17:55:24 2026", "/Users/example/.local/bin/cursor-agent")
-    assert _same_process(started, live) is True
-
-
-def case_pid_reuse_lstart_change_is_different() -> None:
-    started = ("Wed May 20 17:55:24 2026", "cursor-agent")
-    live = ("Wed May 20 17:55:25 2026", "cursor-agent")
-    assert _same_process(started, live) is False
-
-
-def case_unavailable_meta_preserves_kill_fallthrough() -> None:
-    live = ("Wed May 20 17:55:24 2026", "cursor-agent")
-    assert _same_process(None, live) is True
-    assert _same_process(live, None) is True
 
 
 def case_windows_cleanup_preserves_legacy_pidfile_without_identity() -> None:
@@ -1324,9 +1305,6 @@ def case_atexit_pool_kill_requires_fine_identity() -> None:
 
 
 def main() -> None:
-    case_exec_comm_change_keeps_identity()
-    case_pid_reuse_lstart_change_is_different()
-    case_unavailable_meta_preserves_kill_fallthrough()
     case_windows_cleanup_preserves_legacy_pidfile_without_identity()
     case_windows_cleanup_skips_bare_pidfile_pid()
     case_windows_cleanup_does_not_kill_indeterminate_pid()

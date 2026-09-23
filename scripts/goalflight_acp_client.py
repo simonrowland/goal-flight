@@ -346,18 +346,6 @@ def _normalize_lstart(value: str) -> str:
     return " ".join(value.split())
 
 
-def _same_process(
-    started_meta: tuple[str, str] | None,
-    live_meta: tuple[str, str] | None,
-) -> bool:
-    """Return false only when a live process has a different start time."""
-    return (
-        started_meta is None
-        or live_meta is None
-        or _normalize_lstart(started_meta[0]) == _normalize_lstart(live_meta[0])
-    )
-
-
 def _identity_token(identity: dict[str, Any] | None) -> dict[str, Any] | None:
     if not identity:
         return None
