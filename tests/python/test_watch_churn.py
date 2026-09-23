@@ -188,6 +188,32 @@ def test_production_trace_resolution_has_no_quiet_subprocess_spawns(
         assert trace.sample(now_epoch=tick, now_mono=tick, idle_threshold=30) == {}
 
 
+def test_trace_resolution_retries_after_horizon_at_bounded_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    late_trace = tmp_path / "late.trace"
+    monkeypatch.setattr(
+        watch,
+        "_newest_trace_file",
+        lambda _root, _roots: late_trace if late_trace.exists() else None,
+    )
+    monkeypatch.setattr(watch, "_trace_from_lsof", lambda *_args, **_kwargs: None)
+    trace = watch.TraceLiveness(
+        dispatch_id="late-trace",
+        worker_pid=10,
+        effective_account="seat-a",
+        state_dir=tmp_path / "state",
+        home=tmp_path / "home",
+        started_mono=0,
+        retry_secs=300,
+    )
+    for tick in (0, 2, 6, 14, 30, 62, 122, 182, 242):
+        assert trace.sample(now_epoch=tick, now_mono=tick, idle_threshold=30) == {}
+    late_trace.write_text("trace", encoding="utf-8")
+    sample = trace.sample(now_epoch=302, now_mono=302, idle_threshold=30)
+    assert sample["trace_path"] == str(late_trace)
+
+
 def test_v17_status_sidecar_remains_a_compatible_change_view() -> None:
     # This is the status.json shape emitted by the v1.7.0 watcher: consumers
     # still receive the same compatibility fields while polling observations

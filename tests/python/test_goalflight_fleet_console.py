@@ -2538,6 +2538,8 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
                     "state": "running",
                     "heartbeat_at": "2030-01-01T00:00:10+00:00",
                     "worker_alive": True,
+                    "worker_pid": os.getpid(),
+                    "worker_identity": goalflight_ledger.process_identity(os.getpid()),
                 }
             ),
             encoding="utf-8",
@@ -2576,7 +2578,7 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
         heartbeat_row["is_terminal"] is True
         and heartbeat_row["display_state"] == "complete"
         and heartbeat_row["observed_live"] is True
-        and heartbeat_row["observed_live_source"] == "fresh_status",
+        and heartbeat_row["observed_live_source"] == "worker_identity",
     )
     live_row = F._worker_row(
         {

@@ -118,6 +118,38 @@ def _has_recorded_worker_identity(record: dict) -> bool:
     )
 
 
+def worker_process_identity_liveness(record: dict | None) -> bool | None:
+    """Read worker liveness from a status identity, or return UNKNOWN.
+
+    Live-observation consumers must not infer liveness from watcher freshness.
+    A pid without its exact start token is not ownership evidence, so it is
+    deliberately distinct from a confirmed dead identity mismatch.
+    """
+    if not isinstance(record, dict):
+        return None
+    identity = record.get("expected_worker_identity")
+    if not isinstance(identity, dict) or not identity.get("start_token"):
+        identity = record.get("worker_identity")
+    if not isinstance(identity, dict):
+        return None
+    pid = record.get("worker_pid") or identity.get("pid")
+    start_token = identity.get("start_token")
+    if not pid or not start_token:
+        return None
+    if identity.get("identity_probe_error"):
+        return None
+    candidate = dict(record)
+    candidate["worker_pid"] = pid
+    candidate["worker_identity"] = identity
+    try:
+        matched, reason = goalflight_ledger.identity_matches(candidate)
+    except (OSError, TypeError, ValueError):
+        return None
+    if reason == "identity_indeterminate":
+        return None
+    return bool(matched)
+
+
 def _status_json_worker_record(record: dict) -> dict | None:
     status = _status_json_payload(record)
     if not status:
@@ -1095,6 +1127,15 @@ def _elapsed_s(started_at: object, *, now: dt.datetime) -> float | None:
     return round(elapsed, 1)
 
 
+def _tail_idle_s(path: object, *, now_epoch: float) -> float | None:
+    if not path:
+        return None
+    try:
+        return max(0.0, now_epoch - Path(str(path)).expanduser().stat().st_mtime)
+    except (OSError, ValueError):
+        return None
+
+
 def _split_task_ids(value: object) -> list[str]:
     values = value if isinstance(value, list) else [value]
     out: list[str] = []
@@ -1215,6 +1256,7 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
             or status_sidecar.get("last_marker")
         )
         tail_path = status_sidecar.get("tail_path") or record.get("stdout_path")
+        idle_s = _tail_idle_s(tail_path, now_epoch=time.time())
         dispatches.append(
             {
                 "dispatch_id": record.get("dispatch_id"),
@@ -1230,11 +1272,10 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
                 "started_at": record.get("started_at"),
                 "ended_at": record.get("ended_at"),
                 "age_s": _elapsed_s(record.get("started_at"), now=now),
-                "idle_s": (
-                    round(float(status_sidecar["seconds_since_event"]), 1)
-                    if isinstance(status_sidecar.get("seconds_since_event"), (int, float))
-                    else None
-                ),
+                # Watcher status is intentionally quiet between state changes;
+                # derive activity age from the worker's tail instead of its
+                # frozen seconds_since_event observation.
+                "idle_s": round(idle_s, 1) if idle_s is not None else None,
                 "tail_last_line": _last_nonempty_tail_line(tail_path),
                 "marker": marker,
                 "status_path": record.get("status_path"),

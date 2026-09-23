@@ -1287,10 +1287,16 @@ class TraceLiveness:
         self._resolve_backoff_s = TRACE_RESOLUTION_INITIAL_BACKOFF_S
 
     def _resolve(self, now_mono: float) -> None:
-        if self.path is not None or now_mono - self.started_mono > self.retry_secs:
+        if self.path is not None:
             return
         if self._next_resolve_mono is not None and now_mono < self._next_resolve_mono:
             return
+        # Keep looking after the normal retry horizon. Once the exponential
+        # schedule reaches its horizon, every attempt is already capped at the
+        # bounded low-frequency interval; stopping here creates a hole when a
+        # trace appears just before the next scheduled retry.
+        if self.retry_secs > 0 and now_mono - self.started_mono >= self.retry_secs:
+            self._resolve_backoff_s = TRACE_RESOLUTION_MAX_BACKOFF_S
         self._next_resolve_mono = now_mono + self._resolve_backoff_s
         self._resolve_backoff_s = min(
             TRACE_RESOLUTION_MAX_BACKOFF_S,

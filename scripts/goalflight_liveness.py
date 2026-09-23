@@ -513,10 +513,13 @@ def _darwin_pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
         )
         libproc.proc_pid_rusage.restype = ctypes.c_int
         sample: dict[int, float] = {}
+        matched_pids = 0
+        successful_samples = 0
         for row in snapshot:
             pid = int(row["pid"])
             if int(row["pgid"]) != pgid:
                 continue
+            matched_pids += 1
             if pid <= 0:
                 continue
             usage = (ctypes.c_ubyte * 1024)()
@@ -524,6 +527,12 @@ def _darwin_pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
                 continue
             user_ns, system_ns = struct.unpack_from("=QQ", usage, 16)
             sample[pid] = (user_ns + system_ns) / 1_000_000_000.0
+            successful_samples += 1
+        if matched_pids and not successful_samples:
+            # A process row existed, but every counter probe was denied or
+            # unavailable. An empty dict would be interpreted as measured
+            # zero CPU and could feed a wedge/kill decision.
+            return None
         return sample
     except (AttributeError, OSError, TypeError, ValueError):
         return None

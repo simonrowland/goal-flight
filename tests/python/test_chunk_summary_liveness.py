@@ -58,7 +58,11 @@ def _record(
         "classification": state,
         "terminal_state": status.dispatch_states.terminal_state_for(state),
         "worker_pid": 4242,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {
+            "lstart": "Tue Jun  9 09:00:00 2026",
+            "start_token": "worker-token",
+            "comm": "python3",
+        },
         "stdout_path": str(tail),
         "status_path": str(status_path),
         "project_root": str(ROOT),
@@ -144,7 +148,7 @@ def test_missing_identity_does_not_claim_pid_ownership() -> None:
     finally:
         status.goalflight_compat.pid_alive = saved
 
-    assert_eq("pid-only liveness is not confirmed ownership", live, False)
+    assert_eq("pid-only liveness is unknown", live, None)
 
 
 def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> None:

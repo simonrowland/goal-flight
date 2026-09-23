@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -1295,6 +1296,28 @@ def test_pgroup_cpu_pct_measures_now_not_a_decaying_average() -> None:
 def test_pgroup_cpu_pct_returns_float_or_none() -> None:
     sample = pgroup_cpu_pct(1)
     assert sample is None or isinstance(sample, float), sample
+
+
+def test_darwin_all_proc_rusage_failures_are_unknown(monkeypatch) -> None:
+    class FailingRusage:
+        argtypes = None
+        restype = None
+
+        def __call__(self, _pid, _flavor, _usage):
+            return 1
+
+    monkeypatch.setattr(goalflight_liveness.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        goalflight_liveness.goalflight_compat,
+        "darwin_process_snapshot",
+        lambda: [{"pid": 123, "pgid": 123}],
+    )
+    monkeypatch.setattr(
+        goalflight_liveness.ctypes,
+        "CDLL",
+        lambda _path: SimpleNamespace(proc_pid_rusage=FailingRusage()),
+    )
+    assert goalflight_liveness._darwin_pgroup_cputime_snapshot(123) is None
 
 
 @skipif(os.name == "nt", reason="POSIX watcher process-group CPU sampler")

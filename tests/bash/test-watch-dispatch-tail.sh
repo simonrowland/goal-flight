@@ -496,6 +496,38 @@ wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" "$OUT"
 cleanup_pidfile "$PIDFILE_STEM"
 
+# ---- Case 1aa: equal-size tail rewrite invalidates marker cache ----
+# A terminal rewrite can preserve byte length (for example after rotation).
+# Size-only caching misses it and then classifies worker death as failure.
+TAIL=/tmp/test-watch-equal-size-rewrite-$$.txt
+OUT=/tmp/watcher-out-equal-size-rewrite-$$.txt
+MARKER='COMPLETE: equal-size-rewrite - done'
+INITIAL=$(printf '%*s' "${#MARKER}" '' | tr ' ' x)
+printf '%s\n' "$INITIAL" > "$TAIL"
+sleep 30 & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "equal-size-rewrite" \
+  --poll-secs 1 --max-idle-secs 30 \
+  > "$OUT" 2>&1 &
+WATCHER_PID=$!
+if wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM" 50; then
+  printf '%s\n' "$MARKER" > "$TAIL"
+  sleep 2
+  kill "$WORKER_PID" 2>/dev/null
+  wait "$WORKER_PID" 2>/dev/null
+  wait "$WATCHER_PID"
+  expect_eq "case-1aa equal-size rewrite terminalizes" "0" "$?"
+else
+  expect_eq "case-1aa watcher registered live worker" "yes" "no"
+  stop_pid "$WATCHER_PID"
+  stop_pid "$WORKER_PID"
+fi
+rm -f "$TAIL" "$OUT"
+cleanup_pidfile "$PIDFILE_STEM"
+
 # ---- Case 1b: marker received + worker also dead → pidfile REMOVED ----
 # Same as case 1 but the worker exits before the watcher exits, so the trap
 # removes the pidfile.

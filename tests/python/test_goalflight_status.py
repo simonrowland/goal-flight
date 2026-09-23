@@ -1158,6 +1158,40 @@ def test_wait_snapshot_uses_single_liveness_result() -> None:
         S.goalflight_ledger.identity_matches = orig_identity_matches
 
 
+def test_dashboard_idle_age_reads_tail_mtime_not_watcher_seconds(tmp_path) -> None:
+    tail = tmp_path / "worker.tail"
+    tail.write_text("activity\n", encoding="utf-8")
+    now = time.time()
+    os.utime(tail, (now - 17.0, now - 17.0))
+    status_path = tmp_path / "worker.status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": "activity-age",
+                "tail_path": str(tail),
+                "seconds_since_event": 9999.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = S._dashboard_status_records
+    S._dashboard_status_records = lambda _root: [
+        {
+            "dispatch_id": "activity-age",
+            "project_root": "/repo",
+            "classification": "expected_live",
+            "status_path": str(status_path),
+            "stdout_path": str(tail),
+        }
+    ]
+    try:
+        dispatch = S.dashboard_status_payload("/repo")["dispatches"][0]
+    finally:
+        S._dashboard_status_records = original
+    check("dashboard idle age uses tail activity", 10.0 <= dispatch["idle_s"] <= 30.0)
+    check("dashboard idle age ignores watcher heartbeat", dispatch["idle_s"] != 9999.0)
+
+
 def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         status_path = Path(tmp) / "drain-live.status.json"

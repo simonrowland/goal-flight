@@ -604,9 +604,10 @@ prev_loop_ts=$(date +%s)
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s total_runtime=${TOTAL_RUNTIME_SECS}s"
 
 # Marker parsing is content-dependent. Keep its result while the tail byte
-# count is unchanged; the previous implementation forked Python and reread up
-# to 10 MiB on every poll of a quiet worker.
+# count and trailing content are unchanged; equal-size rewrites (including
+# rotation) must invalidate the cache without rereading the whole tail.
 marker_cache_size="__unset__"
+marker_cache_boundary=""
 marker_cache_value=""
 
 terminal_marker_seen() {
@@ -616,12 +617,18 @@ terminal_marker_seen() {
     marker_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
     marker_size=${marker_size:-0}
   fi
-  if [ "$marker_cache_size" = "$marker_size" ]; then
+  # The last 4096 bytes are the scanner's content boundary. This catches a
+  # same-size rewrite of the final lines while keeping quiet polls bounded and
+  # portable across the macOS bash/stat variants.
+  local marker_boundary
+  marker_boundary=$(tail -c 4096 "$TAIL_PATH" 2>/dev/null || true)
+  if [ "$marker_cache_size" = "$marker_size" ] && [ "$marker_cache_boundary" = "$marker_boundary" ]; then
     [ -n "$marker_cache_value" ] || return 1
     printf '%s\n' "$marker_cache_value"
     return 0
   fi
   marker_cache_size="$marker_size"
+  marker_cache_boundary="$marker_boundary"
   marker_cache_value=""
   if [ "$MARKER_RE" != "$DEFAULT_MARKER_RE" ]; then
     # A custom regex is an additional filter, never an alternate identity
