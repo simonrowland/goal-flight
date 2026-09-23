@@ -2688,6 +2688,182 @@ def test_bounded_relay_sanitizes_c1_csi() -> None:
     assert_true("bounded relay has no raw C1 CSI", "\x9b" not in (rendered or ""))
 
 
+def test_named_stream_read_skips_quota_advisory() -> None:
+    """``read --dispatch-id X --last 1`` returns X, not a newer advisory on another stream."""
+    import goalflight_messages as messages
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        named = "b5745-rebase"
+        messages.post_message(
+            dispatch_id=named,
+            msg_type="user_need",
+            payload={"text": "the named body"},
+            messages_dir=messages_dir,
+            seq=1,
+        )
+        messages.post_message(
+            dispatch_id="other-stream",
+            msg_type="user_need",
+            payload={"text": "the other stream"},
+            messages_dir=messages_dir,
+            seq=1,
+        )
+        messages.post_message(
+            dispatch_id="controller-quota-advisory",
+            msg_type="advisory",
+            payload={"text": "moonshot quota exhausted: 4 agent(s) stuck"},
+            messages_dir=messages_dir,
+            seq=1,
+        )
+        read = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["read", "--dispatch-id", named, "--last", "1"],
+        )
+        assert_true(f"named read succeeds: {read.stderr}", read.returncode == 0)
+        envelopes = json.loads(read.stdout)
+        assert_true("named read returns one envelope", len(envelopes) == 1)
+        assert_true(
+            "named read returns that stream, not the advisory",
+            envelopes[0].get("dispatch_id") == named
+            and envelopes[0].get("payload", {}).get("text") == "the named body",
+        )
+        advisory = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            ["read", "--dispatch-id", "controller-quota-advisory", "--last", "1"],
+        )
+        assert_true("naming the advisory still reads it", advisory.returncode == 0)
+        advisory_envelopes = json.loads(advisory.stdout)
+        assert_true(
+            "advisory body is readable by name",
+            len(advisory_envelopes) == 1
+            and "quota exhausted" in advisory_envelopes[0]["payload"]["text"],
+        )
+
+
+def test_drain_bodies_prints_body_before_cursor_advance() -> None:
+    """Text ``relay --drain --bodies`` prints the body, including when the CAS loses."""
+    import goalflight_journal
+
+    body = "visible headline\nsecond line\nUNIQUE-BODY-SENTINEL-9f3a"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "drain-bodies-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "emit_wake_entry_notice",
+                side_effect=AssertionError("drain must not emit a wake-entry notice"),
+            ),
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "drain-bodies-test"},
+            )
+            assert_true("bodies controller lease claimed", claimed.committed)
+            _carrier_messages.post_message(
+                dispatch_id="drain-bodies",
+                msg_type="controller-notice",
+                payload={"text": body},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+            lease = authority.active_lease(label)
+            assert_true("bodies controller lease readable", lease is not None)
+            argv = [
+                "--messages-dir",
+                str(messages_dir),
+                "--fleet-dir",
+                env["GOALFLIGHT_FLEET_DIR"],
+                "relay",
+                "--drain",
+                "--bodies",
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                drained_rc = _carrier_messages.main(argv)
+            rendered = stdout.getvalue()
+            assert_true("drain --bodies succeeds", drained_rc == 0)
+            assert_true(
+                "drain --bodies prints the body the headline omits",
+                "UNIQUE-BODY-SENTINEL-9f3a" in rendered,
+            )
+            assert_true(
+                "body is printed before the cursor receipt",
+                rendered.index("UNIQUE-BODY-SENTINEL-9f3a") < rendered.index("drained "),
+            )
+            assert_true(
+                "drain --bodies still advances",
+                not authority.cursor_peek(label, nonce=lease.nonce).items,
+            )
+
+            _carrier_messages.post_message(
+                dispatch_id="drain-bodies-cas",
+                msg_type="controller-notice",
+                payload={"text": body},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+            before = authority.cursor_peek(label, nonce=lease.nonce, limit=10)
+
+            def lose_cas(*_args, **_kwargs):
+                raise goalflight_journal.CASMismatch("cursor moved")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(goalflight_journal.Journal, "advance_cursor", lose_cas),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                conflict_rc = _carrier_messages.main(argv)
+            combined = stdout.getvalue() + stderr.getvalue()
+            assert_true("cas loss exits conflict", conflict_rc == 3)
+            assert_true(
+                "body was printed even though the cursor did not advance",
+                "UNIQUE-BODY-SENTINEL-9f3a" in combined,
+            )
+            assert_true(
+                "conflict is reported after the body",
+                combined.index("UNIQUE-BODY-SENTINEL-9f3a")
+                < combined.index("drain conflict"),
+            )
+            after = authority.cursor_peek(label, nonce=lease.nonce, limit=10)
+            assert_true(
+                "failed drain did not advance the cursor",
+                after.cursor_version == before.cursor_version
+                and len(after.items) == len(before.items),
+            )
+
+
 def main() -> None:
     tests = sorted(
         [

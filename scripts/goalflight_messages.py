@@ -2742,7 +2742,7 @@ def collect_inbox_paths(
     # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
     # (open() is what blocks on a FIFO), so this filter is safe and cheap.
     def _want(stem: str) -> bool:
-        return dispatch_ids is None or stem in dispatch_ids or stem == "controller-quota-advisory"
+        return dispatch_ids is None or stem in dispatch_ids
 
     paths: dict[str, list[Path]] = {}
     if messages_dir.is_dir():
@@ -5583,8 +5583,16 @@ def cmd_relay(args: argparse.Namespace) -> int:
         if not getattr(args, "json", False):
             # Visibility precedes receipt: if this process dies during the CAS,
             # the controller has still seen every item it attempted to settle.
+            # `--bodies` is printed here, not after the advance, so a lost CAS
+            # does not hide the text the cursor is about to skip.
             for row, envelope in items_with_rows:
                 print(format_receipt_headline(row, envelope), flush=True)
+                if getattr(args, "bodies", False):
+                    payload = envelope.get("payload")
+                    payload = payload if isinstance(payload, dict) else {}
+                    body = payload.get("text")
+                    if isinstance(body, str) and body:
+                        print(body, flush=True)
         try:
             advanced = authority.advance_cursor(
                 controller_label,
