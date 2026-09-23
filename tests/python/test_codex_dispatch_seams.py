@@ -84,6 +84,13 @@ def _stub_bash_launch(
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_PID", "99999991")
+    # Managed resolver fixtures represent a dispatch-time selection; provide
+    # the same usage evidence the production selector now requires.
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: True,
+    )
     spawn_calls: list[dict] = []
     ledger_calls: list[dict] = []
     ordering: list[str] = []
@@ -1021,6 +1028,10 @@ def _install_stub_seat_api(
         entries.append(old_pythonpath)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(entries))
     monkeypatch.setenv("GOALFLIGHT_TEST_CODEX_HOME", str(home))
+    (Path.home() / ".goal-flight" / "accounts" / "seat-e2e" / "codex").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
 def _usage_limit_text(days_ahead: int = 30) -> str:
@@ -1092,6 +1103,8 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     dispatch_argv = [
             "--agent",
             "codex",
+            "--account",
+            "seat-e2e",
             "--unregistered-forced",
             "--shape",
             "bash",

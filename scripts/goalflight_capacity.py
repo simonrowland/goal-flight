@@ -10,6 +10,7 @@ import datetime as dt
 import getpass
 import io
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -1213,7 +1214,7 @@ def _lease_weight(lease: dict) -> float:
         value = float(lease.get("capacity_weight", 1.0))
     except (TypeError, ValueError):
         value = 1.0
-    return value if value > 0 else 1.0
+    return value if math.isfinite(value) and value > 0 else 1.0
 
 
 def _account_cap(vendor: str, account: str, *, default: int | None = None) -> int:
@@ -1706,7 +1707,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         capacity_full = (
             len(leases) >= lane_max_total
-            or agent_count >= lane_agent_cap
+            or account_active_weight + request_weight > lane_agent_cap
             or (
                 bool(prof["ram_mb"])
                 and total_rss + rss_mb > max(0, prof["ram_mb"] - prof["controller_reserve_mb"])
@@ -1714,10 +1715,10 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         )
         if capacity_full and reclaim_stale_leases(data):
             leases = active_leases(data)
-            agent_count = sum(
-                1
+            account_active_weight = sum(
+                _lease_weight(lease)
                 for lease in leases
-                if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
+                if _lease_vendor(lease) == pool and _lease_account(lease) == account
             )
             total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         if len(leases) >= lane_max_total:

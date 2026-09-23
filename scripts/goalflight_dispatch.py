@@ -4992,12 +4992,17 @@ def _rebuild_codex_resume_home(
         )
     expected_home.replace(saved_home)
     try:
-        rebuilt_home, effective_account = resolve_codex_home(
+        resolve_args = (
             project_root,
             explicit_account,
             home_owner_dispatch_id or parent_dispatch_id,
-            model=model,
         )
+        if model is None:
+            rebuilt_home, effective_account = resolve_codex_home(*resolve_args)
+        else:
+            rebuilt_home, effective_account = resolve_codex_home(
+                *resolve_args, model=model
+            )
         if (
             rebuilt_home is None
             or effective_account is None
@@ -6778,13 +6783,15 @@ def _codex_account_admission_reason(
     account: str,
     *,
     model: str | None = None,
-    require_probe: bool = True,
+    usage_rows: list[dict] | None = None,
 ) -> str | None:
     """Return why a configured account cannot accept this dispatch."""
-    probe = _seat_probe_says_usable(account, "codex")
-    if probe is False or _account_quota_blocked(account, engine="codex"):
+    probe = _codex_usage_probe_says_usable(account, rows=usage_rows)
+    if probe is False:
         return "walled or quota-blocked"
-    if require_probe and probe is not True:
+    if probe is not True and _account_quota_blocked(account, engine="codex"):
+        return "walled or quota-blocked"
+    if probe is not True:
         return "health probe unknown"
     try:
         budget = goalflight_capacity.launch_slot_budget(
@@ -6807,6 +6814,55 @@ def _codex_account_admission_reason(
     return None
 
 
+def _codex_usage_probe_rows() -> list[dict]:
+    """Read Codex health through the same usage reader shown to operators."""
+    try:
+        import goalflight_usage as usage
+
+        specs = tuple(spec for spec in usage.READERS if spec.provider == "codex")
+        rows = usage.collect_usage(
+            timeout_s=min(usage.DEFAULT_TIMEOUT_S, 8.0),
+            reader_specs=specs,
+            ledger_records=[],
+        )
+    except Exception:
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _codex_usage_probe_says_usable(
+    account: str,
+    *,
+    rows: list[dict] | None = None,
+) -> bool | None:
+    """Return usage-reader health for one account, without seat-state fallback."""
+    import goalflight_usage as usage
+
+    account_key = usage._label(account) or ""
+    candidates = _codex_usage_probe_rows() if rows is None else rows
+    for row in candidates:
+        if str(row.get("provider") or "") != "codex":
+            continue
+        if (usage._label(row.get("account")) or "") != account_key:
+            continue
+        evidence = row.get("evidence")
+        probe = evidence.get("probe") if isinstance(evidence, dict) else None
+        state = (
+            probe.get("state")
+            if isinstance(probe, dict)
+            else usage._probe_state(row)
+        )
+        if state == "walled" or "walled" in (row.get("flags") or ()):
+            return False
+        if state != "reported":
+            return None
+        remaining = str(row.get("remaining") or "").strip().casefold()
+        if remaining in {"", "unknown", "unavailable", "needs-login"}:
+            return None
+        return True
+    return None
+
+
 def select_codex_account(
     *,
     model: str | None = None,
@@ -6822,8 +6878,11 @@ def select_codex_account(
     if explicit_account:
         return explicit_account.strip() or None, []
     rejected: list[dict[str, str]] = []
+    usage_rows = _codex_usage_probe_rows()
     for account in _configured_account_names("codex"):
-        reason = _codex_account_admission_reason(account, model=model)
+        reason = _codex_account_admission_reason(
+            account, model=model, usage_rows=usage_rows
+        )
         if reason is None:
             return account, rejected
         rejected.append({"account": account, "reason": reason})
@@ -6870,10 +6929,7 @@ def resolve_codex_home(
     # it is accepted; it cannot mask a healthy configured sibling.
     home, account = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
     if account:
-        reason = _codex_account_admission_reason(
-            account,
-            require_probe=bool(_configured_account_names("codex")),
-        )
+        reason = _codex_account_admission_reason(account)
         if reason is None:
             return home, account
         rejected.append({"account": account, "reason": reason})
@@ -6882,7 +6938,9 @@ def resolve_codex_home(
         f"(rejected: {rejected or 'discovery failed'}); billing host",
         file=sys.stderr,
     )
-    return home, "host"
+    # A rejected resolver result may point at an unverified account home. Do not
+    # keep that path while relabelling the billing identity as the host.
+    return None, "host"
 
 
 def cleanup_codex_dispatch_home(dispatch_id: str) -> None:

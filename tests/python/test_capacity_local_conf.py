@@ -67,7 +67,13 @@ def case_conf_overrides_merge_over_baseline() -> None:
                 "operating_total": 75,
                 "agent_caps": {"grok": 60, "codex": 15, "codex-acp": 15},
                 "account_caps": {"codex": {"25ca6b": 30, "default": 24}},
-                "model_weights": {"codex": {"gpt-5.6-luna": 0.25}},
+                "model_weights": {
+                    "codex": {
+                        "gpt-5.6-luna": 0.25,
+                        "unbounded": "1e309",
+                        "not-a-number": "NaN",
+                    }
+                },
                 "agent_rss_mb": {"grok": 250},
             }
         )
@@ -84,6 +90,8 @@ def case_conf_overrides_merge_over_baseline() -> None:
         assert mod.account_cap("codex", "new-account") == 24
         assert mod.model_weight("codex", "gpt-5.6-luna") == 0.25
         assert mod.model_weight("codex", "max-model") == 1.0
+        assert mod.model_weight("codex", "unbounded") == 1.0
+        assert mod.model_weight("codex", "not-a-number") == 1.0
         assert mod.local_hard_cap(40) == 75
         assert mod.local_operating_total() == 75
     finally:

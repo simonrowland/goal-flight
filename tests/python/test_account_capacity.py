@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -112,6 +113,11 @@ def test_model_weights_sum_against_account_cap(isolated_capacity, monkeypatch):
     assert rc == 2 and payload["active_weight"] == 1.0, payload
 
 
+def test_non_finite_lease_weight_defaults_to_one(isolated_capacity):
+    assert cap._lease_weight({"capacity_weight": float("inf")}) == 1.0
+    assert cap._lease_weight({"capacity_weight": "NaN"}) == 1.0
+
+
 def test_account_cooldown_does_not_block_sibling(isolated_capacity):
     with cap.StateLock():
         state = cap.load_state()
@@ -132,8 +138,8 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["walled", "healthy"])
     monkeypatch.setattr(
         dispatch,
-        "_seat_probe_says_usable",
-        lambda account, engine: account == "healthy",
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: account == "healthy",
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
@@ -158,8 +164,8 @@ def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monk
     monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["walled", "healthy"])
     monkeypatch.setattr(
         dispatch,
-        "_seat_probe_says_usable",
-        lambda account, engine: account == "healthy",
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: account == "healthy",
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
@@ -184,6 +190,52 @@ def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monk
     resolved = dispatch.resolve_codex_home(tmp_path, None, "resume-child")
     assert resolved == (str(home), "healthy")
     assert calls == ["healthy"]
+
+
+def test_selection_uses_usage_health_over_seat_state(monkeypatch):
+    monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["alpha"])
+    monkeypatch.setattr(dispatch, "_seat_probe_says_usable", lambda *args: False)
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        usage,
+        "collect_usage",
+        lambda **kwargs: [
+            {
+                "provider": "codex",
+                "account": "alpha",
+                "remaining": "80%",
+                "flags": [],
+                "evidence": {"probe": {"state": "reported"}},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda *args, **kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {"codex/alpha": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    selected, rejected = dispatch.select_codex_account()
+    assert selected == "alpha"
+    assert rejected == []
+
+
+def test_unverified_resolver_account_is_not_promoted(monkeypatch, tmp_path):
+    home = tmp_path / "unverified-home"
+    monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: [])
+    monkeypatch.setattr(dispatch, "_codex_seat_api", lambda: SimpleNamespace(
+        resolve_codex_seat=lambda *_args: (str(home), "mystery")
+    ))
+    monkeypatch.setattr(usage, "collect_usage", lambda **kwargs: [])
+
+    assert dispatch.resolve_codex_home(tmp_path, None, "unknown-health") == (
+        None,
+        "host",
+    )
 
 
 def test_status_and_usage_render_account_active_cap(isolated_capacity):

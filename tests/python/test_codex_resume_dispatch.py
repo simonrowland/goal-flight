@@ -2456,10 +2456,14 @@ def test_unpinned_codex_selection_skips_recently_exhausted_seat(
         "_codex_seat_api",
         lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
     )
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: account == "25ca6b",
+    )
 
     home, account = D.resolve_codex_home(tmp_path, None, "fresh-dispatch")
-    assert seen[0] is None
-    assert "25ca6b" in seen
+    assert seen == ["25ca6b"]
     assert account == "25ca6b"
     assert home.endswith("home-25ca6b")
 

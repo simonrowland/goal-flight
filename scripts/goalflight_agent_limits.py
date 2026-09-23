@@ -20,6 +20,7 @@ Per-machine tuning lives in a gitignored local conf loaded at import time -- see
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -263,7 +264,7 @@ def _merge_model_weights(
                     parsed = float(value)
                 except (TypeError, ValueError):
                     continue
-                if parsed > 0 and str(model).strip():
+                if math.isfinite(parsed) and parsed > 0 and str(model).strip():
                     bucket[str(model).strip().casefold()] = parsed
             continue
         # A flat {"model-name": weight} form is useful when one vendor is in
@@ -272,7 +273,7 @@ def _merge_model_weights(
             parsed = float(models)
         except (TypeError, ValueError):
             continue
-        if parsed > 0 and str(vendor).strip():
+        if math.isfinite(parsed) and parsed > 0 and str(vendor).strip():
             target.setdefault("*", {})[str(vendor).strip().casefold()] = parsed
 
 
@@ -308,7 +309,13 @@ def model_weight(vendor: str, model: str | None = None) -> float:
     value = MODEL_WEIGHTS.get(vendor_key, {}).get(model_key)
     if value is None:
         value = MODEL_WEIGHTS.get("*", {}).get(model_key)
-    return float(value) if value is not None else 1.0
+    if value is None:
+        return 1.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return parsed if math.isfinite(parsed) and parsed > 0 else 1.0
 
 
 def _positive_int_or(value: object, default):
