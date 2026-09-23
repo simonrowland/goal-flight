@@ -9519,17 +9519,17 @@ def _withdraw_preflight(args):
     record = goalflight_ledger.read_record(args.dispatch_id)
     if goalflight_ledger.record_is_unreadable(record):
         raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
-    carrier = _queue_entry_path(args.dispatch_id)
-    active = _claim_has_active_carrier(carrier.parent, args.dispatch_id)
-    if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
-        raise ValueError(
-            f"carrier launch ownership is {active.kind.value} ({active.reason}); "
-            "withdraw never kills a live worker. Wait for launch to settle and verify "
-            "the launcher identity before retrying."
-        )
-    if active:
-        carrier = Path(active.path)
-    entry = json.loads(carrier.read_text()) if carrier.exists() else {}
+    index = _build_queue_carrier_index(_queue_entry_path(args.dispatch_id).parent)
+    statuses = index.carriers_by_id.get(args.dispatch_id, [])
+    for active in ([index.listing_error] if index.listing_error is not None else statuses):
+        if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
+            raise ValueError(
+                f"carrier launch ownership is {active.kind.value} ({active.reason}); "
+                "withdraw never kills a live worker. Wait for launch to settle and verify "
+                "the launcher identity before retrying."
+            )
+    carriers = {Path(active.path): json.loads(Path(active.path).read_text()) for active in statuses}
+    entry = next(iter(carriers.values()), {})
     root_value = args.project_root or (record or entry).get("project_root") or str(Path.cwd())
     root = goalflight_task.resolve_project_root_for_read(str(root_value))
     if root is None:
@@ -9548,7 +9548,8 @@ def _withdraw_preflight(args):
     for source, pid, identity in (
         ("ledger", (record or {}).get("worker_pid"), (record or {}).get("worker_identity")),
         ("journal", worker.get("pid"), worker),
-        ("carrier", entry.get("queue_worker_pid"), entry.get("queue_worker_identity")),
+        *((str(path), evidence.get("queue_worker_pid"), evidence.get("queue_worker_identity"))
+          for path, evidence in carriers.items()),
     ):
         if not pid:
             continue
@@ -9558,7 +9559,7 @@ def _withdraw_preflight(args):
                 f"{source} worker {pid} is {status} ({reason}); withdraw never kills a live worker. "
                 "Steer the worker to stop, wait for exit, and verify its identity before retrying."
             )
-    for evidence in (record or {}, entry):
+    for evidence in (record or {}, *carriers.values()):
         if _queue_claim_worker_spawn_intent(evidence) and not (
             evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
         ):
@@ -9572,7 +9573,7 @@ def _withdraw_preflight(args):
     withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
     if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
         raise ValueError("dispatch already has a different terminal outcome; preserve it instead of withdrawing")
-    return root, authority, attempt, record, carrier, outcome, withdrawn
+    return root, authority, attempt, record, carriers, outcome, withdrawn
 
 
 def _cmd_withdraw(argv: list[str]) -> int:
@@ -9594,7 +9595,7 @@ def _cmd_withdraw(argv: list[str]) -> int:
             raise ValueError("--reason must not be blank")
         if args.superseded_by is not None and (not args.superseded_by.strip() or args.superseded_by == args.dispatch_id):
             raise ValueError("--superseded-by must name a different dispatch")
-        root, authority, attempt, record, carrier, outcome, withdrawn = _withdraw_preflight(args)
+        root, authority, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(args)
         actor = outcome.get("withdrawn_by") if withdrawn else ("operator" if args.operator else args.controller_label)
         terminal_state = attempt["terminal_state"] if withdrawn else ("superseded" if args.superseded_by else "withdrawn")
         observation = outcome if withdrawn else {"reason": args.reason, "withdrawn_by": actor}
@@ -9602,7 +9603,7 @@ def _cmd_withdraw(argv: list[str]) -> int:
             observation["superseded_by"] = args.superseded_by
         payload = {"dispatch_id": args.dispatch_id, "withdrawn_by": actor}
         # No constructors, locks, projection rewrites, or timestamp changes on a retry.
-        if withdrawn and record and record.get("terminal_state") == terminal_state and not carrier.exists():
+        if withdrawn and record and record.get("terminal_state") == terminal_state and not carriers:
             payload["status"] = "already withdrawn"
         elif args.dry_run:
             terminal = goalflight_journal.TerminalCommit(
@@ -9630,13 +9631,14 @@ def _cmd_withdraw(argv: list[str]) -> int:
                 {"record": str(goalflight_ledger.record_path(args.dispatch_id, create=False)),
                  "fields": {key: value for key, value in projected.items() if (record or {}).get(key) != value},
                  "remove_fields": [key for key in ("sidecar_hold", "sidecar_hold_reason") if key in (record or {})]},
-                {"record": str(carrier), "move_to": str(carrier.parent.parent / "dispatch-queue-withdrawn" / f"{carrier.stem}.<utc-stamp>.json") if carrier.exists() else None},
+                *({"record": str(carrier), "move_to": str(carrier.parent.parent / "dispatch-queue-withdrawn" / f"{carrier.stem}.<utc-stamp>.json")}
+                  for carrier in carriers),
             ])
         else:
             # Block queue claims while rechecking evidence and publishing in authority order.
-            with _queue_mutation_lock(carrier.parent), goalflight_ledger.StateLock():
-                root, _, attempt, record, carrier, outcome, withdrawn = _withdraw_preflight(args)
-                if withdrawn and record and record.get("terminal_state") == attempt["terminal_state"] and not carrier.exists():
+            with _queue_mutation_lock(_queue_entry_path(args.dispatch_id).parent), goalflight_ledger.StateLock():
+                root, _, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(args)
+                if withdrawn and record and record.get("terminal_state") == attempt["terminal_state"] and not carriers:
                     payload.update(status="already withdrawn", withdrawn_by=outcome["withdrawn_by"])
                     print(json.dumps(payload, sort_keys=True) if args.json else
                           f"{args.dispatch_id}: already withdrawn by {payload['withdrawn_by']}")
@@ -9657,15 +9659,18 @@ def _cmd_withdraw(argv: list[str]) -> int:
                 )
                 current["project_root"] = str(root)
                 goalflight_ledger.write_record(current)
-                archived = None
-                if carrier.exists():
+                archived_carriers = []
+                for carrier in carriers:
                     archive_dir = carrier.parent.parent / "dispatch-queue-withdrawn"
                     archive_dir.mkdir(parents=True, exist_ok=True)
                     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                     archived = archive_dir / f"{carrier.stem}.{stamp}.json"
                     carrier.replace(archived)
+                    archived_carriers.append(str(archived))
                 payload.update(status="withdrawn", withdrawn_by=terminal.observation["withdrawn_by"],
-                               attempt_id=terminal.attempt_id, archived_carrier=str(archived) if archived else None)
+                               attempt_id=terminal.attempt_id,
+                               archived_carrier=archived_carriers[0] if archived_carriers else None,
+                               archived_carriers=archived_carriers)
         print(json.dumps(payload, sort_keys=True) if args.json else
               f"{args.dispatch_id}: {payload['status']} by {payload['withdrawn_by']}" +
               ("\n" + json.dumps(payload["plan"], indent=2) if "plan" in payload else ""))
@@ -9979,6 +9984,8 @@ class _QueueCarrierIndex:
     ) -> None:
         self.listing_error = listing_error
         self.by_id = by_id or {}
+        # Withdrawal needs every carrier's evidence, not the preferred status.
+        self.carriers_by_id: dict[str, list[ClaimCarrierStatus]] = {}
 
     def status(self, dispatch_id: str) -> ClaimCarrierStatus:
         if self.listing_error is not None:
@@ -10053,7 +10060,9 @@ def _build_queue_carrier_index(
             dispatch_id: _prefer_claim_carrier(statuses)
             for dispatch_id, statuses in collected.items()
         }
-        return _QueueCarrierIndex(by_id=by_id)
+        index = _QueueCarrierIndex(by_id=by_id)
+        index.carriers_by_id = collected
+        return index
     finally:
         _pass_time("carrier_index_s", time.monotonic() - t0)
 
