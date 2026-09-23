@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import json
 import os
+import shlex
 import signal
 import sys
 from contextlib import redirect_stdout
@@ -289,6 +290,69 @@ def test_legacy_unattached_lease_expiry_requires_manual_identity_repair(tmp_path
     manual = status["legacy_manual_release"]
     assert manual and lease["lease_id"] == manual[0]["lease_id"]
     assert lease["lease_id"] in manual[0]["manual_release_command"]
+    assert cap.main(shlex.split(manual[0]["manual_release_command"])[2:]) == 0
+    released = cap.load_state()["leases"][lease["lease_id"]]
+    assert released["state"] == "released"
+    assert released["operator_confirmed"] is True
+    assert released["released_by"]
+    assert released["reason"] == "manual_legacy_release"
+    assert released["released_at"]
+
+
+@pytest.mark.parametrize("identity_source", ["lease", "ledger", "status"])
+def test_operator_release_refuses_proven_live_worker(tmp_path, monkeypatch, identity_source):
+    record = seed(tmp_path, attached=identity_source == "lease")
+    if identity_source == "status":
+        status_path = tmp_path / "worker-status.json"
+        status_path.write_text(json.dumps(record))
+        record.pop("worker_pid")
+        record.pop("worker_identity")
+        record["status_path"] = str(status_path)
+        ledger.write_record(record)
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: True)
+    assert cap.main(["release", "--lease-id", "held", "--operator-confirmed",
+                     "--reason", "operator checked"]) == 1
+    assert cap.load_state()["leases"]["held"]["state"] == "active"
+
+
+@pytest.mark.parametrize("reason", [None, "   "])
+def test_operator_release_requires_reason(tmp_path, reason):
+    cap.save_state({"leases": {"held": {"lease_id": "held", "state": "active"}}, "cooldowns": {}})
+    argv = ["release", "--lease-id", "held", "--operator-confirmed"]
+    if reason is not None:
+        argv.extend(["--reason", reason])
+    assert cap.main(argv) == 1
+    assert cap.load_state()["leases"]["held"]["state"] == "active"
+
+
+@pytest.mark.parametrize("live", [True, False, None])
+def test_operator_release_only_overrides_unknown_identity(tmp_path, monkeypatch, live):
+    seed(tmp_path)
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: live)
+    monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: None)
+    argv = ["release", "--lease-id", "held", "--operator-confirmed", "--reason", "checked session"]
+    assert cap.main(argv) == (1 if live is False else 0)
+    assert cap.load_state()["leases"]["held"]["state"] == ("active" if live is False else "released")
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_normal_release_preserves_unknown_and_releases_dead(tmp_path, monkeypatch, keep):
+    seed(tmp_path)
+    argv = ["release", "--lease-id", "held", "--reason", "normal"]
+    if keep:
+        argv.append("--keep")
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: None)
+    assert cap.main(argv) == 1
+    assert cap.load_state()["leases"]["held"]["state"] == "active"
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: False)
+    assert cap.main(argv) == 0
+    leases = cap.load_state()["leases"]
+    if keep:
+        assert leases["held"]["state"] == "released"
+        assert "operator_confirmed" not in leases["held"]
+    else:
+        assert "held" not in leases
 
 
 def test_remote_lease_is_never_probed_or_reclaimed(tmp_path, monkeypatch):

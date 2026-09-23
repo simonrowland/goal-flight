@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
+import getpass
 import io
 import json
 import os
@@ -507,7 +508,7 @@ def _dispatch_record_for_lease(lease: dict) -> dict | None:
 def _legacy_manual_release_command(lease_id: object) -> str:
     return (
         "python3 scripts/goalflight_capacity.py release --lease-id "
-        f"{shlex.quote(str(lease_id))} --reason manual_legacy_release"
+        f"{shlex.quote(str(lease_id))} --operator-confirmed --reason manual_legacy_release"
     )
 
 
@@ -1635,6 +1636,10 @@ def cmd_acquire(args: argparse.Namespace) -> int:
 
 
 def cmd_release(args: argparse.Namespace) -> int:
+    operator_confirmed = bool(getattr(args, "operator_confirmed", False))
+    if operator_confirmed and (not args.reason or not args.reason.strip()):
+        print(json.dumps({"ok": False, "reason": "operator_reason_required", "lease_id": args.lease_id}, sort_keys=True))
+        return 1
     with StateLock():
         data = load_state()
         lease = data.get("leases", {}).get(args.lease_id)
@@ -1652,14 +1657,24 @@ def cmd_release(args: argparse.Namespace) -> int:
             import goalflight_ledger
 
             record = goalflight_ledger.read_record(str(lease["dispatch_id"]))
-        if not _terminal_worker_gone(lease, record):
+        if operator_confirmed:
+            record = _dispatch_record_for_lease(lease)
+            liveness, _ = worker_identity_liveness(lease, record)
+            if liveness != "unknown":
+                reason = "worker_alive" if liveness == "live" else "worker_identity_resolved"
+                print(json.dumps({"ok": False, "reason": reason, "lease_id": args.lease_id}, sort_keys=True))
+                return 1
+        elif not _terminal_worker_gone(lease, record):
             print(json.dumps({"ok": False, "reason": "worker_alive", "lease_id": args.lease_id}, sort_keys=True))
             return 1
         lease["state"] = args.state
         lease["released_at"] = iso()
         if args.reason:
             lease["reason"] = args.reason
-        if args.keep:
+        if operator_confirmed:
+            lease["operator_confirmed"] = True
+            lease["released_by"] = getpass.getuser()
+        if args.keep or operator_confirmed:
             save_state(data)
         else:
             data.get("leases", {}).pop(args.lease_id, None)
@@ -1988,6 +2003,10 @@ def build_parser() -> argparse.ArgumentParser:
     rel.add_argument("--lease-id", required=True)
     rel.add_argument("--state", default="released")
     rel.add_argument("--reason")
+    rel.add_argument(
+        "--operator-confirmed", action="store_true",
+        help="operator-only: release an unresolved worker identity; requires --reason and retains lease history",
+    )
     rel.add_argument("--keep", action="store_true")
     rel.set_defaults(func=cmd_release)
 
