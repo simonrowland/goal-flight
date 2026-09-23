@@ -121,7 +121,13 @@ def _process_argv(pid: int) -> list[str] | None:
             fields = raw[argv_start:].split(b"\0")
             if len(fields) - 1 < argc:
                 return None
-            return [os.fsdecode(field) for field in fields[:argc]]
+            argv = [os.fsdecode(field) for field in fields[:argc]]
+            # Candidates are pre-filtered to Python interpreters, so a real
+            # argv[0] names Python. Anything else means the padding skip ate an
+            # empty argv[0] and shifted the list: refuse it as unknown.
+            if not argv or "python" not in os.path.basename(argv[0]).lower():
+                return None
+            return argv
         except (OSError, AttributeError, TypeError, ValueError):
             return None
         return None

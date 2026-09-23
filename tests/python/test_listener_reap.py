@@ -474,6 +474,11 @@ def test_project_root_with_spaces_uses_exact_argv_boundaries(monkeypatch) -> Non
         # Empty argv[0] cannot be distinguished from exec-path padding. With
         # too few remaining strings, the only safe interpretation is unknown.
         (2, b"/bin/python\0\0\0script\0", None),
+        # Empty argv[0] followed by padding: the skip shifts the list onto an
+        # environment string or trailing padding. argv[0] is then not Python,
+        # so the result must be unknown rather than a shifted argv.
+        (2, b"/bin/python\0\0\0\0" + b"3\0K=V\0", None),
+        (2, b"/bin/python\0\0\0\0" + b"3\0\0\0", None),
         (2, b"/bin/python\0\0python\0unterminated", None),
         (0, b"/bin/python\0python\0", None),
         (65536, b"/bin/python\0python\0", None),
