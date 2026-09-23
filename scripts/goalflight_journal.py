@@ -879,7 +879,14 @@ def _sqlite_connect(
     timeout: float = 5.0,
     isolation_level: str | None = "",
 ) -> sqlite3.Connection:
-    """Small injection seam for deterministic readonly-open failure tests."""
+    """Shared connection seam for deterministic journal-open tests."""
+    counter_path = os.environ.get("GOALFLIGHT_TEST_SQLITE_CONNECT_COUNTER", "").strip()
+    if counter_path:
+        try:
+            with open(counter_path, "a", encoding="utf-8") as counter:
+                counter.write(f"{os.getpid()}\t{database}\n")
+        except OSError:
+            pass
     return sqlite3.connect(
         database,
         uri=uri,
@@ -1148,6 +1155,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
+        persistent: bool = False,
         retry_budget_s: float = JOURNAL_READER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
@@ -1160,7 +1168,9 @@ class Journal:
         whole-database startup integrity check and schema bootstrap performed by
         the ordinary constructor. Every read uses either a mode=ro connection or
         a mode=rw handle immediately hardened with query_only, then checks the
-        live epoch fence in ``read_all``.
+        live epoch fence in ``read_all``. A persistent reader keeps that
+        read-only connection between calls and ends each read transaction before
+        returning.
         """
         root = goalflight_task.resolve_project_root_for_read(str(project_root))
         if root is None:
@@ -1182,6 +1192,9 @@ class Journal:
         )
         self._require_existing_database()
         self._read_only_client = True
+        self._persistent_reader = bool(persistent)
+        self._reader_connection: sqlite3.Connection | None = None
+        self._reader_pid: int | None = None
         return self
 
     def _configure(
@@ -1218,6 +1231,9 @@ class Journal:
         self.jitter_min_s = jitter_min_s
         self.jitter_max_s = jitter_max_s
         self._read_only_client = False
+        self._persistent_reader = False
+        self._reader_connection: sqlite3.Connection | None = None
+        self._reader_pid: int | None = None
         self._file_identity: tuple[int, int] | None = None
 
     def _acquire_construction_lock(self) -> tuple[goalflight_task.FileLock, float]:
@@ -1313,6 +1329,27 @@ class Journal:
             os.close(fd)
 
     def _connect(self, *, busy_deadline_s: float | None = None) -> sqlite3.Connection:
+        if (
+            self._read_only_client
+            and self._persistent_reader
+            and self._reader_connection is not None
+        ):
+            if self._reader_pid != os.getpid():
+                # Never use a sqlite handle inherited across fork in the child.
+                self._reader_connection.close()
+                self._reader_connection = None
+                self._reader_pid = None
+            else:
+                try:
+                    self._require_existing_database()
+                except BaseException:
+                    # A replacement database cannot safely inherit this reader's
+                    # authority; the existing identity fence intentionally fails
+                    # closed instead of reopening against a new file.
+                    self._reader_connection.close()
+                    self._reader_connection = None
+                    raise
+                return self._reader_connection
         started = time.monotonic()
         open_started = started
         attempts = 0
@@ -1328,7 +1365,7 @@ class Journal:
                         isolation_level=None,
                     )
                 else:
-                    connection = sqlite3.connect(
+                    connection = _sqlite_connect(
                         self.path.as_uri() + "?mode=rw",
                         uri=True,
                         timeout=0,
@@ -1368,14 +1405,22 @@ class Journal:
                     ) from exc
                 raise
             try:
-                connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA busy_timeout = 0")
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA synchronous = FULL")
-                self._require_existing_database()
-                return connection
+                configured = False
+                try:
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA busy_timeout = 0")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute("PRAGMA synchronous = FULL")
+                    self._require_existing_database()
+                    if self._read_only_client and self._persistent_reader:
+                        self._reader_connection = connection
+                        self._reader_pid = os.getpid()
+                    configured = True
+                    return connection
+                finally:
+                    if not configured:
+                        connection.close()
             except sqlite3.OperationalError as exc:
-                connection.close()
                 if self._read_only_client and _is_corruption_error(exc):
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if not _is_busy(exc):
@@ -2467,16 +2512,26 @@ class Journal:
         attempts = 0
         while True:
             attempts += 1
+            connection: sqlite3.Connection | None = None
             try:
-                with contextlib.closing(
-                    self._connect(busy_deadline_s=deadline)
-                ) as connection:
+                connection = self._connect(busy_deadline_s=deadline)
+                try:
                     return action(connection)
+                finally:
+                    if self._read_only_client and self._persistent_reader:
+                        if connection.in_transaction:
+                            connection.rollback()
+                    else:
+                        connection.close()
             except JournalBusy:
                 # _connect already spent this operation's retry budget. Starting
                 # another full window here would silently double the contract.
                 raise
             except sqlite3.OperationalError as exc:
+                if connection is not None and self._read_only_client and self._persistent_reader:
+                    self._reader_connection = None
+                    self._reader_pid = None
+                    connection.close()
                 if not _is_busy(exc):
                     self._raise_disappeared_or_unverified(exc)
                     raise
@@ -2486,6 +2541,16 @@ class Journal:
                     f"{operation} remained busy after {attempts} attempts "
                     f"within {self.retry_budget_s:.3f}s: {self.path}"
                 ) from exc
+
+    def _data_version(self) -> int:
+        """Read SQLite's cheap cross-connection commit counter."""
+        def action(connection: sqlite3.Connection) -> int:
+            row = connection.execute("PRAGMA data_version").fetchone()
+            if row is None:
+                raise JournalIntegrityError("journal data version is unavailable")
+            return int(row[0])
+
+        return self._read_with_retry("journal data version read", action)
 
     def epochs(self) -> JournalEpochs:
         return self._read_with_retry(
