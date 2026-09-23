@@ -9520,6 +9520,15 @@ def _withdraw_preflight(args):
     if goalflight_ledger.record_is_unreadable(record):
         raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
     carrier = _queue_entry_path(args.dispatch_id)
+    active = _claim_has_active_carrier(carrier.parent, args.dispatch_id)
+    if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
+        raise ValueError(
+            f"carrier launch ownership is {active.kind.value} ({active.reason}); "
+            "withdraw never kills a live worker. Wait for launch to settle and verify "
+            "the launcher identity before retrying."
+        )
+    if active:
+        carrier = Path(active.path)
     entry = json.loads(carrier.read_text()) if carrier.exists() else {}
     root_value = args.project_root or (record or entry).get("project_root") or str(Path.cwd())
     root = goalflight_task.resolve_project_root_for_read(str(root_value))
@@ -9627,6 +9636,11 @@ def _cmd_withdraw(argv: list[str]) -> int:
             # Block queue claims while rechecking evidence and publishing in authority order.
             with _queue_mutation_lock(carrier.parent), goalflight_ledger.StateLock():
                 root, _, attempt, record, carrier, outcome, withdrawn = _withdraw_preflight(args)
+                if withdrawn and record and record.get("terminal_state") == attempt["terminal_state"] and not carrier.exists():
+                    payload.update(status="already withdrawn", withdrawn_by=outcome["withdrawn_by"])
+                    print(json.dumps(payload, sort_keys=True) if args.json else
+                          f"{args.dispatch_id}: already withdrawn by {payload['withdrawn_by']}")
+                    return 0
                 authority = goalflight_journal.Journal(root)
                 result = authority.commit_terminal(
                     attempt["attempt_id"], terminal_state=terminal_state, event_type="blocked",
