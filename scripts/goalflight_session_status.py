@@ -3228,6 +3228,7 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
     --force-release-stale or claim --force to take over instead.
     """
     msgs: list[str] = []
+    refused = False
     if queue is not None and queue.exists():
         resolved = _validate_queue_in_project(project_root, queue)
         if resolved is None:
@@ -3287,17 +3288,32 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
                     isinstance(v, dict) for v in raw.values()
                 ):
                     # Old single-record shape (back-compat) — drop the whole file.
-                    sf.unlink()
-                    msgs.append("cleared session file (back-compat)")
+                    if _session_owner_liveness(raw) is True:
+                        sf.unlink()
+                        msgs.append("cleared session file (back-compat)")
+                    else:
+                        refused = True
+                        msgs.append(
+                            "refused to clear session file: process identity mismatch"
+                        )
                 else:
                     # Map shape: remove only this pid's slot.
                     if my_pid in raw:
-                        del raw[my_pid]
-                    if raw:
-                        _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
-                    else:
-                        sf.unlink()
-                    msgs.append("cleared this terminal's session slot")
+                        slot = raw[my_pid]
+                        if not isinstance(slot, dict) or _session_owner_liveness(slot) is not True:
+                            refused = True
+                            msgs.append(
+                                "refused to clear session slot: process identity mismatch"
+                            )
+                        else:
+                            del raw[my_pid]
+                            if raw:
+                                _atomic_write(sf, json.dumps(raw, indent=2) + "\n")
+                            else:
+                                sf.unlink()
+                            msgs.append("cleared this terminal's session slot")
+    if refused:
+        return False, "; ".join(msgs)
     if not msgs:
         return False, "nothing to release"
     return True, "; ".join(msgs)

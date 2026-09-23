@@ -8863,27 +8863,44 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> bool:
     with contextlib.suppress(OSError, AttributeError):
         if hasattr(os, "getpgrp") and pgid == os.getpgrp():
             return False  # never signal the orchestrator's own process group
-    # Re-check liveness immediately before signalling: if worker_pid was reused
-    # and is now a live unrelated process, skip rather than risk a wrong target.
-    if goalflight_compat.pid_alive(worker_pid):
-        return False
     expected_identity = entry.get("worker_identity")
     if not isinstance(expected_identity, dict) or not expected_identity.get("start_token"):
         # Old pidfiles cannot prove which process generation owned this group.
         # Unknown identity is not permission to signal a reused PID.
         return False
-    current_identity = goalflight_ledger.process_identity(worker_pid)
-    matched, _reason = goalflight_ledger.compare_fine_process_identities(
-        worker_pid, expected_identity, current_identity
-    )
-    if not matched:
+    try:
+        if expected_identity.get("pid") and int(expected_identity["pid"]) != worker_pid:
+            return False
+    except (TypeError, ValueError):
         return False
-    # killpg the group DIRECTLY -- not via kill_pid, whose empty-group fallback
-    # to a bare kill(worker_pid) could hit a reused pid. An empty/gone group
-    # (ProcessLookupError) or a Windows-absent os.killpg degrades to a no-op.
+    current_identity = goalflight_ledger.process_identity(worker_pid)
+    if current_identity is None:
+        # process_identity() returns None for a dead PID. Confirm that the
+        # liveness probe agrees; an unavailable probe is not a kill warrant.
+        if goalflight_compat.pid_liveness(worker_pid) is not False:
+            return False
+    else:
+        current_start = current_identity.get("start_token")
+        if not current_start or current_start == expected_identity.get("start_token"):
+            # The recorded generation is still alive, or its identity cannot be
+            # established. Neither case authorizes a group signal.
+            return False
+        # A different start token proves the recorded leader generation is gone.
+
+    # A process-group ID cannot be reused while a member of the original group
+    # exists. Probe the group before signalling so a dead leader with lingering
+    # children can be reaped without ever falling back to the reused PID.
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True  # the whole group is already absent; pidfile is safe to drop
+    except (PermissionError, OSError, AttributeError):
+        return False
     try:
         os.killpg(pgid, getattr(signal, "SIGTERM", 15))
-    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError, AttributeError):
         return False
     return True
 

@@ -1070,6 +1070,33 @@ def test_ensure_session_does_not_pin_same_pid_across_generation_reuse(
     assert second["process_identity"]["start_token"] == "new"
 
 
+def test_release_does_not_clear_reused_pid_session_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    pid = os.getpid()
+    path = root / sessions.SESSION_FILE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old_record = {
+        "id": "old-generation",
+        "pid": pid,
+        "started_at": "2026-09-23T00:00:00Z",
+        "hostname": "test-host",
+        "process_identity": {"pid": pid, "start_token": "old-token"},
+    }
+    path.write_text(json.dumps({str(pid): old_record}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda current_pid: {"pid": current_pid, "start_token": "new-token"},
+    )
+
+    released, _message = sessions.release(root, None)
+
+    assert released is False
+    assert json.loads(path.read_text(encoding="utf-8"))[str(pid)] == old_record
+
+
 def test_queue_claim_refuses_when_process_identity_is_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

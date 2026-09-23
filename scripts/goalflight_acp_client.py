@@ -632,6 +632,17 @@ def cleanup_ghosts(
             pid = entry.get("pid")
             if not isinstance(pid, int) or pid in own_worker_pids:
                 continue
+            try:
+                pgid = int(entry.get("pgid", pid))
+            except (TypeError, ValueError):
+                pgid = pid
+
+            def group_not_proven_gone() -> bool:
+                # Never pass an invalid/low PGID to killpg(0): that could probe
+                # the controller's own process group. Unknown group identity
+                # retains the pidfile as recovery evidence.
+                return pgid <= 1 or _pgid_liveness(pgid) is not False
+
             is_bash_tail = is_bash_tail_pidfile and str(
                 entry.get("agent", "")
             ).endswith("-bash-tail")
@@ -641,7 +652,7 @@ def cleanup_ghosts(
                 # A bash-tail worker can outlive its controller before the launcher's
                 # finally block detach-stamps it. None is a ghost merely because no
                 # live owner is known. Keep an identity-matching live worker and its
-                # pidfile; once the worker dies, unlink the stale pidfile below.
+                # pidfile; once the worker and its whole group are gone, unlink it.
                 protected_live = False
                 if goalflight_compat.is_windows():
                     protected_live = goalflight_compat.pid_alive(pid)
@@ -681,6 +692,11 @@ def cleanup_ghosts(
                         skipped_unowned += 1
                     preserve_pidfile = True
                     continue
+                if group_not_proven_gone():
+                    # A dead or unprobeable leader does not prove its group is
+                    # gone. Retain the pidfile until a later sweep can recover
+                    # the remaining group or prove the group absent.
+                    preserve_pidfile = True
                 continue
             if goalflight_compat.is_windows():
                 liveness = goalflight_compat.pid_liveness(pid)
@@ -727,6 +743,8 @@ def cleanup_ghosts(
                     recorded_meta, live_meta
                 ):
                     preserve_pidfile = True
+                elif group_not_proven_gone():
+                    preserve_pidfile = True
                 log.warning(
                     "ghost_cleanup: pid=%d missing fine process identity; skipping kill",
                     pid,
@@ -738,9 +756,7 @@ def cleanup_ghosts(
             )
             if not matched:
                 skipped_stale += 1
-                if reason == "identity_indeterminate" and goalflight_compat.pid_alive(
-                    pid
-                ):
+                if group_not_proven_gone():
                     preserve_pidfile = True
                 log.warning(
                     "ghost_cleanup: pid=%d stale reason=%s live=%r recorded=%r",
@@ -751,17 +767,14 @@ def cleanup_ghosts(
                 )
                 continue
             current_identity2 = goalflight_ledger.process_identity(pid)
-            matched2, reason2 = goalflight_ledger.compare_fine_process_identities(
+            matched2, _reason2 = goalflight_ledger.compare_fine_process_identities(
                 pid, current_identity, current_identity2
             )
             if not matched2:
                 skipped_stale += 1
-                if reason2 == "identity_indeterminate" and goalflight_compat.pid_alive(
-                    pid
-                ):
+                if group_not_proven_gone():
                     preserve_pidfile = True
                 continue
-            pgid = entry.get("pgid", pid)
             agent = entry.get("agent", "")
             is_bash_tail = str(agent).endswith("-bash-tail")
             hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -780,6 +793,12 @@ def cleanup_ghosts(
                 killed += 1
                 killed_worker = True
             if not killed_worker and goalflight_compat.pid_alive(pid):
+                preserve_pidfile = True
+            if not killed_worker and group_not_proven_gone():
+                preserve_pidfile = True
+            if killed_worker and group_not_proven_gone():
+                # A successful signal is not proof that the whole group has
+                # reaped. Keep recovery evidence while any group remains.
                 preserve_pidfile = True
         if not preserve_pidfile:
             pf.unlink(missing_ok=True)

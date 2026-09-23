@@ -8,6 +8,7 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("asserts POSIX bash process identity strings")
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -209,6 +210,67 @@ def case_posix_cleanup_preserves_live_legacy_pidfile() -> None:
 
     assert killed == 0
     assert preserved
+
+
+def case_posix_cleanup_preserves_pidfile_when_worker_identity_is_dead() -> None:
+    """A non-signal dead/unknown identity retains a live group as evidence."""
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        worker_identity = goalflight_ledger.process_identity(worker.pid)
+        assert worker_identity and worker_identity.get("start_token"), worker_identity
+        with tempfile.TemporaryDirectory() as td:
+            pid_dir = Path(td)
+            controller_pid = 999999
+            pidfile = pid_dir / f"{controller_pid}.jsonl"
+            pidfile.write_text(
+                json.dumps(
+                    {
+                        "pid": worker.pid,
+                        "pgid": worker.pid,
+                        "controller_pid": controller_pid,
+                        "controller_identity": {
+                            "pid": controller_pid,
+                            "start_token": "old-controller",
+                        },
+                        "worker_identity": worker_identity,
+                        "agent": "codex-acp",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), patch(
+                "goalflight_acp_client._list_posix_process_rows", return_value=[]
+            ), patch(
+                "goalflight_acp_client._claude_acp_shim_executable_paths",
+                return_value=set(),
+            ), patch(
+                "goalflight_acp_client.reap_orphaned_acp_shims",
+                return_value={"reaped": []},
+            ), patch(
+                "goalflight_acp_client.reap_quota_stuck_workers",
+                return_value={"reaped": []},
+            ), patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": controller_pid, "start_token": "new-controller"},
+            ), patch(
+                "goalflight_acp_client.goalflight_ledger.process_identity",
+                return_value=None,
+            ), patch(
+                "goalflight_acp_client.goalflight_compat.kill_pid",
+                side_effect=AssertionError("unknown worker identity must not signal"),
+            ):
+                killed = goalflight_acp_client.cleanup_ghosts()
+            assert killed == 0
+            assert pidfile.exists(), "live group evidence must be preserved"
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(worker.pid), goalflight_acp_client.signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            worker.wait(timeout=5)
 
 
 def case_indeterminate_connection_kill_retains_tracking() -> None:
@@ -1212,6 +1274,7 @@ def main() -> None:
     case_windows_cleanup_kills_confirmed_live_identity()
     case_windows_cleanup_unlinks_confirmed_dead_pid()
     case_posix_cleanup_preserves_live_legacy_pidfile()
+    case_posix_cleanup_preserves_pidfile_when_worker_identity_is_dead()
     case_indeterminate_connection_kill_retains_tracking()
     case_connection_fallback_refuses_reused_pid()
     case_hard_signal_reap_deadline_retains_live_scope()
