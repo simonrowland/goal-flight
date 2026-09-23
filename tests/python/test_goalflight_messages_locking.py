@@ -2,12 +2,14 @@
 
 import contextlib
 import errno
+import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
 import subprocess
 import signal
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -59,15 +61,15 @@ def test_stream_ingestion_stream_reentry_completes():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         stream = base / "worker.jsonl"
-        original_load = messages._load_ingestion_identity_orders
+        original_select = messages._select_ingestion_order
 
-        def load_with_stream_reentry(path):
+        def load_with_stream_reentry(conn, db_path, identity_hash):
             with messages.carrier_transaction(stream, lock_timeout_secs=0.05):
-                return original_load(path)
+                return original_select(conn, db_path, identity_hash)
 
         with messages.carrier_transaction(stream, lock_timeout_secs=0.05):
             with mock.patch.object(messages, "_canonical_envelope_identity", return_value="event"):
-                with mock.patch.object(messages, "_load_ingestion_identity_orders", side_effect=load_with_stream_reentry):
+                with mock.patch.object(messages, "_select_ingestion_order", side_effect=load_with_stream_reentry):
                     assert messages._ingestion_order_for_envelope(base, {}) > 0
 
 
@@ -124,6 +126,254 @@ def test_ingestion_lock_timeout_names_path_and_never_writes():
                         raise AssertionError("contention treated as success")
         assert not path.exists()
         assert not (base / messages.INGESTION_ORDER_FILE).exists()
+        assert not (base / messages.INGESTION_IDENTITY_DB).exists()
+
+
+def _legacy_map(base, orders):
+    (base / messages.INGESTION_IDENTITY_FILE).write_text(json.dumps({
+        "schema": messages.INGESTION_IDENTITY_SCHEMA,
+        "schema_version": 1,
+        "orders": orders,
+    }))
+
+
+def _by_id():
+    return mock.patch.object(messages, "_canonical_envelope_identity", side_effect=lambda e: e["id"])
+
+
+def test_ingestion_order_hit_and_miss_use_sqlite_without_a_map():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        with _by_id():
+            first = messages._ingestion_order_for_envelope(base, {"id": "a"})
+            second = messages._ingestion_order_for_envelope(base, {"id": "b"})
+            with mock.patch.object(messages, "mail_lock", side_effect=AssertionError("hit took the lock")):
+                assert messages._ingestion_order_for_envelope(base, {"id": "a"}) == first
+        assert second > first
+        assert int((base / messages.INGESTION_ORDER_FILE).read_text()) == second
+        assert not (base / messages.INGESTION_IDENTITY_FILE).exists()
+        with sqlite3.connect(base / messages.INGESTION_IDENTITY_DB) as conn:
+            rows = conn.execute("SELECT identity_hash, ingestion_order FROM identities").fetchall()
+        assert sorted(order for _, order in rows) == [first, second]
+        assert all(len(identity_hash) == 64 for identity_hash, _ in rows)
+
+
+_CONCURRENT_INGEST = """
+import sys
+from pathlib import Path
+from unittest import mock
+sys.path.insert(0, sys.argv[2])
+import goalflight_messages as messages
+with mock.patch.object(messages, "_canonical_envelope_identity", return_value="same"):
+    print(messages._ingestion_order_for_envelope(Path(sys.argv[1]), {}))
+"""
+
+
+def test_same_identity_from_concurrent_processes_gets_one_order():
+    scripts = str(Path(messages.__file__).resolve().parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        procs = [
+            subprocess.Popen([sys.executable, "-c", _CONCURRENT_INGEST, tmp, scripts], stdout=subprocess.PIPE, text=True)
+            for _ in range(8)
+        ]
+        outputs = [proc.communicate(timeout=30)[0].strip() for proc in procs]
+        assert all(proc.returncode == 0 for proc in procs)
+        assert len(set(outputs)) == 1
+        with sqlite3.connect(Path(tmp) / messages.INGESTION_IDENTITY_DB) as conn:
+            assert conn.execute("SELECT count(*) FROM identities").fetchone() == (1,)
+        assert (Path(tmp) / messages.INGESTION_ORDER_FILE).read_text().strip() == outputs[0]
+
+
+def test_legacy_map_imports_in_one_transaction_and_keeps_orders():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        _legacy_map(base, {"old": 7, "older": 3})
+        (base / messages.INGESTION_ORDER_FILE).write_text("7\n")
+        with _by_id():
+            fresh = messages._ingestion_order_for_envelope(base, {"id": "new"})
+            assert messages._ingestion_order_for_envelope(base, {"id": "old"}) == 7
+            assert messages._ingestion_order_for_envelope(base, {"id": "older"}) == 3
+        assert fresh > 7
+        assert not (base / messages.INGESTION_IDENTITY_FILE).exists()
+        assert len(list(base.glob(messages.INGESTION_IDENTITY_FILE + ".imported-*"))) == 1
+
+
+def test_failed_legacy_import_rolls_back_and_keeps_the_map():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        _legacy_map(base, {"a": 1, "b": 2})
+        real_connect = sqlite3.connect
+
+        class FailingConn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def executemany(self, *args):
+                self._conn.executemany(*args)
+                raise sqlite3.OperationalError("disk full")
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        with _by_id():
+            with mock.patch.object(messages.sqlite3, "connect", side_effect=lambda *a, **k: FailingConn(real_connect(*a, **k))):
+                try:
+                    messages._ingestion_order_for_envelope(base, {"id": "c"})
+                except messages.MessageError as exc:
+                    assert "legacy ingestion identity import failed" in str(exc)
+                else:
+                    raise AssertionError("failed import treated as success")
+        assert (base / messages.INGESTION_IDENTITY_FILE).exists()
+        with sqlite3.connect(base / messages.INGESTION_IDENTITY_DB) as conn:
+            assert conn.execute("SELECT count(*) FROM identities").fetchone() == (0,)
+
+
+def test_interim_shard_stores_import_with_earliest_order_winning():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        digest = lambda identity: hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        (base / (messages.INGESTION_IDENTITY_FILE + ".migrated")).write_text(json.dumps({
+            "schema": messages.INGESTION_IDENTITY_SCHEMA, "schema_version": 1, "orders": {"hist": 3},
+        }))
+        shard_dir = base / ".ingestion-identities.d"
+        for identity, order in (("hist", 3), ("window", 9)):
+            entry = shard_dir / digest(identity)[:2] / digest(identity)
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text(f"{order}\n")
+        _legacy_map(base, {"hist": 40, "window": 41, "after": 42})
+        (base / messages.INGESTION_ORDER_FILE).write_text("42\n")
+        with _by_id():
+            assert messages._ingestion_order_for_envelope(base, {"id": "hist"}) == 3
+            assert messages._ingestion_order_for_envelope(base, {"id": "window"}) == 9
+            assert messages._ingestion_order_for_envelope(base, {"id": "after"}) == 42
+            assert messages._ingestion_order_for_envelope(base, {"id": "fresh"}) > 42
+        assert not shard_dir.exists()
+        assert not (base / (messages.INGESTION_IDENTITY_FILE + ".migrated")).exists()
+        assert len(list(base.glob("*.imported-*"))) == 3
+
+
+def test_upgraded_install_imports_a_large_legacy_map_on_first_ingestion():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        legacy_orders = {f"identity-{i}": i + 1 for i in range(5000)}
+        _legacy_map(base, legacy_orders)
+        (base / messages.INGESTION_ORDER_FILE).write_text("5000\n")
+        with _by_id():
+            assert messages._ingestion_order_for_envelope(base, {"id": "identity-4321"}) == 4322
+            assert messages._ingestion_order_for_envelope(base, {"id": "fresh"}) > 5000
+        assert not (base / messages.INGESTION_IDENTITY_FILE).exists()
+        with sqlite3.connect(base / messages.INGESTION_IDENTITY_DB) as conn:
+            assert conn.execute("SELECT count(*) FROM identities").fetchone() == (5001,)
+
+
+_RACING_UPGRADE = """
+import sys
+from pathlib import Path
+from unittest import mock
+sys.path.insert(0, sys.argv[2])
+import goalflight_messages as messages
+with mock.patch.object(messages, "_canonical_envelope_identity", side_effect=lambda e: e["id"]):
+    print(messages._ingestion_order_for_envelope(Path(sys.argv[1]), {"id": sys.argv[3]}))
+"""
+
+
+def test_processes_racing_the_upgrade_import_agree_on_every_order():
+    scripts = str(Path(messages.__file__).resolve().parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        _legacy_map(base, {f"identity-{i}": i + 1 for i in range(3000)})
+        (base / messages.INGESTION_ORDER_FILE).write_text("3000\n")
+        wanted = ["identity-7", "identity-2999", "new-a", "new-a", "new-b", "identity-7"]
+        procs = [
+            subprocess.Popen([sys.executable, "-c", _RACING_UPGRADE, tmp, scripts, identity], stdout=subprocess.PIPE, text=True)
+            for identity in wanted
+        ]
+        results = [int(proc.communicate(timeout=60)[0]) for proc in procs]
+        assert all(proc.returncode == 0 for proc in procs)
+        got = dict(zip(wanted, results))
+        assert [got[i] for i in wanted] == results
+        assert got["identity-7"] == 8 and got["identity-2999"] == 3000
+        assert got["new-a"] > 3000 and got["new-b"] > 3000 and got["new-a"] != got["new-b"]
+        assert len(list(base.glob(messages.INGESTION_IDENTITY_FILE + ".imported-*"))) == 1
+
+
+def test_import_failing_on_a_later_source_rolls_back_every_source():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        interim = base / (messages.INGESTION_IDENTITY_FILE + ".migrated")
+        interim.write_text(json.dumps({
+            "schema": messages.INGESTION_IDENTITY_SCHEMA, "schema_version": 1, "orders": {"hist": 3},
+        }))
+        _legacy_map(base, {"live": 4})
+        real_connect = sqlite3.connect
+        calls = {"n": 0}
+
+        class FailSecondSource:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def executemany(self, *args):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._conn.executemany(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        with _by_id():
+            with mock.patch.object(messages.sqlite3, "connect", side_effect=lambda *a, **k: FailSecondSource(real_connect(*a, **k))):
+                try:
+                    messages._ingestion_order_for_envelope(base, {"id": "c"})
+                except messages.MessageError as exc:
+                    assert "disk I/O error" in str(exc)
+                else:
+                    raise AssertionError("failed import treated as success")
+        assert calls["n"] == 2
+        assert interim.exists() and (base / messages.INGESTION_IDENTITY_FILE).exists()
+        with sqlite3.connect(base / messages.INGESTION_IDENTITY_DB) as conn:
+            assert conn.execute("SELECT count(*) FROM identities").fetchone() == (0,)
+
+
+def test_zero_byte_ingestion_db_fails_closed_instead_of_reading_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        (base / messages.INGESTION_IDENTITY_DB).write_bytes(b"")
+        with _by_id():
+            try:
+                messages._ingestion_order_for_envelope(base, {"id": "a"})
+            except messages.MessageError as exc:
+                assert "no identities table" in str(exc)
+            else:
+                raise AssertionError("empty store treated as an empty map")
+        assert not (base / messages.INGESTION_ORDER_FILE).exists()
+
+
+def test_legacy_map_recreated_by_old_code_never_changes_a_stored_order():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        with _by_id():
+            kept = messages._ingestion_order_for_envelope(base, {"id": "a"})
+            _legacy_map(base, {"a": kept + 100, "z": 5})
+            messages._ingestion_order_for_envelope(base, {"id": "b"})
+            assert messages._ingestion_order_for_envelope(base, {"id": "a"}) == kept
+            assert messages._ingestion_order_for_envelope(base, {"id": "z"}) == 5
+        assert not (base / messages.INGESTION_IDENTITY_FILE).exists()
+
+
+def test_corrupt_ingestion_db_fails_closed():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        db = base / messages.INGESTION_IDENTITY_DB
+        db.write_bytes(b"not a sqlite database" * 100)
+        with _by_id():
+            try:
+                messages._ingestion_order_for_envelope(base, {"id": "a"})
+            except messages.MessageError as exc:
+                assert str(db) in str(exc)
+            else:
+                raise AssertionError("corrupt store treated as an empty map")
+        assert not (base / messages.INGESTION_ORDER_FILE).exists()
 
 
 def test_fork_cannot_reuse_parent_lock_ownership():
@@ -166,7 +416,7 @@ def test_failed_acquisition_does_not_unlock_or_mask_timeout():
 def test_terminating_signal_posts_once_and_unwinds_outer_transaction():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
-        original_load = messages._load_ingestion_identity_orders
+        original_select = messages._select_ingestion_order
         original_lock = messages.mail_lock
         interrupted = False
 
@@ -181,19 +431,19 @@ def test_terminating_signal_posts_once_and_unwinds_outer_transaction():
             # Match watcher.handle_signal: the interrupted writer never resumes.
             raise SystemExit(128 + signal.SIGUSR1)
 
-        def interrupt_load(path):
+        def interrupt_load(conn, db_path, identity_hash):
             nonlocal interrupted
             if not interrupted:
                 interrupted = True
                 signal.raise_signal(signal.SIGUSR1)
-            return original_load(path)
+            return original_select(conn, db_path, identity_hash)
 
         def bounded_lock(path, **kwargs):
             return original_lock(path, timeout_secs=0.05)
 
         previous = signal.signal(signal.SIGUSR1, handler)
         try:
-            with mock.patch.object(messages, "_load_ingestion_identity_orders", side_effect=interrupt_load):
+            with mock.patch.object(messages, "_select_ingestion_order", side_effect=interrupt_load):
                 with mock.patch.object(messages, "mail_lock", side_effect=bounded_lock):
                     try:
                         post("outer")

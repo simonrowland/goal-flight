@@ -7,6 +7,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -1286,11 +1287,12 @@ def test_remerged_identical_steering_reuses_persisted_ingestion_order() -> None:
         assert_true("remerged carrier input path measured", remerged_path == fleet_path)
         assert_true("identical envelope reuses first ingestion order", second_order == first_order)
         assert_true("remerge cannot displace newer local steer", after_remerge["last_steering"]["payload"]["text"] == "newer local steer")
-        identity_store = messages_dir / ".ingestion-identities.json"
+        identity_store = messages_dir / messages.INGESTION_IDENTITY_DB
         assert_true("canonical ingestion identity store is outside carrier", identity_store.is_file() and identity_store.parent == messages_dir)
-        identity_document = json.loads(identity_store.read_text(encoding="utf-8"))
-        remote_identity = messages._canonical_envelope_identity(messages.read_envelopes(remote_path)[0])
-        assert_true("identity store keys the remote event to its first order", identity_document["orders"][remote_identity] == first_order)
+        remote_hash = messages._ingestion_identity_hash(messages.read_envelopes(remote_path)[0])
+        with contextlib.closing(sqlite3.connect(identity_store)) as conn:
+            stored = conn.execute("SELECT ingestion_order FROM identities WHERE identity_hash = ?", (remote_hash,)).fetchone()
+        assert_true("identity store keys the remote event to its first order", stored == (first_order,))
 
 
 def test_mcp_post_matches_file_append() -> None:

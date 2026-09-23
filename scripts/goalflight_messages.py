@@ -37,6 +37,7 @@ AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 INGESTION_ORDER_FILE = ".ingestion-order"
 INGESTION_IDENTITY_FILE = ".ingestion-identities.json"
 INGESTION_IDENTITY_SCHEMA = "goalflight.ingestion-identities.v1"
+INGESTION_IDENTITY_DB = "ingestion-identities.sqlite3"
 _HELD_MAIL_LOCKS: dict[tuple[int, int, Path], TextIO] = {}
 _INBOX_CURSOR_KEY_FIELD = "_goalflight_inbox_cursor_key"
 _INBOX_CURSOR_KEYS_FIELD = "_goalflight_inbox_cursor_keys"
@@ -553,35 +554,245 @@ def _load_ingestion_identity_orders(path: Path) -> dict[str, int]:
     return orders
 
 
-def _write_ingestion_identity_orders(path: Path, orders: dict[str, int]) -> None:
-    document = {
-        "schema": INGESTION_IDENTITY_SCHEMA,
-        "schema_version": 1,
-        "orders": dict(sorted(orders.items())),
-    }
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+def _ingestion_identity_hash(envelope: dict) -> str:
+    return hashlib.sha256(_canonical_envelope_identity(envelope).encode("utf-8")).hexdigest()
+
+
+_INGESTION_IDENTITY_TABLE = (
+    "CREATE TABLE identities("
+    "identity_hash TEXT PRIMARY KEY, "
+    "ingestion_order INTEGER NOT NULL CHECK (ingestion_order >= 1)"
+    ") WITHOUT ROWID"
+)
+
+
+def _create_ingestion_identity_db(db_path: Path) -> None:
+    """Build the store in a temp file and link it into place, so any file at
+    ``db_path`` already has its table and WAL mode. Caller holds the lock."""
+    tmp = db_path.with_name(f".{db_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        with contextlib.closing(sqlite3.connect(tmp, isolation_level=None)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(_INGESTION_IDENTITY_TABLE)
+        with contextlib.suppress(FileExistsError):
+            os.link(tmp, db_path)
+    except (OSError, sqlite3.Error) as exc:
+        raise MessageError(f"{db_path}: cannot create ingestion identity store: {exc}") from exc
     finally:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
+        for leftover in (tmp, tmp.with_name(tmp.name + "-wal"), tmp.with_name(tmp.name + "-shm")):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
+
+
+def _open_ingestion_identity_db(db_path: Path) -> sqlite3.Connection:
+    """Open an existing store read-write without ever creating one.
+
+    A file without the ``identities`` table is corrupt (the store is only
+    ever linked into place complete), so it fails closed rather than reading
+    as an empty map.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=5.0, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise MessageError(f"{db_path}: cannot open ingestion identity store: {exc}") from exc
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'identities'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise MessageError(f"{db_path}: invalid ingestion identity store: {exc}") from exc
+    if found is None:
+        conn.close()
+        raise MessageError(f"{db_path}: invalid ingestion identity store: no identities table")
+    return conn
+
+
+def _select_ingestion_order(conn: sqlite3.Connection, db_path: Path, identity_hash: str) -> int | None:
+    try:
+        row = conn.execute(
+            "SELECT ingestion_order FROM identities WHERE identity_hash = ?", (identity_hash,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise MessageError(f"{db_path}: unreadable ingestion identity store: {exc}") from exc
+    if row is None:
+        return None
+    value = row[0]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise MessageError(f"{db_path}: invalid ingestion identity entry")
+    return value
+
+
+def _read_shard_ingestion_identities(shard_dir: Path) -> list[tuple[str, int]]:
+    """Entries of the short-lived per-identity shard layout, keyed by the same sha256."""
+    rows = []
+    for entry in sorted(shard_dir.glob("[0-9a-f][0-9a-f]/*")):
+        if entry.name.startswith(".") or not entry.is_file():
+            continue
+        try:
+            value = int(entry.read_text(encoding="utf-8").strip())
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise MessageError(f"{entry}: invalid ingestion identity shard entry: {exc}") from exc
+        if len(entry.name) != 64 or value < 1:
+            raise MessageError(f"{entry}: invalid ingestion identity shard entry")
+        rows.append((entry.name, value))
+    return rows
+
+
+def _interim_ingestion_sources(messages_dir: Path) -> tuple[Path, Path]:
+    return (
+        messages_dir / f"{INGESTION_IDENTITY_FILE}.migrated",
+        messages_dir / ".ingestion-identities.d",
+    )
+
+
+def _read_ingestion_source(map_path: Path) -> list[tuple[str, int]]:
+    if map_path.is_dir():
+        return _read_shard_ingestion_identities(map_path)
+    return [
+        (hashlib.sha256(identity.encode("utf-8")).hexdigest(), order)
+        for identity, order in _load_ingestion_identity_orders(map_path).items()
+    ]
+
+
+def _ingestion_source_signature(path: Path) -> tuple[int, int, int] | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _prepare_interim_ingestion_imports(
+    messages_dir: Path,
+) -> list[tuple[Path, tuple[int, int, int] | None, list[tuple[str, int]]]]:
+    """Read the interim stores before taking the lock.
+
+    Nothing writes them any more, and reading ~50k shard files takes ~10 s,
+    far past the 5 s other callers wait on the ingestion lock.
+    """
+    prepared = []
+    for path in _interim_ingestion_sources(messages_dir):
+        signature = _ingestion_source_signature(path)
+        if signature is not None:
+            prepared.append((path, signature, _read_ingestion_source(path)))
+    return prepared
+
+
+def _import_legacy_ingestion_identities(
+    conn: sqlite3.Connection,
+    db_path: Path,
+    messages_dir: Path,
+    prepared: list[tuple[Path, tuple[int, int, int] | None, list[tuple[str, int]]]] = (),
+) -> None:
+    """Fold the legacy stores into SQLite without changing any stored order.
+
+    The legacy map keyed full canonical envelopes (~3.6 KB each) and was read
+    in full on every ingestion and rewritten in full on every new identity:
+    179 MB per call at 49,675 identities. Caller holds the ingestion mail lock.
+
+    Sources, oldest assignment first, so INSERT OR IGNORE keeps the earliest
+    order any store gave an identity:
+      1. ``.ingestion-identities.json.migrated`` - the full map an interim
+         shard build renamed aside on 2026-09-23;
+      2. ``.ingestion-identities.d/`` - that shard build's per-identity entries;
+      3. ``.ingestion-identities.json`` - the live map. Processes still on the
+         old code recreate it, so this also runs whenever it reappears.
+    Sources 1-2 arrive pre-read (``prepared``) and are skipped if another
+    process already imported them, or re-read under the lock if they changed
+    since. All sources import in one transaction and
+    are renamed aside only after it commits, so a failure leaves every source
+    in place for the next attempt.
+    """
+    sources = []
+    for path, signature, rows in prepared:
+        current = _ingestion_source_signature(path)
+        if current is None:
+            continue
+        sources.append((path, rows if current == signature else _read_ingestion_source(path)))
+    legacy = messages_dir / INGESTION_IDENTITY_FILE
+    if legacy.exists():
+        sources.append((legacy, _read_ingestion_source(legacy)))
+    if not sources:
+        return
+    conflicts = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS legacy_import("
+                "identity_hash TEXT PRIMARY KEY, ingestion_order INTEGER NOT NULL)"
+            )
+            for _, rows in sources:
+                conn.execute("DELETE FROM legacy_import")
+                conn.executemany("INSERT OR REPLACE INTO legacy_import VALUES (?, ?)", rows)
+                conn.execute(
+                    "INSERT OR IGNORE INTO identities SELECT identity_hash, ingestion_order FROM legacy_import"
+                )
+                conflicts += conn.execute(
+                    "SELECT count(*) FROM legacy_import JOIN identities USING (identity_hash) "
+                    "WHERE legacy_import.ingestion_order != identities.ingestion_order"
+                ).fetchone()[0]
+            conn.execute("DELETE FROM legacy_import")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+            raise
+    except sqlite3.Error as exc:
+        raise MessageError(f"{db_path}: legacy ingestion identity import failed: {exc}") from exc
+    if conflicts:
+        print(
+            f"goalflight_messages: {messages_dir}: kept {conflicts} stored ingestion order(s) "
+            "that a legacy store disagreed with",
+            file=sys.stderr,
+        )
+    for map_path, _ in sources:
+        try:
+            os.replace(map_path, map_path.with_name(f"{map_path.name}.imported-{uuid.uuid4().hex}"))
+        except OSError as exc:
+            raise MessageError(f"{map_path}: imported but could not be renamed aside: {exc}") from exc
 
 
 def _ingestion_order_for_envelope(messages_dir: Path, envelope: dict) -> int:
-    """Assign one durable controller-local order per canonical event identity."""
-    identity = _canonical_envelope_identity(envelope)
+    """Assign one durable controller-local order per canonical event identity.
+
+    Rows are only ever added (INSERT OR IGNORE), so a lock-free SELECT that
+    finds one is final. A miss takes the legacy map's mail lock, which also
+    excludes writers still running the old code, then imports any legacy map,
+    rechecks, and allocates from the shared ``.ingestion-order`` counter.
+    """
+    identity_hash = _ingestion_identity_hash(envelope)
+    db_path = messages_dir / INGESTION_IDENTITY_DB
+    if db_path.exists():
+        with contextlib.closing(_open_ingestion_identity_db(db_path)) as conn:
+            existing = _select_ingestion_order(conn, db_path, identity_hash)
+        if existing is not None:
+            return existing
+    prepared = _prepare_interim_ingestion_imports(messages_dir)
     path = messages_dir / INGESTION_IDENTITY_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with mail_lock(path, timeout_secs=5.0):
-        orders = _load_ingestion_identity_orders(path)
-        existing = orders.get(identity)
-        if existing is not None:
-            return existing
-        order = _next_ingestion_order(messages_dir)
-        orders[identity] = order
-        _write_ingestion_identity_orders(path, orders)
-        return order
+        if not db_path.exists():
+            _create_ingestion_identity_db(db_path)
+        with contextlib.closing(_open_ingestion_identity_db(db_path)) as conn:
+            _import_legacy_ingestion_identities(conn, db_path, messages_dir, prepared)
+            existing = _select_ingestion_order(conn, db_path, identity_hash)
+            if existing is not None:
+                return existing
+            order = _next_ingestion_order(messages_dir)
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO identities(identity_hash, ingestion_order) VALUES (?, ?)",
+                    (identity_hash, order),
+                )
+            except sqlite3.Error as exc:
+                raise MessageError(f"{db_path}: ingestion identity insert failed: {exc}") from exc
+            stored = _select_ingestion_order(conn, db_path, identity_hash)
+            if stored is None:
+                raise MessageError(f"{db_path}: ingestion identity insert did not persist")
+            return stored
 
 
 def _bounded_nonblank_string(value: object, *, path: str, limit: int) -> str:
