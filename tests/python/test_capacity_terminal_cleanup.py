@@ -377,6 +377,20 @@ def test_remote_lease_is_never_probed_or_reclaimed(tmp_path, monkeypatch):
     assert data["leases"][lease["lease_id"]]["state"] == "active"
 
 
+def test_hostname_drift_keeps_own_leases_local(monkeypatch):
+    # The state file was stamped when this machine had another hostname.
+    monkeypatch.setattr(cap, "machine_id", lambda: "SimonMaookProM5:arm64")
+    data = {"machine_id": "Simon-MacBookPro-M5.local:arm64", "leases": {}, "cooldowns": {}}
+    legacy = {"lease_id": "legacy", "state": "active"}
+    stamped = {"lease_id": "old-name", "state": "active", "machine_id": "Simon-MacBookPro-M5.local:arm64"}
+    current = {"lease_id": "new-name", "state": "active", "machine_id": "SimonMaookProM5:arm64"}
+    remote = {"lease_id": "studio", "state": "active", "machine_id": "Mac-Studio-256-1:arm64"}
+    assert cap._lease_is_local(legacy, data)
+    assert cap._lease_is_local(stamped, data)
+    assert cap._lease_is_local(current, data)
+    assert not cap._lease_is_local(remote, data)
+
+
 def test_release_does_not_free_unattached_live_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: True)
     monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: True)

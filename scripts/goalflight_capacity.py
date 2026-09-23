@@ -830,8 +830,22 @@ def _lease_machine_id(lease: dict, data: dict | None = None) -> str:
 
 
 def _lease_is_local(lease: dict, data: dict | None = None) -> bool:
-    """Only probe process identities for leases owned by this host."""
-    return _lease_machine_id(lease, data) == machine_id()
+    """Only probe process identities for leases owned by this host.
+
+    The capacity state file lives in this host's local temp directory, so the
+    machine id stamped on the file was written by this host. macOS hostnames
+    drift (network-assigned names), so ``machine_id()`` can differ from the
+    stamp written earlier by the same machine. A lease is local when it names
+    no machine, names the file's own stamp, or names the current hostname id;
+    only a lease naming some other machine is remote.
+    """
+    recorded = lease.get("machine_id")
+    if recorded in (None, ""):
+        return True
+    local_ids = {machine_id()}
+    if data is not None and data.get("machine_id") not in (None, ""):
+        local_ids.add(str(data["machine_id"]))
+    return str(recorded) in local_ids
 
 
 def _pid_holds_capacity(
