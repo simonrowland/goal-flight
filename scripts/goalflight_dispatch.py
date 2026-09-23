@@ -1048,7 +1048,9 @@ WORKER_EXECUTION_PREAMBLE = (
     "exact shape supplied by the dispatch-specific identity contract.\n"
     "- The `!COMPLETE:` line must be the last non-empty line of your output. "
     "Do not print anything after it.\n"
-    "- Legacy unprefixed marker lines remain accepted; new emissions use the `!` prefix."
+    "- The dispatch id is required: a COMPLETE, READY or RESULT line without this "
+    "dispatch's id is ignored. Only the leading `!` sigil is optional (older lines "
+    "without it still parse); new emissions use it."
 )
 
 
@@ -5320,10 +5322,11 @@ def _worker_prompt_preamble(
         preambles.append(_project_orientation_preamble(orientation_path))
     if is_cursor:
         preambles.append(CURSOR_TOOLING_PREAMBLE)
-    # Execution contract goes to the bash-tail agents only. ACP transports
-    # (cursor, codex-acp, claude-acp) carry terminal state in the protocol, so
-    # they do not need to be taught a text marker shape -- see
-    # test_dispatch_steer.case_preamble_routing_matrix, which pins that split.
+    # The execution contract goes to the grok/moonshot bash-tail agents only.
+    # Every text-path agent (codex, cursor, ...) is taught the id-bound marker
+    # shape by the identity contract in _materialize_steer_prompt; codex and
+    # cursor complete with that alone. test_dispatch_steer's
+    # case_preamble_routing_matrix pins this split.
     if agent in {"grok-code", "grok-research", "moonshot"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
     preambles.append(SCOPE_GUARD_PREAMBLE)
@@ -5343,7 +5346,14 @@ def _materialize_steer_prompt(
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
     preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
-    if agent not in {*CURSOR_AGENTS, "codex-acp", "claude-acp"}:
+    # The watcher binds success markers to the dispatch id, so every agent whose
+    # markers are scraped from a text tail must be told the id. That includes
+    # cursor: it runs on the text path, and an untold cursor worker signed off
+    # with its task id and was recorded worker_dead. The exclusion is keyed on
+    # agent name, not transport: cursor over ACP (GOALFLIGHT_CURSOR_ACP=1) also
+    # gets this text, which ACP ignores. codex-acp and claude-acp carry terminal
+    # state in the protocol and stay excluded.
+    if agent not in {"codex-acp", "claude-acp"}:
         preamble += (
             "\n\nTerminal evidence identity contract:\n"
             f"- Every terminal marker payload starts with the exact dispatch id `{dispatch_id}`.\n"
