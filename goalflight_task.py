@@ -1918,6 +1918,43 @@ def _write_bytes_fsync(path: Path, data: bytes) -> None:
         os.fsync(fh.fileno())
 
 
+def _clone_or_copy(src: Path, dst: Path) -> None:
+    """Clone file extents where supported, retaining copy2 metadata semantics."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes
+
+            clonefile = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).clonefile
+            clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+            clonefile.restype = ctypes.c_int
+            if clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
+                raise OSError(ctypes.get_errno(), "clonefile failed")
+        elif sys.platform.startswith("linux"):
+            import fcntl as native_fcntl
+
+            with src.open("rb") as source, dst.open("xb") as target:
+                native_fcntl.ioctl(target.fileno(), 0x40049409, source.fileno())  # FICLONE
+        else:
+            raise OSError("file cloning unavailable")
+        shutil.copystat(src, dst)
+        return
+    except Exception:
+        # A failed ioctl may have created an empty destination.
+        with contextlib.suppress(OSError):
+            dst.unlink()
+    shutil.copy2(src, dst)
+
+
+def _file_matches_bytes(path: Path, data: bytes) -> bool:
+    if not require_regular_or_absent(path) or path.stat().st_size != len(data):
+        return False
+    with path.open("rb") as source:
+        for offset in range(0, len(data), 1024 * 1024):
+            if source.read(1024 * 1024) != data[offset:offset + 1024 * 1024]:
+                return False
+        return not source.read(1)
+
+
 def _atomic_write_text(path: Path, text: str, *, prefix: str = ".tmp-") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
@@ -2646,7 +2683,7 @@ class TaskStore:
         _validate_items_for_write(items)
         staging = Path(tempfile.mkdtemp(prefix=".tasks-stage-", dir=str(self.docs_dir)))
         try:
-            self._write_staged_generation(staging, items)
+            unchanged = self._write_staged_generation(staging, items)
             _run_checker(staging)
             targets = {
                 self.tasks_path: staging / "tasks.jsonl",
@@ -2656,6 +2693,13 @@ class TaskStore:
                 self.bug_backlog_path: staging / "bug-backlog.md",
                 self.bugs_done_path: staging / "bugs-done.md",
             }
+            targets = {target: source for target, source in targets.items() if source.name not in unchanged}
+            if not targets:
+                if export:
+                    self._export_to_project_tree()
+                with contextlib.suppress(Exception):
+                    upsert_project_registry(self.project_root, throttle_s=PROJECT_REGISTRY_THROTTLE_S)
+                return
             old_bytes = {path: path.read_bytes() if require_regular_or_absent(path) else None for path in targets}
             generation = hashlib.sha256((staging / "tasks.jsonl").read_bytes()).hexdigest()
             self._write_publish_marker(generation)
@@ -2708,7 +2752,9 @@ class TaskStore:
             try:
                 if not require_regular_or_absent(src):
                     continue
-                _atomic_write_bytes(dst, src.read_bytes())
+                data = src.read_bytes()
+                if not _file_matches_bytes(dst, data):
+                    _atomic_write_bytes(dst, data)
             except (OSError, TaskError) as exc:
                 print(f"goalflight_task: export of {dst.name} failed (non-fatal): {exc}", file=sys.stderr)
 
@@ -2724,12 +2770,26 @@ class TaskStore:
         tmp.replace(path)
         _fsync_dir(path.parent)
 
-    def _write_staged_generation(self, staging: Path, items: list[dict[str, Any]]) -> None:
-        _write_text_fsync(staging / "tasks.jsonl", _items_jsonl(items))
-        _write_text_fsync(staging / "tasks-data.js", _items_data_js(self._mirror_items_for_script(items)))
-        for name, content in self.generated_markdown(items).items():
-            _write_text_fsync(staging / name, content)
+    def _write_staged_generation(self, staging: Path, items: list[dict[str, Any]]) -> set[str]:
+        contents = {
+            "tasks.jsonl": _items_jsonl(items),
+            "tasks-data.js": _items_data_js(self._mirror_items_for_script(items)),
+            **self.generated_markdown(items),
+        }
+        unchanged: set[str] = set()
+        for name, content in contents.items():
+            target = self.data_js_path if name == "tasks-data.js" else self.docs_dir / name
+            if _file_matches_bytes(target, content.replace("\n", os.linesep).encode("utf-8")):
+                # Checker still sees a complete generation, without rewriting it.
+                try:
+                    os.link(target, staging / name)
+                except OSError:
+                    _clone_or_copy(target, staging / name)
+                unchanged.add(name)
+            else:
+                _write_text_fsync(staging / name, content)
         _fsync_dir(staging)
+        return unchanged
 
     def _mirror_items_for_script(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows = self.derived_rows_for_items(items)
@@ -2817,13 +2877,13 @@ class TaskStore:
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         require_regular_file(self.tasks_path)
         require_regular_file(self.data_js_path)
-        shutil.copy2(self.tasks_path, self.log_dir / f"tasks-{stamp}.jsonl")
-        shutil.copy2(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
+        _clone_or_copy(self.tasks_path, self.log_dir / f"tasks-{stamp}.jsonl")
+        _clone_or_copy(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
         self._prune_backups()
 
     def _prune_backups(self, keep: int = 20) -> None:
         for pattern in ("tasks-*.jsonl", "tasks-data-*.js"):
-            backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+            backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.name, reverse=True)
             for path in backups[keep:]:
                 with contextlib.suppress(OSError):
                     path.unlink()
