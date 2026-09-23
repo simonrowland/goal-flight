@@ -273,7 +273,11 @@ def process_identity(pid: int | None) -> dict | None:
         return ident
     fields, probe_ok = _ps_identity(pid)
     if not probe_ok:
-        liveness = goalflight_compat.pid_liveness(pid)
+        # Same rule as the first probe: a failing re-probe is unknown, never a raise.
+        try:
+            liveness = goalflight_compat.pid_liveness(pid)
+        except (OSError, subprocess.SubprocessError):
+            liveness = None
         if liveness is False:
             return None
         ident = {

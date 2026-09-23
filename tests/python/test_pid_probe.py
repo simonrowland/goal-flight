@@ -375,7 +375,29 @@ def case_legacy_lstart_match_keeps_status_running_without_ownership() -> None:
         assert goalflight_status.done_code(record) == 1
 
 
+def case_ps_fallback_reprobe_failure_is_unknown_not_raise() -> None:
+    # The combined ps probe failed; the fallback liveness re-probe then raises
+    # (EPERM). The identity must come back indeterminate, never propagate.
+    state = {"ps_failed": False}
+
+    def ps_identity(_pid):
+        state["ps_failed"] = True
+        return None, False
+
+    def liveness(_pid):
+        if state["ps_failed"]:  # only the post-ps fallback re-probe fails
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+        return True
+
+    with patch.object(goalflight_ledger, "_ps_identity", side_effect=ps_identity), \
+            patch.object(goalflight_compat, "pid_liveness", side_effect=liveness):
+        ident = goalflight_ledger.process_identity(424242)
+    assert state["ps_failed"], "test must reach the ps fallback"
+    assert ident is not None and ident.get("identity_probe_error") is True, ident
+
+
 def main() -> None:
+    case_ps_fallback_reprobe_failure_is_unknown_not_raise()
     case_windows_pid_alive_does_not_call_os_kill()
     case_windows_access_denied_means_alive()
     case_windows_pid_liveness_without_windll_is_unknown()
