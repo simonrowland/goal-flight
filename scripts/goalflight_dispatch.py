@@ -4074,13 +4074,13 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
             args, refusal=refusal, forced_warning=forced_warning
         )
     if occupied is not None and not getattr(args, "from_queue", False):
-        # A queued row occupies with no process. A running/starting/
-        # waiting_capacity row whose holder already died (SIGKILL) leaves
-        # the kernel lock free; dropping the lock we just won would recreate
-        # the dual-launch TOCTOU until the watcher rewrites the ledger.
+        # A queued row is no longer an owning claim. A running row whose
+        # holder already died (SIGKILL) leaves the kernel lock free; dropping
+        # the lock we just won would recreate the dual-launch TOCTOU until the
+        # watcher rewrites the ledger. A starting row is post-admission and
+        # remains an owning claim.
         if inherited is None and occupied_state in {
             "running",
-            "starting",
         }:
             _bind_worktree_occupancy_lock(args, lock)
             return None
