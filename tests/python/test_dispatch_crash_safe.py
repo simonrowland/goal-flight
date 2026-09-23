@@ -1255,6 +1255,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         status = tmp_path / "status.json"
         started = tmp_path / "started"
         done = tmp_path / "done"
+        release = tmp_path / "release"
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
         env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
@@ -1266,7 +1267,9 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             "import pathlib, time\n"
             f"pathlib.Path({str(started)!r}).write_text('started')\n"
             "print('worker-started', flush=True)\n"
-            "time.sleep(8.0)\n"
+            f"release = pathlib.Path({str(release)!r})\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.05)\n"
             "print('COMPLETE: foreground-interrupt — interrupt-safe done', flush=True)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
         )
@@ -1354,6 +1357,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             assert _process_exists(worker_pid), "worker died during cleanup_ghosts sweep"
             assert pidfile.exists(), "live unowned pidfile stays available for re-attach"
 
+            release.write_text("release\n", encoding="utf-8")
             assert _wait_for(done.exists), "worker did not finish after launcher interrupt"
             assert _wait_for(
                 lambda: status.exists()

@@ -684,12 +684,14 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
             try:
                 ps_probe = _run(["ps", "-p", str(os.getpid()), "-o", "pid="], env)
             except PermissionError:
-                pytest.skip("ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+                print("SKIP: ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+                return
             if ps_probe.returncode and any(
                 reason in ps_probe.stderr.lower()
                 for reason in ("operation not permitted", "permission denied")
             ):
-                pytest.skip("ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+                print("SKIP: ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+                return
             assert ps_probe.returncode == 0, ps_probe.stderr
             env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "goal"
             with patch.dict(os.environ, env, clear=True):
@@ -1721,7 +1723,7 @@ if __name__ == "__main__":
     test_relative_worker_cwd_resolved_against_project_root_occupies()
     test_cwd_after_double_dash_in_argv_is_path_evidence()
     test_live_cwdless_matching_project_root_second_writer_is_refused()
-    test_synthetic_queued_record_with_target_cwd_still_blocks()
+    test_synthetic_starting_record_with_target_cwd_still_blocks()
     test_preset_bash_writer_refused_into_occupied_worktree()
     test_acp_writer_refused_into_occupied_worktree()
     test_live_watcher_stopped_incumbent_still_occupies()
