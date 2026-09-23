@@ -9054,6 +9054,21 @@ def cmd_listen(args) -> int:
         except (OSError, RuntimeError, ValueError):
             pending_report_settled = False
 
+    def wait_poll_interval(delay: float) -> int | None:
+        """Sleep one poll interval, still reacting to exit conditions every 0.25 s."""
+        sleep_until = time.monotonic() + delay
+        while time.monotonic() < sleep_until:
+            parent_result = parent_exit()
+            if parent_result is not None:
+                return parent_result
+            signal_result = signal_or_stdio_exit()
+            if signal_result is not None:
+                return signal_result
+            if deadline is not None and time.monotonic() >= deadline:
+                return finish("timeout", code=1, detail="no waking event before timeout")
+            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
+        return None
+
     while True:
         parent_result = parent_exit()
         if parent_result is not None:
@@ -9317,7 +9332,17 @@ def cmd_listen(args) -> int:
                     detail=f"listener ring stamp unavailable: {exc}",
                 )
             if not ring_claimed:
-                time.sleep(min(0.05, poll))
+                # The ring for this cursor version is already stamped (a sibling
+                # is waking the controller) or its lock is momentarily contended.
+                # Until the controller advances, every re-peek finds the same
+                # items and the same stamp, so re-peeking every 50 ms spun such
+                # listeners at ~20 journal reads/s (~45% CPU and ~1 MB/s of
+                # journal I/O each). Wait one normal poll interval instead; in
+                # the contended case a wake is delayed by at most one poll, never
+                # lost.
+                waited = wait_poll_interval(poll)
+                if waited is not None:
+                    return waited
                 continue
             positions = _cursor_positions(snapshot.items)
             advance_command = _cursor_advance_command(
@@ -9377,17 +9402,9 @@ def cmd_listen(args) -> int:
             death_watch.restore()
             return 0
         delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll
-        sleep_until = time.monotonic() + delay
-        while time.monotonic() < sleep_until:
-            parent_result = parent_exit()
-            if parent_result is not None:
-                return parent_result
-            signal_result = signal_or_stdio_exit()
-            if signal_result is not None:
-                return signal_result
-            if deadline is not None and time.monotonic() >= deadline:
-                return finish("timeout", code=1, detail="no waking event before timeout")
-            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
+        waited = wait_poll_interval(delay)
+        if waited is not None:
+            return waited
 
 
 def cmd_listen_auto(args) -> int:
