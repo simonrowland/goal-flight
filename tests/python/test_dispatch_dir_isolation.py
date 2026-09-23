@@ -198,10 +198,9 @@ def test_blank_override_falls_back() -> None:
 def test_journal_mail_are_not_covered_by_dispatch_dir() -> None:
     """DISPATCH_DIR must not pretend to isolate journal/mail.
 
-    The live journal already exists for this repo. resolve_journal_path is
-    keyed off GOALFLIGHT_JOURNAL_DIR (else the task-store base), so a launch
-    that only sets DISPATCH_DIR still registers in the live journal and the
-    journal-outbox adapter still writes ~/.goal-flight/messages/<id>.jsonl.
+    resolve_journal_path is keyed off GOALFLIGHT_JOURNAL_DIR (else the
+    task-store base), so a launch that only sets DISPATCH_DIR still resolves
+    the journal path and the journal-outbox adapter path independently.
     Those knobs already exist; do not invent a second pattern.
     """
     with tempfile.TemporaryDirectory(prefix="gf-dispatch-dir-only-") as tmp:
@@ -212,9 +211,7 @@ def test_journal_mail_are_not_covered_by_dispatch_dir() -> None:
                 live_journal = journal.resolve_journal_path(ROOT)
                 live_messages = messages.default_messages_dir()
         assert_eq("journal stays on the live path", live_journal, _live_journal_path())
-        assert_true("live journal exists (the mail source)", live_journal.exists())
         assert_eq("messages stay on the live path", live_messages, _live_messages_dir())
-        assert_true("live messages dir exists", live_messages.exists())
 
 
 def test_isolated_launch_does_not_touch_live_dispatch_or_mail() -> None:

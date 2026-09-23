@@ -243,7 +243,9 @@ def case_dispatch_acp_cfg_passes_resolved_prompt_file() -> None:
         finally:
             os.chdir(old_cwd)
 
-        assert cfg.prompt == str(prompt.resolve()), cfg.prompt
+        assert cfg.prompt is None, cfg.prompt
+        assert dispatch.SEARCH_SCOPE_PREAMBLE in cfg.prompt_text, cfg.prompt_text
+        assert "do work\n" in cfg.prompt_text, cfg.prompt_text
         assert cfg.original_prompt_file == str(prompt.resolve()), cfg.original_prompt_file
         env = acp._worker_spawn_env(cfg, acp._resolve_original_prompt_file(cfg))
         assert env["GOALFLIGHT_PROMPT_FILE"] == str(prompt.resolve()), env.get("GOALFLIGHT_PROMPT_FILE")

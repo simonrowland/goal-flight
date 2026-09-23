@@ -1485,7 +1485,7 @@ def main() -> None:
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()
     test_cpu_keep_waiting_all_none_is_unknown()
-    test_cpu_keep_waiting_real_ps_failure_is_unknown()
+    test_cpu_keep_waiting_uses_native_counter_when_ps_is_unavailable()
     test_idle_gate_busy_keeps_waiting()
     test_idle_gate_idle_is_wedged()
     test_idle_gate_unknown_cpu_keeps_waiting()

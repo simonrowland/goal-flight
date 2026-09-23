@@ -1383,12 +1383,13 @@ def test_quota_requeue_carries_cooldown_not_before(tmp_path: Path) -> None:
     entry, queue_dir, tail = _claimed_entry(tmp_path, dispatch_id)
     _terminal_record(dispatch_id, state="rate_limited", effective_account="seat-q")
     state_dir = Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
-    state_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     cooldown = "2030-01-02T03:04:05Z"
     (state_dir / "codex-seat-states.json").write_text(
         json.dumps(
             {
                 "version": 1,
+                "updated_at": time.time(),
                 "seats": {"seat-q": {"cooldown_until": cooldown}},
             }
         ),
@@ -1514,7 +1515,6 @@ def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
             "ended_at": "2026-08-26T00:48:00+00:00",
         }
     )
-    monkeypatch.setattr(D, "_claim_queue_entry", lambda path: None)
     payload = D._drain_queue_once(
         argparse.Namespace(
             queue_dir=str(queue_dir),
@@ -1546,6 +1546,7 @@ def _drain_held_not_before(
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
     queue_path = queue_dir / f"{dispatch_id}.json"
+    not_before = "2999-01-02T03:04:05Z"
     D._write_json_atomic(
         queue_path,
         {
@@ -1554,9 +1555,9 @@ def _drain_held_not_before(
             "dispatch_id": dispatch_id,
             "agent": "codex",
             "created_at": L.utc_now(),
-            "not_before": "2026-09-01T11:44:00Z",
+            "not_before": not_before,
             "request": {
-                "not_before": "2026-09-01T11:44:00Z",
+                "not_before": not_before,
                 "account": "25ca6b",
                 "agent": "codex",
             },
@@ -1566,7 +1567,6 @@ def _drain_held_not_before(
     monkeypatch.setattr(D, "_NOT_BEFORE_PROBE_ROWS", [probe_row])
     if ledger_record is not None:
         L.write_record(ledger_record)
-    monkeypatch.setattr(D, "_claim_queue_entry", lambda path: None)
     payload = D._drain_queue_once(
         argparse.Namespace(
             queue_dir=str(queue_dir),
@@ -1578,7 +1578,7 @@ def _drain_held_not_before(
         )
     )
     leftover = json.loads(queue_path.read_text(encoding="utf-8"))
-    assert leftover["not_before"] == "2026-09-01T11:44:00Z"
+    assert leftover["not_before"] == not_before
     holds = [
         row
         for row in payload.get("details") or []

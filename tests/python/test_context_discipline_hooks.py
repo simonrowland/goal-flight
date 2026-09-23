@@ -112,14 +112,16 @@ def test_hook_script_exists_and_is_executable() -> None:
     assert os.access(HOOK, os.X_OK)
 
 
-def test_hook_read_size_blocks_only_large_reads() -> None:
+def test_hook_read_size_blocks_only_large_reads(tmp_path: Path) -> None:
+    small_file = tmp_path / "small.md"
+    small_file.write_text("small\n", encoding="utf-8")
     blocked, _ = decision({
         "tool_name": "Read",
         "tool_input": {"file_path": str(ROOT / "SKILL.md")},
     })
     allowed, _ = decision({
         "tool_name": "Read",
-        "tool_input": {"file_path": str(ROOT / "commands/resume.md")},
+        "tool_input": {"file_path": str(small_file)},
     })
     assert blocked["block"] is True
     assert "Read of file >5KB" in blocked["message"]

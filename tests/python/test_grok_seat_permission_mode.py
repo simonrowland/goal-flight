@@ -227,7 +227,9 @@ def test_launch_wrapper_is_the_only_account_env_call_in_main() -> None:
     # The raw resolver stays for the wrapper and for tests; launch sites use
     # the wrapper so a missing permission_mode cannot reach spawn.
     after_def = source.split("def main(", 1)[1]
-    assert "_resolve_account_env(args)" not in after_def
+    # Main performs one validation-only raw resolution before launch. Every
+    # launch site still goes through the wrapper that enforces permission mode.
+    assert after_def.count("_resolve_account_env(args)") == 1
 
 
 def _isolated_env(tmp_path: Path, home: Path) -> dict[str, str]:

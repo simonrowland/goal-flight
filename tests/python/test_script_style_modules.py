@@ -294,7 +294,11 @@ def test_isolated_env_scrubs_ambient_runtime_identity(
     for key in AMBIENT_RUNTIME_ENV:
         monkeypatch.setenv(key, f"ambient-{key.lower()}")
     env = _isolated_env(tmp_path, test_id="test_probe.py")
-    assert all(key not in env for key in AMBIENT_RUNTIME_ENV)
+    assert all(
+        key not in env
+        for key in AMBIENT_RUNTIME_ENV
+        if key != ISOLATED_TEST_FILE_ENV
+    )
     assert env[ISOLATED_TEST_FILE_ENV] == "test_probe.py"
     assert env["GOALFLIGHT_STATE_DIR"] == str(tmp_path / "state")
     assert env["GOALFLIGHT_DISPATCH_DIR"] == str(tmp_path / "state" / "dispatch")
@@ -355,6 +359,11 @@ def test_deliberate_flake_is_reported_end_to_end(tmp_path: Path) -> None:
         (TEST_DIR / "conftest.py").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    for helper in ("machine_isolation.py", "support.py"):
+        (suite / helper).write_text(
+            (TEST_DIR / helper).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
     (suite / "test_probe.py").write_text(
         "def test_deliberate_flake(request):\n"
         "    request.node.user_properties.extend((\n"
