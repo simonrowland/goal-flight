@@ -402,7 +402,7 @@ def case_identity_mismatch_not_alive() -> None:
     try:
         goalflight_watch._lightweight_process_identity = lambda pid: {
             "pid": pid,
-            "lstart": "actual process start",
+            "lstart": "expected process start",
             "start_token": "actual-token",
             "comm": "worker",
         }

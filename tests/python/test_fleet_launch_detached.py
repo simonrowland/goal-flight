@@ -712,7 +712,7 @@ def test_recovery_reclaims_reused_pid_owner_lock() -> None:
                 return {
                     "pid": pid,
                     "start_token": "linux:boot:7779-new",
-                    "lstart": "Thu Jun 11 12:00:01 2026",
+                    "lstart": "Thu Jun 11 12:00:00 2026",
                     "comm": "python3",
                 }
             return {"pid": pid, "lstart": "Thu Jun 11 12:00:02 2026", "comm": "python3"}

@@ -1099,6 +1099,7 @@ def test_launch_helper_recovers_existing_status_with_unconfirmed_evidence() -> N
                     "worker_pid": 12345,
                     "worker_identity": {
                         "pid": 12345,
+                        "start_token": "linux:boot:12345",
                         "lstart": "Thu Jun 11 12:00:00 2026",
                         "comm": "python3",
                     },
@@ -1126,6 +1127,7 @@ def test_launch_helper_recovers_existing_status_with_unconfirmed_evidence() -> N
             if pid == 12345:
                 return {
                     "pid": 12345,
+                    "start_token": "linux:boot:12345",
                     "lstart": "Thu Jun 11 12:00:00 2026",
                     "comm": "python3",
                 }
