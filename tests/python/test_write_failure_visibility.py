@@ -937,6 +937,7 @@ def test_dashboard_pidfile_write_distinguishes_contract_from_transient(
         lambda *_args: (False, "missing"),
     )
     monkeypatch.setattr(dispatch, "_try_claim_dashboard_refresh_start", lambda _path: True)
+    monkeypatch.setattr(dispatch, "_dashboard_refresh_disabled", lambda: False)
     monkeypatch.setattr(
         dispatch.subprocess,
         "Popen",
@@ -1302,6 +1303,7 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
     """Restoring the old broad suppress at any nested changed site fails here."""
     dispatch_source = inspect.getsource(dispatch.main)
     acp_source = inspect.getsource(acp_run._run_acp_dispatch_impl)
+    acp_finalize_source = inspect.getsource(acp_run._finalize_capacity_after_cleanup)
     acp_attach_source = inspect.getsource(acp_run._attach_worker_state_before_running)
     acp_detach_source = inspect.getsource(acp_run._detach_live_worker_state)
     watch_source = inspect.getsource(watch.main)
@@ -1315,8 +1317,9 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
     assert '"write": "capacity_release"' in dispatch_source
     assert "DISPATCH-FINALIZE-WARN" in dispatch_source
     assert "_attach_worker_state_before_running" in acp_source
-    assert "_detach_live_worker_state" in acp_source
-    assert "except OSError:" in acp_attach_source
+    assert "_finalize_capacity_after_cleanup" in acp_source
+    assert "_detach_live_worker_state" in acp_finalize_source
+    assert "attach(worker_pid" in acp_attach_source
     assert "lease_detach_error" in acp_detach_source
     assert "final state write failed" in watch_source
     assert "_record_monitor_fault_before_final_event" in messages_source

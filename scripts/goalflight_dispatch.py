@@ -10148,7 +10148,15 @@ def _settle_final_for_drain(entry: dict, queue_dir: Path) -> dict | None:
         attempt = goalflight_journal.Journal.open_reader(
             root, retry_budget_s=0.0, open_retry_budget_s=0.0,
         ).attempt_for_dispatch(dispatch_id)
-    except (ValueError, OSError, goalflight_journal.JournalError):
+    except (
+        ValueError,
+        OSError,
+        goalflight_journal.JournalIntegrityError,
+        goalflight_journal.JournalUpgradeRequired,
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return None
     if attempt is None or attempt.lifecycle_state not in goalflight_journal.ATTEMPT_FINAL_STATES:
         return None
@@ -10157,7 +10165,15 @@ def _settle_final_for_drain(entry: dict, queue_dir: Path) -> dict | None:
             dispatch_id=dispatch_id, project_root=str(root), operator=True,
             controller_label=None, dry_run=False,
         ), queue_dir)
-    except (ValueError, OSError, goalflight_journal.JournalError) as exc:
+    except (
+        ValueError,
+        OSError,
+        goalflight_journal.JournalIntegrityError,
+        goalflight_journal.JournalUpgradeRequired,
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return {"dispatch_id": dispatch_id, "status": "refused", "reason": str(exc)}
 
 
@@ -10290,7 +10306,15 @@ def _cmd_withdraw(argv: list[str]) -> int:
               f"{args.dispatch_id}: {payload['status']} by {payload['withdrawn_by']}" +
               ("\n" + json.dumps(payload["plan"], indent=2) if "plan" in payload else ""))
         return 0
-    except (ValueError, OSError, goalflight_journal.JournalError) as exc:
+    except (
+        ValueError,
+        OSError,
+        goalflight_journal.JournalIntegrityError,
+        goalflight_journal.JournalUpgradeRequired,
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         payload = {"dispatch_id": args.dispatch_id, "status": "refused", "reason": str(exc)}
         print(json.dumps(payload, sort_keys=True) if args.json else f"withdraw refused: {exc}")
         return 1

@@ -206,7 +206,7 @@ def test_writer_default_acquires_after_real_contention_outlasts_old_budget(
     assert reopened.attempt_for_dispatch("contention-seed") is not None
 
 
-def test_writer_default_still_fails_when_contention_never_releases(
+def test_writer_default_construction_bypasses_contention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
@@ -223,14 +223,12 @@ def test_writer_default_still_fails_when_contention_never_releases(
     )
     started = time.monotonic()
     try:
-        with pytest.raises(journal.JournalBusy) as exc_info:
-            journal.Journal(project)
+        reopened = journal.Journal(project)
         elapsed = time.monotonic() - started
     finally:
         _finish_sqlite_write_holder(holder, release=release)
-    message = str(exc_info.value)
-    assert "within 5.000s" in message
-    assert 4.0 <= elapsed < 6.5
+    assert reopened.path == authority.path
+    assert elapsed < 1.0
 
 
 def test_retry_budget_rejects_infinite_wait(
@@ -273,7 +271,7 @@ def test_reader_default_fails_when_contention_never_releases(
     assert 0.7 <= elapsed < 1.8
 
 
-def test_construction_write_lock_timeout_is_bounded_by_retry_budget(
+def test_construction_fast_path_bypasses_sidecar_write_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
@@ -287,13 +285,11 @@ def test_construction_write_lock_timeout_is_bounded_by_retry_budget(
     )
     started = time.monotonic()
     try:
-        with pytest.raises(
-            journal.JournalBusy, match="construction lock timeout within 0.200s"
-        ):
-            journal.Journal(project, retry_budget_s=0.2)
+        reopened = journal.Journal(project, retry_budget_s=0.2)
         elapsed = time.monotonic() - started
     finally:
         _finish_sqlite_write_holder(holder)
+    assert reopened.path == authority.path
     assert elapsed < 1.0
 
 
