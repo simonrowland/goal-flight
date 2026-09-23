@@ -274,6 +274,32 @@ def case_process_identity_uses_one_combined_ps_probe() -> None:
     ]
 
 
+def case_probe_exceptions_are_unknown_not_dead() -> None:
+    pid = os.getpid()
+    ps_output = {"lstart": "Wed Sep 23 12:34:56 2026"}
+    with patch(
+        "goalflight_compat.pid_liveness",
+        side_effect=PermissionError(errno.EPERM, "denied"),
+    ):
+        identity = goalflight_ledger.process_identity(pid)
+        assert identity and identity["identity_probe_error"] is True
+        assert goalflight_ledger.identity_matches(
+            {"worker_pid": pid, "worker_identity": identity}
+        ) == (True, "identity_indeterminate")
+
+    with patch("goalflight_compat.pid_liveness", return_value=True), patch(
+        "goalflight_compat.process_start_identity",
+        side_effect=subprocess.CalledProcessError(1, ["native-start-probe"]),
+    ), patch(
+        "goalflight_ledger._ps_identity", return_value=(ps_output, True)
+    ):
+        identity = goalflight_ledger.process_identity(pid)
+        assert identity and identity["lstart"] == ps_output["lstart"]
+        assert goalflight_ledger.worker_identity_liveness(
+            {"worker_pid": pid, "worker_identity": identity}
+        ) == ("unknown", "identity_indeterminate")
+
+
 def case_reaped_pid_still_classifies_dead() -> None:
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(0.1)"],
@@ -364,6 +390,7 @@ def main() -> None:
     case_live_ps_probe_error_classifies_indeterminate()
     case_live_ps_missing_lstart_classifies_indeterminate()
     case_process_identity_uses_one_combined_ps_probe()
+    case_probe_exceptions_are_unknown_not_dead()
     case_reaped_pid_still_classifies_dead()
     case_ledger_windows_identity_indeterminate_not_expected_live()
     case_lstart_only_identity_is_unknown()
