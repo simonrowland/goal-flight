@@ -5,6 +5,11 @@ Before taking over or relaunching, decide resume-vs-redispatch:
 cheaper than re-deriving it, and a reviewer must never resume the
 implementer's session.
 
+If the dispatch must instead be retired permanently, use
+`goalflight_dispatch.py withdraw <dispatch_id> --reason TEXT --controller-label <owner>`.
+It never kills a live worker; steer it to stop and wait for exit first.
+See `protocols/dispatch-danger.md` for dry-run, operator, and moved-root recovery.
+
 The controller-takeover pattern for when an ACP-dispatched worker reaches a
 terminal blocked state before its chunk landed. This is recovery, not normal
 operation — the canonical path is worker-completes-and-commits. Use this when

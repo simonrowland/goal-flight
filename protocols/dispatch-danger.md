@@ -36,6 +36,22 @@ direct-only. It is a graceful backlog consumer, not a producer.
 read-only diagnostic of the same reconciliation predicate; only the drainer tick
 applies it automatically.
 
+To retire a dispatch that must never run, use
+`goalflight_dispatch.py withdraw <dispatch_id> --reason TEXT --controller-label <owner>`.
+It never kills a live worker: steer that worker to stop and wait for exit first.
+Withdrawal commits journal terminal state `withdrawn`, projects the terminal ledger row, then
+moves the queue carrier to `dispatch-queue-withdrawn/<id>.<utc-stamp>.json`.
+Do not remove a carrier by hand: drain can restore it from a nonterminal ledger row.
+The human owner can override controller ownership with `--operator`. If the
+record's project moved, pass `--project-root PATH`; that journal must contain the
+dispatch attempt. `--dry-run` lists planned record fields without writing;
+`--json` returns machine-readable results. Repeating a completed withdrawal is
+a no-op. A spawn intent without a worker PID must age past the claim-stale window
+before withdrawal is allowed.
+Use `--superseded-by <replacement-id>` to record `superseded` instead. Both
+outcomes settle the journal as `TERMINAL`, release the seat, and do not hold
+linked tasks against a fresh dispatch. The replacement keeps its own task claim.
+
 Reconciliation is fail-closed. A record must be a stale local running dispatch
 with no queue carrier; recorded status/output pointers whose referenced files
 are absent or readable (and whose status, when present, matches); no live,

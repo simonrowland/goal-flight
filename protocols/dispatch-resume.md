@@ -1,5 +1,11 @@
 # Resume or redispatch?
 
+If the dispatch must never run, retire it with
+`goalflight_dispatch.py withdraw <dispatch_id> --reason TEXT --controller-label <owner>`.
+Withdrawal never kills a live worker. It requires no live worker, preserves a
+carrier audit copy, and prevents drain from restoring the retired dispatch.
+See `protocols/dispatch-danger.md` for ownership, moved roots, and dry-run flags.
+
 ## ★ The most expensive miss: a worker that stopped to ASK YOU something
 
 **If the worker ended because it needs something from you, RESUME it with the

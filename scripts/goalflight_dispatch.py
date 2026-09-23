@@ -122,6 +122,7 @@ _ROUTED_SUBCOMMANDS = (
     "steer",
     "resume",
     "reconcile-abandoned",
+    "withdraw",
     "drain",
     "dashboard-refresh",
 )
@@ -9513,6 +9514,154 @@ def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
         }
 
 
+def _withdraw_preflight(args):
+    """Read authority and identity evidence without creating any state."""
+    record = goalflight_ledger.read_record(args.dispatch_id)
+    if goalflight_ledger.record_is_unreadable(record):
+        raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
+    carrier = _queue_entry_path(args.dispatch_id)
+    entry = json.loads(carrier.read_text()) if carrier.exists() else {}
+    root_value = args.project_root or (record or entry).get("project_root") or str(Path.cwd())
+    root = goalflight_task.resolve_project_root_for_read(str(root_value))
+    if root is None:
+        raise ValueError("project root is unresolvable; pass --project-root PATH to the journal holding this dispatch")
+    authority = goalflight_journal.Journal.open_reader(root)
+    rows = authority.read_all(
+        "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?", (args.dispatch_id,),
+    )
+    if not rows:
+        raise ValueError("no attempt for this dispatch in the selected journal; check --project-root")
+    attempt = dict(rows[0])
+    owner = (record or entry).get("controller_label") or attempt.get("owner_controller_label")
+    if not args.operator and (not args.controller_label or args.controller_label != owner):
+        raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
+    worker = json.loads(attempt.get("worker_instance_json") or "{}")
+    for source, pid, identity in (
+        ("ledger", (record or {}).get("worker_pid"), (record or {}).get("worker_identity")),
+        ("journal", worker.get("pid"), worker),
+        ("carrier", entry.get("queue_worker_pid"), entry.get("queue_worker_identity")),
+    ):
+        if not pid:
+            continue
+        status, reason = _queue_claim_identity_status(pid, identity)
+        if status != "dead":
+            raise ValueError(
+                f"{source} worker {pid} is {status} ({reason}); withdraw never kills a live worker. "
+                "Steer the worker to stop, wait for exit, and verify its identity before retrying."
+            )
+    for evidence in (record or {}, entry):
+        if _queue_claim_worker_spawn_intent(evidence) and not (
+            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
+        ):
+            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
+            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
+                raise ValueError(
+                    "spawn intent has no worker pid and is not older than the claim-stale window "
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry"
+                )
+    outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
+    withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
+    if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
+        raise ValueError("dispatch already has a different terminal outcome; preserve it instead of withdrawing")
+    return root, authority, attempt, record, carrier, outcome, withdrawn
+
+
+def _cmd_withdraw(argv: list[str]) -> int:
+    parser = _TerseArgumentParser(
+        description="Retire a dispatch with no live worker; never kills a worker.",
+        usage_hint="try withdraw <dispatch_id> --reason TEXT [--operator] (or --help)",
+    )
+    parser.add_argument("dispatch_id")
+    parser.add_argument("--reason", required=True)
+    parser.add_argument("--superseded-by", help="replacement dispatch id; records terminal state superseded")
+    parser.add_argument("--project-root")
+    parser.add_argument("--controller-label", default=os.environ.get("GOALFLIGHT_CONTROLLER_LABEL"))
+    parser.add_argument("--operator", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if not args.reason.strip():
+            raise ValueError("--reason must not be blank")
+        if args.superseded_by is not None and (not args.superseded_by.strip() or args.superseded_by == args.dispatch_id):
+            raise ValueError("--superseded-by must name a different dispatch")
+        root, authority, attempt, record, carrier, outcome, withdrawn = _withdraw_preflight(args)
+        actor = outcome.get("withdrawn_by") if withdrawn else ("operator" if args.operator else args.controller_label)
+        terminal_state = attempt["terminal_state"] if withdrawn else ("superseded" if args.superseded_by else "withdrawn")
+        observation = outcome if withdrawn else {"reason": args.reason, "withdrawn_by": actor}
+        if not withdrawn and args.superseded_by:
+            observation["superseded_by"] = args.superseded_by
+        payload = {"dispatch_id": args.dispatch_id, "withdrawn_by": actor}
+        # No constructors, locks, projection rewrites, or timestamp changes on a retry.
+        if withdrawn and record and record.get("terminal_state") == terminal_state and not carrier.exists():
+            payload["status"] = "already withdrawn"
+        elif args.dry_run:
+            terminal = goalflight_journal.TerminalCommit(
+                attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+                transition_id=attempt.get("terminal_transition_id") or "<journal allocates transition UUID>",
+                event_uuid="<terminal_outbox event UUID>", event_type="blocked",
+                terminal_state=terminal_state, observation=observation,
+                terminal_at=attempt.get("terminal_at") or goalflight_ledger.utc_now(),
+            )
+            projected = goalflight_ledger.terminal_record_projection(
+                record or {"dispatch_id": args.dispatch_id, "controller_label": actor}, terminal, observation["reason"],
+            )
+            projected["project_root"] = str(root)
+            projected["updated_at"] = "<projection UTC time>"
+            if not withdrawn and not (record or {}).get("ended_at"):
+                projected["ended_at"] = "<journal terminal UTC time>"
+            payload.update(status="dry-run", plan=[
+                {"record": str(authority.path), "table": "dispatch_attempts", "attempt_id": attempt["attempt_id"],
+                 "fields": {} if withdrawn else {
+                     "lifecycle_state": "TERMINAL", "terminal_state": terminal_state,
+                     "terminal_transition_id": terminal.transition_id, "terminal_outcome_json": observation,
+                     "terminal_at": "<journal terminal UTC time>", "state_updated_at": "<journal terminal UTC time>",
+                 }, "terminal_outbox": {} if withdrawn else {"event_type": "blocked", "observation": observation,
+                     "event_uuid": terminal.event_uuid, "transition_id": terminal.transition_id}},
+                {"record": str(goalflight_ledger.record_path(args.dispatch_id, create=False)),
+                 "fields": {key: value for key, value in projected.items() if (record or {}).get(key) != value},
+                 "remove_fields": [key for key in ("sidecar_hold", "sidecar_hold_reason") if key in (record or {})]},
+                {"record": str(carrier), "move_to": str(carrier.parent.parent / "dispatch-queue-withdrawn" / f"{carrier.stem}.<utc-stamp>.json") if carrier.exists() else None},
+            ])
+        else:
+            # Block queue claims while rechecking evidence and publishing in authority order.
+            with _queue_mutation_lock(carrier.parent), goalflight_ledger.StateLock():
+                root, _, attempt, record, carrier, outcome, withdrawn = _withdraw_preflight(args)
+                authority = goalflight_journal.Journal(root)
+                result = authority.commit_terminal(
+                    attempt["attempt_id"], terminal_state=terminal_state, event_type="blocked",
+                    observation=observation,
+                )
+                if not result.committed or result.value is None:
+                    raise ValueError(f"journal terminal commit failed: {result}")
+                terminal = result.value
+                if terminal.terminal_state not in {"withdrawn", "superseded"} or not terminal.observation.get("withdrawn_by"):
+                    raise ValueError("another terminal outcome won; preserve it instead of withdrawing")
+                current = goalflight_ledger.terminal_record_projection(
+                    record or {"dispatch_id": args.dispatch_id, "controller_label": actor},
+                    terminal, terminal.observation["reason"],
+                )
+                current["project_root"] = str(root)
+                goalflight_ledger.write_record(current)
+                archived = None
+                if carrier.exists():
+                    archive_dir = carrier.parent.parent / "dispatch-queue-withdrawn"
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    archived = archive_dir / f"{carrier.stem}.{stamp}.json"
+                    carrier.replace(archived)
+                payload.update(status="withdrawn", withdrawn_by=terminal.observation["withdrawn_by"],
+                               attempt_id=terminal.attempt_id, archived_carrier=str(archived) if archived else None)
+        print(json.dumps(payload, sort_keys=True) if args.json else
+              f"{args.dispatch_id}: {payload['status']} by {payload['withdrawn_by']}" +
+              ("\n" + json.dumps(payload["plan"], indent=2) if "plan" in payload else ""))
+        return 0
+    except (ValueError, OSError, goalflight_journal.JournalError) as exc:
+        payload = {"dispatch_id": args.dispatch_id, "status": "refused", "reason": str(exc)}
+        print(json.dumps(payload, sort_keys=True) if args.json else f"withdraw refused: {exc}")
+        return 1
+
+
 def _cmd_reconcile_abandoned(argv: list[str]) -> int:
     parser = _TerseArgumentParser(
         description="Dry-run abandoned dispatch reconciliation; never changes ledger records.",
@@ -10123,6 +10272,10 @@ def _ledger_task_ids_advanced(
             or ""
         )
         completion_order = "not_compared"
+        if record.get("withdrawn_by") and terminal in {"withdrawn", "superseded"}:
+            # Retirement is not task progress. A replacement owns its own claim;
+            # this retired row must not hold the task against that replacement.
+            continue
         if (
             state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
             or terminal in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
@@ -17900,6 +18053,7 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("steer", "append, list, or wait on a live worker's mailbox"),
     ("resume", "continue a recorded worker session in its existing worktree"),
     ("reconcile-abandoned", "dry-run report of abandoned dispatches; drain writes"),
+    ("withdraw", "retire a dispatch with no live worker; never kills workers"),
     ("drain", "launch queued dispatch requests"),
     ("dashboard-refresh", "rebuild the dashboard projection"),
 )
@@ -18203,6 +18357,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == DAEMON_SPAWN_ARG:
         return _cmd_spawn_daemon()
+    # Withdrawal dry-runs and no-op retries must not emit a wake-entry notice.
+    if argv and argv[0] == "withdraw":
+        return _cmd_withdraw(argv[1:])
     option_argv = argv[: argv.index("--")] if "--" in argv else argv
     # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
     # _persist_acp_watcher_prompt and the launch path), never here: a refused

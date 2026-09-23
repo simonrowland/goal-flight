@@ -57,6 +57,7 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "controller_dead",
         "orphaned",
         "superseded",
+        "withdrawn",
     }
 ) | LIMIT_TERMINAL_STATES
 

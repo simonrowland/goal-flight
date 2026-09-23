@@ -45,6 +45,11 @@ Do not act on any resume state until STEP 0 is satisfied.
 
 ## STEP 1 — Reload order + handoff
 
+For a dispatch that must never run, use
+`goalflight_dispatch.py withdraw <dispatch_id> --reason TEXT --controller-label <owner>`.
+It never kills a live worker. See `protocols/dispatch-danger.md` for the
+`--operator`, `--project-root`, `--dry-run`, and `--json` recovery options.
+
 Follow `AGENTS.md`, then the canonical post-compaction reload order in `SKILL.md`
 and `protocols/state-handoff.md`: session-status verdict, `SKILL.md` end-to-end,
 named controller registration from `protocols/session-preflight.md`, store

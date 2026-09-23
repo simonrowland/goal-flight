@@ -1828,6 +1828,30 @@ def _record_sidecar_overrule(
     }
 
 
+def terminal_record_projection(
+    record: dict, terminal: goalflight_journal.TerminalCommit, reason: object,
+) -> dict:
+    """Build the ledger mirror of committed authority; callers lock before writing."""
+    current = dict(record)
+    current.pop("sidecar_hold", None)
+    current.pop("sidecar_hold_reason", None)
+    current.update(
+        state=str(terminal.observation.get("state") or terminal.terminal_state),
+        terminal_state=terminal.terminal_state,
+        worker_still_alive=False,
+        liveness_state=goalflight_terminal.terminal_liveness_state(terminal.terminal_state),
+        attempt_id=terminal.attempt_id,
+        transition_id=terminal.transition_id,
+        terminal_event_uuid=terminal.event_uuid,
+        reason=reason,
+    )
+    preserve_first_terminal_time(current, terminal.terminal_at)
+    for key in ("withdrawn_by", "superseded_by"):
+        if key in terminal.observation:
+            current[key] = terminal.observation[key]
+    return current
+
+
 def reconcile_terminal_outbox(
     project_root: Path | str,
     *,
@@ -2103,23 +2127,7 @@ def reconcile_terminal_outbox(
                         if current_path.exists()
                         else dict(record)
                     )
-                    current.pop("sidecar_hold", None)
-                    current.pop("sidecar_hold_reason", None)
-                    current.update(
-                        {
-                            "state": str(
-                                result.value.observation.get("state")
-                                or result.value.terminal_state
-                            ),
-                            "terminal_state": result.value.terminal_state,
-                            "worker_still_alive": False,
-                            "attempt_id": result.value.attempt_id,
-                            "transition_id": result.value.transition_id,
-                            "terminal_event_uuid": result.value.event_uuid,
-                            "reason": reason,
-                        }
-                    )
-                    preserve_first_terminal_time(current, result.value.terminal_at)
+                    current = terminal_record_projection(current, result.value, reason)
                     write_record(current)
                 history_records.append(dict(current))
             if (
