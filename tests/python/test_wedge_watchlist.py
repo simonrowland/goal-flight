@@ -223,6 +223,49 @@ def _reap(worker: subprocess.Popen) -> None:
         worker.wait(timeout=2)
 
 
+def _controlled_cpu_delta() -> tuple[float | None, float | None]:
+    """Observe a real CPU-positive group without assuming scheduler share."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        ready = root / "ready"
+        go = root / "go"
+        code = (
+            "from pathlib import Path\n"
+            "import time\n"
+            f"Path({str(ready)!r}).write_text('ready')\n"
+            f"while not Path({str(go)!r}).exists(): time.sleep(0.01)\n"
+            "end = time.time() + 30\n"
+            "x = 0\n"
+            "while time.time() < end: x += 1\n"
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-c", code],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 30.0
+            while not ready.exists() and worker.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert ready.exists(), "spinner never became ready"
+            first = pgroup_cputime_snapshot(worker.pid)
+            if first is None:
+                return None, None
+            first_at = time.monotonic()
+            go.write_text("go")
+            while worker.poll() is None and time.monotonic() < deadline:
+                second = pgroup_cputime_snapshot(worker.pid)
+                if second is not None:
+                    delta = cputime_delta_seconds(first, second)
+                    if delta > wedge.CPU_EPSILON_S:
+                        return delta, time.monotonic() - first_at
+                time.sleep(0.05)
+            raise AssertionError("spinner never produced a CPU-positive sample")
+        finally:
+            _reap(worker)
+
+
 def test_real_sleeper_cpu_delta_is_near_zero() -> None:
     delta, worker = _cpu_delta_for("import time; time.sleep(8)", window_s=0.8)
     try:
@@ -237,48 +280,36 @@ def test_real_sleeper_cpu_delta_is_near_zero() -> None:
 
 
 def test_real_spinner_cpu_delta_is_positive() -> None:
-    delta, worker = _cpu_delta_for(
-        "end=__import__('time').time()+5\nx=0\nwhile __import__('time').time()<end:\n    x+=1\n",
-        window_s=0.8,
-    )
-    try:
-        if delta is None:
-            print("SKIP: test_real_spinner_cpu_delta_is_positive: cpu snapshot unavailable")
-            return
-        assert delta > wedge.CPU_EPSILON_S, delta
-        verdict, _reason = _classify(cpu_s=delta, sample_interval_s=0.8)
-        assert verdict == wedge.VERDICT_LIVE, (verdict, delta)
-    finally:
-        _reap(worker)
+    delta, interval = _controlled_cpu_delta()
+    if delta is None:
+        print("SKIP: test_real_spinner_cpu_delta_is_positive: cpu snapshot unavailable")
+        return
+    assert delta > wedge.CPU_EPSILON_S, delta
+    verdict, _reason = _classify(cpu_s=delta, sample_interval_s=interval)
+    assert verdict == wedge.VERDICT_LIVE, (verdict, delta)
 
 
 def test_long_gate_real_cpu_is_not_wedged() -> None:
     """A worker quiet on the tail because it is running a long gate is live."""
-    delta, worker = _cpu_delta_for(
-        "end=__import__('time').time()+5\nx=0\nwhile __import__('time').time()<end:\n    x+=1\n",
-        window_s=0.8,
+    delta, interval = _controlled_cpu_delta()
+    if delta is None:
+        print("SKIP: test_long_gate_real_cpu_is_not_wedged: cpu snapshot unavailable")
+        return
+    obs = wedge.observe_wedge(
+        dispatch_id="gate-run",
+        worker_alive=True,
+        quiet_s=2000.0,
+        tail_delta_bytes=0,
+        probation_s=1080.0,
+        tree_writes=0,
+        tree_available=True,
+        cpu_s=delta,
+        sample_interval_s=interval,
+        socket_state=wedge.SOCKET_NONE,
+        watchlisted_s=600.0,
     )
-    try:
-        if delta is None:
-            print("SKIP: test_long_gate_real_cpu_is_not_wedged: cpu snapshot unavailable")
-            return
-        obs = wedge.observe_wedge(
-            dispatch_id="gate-run",
-            worker_alive=True,
-            quiet_s=2000.0,
-            tail_delta_bytes=0,
-            probation_s=1080.0,
-            tree_writes=0,
-            tree_available=True,
-            cpu_s=delta,
-            sample_interval_s=0.8,
-            socket_state=wedge.SOCKET_NONE,
-            watchlisted_s=600.0,
-        )
-        assert obs.verdict == wedge.VERDICT_LIVE, (obs, delta)
-        assert "wedged" not in wedge.format_status_line(obs)
-    finally:
-        _reap(worker)
+    assert obs.verdict == wedge.VERDICT_LIVE, (obs, delta)
+    assert "wedged" not in wedge.format_status_line(obs)
 
 
 def test_long_gate_real_tree_writes_are_not_wedged() -> None:

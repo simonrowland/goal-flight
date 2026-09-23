@@ -527,7 +527,7 @@ def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> N
         env={**os.environ, "GOALFLIGHT_TEST_LARGE_ENV": "x" * 8192},
     )
     try:
-        assert R._process_argv(victim.pid) == [
+        expected = [
             sys.executable,
             str(script),
             "supervise",
@@ -536,6 +536,14 @@ def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> N
             "--lease-nonce",
             DEAD,
         ]
+        deadline = time.monotonic() + 5
+        parsed = None
+        while time.monotonic() < deadline:
+            parsed = R._process_argv(victim.pid)
+            if parsed == expected:
+                break
+            time.sleep(0.05)
+        assert parsed == expected, parsed
         # sysctl can read our child even when the sandbox denies ps. Always
         # exercise argv above; verify full enumeration where ps is available.
         if _ps_liveness_available(os.getpid()):

@@ -67,9 +67,14 @@ def case_worker_still_cannot_author_fleet_state() -> None:
     roots = sandbox.macos_write_roots(
         str(ROOT), sandbox.OS_SANDBOX_WORKSPACE_WRITE, agent="grok-code", command="grok"
     )
+    # The isolated suite redirects GOALFLIGHT_FLEET_DIR below the system temp
+    # root, which is intentionally granted to a seatbelt worker. This assertion
+    # is about the production default fleet registry, not the test's writable
+    # isolation directory.
+    default_fleet_dir = Path.home() / ".goal-flight" / "fleet"
     assert_true(
         "fleet state stays denied",
-        not _writable(roots, str(gm.default_fleet_dir())),
+        not _writable(roots, str(default_fleet_dir)),
     )
     assert_true(
         "the rest of HOME stays denied",
