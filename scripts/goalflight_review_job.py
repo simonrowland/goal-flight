@@ -186,9 +186,28 @@ def _pgroup_has_live_processes(pgid: int | None) -> bool:
             timeout=2.0,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
+        # An unreadable process table is not proof that the group is gone.
+        return True
     target = str(int(pgid))
     return any(line.strip() == target for line in output.splitlines())
+
+
+def _pgroup_liveness(pgid: int | None) -> bool:
+    """Cheap group liveness probe for the grace intervals.
+
+    ``killpg(..., 0)`` avoids spawning ``ps`` while a group is settling. Any
+    error other than an absent group is treated as live; the one process-table
+    confirmation happens only after the final grace deadline.
+    """
+    if pgid is None or goalflight_compat.is_windows():
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 
 def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grace_s: float = 5.0) -> bool:
@@ -217,7 +236,7 @@ def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grac
             proc.wait(timeout=grace_s)
     elif signalled:
         time.sleep(min(0.25, grace_s))
-    if proc.poll() is None or _pgroup_has_live_processes(target):
+    if proc.poll() is None or _pgroup_liveness(target):
         try:
             os.killpg(target, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
@@ -227,7 +246,7 @@ def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grac
             proc.wait(timeout=grace_s)
     deadline = time.time() + max(0.1, grace_s)
     while time.time() < deadline:
-        if not _pgroup_has_live_processes(target):
+        if not _pgroup_liveness(target):
             return True
         time.sleep(0.05)
     return not _pgroup_has_live_processes(target)
@@ -416,7 +435,7 @@ def _monitor_process(
         write_status(status_path, payload)
 
         if returncode is not None:
-            if _pgroup_has_live_processes(pgid):
+            if _pgroup_liveness(pgid):
                 timed_out = True
                 timeout_reason = "process_group_alive_after_parent_exit"
                 process_group_drained = _terminate_process_group(proc, pgid)

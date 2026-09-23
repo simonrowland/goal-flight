@@ -298,6 +298,34 @@ def _controller_process_identity(pid: int) -> dict | None:
     return {"pid": snapshot["pid"], "start_token": snapshot["start_token"]}
 
 
+def _session_owner_liveness(session: dict) -> bool | None:
+    """Match a queue owner by PID and start token, or return unknown.
+
+    Legacy queue records without a token are intentionally unknown: a live PID
+    is not evidence that it is the same controller generation.
+    """
+    try:
+        pid = int(session.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    expected = session.get("process_identity")
+    expected_start = (
+        expected.get("start_token")
+        if isinstance(expected, dict)
+        else session.get("process_start_token")
+    )
+    if not expected_start:
+        return None
+    current = _controller_process_identity(pid)
+    if current is None:
+        liveness = goalflight_compat.pid_liveness(pid)
+        return False if liveness is False else None
+    return (
+        current.get("pid") == pid
+        and current.get("start_token") == expected_start
+    )
+
+
 def _controller_process_ancestry(pid: int | None = None) -> tuple[dict, ...]:
     """Measure the helper-to-root process chain without invoking ``ps``."""
     current = os.getpid() if pid is None else pid
@@ -2434,11 +2462,13 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _file_lock(path):
         data: dict[str, dict] = {}
+        changed = not path.exists()
         if path.exists():
             try:
                 raw = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
                 raw = None
+                changed = True
             # Back-compat: previous shape was a single record without a pid map.
             # If we find that, migrate it under its own pid key.
             if isinstance(raw, dict):
@@ -2446,9 +2476,11 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
                     isinstance(v, dict) for v in raw.values()
                 ):
                     data = {str(raw.get("pid")): raw}
+                    changed = True
                 else:
                     # Map-shape: keys are pid strings, values are records.
                     data = {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+                    changed = changed or data != raw
         key = str(pid)
         if key in data:
             # Existing record for this PID — return it as-is. Pruning of
@@ -2457,20 +2489,32 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
             # (which is hot — runs on every CLI invocation in a goal-flight
             # terminal).
             result = data[key]
+            if (
+                not isinstance(result.get("process_identity"), dict)
+                or not result["process_identity"].get("start_token")
+            ):
+                measured_identity = _controller_process_identity(pid)
+                if measured_identity is not None:
+                    result = {**result, "process_identity": measured_identity}
+                    data[key] = result
+                    changed = True
         else:
             result = {
                 "id": str(uuid.uuid4()),
                 "pid": pid,
                 "started_at": _now_iso(),
                 "hostname": socket.gethostname(),
+                "process_identity": _controller_process_identity(pid),
             }
             data[key] = result
-        # Atomic write via unique temp file rename. Unique suffix prevents
-        # concurrent ensure_session()s from clobbering each other's temp
-        # files (lock-serialized but defensive).
-        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        tmp.replace(path)
+            changed = True
+        if changed:
+            # Atomic write via unique temp file rename. Unique suffix prevents
+            # concurrent ensure_session()s from clobbering each other's temp
+            # files (lock-serialized but defensive).
+            tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            tmp.replace(path)
     return result
 
 
@@ -3103,11 +3147,12 @@ def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool
         session = ensure_session(project_root)
         current = front.get("current_session")
         if isinstance(current, dict) and current.get("id") and current.get("id") != session["id"]:
-            owner_alive = _pid_alive(current.get("pid"))
-            if owner_alive and not force:
+            owner_liveness = _session_owner_liveness(current)
+            if owner_liveness is not False and not force:
                 return False, (
                     f"queue already claimed by session {current.get('id')} "
-                    f"(pid {current.get('pid')} alive); pass --force to take over"
+                    f"(pid {current.get('pid')} identity {('live' if owner_liveness else 'unknown')}); "
+                    "pass --force to take over"
                 )
         history = list(front.get("session_history") or [])
         history.append({
@@ -3117,12 +3162,22 @@ def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool
             "claimed_at": _now_iso(),
             "ended_at": None,
             "ended_reason": None,
+            "process_start_token": (
+                (session.get("process_identity") or {}).get("start_token")
+                if isinstance(session.get("process_identity"), dict)
+                else None
+            ),
         })
         front["current_session"] = {
             "id": session["id"],
             "pid": session["pid"],
             "started_at": session["started_at"],
             "hostname": session["hostname"],
+            "process_start_token": (
+                (session.get("process_identity") or {}).get("start_token")
+                if isinstance(session.get("process_identity"), dict)
+                else None
+            ),
         }
         front["session_history"] = history
         front["last-touched"] = _now_iso()
@@ -3217,7 +3272,7 @@ def force_release_stale(project_root: Path) -> tuple[int, list[str]]:
         with _file_lock(queue):
             front, body = _parse_frontmatter(queue.read_text())
             current = front.get("current_session")
-            if isinstance(current, dict) and current.get("pid") and not _pid_alive(current.get("pid")):
+            if isinstance(current, dict) and current.get("pid") and _session_owner_liveness(current) is False:
                 history = list(front.get("session_history") or [])
                 for entry in reversed(history):
                     if isinstance(entry, dict) and entry.get("id") == current.get("id") and entry.get("ended_at") is None:

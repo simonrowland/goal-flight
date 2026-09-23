@@ -98,6 +98,17 @@ def test_a_process_with_no_nonce_is_never_attributed(monkeypatch) -> None:
     assert got == {DEAD: [101]}, got
 
 
+def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
+    listing = (
+        "  101 python3 /s/other.py goalflight_messages.py listen "
+        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
+    )
+    monkeypatch.setattr(
+        R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
+    )
+    assert R.listener_processes_by_nonce(Path("/repos/mine")) == {}
+
+
 def test_own_pid_is_protected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         R, "listener_processes_by_nonce", _fake_ps({DEAD: [os.getpid()]})

@@ -51,6 +51,7 @@ PS_TIMEOUT_S = 15.0
 # Between SIGTERM and the liveness re-check. Listeners exit on the signal; this
 # only has to cover process teardown, not any work they might be doing.
 TERM_GRACE_S = 0.5
+_LISTENER_COMMANDS = frozenset({"listen", "listen-auto", "follow", "supervise"})
 
 
 def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | None:
@@ -87,16 +88,14 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | No
         head, _, rest = line.strip().partition(" ")
         if not head.isdigit() or not rest:
             continue
-        parts = rest.split()
-        if not any(goalflight_wake._is_messages_argv_name(p) for p in parts):
+        classification, fields = goalflight_wake._probe_messages_argv(
+            rest, commands=_LISTENER_COMMANDS
+        )
+        if classification != goalflight_wake._SUPERVISE_ARGV_MATCH or fields is None:
             continue
         # Same-project only. A listener that does not say which project it
         # serves cannot be attributed, so it is never reapable.
-        root = None
-        for index, part in enumerate(parts):
-            if part == "--project-root" and index + 1 < len(parts):
-                root = parts[index + 1]
-                break
+        root = fields.get("project_root")
         if not root:
             continue
         try:
@@ -104,11 +103,7 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | No
                 continue
         except OSError:
             continue
-        nonce = None
-        for index, part in enumerate(parts):
-            if part == "--lease-nonce" and index + 1 < len(parts):
-                nonce = parts[index + 1]
-                break
+        nonce = fields.get("lease_nonce")
         if not nonce:
             # Unattributable: it may belong to a live generation. Never reapable.
             continue

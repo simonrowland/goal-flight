@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from support import skip_posix_on_native_windows
 
@@ -44,7 +45,8 @@ def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
 
 def _write_pidfile(path: Path, worker_pid: int, pgid: int | None) -> None:
     entry = {"pid": worker_pid, "controller_pid": os.getpid(),
-             "agent": "test-dispatch", "session_id": "reap-test"}
+             "agent": "test-dispatch", "session_id": "reap-test",
+             "worker_identity": {"pid": worker_pid, "start_token": "test-worker"}}
     if pgid is not None:
         entry["pgid"] = pgid
     path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
@@ -95,7 +97,12 @@ def case_cleanup_reaps_dead_worker_orphans() -> None:
             pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
             _write_pidfile(pidfile, worker_pid, pgid)
             # killpg(pgid) targets the group (the orphan), not the dead leader pid.
-            dispatch._cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
+            with patch.object(
+                dispatch.goalflight_ledger,
+                "process_identity",
+                return_value={"pid": worker_pid, "start_token": "test-worker"},
+            ):
+                dispatch._cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
             assert _wait_dead(child_pid), "orphan child should be reaped by teardown"
             assert not pidfile.exists(), "pidfile should be unlinked after reap"
     finally:
@@ -162,11 +169,24 @@ def case_reap_skips_pgid_neq_worker() -> None:
         assert True, "reaper must skip when pgid != worker_pid"
 
 
+def case_reap_refuses_reused_worker_pid() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        _write_pidfile(pidfile, 999_999, 999_999)
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.goalflight_ledger,
+            "process_identity",
+            return_value={"pid": 999_999, "start_token": "new-worker"},
+        ), patch.object(dispatch.os, "killpg", side_effect=AssertionError("reused group signalled")):
+            dispatch._reap_dead_worker_pgroup(pidfile, 999_999)
+
+
 def main() -> None:
     case_cleanup_reaps_dead_worker_orphans()
     case_cleanup_preserves_live_worker()
     case_reap_safe_on_bad_pidfile()
     case_reap_skips_pgid_neq_worker()
+    case_reap_refuses_reused_worker_pid()
     case_guard_skips_own_pgroup()
     print("OK: dispatch pgroup-reap teardown tests pass")
 

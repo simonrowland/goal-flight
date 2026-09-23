@@ -8799,14 +8799,21 @@ def _write_pidfile(
     controller_session_id = _controller_session_id(args)
     owner_key = str(controller_pid) if controller_pid is not None else "unowned"
     pidfile = pidfile_dir / f"{owner_key}.bashtail.{worker_pid}.jsonl"
+    controller_identity = (
+        _identity_token(goalflight_compat.process_start_identity(controller_pid))
+        if controller_pid is not None
+        else None
+    )
     entry = {
         "controller_pid": controller_pid,
         "controller_session_id": controller_session_id,
+        "controller_identity": controller_identity,
         "controller_label": _controller_label(args),
         "pid": worker_pid,
         "pgid": int(pgid or worker_pid),
         "started_at": ident.get("lstart"),
         "cmd": ident.get("comm"),
+        "worker_identity": _identity_token(ident),
         # The "-bash-tail" suffix is load-bearing: cleanup_ghosts() keys its
         # bash-tail branch (pgid!=pid -> kill the bare pid, not the group) on
         # ``agent.endswith("-bash-tail")``. Tag it so this dispatch's worker is
@@ -8858,6 +8865,17 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
     # Re-check liveness immediately before signalling: if worker_pid was reused
     # and is now a live unrelated process, skip rather than risk a wrong target.
     if goalflight_compat.pid_alive(worker_pid):
+        return
+    expected_identity = entry.get("worker_identity")
+    if not isinstance(expected_identity, dict) or not expected_identity.get("start_token"):
+        # Old pidfiles cannot prove which process generation owned this group.
+        # Unknown identity is not permission to signal a reused PID.
+        return
+    current_identity = goalflight_ledger.process_identity(worker_pid)
+    matched, _reason = goalflight_ledger.compare_fine_process_identities(
+        worker_pid, expected_identity, current_identity
+    )
+    if not matched:
         return
     # killpg the group DIRECTLY -- not via kill_pid, whose empty-group fallback
     # to a bare kill(worker_pid) could hit a reused pid. An empty/gone group

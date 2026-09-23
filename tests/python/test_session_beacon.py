@@ -1033,3 +1033,60 @@ def test_release_requires_exact_process_generation(
     token["value"] = "generation-a"
     assert sessions.release_session(root, pid=71001)["released"] is True
     assert journal.Journal(root).active_lease("controller") is None
+
+
+def test_ensure_session_reuses_inode_when_record_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": "session-generation"},
+    )
+    first = sessions.ensure_session(root, pid=71001)
+    path = root / sessions.SESSION_FILE_REL
+    inode = path.stat().st_ino
+    second = sessions.ensure_session(root, pid=71001)
+    assert second == first
+    assert path.stat().st_ino == inode
+    assert first["process_identity"]["start_token"] == "session-generation"
+
+
+def test_queue_claim_does_not_pin_a_reused_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    queue = root / "docs-private" / "goal-queue-reuse.md"
+    queue.parent.mkdir(parents=True)
+    queue.write_text(
+        sessions._dump_frontmatter(
+            {
+                "state": "active",
+                "current_session": {
+                    "id": "old-session",
+                    "pid": 71001,
+                    "process_start_token": "old",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sessions,
+        "ensure_session",
+        lambda _root: {
+            "id": "new-session",
+            "pid": 71002,
+            "started_at": "now",
+            "hostname": "test",
+            "process_identity": {"pid": 71002, "start_token": "new"},
+        },
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": "new"},
+    )
+    claimed, message = sessions.claim(root, queue)
+    assert claimed, message

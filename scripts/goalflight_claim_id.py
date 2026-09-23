@@ -126,9 +126,23 @@ def claim(
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
-            # The number was ours but this exact filename already exists; the
-            # marker stays so the number is not handed out again.
-            return path
+            # A concurrent writer may have created a different artifact for the
+            # same number after our initial scan. Release our marker and advance;
+            # returning the existing path would falsely report ownership of it.
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            n += 1
+            continue
+        except OSError:
+            # Do not strand a reservation when artifact creation fails for any
+            # reason other than a raced existing path.
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            raise
         os.close(fd)
         return path
     raise RuntimeError(
