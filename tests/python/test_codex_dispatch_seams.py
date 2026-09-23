@@ -80,10 +80,19 @@ def _stub_bash_launch(
     drop_starting_projection: bool = False,
     preset_options: list[str] | None = None,
     expected_refusal: bool = False,
+    capacity_calls: list[argparse.Namespace] | None = None,
+    model: str | None = None,
 ) -> tuple[dict, list[dict]]:
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_PID", "99999991")
+    # Managed resolver fixtures represent a dispatch-time selection; provide
+    # the same usage evidence the production selector now requires.
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: True,
+    )
     spawn_calls: list[dict] = []
     ledger_calls: list[dict] = []
     ordering: list[str] = []
@@ -113,6 +122,8 @@ def _stub_bash_launch(
 
     def allow_capacity(*_args, **_kwargs):
         ordering.append("capacity")
+        if capacity_calls is not None:
+            capacity_calls.append(_args[0])
         return "lease-test"
 
     monkeypatch.setattr(D, "_acquire_capacity", allow_capacity)
@@ -207,6 +218,8 @@ def _stub_bash_launch(
         canonical_home = Path.home() / ".goal-flight" / "accounts" / account / "codex"
         canonical_home.mkdir(parents=True)
         argv.extend(["--account", account])
+    if model is not None:
+        argv.extend(["--model", model])
     argv.extend(preset_options if preset_options is not None else
                 ["--", sys.executable, "-c", "pass"])
     rc = D.main(argv)
@@ -217,7 +230,10 @@ def _stub_bash_launch(
     assert rc == (1 if failure_phase else 0)
     assert resolve_accounts == ([] if api_missing or agent != "codex" else [account])
     if not api_missing and agent == "codex":
-        assert ordering.index("capacity") < ordering.index("resolve")
+        if account is None:
+            assert ordering.index("resolve") < ordering.index("capacity")
+        else:
+            assert ordering.index("capacity") < ordering.index("resolve")
         assert ordering.index("resolve") < ordering.index("ledger:starting")
     else:
         assert ordering.index("capacity") < ordering.index("ledger:starting")
@@ -295,6 +311,26 @@ def test_bash_pin_is_applied_after_capacity_and_reaches_spawn(
     assert row["effective_account"] == dispatch_start["effective_account"]
     assert row["effective_account"] != "explicit-seat"
     assert row["engine"] == dispatch_start["engine"] == "codex"
+
+
+def test_bash_resolver_only_account_reaches_capacity_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "resolver-only-home"
+    home.mkdir()
+    capacity_calls: list[argparse.Namespace] = []
+    worker_spawn, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "resolver-only"),
+        capacity_calls=capacity_calls,
+        model="gpt-5.6-luna",
+    )
+    assert capacity_calls[0]._codex_account_pre_resolved is True
+    assert capacity_calls[0]._capacity_account == "resolver-only"
+    assert capacity_calls[0].model == "gpt-5.6-luna"
+    assert worker_spawn["env"]["CODEX_HOME"] == str(home)
 
 
 def test_bash_launch_survives_missing_starting_ledger_projection(
@@ -711,6 +747,8 @@ def _run_acp_to_spawn_failure(
     spawn_base_env: dict[str, str] | None = None,
     request_envelope: dict | None = None,
     dispatch_import_attempts: list[str] | None = None,
+    capacity_calls: list[argparse.Namespace] | None = None,
+    model: str | None = None,
 ) -> tuple[argparse.Namespace, dict[str, str], list[str]]:
     cleanups: list[str] = []
     ordering: list[str] = []
@@ -754,8 +792,10 @@ def _run_acp_to_spawn_failure(
 
         monkeypatch.setattr(builtins, "__import__", fail_dispatch_import)
 
-    async def allow_capacity(*_args, **_kwargs):
+    async def allow_capacity(acquire_args, *_args, **_kwargs):
         ordering.append("capacity")
+        if capacity_calls is not None:
+            capacity_calls.append(acquire_args)
         return {"decision": "allow", "lease": {}}
 
     monkeypatch.setattr(A.goalflight_capacity, "acquire_with_wait_async", allow_capacity)
@@ -775,6 +815,7 @@ def _run_acp_to_spawn_failure(
 
     monkeypatch.setattr(A, "spawn_and_handshake_with_retry", fail_after_env)
     cfg = _acp_cfg(tmp_path, account=account, agent=agent)
+    cfg.model = model
     cfg.request_envelope = request_envelope
     payload = asyncio.run(A.run_acp_dispatch(cfg))
     if block_dispatch_import:
@@ -788,13 +829,21 @@ def _run_acp_to_spawn_failure(
         L.infer_engine(agent) == "codex" and not block_dispatch_import
     )
     if expect_resolve:
-        assert ordering.index("capacity") < ordering.index("resolve")
+        if getattr(cfg, "_codex_account_pre_resolved", False):
+            assert ordering.index("resolve") < ordering.index("capacity")
+        else:
+            assert ordering.index("capacity") < ordering.index("resolve")
         assert ordering.index("resolve") < ordering.index("ledger:starting")
     else:
         assert "resolve" not in ordering
         assert ordering.index("capacity") < ordering.index("ledger:starting")
     assert ordering.index("ledger:starting") < ordering.index("spawn")
-    assert resolve_accounts == ([account] if expect_resolve else [])
+    expected_resolve_account = (
+        None
+        if getattr(cfg, "_codex_account_pre_resolved", False)
+        else getattr(cfg, "_codex_selected_account", None) or account
+    )
+    assert resolve_accounts == ([expected_resolve_account] if expect_resolve else [])
     return cfg, captured, cleanups
 
 
@@ -841,6 +890,106 @@ def test_acp_unselectable_seat_preserves_inherited_env_and_labels_host(
     assert record["effective_account"] == "host"
     assert cleanups == []
     assert cfg.context_mode == "enabled"
+
+
+def test_acp_capacity_request_keeps_pinned_account_and_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    capacity_calls: list[argparse.Namespace] = []
+    cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        account="explicit-account",
+        capacity_calls=capacity_calls,
+        model="gpt-5.6-luna",
+    )
+    assert capacity_calls[0].account == "explicit-account"
+    assert capacity_calls[0].model == "gpt-5.6-luna"
+
+
+def test_acp_grok_selection_reaches_capacity_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    selected: list[str] = []
+    monkeypatch.setattr(
+        D,
+        "grok_selected_account",
+        lambda _cfg: selected.append("healthy") or "healthy",
+    )
+    capacity_calls: list[argparse.Namespace] = []
+    cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        account=None,
+        agent="grok-acp",
+        capacity_calls=capacity_calls,
+    )
+    assert selected == ["healthy"]
+    assert capacity_calls[0].account == "healthy"
+    record = json.loads(L.record_path(cfg.dispatch_id).read_text(encoding="utf-8"))
+    assert record["account"] == "default"
+    assert record["effective_account"] == "healthy"
+
+
+def test_acp_capacity_uses_selected_account_before_home_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "selected-home"
+    home.mkdir()
+    monkeypatch.setattr(D, "_configured_account_names", lambda engine: ["healthy"])
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: account == "healthy",
+    )
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        D.goalflight_capacity,
+        "launch_slot_budget",
+        lambda *args, **kwargs: {
+            "account_remaining": 30,
+            "request_weight": 0.25,
+            "by_account": {"codex/healthy": {"active_weight": 0, "cap": 30}},
+        },
+    )
+    capacity_calls: list[argparse.Namespace] = []
+    cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "healthy"),
+        account=None,
+        capacity_calls=capacity_calls,
+    )
+    assert cfg._codex_selected_account == "healthy"
+    assert capacity_calls[0].account == "healthy"
+    assert capacity_calls[0].model is None
+
+
+def test_acp_resolver_only_account_reaches_capacity_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "resolver-only-home"
+    home.mkdir()
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda account, **kwargs: True,
+    )
+    capacity_calls: list[argparse.Namespace] = []
+    cfg, _captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "resolver-only"),
+        account=None,
+        capacity_calls=capacity_calls,
+        model="gpt-5.6-luna",
+    )
+    assert cfg._codex_account_pre_resolved is True
+    assert cfg._codex_selected_account == "resolver-only"
+    assert capacity_calls[0].account == "resolver-only"
+    assert capacity_calls[0].model == "gpt-5.6-luna"
 
 
 def test_acp_dispatcher_import_failure_refuses_before_capacity_or_spawn(
@@ -1021,6 +1170,10 @@ def _install_stub_seat_api(
         entries.append(old_pythonpath)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(entries))
     monkeypatch.setenv("GOALFLIGHT_TEST_CODEX_HOME", str(home))
+    (Path.home() / ".goal-flight" / "accounts" / "seat-e2e" / "codex").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
 def _usage_limit_text(days_ahead: int = 30) -> str:
@@ -1092,6 +1245,8 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     dispatch_argv = [
             "--agent",
             "codex",
+            "--account",
+            "seat-e2e",
             "--unregistered-forced",
             "--shape",
             "bash",

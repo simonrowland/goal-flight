@@ -1398,6 +1398,7 @@ def render_table(
     rows: Sequence[Mapping[str, object]],
     *,
     now: float | None = None,
+    capacity_rows: Mapping[str, Mapping[str, object]] | None = None,
 ) -> str:
     current_time = time.time() if now is None else now
     headers = (
@@ -1444,6 +1445,15 @@ def render_table(
         for row in display_rows
     )
     lines.append("---")
+    if capacity_rows:
+        lines.append("capacity by account:")
+        for key, capacity in sorted(capacity_rows.items()):
+            lines.append(
+                f"{key}: active={capacity.get('active', 0)} "
+                f"weight={capacity.get('active_weight', 0)} "
+                f"cap={capacity.get('cap', '?')} "
+                f"remaining={capacity.get('remaining', 0)}"
+            )
 
     soonest = soonest_reset(rows, now=current_time)
     if soonest is None:
@@ -1493,7 +1503,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
-        print(render_table(rows, now=now))
+        try:
+            import goalflight_capacity
+        except Exception:
+            capacity_rows = None
+        else:
+            capacity_rows = goalflight_capacity.account_capacity_status()
+        print(render_table(rows, now=now, capacity_rows=capacity_rows))
         try:
             import goalflight_messages
         except Exception:

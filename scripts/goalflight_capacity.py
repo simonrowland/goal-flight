@@ -10,6 +10,7 @@ import datetime as dt
 import getpass
 import io
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -29,11 +30,14 @@ import goalflight_compat as fcntl
 from goalflight_agent_limits import (
     AGENT_CAP_POOL,
     AGENT_RSS_MB,
+    ACCOUNT_CAPS,
     DEFAULT_AGENT_CAPS,
     LEGACY_AGENT_HANDLES,
     cap_pool,
+    account_cap,
     local_hard_cap,
     local_operating_total,
+    model_weight,
     normalize_agent,
 )
 import goalflight_dispatch_states as dispatch_states
@@ -694,6 +698,7 @@ def profile(args: argparse.Namespace | None = None) -> dict:
         "operating_cap": operating_cap,
         "hard_cap": hard_cap,
         "agent_caps": DEFAULT_AGENT_CAPS,
+        "account_caps": ACCOUNT_CAPS,
         "agent_rss_mb": AGENT_RSS_MB,
         "tools": detect_tools(),
     }
@@ -1230,10 +1235,117 @@ def active_leases(data: dict) -> list[dict]:
     return [lease for lease in data.get("leases", {}).values() if lease.get("state") == "active"]
 
 
+def _lease_vendor(lease: dict) -> str:
+    return cap_pool(normalize_agent(str(lease.get("agent") or "")))
+
+
+def _lease_account(lease: dict) -> str:
+    account = str(lease.get("account") or "").strip()
+    if account and account != "default":
+        return account
+    effective_account = str(lease.get("effective_account") or "").strip()
+    if effective_account and effective_account != "default":
+        return effective_account
+
+    # Public-release capacity leases predate account-scoped state and therefore
+    # have no account field. Their dispatch ledger still records the billing
+    # identity once the worker home was resolved; use that durable evidence so
+    # old work consumes the correct account's cap during the mixed-version
+    # upgrade window.
+    record = _dispatch_record_for_lease(lease)
+    if isinstance(record, dict) and record.get("state") != "unreadable":
+        for field in ("effective_account", "account"):
+            value = str(record.get(field) or "").strip()
+            if value and value != "default":
+                return value
+    return "default"
+
+
+def _lease_weight(lease: dict) -> float:
+    try:
+        value = float(lease.get("capacity_weight", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return value if math.isfinite(value) and value > 0 else 1.0
+
+
+def _account_cap(vendor: str, account: str, *, default: int | None = None) -> int:
+    """Resolve the locally loaded account map, with legacy fallback."""
+    vendor_key = cap_pool(normalize_agent(vendor))
+    configured = ACCOUNT_CAPS.get(vendor_key, {})
+    if account in configured:
+        return int(configured[account])
+    if "default" in configured:
+        return int(configured["default"])
+    return account_cap(vendor_key, account, default=default)
+
+
+def account_capacity_rows(
+    leases: list[dict],
+    *,
+    args: argparse.Namespace | None = None,
+    pressure: dict | None = None,
+) -> dict[str, dict]:
+    """Return per-vendor/account active weight, cap, and remaining headroom."""
+    rows: dict[str, dict] = {}
+    active_by_key: dict[str, float] = {}
+    sessions_by_key: dict[str, int] = {}
+    for lease in leases:
+        vendor = _lease_vendor(lease)
+        account = _lease_account(lease)
+        key = f"{vendor}/{account}"
+        active_by_key[key] = active_by_key.get(key, 0.0) + _lease_weight(lease)
+        sessions_by_key[key] = sessions_by_key.get(key, 0) + 1
+
+    configured = set()
+    for vendor, accounts in ACCOUNT_CAPS.items():
+        if not isinstance(accounts, dict):
+            continue
+        for account in accounts:
+            if account != "default":
+                configured.add(f"{vendor}/{account}")
+    keys = set(active_by_key) | configured
+    for key in sorted(keys):
+        vendor, account = key.split("/", 1)
+        base = _account_cap(vendor, account)
+        effective, detail = adaptive_agent_cap(vendor, base, pressure)
+        active_weight = round(active_by_key.get(key, 0.0), 6)
+        remaining = max(0.0, float(effective) - active_weight)
+        rows[key] = {
+            "vendor": vendor,
+            "account": account,
+            "active": sessions_by_key.get(key, 0),
+            "active_weight": active_weight,
+            "cap": int(effective),
+            "base_cap": int(base),
+            "remaining": round(remaining, 6),
+        }
+        if detail:
+            rows[key]["adaptive_rate_pressure"] = detail
+    return rows
+
+
+def account_capacity_status(args: argparse.Namespace | None = None) -> dict[str, dict]:
+    """Read-only per-account capacity view for status/usage surfaces."""
+    try:
+        with StateLock():
+            data = load_state()
+    except CapacityStateUnreadable:
+        return {}
+    prune_state(data)
+    return account_capacity_rows(
+        active_leases(data),
+        args=args,
+        pressure=current_rate_pressure(args),
+    )
+
+
 def launch_slot_budget(
     agent: str | None = None,
     priority: str = "normal",
     args: argparse.Namespace | None = None,
+    account: str | None = None,
+    model: str | None = None,
 ) -> dict:
     """Read-only remaining worker slots. Never persists.
 
@@ -1257,7 +1369,9 @@ def launch_slot_budget(
             "active": 0,
             "global_remaining": 0,
             "by_pool": {},
+            "by_account": {},
             "agent": agent,
+            "account": account,
             "agent_remaining": 0,
         }
     prune_state(data)
@@ -1265,36 +1379,87 @@ def launch_slot_budget(
     active = len(leases)
     global_remaining = max(0, operating_cap - active)
     pressure = current_rate_pressure(args)
-    pool_active: dict[str, int] = {}
+    pool_active: dict[str, float] = {}
     for lease in leases:
-        pool = cap_pool(normalize_agent(str(lease.get("agent") or "")))
+        pool = _lease_vendor(lease)
         if not pool:
             continue
-        pool_active[pool] = pool_active.get(pool, 0) + 1
+        pool_active[pool] = pool_active.get(pool, 0.0) + _lease_weight(lease)
     by_pool: dict[str, int] = {}
-    for pool in set(DEFAULT_AGENT_CAPS) | set(pool_active):
+    by_account = account_capacity_rows(leases, args=args, pressure=pressure)
+    if agent and account:
+        requested_key = f"{cap_pool(normalize_agent(agent))}/{account}"
+        if requested_key not in by_account:
+            vendor = cap_pool(normalize_agent(agent))
+            base = _account_cap(vendor, account)
+            effective, detail = adaptive_agent_cap(vendor, base, pressure)
+            by_account[requested_key] = {
+                "vendor": vendor,
+                "account": account,
+                "active": 0,
+                "active_weight": 0.0,
+                "cap": int(effective),
+                "base_cap": int(base),
+                "remaining": float(effective),
+            }
+            if detail:
+                by_account[requested_key]["adaptive_rate_pressure"] = detail
+    for pool in set(DEFAULT_AGENT_CAPS) | set(pool_active) | set(ACCOUNT_CAPS):
         if not pool:
             continue
-        base = DEFAULT_AGENT_CAPS.get(pool, 2)
-        effective, _detail = adaptive_agent_cap(pool, base, pressure)
-        by_pool[pool] = max(0, int(effective) - int(pool_active.get(pool, 0)))
+        account_rows = [row for row in by_account.values() if row["vendor"] == pool]
+        if account_rows:
+            by_pool[pool] = max(
+                0,
+                int(sum(float(row["remaining"]) for row in account_rows)),
+            )
+        else:
+            base = DEFAULT_AGENT_CAPS.get(pool, 2)
+            effective, _detail = adaptive_agent_cap(pool, base, pressure)
+            by_pool[pool] = max(0, int(effective) - int(pool_active.get(pool, 0)))
     agent_remaining = None
     if agent:
         pool = cap_pool(normalize_agent(agent))
-        agent_remaining = min(global_remaining, by_pool.get(pool, global_remaining))
+        if account:
+            key = f"{pool}/{account}"
+            agent_remaining = min(
+                global_remaining,
+                int(float((by_account.get(key) or {}).get("remaining", 0))),
+            )
+        else:
+            agent_remaining = min(global_remaining, by_pool.get(pool, global_remaining))
+    account_remaining = None
+    if agent and account:
+        key = f"{cap_pool(normalize_agent(agent))}/{account}"
+        account_remaining = (by_account.get(key) or {}).get("remaining", 0.0)
     return {
         "unreadable": False,
         "operating_cap": operating_cap,
         "active": active,
         "global_remaining": global_remaining,
         "by_pool": by_pool,
+        "by_account": by_account,
         "agent": agent,
+        "account": account,
+        "model": model,
+        "request_weight": model_weight(cap_pool(normalize_agent(agent)), model) if agent else 1.0,
+        "account_remaining": account_remaining,
         "agent_remaining": agent_remaining,
     }
 
 
-def cooldown_for(data: dict, agent: str) -> dict | None:
+def cooldown_for(
+    data: dict,
+    agent: str,
+    account: str | None = None,
+) -> dict | None:
     cooldowns = data.get("cooldowns", {})
+    account_key = str(account or "").strip()
+    if account_key and account_key != "default":
+        vendor = cap_pool(normalize_agent(agent))
+        scoped = cooldowns.get(f"{vendor}/{account_key}")
+        if scoped:
+            return scoped
     return cooldowns.get(agent) or cooldowns.get(agent.split("-")[0])
 
 
@@ -1421,15 +1586,16 @@ def current_rate_pressure(args: argparse.Namespace | None = None) -> dict:
 
 def adaptive_agent_cap(agent: str, base_agent_cap: int, pressure: dict | None = None) -> tuple[int, dict | None]:
     pressure = pressure if pressure is not None else current_rate_pressure()
+    if not isinstance(pressure, dict):
+        pressure = {}
     agent = normalize_agent(agent)
     pool = cap_pool(agent)
     for entry in pressure.get("providers_under_pressure") or []:
         if entry.get("scope") == "account":
-            # Capacity leases are keyed by agent pool/label and carry no account,
-            # so applying account-scoped pressure here would zero machine-global
-            # labels shared by every seat of the provider (stopping healthy
-            # siblings). account_quota_advisory is currently advisory only —
-            # no automated consumer holds or reroutes on it yet.
+            # Account-scoped capacity is enforced by the account rows below;
+            # this advisory must not zero a vendor label shared by healthy
+            # accounts. account_quota_advisory is currently advisory only — no
+            # automated consumer holds or reroutes on it yet.
             continue
         labels = [normalize_agent(str(label)) for label in entry.get("labels") or []]
         if agent not in labels and pool not in labels:
@@ -1533,6 +1699,12 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         return 2
     prof = profile(args)
     rss_mb = args.mem_mb or AGENT_RSS_MB.get(agent, DEFAULT_WORST_WORKER_MB)
+    account = str(
+        getattr(args, "account", None)
+        or getattr(args, "effective_account", None)
+        or "default"
+    ).strip() or "default"
+    model = getattr(args, "model", None)
     with StateLock():
         try:
             data = load_state()
@@ -1542,7 +1714,7 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             print(json.dumps(unreadable_admission_payload(exc), sort_keys=True))
             return 2
         prune_state(data)
-        cooldown = cooldown_for(data, agent)
+        cooldown = cooldown_for(data, agent, account)
         if cooldown:
             payload = {
                 "decision": "wait",
@@ -1551,19 +1723,21 @@ def cmd_acquire(args: argparse.Namespace) -> int:
                 "retry_after_s": max(0, int((parse_iso(cooldown.get("until")) - utc_now()).total_seconds())) if parse_iso(cooldown.get("until")) else None,
                 "cooldown": cooldown,
             }
-            save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
 
         leases = active_leases(data)
         max_total = args.max_total or prof["operating_cap"]
         pool = cap_pool(agent)
-        base_agent_cap = args.agent_cap or DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
+        request_weight = model_weight(pool, model)
+        legacy_agent_cap = DEFAULT_AGENT_CAPS.get(pool, DEFAULT_AGENT_CAPS.get(agent, 2))
+        base_agent_cap = args.agent_cap or _account_cap(
+            pool, account, default=legacy_agent_cap
+        )
         pressure = current_rate_pressure(args)
         agent_cap, adaptive_pressure = adaptive_agent_cap(agent, base_agent_cap, pressure)
         priority = (getattr(args, "priority", None) or "normal").strip().lower()
         if priority not in PRIORITY_LANES:
-            save_state(data)  # persist the prune_state() above (hygiene)
             print(json.dumps({"decision": "error", "reason": f"unknown priority {priority!r}; choose one of {PRIORITY_LANES}"}, sort_keys=True))
             return 2
         # Lane-adjusted ceilings. Global critical borrow never exceeds the RAM
@@ -1577,13 +1751,15 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             lane_max_total = min(max_total + CRITICAL_GLOBAL_BORROW, prof["raw_ram_ceiling"])
             if adaptive_pressure is None:
                 lane_agent_cap = agent_cap + CRITICAL_POOL_BORROW
-        agent_count = sum(
-            1 for lease in leases if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
+        account_active_weight = sum(
+            _lease_weight(lease)
+            for lease in leases
+            if _lease_vendor(lease) == pool and _lease_account(lease) == account
         )
         total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         capacity_full = (
             len(leases) >= lane_max_total
-            or agent_count >= lane_agent_cap
+            or account_active_weight + request_weight > lane_agent_cap
             or (
                 bool(prof["ram_mb"])
                 and total_rss + rss_mb > max(0, prof["ram_mb"] - prof["controller_reserve_mb"])
@@ -1591,10 +1767,10 @@ def cmd_acquire(args: argparse.Namespace) -> int:
         )
         if capacity_full and reclaim_stale_leases(data):
             leases = active_leases(data)
-            agent_count = sum(
-                1
+            account_active_weight = sum(
+                _lease_weight(lease)
                 for lease in leases
-                if cap_pool(normalize_agent(lease.get("agent", ""))) == pool
+                if _lease_vendor(lease) == pool and _lease_account(lease) == account
             )
             total_rss = sum(int(lease.get("mem_mb") or 0) for lease in leases)
         if len(leases) >= lane_max_total:
@@ -1606,30 +1782,40 @@ def cmd_acquire(args: argparse.Namespace) -> int:
                 "priority": priority,
                 "lane_max_total": lane_max_total,
             }
-            save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
-        if agent_count >= lane_agent_cap:
-            reason = "adaptive_rate_pressure" if adaptive_pressure else "agent_worker_cap"
+        if account_active_weight + request_weight > lane_agent_cap:
+            configured_account = account in ACCOUNT_CAPS.get(pool, {})
+            reason = "adaptive_rate_pressure" if adaptive_pressure else (
+                "account_worker_cap"
+                if account != "default" or configured_account
+                else "agent_worker_cap"
+            )
             payload = {
                 "decision": "wait",
                 "reason": reason,
                 "agent": agent,
-                "active": agent_count,
+                "vendor": pool,
+                "account": account,
+                "active": sum(
+                    1 for lease in leases
+                    if _lease_vendor(lease) == pool and _lease_account(lease) == account
+                ),
+                "active_weight": round(account_active_weight, 6),
+                "request_weight": request_weight,
                 "agent_cap": agent_cap,
                 "base_agent_cap": base_agent_cap,
+                "account_cap": agent_cap,
                 "priority": priority,
                 "lane_agent_cap": lane_agent_cap,
             }
             if adaptive_pressure:
                 payload["adaptive_rate_pressure"] = adaptive_pressure
-            save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
         if prof["ram_mb"] and total_rss + rss_mb > max(0, prof["ram_mb"] - prof["controller_reserve_mb"]):
             # RAM safety binds ALL lanes — critical cannot borrow past the RSS budget.
             payload = {"decision": "wait", "reason": "rss_budget", "active_rss_mb": total_rss, "request_mem_mb": rss_mb, "priority": priority}
-            save_state(data)
             print(json.dumps(payload, sort_keys=True))
             return 2
 
@@ -1641,6 +1827,10 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             "dispatch_id": args.dispatch_id,
             "prompt_id": args.prompt_id,
             "agent": agent,
+            "vendor": pool,
+            "account": account,
+            "model": model,
+            "capacity_weight": request_weight,
             "project_root": args.project_root,
             "worker_cwd": getattr(args, "worker_cwd", None),
             "worktree_path": getattr(args, "worktree_path", None),
@@ -1744,23 +1934,30 @@ def cmd_release(args: argparse.Namespace) -> int:
 
 def cmd_cooldown(args: argparse.Namespace) -> int:
     agent = normalize_agent(args.agent)
+    account = str(getattr(args, "account", None) or "").strip()
+    key = (
+        f"{cap_pool(agent)}/{account}"
+        if account and account != "default"
+        else agent
+    )
     with StateLock():
         data = load_state()
         prune_state(data)
         if args.action == "clear":
-            data.get("cooldowns", {}).pop(agent, None)
+            data.get("cooldowns", {}).pop(key, None)
             save_state(data)
-            print(json.dumps({"ok": True, "agent": agent, "action": "clear"}, sort_keys=True))
+            print(json.dumps({"ok": True, "agent": agent, "account": account or None, "action": "clear"}, sort_keys=True))
             return 0
         until = utc_now() + dt.timedelta(seconds=args.seconds)
-        data.setdefault("cooldowns", {})[agent] = {
+        data.setdefault("cooldowns", {})[key] = {
             "agent": agent,
+            "account": account or None,
             "reason": args.reason,
             "until": iso(until),
             "recorded_at": iso(),
         }
         save_state(data)
-    print(json.dumps({"ok": True, "agent": agent, "until": iso(until), "reason": args.reason}, sort_keys=True))
+    print(json.dumps({"ok": True, "agent": agent, "account": account or None, "until": iso(until), "reason": args.reason}, sort_keys=True))
     return 0
 
 
@@ -1970,13 +2167,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     prune_state(data)
     reclaim_stale_leases(data)
     pressure = current_rate_pressure(args)
+    active = active_leases(data)
+    by_account = account_capacity_rows(active, args=args, pressure=pressure)
     unknown_claimant = unknown_claimant_leases(data)
     legacy_manual_release = legacy_manual_release_leases(data)
     payload = {
         "schema": SCHEMA,
         "profile": profile(args),
         "state": data,
-        "active": active_leases(data),
+        "active": active,
+        "by_account": by_account,
         "unknown_claimant": unknown_claimant,
         "legacy_manual_release": legacy_manual_release,
         "rate_pressure": pressure,
@@ -1986,6 +2186,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     prof = payload["profile"]
     print(f"capacity: active={len(payload['active'])}/{prof['operating_cap']} raw={prof['raw_ram_ceiling']} ram={prof['ram_mb']}MB")
+    if by_account:
+        print("accounts:")
+        for key, row in by_account.items():
+            print(
+                f"- {key} active={row['active']} weight={row['active_weight']} "
+                f"cap={row['cap']} remaining={row['remaining']}"
+            )
     unknown_ids = {row.get("lease_id") for row in unknown_claimant}
     for lease in payload["active"]:
         prio = lease.get("priority")
@@ -2017,8 +2224,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
     if data.get("cooldowns"):
         print("cooldowns:")
-        for cooldown in data["cooldowns"].values():
-            print(f"- {cooldown['agent']}: {cooldown.get('reason')} until {cooldown.get('until')}")
+        for cooldown_key, cooldown in data["cooldowns"].items():
+            subject = cooldown_key
+            print(f"- {subject}: {cooldown.get('reason')} until {cooldown.get('until')}")
     for warning in rate_pressure_warnings(pressure):
         print(f"warning: {warning}")
     return 0
@@ -2042,6 +2250,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     acq = sub.add_parser("acquire", parents=[parent])
     acq.add_argument("--agent", required=True)
+    acq.add_argument("--account")
+    acq.add_argument("--model")
     acq.add_argument("--dispatch-id")
     acq.add_argument("--prompt-id")
     acq.add_argument("--project-root")
@@ -2083,6 +2293,7 @@ def build_parser() -> argparse.ArgumentParser:
     cool = sub.add_parser("cooldown")
     cool.add_argument("action", choices=["set", "clear"])
     cool.add_argument("--agent", required=True)
+    cool.add_argument("--account")
     cool.add_argument("--seconds", type=int, default=3600)
     cool.add_argument("--reason", default="rate_limit")
     cool.set_defaults(func=cmd_cooldown)

@@ -2630,8 +2630,65 @@ async def _run_acp_dispatch_impl(
 
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
     lease_ttl_s = max(int(cfg.idle_timeout or (36000 if cfg.mode == "goal" else 300)) * 4, 3600)
+    codex_selected_account = getattr(cfg, "_codex_selected_account", None)
+    capacity_account = codex_selected_account or getattr(cfg, "account", None)
+    if (
+        goalflight_ledger.infer_engine(cfg.agent) == "codex"
+        and not capacity_account
+    ):
+        account_rejections: list[dict[str, str]] = []
+        pre_resolved_home = None
+        pre_resolved_account = None
+        pre_resolved = False
+        try:
+            import goalflight_dispatch
+        except ImportError:
+            goalflight_dispatch = None
+        if goalflight_dispatch is not None:
+            (
+                codex_selected_account,
+                account_rejections,
+                pre_resolved_home,
+                pre_resolved_account,
+                pre_resolved,
+            ) = goalflight_dispatch._prepare_codex_account_for_capacity(
+                project_root,
+                dispatch_id,
+                model=getattr(cfg, "model", None),
+            )
+        setattr(cfg, "_codex_selected_account", codex_selected_account)
+        setattr(cfg, "_codex_account_rejections", account_rejections)
+        setattr(cfg, "_codex_account_pre_resolved", pre_resolved)
+        setattr(cfg, "_codex_pre_resolved_home", pre_resolved_home)
+        setattr(cfg, "_codex_pre_resolved_account", pre_resolved_account)
+        if pre_resolved_home is not None:
+            setattr(cfg, "_codex_dispatch_home_resolved", True)
+        capacity_account = codex_selected_account
+
+    effective_account: str | None = None
+    if (
+        goalflight_ledger.infer_engine(cfg.agent) == "grok"
+        and not getattr(cfg, "account", None)
+    ):
+        try:
+            import goalflight_dispatch
+
+            if not getattr(cfg, "_grok_selection_complete", False):
+                setattr(
+                    cfg,
+                    "_grok_selected_account",
+                    goalflight_dispatch.grok_selected_account(cfg),
+                )
+                setattr(cfg, "_grok_selection_complete", True)
+            capacity_account = getattr(cfg, "_grok_selected_account", None)
+        except ImportError:
+            pass
+        effective_account = getattr(cfg, "_grok_selected_account", None)
+
     acquire_args = argparse.Namespace(
         agent=cfg.agent,
+        account=capacity_account,
+        model=getattr(cfg, "model", None),
         dispatch_id=dispatch_id,
         prompt_id=cfg.prompt_id,
         project_root=str(project_root),
@@ -2666,7 +2723,7 @@ async def _run_acp_dispatch_impl(
         controller_label=controller_label,
         status_path=status_path,
         payload=payload,
-        effective_account=None,
+        effective_account=effective_account,
         lease_id=None,
         worker_pid=None,
         state="waiting_capacity",
@@ -2785,7 +2842,6 @@ async def _run_acp_dispatch_impl(
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
-    effective_account: str | None = None
     activity = AcpLivenessActivity()
     heartbeat_outcome: str | None = None
     heartbeat_error: dict[str, object] | None = None
@@ -4114,14 +4170,22 @@ async def _run_acp_dispatch_impl(
             dispatch_module = None
         codex_home = None
         if dispatch_module is not None:
-            try:
-                codex_home, effective_account = dispatch_module.resolve_codex_home(
-                    project_root,
-                    getattr(cfg, "account", None),
-                    dispatch_id,
+            if getattr(cfg, "_codex_account_pre_resolved", False):
+                codex_home = getattr(cfg, "_codex_pre_resolved_home", None)
+                effective_account = getattr(
+                    cfg, "_codex_pre_resolved_account", None
                 )
-            except BaseException:
-                codex_home, effective_account = None, None
+            else:
+                try:
+                    codex_home, effective_account = dispatch_module.resolve_codex_home(
+                        project_root,
+                        getattr(cfg, "_codex_selected_account", None)
+                        or getattr(cfg, "account", None),
+                        dispatch_id,
+                        model=getattr(cfg, "model", None),
+                    )
+                except BaseException:
+                    codex_home, effective_account = None, None
         if codex_home is not None:
             spawn_env["CODEX_HOME"] = codex_home
             setattr(cfg, "_codex_dispatch_home_resolved", True)

@@ -20,6 +20,7 @@ Per-machine tuning lives in a gitignored local conf loaded at import time -- see
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -89,8 +90,16 @@ DEFAULT_AGENT_CAPS = {
     "paperclip": 2,
 }
 
+# Per-account provider policy is separate from the generic per-pool worker cap.
+# Operators may override this through account_caps.default in the machine-local
+# capacity profile without changing the committed pool baseline.
+DEFAULT_ACCOUNT_CAPS = {
+    "grok": 50,
+}
+
 # Bash-tail and dispatch presets that share one engine/provider concurrency budget.
 AGENT_CAP_POOL: dict[str, str] = {
+    "codex-acp": "codex",
     "grok-code": "grok",
     "grok-research": "grok",
     "grok-acp": "grok",
@@ -149,6 +158,10 @@ def cap_pool(agent: str) -> str:
 #                                                                              #
 # Recognized keys (all optional):                                              #
 #   "agent_caps":   {agent: int}  merged over DEFAULT_AGENT_CAPS               #
+#   "account_caps": {vendor: {account: int, "default": int}}                 #
+#                    per-account caps; the vendor default handles new accounts #
+#   "model_weights": {vendor: {model: number}}                                #
+#                    optional slot weights; omitted models weigh 1.0             #
 #   "agent_rss_mb": {agent: int}  merged over AGENT_RSS_MB                      #
 #   "hard_cap":     int           raw ceiling for goalflight_capacity          #
 #   "operating_total"|"max_total": int  persistent machine operating cap       #
@@ -203,6 +216,118 @@ LOCAL_OVERRIDES = load_local_overrides()
 COMMITTED_AGENT_CAPS = dict(DEFAULT_AGENT_CAPS)
 _merge_int_map(DEFAULT_AGENT_CAPS, LOCAL_OVERRIDES.get("agent_caps"))
 _merge_int_map(AGENT_RSS_MB, LOCAL_OVERRIDES.get("agent_rss_mb"))
+
+
+def _canonical_pool(value: object) -> str:
+    """Normalize a vendor/agent label to the capacity vendor key."""
+    return cap_pool(normalize_agent(str(value or "")))
+
+
+def _merge_account_caps(target: dict[str, dict[str, int]], override: object) -> None:
+    """Merge account caps while accepting both nested and flat local shapes."""
+    if not isinstance(override, dict):
+        return
+    for vendor, accounts in override.items():
+        if isinstance(accounts, dict):
+            vendor_key = _canonical_pool(vendor)
+            if not vendor_key:
+                continue
+            bucket = target.setdefault(vendor_key, {})
+            for account, value in accounts.items():
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0 and str(account).strip():
+                    bucket[str(account).strip()] = parsed
+            continue
+        # Also accept {"vendor:account": 30}; this keeps hand-written local
+        # profiles easy to migrate without making it the documented shape.
+        try:
+            parsed = int(accounts)
+        except (TypeError, ValueError):
+            continue
+        text = str(vendor).strip()
+        if parsed <= 0 or ":" not in text:
+            continue
+        vendor_name, account = text.split(":", 1)
+        vendor_key = _canonical_pool(vendor_name)
+        if vendor_key and account.strip():
+            target.setdefault(vendor_key, {})[account.strip()] = parsed
+
+
+def _merge_model_weights(
+    target: dict[str, dict[str, float]], override: object
+) -> None:
+    """Merge positive model slot weights from the machine-local profile."""
+    if not isinstance(override, dict):
+        return
+    for vendor, models in override.items():
+        vendor_key = _canonical_pool(vendor) if vendor != "*" else "*"
+        if isinstance(models, dict):
+            bucket = target.setdefault(vendor_key, {})
+            for model, value in models.items():
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(parsed) and parsed > 0 and str(model).strip():
+                    bucket[str(model).strip().casefold()] = parsed
+            continue
+        # A flat {"model-name": weight} form is useful when one vendor is in
+        # the profile; it applies to every vendor and remains read-compatible.
+        try:
+            parsed = float(models)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0 and str(vendor).strip():
+            target.setdefault("*", {})[str(vendor).strip().casefold()] = parsed
+
+
+ACCOUNT_CAPS: dict[str, dict[str, int]] = {}
+_merge_account_caps(ACCOUNT_CAPS, LOCAL_OVERRIDES.get("account_caps"))
+
+MODEL_WEIGHTS: dict[str, dict[str, float]] = {}
+_merge_model_weights(
+    MODEL_WEIGHTS,
+    LOCAL_OVERRIDES.get("model_weights", LOCAL_OVERRIDES.get("model_weights_by_vendor")),
+)
+
+
+def account_cap(vendor: str, account: str | None = None, *, default: int | None = None) -> int:
+    """Return the cap for one vendor/account, with a vendor fallback."""
+    vendor_key = _canonical_pool(vendor)
+    configured = ACCOUNT_CAPS.get(vendor_key, {})
+    account_key = str(account or "default").strip() or "default"
+    value = configured.get(account_key, configured.get("default"))
+    if value is not None:
+        return int(value)
+    if default is not None:
+        return int(default)
+    return int(
+        DEFAULT_ACCOUNT_CAPS.get(
+            vendor_key,
+            DEFAULT_AGENT_CAPS.get(vendor_key, DEFAULT_AGENT_CAPS.get(vendor, 2)),
+        )
+    )
+
+
+def model_weight(vendor: str, model: str | None = None) -> float:
+    """Return configured slot weight for a model; unconfigured models weigh 1."""
+    model_key = str(model or "").strip().casefold()
+    if not model_key:
+        return 1.0
+    vendor_key = _canonical_pool(vendor)
+    value = MODEL_WEIGHTS.get(vendor_key, {}).get(model_key)
+    if value is None:
+        value = MODEL_WEIGHTS.get("*", {}).get(model_key)
+    if value is None:
+        return 1.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return parsed if math.isfinite(parsed) and parsed > 0 else 1.0
 
 
 def _positive_int_or(value: object, default):
@@ -295,6 +420,8 @@ def seed_capacity_conf(path: Path | None = None, *, force: bool = False) -> dict
         "hard_cap": cap,
         "operating_total": cap,
         "agent_caps": dict(COMMITTED_AGENT_CAPS),
+        "account_caps": {},
+        "model_weights": {},
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
