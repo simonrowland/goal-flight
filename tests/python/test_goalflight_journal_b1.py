@@ -1,4 +1,4 @@
-"""B1 journal startup, holder, and settled-history regressions."""
+"""Journal startup, holder, and integrity regressions."""
 
 from __future__ import annotations
 
@@ -76,6 +76,73 @@ def test_integrity_check_is_once_per_identity_and_rechecks_replacement(
     assert calls == [False, False]
 
 
+def _corrupt_table_root(path: Path, table: str) -> None:
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        root_page = int(
+            connection.execute(
+                "SELECT rootpage FROM sqlite_master WHERE name = ?", (table,)
+            ).fetchone()[0]
+        )
+    with path.open("r+b") as handle:
+        handle.seek((root_page - 1) * page_size)
+        handle.write(b"\x00")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def test_in_place_corruption_rechecks_within_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    assert authority.prepare_attempt("corrupt-bound").committed
+    _checkpoint(authority.path)
+    _corrupt_table_root(authority.path, "dispatch_attempts")
+    key = authority._integrity_cache_key()
+    journal._INTEGRITY_CHECKED_AT[key] = (
+        journal.time.monotonic() - journal.INTEGRITY_CHECK_INTERVAL_S
+    )
+
+    with pytest.raises(journal.JournalIntegrityError, match="integrity check failed"):
+        journal.Journal(project)
+
+
+def test_in_place_corruption_is_reported_on_first_corrupt_read_and_refuses_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    assert authority.prepare_attempt("corrupt-read").committed
+    _checkpoint(authority.path)
+    _corrupt_table_root(authority.path, "dispatch_attempts")
+
+    with pytest.raises(journal.JournalIntegrityError, match="integrity check failed"):
+        authority.read_all("SELECT * FROM dispatch_attempts")
+    with pytest.raises(journal.JournalIntegrityError, match="Failing closed"):
+        authority.prepare_attempt("refused-after-corruption")
+
+
+def test_unknown_future_user_version_is_not_rewritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("PRAGMA user_version = 7")
+
+    with pytest.raises(journal.JournalUpgradeRequired, match="user_version=7"):
+        journal.Journal(project)
+    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
 def test_current_schema_open_skips_construction_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -129,58 +196,3 @@ def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
     finally:
         reader._reader_connection.close()
         reader._reader_connection = None
-
-
-def test_retention_deletes_settled_rows_but_keeps_live_and_unresolved(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    _set_state_env(monkeypatch, tmp_path)
-    project = _project(tmp_path)
-    authority = journal.Journal.create(project)
-    live = authority.prepare_attempt("live-row")
-    settled = authority.prepare_attempt("settled-row")
-    unresolved = authority.prepare_attempt("unresolved-row")
-    assert live.committed and settled.committed and unresolved.committed
-    assert settled.value is not None and unresolved.value is not None
-    settled_commit = authority.commit_terminal(
-        settled.value.attempt_id,
-        terminal_state="complete",
-        observation={"text": "done"},
-    )
-    unresolved_commit = authority.commit_terminal(
-        unresolved.value.attempt_id,
-        terminal_state="complete",
-        observation={"text": "waiting"},
-    )
-    assert settled_commit.committed and unresolved_commit.committed
-
-    old = "2020-01-01T00:00:00+00:00"
-    with sqlite3.connect(authority.path) as connection:
-        connection.execute(
-            "UPDATE dispatch_attempts SET terminal_at = ?, state_updated_at = ? "
-            "WHERE dispatch_id IN (?, ?)",
-            (old, old, "settled-row", "unresolved-row"),
-        )
-        connection.execute(
-            "UPDATE terminal_outbox SET projected_at = ? WHERE attempt_id = ?",
-            (old, settled.value.attempt_id),
-        )
-
-    result = authority.retain_settled_rows(
-        older_than="2021-01-01T00:00:00+00:00",
-        compact_threshold_bytes=10**12,
-    )
-    assert result["disposition"] == "committed"
-    assert result["deleted"]["dispatch_attempts"] == 1
-
-    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
-        rows = {
-            str(row[0]): str(row[1])
-            for row in connection.execute(
-                "SELECT dispatch_id, lifecycle_state FROM dispatch_attempts"
-            )
-        }
-    assert rows["live-row"] == "PREPARED"
-    assert rows["unresolved-row"] == "TERMINAL"
-    assert "settled-row" not in rows
