@@ -116,6 +116,9 @@ def _stub_bash_launch(
         return "lease-test"
 
     monkeypatch.setattr(D, "_acquire_capacity", allow_capacity)
+    # The fake lease is never written to capacity state, so the launcher's
+    # "lease still held before spawn" check must be faked alongside it.
+    monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
     def record_ledger(*_args, **kwargs):
         ordering.append(f"ledger:{kwargs['state']}")
         ledger_calls.append(dict(kwargs))
