@@ -4145,6 +4145,12 @@ async def _run_acp_dispatch_impl(
             # Every ACP shape binds only after account/capacity admission. The
             # central hook also handles in-place launches and occupancy locking.
             worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+            occupancy_warning = getattr(cfg, "_worktree_occupancy_warning", None)
+            if occupancy_warning is not None:
+                tail = getattr(cfg, "tail", None)
+                goalflight_dispatch._emit_dispatch_warnings(
+                    [occupancy_warning], tail_path=Path(tail) if tail else None,
+                )
             if worktree_mode == "create":
                 if worktree_seat is None:
                     raise goalflight_worktree_pool.WorktreeSeatError(
@@ -4181,6 +4187,8 @@ async def _run_acp_dispatch_impl(
         except Exception as e:
             if getattr(cfg, "_worktree_occupancy_refused", False):
                 goalflight_dispatch._discard_preworker_ledger(cfg)
+                payload["reason"] = "worktree_occupied"
+                print(f"goalflight_acp_run: {e}", file=sys.stderr, flush=True)
             if worktree_seat is not None:
                 worktree_seat.release()
                 worktree_seat = None
@@ -5079,6 +5087,8 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def acp_dispatch_exit_code(payload: dict) -> int:
+    if payload.get("state") == "failed_worktree" and payload.get("reason") == "worktree_occupied":
+        return 64
     if payload.get("state") == "blocked_windows_dispatch":
         return 2
     return 0 if payload.get("state") == "complete" else 1
@@ -5213,6 +5223,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="File-IPC steer mailbox for between-turn ACP steer delivery.",
     )
+    parser.add_argument("--occupied-worktree-forced", action="store_true")
+    parser.add_argument("--tail", help="Append dispatch warnings to this file.")
     parser.add_argument(
         "--user-confirm-timeout-s",
         type=float,

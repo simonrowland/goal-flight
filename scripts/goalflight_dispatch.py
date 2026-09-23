@@ -2068,6 +2068,7 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     """
     lease = _bind_dispatch_worktree(args)
     warning = _prepare_attempt_worktree_occupancy(args)
+    args._worktree_occupancy_warning = warning
     if warning is not None:
         args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
     return lease
@@ -17960,6 +17961,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         controller_pid=_controller_pid(args),
         controller_label=_controller_label(args),
         unregistered_forced=bool(getattr(args, "unregistered_forced", False)),
+        occupied_worktree_forced=bool(getattr(args, "occupied_worktree_forced", False)),
+        tail=str(Path(args.tail) if args.tail else (base or _dispatch_base_dir()) / f"{args.dispatch_id}.tail"),
         _controller_registration_script="goalflight_acp_run.py",
         cpu_epsilon=0.1,
         json=False,
@@ -18259,6 +18262,12 @@ def _run_acp_detached_launcher(
             with contextlib.suppress(OSError, json.JSONDecodeError):
                 status_payload = json.loads(status_json.read_text(encoding="utf-8"))
                 last_state = status_payload.get("state")
+                if (
+                    last_state == "failed_worktree"
+                    and status_payload.get("reason") == "worktree_occupied"
+                ):
+                    print(f"goalflight_dispatch: {status_payload['error']}", file=sys.stderr)
+                    return 64
                 if str(last_state).startswith("blocked_capacity"):
                     if child_alive:
                         time.sleep(0.2)
@@ -19374,6 +19383,7 @@ def main(argv: list[str] | None = None) -> int:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
+        args.dispatch_warnings = dispatch_warnings
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)
@@ -19777,6 +19787,14 @@ def main(argv: list[str] | None = None) -> int:
                 codex_env["CODEX_HOME"] = codex_dispatch_home
             _validate_codex_reasoning_effort(args, codex_env)
         worktree_seat = _admit_dispatch_worktree(args)
+        occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
+        if occupancy_warning is not None:
+            _emit_dispatch_warnings(
+                [occupancy_warning],
+                tail_path=tail,
+                reset_tail=False,
+            )
+            worker_stdout_mode = "ab"
         request_envelope = _queue_request_envelope(args)
         if worktree_seat is not None:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)

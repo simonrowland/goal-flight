@@ -586,15 +586,15 @@ def test_spawn_intent_stale_window(prepared, age, allowed):
 
 
 @pytest.mark.parametrize("replacement", [None, "replacement-dispatch"])
-def test_withdraw_releases_seat_and_task(prepared, replacement):
+def test_queued_rows_never_own_worktree_and_withdraw_releases_task(prepared, replacement):
     project, authority, _, _ = prepared
     record = ledger.read_record("withdraw-test")
     record.update(worker_cwd=str(project), task_ids=["t-withdraw"])
     ledger.write_record(record)
     fresh = SimpleNamespace(cwd=str(project), dispatch_id="fresh-dispatch", agent="test")
-    # Exercise the real ledger + kernel-lock admission gate, not a mocked verdict.
-    with pytest.raises(dispatch.DispatchUsageError, match="withdraw-test"):
-        dispatch._prepare_attempt_worktree_occupancy(fresh)
+    # Queued rows never own a worktree, even when they record worker_cwd.
+    assert dispatch._prepare_attempt_worktree_occupancy(fresh) is None
+    dispatch._release_worktree_occupancy_lock(fresh)
     args = ["--superseded-by", replacement] if replacement else []
     code, result = withdraw(*args)
     assert code == 0, result

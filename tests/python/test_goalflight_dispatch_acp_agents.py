@@ -1111,6 +1111,48 @@ def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
         assert events[:3] == ["spawning", "spawn", "attach"], events
 
 
+def test_acp_occupancy_override_reaches_admission_and_warns() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _capacity_env(tmp / "state")
+        env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            ):
+                lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(tmp, "incumbent")
+                try:
+                    for forced in (False, True):
+                        dispatch_id = f"occupancy-{forced}"
+                        args = _base_acp_args(tmp, agent="fake-acp", dispatch_id=dispatch_id)
+                        args.unregistered_forced = True
+                        args.occupied_worktree_forced = forced
+                        args.tail = str(tmp / f"{dispatch_id}.tail")
+                        cfg = dispatch_mod._build_acp_cfg(
+                            args, status_json=tmp / f"{dispatch_id}.json", base=tmp,
+                        )
+                        stderr = io.StringIO()
+                        with contextlib.redirect_stderr(stderr):
+                            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                        assert goalflight_acp_run.acp_dispatch_exit_code(payload) == (0 if forced else 64), payload
+                        if forced:
+                            assert payload["state"] == "complete", payload
+                            for output in (stderr.getvalue(), Path(args.tail).read_text()):
+                                assert "--occupied-worktree-forced accepted" in output, output
+                                assert "incumbent" in output, output
+                        else:
+                            assert "incumbent" in payload["error"], payload
+                            assert "incumbent" in stderr.getvalue(), stderr.getvalue()
+                finally:
+                    lock.release()
+        finally:
+            _restore_fake_acp(saved)
+        assert goalflight_acp_run.acp_dispatch_exit_code({"state": "failed_worktree"}) == 1
+
+
 def _run_acp_thread(cfg: SimpleNamespace):
     result: dict[str, object] = {}
 
