@@ -895,10 +895,28 @@ def test_pid_identity_lstart_only_is_unknown() -> None:
     )
 
 
+def test_identity_after_spawn_is_one_ledger_probe() -> None:
+    calls: list[int] = []
+
+    def identity(pid: int) -> dict[str, Any]:
+        calls.append(pid)
+        return {"pid": pid, "lstart": "Thu Jun 11 12:00:00 2026"}
+
+    with patched_process_identity(identity):
+        result = fleet_launch._process_identity_after_spawn(4242)
+
+    assert_true(
+        "identity returned",
+        result == {"pid": 4242, "lstart": "Thu Jun 11 12:00:00 2026"},
+    )
+    assert_true("single identity probe", calls == [4242])
+
+
 def main() -> None:
     tests = [
         test_sanitized_env_allows_oauth_token_exact_not_prefix,
         test_pid_identity_lstart_only_is_unknown,
+        test_identity_after_spawn_is_one_ledger_probe,
         test_ensure_local_bin_prepends_when_absent,
         test_ensure_local_bin_idempotent_when_present,
         test_ensure_local_bin_no_home_noop,

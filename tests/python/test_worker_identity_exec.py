@@ -375,8 +375,6 @@ def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) 
         "process_start_identity",
         lambda pid: {"pid": pid, "start_token": START_TOKEN},
     )
-    monkeypatch.setattr(goalflight_ledger, "_posix_ps_available", lambda: False)
-
     identity = goalflight_ledger.process_identity(PID)
     assert identity and identity.get("start_token") == START_TOKEN
     assert goalflight_dispatch._watch_identity_token(identity) == {

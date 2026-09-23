@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -169,6 +170,114 @@ def test_f6_genuinely_absent_row_can_still_be_created(
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     path = ledger.write_record({"dispatch_id": "new-row", "state": "running"})
     assert json.loads(path.read_text(encoding="utf-8"))["state"] == "running"
+
+
+def test_unchanged_nonterminal_hold_skips_the_ledger_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    record = {
+        "schema": ledger.SCHEMA,
+        "dispatch_id": "unchanged-hold",
+        "state": "running",
+        "sidecar_hold": "live",
+        "sidecar_hold_reason": "identity_matches",
+    }
+    ledger.write_record(record)
+    writes: list[dict] = []
+    monkeypatch.setattr(ledger, "write_record", lambda value: writes.append(dict(value)))
+
+    ledger._stamp_nonterminal_fields(
+        record,
+        {"sidecar_hold": "live", "sidecar_hold_reason": "identity_matches"},
+    )
+
+    assert writes == []
+
+
+def test_archive_moves_old_terminal_rows_and_read_record_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    now = dt.datetime(2026, 9, 23, 12, tzinfo=dt.timezone.utc)
+    ended_at = now - dt.timedelta(days=ledger.TERMINAL_RECORD_RETENTION_DAYS + 1)
+    record = {
+        "schema": ledger.SCHEMA,
+        "dispatch_id": "archived-id",
+        "state": "complete",
+        "terminal_state": "complete",
+        "ended_at": ended_at.isoformat(),
+    }
+    live_path = ledger.write_record(record)
+
+    summary = ledger.archive_terminal_records(now=now)
+
+    assert summary["moved"] == 1
+    assert not live_path.exists()
+    archived_path = (
+        ledger.runs_archive_dir(create=False)
+        / ended_at.strftime("%Y-%m")
+        / live_path.name
+    )
+    assert archived_path.exists()
+    assert ledger.read_record("archived-id")["state"] == "complete"
+
+
+def test_status_reads_live_and_recent_rows_without_parsing_old_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    runs = ledger.runs_dir()
+    old_epoch = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).timestamp()
+    for index in range(3000):
+        path = runs / f"old-{index:04d}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": f"old-{index:04d}",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "ended_at": "2026-08-01T12:00:00+00:00",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.utime(path, (old_epoch, old_epoch))
+    (runs / "recent.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "recent",
+                "state": "complete",
+                "terminal_state": "complete",
+                "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (runs / "live.json").write_text(
+        json.dumps(
+            {"dispatch_id": "live", "state": "queued"},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ledger, "scan_surplus", lambda _records: [])
+
+    payload = ledger.status_payload()
+    work = ledger.last_read_work()
+
+    assert {row["dispatch_id"] for row in payload["records"]} == {"live", "recent"}
+    assert work["listed"] == 3002
+    assert work["parsed"] == 2
+    assert work["skipped_terminal"] == 3000
 
 
 def test_f7_relative_retry_delay_without_anchor_is_indeterminate() -> None:

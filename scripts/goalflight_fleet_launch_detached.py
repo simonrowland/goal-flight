@@ -17,7 +17,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -91,55 +90,16 @@ def _decode_b64(value: str) -> str:
 
 
 def _process_identity(pid: int) -> dict[str, Any] | None:
-    ledger_identity: dict[str, Any] | None = None
     try:
         import goalflight_ledger
 
-        identity = goalflight_ledger.process_identity(pid)
-        if identity and identity.get("lstart"):
-            return identity
-        if isinstance(identity, dict):
-            ledger_identity = identity
+        return goalflight_ledger.process_identity(pid)
     except Exception:
-        pass
-
-    try:
-        lstart = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        comm = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "comm="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return ledger_identity
-    if lstart.returncode != 0 or not lstart.stdout.strip():
-        return ledger_identity
-    fallback = {
-        "pid": pid,
-        "lstart": lstart.stdout.strip(),
-        "comm": comm.stdout.strip() if comm.returncode == 0 else "",
-    }
-    if ledger_identity:
-        fallback = {**ledger_identity, **{k: v for k, v in fallback.items() if v}}
-    return fallback
+        return None
 
 
 def _process_identity_after_spawn(pid: int) -> dict[str, Any] | None:
-    identity = None
-    for _ in range(20):
-        current = _process_identity(pid)
-        if current:
-            identity = current
-        if current and current.get("start_token"):
-            break
-        time.sleep(0.05)
-    return identity
+    return _process_identity(pid)
 
 
 def _sanitized_env(source: dict[str, str]) -> dict[str, str]:
