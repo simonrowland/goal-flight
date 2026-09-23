@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -18,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_wake_supervise as supervise  # noqa: E402
 
 
 def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -184,52 +186,84 @@ def test_current_schema_fast_path_repairs_non_wal_mode(
         assert str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
 
 
-def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
+def test_supervisor_holder_holds_wal_sidecars_before_any_mail(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.Journal.create(project)
-    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
-        connection.execute("CREATE TABLE synthetic_padding (payload BLOB NOT NULL)")
-        connection.execute(
-            "INSERT INTO synthetic_padding(payload) VALUES (zeroblob(?))",
-            (85 * 1024 * 1024,),
-        )
-        connection.commit()
-    _checkpoint(authority.path)
-    assert authority.path.stat().st_size >= 80 * 1024 * 1024
-    reader = journal.Journal.open_reader(project, persistent=True)
-    reader._connect()
-    assert reader._reader_connection is not None
-    assert not reader._reader_connection.in_transaction
+    holder = supervise._JournalWALHolder(authority.path)
     try:
-        first = authority.prepare_attempt("holder-first")
-        assert first.committed
+        assert holder.connection is not None
+        assert not holder.connection.in_transaction
+        assert holder.connection.execute("PRAGMA busy_timeout").fetchone() == (0,)
         wal = Path(f"{authority.path}-wal")
         shm = Path(f"{authority.path}-shm")
         assert wal.exists() and shm.exists()
-        wal_identity = wal.stat().st_ino
-        shm_identity = shm.stat().st_ino
-        max_wal_bytes = wal.stat().st_size
-
-        for index in range(64):
-            writer = journal.Journal(project)
-            result = writer.prepare_attempt(f"holder-{index}")
-            assert result.committed
-            assert wal.exists() and shm.exists()
-            assert wal.stat().st_ino == wal_identity
-            assert shm.stat().st_ino == shm_identity
-            max_wal_bytes = max(max_wal_bytes, wal.stat().st_size)
-
+        # Keep descriptors open so an unlinked inode cannot be reused and
+        # accidentally make the identity assertion pass after recreation.
+        with wal.open("rb") as wal_fd, shm.open("rb") as shm_fd:
+            subprocess.run(
+                [sys.executable, "-c", """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import goalflight_journal as journal
+project, path = Path(sys.argv[2]), Path(sys.argv[3])
+for index in range(64):
+    writer = journal.Journal(project)
+    assert writer.prepare_attempt(f"holder-{index}").committed
+    for suffix, inode in zip(("-wal", "-shm"), sys.argv[4:]):
+        assert Path(f"{path}{suffix}").stat().st_ino == int(inode)
+""", str(ROOT / "scripts"), str(project), str(authority.path),
+                 str(os.fstat(wal_fd.fileno()).st_ino),
+                 str(os.fstat(shm_fd.fileno()).st_ino)],
+                check=True, timeout=30,
+            )
+            assert os.fstat(wal_fd.fileno()).st_nlink == 1
+            assert os.fstat(shm_fd.fileno()).st_nlink == 1
         with contextlib.closing(sqlite3.connect(authority.path, timeout=0, isolation_level=None)) as connection:
-            checkpoint = connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-        assert checkpoint is not None and checkpoint[0] == 0
-        assert max_wal_bytes < 16 * 1024 * 1024
+            assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (0, 0, 0)
+        assert not holder.connection.in_transaction
     finally:
-        reader._reader_connection.close()
-        reader._reader_connection = None
+        holder.close()
+    assert holder.connection is None
+
+
+def test_supervisor_holder_retries_busy_open_and_reopens_replaced_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    authority = journal.Journal.create(_project(tmp_path))
+    with contextlib.closing(sqlite3.connect(authority.path, isolation_level=None)) as blocker:
+        blocker.execute("PRAGMA journal_mode = DELETE")
+        blocker.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        holder = supervise._JournalWALHolder(authority.path)
+        assert time.monotonic() - started < 0.5
+        assert holder.connection is None
+        blocker.rollback()
+        blocker.execute("PRAGMA journal_mode = WAL")
+    try:
+        host = supervise.RealHost.__new__(supervise.RealHost)
+        host._stop = False
+        host._journal_holder = holder
+        assert host.running()
+        old = holder.connection
+        assert old is not None
+        replacement = tmp_path / "replacement.sqlite3"
+        with contextlib.closing(sqlite3.connect(replacement)) as destination:
+            old.backup(destination)
+        os.replace(replacement, authority.path)
+        assert host.running()
+        assert holder.connection is not None
+        assert holder.connection is not old
+        assert not holder.connection.in_transaction
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            old.execute("SELECT 1")
+    finally:
+        holder.close()
 
 
 @pytest.mark.skipif(

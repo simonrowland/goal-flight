@@ -155,9 +155,10 @@ JOURNAL_OPEN_RETRY_MAX_S = 5.0
 # key so a restore/replace gets a fresh validation in this process. The cache is
 # intentionally memory-only: a process restart (including recovery after an
 # unclean shutdown) makes the next open run a full check without a disk write.
-# On the battery journal, five full checks per open read roughly 85 MiB and
-# cost a measured 24.7 ms median; fifteen minutes bounds the accepted window
-# while avoiding that cost on every short-lived open. SQLite still detects
+# Before caching, one full integrity check per open read roughly 85 MiB.
+# tests/python/test_goalflight_journal_b1.py::test_large_journal_open_benchmark
+# measured 28.4 -> 12.4 ms per open on an 89 MB journal. Fifteen minutes bounds
+# the accepted window while avoiding repeated checks in a process. SQLite detects
 # corruption on pages an operation touches, and _handle_corruption latches the
 # first SQLITE_CORRUPT/NOTADB failure so subsequent writes fail closed.
 INTEGRITY_CHECK_INTERVAL_S = 15 * 60.0
