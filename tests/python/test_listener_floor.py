@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -514,3 +515,43 @@ def test_lease_claim_stays_silent_without_in_flight_work(
     assert isinstance(depth["command"], str) and depth["command"]
     assert "commands" not in depth
     assert "hint" not in depth
+
+
+def test_listener_waits_a_poll_interval_while_a_sibling_holds_the_ring(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listener whose sibling holds the ring must not re-peek every 50 ms.
+
+    Regression (2026-09-23): with unread mail and the ring claimed by a sibling,
+    the listen loop slept 0.05 s and re-peeked the journal ~20x/s until the
+    controller advanced, pinning listeners at ~45% CPU and ~1 MB/s of journal
+    I/O each. It must wait one poll interval between re-peeks instead.
+    """
+    project, env = isolated
+    lease = _claim(project)
+    attempts: list[float] = []
+
+    def sibling_holds_ring(*_args, **_kwargs) -> bool:
+        attempts.append(time.monotonic())
+        return False
+
+    monkeypatch.setattr(wake, "claim_ring", sibling_holds_ring)
+    argv = _listen_cmd(project, label=lease.label, nonce=lease.nonce, timeout_s=2)[2:]
+    poll_index = argv.index("--poll-secs") + 1
+    argv[poll_index] = "0.5"
+    def post_once_live() -> None:
+        _wait_live(project, lease.label, 1)
+        _post(env, project, lease.label, "unread mail the sibling is ringing for")
+
+    poster = threading.Thread(target=post_once_live, daemon=True)
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        poster.start()
+        code = messages.main(argv)
+    poster.join(timeout=5)
+    assert code == 1, "listener should time out without delivering"
+    assert attempts, "the unread mail never reached the ring claim"
+    # 2 s at a 0.5 s poll allows ~4 claim attempts; the 50 ms spin made ~40.
+    assert len(attempts) <= 8, f"re-peeked {len(attempts)} times in 2 s"
