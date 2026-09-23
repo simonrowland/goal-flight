@@ -282,6 +282,9 @@ def test_controller_startup_json_is_terse_with_work_in_flight(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "terse-claim-token"},
     )
+    # A zero waiter count is valid only when the ledger probe supplied known
+    # evidence.  An unreadable process/ledger probe is intentionally UNKNOWN.
+    monkeypatch.setattr(wake, "live_waiters", lambda *args, **kwargs: [])
     monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     result = sessions.claim_controller_startup(
         project, pid=81001, label="terse-ctl", role="controller"
@@ -301,6 +304,7 @@ def test_listen_exit_still_prints_the_numbered_hint(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
+    env = _env_with_empty_process_listing(env, project.parent)
     authority = journal.open_or_create_journal(project)
     lease = _claim(project)
     assert authority.prepare_attempt("terse-exit-work").committed

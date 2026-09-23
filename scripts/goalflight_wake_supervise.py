@@ -166,6 +166,7 @@ _ORPHANED_STDOUT_MARKERS = (
 _SLOT_STOP_REASONS = frozenset({"did-not-arm"})
 _DIAGNOSTIC_EVENT_TYPES = frozenset({"listener-exit", "listener-fault"})
 _IDLE_NEXT_STATES = frozenset({"empty", "unknown"})
+_DASHBOARD_HINT_UNAVAILABLE = "next-task hint unavailable"
 _ARMED_STDOUT_KINDS = frozenset(
     {
         "armed",
@@ -662,11 +663,22 @@ def _owned_coverage_label(slots: list[_Slot]) -> str:
 
 
 def _next_is_actionable_wake(record: dict[str, object]) -> bool:
-    """Idle empty/unknown next records are not controller wakes."""
+    """Idle next records are not controller wakes.
+
+    A disabled optional dashboard is a known idle condition. Other
+    unavailable states, such as a malformed projection, remain actionable so
+    the controller sees the fault rather than silently treating it as empty.
+    """
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return False
-    return str(payload.get("state") or "") not in _IDLE_NEXT_STATES
+    state = str(payload.get("state") or "")
+    if state in _IDLE_NEXT_STATES:
+        return False
+    if state == "unavailable":
+        detail = str(payload.get("detail") or "")
+        return not detail.startswith(_DASHBOARD_HINT_UNAVAILABLE)
+    return True
 
 
 def _silent_peer_write(host: SuperviseHost) -> bool:
@@ -2899,7 +2911,7 @@ def cmd_supervise(
             retry_budget_s=0,
             open_retry_budget_s=0,
         )
-    except goalflight_journal.JournalError as exc:
+    except goalflight_journal.JournalIntegrityError as exc:
         print(f"supervise: journal holder unavailable: {exc}", file=sys.stderr)
         return SUPERVISE_START_EXIT
 

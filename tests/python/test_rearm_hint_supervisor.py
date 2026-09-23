@@ -392,6 +392,15 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
     assert absent_command in initial_context, initial_context
     env["GOALFLIGHT_CONTROLLER_SESSION_ID"] = lease.nonce
     env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
+    # The migration preflight must prove supervisor absence before replacing
+    # coverage.  Supply that evidence explicitly; a denied host process table
+    # is UNKNOWN and must not be treated as absence.
+    env = _ps_listing_env(
+        tmp_path,
+        env,
+        name="probe-absent-supervisor",
+        rows=[],
+    )
 
     supervise_parts = shlex.split(
         wake.coverage_supervise_command(
@@ -1942,6 +1951,8 @@ def test_doctor_wake_coverage_reports_supervisor_state(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if wake._process_listing() is None:
+        pytest.skip("real process-table probe unavailable")
     project, lease = isolated
     supervise_cmd = wake.coverage_supervise_command(
         project,

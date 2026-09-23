@@ -7781,7 +7781,13 @@ def cmd_follow(args) -> int:
                         emit=emit,
                         delivered=delivered,
                     )
-                except goalflight_journal.JournalError:
+                except (
+                    goalflight_journal.JournalBusy,
+                    goalflight_journal.JournalDisappeared,
+                    goalflight_journal.JournalIOError,
+                    goalflight_journal.JournalIntegrityError,
+                    goalflight_journal.JournalUpgradeRequired,
+                ):
                     # Delivery's position reads share peek's busy tolerance.
                     raise
                 except (OSError, RuntimeError, ValueError) as exc:
