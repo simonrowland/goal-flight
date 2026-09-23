@@ -4045,18 +4045,11 @@ def test_listen_survives_transient_journal_busy(
     try:
         _await_armed_listener(project, lease.label)
         gate.set()
-        if busy_stage == "connect":
-            # Persistent readers are eager holders now, so steady-state
-            # polling does not create a fresh SQLite connection to gate.
-            time.sleep(0.15)
-            assert not hits
-        else:
-            cap.await_stderr("listener degraded")
-            assert hits, f"{busy_stage} busy injection did not bind"
+        cap.await_stderr("listener degraded")
+        assert hits, f"{busy_stage} busy injection did not bind"
         assert thread.is_alive()
         gate.clear()
-        if busy_stage == "query":
-            cap.await_stderr("listener recovered")
+        cap.await_stderr("listener recovered")
         assert thread.is_alive()
     finally:
         gate.clear()
@@ -4064,8 +4057,8 @@ def test_listen_survives_transient_journal_busy(
     thread.join(15.0)
     cap.pump()
     assert results == [3]  # stale-lease/superseded shutdown, not a fault exit
-    assert cap.stderr.count("listener degraded") == (1 if busy_stage == "query" else 0)
-    assert cap.stderr.count("listener recovered") == (1 if busy_stage == "query" else 0)
+    assert cap.stderr.count("listener degraded") == 1
+    assert cap.stderr.count("listener recovered") == 1
 
 
 def test_listen_emits_structured_exit_when_journal_disappears(

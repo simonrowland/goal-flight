@@ -1222,11 +1222,6 @@ class Journal:
         self._persistent_reader = bool(persistent)
         self._reader_connection: sqlite3.Connection | None = None
         self._reader_pid: int | None = None
-        if self._persistent_reader:
-            # Start the holder at construction time. A lazy handle leaves a
-            # window where a short-lived writer can still be SQLite's last
-            # connection and trigger WAL sidecar cleanup.
-            self._connect()
         return self
 
     def _configure(

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import time
 
 import pytest
 
@@ -200,6 +201,7 @@ def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
     _checkpoint(authority.path)
     assert authority.path.stat().st_size >= 80 * 1024 * 1024
     reader = journal.Journal.open_reader(project, persistent=True)
+    reader._connect()
     assert reader._reader_connection is not None
     assert not reader._reader_connection.in_transaction
     try:
@@ -228,3 +230,75 @@ def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
     finally:
         reader._reader_connection.close()
         reader._reader_connection = None
+
+
+@pytest.mark.skipif(
+    os.environ.get("GOALFLIGHT_RUN_JOURNAL_BENCHMARK") != "1",
+    reason="large-journal benchmark is opt-in",
+)
+def test_large_journal_open_benchmark(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Print reproducible bcf75a1-style versus cached-open measurements.
+
+    Run with ``pytest -s tests/python/test_goalflight_journal_b1.py -k benchmark``.
+    The baseline clears the process cache before every open, matching the old
+    per-open integrity check; the cached run clears it once, then reuses the
+    fifteen-minute identity cache. ``integrity_bytes_read`` is the logical
+    journal bytes traversed by each full integrity check, independent of the
+    host page cache.
+    """
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
+        connection.execute("CREATE TABLE synthetic_padding (payload BLOB NOT NULL)")
+        connection.execute(
+            "INSERT INTO synthetic_padding(payload) VALUES (zeroblob(?))",
+            (85 * 1024 * 1024,),
+        )
+        connection.commit()
+    _checkpoint(authority.path)
+    journal_bytes = authority.path.stat().st_size
+    opens = int(os.environ.get("GOALFLIGHT_JOURNAL_BENCHMARK_OPENS", "5"))
+    if opens < 2:
+        raise ValueError("GOALFLIGHT_JOURNAL_BENCHMARK_OPENS must be at least 2")
+
+    real_uncached = journal.Journal._startup_integrity_check_uncached
+
+    def measure(*, clear_each_open: bool) -> tuple[int, float]:
+        checks = 0
+
+        def counted(current: journal.Journal, **kwargs: object) -> None:
+            nonlocal checks
+            checks += 1
+            real_uncached(current, **kwargs)
+
+        monkeypatch.setattr(journal.Journal, "_startup_integrity_check_uncached", counted)
+        journal._INTEGRITY_CHECKED_AT.clear()
+        journal._INTEGRITY_FAILURES.clear()
+        started = time.process_time()
+        for _ in range(opens):
+            if clear_each_open:
+                journal._INTEGRITY_CHECKED_AT.clear()
+            journal.Journal(project)
+        cpu_ms_per_open = (time.process_time() - started) * 1000 / opens
+        return checks, cpu_ms_per_open
+
+    baseline_checks, baseline_cpu = measure(clear_each_open=True)
+    cached_checks, cached_cpu = measure(clear_each_open=False)
+    print(
+        "JOURNAL_OPEN_BENCHMARK "
+        f"journal_bytes={journal_bytes} opens={opens} "
+        f"before_bcf75a1_integrity_checks={baseline_checks} "
+        f"before_bcf75a1_integrity_bytes_read={baseline_checks * journal_bytes} "
+        f"before_bcf75a1_integrity_bytes_read_per_open="
+        f"{baseline_checks * journal_bytes / opens:.0f} "
+        f"before_bcf75a1_cpu_ms_per_open={baseline_cpu:.3f} "
+        f"after_integrity_checks={cached_checks} "
+        f"after_integrity_bytes_read={cached_checks * journal_bytes} "
+        f"after_integrity_bytes_read_per_open={cached_checks * journal_bytes / opens:.0f} "
+        f"after_cpu_ms_per_open={cached_cpu:.3f}",
+        flush=True,
+    )
