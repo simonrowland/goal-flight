@@ -381,6 +381,17 @@ def _text_entries(payload: dict, level: str) -> list[tuple[str, str]]:
     return out
 
 
+def case_doctor_json_verdict_parses_with_dashboard_export_disabled() -> None:
+    # Default installs have the dashboard mirror disabled; the JSON verdict
+    # must still parse every human line (upgrade rehearsal, 2026-09-23).
+    payload = _minimal_human_payload()
+    with patch.object(goalflight_doctor.goalflight_task, "_dashboard_export_enabled", return_value=False):
+        lines = goalflight_doctor.collect_human_lines(payload)
+        summary = goalflight_doctor.verdict_summary(payload)
+    assert any("dashboard mirror" in line and line.startswith("[INFO]") for line in lines)
+    assert any(row["probe"] == "dashboard mirror" for row in summary["info"])
+
+
 def case_doctor_json_verdict_matches_text_warnings_and_info() -> None:
     payload = _minimal_human_payload(
         worker_currency={
@@ -873,6 +884,7 @@ def main() -> None:
     case_claude_acp_reports_pinned_build_when_orig_differs()
     case_doctor_json_verdict_matches_text_warnings_and_info()
     case_doctor_json_verdict_ok_when_text_has_no_warns()
+    case_doctor_json_verdict_parses_with_dashboard_export_disabled()
     case_doctor_failed_session_status_makes_verdict_warn()
     case_doctor_rejects_structurally_empty_session_status()
     case_doctor_accepts_canonical_inactive_session_status()

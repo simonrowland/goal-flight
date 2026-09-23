@@ -587,3 +587,20 @@ def test_state_lock_reenters_in_one_thread_and_excludes_other_threads(
         assert not entered.wait(0.3), "another thread must not enter while held"
     assert entered.wait(5), "lock must be free once the outer holder exits"
     other.join(5)
+
+
+def test_state_lock_does_not_touch_an_existing_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Read-only callers (capacity status) take this lock on every poll; the
+    # open must not truncate, or every read shows up as a metadata write.
+    import time
+
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    with cap.StateLock():
+        pass
+    before = cap.lock_path().stat().st_mtime_ns
+    time.sleep(0.05)
+    with cap.StateLock():
+        pass
+    assert cap.lock_path().stat().st_mtime_ns == before

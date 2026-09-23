@@ -4197,7 +4197,11 @@ def collect_human_lines(payload: dict) -> list[str]:
         ),
     ])
     if not goalflight_task._dashboard_export_enabled():
-        lines.append(goalflight_task.DASHBOARD_EXPORT_DISABLED)
+        # Every collected line must carry a severity prefix: --json parses
+        # them all into the verdict and rejects a bare message.
+        lines.append(
+            status_line(None, "dashboard mirror", goalflight_task.DASHBOARD_EXPORT_DISABLED)
+        )
     lines.append(
         status_line(
             router.get("ok"),

@@ -387,7 +387,9 @@ class StateLock:
             _STATE_LOCK_HELD.depth = depth + 1
             return self
         lock_path().parent.mkdir(parents=True, exist_ok=True)
-        fh = lock_path().open("w")
+        # Append mode creates the file without truncating it, so taking the
+        # lock for a read (status) leaves the lock file's mtime untouched.
+        fh = lock_path().open("a")
         try:
             fcntl.flock(fh, fcntl.LOCK_EX)
         except BaseException:
