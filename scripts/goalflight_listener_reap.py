@@ -79,7 +79,7 @@ def _process_argv(pid: int) -> list[str] | None:
             return None
 
     if sys.platform == "darwin":
-        # KERN_PROCARGS2 returns: argc, executable path, argv[0..argc-1],
+        # KERN_PROCARGS2 returns: argc, executable path, NUL padding, argv[0..argc-1],
         # followed by the environment. Unlike ps(1)'s args column, this keeps
         # every argument as a distinct value, including roots containing spaces.
         try:
@@ -106,10 +106,15 @@ def _process_argv(pid: int) -> list[str] | None:
                     argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
                     if argc < 1:
                         return None
-                    fields = raw[4:].split(b"\0")
-                    argv_fields = fields[1 : argc + 1]
-                    if len(argv_fields) != argc:
+                    payload = raw[4:]
+                    exec_end = payload.find(b"\0")
+                    if exec_end < 0:
                         return None
+                    argv_payload = payload[exec_end + 1 :].lstrip(b"\0")
+                    fields = argv_payload.split(b"\0")
+                    if len(fields) < argc:
+                        return None
+                    argv_fields = fields[:argc]
                     try:
                         return [os.fsdecode(field) for field in argv_fields]
                     except UnicodeDecodeError:
@@ -149,7 +154,7 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
         return None
     try:
         result = subprocess.run(
-            ["ps", "-axww", "-o", "pid="],
+            ["ps", "-axo", "pid=,uid=,comm="],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
@@ -162,17 +167,37 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
     if not isinstance(listing, str):
         return None
 
+    try:
+        current_uid = os.getuid()
+    except AttributeError:
+        return None
+
     found: dict[str, list[dict[str, object]]] = {}
     for line in listing.splitlines():
-        columns = line.split(None, 1)
-        if not columns or not columns[0].isdigit():
+        columns = line.split(None, 2)
+        if len(columns) != 3 or not columns[0].isdigit() or not columns[1].isdigit():
             continue
         pid = int(columns[0])
-        argv = _process_argv(pid)
-        if argv == []:
+        if int(columns[1]) != current_uid or not goalflight_wake._is_python_interpreter(
+            columns[2]
+        ):
             continue
+        identity = goalflight_compat.process_start_identity(pid)
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return None
+        start_token = str(identity["start_token"])
+        argv = _process_argv(pid)
         if argv is None:
             return None
+        after_argv = goalflight_compat.process_start_identity(pid)
+        if (
+            not isinstance(after_argv, dict)
+            or not after_argv.get("start_token")
+            or str(after_argv["start_token"]) != start_token
+        ):
+            return None
+        if argv == []:
+            continue
         classification, fields = goalflight_wake._probe_messages_argv(
             shlex.join(argv), commands=_LISTENER_COMMANDS
         )
@@ -195,13 +220,8 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
             # A truncated or unreadable nonce may belong to a live generation.
             # Do not let any other listener become reapable from this scan.
             return None
-        identity = goalflight_compat.process_start_identity(pid)
-        if not isinstance(identity, dict) or not identity.get("start_token"):
-            # PID/argv alone is not ownership. A failed or incomplete identity
-            # probe stays out of the actionable population.
-            continue
         found.setdefault(nonce, []).append(
-            {"pid": pid, "start_token": str(identity["start_token"])}
+            {"pid": pid, "start_token": start_token}
         )
     return found
 

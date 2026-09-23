@@ -51,6 +51,11 @@ def _fake_argv(monkeypatch, argv_by_pid: dict[int, list[str]]) -> None:
     monkeypatch.setattr(R, "_process_argv", lambda pid: argv_by_pid.get(pid))
 
 
+def _ps_python_row(pid: int, *, uid: int | None = None, comm: str = "python3") -> str:
+    owner = os.getuid() if uid is None else uid
+    return f"{pid} {owner} {comm}"
+
+
 def _ps_liveness_available(pid: int) -> bool:
     try:
         result = subprocess.run(
@@ -113,9 +118,9 @@ def test_the_current_generation_is_never_reaped(
 def test_a_process_with_no_nonce_is_never_attributed(monkeypatch) -> None:
     """Unattributable means it may belong to a LIVE generation. Never reapable."""
     listing = (
-        "  101 python3 /s/goalflight_messages.py listen --project-root /repos/mine --lease-nonce " + DEAD + "\n"
-        "  102 python3 /s/goalflight_messages.py status --project-root /repos/mine\n"
-        "  103 python3 /s/unrelated.py --project-root /repos/mine --lease-nonce " + DEAD + "\n"
+        _ps_python_row(101) + "\n"
+        + _ps_python_row(102) + "\n"
+        + _ps_python_row(103) + "\n"
     )
     monkeypatch.setattr(
         R.subprocess, "run",
@@ -144,10 +149,7 @@ def test_a_process_with_no_nonce_is_never_attributed(monkeypatch) -> None:
 
 
 def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
-    listing = (
-        "  101 python3 /s/other.py goalflight_messages.py listen "
-        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
-    )
+    listing = _ps_python_row(101) + "\n"
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
@@ -160,14 +162,74 @@ def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
             ],
         },
     )
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     assert R.listener_processes_by_nonce(Path("/repos/mine")) == {}
 
 
-def test_nonzero_process_listing_refuses_even_with_matching_stdout(monkeypatch) -> None:
-    listing = (
-        "  101 python3 /s/goalflight_messages.py listen "
-        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
+def test_unreadable_non_candidates_do_not_poison_the_scan(monkeypatch) -> None:
+    listing = "\n".join(
+        [
+            _ps_python_row(401),
+            _ps_python_row(402, comm="launchd"),
+            _ps_python_row(403, uid=os.getuid() + 1),
+        ]
     )
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda *a, **k: type("P", (), {"stdout": listing})(),
+    )
+    calls: list[int] = []
+
+    def fake_argv(pid: int) -> list[str]:
+        calls.append(pid)
+        assert pid == 401
+        return ["python3", "-c", "pass"]
+
+    monkeypatch.setattr(R, "_process_argv", fake_argv)
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
+
+    assert R.listener_processes_by_nonce(Path("/repos/mine")) == {}
+    assert calls == [401], calls
+
+
+def test_unreadable_candidate_makes_the_scan_unknown(monkeypatch) -> None:
+    listing = _ps_python_row(402) + "\n"
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda *a, **k: type("P", (), {"stdout": listing})(),
+    )
+    _fake_argv(monkeypatch, {402: None})
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
+
+    assert R.listener_processes_by_nonce(Path("/repos/mine")) is None
+
+
+def test_start_token_change_during_argv_read_makes_the_scan_unknown(monkeypatch) -> None:
+    listing = _ps_python_row(404) + "\n"
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda *a, **k: type("P", (), {"stdout": listing})(),
+    )
+    _fake_argv(
+        monkeypatch,
+        {
+            404: [
+                "python3", "/s/goalflight_messages.py", "listen",
+                "--project-root", "/repos/mine", "--lease-nonce", DEAD,
+            ],
+        },
+    )
+    identities = iter([_fake_identity(404), {"pid": 404, "start_token": "changed"}])
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", lambda _pid: next(identities))
+
+    assert R.listener_processes_by_nonce(Path("/repos/mine")) is None
+
+
+def test_nonzero_process_listing_refuses_even_with_matching_stdout(monkeypatch) -> None:
+    listing = _ps_python_row(101) + "\n"
     result = subprocess.CompletedProcess(
         ["ps"], 1, stdout=listing, stderr="ps: permission denied"
     )
@@ -182,12 +244,7 @@ def test_nonzero_process_listing_refuses_even_with_matching_stdout(monkeypatch) 
 
 def test_truncated_listener_argv_refuses_the_entire_scan(monkeypatch) -> None:
     """A clipped nonce must not leave other listeners actionable."""
-    listing = (
-        "  101 python3 /s/goalflight_messages.py listen "
-        "--project-root /repos/mine --lease-nonce\n"
-        "  102 python3 /s/goalflight_messages.py listen "
-        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
-    )
+    listing = _ps_python_row(101) + "\n" + _ps_python_row(102) + "\n"
     calls: list[list[str]] = []
 
     def fake_run(command, *args, **kwargs):
@@ -217,7 +274,7 @@ def test_truncated_listener_argv_refuses_the_entire_scan(monkeypatch) -> None:
     assert R.listener_processes_by_nonce(Path("/repos/mine")) is None
     out = R.reap_orphaned_listeners(Path("/repos/mine"))
 
-    assert calls[0][1] == "-axww", calls
+    assert calls[0][1] == "-axo", calls
     assert killed == [] and out["reaped"] == 0, out
     assert out["detail"]["known"] is False, out
 
@@ -313,10 +370,7 @@ def test_listeners_of_other_projects_are_never_enumerated(monkeypatch) -> None:
     listeners belonging to three other projects on the same machine, each of
     which was running correctly under its own controller.
     """
-    listing = (
-        "  101 python3 /s/goalflight_messages.py supervise --project-root /repos/mine  --lease-nonce " + DEAD + "\n"
-        "  102 python3 /s/goalflight_messages.py listen    --project-root /repos/other --lease-nonce " + DEAD + "\n"
-    )
+    listing = _ps_python_row(101) + "\n" + _ps_python_row(102) + "\n"
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
@@ -344,9 +398,7 @@ def test_a_foreign_projects_live_generation_is_not_reapable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """End to end: a foreign listener must survive even with an empty journal."""
-    listing = (
-        "  201 python3 /s/goalflight_messages.py supervise --project-root /repos/other --lease-nonce " + DEAD + "\n"
-    )
+    listing = _ps_python_row(201) + "\n"
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
@@ -389,13 +441,7 @@ def test_reused_pid_with_new_start_token_is_not_signalled(monkeypatch, tmp_path:
 
 def test_project_root_with_spaces_uses_exact_argv_boundaries(monkeypatch) -> None:
     root = "/repos/project with spaces"
-    listing = (
-        "  303 python3 /s/goalflight_messages.py supervise --project-root "
-        + root
-        + " --lease-nonce "
-        + DEAD
-        + "\n"
-    )
+    listing = _ps_python_row(303) + "\n"
     monkeypatch.setattr(
         R.subprocess,
         "run",
@@ -415,3 +461,48 @@ def test_project_root_with_spaces_uses_exact_argv_boundaries(monkeypatch) -> Non
     got = R.listener_processes_by_nonce(Path(root))
 
     assert got == {DEAD: [{"pid": 303, "start_token": "test:303"}]}, got
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="exercises KERN_PROCARGS2 on macOS")
+def test_real_python_listener_with_spaces_is_parsed_exactly(tmp_path: Path) -> None:
+    if not _ps_liveness_available(os.getpid()):
+        pytest.skip("sandbox denies the process-table probe")
+
+    project_root = tmp_path / "project with spaces"
+    project_root.mkdir()
+    script = tmp_path / "goalflight_messages.py"
+    script.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+    victim = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "supervise",
+            "--project-root",
+            str(project_root),
+            "--lease-nonce",
+            DEAD,
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 5
+        got = None
+        while time.monotonic() < deadline:
+            got = R.listener_processes_by_nonce(project_root)
+            if got and got.get(DEAD) and got[DEAD][0]["pid"] == victim.pid:
+                break
+            time.sleep(0.05)
+        assert got is not None and DEAD in got, got
+        assert got[DEAD][0]["pid"] == victim.pid, got
+        assert got[DEAD][0]["start_token"], got
+        assert R._process_argv(victim.pid) == [
+            sys.executable,
+            str(script),
+            "supervise",
+            "--project-root",
+            str(project_root),
+            "--lease-nonce",
+            DEAD,
+        ]
+    finally:
+        victim.terminate()
+        victim.wait(timeout=10)
