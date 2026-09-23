@@ -412,10 +412,10 @@ def test_non_repository_exits_nonzero(tmp_path: Path) -> None:
     assert "cannot list worktrees" in done.stderr
 
 
-def test_pool_seat_is_never_reclaimed_as_litter(
+def test_registered_pool_worktree_is_reclaimed_only_after_full_gate(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A registered seat is retained even when merged+clean+unowned."""
+    """A registered worktree still passes through the same four-part gate."""
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "register-seat")
@@ -425,17 +425,18 @@ def test_pool_seat_is_never_reclaimed_as_litter(
 
     _done, report = _run(repo)
     entry = _entry(report, wt)
-    assert entry["decision"] == "retain", entry
-    assert "pool seat" in entry["reason"]
+    assert entry["decision"] == "remove", entry
+    assert "all four conditions hold" in entry["reason"]
     assert entry.get("pool_seat", {}).get("verdict") == "yes", entry
     assert wt.is_dir()
 
     done, report = _run(repo, "--apply")
     assert done.returncode == 0
     entry = _entry(report, wt)
-    assert entry["decision"] == "retain", entry
-    assert wt.is_dir()
-    assert os.path.realpath(wt) in _worktree_paths(repo)
+    assert entry.get("outcome") == "removed", entry
+    assert entry.get("keep_ref", "").startswith("refs/goalflight/keep/")
+    assert not wt.is_dir()
+    assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
 def test_adhoc_worktree_named_wt_n_is_reclaimable(

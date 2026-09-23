@@ -25,6 +25,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch  # noqa: E402
+import goalflight_capacity  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
 
@@ -69,6 +70,7 @@ def _env(tmp: Path, *, seats: int) -> dict[str, str]:
     env["GOALFLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
+    env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = str(seats)
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     env["GOALFLIGHT_WORKTREE_SEATS"] = str(seats)
     env["GOALFLIGHT_DISABLE_NUDGES"] = "1"
@@ -128,11 +130,11 @@ def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
         )
         combined = proc.stdout + proc.stderr
         assert proc.returncode == 2, combined
-        assert "all 1 worktree seats are held" in combined, combined
+        assert "1/1 worktrees busy in repo" in combined, combined
         assert "held-occupant" in combined, combined
         assert "s-1" in combined, combined
         assert "refusing to git worktree add" in combined, combined
-        assert not (repo / "worktrees" / "repo" / "s-2").exists()
+        assert not (repo / "worktrees" / "s-2").exists()
     finally:
         holder.release()
 
@@ -480,6 +482,8 @@ def test_two_worktree_launches_do_not_serialize_on_occupancy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Pooled seats are distinct trees; occupancy must not lock the project root."""
+    if goalflight_capacity.profile().get("operating_cap", 1) < 2:
+        pytest.skip("host capacity profile cannot run two dispatches concurrently")
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
     repo = _make_repo(tmp_path)
     env = _env(tmp_path, seats=2)
@@ -612,11 +616,11 @@ def test_acquire_checks_out_named_seat_branch(
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "named-one")
     try:
         abbrev = _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD")
-        assert abbrev == "seat/named-one", abbrev
+        assert abbrev == "worktree/named-one", abbrev
         status = _git(lease.path, "status", "--branch", "--porcelain=v1")
         assert "HEAD (no branch)" not in status, status
-        assert status.splitlines()[0].startswith("## seat/named-one"), status
-        assert lease.branch == "seat/named-one"
+        assert status.splitlines()[0].startswith("## worktree/named-one"), status
+        assert lease.branch == "worktree/named-one"
     finally:
         lease.release()
 
@@ -653,8 +657,8 @@ def test_dispatch_payload_includes_worktree_branch(
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, combined
     started, launched = _payloads(proc.stdout)
-    assert started.get("worktree_branch") == "seat/report-branch", started
-    assert launched.get("worktree_branch") == "seat/report-branch", launched
+    assert started.get("worktree_branch") == "worktree/report-branch", started
+    assert launched.get("worktree_branch") == "worktree/report-branch", launched
     assert launched.get("worktree_seat") == "s-1", launched
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
@@ -744,10 +748,10 @@ def test_dispatch_records_resolved_base_and_launches_from_it(
     assert launched.get("worktree_base") == base, launched
 
 
-def test_refuse_reset_when_detached_ahead_of_base(
+def test_pin_and_reset_detached_ahead_of_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A real commit on a real detached seat must block acquire-time reset."""
+    """A unique detached commit is pinned before acquire-time reset."""
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
     repo = _make_repo(tmp_path)
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "detached-ahead")
@@ -756,26 +760,13 @@ def test_refuse_reset_when_detached_ahead_of_base(
     short = _git(lease.path, "rev-parse", "--short", "HEAD")
     lease.release()
 
-    nxt = None
+    nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "next-occupant")
     try:
-        nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "next-occupant")
-    except Exception as exc:
-        text = str(exc)
-        assert "would lose" in text, text
-        assert short in text or sha[:7] in text, text
-        assert "detached HEAD" in text, text
-        assert isinstance(exc, goalflight_worktree_pool.WorktreeSeatResetRefused)
-    else:
-        raise AssertionError(
-            f"acquire reset a detached-ahead seat; unique commit {sha} "
-            f"HEAD is now {_git(lease.path, 'rev-parse', 'HEAD')}"
-        )
+        assert _git(nxt.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "main")
+        keep_refs = _git(repo, "for-each-ref", "--format=%(refname)", "refs/goalflight/keep/").splitlines()
+        assert any(short in _git(repo, "rev-parse", ref) or sha == _git(repo, "rev-parse", ref) for ref in keep_refs)
     finally:
-        if nxt is not None:
-            nxt.release()
-    assert _git(lease.path, "rev-parse", "HEAD") == sha
-    assert _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
-    assert (lease.path / "tracked.txt").read_text(encoding="utf-8") == "unique work\n"
+        nxt.release()
 
 
 def test_detached_ahead_seat_is_skipped_for_a_free_sibling(
@@ -790,10 +781,11 @@ def test_detached_ahead_seat_is_skipped_for_a_free_sibling(
 
     second = goalflight_worktree_pool.acquire_worktree_seat(repo, "use-wt-2")
     try:
-        assert second.path.name == "s-2"
-        assert second.branch == "seat/use-wt-2"
-        assert _git(first.path, "rev-parse", "HEAD") == sha
-        assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+        assert second.path.name == "s-1"
+        assert second.branch == "worktree/use-wt-2"
+        assert _git(second.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "main")
+        keep_refs = _git(repo, "for-each-ref", "--format=%(refname)", "refs/goalflight/keep/").splitlines()
+        assert any(_git(repo, "rev-parse", ref) == sha for ref in keep_refs)
     finally:
         second.release()
 
@@ -805,20 +797,20 @@ def test_reuse_keeps_prior_named_branch_reachable(
     repo = _make_repo(tmp_path)
     first = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-a")
     sha = _commit_in(first.path, "worker a finished")
-    assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/worker-a"
+    assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "worktree/worker-a"
     first.release()
 
     second = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-b")
     try:
-        assert second.branch == "seat/worker-b"
-        assert _git(second.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/worker-b"
-        assert _git(repo, "rev-parse", "refs/heads/seat/worker-a") == sha
-        assert _git(repo, "show", "seat/worker-a:tracked.txt") == "unique work"
+        assert second.branch == "worktree/worker-b"
+        assert _git(second.path, "rev-parse", "--abbrev-ref", "HEAD") == "worktree/worker-b"
+        assert _git(repo, "rev-parse", "refs/heads/worktree/worker-a") == sha
+        assert _git(repo, "show", "worktree/worker-a:tracked.txt") == "unique work"
     finally:
         second.release()
 
 
-def test_refuse_reset_when_same_branch_uniquely_holds_commits(
+def test_pin_and_reset_when_same_branch_uniquely_holds_commits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
@@ -828,24 +820,13 @@ def test_refuse_reset_when_same_branch_uniquely_holds_commits(
     short = _git(lease.path, "rev-parse", "--short", "HEAD")
     lease.release()
 
-    nxt = None
+    nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
     try:
-        nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
-    except Exception as exc:
-        text = str(exc)
-        assert "would lose" in text, text
-        assert short in text or sha[:7] in text, text
-        assert isinstance(exc, goalflight_worktree_pool.WorktreeSeatResetRefused)
-    else:
-        raise AssertionError(
-            f"acquire rewound unique branch seat/same-id; unique commit {sha} "
-            f"HEAD is now {_git(lease.path, 'rev-parse', 'HEAD')}"
-        )
+        assert _git(nxt.path, "rev-parse", "HEAD") == _git(repo, "rev-parse", "main")
+        keep_refs = _git(repo, "for-each-ref", "--format=%(refname)", "refs/goalflight/keep/").splitlines()
+        assert any(_git(repo, "rev-parse", ref) == sha for ref in keep_refs)
     finally:
-        if nxt is not None:
-            nxt.release()
-    assert _git(lease.path, "rev-parse", "HEAD") == sha
-    assert _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/same-id"
+        nxt.release()
 
 
 def test_saved_detached_commit_does_not_block_reset(
@@ -861,7 +842,7 @@ def test_saved_detached_commit_does_not_block_reset(
 
     reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "after-rescue")
     try:
-        assert _git(reused.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/after-rescue"
+        assert _git(reused.path, "rev-parse", "--abbrev-ref", "HEAD") == "worktree/after-rescue"
         assert _git(repo, "rev-parse", "refs/heads/rescue/already-saved") == sha
     finally:
         reused.release()
@@ -912,7 +893,7 @@ def test_default_dispatch_acquires_captive_seat(
     assert launched.get("worktree_seat") == "s-1", launched
     seat = Path(launched["worktree_path"]).resolve()
     assert seat.name == "s-1"
-    assert seat.parent.name == repo.name
+    assert seat.parent.name == "worktrees"
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)
@@ -935,10 +916,13 @@ def test_sequential_default_dispatch_reuses_one_seat(
         worker = (
             "from pathlib import Path; import os; "
             f"Path({str(marker)!r}).write_text(os.getcwd()); "
-            "print('COMPLETE: seq — ok', flush=True)"
+            f"print('COMPLETE: {name} — ok', flush=True)"
         )
+        command = _dispatch_cmd(tmp_path, repo, name, sys.executable, "-c", worker)
+        command.remove("--launch-detached")
+        command.insert(command.index("--"), "--foreground")
         proc = subprocess.run(
-            _dispatch_cmd(tmp_path, repo, name, sys.executable, "-c", worker),
+            command,
             cwd=str(repo),
             env=env,
             text=True,
@@ -951,6 +935,25 @@ def test_sequential_default_dispatch_reuses_one_seat(
         paths.append(Path(launched["worktree_path"]).resolve())
         deadline = time.time() + 10
         while time.time() < deadline and not marker.exists():
+            time.sleep(0.05)
+        status_path = tmp_path / f"{name}.status.json"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                state = json.loads(status_path.read_text(encoding="utf-8")).get("state")
+            except (FileNotFoundError, json.JSONDecodeError):
+                state = None
+            if state in {"complete", "failed", "worker_dead", "worker_error"}:
+                break
+            time.sleep(0.05)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                leases = json.loads((tmp_path / "state" / "capacity.json").read_text(encoding="utf-8")).get("leases", {})
+            except (FileNotFoundError, json.JSONDecodeError):
+                leases = {}
+            if not leases:
+                break
             time.sleep(0.05)
     assert paths[0] == paths[1]
     assert paths[0].name == "s-1"

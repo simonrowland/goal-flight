@@ -10,12 +10,12 @@ Routine merge-down command (run from the repo after integrating a worker branch)
     python3 scripts/goalflight_worktree_gc.py --into main
     python3 scripts/goalflight_worktree_gc.py --into main --apply
 
-Registered pool seats (captive ``<repo>/worktrees/<label>/s-N`` and legacy
-``<repo>/worktrees/wt-N`` with a matching seat lock) are maintained by
-``goalflight_worktree_pool`` and are never reclaimed as litter. A directory
-merely *named* ``s-N`` or ``wt-N`` is ordinary litter: exemption is by
-registration, not basename. If registration cannot be determined, the
-verdict is UNKNOWN and the tree is retained.
+Managed pool worktrees (new ``<repo>/worktrees/s-N`` and migrated legacy
+``<repo>/worktrees/<label>/s-N`` / ``wt-N`` paths) are evaluated by the same
+four-part predicate as other registered worktrees. A directory merely *named*
+``s-N`` or ``wt-N`` is ordinary litter: registration is evidence, not a
+deletion exemption. If registration cannot be determined, the verdict is
+UNKNOWN and the tree is retained.
 
 Removal requires the CONJUNCTION of all four conditions:
 
@@ -68,6 +68,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -481,6 +482,35 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
     return _condition(YES, "no non-terminal dispatch records this path")
 
 
+def check_pool_unlocked(repo: Path, path: str) -> dict[str, str]:
+    """Include the kernel worktree lease in the ownership conjunction."""
+    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+        path, project_root=repo
+    )
+    if verdict == NO:
+        return _condition(YES, "path is not a registered pool worktree")
+    if verdict == UNKNOWN:
+        return _condition(UNKNOWN, reason)
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return _condition(UNKNOWN, f"pool worktree lock could not be opened ({exc})")
+    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _condition(NO, "registered pool worktree is held by a live lease")
+        except OSError as exc:
+            return _condition(UNKNOWN, f"pool worktree lease could not be evaluated ({exc})")
+    finally:
+        handle.close()
+    return _condition(YES, "registered pool worktree has no live kernel lease")
+
+
 def check_not_current(
     path: str,
     *,
@@ -531,23 +561,16 @@ def classify(
     seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
         path, project_root=repo
     )
-    if seat_verdict == YES:
-        result["decision"] = "retain"
-        result["reason"] = (
-            "managed pool seat "
-            f"{Path(path).name} is maintained by the worktree pool, not litter"
-        )
-        result["conditions"] = {}
-        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
-        return result
     if seat_verdict == UNKNOWN:
         result["decision"] = "retain"
         result["reason"] = (
-            "pool-seat registration unknown ("
-            f"{seat_reason}); cannot prove this path is not a maintained seat"
+            "pool-worktree registration unknown ("
+            f"{seat_reason}); cannot prove this path is not a maintained worktree"
         )
         result["conditions"] = {}
-        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
+        pool = {"verdict": seat_verdict, "reason": seat_reason}
+        result["pool_worktree"] = pool
+        result["pool_seat"] = pool
         return result
 
     conditions = {
@@ -558,6 +581,13 @@ def classify(
             path, current_checkout=current_checkout, current_error=current_error
         ),
     }
+    if seat_verdict == YES:
+        lease = check_pool_unlocked(repo, path)
+        if lease["verdict"] != YES:
+            conditions["unowned"] = lease
+        pool = {"verdict": seat_verdict, "reason": seat_reason}
+        result["pool_worktree"] = pool
+        result["pool_seat"] = pool
     result["conditions"] = conditions
 
     blockers = [
@@ -595,6 +625,23 @@ def _prune_worktrees(repo: Path) -> tuple[bool, str]:
     if proc.returncode == 0:
         return True, ""
     return False, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+
+
+def _pin_before_remove(repo: Path, path: str) -> tuple[str | None, str | None]:
+    """Keep the candidate's current commit durable before destructive removal."""
+    head = _git(Path(path), "rev-parse", "HEAD^{commit}")
+    if head.returncode != 0 or not head.stdout.strip():
+        return None, (head.stderr or head.stdout).strip() or "cannot resolve candidate HEAD"
+    stamp = str(int(time.time() * 1_000_000))
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in Path(path).name)
+    ref = f"refs/goalflight/keep/gc-{stamp}-{safe}-{head.stdout.strip()[:12]}"
+    updated = _git(repo, "update-ref", ref, head.stdout.strip(), "")
+    if updated.returncode != 0:
+        return None, (updated.stderr or updated.stdout).strip() or "cannot create keep ref"
+    verified = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if verified.returncode != 0 or verified.stdout.strip() != head.stdout.strip():
+        return None, "keep ref did not verify after creation"
+    return ref, None
 
 
 def apply_removals(
@@ -647,6 +694,14 @@ def apply_removals(
             entry["outcome"] = "retained"
             entry["reason"] = f"changed_before_remove: {current['reason']}"
             continue
+
+        if current["decision"] == "remove":
+            keep_ref, pin_error = _pin_before_remove(repo, path)
+            if pin_error is not None:
+                entry["outcome"] = "failed"
+                entry["error"] = f"keep pin failed: {pin_error}"
+                continue
+            entry["keep_ref"] = keep_ref
 
         # ``git worktree prune`` clears the admin entry of EVERY worktree
         # whose directory is gone — it takes no path argument. Run it only
@@ -754,7 +809,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Report (or with --apply, remove) git worktrees that are merged, "
             "clean, unowned by a live dispatch, and not checked out. "
-            "Registered wt-N pool seats are never reclaimed; a directory "
+            "Registered pool worktrees are evaluated by the full predicate; a directory "
             "merely named wt-N is ordinary litter. Run after merging "
             "a worker branch into the integration branch."
         )
@@ -785,6 +840,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON.")
     return parser
+
+
+def terminal_dry_run(repo: Path, *, into: str = "main", ledger_dir: Path | None = None) -> dict[str, Any]:
+    """Return the same report used by the CLI, without mutating the repository."""
+    repo = Path(repo).resolve()
+    ledger_dir = ledger_dir or goalflight_ledger.runs_dir(create=False)
+    listed, list_error = list_worktrees(repo)
+    if list_error is not None:
+        return {"schema": SCHEMA, "repo": str(repo), "mode": "report", "error": list_error}
+    main_path = main_worktree_path(repo)
+    current_checkout, current_error = current_checkout_path(repo)
+    entries = [
+        classify(
+            repo,
+            entry,
+            into=into,
+            ledger_dir=ledger_dir,
+            main_path=main_path,
+            current_checkout=current_checkout,
+            current_error=current_error,
+        )
+        for entry in listed
+    ]
+    return {
+        "schema": SCHEMA,
+        "repo": str(repo),
+        "into": into,
+        "ledger_dir": str(ledger_dir),
+        "mode": "report",
+        **_counts(entries),
+        "entries": entries,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

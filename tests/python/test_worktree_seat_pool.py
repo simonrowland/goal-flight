@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -401,22 +403,96 @@ def test_parent_release_keeps_inherited_worker_lease_until_worker_dies() -> None
 def test_default_seat_count_is_not_a_per_controller_cap() -> None:
     assert_true(
         "default is the documented checkout ceiling",
-        goalflight_worktree_pool.DEFAULT_WORKTREE_SEATS == 24,
+        goalflight_worktree_pool.DEFAULT_WORKTREE_SEATS == 15,
     )
     assert_true(
-        "wt-1 basename matches the legacy seat name pattern",
+        "wt-1 basename matches the legacy worktree name pattern",
         goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/wt-1"),
     )
     assert_true(
-        "s-1 basename matches the captive seat name pattern",
+        "s-1 basename matches the captive worktree name pattern",
         goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/ctrl/s-1"),
     )
     assert_true(
-        "ad-hoc task tree is not a pool seat name",
+        "ad-hoc task tree is not a pool worktree name",
         not goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/t-353-live"),
     )
 
 
+def test_new_repo_cap_precedes_deprecated_seat_alias() -> None:
+    prior_new = os.environ.get(goalflight_worktree_pool.WORKTREES_PER_REPO_ENV)
+    prior_old = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
+    try:
+        os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "3"
+        os.environ[goalflight_worktree_pool.WORKTREES_PER_REPO_ENV] = "5"
+        assert goalflight_worktree_pool.configured_worktree_seats() == 5
+        os.environ.pop(goalflight_worktree_pool.WORKTREES_PER_REPO_ENV)
+        assert goalflight_worktree_pool.configured_worktree_seats() == 3
+    finally:
+        if prior_new is None:
+            os.environ.pop(goalflight_worktree_pool.WORKTREES_PER_REPO_ENV, None)
+        else:
+            os.environ[goalflight_worktree_pool.WORKTREES_PER_REPO_ENV] = prior_new
+        if prior_old is None:
+            os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
+        else:
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = prior_old
+
+
+def test_read_only_worktree_is_shared_by_commit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        first_path, first_base = goalflight_worktree_pool.shared_read_only_worktree(repo)
+        second_path, second_base = goalflight_worktree_pool.shared_read_only_worktree(repo)
+        assert_true("same read-only path", first_path == second_path)
+        assert_true("same read-only base", first_base == second_base)
+        assert_true("read-only checkout is detached", git(first_path, "branch", "--show-current") == "")
+        assert_true("read-only checkout is not an exclusive pool slot", not (repo / "worktrees" / "s-1").exists())
+
+
+@pytest.mark.parametrize("bind_step", ["create", "verify", "pin", "quarantine", "checkout"])
+def test_failed_bind_has_no_phantom_holder(
+    bind_step: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        if bind_step in {"pin", "quarantine", "checkout"}:
+            seed = goalflight_worktree_pool.acquire_worktree_seat(repo, "seed")
+            if bind_step == "pin":
+                git(seed.path, "checkout", "--detach")
+                (seed.path / "tracked.txt").write_text("unique\n", encoding="utf-8")
+                git(seed.path, "add", "tracked.txt")
+                git(seed.path, "commit", "-m", "unique")
+            elif bind_step == "quarantine":
+                (seed.path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            seed.release()
+
+        target = {
+            "create": "_create_seat_worktree",
+            "verify": "_verify_existing_seat",
+            "pin": "pin_unique_commits",
+            "quarantine": "_quarantine_dirty_worktree",
+            "checkout": "_prepare_seat_checkout",
+        }[bind_step]
+        original = getattr(goalflight_worktree_pool, target)
+
+        def fail(*_args, **_kwargs):
+            if bind_step == "pin":
+                return {"verdict": goalflight_worktree_pool.UNKNOWN, "reason": "injected pin failure", "keep_ref": None}
+            raise RuntimeError(f"injected {bind_step} failure")
+
+        monkeypatch.setattr(goalflight_worktree_pool, target, fail)
+        with pytest.raises(Exception, match=f"injected {bind_step} failure"):
+            goalflight_worktree_pool.acquire_worktree_seat(repo, "failed-bind")
+        monkeypatch.setattr(goalflight_worktree_pool, target, original)
+
+        lock_path = goalflight_worktree_pool.worktree_seat_lock_path(repo, "s-1")
+        assert lock_path.read_text(encoding="utf-8") == ""
+        retry = goalflight_worktree_pool.acquire_worktree_seat(repo, "retry-bind")
+        try:
+            assert retry.path.name == "s-1"
+        finally:
+            retry.release()
 def test_registration_ignores_basename_without_a_lock() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -433,7 +509,7 @@ def test_registration_ignores_basename_without_a_lock() -> None:
             )
             assert_true(
                 "reason names the managed root, not the basename",
-                "managed seat root" in reason,
+                "managed worktree root" in reason,
             )
             lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "real-seat")
             try:
@@ -524,7 +600,7 @@ def test_skip_reset_keeps_dirty_product_files() -> None:
             resumed.release()
 
 
-def test_two_controller_labels_get_separate_rings() -> None:
+def test_two_controller_labels_share_repository_pool() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(2):
         repo = make_repo(Path(td))
         a = goalflight_worktree_pool.acquire_worktree_seat(
@@ -534,10 +610,9 @@ def test_two_controller_labels_get_separate_rings() -> None:
             repo, "ctrl-b", controller_label="beta"
         )
         try:
-            assert_true("both get s-1", a.path.name == "s-1" and b.path.name == "s-1")
-            assert_true("separate ring directories", a.path.parent != b.path.parent)
-            assert_true("alpha ring", a.path.parent.name == "alpha")
-            assert_true("beta ring", b.path.parent.name == "beta")
+            assert_true("distinct concurrent worktrees", a.path != b.path)
+            assert_true("repository pool directory", a.path.parent.name == "worktrees")
+            assert_true("alpha label is metadata only", a.path.parent == b.path.parent)
         finally:
             a.release()
             b.release()
@@ -576,7 +651,7 @@ def test_classify_dispatch_cwd_lock() -> None:
             foreign = goalflight_worktree_pool.classify_dispatch_cwd(
                 lease.path, project_root=repo, controller_label="beta"
             )
-            assert_true("other controller seat is refused", foreign == "refuse")
+            assert_true("other controller sees pooled worktree", foreign == "ring-seat")
             orphan = Path(td) / "nongit-project"
             orphan.mkdir()
             assert_true(

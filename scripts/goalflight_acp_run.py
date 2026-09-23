@@ -1804,7 +1804,7 @@ def create_and_route_dispatch_worktree(
     project_root: Path,
     dispatch_id: str,
 ) -> goalflight_worktree_pool.WorktreeSeatLease:
-    """Acquire and prepare one reusable worktree seat for a dispatch."""
+    """Acquire and prepare one reusable worktree for a dispatch."""
     configured_root = getattr(cfg, "worktree_root", None)
     return goalflight_worktree_pool.acquire_worktree_seat(
         project_root,
@@ -2849,7 +2849,7 @@ async def _run_acp_dispatch_impl(
 
     def record_ledger_state(*, worker_pid: int | None, state: str) -> None:
         # project_root MUST stay the original --cwd, not a leased worktree
-        # seat, so status scoping and capacity attribution agree.
+        # worktree, so status scoping and capacity attribution agree.
         _record_acp_ledger_state(
             cfg,
             dispatch_id=dispatch_id,
@@ -4139,11 +4139,19 @@ async def _run_acp_dispatch_impl(
     record_ledger_state(worker_pid=None, state="starting")
     ledger_recorded = True
     try:
-        if worktree_mode == "create":
+        if worktree_mode in {"create", "shared-read-only"}:
             try:
-                worktree_seat = create_and_route_dispatch_worktree(
-                    cfg, project_root, dispatch_id
-                )
+                if worktree_mode == "shared-read-only":
+                    shared_path, shared_base = (
+                        goalflight_worktree_pool.shared_read_only_worktree(
+                            project_root, base=getattr(cfg, "worktree_base", None)
+                        )
+                    )
+                    worktree_seat = None
+                else:
+                    worktree_seat = create_and_route_dispatch_worktree(
+                        cfg, project_root, dispatch_id
+                    )
             except Exception as e:
                 await update_status(
                     state="failed_worktree",
@@ -4151,9 +4159,12 @@ async def _run_acp_dispatch_impl(
                     error=f"{type(e).__name__}: {e}",
                 )
                 return payload
-            worker_cwd = str(worktree_seat.path)
+            if worktree_seat is not None:
+                worker_cwd = str(worktree_seat.path)
+            else:
+                worker_cwd = str(shared_path)
             prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
-            attach_worktree_to_lease(worktree_seat.path)
+            attach_worktree_to_lease(Path(worker_cwd))
             command, acp_args = agent_command(
                 cfg.agent,
                 model=getattr(cfg, "model", None),
@@ -4164,10 +4175,27 @@ async def _run_acp_dispatch_impl(
             await update_status(
                 state="worktree_created",
                 worker_cwd=worker_cwd,
-                worktree_path=str(worktree_seat.path),
-                worktree_seat=worktree_seat.seat_name,
-                worktree_branch=worktree_seat.branch,
-                quarantine_branch=worktree_seat.quarantine_branch,
+                worktree_path=worker_cwd,
+                worktree_id=(
+                    worktree_seat.seat_name
+                    if worktree_seat is not None
+                    else Path(worker_cwd).name
+                ),
+                worktree_seat=(
+                    worktree_seat.seat_name
+                    if worktree_seat is not None
+                    else Path(worker_cwd).name
+                ),
+                worktree_branch=(worktree_seat.branch if worktree_seat is not None else None),
+                quarantine_branch=(
+                    worktree_seat.quarantine_branch
+                    if worktree_seat is not None
+                    else None
+                ),
+                worktree_base=(
+                    shared_base if worktree_seat is None else cfg.worktree_base
+                ),
+                worktree_read_only=(worktree_seat is None),
             )
         goalflight_cursor.isolate_context_mode(
             cfg.agent, spawn_env, cwd=worker_cwd, dispatch_id=dispatch_id,
@@ -5110,7 +5138,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["off", "create"],
         default="off",
         help="Dispatch worktree mode. 'create' leases and acquire-resets one "
-             "lazy seat from the configured wt-1..wt-N pool.",
+             "lazy worktree from the configured wt-1..wt-N pool.",
     )
     parser.add_argument(
         "--worktree-root",

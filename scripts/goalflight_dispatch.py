@@ -9,10 +9,10 @@ process to block until terminal state. It fixes the
 (observed 2026-05-30).
 
 Easy path (agent preset — the common case):
-    python3 goalflight_dispatch.py --agent codex --prompt-file p.md      # background/default; captive seat
+    python3 goalflight_dispatch.py --agent codex --prompt-file p.md      # background/default; pooled worktree
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --read-only   # review/analysis
     python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md
-    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --at HEAD  # prepare seat at ref
+    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --at HEAD  # prepare worktree at ref
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --foreground  # synchronous scripts/tests
 
 After launch, stderr is one line (dispatch id + status path). DISPATCH-LAUNCHED
@@ -1760,7 +1760,7 @@ def _is_git_toplevel_in_project(cwd: Path, project_root: Path) -> bool:
 
 
 def _inherited_seat_lock_present() -> bool:
-    """True when this process already holds a pooled-seat lock fd.
+    """True when this process already holds a pooled-worktree lock fd.
 
     Occupancy uses a different fd in the same inherited-fd helper. Treating
     occupancy as "seat already leased" would skip ``--worktree`` acquire after
@@ -1791,7 +1791,7 @@ def _controller_ring_label(args, project_root: Path) -> str:
 
 
 def _record_dispatch_worktree(args, lease) -> None:
-    """Keep the prepared seat's SHA, refusing unknown bases before launch."""
+    """Keep the prepared worktree's SHA, refusing unknown bases before launch."""
     try:
         base_commit = goalflight_worktree_pool._git(
             lease.path, "rev-parse", "--verify", "HEAD^{commit}"
@@ -1803,29 +1803,40 @@ def _record_dispatch_worktree(args, lease) -> None:
         requested = _requested_worktree_base(args)
         request = f"--at {requested!r}" if requested else "--at omitted (project default)"
         raise goalflight_worktree_pool.WorktreeSeatError(
-            f"dispatch refused: worktree seat {lease.seat_name} ({lease.path}) "
+            f"dispatch refused: worktree {lease.seat_name} ({lease.path}) "
             f"has no resolvable base SHA; requested {request}: {exc}. "
             "Pass --at <ref> naming a valid commit to proceed deliberately."
         ) from exc
     args.cwd = str(lease.path)
     args._worktree_base_commit = base_commit
     args._worktree_seat = lease
+    args._worktree_id = lease.seat_name
+    args._worktree_path = str(lease.path)
+
+
+def _record_shared_read_only_worktree(args, path: Path, base_commit: str) -> None:
+    """Bind a commit-keyed checkout without taking an exclusive worktree lock."""
+    args.cwd = str(path)
+    args._worktree_base_commit = base_commit
+    args._worktree_id = path.name
+    args._worktree_path = str(path)
+    args._worktree_read_only = True
 
 
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
-    """Acquire a captive seat. Isolation is not a mode.
+    """Acquire a captive worktree. Isolation is not a mode.
 
-    Default dispatch (no ``--cwd``, no ``--in-place``) takes one seat in this
-    controller's ring. ``--cwd`` is a lock: project root (in-place), a seat
+    Default dispatch (no ``--cwd``, no ``--in-place``) takes one worktree from
+    the repository pool. ``--cwd`` is a lock: project root (in-place), a worktree
     in this ring, or resume's recorded tree. Anything else is refused and
     never created. Never falls back to unmanaged ``git worktree add``.
 
-    The seat lock fd is left open on the returned lease. The caller must put
+    The worktree lock fd is left open on the returned lease. The caller must put
     ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
     spawn, then ``release()`` this process's copy so the worker's lifetime is
     the lease lifetime.
 
-    Occupancy must bind AFTER this so the kernel lock is on the seat path,
+    Occupancy must bind AFTER this so the kernel lock is on the worktree path,
     not the project root. Caching the lease lets the launch path call this
     once before occupancy and again when wiring env/summary.
     """
@@ -1833,7 +1844,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     if existing is not None:
         return existing
     if _inherited_seat_lock_present():
-        # Fleet / parent already leased a seat and passed the fd. Re-acquire
+        # Fleet / parent already leased a worktree and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
         # reset a tree the worker is already in.
         return None
@@ -1888,17 +1899,22 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             return lease
         if skip_reset:
             raise goalflight_worktree_pool.WorktreeCwdRefused(
-                f"resume refused: recorded worker cwd {cwd} is not a captive "
-                f"seat in this controller ring (worktrees/{label}/s-N); "
-                "refusing to create or choose a replacement seat"
+                f"resume refused: recorded worker cwd {cwd} is not a managed "
+                "repository worktree; refusing to create or choose a replacement"
             )
         raise goalflight_worktree_pool.WorktreeCwdRefused(
-            f"--cwd {cwd} is not a seat in this controller ring "
-            f"(worktrees/{label}/s-N) and is not the project root. "
-            "Omit --cwd to acquire a captive seat, or pass --in-place "
+            f"--cwd {cwd} is not a managed repository worktree and is not the project root. "
+            "Omit --cwd to acquire a pooled worktree, or pass --in-place "
             f"for {project_root}. Isolation is not a mode; refusing to "
             "create that path or git worktree add."
         )
+
+    if _occupancy_exempt_read_only(args):
+        shared_path, base_commit = goalflight_worktree_pool.shared_read_only_worktree(
+            project_root, base=base
+        )
+        _record_shared_read_only_worktree(args, shared_path, base_commit)
+        return None
 
     lease = goalflight_worktree_pool.acquire_worktree_seat(
         project_root,
@@ -3082,6 +3098,13 @@ def _guard_grok_code_research_prompt(args) -> None:
 
 
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
+    if getattr(args, "occupied_worktree_forced", False) and not getattr(
+        args, "operator_recovery", False
+    ):
+        raise ProvenPreWorkerRefusal(
+            "--occupied-worktree-forced is deprecated and rejected for ordinary "
+            "dispatch; use an operator recovery flow"
+        )
     if not raw_argv:
         retired = RETIRED_AGENT_LABELS.get(args.agent)
         if retired:
@@ -3759,7 +3782,63 @@ def _release_worktree_occupancy_lock(args) -> None:
             fd = lock.fileno()
         with contextlib.suppress(Exception):
             lock.release()
-        args._worktree_occupancy_lock = None
+    args._worktree_occupancy_lock = None
+
+
+def _release_withdrawn_worktree(record: dict | None, dispatch_id: str) -> None:
+    """Best-effort stale pool-occupant release after terminal withdrawal."""
+    if not isinstance(record, dict):
+        return
+    path = record.get("worker_cwd") or record.get("worktree_path")
+    root = record.get("project_root")
+    if not path or not root:
+        return
+    with contextlib.suppress(Exception):
+        goalflight_worktree_pool.release_worktree_for_dispatch(
+            Path(str(root)), str(path), dispatch_id
+        )
+
+
+def _terminal_worktree_gc(project_root: Path | None, dispatch_id: str) -> None:
+    """Write a terminal-triggered dry-run report; reclaim only when opted in."""
+    mode = os.environ.get("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", "dry-run").strip().lower()
+    if mode in {"", "off", "disabled"} or project_root is None:
+        return
+    try:
+        import goalflight_worktree_gc
+
+        report = goalflight_worktree_gc.terminal_dry_run(project_root)
+        if mode == "reclaim" and not report.get("error"):
+            listed, _ = goalflight_worktree_gc.list_worktrees(project_root)
+            main_path = goalflight_worktree_gc.main_worktree_path(project_root)
+            current, current_error = goalflight_worktree_gc.current_checkout_path(project_root)
+            entries = [
+                goalflight_worktree_gc.classify(
+                    project_root,
+                    item,
+                    into="main",
+                    ledger_dir=goalflight_ledger.runs_dir(create=False),
+                    main_path=main_path,
+                    current_checkout=current,
+                    current_error=current_error,
+                )
+                for item in listed
+            ]
+            goalflight_worktree_gc.apply_removals(
+                project_root,
+                entries,
+                into="main",
+                ledger_dir=goalflight_ledger.runs_dir(create=False),
+                main_path=main_path,
+                current_checkout=current,
+                current_error=current_error,
+            )
+            report["mode"] = "reclaim"
+            report["entries"] = entries
+        path = _dispatch_base_dir() / f"{dispatch_id}.worktree-gc.json"
+        _write_json_atomic(path, report)
+    except Exception:
+        return
     raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
     if raw and (fd is None or raw == str(fd)):
         os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
@@ -4859,7 +4938,7 @@ def _seed_codex_resume_home_from_canonical(
     the original. A canonical account home is shared state -- that account's
     login and every session it has run -- so it must never take that path.
     Instead the resumed worker gets a fresh per-dispatch home for the target
-    account, built by the ordinary seat path and keyed by THIS dispatch, and a
+    account, built by the ordinary account path and keyed by THIS dispatch, and a
     byte copy of the one rollout it resumes at the same path relative to the
     home, which is where `codex exec resume <session>` looks. The source home
     is only read. The prompt-token cache does not carry over; after a quota
@@ -4941,7 +5020,7 @@ def _cmd_resume(argv: list[str]) -> int:
     parser.add_argument(
         "--account",
         help=(
-            "Seat to bill the resumed worker to. Honored as a pin. "
+            "Account to bill the resumed worker to. Honored as a pin. "
             "When omitted, default selection skips recently quota-exhausted "
             "accounts until their reset."
         ),
@@ -5147,7 +5226,7 @@ def _resume_launch_argv(
 
     if engine == "codex":
         # Codex carries --codex-resume-home, so the rollout is read from the
-        # ORIGINAL home regardless of which seat is billed. No migration needed.
+        # ORIGINAL home regardless of which account is billed. No migration needed.
         if requested:
             replace["--account"] = requested
     elif engine in SEAT_SCOPED_SESSION_ENGINES:
@@ -5173,7 +5252,7 @@ def _resume_launch_argv(
             if healthy:
                 target = healthy[0]
             else:
-                # Every configured seat is walled. Launching anyway spends a
+                # Every configured account is walled. Launching anyway spends a
                 # dispatch to rediscover the same 402 and re-terminalizes the
                 # parent for nothing. Grok in particular meters a SHARED
                 # "Build usage balance", so an account change cannot help once it
@@ -6078,7 +6157,7 @@ def _account_engine(agent: str) -> str | None:
 # cursor dispatch records no session handle at all, so resume refuses it before
 # migration could ever apply. Codex is absent on purpose: it carries
 # --codex-resume-home, so its rollout is read from the original home whatever
-# seat is billed. Add an engine here only with a verified layout.
+# account is billed. Add an engine here only with a verified layout.
 SEAT_SCOPED_SESSION_ENGINES = {"grok": ".grok"}
 
 
@@ -6233,7 +6312,7 @@ def _codex_seat_probe_says_usable(seat: str) -> bool | None:
     leaving the conservative path exactly as it was.
 
     The daemon's own verdict is the cooldown it writes -- it sets one when it
-    measures a seat exhausted and clears it when it does not -- so a fresh
+    measures an account exhausted and clears it when it does not -- so a fresh
     snapshot with no cooldown and measured headroom is that daemon saying the
     seat is usable right now.
     """
@@ -6598,11 +6677,11 @@ def resolve_codex_home(
     """Resolve one launch snapshot without ever failing the dispatch.
 
     An explicit ``--account`` is honored as a pin. Unpinned selection skips
-    recently quota-exhausted seats until their reset rather than dying on
+    recently quota-exhausted accounts until their reset rather than dying on
     the first serial seat.
 
-    When the seat library is absent this returns ``(None, None)``: we did
-    not look. When it is present but no managed seat is selectable, the
+    When the account library is absent this returns ``(None, None)``: we did
+    not look. When it is present but no managed account is selectable, the
     launch still proceeds on the inherited host login and the billed
     account is labelled ``host`` so the ledger does not record ``None``.
     """
@@ -6626,8 +6705,8 @@ def resolve_codex_home(
     if account:
         return home, account
     print(
-        "goalflight_dispatch: WARN: no managed codex seat selectable "
-        "(all seats walled or discovery failed); billing host",
+        "goalflight_dispatch: WARN: no managed codex account selectable "
+        "(all accounts walled or discovery failed); billing host",
         file=sys.stderr,
     )
     return home, "host"
@@ -6835,6 +6914,15 @@ def _prelaunch_status_metadata(
         "controller_pid": _controller_pid(args),
         "controller_label": _controller_label(args),
     }
+    worktree_id = getattr(args, "_worktree_id", None)
+    worktree_path = getattr(args, "_worktree_path", None)
+    if worktree_id:
+        metadata["worktree_id"] = str(worktree_id)
+        metadata["worktree_seat"] = str(worktree_id)
+    if worktree_path:
+        metadata["worktree_path"] = str(worktree_path)
+    if getattr(args, "_worktree_base_commit", None):
+        metadata["worktree_base"] = str(args._worktree_base_commit)
     task_ids = list(getattr(args, "task_ids", []) or [])
     if task_ids:
         metadata["task_ids"] = task_ids
@@ -7080,6 +7168,10 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                     parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
                     worker_cwd=str(_worker_cwd(args)),
+                    worktree_id=getattr(args, "_worktree_id", None),
+                    worktree_seat=getattr(args, "_worktree_id", None),
+                    worktree_path=getattr(args, "_worktree_path", None),
+                    worktree_base=getattr(args, "_worktree_base_commit", None),
                     dispatch_argv=_canonical_replay_argv(
                         args,
                         _raw_worker_args(args)
@@ -7340,7 +7432,7 @@ def _proven_transient_local_pre_spawn(proc: subprocess.CompletedProcess) -> bool
     Absence of DISPATCH-PRE-WORKER-REFUSED is not proof of transience.
     """
     blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
-    if "wait for a seat" in blob:
+    if "wait for a worktree" in blob or "wait for a seat" in blob:
         return True
     if "label in use" in blob:
         return True
@@ -9947,6 +10039,7 @@ def _cmd_withdraw(argv: list[str]) -> int:
                 )
                 current["project_root"] = str(root)
                 goalflight_ledger.write_record(current)
+                _release_withdrawn_worktree(current, args.dispatch_id)
                 archived_carriers = _archive_withdraw_carriers(carriers)
                 payload.update(status="withdrawn", withdrawn_by=terminal.observation["withdrawn_by"],
                                attempt_id=terminal.attempt_id,
@@ -16090,7 +16183,7 @@ def _stamp_launch_attempt(
     last_attempted_at is the forward-progress cursor (never-attempted first).
     Backoff is the next-pass skip. Proven-failure and undetermined attempts
     always back off, even when fast; proven-transient / capacity deferrals
-    back off only on a material budget burn so a free seat is not parked.
+    back off only on a material budget burn so a free account is not parked.
     """
     stamp_fields = _apply_launch_attempt_cursor(
         claim,
@@ -17425,9 +17518,12 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         if outer_seat_bound or not requested_worktree_base
         else project_root
     )
-    acp_worktree = "off" if outer_seat_bound else (
-        "create" if requested_worktree_base else "off"
-    )
+    if outer_seat_bound:
+        acp_worktree = "off"
+    elif _occupancy_exempt_read_only(args):
+        acp_worktree = "shared-read-only"
+    else:
+        acp_worktree = "create"
     prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
     orientation_path = _project_orientation_path(
         project_root,
@@ -18452,7 +18548,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         "--cwd",
         type=_existing_cwd_arg,
         help=(
-            "Lock an existing tree: this controller's captive seat, the "
+            "Lock an existing tree: a managed worktree, the "
             "project root (in-place), or resume's recorded worker_cwd. "
             "Refuses any other path and never creates it."
         ),
@@ -18460,7 +18556,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--in-place",
         action="store_true",
-        help="Run in the project root without acquiring a captive seat.",
+        help="Run in the project root without acquiring a pooled worktree.",
     )
     parser.add_argument(
         "--worktree",
@@ -18468,9 +18564,9 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         dest="worktree",
         metavar="REF",
         help=(
-            "Prepare the captive seat at git ref REF (HEAD, main, a commit). "
+            "Prepare the pooled worktree at git ref REF (HEAD, main, a commit). "
             "This is not an opt-in to the pool: every dispatch acquires a "
-            "seat unless --in-place or --cwd names the project root. "
+            "worktree unless --in-place or --cwd names the project root. "
             "Default ref is origin/main when it exists, else HEAD. "
             "Exhaustion names occupants and never falls back to "
             "`git worktree add`."
@@ -18478,6 +18574,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--skip-seat-reset",
+        "--skip-worktree-reset",
         action="store_true",
         default=False,
         help=argparse.SUPPRESS,
@@ -18656,6 +18753,14 @@ def _build_launch_parser() -> argparse.ArgumentParser:
             "kernel lock or a non-terminal dispatch already owns --cwd (the two "
             "writers then share one filesystem tree with no merge discipline), "
             "or when occupancy cannot be evaluated."
+        ),
+    )
+    parser.add_argument(
+        "--operator-recovery",
+        action="store_true",
+        help=(
+            "Explicit operator recovery mode required with the deprecated "
+            "--occupied-worktree-forced override."
         ),
     )
     parser.add_argument(
@@ -18872,7 +18977,6 @@ def main(argv: list[str] | None = None) -> int:
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
-            _resolve_account_env(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
@@ -18892,36 +18996,41 @@ def main(argv: list[str] | None = None) -> int:
                 _validate_resume_source(
                     args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
                 )
-            # Before the seat bind. This gate reads the ledger and the task
-            # store, not the seat, and a refusal must not become the occupant.
+            # Before any worktree bind. This gate reads the ledger and the task
+            # store, not the worktree, and a refusal must not become the occupant.
             _refuse_launch_blocked_by_completion_authority(args)
-            try:
-                _bind_dispatch_worktree(args)
-            except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
-                print(f"goalflight_dispatch: {e}", file=sys.stderr)
-                print(
-                    "goalflight_dispatch: refusing to git worktree add; "
-                    "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
-                    file=sys.stderr,
-                )
-                return 2
-            except goalflight_worktree_pool.WorktreeSeatError as e:
-                print(
-                    f"goalflight_dispatch: worktree seat error: {e}",
-                    file=sys.stderr,
-                )
-                return 1
-            occupancy_warning = _prepare_attempt_worktree_occupancy(args)
-            if occupancy_warning is not None:
-                args.dispatch_warnings = [
-                    *getattr(args, "dispatch_warnings", []),
-                    occupancy_warning,
-                ]
+            # The ACP runner owns the account -> capacity -> worktree sequence
+            # for ordinary pooled launches. Explicit --cwd/in-place resumes
+            # still bind here because they attach an existing checkout rather
+            # than asking ACP to create one after capacity is granted.
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
             if not goalflight_compat.is_windows():
                 _validate_claude_auth_before_attempt(args, account_env)
+            if getattr(args, "cwd", None) or getattr(args, "in_place", False):
+                try:
+                    _bind_dispatch_worktree(args)
+                except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+                    print(f"goalflight_dispatch: {e}", file=sys.stderr)
+                    print(
+                        "goalflight_dispatch: refusing to git worktree add; "
+                        "wait for a worktree or raise GOALFLIGHT_WORKTREES_PER_REPO",
+                        file=sys.stderr,
+                    )
+                    return 2
+                except goalflight_worktree_pool.WorktreeSeatError as e:
+                    print(
+                        f"goalflight_dispatch: worktree allocation error: {e}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+                if occupancy_warning is not None:
+                    args.dispatch_warnings = [
+                        *getattr(args, "dispatch_warnings", []),
+                        occupancy_warning,
+                    ]
             if (
                 not args.foreground
                 and not getattr(args, "launch_detached", False)
@@ -19000,20 +19109,19 @@ def main(argv: list[str] | None = None) -> int:
         # not bypass this: a same-task sibling still refuses, and a refusal
         # must not rewrite the seat occupant.
         _refuse_launch_blocked_by_completion_authority(args)
-        _bind_dispatch_worktree(args)
-        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
-        if occupancy_warning is not None:
-            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+        # Admission order is account -> capacity -> worktree -> launch. The
+        # worktree bind is intentionally deferred until after the account and
+        # capacity leases are durable; a refusal must not mint a checkout.
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(
             "goalflight_dispatch: refusing to git worktree add; "
-            "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+            "wait for a worktree or raise GOALFLIGHT_WORKTREES_PER_REPO",
             file=sys.stderr,
         )
         return 2
     except goalflight_worktree_pool.WorktreeSeatError as e:
-        print(f"goalflight_dispatch: worktree seat error: {e}", file=sys.stderr)
+        print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
         return 1
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
@@ -19373,12 +19481,22 @@ def main(argv: list[str] | None = None) -> int:
             _validate_codex_reasoning_effort(args, codex_env)
         request_envelope = _queue_request_envelope(args)
         worktree_seat = _bind_dispatch_worktree(args)
+        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+        if occupancy_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
         if worktree_seat is not None:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+            summary_head["worktree_id"] = worktree_seat.seat_name
             summary_head["worktree_seat"] = worktree_seat.seat_name
             summary_head["worktree_path"] = str(worktree_seat.path)
             summary_head["worktree_branch"] = worktree_seat.branch
             summary_head["worktree_base"] = args._worktree_base_commit
+        elif getattr(args, "_worktree_path", None):
+            worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+            summary_head["worktree_id"] = getattr(args, "_worktree_id", None)
+            summary_head["worktree_seat"] = getattr(args, "_worktree_id", None)
+            summary_head["worktree_path"] = getattr(args, "_worktree_path", None)
+            summary_head["worktree_base"] = getattr(args, "_worktree_base_commit", None)
         _record_ledger(
             args,
             project_root=project_root,
@@ -19430,9 +19548,9 @@ def main(argv: list[str] | None = None) -> int:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
         else:
             env.pop("GOALFLIGHT_PROMPT_FILE", None)
-        # An auto-selected seat is still a seat: the API-key scrub must key on
+        # An auto-selected account is still an account: the API-key scrub must key on
         # the account actually resolved, or a GROK_API_KEY in the environment
-        # would quietly bill the API instead of the subscription seat we chose.
+        # would quietly bill the API instead of the subscription account we chose.
         if (args.account or grok_selected_account(args)) and _account_engine(
             args.agent
         ) == "grok":
@@ -19805,14 +19923,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(
             "goalflight_dispatch: refusing to git worktree add; "
-            "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+            "wait for a worktree or raise GOALFLIGHT_WORKTREES_PER_REPO",
             file=sys.stderr,
         )
         return 2
     except goalflight_worktree_pool.WorktreeSeatError as e:
         final_state = "failed_worktree"
         final_reason = str(e)
-        print(f"goalflight_dispatch: worktree seat error: {e}", file=sys.stderr)
+        print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
         return 1
     except DispatchUsageError as e:
         final_state = "failed"
@@ -19877,6 +19995,8 @@ def main(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                         flush=True,
                     )
+        if not detached_launched and not keep_live_watcher_open and final_worker_alive is not True:
+            _terminal_worktree_gc(project_root, args.dispatch_id)
         if not detached_launched and not keep_live_watcher_open:
             try:
                 _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
