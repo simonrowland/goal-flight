@@ -118,6 +118,26 @@ def test_non_finite_lease_weight_defaults_to_one(isolated_capacity):
     assert cap._lease_weight({"capacity_weight": "NaN"}) == 1.0
 
 
+def test_legacy_vendor_lease_uses_ledger_account_for_capacity(isolated_capacity, monkeypatch):
+    legacy_lease = {
+        "dispatch_id": "legacy-alpha",
+        "agent": "codex",
+        "state": "active",
+        "capacity_weight": 1.0,
+    }
+    monkeypatch.setattr(
+        cap,
+        "_dispatch_record_for_lease",
+        lambda lease: {"effective_account": "alpha"}
+        if lease is legacy_lease
+        else None,
+    )
+    rows = cap.account_capacity_rows([legacy_lease])
+    assert rows["codex/alpha"]["active"] == 1
+    assert rows["codex/alpha"]["active_weight"] == 1.0
+    assert "codex/default" not in rows
+
+
 def test_account_cooldown_does_not_block_sibling(isolated_capacity):
     with cap.StateLock():
         state = cap.load_state()

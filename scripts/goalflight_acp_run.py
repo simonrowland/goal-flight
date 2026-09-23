@@ -2630,8 +2630,31 @@ async def _run_acp_dispatch_impl(
 
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
     lease_ttl_s = max(int(cfg.idle_timeout or (36000 if cfg.mode == "goal" else 300)) * 4, 3600)
+    codex_selected_account = getattr(cfg, "_codex_selected_account", None)
+    capacity_account = codex_selected_account or getattr(cfg, "account", None)
+    if (
+        goalflight_ledger.infer_engine(cfg.agent) == "codex"
+        and not capacity_account
+    ):
+        account_rejections: list[dict[str, str]] = []
+        try:
+            import goalflight_dispatch
+        except ImportError:
+            goalflight_dispatch = None
+        if goalflight_dispatch is not None:
+            codex_selected_account, account_rejections = (
+                goalflight_dispatch.select_codex_account(
+                    model=getattr(cfg, "model", None)
+                )
+            )
+        setattr(cfg, "_codex_selected_account", codex_selected_account)
+        setattr(cfg, "_codex_account_rejections", account_rejections)
+        capacity_account = codex_selected_account
+
     acquire_args = argparse.Namespace(
         agent=cfg.agent,
+        account=capacity_account,
+        model=getattr(cfg, "model", None),
         dispatch_id=dispatch_id,
         prompt_id=cfg.prompt_id,
         project_root=str(project_root),
@@ -4117,8 +4140,10 @@ async def _run_acp_dispatch_impl(
             try:
                 codex_home, effective_account = dispatch_module.resolve_codex_home(
                     project_root,
-                    getattr(cfg, "account", None),
+                    getattr(cfg, "_codex_selected_account", None)
+                    or getattr(cfg, "account", None),
                     dispatch_id,
+                    model=getattr(cfg, "model", None),
                 )
             except BaseException:
                 codex_home, effective_account = None, None

@@ -1205,8 +1205,25 @@ def _lease_vendor(lease: dict) -> str:
 
 
 def _lease_account(lease: dict) -> str:
-    value = lease.get("account") or lease.get("effective_account") or "default"
-    return str(value).strip() or "default"
+    account = str(lease.get("account") or "").strip()
+    if account and account != "default":
+        return account
+    effective_account = str(lease.get("effective_account") or "").strip()
+    if effective_account and effective_account != "default":
+        return effective_account
+
+    # Public-release capacity leases predate account-scoped state and therefore
+    # have no account field. Their dispatch ledger still records the billing
+    # identity once the worker home was resolved; use that durable evidence so
+    # old work consumes the correct account's cap during the mixed-version
+    # upgrade window.
+    record = _dispatch_record_for_lease(lease)
+    if isinstance(record, dict) and record.get("state") != "unreadable":
+        for field in ("effective_account", "account"):
+            value = str(record.get(field) or "").strip()
+            if value and value != "default":
+                return value
+    return "default"
 
 
 def _lease_weight(lease: dict) -> float:
