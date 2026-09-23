@@ -134,11 +134,109 @@ def test_current_spawning_lease_stays_protected_without_worker_identity(tmp_path
         "machine_id": cap.machine_id(),
         "lease_schema": cap.LEASE_SCHEMA,
         "launch_state": "spawning",
+        "reservation_deadline_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
         "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
     }
     cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
     cap.cmd_release_stale(argparse.Namespace(state="released", reason="stale", keep=True))
     assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "active"
+
+
+def test_spawn_failure_transitions_and_releases_spawning_lease(tmp_path):
+    record = {
+        "dispatch_id": "spawn-failed",
+        "project_root": str(tmp_path),
+        "state": "failed",
+        "terminal_state": "error",
+        "worker_still_alive": False,
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "spawn-failed-lease",
+        "dispatch_id": record["dispatch_id"],
+        "state": "active",
+        "agent": "codex",
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "launch_state": "spawning",
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    assert cap.mark_lease_spawn_failed(lease["lease_id"])
+    assert cap.load_state()["leases"][lease["lease_id"]]["launch_state"] == "spawn_failed"
+    cap.release_terminal_dispatch(record["dispatch_id"], "error")
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "error"
+    assert not cap.mark_lease_spawn_failed(lease["lease_id"])
+
+
+def test_expired_spawning_lease_uses_terminal_ledger_proof(tmp_path):
+    record = {
+        "dispatch_id": "expired-spawning",
+        "project_root": str(tmp_path),
+        "state": "failed",
+        "terminal_state": "error",
+        "worker_still_alive": False,
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "expired-spawning-lease",
+        "dispatch_id": record["dispatch_id"],
+        "state": "active",
+        "agent": "codex",
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "launch_state": "spawning",
+        "reservation_deadline_at": cap.iso(cap.utc_now() - dt.timedelta(seconds=1)),
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    assert cap.reclaim_stale_leases({"leases": {lease["lease_id"]: lease}, "cooldowns": {}}) == [
+        lease["lease_id"]
+    ]
+
+
+def test_reconcile_terminal_projection_retries_capacity_cleanup(tmp_path, monkeypatch):
+    dispatch_id = "reconcile-terminal-lease"
+    project_root = Path.cwd()
+    status_path = tmp_path / "reconcile.status.json"
+    status_path.write_text(
+        json.dumps({
+            "dispatch_id": dispatch_id,
+            "state": "complete",
+            "worker_alive": False,
+        })
+    )
+    record = {
+        "dispatch_id": dispatch_id,
+        "project_root": str(project_root),
+        "state": "running",
+        "terminal_state": "unknown",
+        "status_path": str(status_path),
+        "worker_still_alive": False,
+    }
+    ledger.write_record(record)
+    lease = {
+        "lease_id": "reconcile-lease",
+        "dispatch_id": dispatch_id,
+        "state": "active",
+        "agent": "codex",
+        "machine_id": cap.machine_id(),
+        "lease_schema": cap.LEASE_SCHEMA,
+        "launch_state": "reserved",
+        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+    }
+    cap.save_state({"leases": {lease["lease_id"]: lease}, "cooldowns": {}})
+    authority = journal.open_or_create_journal(project_root)
+    attempt = authority.prepare_attempt(dispatch_id).value
+    monkeypatch.setattr(ledger, "worker_identity_liveness", lambda _record: ("dead", "pid_absent"))
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "worker_still_alive": False},
+    ).committed
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "active"
+    summary = ledger.reconcile_terminal_outbox(project_root)
+    assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "complete", summary
 
 
 def test_unattached_lease_is_not_reclaimed_from_claimant_death(tmp_path, monkeypatch):
@@ -161,13 +259,14 @@ def test_unattached_lease_is_not_reclaimed_from_claimant_death(tmp_path, monkeyp
     assert data["leases"][lease["lease_id"]]["state"] == "active"
 
 
-def test_legacy_unattached_lease_uses_existing_ttl_backstop(tmp_path, monkeypatch):
+def test_legacy_unattached_lease_expiry_requires_manual_identity_repair(tmp_path, monkeypatch):
     monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: False)
     lease = {
         # v1.7.0 wrote no per-lease machine_id or lease_schema.
         "lease_id": "legacy-spawn-handoff",
         "state": "active",
         "agent": "codex",
+        "dispatch_id": "legacy-unattached",
         "claimant_pid": 4242,
         "controller_pid": 4343,
         "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
@@ -175,9 +274,21 @@ def test_legacy_unattached_lease_uses_existing_ttl_backstop(tmp_path, monkeypatc
     data = {"machine_id": cap.machine_id(), "leases": {lease["lease_id"]: lease}, "cooldowns": {}}
     assert cap.reclaim_stale_leases(data) == []
     lease["expires_at"] = cap.iso(cap.utc_now() - dt.timedelta(seconds=1))
-    assert cap.reclaim_stale_leases(data) == [lease["lease_id"]]
+    assert cap.reclaim_stale_leases(data) == []
     cap.prune_state(data)
-    assert data["leases"][lease["lease_id"]]["state"] == "expired"
+    assert data["leases"][lease["lease_id"]]["state"] == "active"
+    cap.save_state(data)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert cap.cmd_status(argparse.Namespace(
+            json=True, ram_mb=65536, reserve_mb=0, worst_worker_mb=1200,
+            hard_cap=40, max_total=None, rate_pressure_window_s=None,
+            rate_pressure_threshold=None,
+        )) == 0
+    status = json.loads(output.getvalue())
+    manual = status["legacy_manual_release"]
+    assert manual and lease["lease_id"] == manual[0]["lease_id"]
+    assert lease["lease_id"] in manual[0]["manual_release_command"]
 
 
 def test_remote_lease_is_never_probed_or_reclaimed(tmp_path, monkeypatch):

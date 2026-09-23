@@ -2146,6 +2146,18 @@ def reconcile_terminal_outbox(
                     current = terminal_record_projection(current, result.value, reason)
                     write_record(current)
                 history_records.append(dict(current))
+            try:
+                import goalflight_capacity
+
+                goalflight_capacity.release_terminal_dispatch(
+                    str(record["dispatch_id"]), result.value.terminal_state,
+                )
+            except Exception as exc:
+                print(
+                    "goalflight_ledger: terminal capacity cleanup deferred: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
             if (
                 status_observation is not None
                 and status_observation.get("state") == "terminal_pending"

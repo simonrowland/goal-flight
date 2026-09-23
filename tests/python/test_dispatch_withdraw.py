@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import io
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 from support import SCRIPTS
 
 import goalflight_dispatch as dispatch
+import goalflight_capacity as capacity
 import goalflight_journal as journal
 import goalflight_ledger as ledger
 import goalflight_status as status
@@ -100,6 +102,7 @@ def test_claimed_worker_identity(prepared, claimed, alive):
         if not alive:
             child.terminate()
             child.wait(timeout=10)
+
         original = claimed.read_bytes()
         row = attempt_row(authority)
         record = ledger.record_path("withdraw-test").read_bytes()
@@ -122,6 +125,76 @@ def test_claimed_worker_identity(prepared, claimed, alive):
         if child.poll() is None:
             child.terminate()
         child.wait(timeout=10)
+
+
+def test_withdraw_releases_reserved_lease_after_projection(prepared):
+    project, _, _, _ = prepared
+    capacity.save_state(
+        {
+            "leases": {
+                "withdraw-lease": {
+                    "lease_id": "withdraw-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                    "expires_at": capacity.iso(
+                        capacity.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+    code, result = withdraw()
+    assert code == 0, result
+    assert (
+        capacity.load_state()["leases"]["withdraw-lease"]["state"]
+        == "withdrawn"
+    )
+
+
+def test_withdraw_retry_releases_after_initial_cleanup_failure(prepared, monkeypatch):
+    project, _, _, _ = prepared
+    capacity.save_state(
+        {
+            "leases": {
+                "withdraw-retry-lease": {
+                    "lease_id": "withdraw-retry-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                    "expires_at": capacity.iso(
+                        capacity.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+
+    def fail_cleanup(*_args):
+        raise RuntimeError("capacity unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dispatch, "_release_terminal_capacity", fail_cleanup)
+        code, result = withdraw()
+        assert code == 0, result
+        assert capacity.load_state()["leases"]["withdraw-retry-lease"]["state"] == "active"
+
+    code, result = withdraw()
+    assert code == 0 and result["status"] == "already withdrawn", result
+    assert (
+        capacity.load_state()["leases"]["withdraw-retry-lease"]["state"]
+        == "withdrawn"
+    )
 
 
 def test_claimed_spawn_intent_waits_for_stale_window(prepared, claimed, monkeypatch):
