@@ -2489,15 +2489,39 @@ def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
             # (which is hot — runs on every CLI invocation in a goal-flight
             # terminal).
             result = data[key]
-            if (
-                not isinstance(result.get("process_identity"), dict)
-                or not result["process_identity"].get("start_token")
-            ):
-                measured_identity = _controller_process_identity(pid)
-                if measured_identity is not None:
-                    result = {**result, "process_identity": measured_identity}
-                    data[key] = result
-                    changed = True
+            measured_identity = _controller_process_identity(pid)
+            stored_identity = result.get("process_identity")
+            stored_token = (
+                stored_identity.get("start_token")
+                if isinstance(stored_identity, dict)
+                else None
+            )
+            measured_token = (
+                measured_identity.get("start_token")
+                if isinstance(measured_identity, dict)
+                else None
+            )
+            if stored_token and measured_token and stored_token != measured_token:
+                # The PID slot survived, but the process generation did not.
+                # Start a new session rather than letting claim/release trust
+                # the old session id across PID reuse.
+                result = {
+                    "id": str(uuid.uuid4()),
+                    "pid": pid,
+                    "started_at": _now_iso(),
+                    "hostname": socket.gethostname(),
+                    "process_identity": measured_identity,
+                }
+                data[key] = result
+                changed = True
+            elif not stored_token and measured_identity is not None:
+                result = {**result, "process_identity": measured_identity}
+                data[key] = result
+                changed = True
+            elif stored_token and measured_identity is None:
+                # Preserve the stored record on disk, but do not hand an
+                # unverified generation to claim/release as if it were live.
+                result = {**result, "process_identity": None}
         else:
             result = {
                 "id": str(uuid.uuid4()),
@@ -3145,6 +3169,9 @@ def claim(project_root: Path, queue: Path, *, force: bool = False) -> tuple[bool
         if not front:
             return False, f"queue {queue.name} has no frontmatter to stamp into"
         session = ensure_session(project_root)
+        identity = session.get("process_identity")
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return False, "controller process identity unavailable; refusing to claim"
         current = front.get("current_session")
         if isinstance(current, dict) and current.get("id") and current.get("id") != session["id"]:
             owner_liveness = _session_owner_liveness(current)
@@ -3219,6 +3246,18 @@ def release(project_root: Path, queue: Path | None, *, reason: str = "user-exit"
                             f"this terminal's session ({my_session['id']}); "
                             "refusing to release. Use --force-release-stale "
                             "or claim --force to take over."
+                        )
+                    current_token = current.get("process_start_token")
+                    my_identity = my_session.get("process_identity")
+                    my_token = (
+                        my_identity.get("start_token")
+                        if isinstance(my_identity, dict)
+                        else None
+                    )
+                    if not current_token or not my_token or current_token != my_token:
+                        return False, (
+                            "queue current_session process identity is not this "
+                            "terminal generation; refusing to release"
                         )
                 history = list(front.get("session_history") or [])
                 if isinstance(current, dict) and current.get("id"):

@@ -8828,7 +8828,7 @@ def _write_pidfile(
     return pidfile
 
 
-def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
+def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> bool:
     """Best-effort reap of a DEAD worker's orphaned process group.
 
     The direct-dispatch worker runs in its own session/group
@@ -8844,6 +8844,7 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
     ``kern.tty.ptmx_max`` backstop + agent choice mitigate that residual class.
     """
     pgid = None
+    entry = None
     try:
         lines = pidfile.read_text(encoding="utf-8").splitlines()
         if lines:
@@ -8853,35 +8854,38 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> None:
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pgid = None
     if not pgid or pgid <= 1:
-        return
+        return False
     # Direct-dispatch invariant: the worker is its own session/group leader
     # (start_new_session), so pgid == worker_pid. If they disagree we cannot be
     # sure the group is the worker's -- be conservative and skip.
     if pgid != worker_pid:
-        return
+        return False
     with contextlib.suppress(OSError, AttributeError):
         if hasattr(os, "getpgrp") and pgid == os.getpgrp():
-            return  # never signal the orchestrator's own process group
+            return False  # never signal the orchestrator's own process group
     # Re-check liveness immediately before signalling: if worker_pid was reused
     # and is now a live unrelated process, skip rather than risk a wrong target.
     if goalflight_compat.pid_alive(worker_pid):
-        return
+        return False
     expected_identity = entry.get("worker_identity")
     if not isinstance(expected_identity, dict) or not expected_identity.get("start_token"):
         # Old pidfiles cannot prove which process generation owned this group.
         # Unknown identity is not permission to signal a reused PID.
-        return
+        return False
     current_identity = goalflight_ledger.process_identity(worker_pid)
     matched, _reason = goalflight_ledger.compare_fine_process_identities(
         worker_pid, expected_identity, current_identity
     )
     if not matched:
-        return
+        return False
     # killpg the group DIRECTLY -- not via kill_pid, whose empty-group fallback
     # to a bare kill(worker_pid) could hit a reused pid. An empty/gone group
     # (ProcessLookupError) or a Windows-absent os.killpg degrades to a no-op.
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError, AttributeError):
+    try:
         os.killpg(pgid, getattr(signal, "SIGTERM", 15))
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        return False
+    return True
 
 
 def _mark_pidfile_detached(pidfile: Path) -> None:
@@ -8913,9 +8917,9 @@ def _cleanup_pidfile_if_worker_dead(pidfile: Path | None, worker_pid: int | None
         # owned workers after their controller exits (symmetry with ACP cleanup).
         _mark_pidfile_detached(pidfile)
         return
-    _reap_dead_worker_pgroup(pidfile, worker_pid)
-    with contextlib.suppress(OSError):
-        pidfile.unlink(missing_ok=True)
+    if _reap_dead_worker_pgroup(pidfile, worker_pid):
+        with contextlib.suppress(OSError):
+            pidfile.unlink(missing_ok=True)
 
 
 def _finish_ledger(

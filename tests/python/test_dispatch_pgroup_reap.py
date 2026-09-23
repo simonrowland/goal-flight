@@ -181,6 +181,35 @@ def case_reap_refuses_reused_worker_pid() -> None:
             dispatch._reap_dead_worker_pgroup(pidfile, 999_999)
 
 
+def case_cleanup_preserves_legacy_pidfile_without_identity() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        pidfile.write_text(
+            json.dumps({"pid": 999_999, "pgid": 999_999}) + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.os, "killpg", side_effect=AssertionError("legacy evidence must not be signalled")
+        ):
+            dispatch._cleanup_pidfile_if_worker_dead(pidfile, 999_999)
+        assert pidfile.exists(), "legacy pidfile must be retained as recovery evidence"
+
+
+def case_cleanup_preserves_pidfile_when_identity_probe_is_unknown() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        _write_pidfile(pidfile, 999_999, 999_999)
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.goalflight_ledger,
+            "process_identity",
+            return_value=None,
+        ), patch.object(
+            dispatch.os, "killpg", side_effect=AssertionError("unknown identity must not signal")
+        ):
+            dispatch._cleanup_pidfile_if_worker_dead(pidfile, 999_999)
+        assert pidfile.exists(), "unknown identity must preserve the pidfile"
+
+
 def main() -> None:
     case_cleanup_reaps_dead_worker_orphans()
     case_cleanup_preserves_live_worker()
@@ -188,6 +217,8 @@ def main() -> None:
     case_reap_skips_pgid_neq_worker()
     case_reap_refuses_reused_worker_pid()
     case_guard_skips_own_pgroup()
+    case_cleanup_preserves_legacy_pidfile_without_identity()
+    case_cleanup_preserves_pidfile_when_identity_probe_is_unknown()
     print("OK: dispatch pgroup-reap teardown tests pass")
 
 

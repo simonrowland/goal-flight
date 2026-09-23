@@ -34,7 +34,30 @@ DEAD = "2222222222222222"
 
 
 def _fake_ps(mapping: dict[str, list[int]]):
-    return lambda _root: dict(mapping)
+    return lambda _root: {
+        nonce: [
+            {"pid": pid, "start_token": f"test:{pid}"}
+            for pid in pids
+        ]
+        for nonce, pids in mapping.items()
+    }
+
+
+def _fake_identity(pid: int) -> dict[str, object]:
+    return {"pid": pid, "start_token": f"test:{pid}"}
+
+
+def _ps_liveness_available(pid: int) -> bool:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "pid=,state=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
 # --------------------------------------------------------------------------
@@ -94,8 +117,9 @@ def test_a_process_with_no_nonce_is_never_attributed(monkeypatch) -> None:
         R.subprocess, "run",
         lambda *a, **k: type("P", (), {"stdout": listing})(),
     )
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     got = R.listener_processes_by_nonce(Path("/repos/mine"))
-    assert got == {DEAD: [101]}, got
+    assert got == {DEAD: [{"pid": 101, "start_token": "test:101"}]}, got
 
 
 def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
@@ -107,6 +131,23 @@ def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
     assert R.listener_processes_by_nonce(Path("/repos/mine")) == {}
+
+
+def test_nonzero_process_listing_refuses_even_with_matching_stdout(monkeypatch) -> None:
+    listing = (
+        "  101 python3 /s/goalflight_messages.py listen "
+        "--project-root /repos/mine --lease-nonce " + DEAD + "\n"
+    )
+    result = subprocess.CompletedProcess(
+        ["ps"], 1, stdout=listing, stderr="ps: permission denied"
+    )
+    monkeypatch.setattr(R.subprocess, "run", lambda *a, **k: result)
+    monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: set())
+    killed: list[int] = []
+    monkeypatch.setattr(R.os, "kill", lambda pid, sig: killed.append(pid))
+    out = R.reap_orphaned_listeners(Path("/repos/mine"))
+    assert killed == [] and out["reaped"] == 0, out
+    assert out["detail"]["known"] is False, out
 
 
 def test_own_pid_is_protected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -126,8 +167,11 @@ def test_own_pid_is_protected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
 def test_an_orphan_is_actually_killed_and_the_kill_is_verified(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    if not _ps_liveness_available(os.getpid()):
+        pytest.skip("sandbox denies the post-signal ps liveness probe")
     victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
     try:
+        monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
         monkeypatch.setattr(
             R, "listener_processes_by_nonce", _fake_ps({DEAD: [victim.pid]})
         )
@@ -148,12 +192,15 @@ def test_a_survivor_is_reported_stubborn_not_counted_as_reaped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Sending a signal is not evidence the process died."""
+    if not _ps_liveness_available(os.getpid()):
+        pytest.skip("sandbox denies the post-signal ps liveness probe")
     victim = subprocess.Popen(
         [sys.executable, "-c",
          "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"]
     )
     try:
         time.sleep(0.4)  # let the handler install before we signal
+        monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
         monkeypatch.setattr(
             R, "listener_processes_by_nonce", _fake_ps({DEAD: [victim.pid]})
         )
@@ -202,8 +249,9 @@ def test_listeners_of_other_projects_are_never_enumerated(monkeypatch) -> None:
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     got = R.listener_processes_by_nonce(Path("/repos/mine"))
-    assert got == {DEAD: [101]}, (
+    assert got == {DEAD: [{"pid": 101, "start_token": "test:101"}]}, (
         f"only this project's listener may be enumerated, got {got}"
     )
 
@@ -218,9 +266,29 @@ def test_a_foreign_projects_live_generation_is_not_reapable(
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: set())
     killed: list[int] = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
     out = R.reap_orphaned_listeners(tmp_path)
     assert killed == [], f"a foreign project's listener must not be signalled: {killed}"
     assert out["reaped"] == 0, out
+
+
+def test_reused_pid_with_new_start_token_is_not_signalled(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        R,
+        "listener_processes_by_nonce",
+        lambda _root: {DEAD: [{"pid": 777, "start_token": "old"}]},
+    )
+    monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: {LIVE})
+    monkeypatch.setattr(
+        R.goalflight_compat,
+        "process_start_identity",
+        lambda pid: {"pid": pid, "start_token": "new"},
+    )
+    killed: list[int] = []
+    monkeypatch.setattr(R.os, "kill", lambda pid, sig: killed.append(pid))
+    out = R.reap_orphaned_listeners(tmp_path)
+    assert killed == [] and out["reaped"] == 0, out
+    assert out["refused_identity"] == [{"pid": 777, "why": "identity-unverified"}], out

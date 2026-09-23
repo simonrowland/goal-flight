@@ -43,6 +43,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat
 import goalflight_journal
 import goalflight_wake
 
@@ -54,8 +55,11 @@ TERM_GRACE_S = 0.5
 _LISTENER_COMMANDS = frozenset({"listen", "listen-auto", "follow", "supervise"})
 
 
-def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | None:
-    """{lease_nonce: [pid, ...]} FOR THIS PROJECT, or None if ps cannot be read.
+def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, object]]] | None:
+    """{lease_nonce: [{pid, start_token}, ...]} FOR THIS PROJECT.
+
+    Each candidate carries a start token captured in the same enumeration pass;
+    a PID without a proven generation is never actionable.
 
     ★ The project filter is load-bearing, not tidiness. The process table is
     machine-wide while lease records are per-project, so an unscoped listing
@@ -74,16 +78,19 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | No
     except OSError:
         return None
     try:
-        listing = subprocess.run(
+        result = subprocess.run(
             ["ps", "-ax", "-o", "pid=,args="],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
-        ).stdout
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return None
+        listing = result.stdout
     except (OSError, subprocess.SubprocessError):
         return None
 
-    found: dict[str, list[int]] = {}
+    found: dict[str, list[dict[str, object]]] = {}
     for line in listing.splitlines():
         head, _, rest = line.strip().partition(" ")
         if not head.isdigit() or not rest:
@@ -107,7 +114,14 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[int]] | No
         if not nonce:
             # Unattributable: it may belong to a live generation. Never reapable.
             continue
-        found.setdefault(nonce, []).append(int(head))
+        identity = goalflight_compat.process_start_identity(int(head))
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            # PID/argv alone is not ownership. A failed or incomplete identity
+            # probe stays out of the actionable population.
+            continue
+        found.setdefault(nonce, []).append(
+            {"pid": int(head), "start_token": str(identity["start_token"])}
+        )
     return found
 
 
@@ -165,12 +179,14 @@ def orphaned_listeners(
     if current_nonce:
         live.add(current_nonce)
     orphan_nonces = sorted(n for n in by_nonce if n not in live)
-    orphan_pids = [pid for n in orphan_nonces for pid in by_nonce[n]]
+    orphan_records = [record for n in orphan_nonces for record in by_nonce[n]]
+    orphan_pids = [int(record["pid"]) for record in orphan_records]
     return {
         "known": True,
         "listeners": sum(len(v) for v in by_nonce.values()),
         "generations": len(by_nonce),
         "orphans": orphan_pids,
+        "orphan_records": orphan_records,
         "orphan_generations": orphan_nonces,
     }
 
@@ -196,12 +212,15 @@ def _liveness(pids: list[int]) -> dict[int, bool | None]:
     if not pids:
         return {}
     try:
-        listing = subprocess.run(
+        result = subprocess.run(
             ["ps", "-o", "pid=,state=", "-p", ",".join(str(p) for p in pids)],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
-        ).stdout
+        )
+        if getattr(result, "returncode", 0) != 0:
+            return {pid: None for pid in pids}
+        listing = result.stdout
     except (OSError, subprocess.SubprocessError):
         return {pid: None for pid in pids}
     # ps omits pids that no longer exist, so absence here is a measured exit.
@@ -235,14 +254,38 @@ def reap_orphaned_listeners(
             "detail": report,
         }
 
-    targets = [pid for pid in report["orphans"] if pid not in _protected_pids()]
+    protected = _protected_pids()
+    targets = [
+        record
+        for record in report.get("orphan_records", [])
+        if isinstance(record, dict)
+        and isinstance(record.get("pid"), int)
+        and isinstance(record.get("start_token"), str)
+        and record["start_token"]
+        and record["pid"] not in protected
+    ]
     if dry_run:
-        return {"reaped": 0, "would_reap": targets, "detail": report}
+        return {
+            "reaped": 0,
+            "would_reap": [record["pid"] for record in targets],
+            "detail": report,
+        }
 
     reaped: list[int] = []
     stubborn: list[dict] = []
     signalled: list[int] = []
-    for pid in targets:
+    refused_identity: list[dict[str, object]] = []
+    for record in targets:
+        pid = int(record["pid"])
+        current = goalflight_compat.process_start_identity(pid)
+        if (
+            not isinstance(current, dict)
+            or not current.get("start_token")
+            or current.get("pid") != pid
+            or str(current["start_token"]) != record["start_token"]
+        ):
+            refused_identity.append({"pid": pid, "why": "identity-unverified"})
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -269,6 +312,8 @@ def reap_orphaned_listeners(
         "generations": report["orphan_generations"],
         "detail": report,
     }
+    if refused_identity:
+        result["refused_identity"] = refused_identity
     if stubborn:
         result["stubborn"] = stubborn
     return result

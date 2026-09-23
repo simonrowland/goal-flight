@@ -1053,40 +1053,34 @@ def test_ensure_session_reuses_inode_when_record_is_unchanged(
     assert first["process_identity"]["start_token"] == "session-generation"
 
 
-def test_queue_claim_does_not_pin_a_reused_pid(
+def test_ensure_session_does_not_pin_same_pid_across_generation_reuse(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = _root(monkeypatch, tmp_path)
-    queue = root / "docs-private" / "goal-queue-reuse.md"
+    token = {"value": "old"}
+    monkeypatch.setattr(
+        sessions, "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": token["value"]},
+    )
+    first = sessions.ensure_session(root, pid=71001)
+    token["value"] = "new"
+    second = sessions.ensure_session(root, pid=71001)
+    assert second["pid"] == first["pid"] == 71001
+    assert second["id"] != first["id"]
+    assert second["process_identity"]["start_token"] == "new"
+
+
+def test_queue_claim_refuses_when_process_identity_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    queue = root / "docs-private" / "goal-queue-unknown.md"
     queue.parent.mkdir(parents=True)
     queue.write_text(
-        sessions._dump_frontmatter(
-            {
-                "state": "active",
-                "current_session": {
-                    "id": "old-session",
-                    "pid": 71001,
-                    "process_start_token": "old",
-                },
-            }
-        ),
+        sessions._dump_frontmatter({"state": "active"}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        sessions,
-        "ensure_session",
-        lambda _root: {
-            "id": "new-session",
-            "pid": 71002,
-            "started_at": "now",
-            "hostname": "test",
-            "process_identity": {"pid": 71002, "start_token": "new"},
-        },
-    )
-    monkeypatch.setattr(
-        sessions,
-        "_controller_process_identity",
-        lambda pid: {"pid": pid, "start_token": "new"},
-    )
+    monkeypatch.setattr(sessions, "_controller_process_identity", lambda _pid: None)
     claimed, message = sessions.claim(root, queue)
-    assert claimed, message
+    assert not claimed
+    assert "identity unavailable" in message

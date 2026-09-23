@@ -210,7 +210,25 @@ def _pgroup_liveness(pgid: int | None) -> bool:
     return True
 
 
-def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grace_s: float = 5.0) -> bool:
+def _terminate_process_group(
+    proc: subprocess.Popen[str],
+    pgid: int | None,
+    grace_s: float = 5.0,
+    *,
+    expected_identity: dict[str, Any] | None = None,
+    identity_probe: Any = None,
+) -> bool:
+    probe = identity_probe or goalflight_compat.process_start_identity
+
+    def identity_verified() -> bool:
+        current = probe(proc.pid)
+        matched, _reason = goalflight_ledger.compare_fine_process_identities(
+            proc.pid, expected_identity, current
+        )
+        return matched
+
+    if not identity_verified():
+        return False
     if goalflight_compat.is_windows():
         with contextlib.suppress(Exception):
             proc.terminate()
@@ -220,8 +238,8 @@ def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grac
         if proc.poll() is None:
             with contextlib.suppress(Exception):
                 proc.kill()
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=grace_s)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=grace_s)
         return proc.poll() is not None
     target = pgid or process_group_id(proc.pid) or proc.pid
     signalled = False
@@ -229,6 +247,8 @@ def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grac
         os.killpg(target, signal.SIGTERM)
         signalled = True
     except (ProcessLookupError, PermissionError, OSError):
+        if not identity_verified():
+            return False
         with contextlib.suppress(Exception):
             proc.terminate()
     if proc.poll() is None:
@@ -237,6 +257,8 @@ def _terminate_process_group(proc: subprocess.Popen[str], pgid: int | None, grac
     elif signalled:
         time.sleep(min(0.25, grace_s))
     if proc.poll() is None or _pgroup_liveness(target):
+        if not identity_verified():
+            return False
         try:
             os.killpg(target, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
@@ -298,6 +320,8 @@ def _monitor_process(
     prompt_state, prompt_thread = _start_prompt_writer(proc, prompt_text)
 
     pgid = None if goalflight_compat.is_windows() else (process_group_id(proc.pid) or proc.pid)
+    expected_identity = goalflight_compat.process_start_identity(proc.pid)
+    payload["worker_identity"] = expected_identity
     stdout_progress = JsonlProgress(stdout_path)
     last_stdout_bytes = _file_size(stdout_path)
     last_stderr_bytes = _file_size(stderr_path)
@@ -438,13 +462,21 @@ def _monitor_process(
             if _pgroup_liveness(pgid):
                 timed_out = True
                 timeout_reason = "process_group_alive_after_parent_exit"
-                process_group_drained = _terminate_process_group(proc, pgid)
+                process_group_drained = _terminate_process_group(
+                    proc,
+                    pgid,
+                    expected_identity=expected_identity,
+                )
             break
 
         if max_total_s > 0 and duration_s >= max_total_s:
             timed_out = True
             timeout_reason = "max_total_s"
-            process_group_drained = _terminate_process_group(proc, pgid)
+            process_group_drained = _terminate_process_group(
+                proc,
+                pgid,
+                expected_identity=expected_identity,
+            )
             break
 
         if (
@@ -455,7 +487,11 @@ def _monitor_process(
         ):
             timed_out = True
             timeout_reason = "no_progress_timeout"
-            process_group_drained = _terminate_process_group(proc, pgid)
+            process_group_drained = _terminate_process_group(
+                proc,
+                pgid,
+                expected_identity=expected_identity,
+            )
             break
 
         time.sleep(heartbeat_interval)

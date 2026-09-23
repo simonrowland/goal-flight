@@ -600,6 +600,19 @@ def cleanup_ghosts(
                     goalflight_compat.process_start_identity(controller_pid)
                 )
             current_controller = controller_identities[controller_pid]
+            if not isinstance(current_controller, dict) or not current_controller.get(
+                "start_token"
+            ):
+                # An unavailable controller probe cannot distinguish a dead
+                # owner from a reused or inaccessible PID. Preserve the whole
+                # pidfile and defer the decision to a later proven sweep.
+                skipped_stale += 1
+                log.warning(
+                    "ghost_cleanup: controller pid=%d identity unavailable; "
+                    "preserving pidfile",
+                    controller_pid,
+                )
+                continue
             owner_matches = False
             for entry in entries:
                 recorded_controller = entry.get("controller_identity")
