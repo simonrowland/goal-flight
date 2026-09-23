@@ -173,6 +173,12 @@ origin by `project_root`).
 not restore ledger orphans into a private dir). Launch one id with
 `drain --dispatch-id <id>`.
 
+**Retire a dispatch:** `goalflight_dispatch.py withdraw <id> --reason TEXT
+--controller-label <owner>` commits terminal withdrawal before archiving its queue
+carrier, so drain cannot restore it. It never kills a live worker. Supports
+`--superseded-by <id>`, `--operator`, `--project-root`, `--dry-run`, and `--json`; see
+`protocols/dispatch-danger.md`.
+
 ## Review layers
 
 Reviews are cut by SUBJECT; `protocols/review-types.md` is operative (two waves
