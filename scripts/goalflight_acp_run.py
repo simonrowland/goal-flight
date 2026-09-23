@@ -4170,7 +4170,7 @@ async def _run_acp_dispatch_impl(
                 quarantine_branch=worktree_seat.quarantine_branch,
             )
         goalflight_cursor.isolate_context_mode(
-            cfg.agent, spawn_env, cwd=worker_cwd,
+            cfg.agent, spawn_env, cwd=worker_cwd, dispatch_id=dispatch_id,
         )
         try:
             if os_sandbox_profile != OS_SANDBOX_OFF:
@@ -4994,6 +4994,10 @@ async def _run_acp_dispatch_impl(
                 )
         if worktree_seat is not None:
             worktree_seat.release()
+        if not detach_worker and (proc is None or (termination_result is not None and termination_result.confirmed)):
+            goalflight_cursor.cleanup_dispatch_data(
+                dispatch_id, launcher_finished=True, prelaunch_failure=proc is None,
+            )
     _attach_agent_stderr_tail(payload, agent_stderr_capture)
     write_status(status_path, payload)
     return payload

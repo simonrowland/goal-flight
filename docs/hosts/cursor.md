@@ -35,8 +35,12 @@ and can run `cursor-agent` as an ACP worker.
   disabled entries, and disables `context-mode` plus its plugin identifier
   `plugin-context-mode-context-mode`. Global and project MCP configs, plugin
   installations, login credentials, and other servers remain unchanged. Nothing
-  is written into the checkout; the private data remains a temporary artifact
-  for the worker lifetime, including detached runs.
+  is written into the checkout. Workspace keys follow Cursor's lexical `.git`
+  ancestor lookup, preserving symlink aliases even when Git commands fail.
+  Private data is owned by the dispatch and removed at terminal cleanup after
+  worker/process-group death. Reconciliation also sweeps terminal orphan data.
+  Live or uncertain workers (including a lost daemon PID receipt), unreadable
+  ownership, and legacy unowned directories retain their data conservatively.
   This uses the data-directory and disabled-store behavior verified in Cursor
   CLI `2026.09.18-9a7762b`: `CURSOR_CONFIG_DIR` alone does not redirect global
   MCP definitions, and removing a global definition alone leaves project and

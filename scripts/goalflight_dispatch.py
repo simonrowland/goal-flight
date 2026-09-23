@@ -9595,6 +9595,8 @@ def reconcile_abandoned_dispatches(
 
     for project_root in changed_projects:
         _export_dashboard_status_for_project(project_root)
+    if not dry_run:
+        goalflight_cursor.cleanup_dispatch_data()
     closed = [entry for entry in entries if entry.get("action") == "closed"]
     would_close = [entry for entry in entries if entry.get("action") == "would_close"]
     kept_reasons: dict[str, int] = {}
@@ -18913,6 +18915,7 @@ def main(argv: list[str] | None = None) -> int:
     worker_stdout_mode = "ab" if dispatch_warnings else "wb"
     _reap_quota_stuck_before_bash_launch()
     worker_pid = None
+    worker_spawn_attempted = False
     watcher_pid = None
     caffeinate_pid = None
     pidfile = None
@@ -19292,6 +19295,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv,
         )
         _mark_queue_claim_worker_spawn_intent(args)
+        worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
@@ -19704,6 +19708,11 @@ def main(argv: list[str] | None = None) -> int:
             and codex_session_id is None
         ):
             cleanup_codex_dispatch_home(args.dispatch_id)
+        if not detached_launched:
+            goalflight_cursor.cleanup_dispatch_data(
+                args.dispatch_id, launcher_finished=True,
+                prelaunch_failure=not worker_spawn_attempted,
+            )
 
 
 def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:

@@ -141,6 +141,8 @@ def _stub_bash_launch(
 
     def recorded_attempt_peek(*peek_args, **peek_kwargs):
         ordering.append("attempt_peek")
+        if failure_phase == "after_isolation":
+            raise RuntimeError("pre-spawn validation failure")
         return real_attempt_peek(*peek_args, **peek_kwargs)
 
     monkeypatch.setattr(D, "_attempt_claiming_worker_argv", recorded_attempt_peek)
@@ -209,7 +211,7 @@ def _stub_bash_launch(
         assert ordering.index("resolve") < ordering.index("ledger:starting")
     else:
         assert ordering.index("capacity") < ordering.index("ledger:starting")
-    if failure_phase != "pre_spawn":
+    if failure_phase not in {"pre_spawn", "after_isolation"}:
         assert ordering.index("ledger:starting") < ordering.index("spawn:worker")
         # The attempt peek may busy-wait for the launch budget. It must finish
         # before the claim is stamped with spawn intent: a launcher killed

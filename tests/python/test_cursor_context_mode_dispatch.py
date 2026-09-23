@@ -60,6 +60,8 @@ def seed(tmp_path):
 @pytest.mark.parametrize("transport", ["text", "acp"])
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_cursor_spawn_excludes_only_context_mode(monkeypatch, tmp_path, transport, opt_in):
+    # Inspect the config at the mocked boundary; lifecycle is tested separately.
+    monkeypatch.setattr(C, "cleanup_dispatch_data", lambda *a, **kw: None)
     source, originals = seed(tmp_path)
     if opt_in:
         monkeypatch.setenv("GOALFLIGHT_CURSOR_CONTEXT_MODE", "on")
@@ -105,7 +107,8 @@ def test_cursor_alias_uses_selected_data_and_actual_worktree(monkeypatch, tmp_pa
     source.rename(data / "projects" / source.name)
     nested = tmp_path / "nested"
     nested.mkdir()
-    env = {"HOME": str(tmp_path / "selected-home"), "CURSOR_DATA_DIR": str(data)}
+    env = {"HOME": str(tmp_path / "selected-home"), "CURSOR_DATA_DIR": str(data),
+           "GOALFLIGHT_DISPATCH_ID": "selected-data"}
     C.isolate_context_mode("cursor-agent", env, cwd=str(nested))
     result = Path(env["CURSOR_DATA_DIR"]) / "projects" / source.name
     assert json.loads((result / "mcp-auth.json").read_text()) == {"hindsight": "test-credential"}
@@ -119,3 +122,130 @@ def test_invalid_disabled_state_refuses_launch(tmp_path):
     with pytest.raises(ValueError, match="Invalid Cursor MCP disabled list"):
         C.isolate_context_mode("cursor", env, cwd=str(tmp_path))
     assert "CURSOR_DATA_DIR" not in env
+    assert not list(tmp_path.glob("goalflight-cursor-data-*"))
+
+
+@pytest.mark.parametrize("case", ["nested", "symlink", "git-failure"])
+def test_cursor_lexical_workspace_root(monkeypatch, tmp_path, case):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "nested").mkdir()
+    root = repo
+    if case == "symlink":
+        root = tmp_path / "alias"
+        root.symlink_to(repo, target_is_directory=True)
+    if case == "git-failure":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "invalid-key")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "x")
+        assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                              capture_output=True).returncode != 0
+    # Cursor index.js utils/git.ts A walks lexical ancestors to .git; its
+    # workspace-paths.js s replaces non-alphanumerics and collapses dashes.
+    # Expected root is independent of Git success and realpath of the alias.
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(root)).strip("-")
+    env = {"HOME": str(tmp_path / "home"), "GOALFLIGHT_DISPATCH_ID": case}
+    C.isolate_context_mode("cursor", env, cwd=str(root / "nested"))
+    disabled = Path(env["CURSOR_DATA_DIR"]) / "projects" / slug / "mcp-disabled.json"
+    assert json.loads(disabled.read_text()) == ["context-mode", "plugin-context-mode-context-mode"]
+
+
+def test_copy_failure_removes_private_credentials(monkeypatch, tmp_path):
+    seed(tmp_path)
+    original = Path.write_bytes
+
+    def fail_second_copy(path, content):
+        if path.name == "mcp-approvals.json":
+            raise OSError("copy failed")
+        return original(path, content)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_second_copy)
+    env = {**os.environ, "GOALFLIGHT_DISPATCH_ID": "copy-failed"}
+    with pytest.raises(OSError, match="copy failed"):
+        C.isolate_context_mode("cursor", env, cwd=str(tmp_path))
+    assert not list(tmp_path.glob("goalflight-cursor-data-*"))
+    assert "CURSOR_DATA_DIR" not in env
+
+
+@pytest.mark.parametrize("transport", ["text", "acp", "text-validation"])
+def test_failed_spawn_cleanup_requires_confirmed_absence(monkeypatch, tmp_path, transport):
+    seed(tmp_path)
+    if transport in {"text", "text-validation"}:
+        _stub_bash_launch(monkeypatch, tmp_path, resolved=(None, None),
+                          agent="cursor", failure_phase="spawn" if transport == "text" else "after_isolation")
+    else:
+        _run_acp_to_spawn_failure(monkeypatch, tmp_path, resolved=(None, None),
+                                 agent="cursor", account=None, spawn_base_env=dict(os.environ))
+    # Text daemon errors can lose the PID receipt after the child started.
+    # ACP's retry helper accounts for unconfirmed termination explicitly.
+    assert bool(list(tmp_path.glob("goalflight-cursor-data-*"))) is (transport == "text")
+
+
+@pytest.mark.parametrize("state,launcher_live,worker_live,group_live,probe_error,removed", [
+    ("complete", False, False, False, False, True),
+    ("failed", False, False, False, False, True),
+    ("running", False, False, False, False, False),
+    ("complete", True, False, False, False, False),
+    ("complete", False, True, False, False, False),
+    ("complete", False, False, True, False, False),
+    ("complete", False, False, False, True, False),
+])
+def test_terminal_sweep_preserves_live_and_uncertain_scopes(
+    monkeypatch, tmp_path, state, launcher_live, worker_live, group_live, probe_error, removed,
+):
+    import goalflight_ledger as L
+    env = {"HOME": str(tmp_path / "home"), "GOALFLIGHT_DISPATCH_ID": "cleanup-test"}
+    C.isolate_context_mode("cursor", env, cwd=str(tmp_path))
+    data = Path(env["CURSOR_DATA_DIR"])
+    record = L.record_path("cleanup-test")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"state": state, "worker_pid": 42001, "worker_pgid": 42002}))
+
+    def kill(pid, sig):
+        if probe_error:
+            raise PermissionError("unknown")
+        if (pid == os.getpid() and launcher_live) or (pid == 42001 and worker_live):
+            return
+        raise ProcessLookupError()
+
+    def killpg(pgid, sig):
+        assert pgid == 42002
+        if not group_live:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(C.os, "kill", kill)
+    monkeypatch.setattr(C.os, "killpg", killpg)
+    C.cleanup_dispatch_data()
+    assert data.exists() is not removed
+
+
+@pytest.mark.parametrize("entrypoint", ["watcher", "reconcile", "dry-run"])
+def test_terminal_owners_invoke_cleanup(monkeypatch, tmp_path, entrypoint):
+    from test_codex_dispatch_seams import D, L, W
+    env = {"HOME": str(tmp_path / "home"), "GOALFLIGHT_DISPATCH_ID": "terminal-owner"}
+    C.isolate_context_mode("cursor", env, cwd=str(tmp_path))
+    data = Path(env["CURSOR_DATA_DIR"])
+    record = L.record_path("terminal-owner")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"dispatch_id": "terminal-owner", "state": "complete", "worker_pid": 42001}))
+
+    def gone(*args):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(C.os, "kill", gone)
+    monkeypatch.setattr(C.os, "killpg", gone)
+    monkeypatch.setattr(L, "cmd_finish", lambda *a, **kw: 0)
+    if entrypoint == "watcher":
+        W._finish_existing_ledger("terminal-owner", "complete", "test", agent="cursor", detached=True,
+                                  worker_still_alive=False)
+    else:
+        D.reconcile_abandoned_dispatches(queue_dir=tmp_path / "queue", dry_run=entrypoint == "dry-run")
+    assert data.exists() is (entrypoint == "dry-run")
+
+
+def test_terminal_sweep_keeps_unowned_data(tmp_path):
+    legacy = tmp_path / "goalflight-cursor-data-legacy"
+    legacy.mkdir()
+    C.cleanup_dispatch_data()
+    assert legacy.exists()
