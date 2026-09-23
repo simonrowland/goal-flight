@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -1945,6 +1946,65 @@ def test_dead_event_contracts_scope_actions_to_unsupervised_paths() -> None:
     assert "running supervisor suppresses controller-facing depth" in fleet_contract
     assert "Unknown supervisor state carries numberless" in fleet_contract
     assert "no component command" in fleet_contract
+
+
+def test_supervise_migration_never_signals_caller_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid caller-owned waiter is not a safe supervisor migration target."""
+    record = wake.WaiterRecord(
+        kind=wake.WATCHDOG_KIND,
+        label_hash="label",
+        pid=43210,
+        start_hash=wake._start_hash("caller-start"),
+        instance_id="i" * 32,
+        path=tmp_path / "watchdog.lock",
+        generation_hash="generation",
+    )
+    captured: dict[str, object] = {}
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        messages.goalflight_wake,
+        "live_waiters",
+        lambda *args, **kwargs: [record],
+    )
+    monkeypatch.setattr(
+        messages.goalflight_compat,
+        "process_start_identity",
+        lambda _pid: {"start_token": "caller-start"},
+    )
+    monkeypatch.setattr(messages.os, "getppid", lambda: 12345)
+    monkeypatch.setattr(messages.os, "getpgid", lambda _pid: 77)
+    monkeypatch.setattr(
+        messages.os,
+        "kill",
+        lambda pid, signum: killed.append((pid, signum)),
+    )
+
+    def fake_cmd_supervise(args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        root = Path(args.project_root)  # type: ignore[attr-defined]
+        before = kwargs["before_renewal"]
+        on_probe = kwargs["on_startup_probe"]
+        assert callable(before) and callable(on_probe)
+        assert before(root, "label", "nonce") is None
+        assert on_probe(root, "label", "nonce") is None
+        return 0
+
+    monkeypatch.setattr(supervise, "cmd_supervise", fake_cmd_supervise)
+    result = messages.cmd_supervise(
+        SimpleNamespace(
+            project_root=str(tmp_path),
+            controller_label="label",
+            lease_nonce="nonce",
+        )
+    )
+
+    assert result == 0
+    assert captured["before_renewal"] is not None
+    assert killed == []
 
 
 def test_doctor_wake_coverage_reports_supervisor_state(

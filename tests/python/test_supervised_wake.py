@@ -1074,6 +1074,65 @@ def test_supervise_start_renews_lease_before_arm(
     assert after.renew_deadline_at == seen["deadline"]
 
 
+@pytest.mark.parametrize(
+    "journal_failure",
+    (
+        journal.JournalBusy("busy"),
+        journal.JournalDisappeared("disappeared"),
+        journal.JournalIOError("unreadable"),
+        journal.JournalIntegrityError("integrity"),
+        journal.JournalUpgradeRequired("upgrade"),
+    ),
+)
+def test_supervise_open_reader_failures_exit_with_holder_diagnostic(
+    journal_failure: journal.JournalError,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every concrete journal-open failure keeps the controlled startup exit."""
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(goalflight_task, "resolve_project_root", lambda _value: tmp_path)
+    monkeypatch.setattr(
+        sessions,
+        "resolve_controller_label",
+        lambda *_args, **_kwargs: "bugs",
+    )
+    monkeypatch.setattr(
+        supervise,
+        "resolve_startup_lease_nonce",
+        lambda **_kwargs: ("nonce-1", None, None),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "_renew_controller_lease_before_arm",
+        lambda **kwargs: str(kwargs["nonce"]),
+    )
+
+    def failed_open_reader(cls, project_root, **kwargs):  # type: ignore[no-untyped-def]
+        raise journal_failure
+
+    monkeypatch.setattr(
+        journal.Journal,
+        "open_reader",
+        classmethod(failed_open_reader),
+    )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_secs=3600.0,
+        coverage_secs=3600.0,
+        debug=False,
+        chatty=False,
+    )
+
+    assert supervise.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
+    assert "supervise: journal holder unavailable:" in capsys.readouterr().err
+
+
 def test_supervise_start_with_stale_nonce_does_not_renew(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

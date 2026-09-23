@@ -1410,6 +1410,10 @@ class Journal:
                 return False
             if _is_corruption_error(exc):
                 self._handle_corruption(exc)
+            if "no such table" in str(exc).lower():
+                self._raise_integrity_failure(
+                    f"journal schema probe found a missing required table: {exc}"
+                )
             raise JournalIOError(
                 f"journal schema probe unavailable/unreadable for {self.path}: {exc}"
             ) from exc

@@ -2911,7 +2911,13 @@ def cmd_supervise(
             retry_budget_s=0,
             open_retry_budget_s=0,
         )
-    except goalflight_journal.JournalIntegrityError as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalIntegrityError,
+        goalflight_journal.JournalUpgradeRequired,
+    ) as exc:
         print(f"supervise: journal holder unavailable: {exc}", file=sys.stderr)
         return SUPERVISE_START_EXIT
 

@@ -9503,6 +9503,24 @@ def cmd_listen_auto(args) -> int:
     return cmd_listen(args)
 
 
+def _pid_in_caller_process_group(pid: int) -> bool | None:
+    """Return whether *pid* belongs to this supervisor's caller group."""
+    try:
+        caller_pid = os.getppid()
+        if caller_pid <= 1:
+            return None
+        caller_pgid = os.getpgid(caller_pid)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    try:
+        target_pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return False
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return target_pgid == caller_pgid
+
+
 def cmd_supervise(args) -> int:
     """One tracked task that owns the persistent wake pool."""
     import goalflight_wake_supervise as supervise
@@ -9589,6 +9607,14 @@ def cmd_supervise(args) -> int:
                 if goalflight_wake._start_hash(start_token) == record.start_hash:
                     if pid == os.getpid():
                         return f"refused to signal current process {pid}; coverage retained"
+                    caller_group = _pid_in_caller_process_group(pid)
+                    if caller_group is None:
+                        identity_unknown.append(
+                            f"pid {pid} caller process group is unavailable"
+                        )
+                        continue
+                    if caller_group:
+                        continue
                     verified_records[pid] = record
                 # A different start token proves the incumbent exited and its
                 # PID was reused. It is already released; never signal the new
@@ -9634,6 +9660,12 @@ def cmd_supervise(args) -> int:
                     failures.append(f"pid {pid} owner is unavailable")
                     continue
                 if goalflight_wake._start_hash(start_token) != record.start_hash:
+                    continue
+                caller_group = _pid_in_caller_process_group(pid)
+                if caller_group is None:
+                    failures.append(f"pid {pid} caller process group is unavailable")
+                    continue
+                if caller_group:
                     continue
                 os.kill(pid, signal.SIGTERM)
                 signal_sent = True
