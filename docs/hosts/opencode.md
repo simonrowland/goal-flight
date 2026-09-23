@@ -22,6 +22,11 @@ check for drift, run
 OpenCode can run Goal Flight as an orchestrator through the installed skill wrapper
 and can run `opencode acp` as an ACP worker.
 
+The server output started by `scripts/hosts/opencode/prompt.py` is streamed
+through `scripts/goalflight_opencode_log_writer.py`. It rotates at 16 MiB and
+keeps two generations, including for `--keep-server`; symlinked log paths are
+refused.
+
 - OpenCode config lives in `~/.config/opencode/opencode.json` globally or
   `<project>/opencode.json` for one project.
 - Skills live in `~/.config/opencode/skills/<name>/SKILL.md` globally or

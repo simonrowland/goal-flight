@@ -38,6 +38,8 @@ the built-in `/usr/sbin/newsyslog`; a retention error is reported to stderr and
 does not prevent the drain pass. The existing `GOALFLIGHT_DRAIN_LOG` override
 still selects the drainer log. The other five paths are under `~/.goal-flight`.
 No root installation, extra daemon, or Python logging framework is required.
+The wrapper skips any requested log path that is itself a symlink rather than
+passing it to `newsyslog`.
 
 `scripts/templates/daemon-logs.newsyslog.conf` sets a **16 MiB allocated-disk
 threshold**, size-only rotation, and **two uncompressed archives** (`.0`, `.1`).
