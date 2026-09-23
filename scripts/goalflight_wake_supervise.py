@@ -2845,29 +2845,48 @@ def cmd_supervise(
         controller_label=label,
         lease_nonce=live_nonce,
     )
+    try:
+        # Keep one autocommit read-only handle for the supervisor lifetime.
+        # It is a WAL sidecar holder, not a transaction: every Journal read
+        # rolls back any accidental transaction before the next poll. Keeping
+        # this here covers the controller even when no listener is alive.
+        holder = goalflight_journal.Journal.open_reader(
+            project_root,
+            persistent=True,
+        )
+    except goalflight_journal.JournalError as exc:
+        print(f"supervise: journal holder unavailable: {exc}", file=sys.stderr)
+        return SUPERVISE_START_EXIT
 
     def cursor_rewinds() -> dict[str, int]:
         # Read-only and without contention waits: mail/peer handling must stay
         # responsive even when the journal cannot currently establish identity.
-        return goalflight_journal.Journal.open_reader(
-            project_root, retry_budget_s=0, open_retry_budget_s=0,
-        )._cursor_rewinds(label)
+        return holder._cursor_rewinds(label)
 
-    return run_supervisor(
-        project_root=project_root,
-        controller_label=label,
-        lease_nonce=live_nonce,
-        host=host,
-        cursor_rewinds=cursor_rewinds,
-        heartbeat_s=heartbeat_s,
-        coverage_s=coverage_s,
-        emit_depth=bool(getattr(args, "chatty", False)),
-        debug=bool(getattr(args, "debug", False)),
-        chatty=bool(getattr(args, "chatty", False)),
-        forwarding_frontier=(
-            (lambda: forwarding_frontier(project_root))
-            if forwarding_frontier is not None
-            else None
-        ),
-        on_startup_probe=on_startup_probe,
-    )
+    try:
+        return run_supervisor(
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=live_nonce,
+            host=host,
+            cursor_rewinds=cursor_rewinds,
+            heartbeat_s=heartbeat_s,
+            coverage_s=coverage_s,
+            emit_depth=bool(getattr(args, "chatty", False)),
+            debug=bool(getattr(args, "debug", False)),
+            chatty=bool(getattr(args, "chatty", False)),
+            forwarding_frontier=(
+                (lambda: forwarding_frontier(project_root))
+                if forwarding_frontier is not None
+                else None
+            ),
+            on_startup_probe=on_startup_probe,
+        )
+    finally:
+        connection = getattr(holder, "_reader_connection", None)
+        if connection is not None:
+            holder._reader_connection = None
+            holder._reader_pid = None
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()

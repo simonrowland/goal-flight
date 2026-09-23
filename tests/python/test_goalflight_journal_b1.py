@@ -162,6 +162,27 @@ def test_current_schema_open_skips_construction_lock(
     journal.Journal(project)
 
 
+def test_current_schema_fast_path_repairs_non_wal_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    with contextlib.closing(
+        sqlite3.connect(authority.path, timeout=0, isolation_level=None)
+    ) as connection:
+        assert connection.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+
+    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
+        assert str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
+
+    journal.Journal(project)
+
+    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
+        assert str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+
+
 def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -169,6 +190,15 @@ def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.Journal.create(project)
+    with contextlib.closing(sqlite3.connect(authority.path)) as connection:
+        connection.execute("CREATE TABLE synthetic_padding (payload BLOB NOT NULL)")
+        connection.execute(
+            "INSERT INTO synthetic_padding(payload) VALUES (zeroblob(?))",
+            (85 * 1024 * 1024,),
+        )
+        connection.commit()
+    _checkpoint(authority.path)
+    assert authority.path.stat().st_size >= 80 * 1024 * 1024
     reader = journal.Journal.open_reader(project, persistent=True)
     assert reader._reader_connection is not None
     assert not reader._reader_connection.in_transaction
@@ -180,19 +210,21 @@ def test_persistent_reader_holds_wal_sidecars_for_short_lived_writers(
         assert wal.exists() and shm.exists()
         wal_identity = wal.stat().st_ino
         shm_identity = shm.stat().st_ino
+        max_wal_bytes = wal.stat().st_size
 
-        for index in range(20):
+        for index in range(64):
             writer = journal.Journal(project)
             result = writer.prepare_attempt(f"holder-{index}")
             assert result.committed
             assert wal.exists() and shm.exists()
             assert wal.stat().st_ino == wal_identity
             assert shm.stat().st_ino == shm_identity
+            max_wal_bytes = max(max_wal_bytes, wal.stat().st_size)
 
         with contextlib.closing(sqlite3.connect(authority.path, timeout=0, isolation_level=None)) as connection:
             checkpoint = connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
         assert checkpoint is not None and checkpoint[0] == 0
-        assert wal.stat().st_size < 8 * 1024 * 1024
+        assert max_wal_bytes < 16 * 1024 * 1024
     finally:
         reader._reader_connection.close()
         reader._reader_connection = None

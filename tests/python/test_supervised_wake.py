@@ -933,6 +933,7 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         "run_supervisor",
         lambda **kwargs: calls.append(kwargs) or 0,
     )
+    journal.Journal.create(tmp_path)
 
     parsed = subprocess.run(
         [
@@ -1026,6 +1027,7 @@ def test_supervise_start_renews_lease_before_arm(
         assert lease is not None
         seen["deadline"] = lease.renew_deadline_at
         seen["nonce"] = str(kwargs["lease_nonce"])
+        seen["rewinds"] = str(kwargs["cursor_rewinds"]())
         return 0
 
     monkeypatch.setattr(supervise, "run_supervisor", arm)
@@ -1044,6 +1046,7 @@ def test_supervise_start_renews_lease_before_arm(
         result = supervise.cmd_supervise(args)
     assert result == 0, capsys.readouterr().err
     assert seen["nonce"] == nonce
+    assert seen["rewinds"] == "{}"
     assert seen["deadline"] > before
     after = authority.active_lease(label)
     assert after is not None

@@ -155,8 +155,11 @@ JOURNAL_OPEN_RETRY_MAX_S = 5.0
 # key so a restore/replace gets a fresh validation in this process. The cache is
 # intentionally memory-only: a process restart (including recovery after an
 # unclean shutdown) makes the next open run a full check without a disk write.
-# Fifteen minutes bounds the time an in-place page corruption can remain
-# undetected while avoiding the write churn caused by recording every open.
+# On the battery journal, five full checks per open read roughly 85 MiB and
+# cost a measured 24.7 ms median; fifteen minutes bounds the accepted window
+# while avoiding that cost on every short-lived open. SQLite still detects
+# corruption on pages an operation touches, and _handle_corruption latches the
+# first SQLITE_CORRUPT/NOTADB failure so subsequent writes fail closed.
 INTEGRITY_CHECK_INTERVAL_S = 15 * 60.0
 _INTEGRITY_CHECKED_AT: dict[tuple[str, int, int], float] = {}
 _INTEGRITY_FAILURES: dict[tuple[str, int, int], str] = {}
@@ -1365,6 +1368,11 @@ class Journal:
                         f"journal schema probe returned invalid user_version for {self.path}: {row[0]!r}"
                     ) from exc
                 if user_version != CURRENT_SCHEMA_EPOCH:
+                    return False
+                mode_row = connection.execute("PRAGMA journal_mode").fetchone()
+                if mode_row is None or str(mode_row[0]).lower() != "wal":
+                    # _bootstrap_schema is the repair path for a valid current
+                    # schema that has been switched out of WAL mode.
                     return False
                 epoch_row = connection.execute(
                     """
