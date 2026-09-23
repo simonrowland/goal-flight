@@ -24,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 WATCH = ROOT / "scripts" / "goalflight_watch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -180,6 +182,40 @@ def test_live_descendant_count_none_when_ps_nonzero() -> None:
         return _Result()
 
     assert goalflight_watch.live_descendant_count(10, ps_runner=_runner) is None
+
+
+def test_expensive_probe_reruns_only_after_interval_or_force() -> None:
+    calls: list[int] = []
+
+    def probe() -> int:
+        calls.append(len(calls))
+        return len(calls)
+
+    throttle = goalflight_watch._ThrottledProbe(interval_s=120.0)
+    assert throttle.get(1000.0, probe) == (1, True)
+    # A 2 s poll loop inside the interval reuses the sample.
+    for step in range(1, 60):
+        assert throttle.get(1000.0 + 2.0 * step, probe) == (1, False)
+    assert throttle.get(1120.0, probe) == (2, True)
+    assert throttle.get(1121.0, probe, force=True) == (3, True)
+    assert throttle.get(1122.0, probe) == (3, False)
+    throttle.reset()
+    assert throttle.get(1123.0, probe) == (4, True)
+    assert len(calls) == 4
+
+
+def test_expensive_probe_interval_is_a_quarter_of_its_window_at_most() -> None:
+    # A cached sample delays noticing new writes by at most one interval;
+    # that must stay small against the window it feeds.
+    import goalflight_wedge_watch
+
+    interval_for = goalflight_watch._probe_interval_for
+    cap = goalflight_watch.EXPENSIVE_PROBE_INTERVAL_S
+    assert interval_for(goalflight_wedge_watch.DEFAULT_PROBATION_S) == cap
+    assert interval_for(900.0) == cap
+    assert interval_for(1.0) == 0.25
+    assert interval_for(0.0) == cap
+    assert interval_for(None) == cap
 
 
 def test_mtime_sample_empty_tree_is_available(tmp_path: Path) -> None:
@@ -528,7 +564,25 @@ def test_quiet_worker_with_sleeping_child_is_not_idle_killed(tmp_path: Path) -> 
         worker.wait(timeout=5)
 
 
-def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> None:
+def _set_tree_mode(env: dict[str, str], tree_mode: str) -> None:
+    """events: the FSEvents tree view. walk: the fallback walk, fresh each poll.
+    walk-cached: the fallback walk at the production refresh interval, so an
+    idle verdict can only be reached through the fresh re-walk guard."""
+    if tree_mode != "events":
+        env[goalflight_watch.TREE_EVENTS_ENV] = "0"
+    if tree_mode == "walk-cached":
+        env["GOALFLIGHT_TEST_EXPENSIVE_PROBE_INTERVAL_S"] = str(
+            goalflight_watch.EXPENSIVE_PROBE_INTERVAL_S
+        )
+
+
+TREE_MODES = ("events", "walk", "walk-cached")
+
+
+@pytest.mark.parametrize("tree_mode", TREE_MODES)
+def test_quiet_worker_writing_worktree_is_not_idle_killed(
+    tmp_path: Path, tree_mode: str
+) -> None:
     project_root = tmp_path / "repo"
     worker_cwd = tmp_path / "worktree"
     project_root.mkdir()
@@ -566,6 +620,7 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
         # CPU is not the subject: pin it idle so the watcher has to consult
         # the real worktree mtime. The file writes themselves are genuine.
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        _set_tree_mode(env, tree_mode)
         watcher = subprocess.Popen(
             _watcher_cmd(
                 tail=tail,
@@ -595,7 +650,10 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
             "watcher exited while the worker was writing its tree: "
             f"rc={watcher.returncode} status={payload}"
         )
-        time.sleep(2.0)
+        # walk-cached must outlast the low-power-relaxed deadline (3x the 1 s
+        # window) plus the two confirming samples, or a missing re-walk guard
+        # would not have had time to kill the worker.
+        time.sleep(5.0 if tree_mode == "walk-cached" else 2.0)
         assert watcher.poll() is None, (
             "watcher idle-killed a worktree-writing worker: "
             f"rc={watcher.returncode} status={_read_status(status)}"
@@ -606,9 +664,12 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
             "wedged",
             "liveness_indeterminate",
         }, payload
-        assert payload.get("liveness_state") == "running_quiet", payload
-        tree_age = payload.get("idle_tree_age_s")
-        assert isinstance(tree_age, (int, float)) and tree_age < 1.0, payload
+        if tree_mode != "walk-cached":
+            # A cached walk may legitimately report an old tree age while the
+            # low-power relax keeps the verdict at "running".
+            assert payload.get("liveness_state") == "running_quiet", payload
+            tree_age = payload.get("idle_tree_age_s")
+            assert isinstance(tree_age, (int, float)) and tree_age < 1.0, payload
     finally:
         if watcher is not None and watcher.poll() is None:
             watcher.terminate()
@@ -621,7 +682,10 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
         worker.wait(timeout=5)
 
 
-def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> None:
+@pytest.mark.parametrize("tree_mode", TREE_MODES)
+def test_quiet_worker_without_children_still_idle_times_out(
+    tmp_path: Path, tree_mode: str
+) -> None:
     project_root = tmp_path / "repo"
     worker_cwd = tmp_path / "worktree"
     project_root.mkdir()
@@ -643,6 +707,7 @@ def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> N
         # Known-idle CPU is the precondition: unknown CPU must wait, not
         # idle_timeout. Pin it so this test is "looked and found nothing".
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        _set_tree_mode(env, tree_mode)
         proc = subprocess.run(
             _watcher_cmd(
                 tail=tail,

@@ -53,6 +53,7 @@ from goalflight_liveness import (
     system_starved,
     write_status,
 )
+import goalflight_tree_events as tree_events
 import goalflight_wedge_watch as wedge_watch
 
 # `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
@@ -158,6 +159,119 @@ STREAM_READ_CHUNK_CHARS = 64 * 1024
 # give-up is liveness_indeterminate, not idle_timeout. The streak still
 # protects against one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
+# The worktree walks stat every file in the checkout and the socket check forks
+# lsof. Run on every 2 s poll by every quiet watcher, they were the watcher
+# fleet's filesystem load (2026-09-22). The tree answer now comes from FSEvents
+# (``_LazyTreeMonitor``), fresh on every poll; the walk remains only where
+# events are unavailable. That fallback walk, and the socket check, re-run at
+# most this often and at least every quarter of the window they feed
+# (``_probe_interval_for``).
+#
+# Staleness of a cached walk is one-sided: it can miss writes made after it
+# ran, and the idle walk's early stop reports the first newer file rather
+# than the newest, so a cached sample can only make a worker look MORE idle.
+# Callers re-walk before acting on a "wedged" or indeterminate verdict; a
+# cached "live" only delays recovery. FSEvents answers get the same
+# confirmation. The socket is checked only when it decides the verdict, and
+# only an open provider socket is cached: it can yield "waiting on provider"
+# but never "wedged".
+EXPENSIVE_PROBE_INTERVAL_S = 120.0
+
+
+class _ThrottledProbe:
+    """Cache one probe's result for ``interval_s`` of monotonic time."""
+
+    def __init__(self, interval_s: float = EXPENSIVE_PROBE_INTERVAL_S) -> None:
+        self.interval_s = interval_s
+        self._at: float | None = None
+        self._value = None
+
+    def get(self, now_mono: float, probe, *, force: bool = False):
+        """Return ``(value, fresh)``; ``fresh`` is True when ``probe`` ran now."""
+        if force or self._at is None or now_mono - self._at >= self.interval_s:
+            self._value = probe()
+            self._at = now_mono
+            return self._value, True
+        return self._value, False
+
+    def reset(self) -> None:
+        self._at = None
+        self._value = None
+
+
+def _probe_interval_for(window_s: float | None) -> float:
+    """Refresh interval for a probe feeding a ``window_s`` idle window.
+
+    A cached sample can hide writes for one interval, so the interval must
+    stay small against the window: at most a quarter of it. The production
+    windows (900 s idle, 1080 s wedge probation) get the full cap.
+    """
+    override = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_EXPENSIVE_PROBE_INTERVAL_S", "", test_mode=True
+    )
+    if override is not None:
+        return float(override)
+    if window_s is None or window_s <= 0:
+        return EXPENSIVE_PROBE_INTERVAL_S
+    return min(EXPENSIVE_PROBE_INTERVAL_S, window_s / 4.0)
+
+
+# Operator kill switch for the FSEvents tree view; "0" falls back to walking.
+TREE_EVENTS_ENV = "GOALFLIGHT_WATCH_TREE_EVENTS"
+
+
+class _LazyTreeMonitor:
+    """FSEvents view of a worker's tree, started on first use.
+
+    ``snapshot()`` returns None whenever events cannot vouch for the tree
+    (off macOS, a failed start or seed, or ``GOALFLIGHT_WATCH_TREE_EVENTS=0``)
+    and callers walk instead. A failed start is not retried; the throttled walk
+    is then the steady state for this watcher.
+    """
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self._monitor: tree_events.TreeEventMonitor | None = None
+        self._disabled = root is None or os.environ.get(TREE_EVENTS_ENV, "1") == "0"
+
+    def snapshot(self) -> tree_events.TreeSnapshot | None:
+        if self._disabled:
+            return None
+        if self._monitor is None:
+            self._monitor = tree_events.TreeEventMonitor.start(
+                self.root, skip_names=_TREE_SKIP_DIR_NAMES
+            )
+            if self._monitor is None:
+                self._disabled = True
+                return None
+        return self._monitor.snapshot()
+
+
+def _newest_from_snapshot(
+    snapshot: tree_events.TreeSnapshot, *, stop_if_newer_than: float | None
+) -> TreeMtimeSample:
+    """``sample_newest_mtime_under`` semantics over an event-kept map."""
+    newest = snapshot.newest()
+    if not snapshot.stat_failed:
+        return TreeMtimeSample(newest=newest, available=True)
+    found_newer = (
+        stop_if_newer_than is not None
+        and newest is not None
+        and newest > stop_if_newer_than
+    )
+    return TreeMtimeSample(newest=newest, available=found_newer)
+
+
+def _count_from_snapshot(
+    snapshot: tree_events.TreeSnapshot, *, since_mtime: float
+) -> wedge_watch.TreeWriteSample:
+    """``count_tree_writes_since`` semantics over an event-kept map."""
+    count = snapshot.count_newer_than(since_mtime)
+    if snapshot.stat_failed and count == 0:
+        return wedge_watch.TreeWriteSample(count=None, available=False)
+    return wedge_watch.TreeWriteSample(count=count, available=True)
+
+
 REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
 WORKER_WAIT_ARM_GRACE_SECS = 1.0
 # Live salvage CANDIDATE: tail stale + tree quiet + cumulative CPU flat.
@@ -4149,6 +4263,12 @@ def main() -> int:
     wedge_streak = 0
     indeterminate_streak = 0
     post_terminal_quiet_streak = 0
+    idle_tree_probe = _ThrottledProbe(_probe_interval_for(args.max_idle_secs))
+    wedge_window_s = float(
+        getattr(args, "wedge_idle_secs", DEFAULT_WEDGE_IDLE_SECS) or 0.0
+    )
+    wedge_tree_probe = _ThrottledProbe(_probe_interval_for(wedge_window_s))
+    wedge_socket_probe = _ThrottledProbe(_probe_interval_for(wedge_window_s))
     tracked_worker_pgid = args.pgid or process_group_id(args.pid)
     pgid = tracked_worker_pgid or args.pid
     prior_status = _read_json_object(status_path) if status_existed_at_startup else None
@@ -4160,6 +4280,11 @@ def main() -> int:
         status=prior_status,
     )
     tree_root = tree_leg.get("scan_root")
+    tree_monitor = _LazyTreeMonitor(
+        tree_root
+        if tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD and isinstance(tree_root, Path)
+        else None
+    )
     restored_watch = load_wedge_watch_state(prior_status)
     prev_cputime_sample: dict[int, float] | None = restored_watch["cputime_sample"]
     prev_cputime_at_epoch: float | None = restored_watch["cputime_sampled_at"]
@@ -4831,6 +4956,22 @@ def main() -> int:
         # CPU is idle *or unknown*. A busy group already vetoes. Failed
         # descendant/mtime samples stay None/unavailable so classify_liveness
         # can wait; live children still veto even when CPU could not be read.
+        idle_tree_sample_cached = False
+
+        def _walk_idle_tree() -> TreeMtimeSample:
+            return sample_newest_mtime_under(
+                tree_root,
+                stop_if_newer_than=now - args.max_idle_secs,
+            )
+
+        def _idle_tree_leg(tree_sample: TreeMtimeSample) -> tuple[str, float | None]:
+            if not tree_sample.available:
+                return TREE_PROBE_UNAVAILABLE, None
+            if tree_sample.newest is None:
+                # Walk finished; empty tree is stale, not unknown.
+                return TREE_PROBE_MEASURED, args.max_idle_secs
+            return TREE_PROBE_MEASURED, max(0.0, now - tree_sample.newest)
+
         if idle_window_expired and (
             cpu_confirmed_idle(cpu_pct, args.cpu_epsilon) or cpu_pct is None
         ):
@@ -4842,19 +4983,22 @@ def main() -> int:
                     tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
                     and isinstance(tree_root, Path)
                 ):
-                    tree_sample = sample_newest_mtime_under(
-                        tree_root,
-                        stop_if_newer_than=now - args.max_idle_secs,
-                    )
-                    if not tree_sample.available:
-                        tree_probe = TREE_PROBE_UNAVAILABLE
+                    event_snapshot = tree_monitor.snapshot()
+                    if event_snapshot is not None:
+                        tree_sample = _newest_from_snapshot(
+                            event_snapshot,
+                            stop_if_newer_than=now - args.max_idle_secs,
+                        )
+                        # FSEvents has unsignalled gaps (see goalflight_tree_events),
+                        # so its answer gets the same fresh-walk confirmation as a
+                        # cached walk before it can stop a worker.
+                        idle_tree_sample_cached = True
                     else:
-                        tree_probe = TREE_PROBE_MEASURED
-                        if tree_sample.newest is None:
-                            # Walk finished; empty tree is stale, not unknown.
-                            idle_tree_age_s = args.max_idle_secs
-                        else:
-                            idle_tree_age_s = max(0.0, now - tree_sample.newest)
+                        tree_sample, fresh = idle_tree_probe.get(now_mono, _walk_idle_tree)
+                        idle_tree_sample_cached = not fresh
+                    tree_probe, idle_tree_age_s = _idle_tree_leg(tree_sample)
+        else:
+            idle_tree_probe.reset()
         starvation_verdict = (
             system_starved()
             if idle_window_expired
@@ -4888,6 +5032,33 @@ def main() -> int:
         )
         if trace_idle_veto:
             liveness_state = "running_via_trace"
+        if idle_tree_sample_cached and liveness_state in (
+            "wedged",
+            LIVENESS_INDETERMINATE_STATE,
+        ):
+            # Both states count toward terminating the worker, and a cached
+            # walk can miss recent writes; confirm with a fresh one first.
+            # Waiting and trace-vetoed workers never reach here.
+            tree_sample, _fresh = idle_tree_probe.get(
+                now_mono, _walk_idle_tree, force=True
+            )
+            tree_probe, idle_tree_age_s = _idle_tree_leg(tree_sample)
+            liveness_state = classify_liveness(
+                worker_is_alive,
+                cpu_pct,
+                seconds_since_event,
+                thresholds,
+                low_power_relax=low_power_relax,
+                live_descendants=live_descendants,
+                tree_age_s=idle_tree_age_s,
+                tree_probe=tree_probe,
+                indeterminate_timeout_s=indeterminate_timeout_s,
+            )
+            # indeterminate -> wedged skipped the trace veto above.
+            if liveness_state == "wedged" and _trace_vetoes_idle(
+                trace_active=bool(trace_sample.get("trace_active")),
+            ):
+                liveness_state = "running_via_trace"
         payload = {
             "schema": "goalflight.status.v1",
             "dispatch_id": args.dispatch_id,
@@ -4979,6 +5150,18 @@ def main() -> int:
         tree_writes: int | None = None
         tree_available = False
         socket_state = wedge_watch.SOCKET_UNKNOWN
+        wedge_tree_cached = False
+        wedge_tree_since: float | None = None
+
+        def _probe_wedge_tree():
+            return wedge_watch.count_tree_writes_since(
+                tree_root,
+                since_mtime=wedge_tree_since,
+            )
+
+        def _probe_wedge_socket() -> str:
+            return wedge_watch.provider_socket_state(_worker_process_tree(args.pid))
+
         watchlisted = (
             wedge_idle_s > 0
             and worker_is_alive
@@ -5016,7 +5199,16 @@ def main() -> int:
                 prev_cputime_sample = cpu_sample
                 prev_cputime_at_mono = now_mono
                 prev_cputime_at_epoch = now
-            if (
+            cpu_busy = (
+                cpu_delta_s is not None
+                and sample_interval_s is not None
+                and sample_interval_s > 0
+                and cpu_delta_s > wedge_watch.CPU_EPSILON_S
+            )
+            # Moving CPU already makes the verdict live: classify_wedge_watch
+            # checks it before the socket and before any missing probe, so the
+            # tree and socket answers could not change it. Skip them.
+            if not cpu_busy and (
                 tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
                 and isinstance(tree_root, Path)
                 and tail_age_s is not None
@@ -5024,16 +5216,39 @@ def main() -> int:
                 # Count writes since the tail went idle, not only since the
                 # last 2s poll: a tree write 90s ago must still veto (the
                 # tail lags while a worker edits).
-                tree_sample = wedge_watch.count_tree_writes_since(
-                    tree_root,
-                    since_mtime=now - tail_age_s,
-                )
+                wedge_tree_since = now - tail_age_s
+                event_snapshot = tree_monitor.snapshot()
+                if event_snapshot is not None:
+                    tree_sample = _count_from_snapshot(
+                        event_snapshot, since_mtime=wedge_tree_since
+                    )
+                    # Confirmed by a fresh walk before entering wedged.
+                    wedge_tree_cached = True
+                else:
+                    tree_sample, fresh = wedge_tree_probe.get(now_mono, _probe_wedge_tree)
+                    wedge_tree_cached = not fresh
                 tree_available = tree_sample.available
                 tree_writes = tree_sample.count
-            socket_pids = _worker_process_tree(args.pid)
-            socket_state = wedge_watch.provider_socket_state(socket_pids)
+            # The socket only decides the verdict once the tail, tree and CPU
+            # all came back idle (classify_wedge_watch returns earlier
+            # otherwise), so only then fork lsof.
+            socket_decides = (
+                not cpu_busy
+                and tail_bytes_grown <= 0
+                and tree_available
+                and tree_writes == 0
+                and cpu_delta_s is not None
+                and sample_interval_s is not None
+                and sample_interval_s > 0
+            )
+            if socket_decides:
+                socket_state, fresh = wedge_socket_probe.get(now_mono, _probe_wedge_socket)
+                if fresh and socket_state != wedge_watch.SOCKET_PROVIDER:
+                    wedge_socket_probe.reset()
         else:
             watchlisted_at_epoch = None
+            wedge_tree_probe.reset()
+            wedge_socket_probe.reset()
             prev_cputime_sample = None
             prev_cputime_at_mono = None
             prev_cputime_at_epoch = None
@@ -5048,19 +5263,35 @@ def main() -> int:
             previously_wedged = False
             last_wedge_verdict = None
         else:
-            observation = wedge_watch.observe_wedge(
-                dispatch_id=args.dispatch_id,
-                worker_alive=worker_is_alive and not trace_active and not trace_attention,
-                quiet_s=tail_age_s,
-                tail_delta_bytes=tail_bytes_grown,
-                probation_s=wedge_idle_s,
-                tree_writes=tree_writes,
-                tree_available=tree_available,
-                cpu_s=cpu_delta_s,
-                sample_interval_s=sample_interval_s,
-                socket_state=socket_state,
-                watchlisted_s=watchlisted_s,
-            )
+            def _observe():
+                return wedge_watch.observe_wedge(
+                    dispatch_id=args.dispatch_id,
+                    worker_alive=worker_is_alive and not trace_active and not trace_attention,
+                    quiet_s=tail_age_s,
+                    tail_delta_bytes=tail_bytes_grown,
+                    probation_s=wedge_idle_s,
+                    tree_writes=tree_writes,
+                    tree_available=tree_available,
+                    cpu_s=cpu_delta_s,
+                    sample_interval_s=sample_interval_s,
+                    socket_state=socket_state,
+                    watchlisted_s=watchlisted_s,
+                )
+
+            observation = _observe()
+            if (
+                observation.verdict == wedge_watch.VERDICT_WEDGED
+                and not previously_wedged
+                and wedge_tree_cached
+            ):
+                # Entering wedged on a cached walk: confirm with a fresh one.
+                # Once wedged, a cached walk only delays the recover event.
+                tree_sample, _fresh = wedge_tree_probe.get(
+                    now_mono, _probe_wedge_tree, force=True
+                )
+                tree_available = tree_sample.available
+                tree_writes = tree_sample.count
+                observation = _observe()
             wedge_applied = apply_wedge_watch_observation(
                 payload,
                 observation=observation,
