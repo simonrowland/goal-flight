@@ -599,7 +599,7 @@ def test_rendering_prints_unknown_probe_state(monkeypatch, capsys) -> None:
     assert seats.main([]) == 0
     output = capsys.readouterr().out
     assert "state=unknown" in output
-    assert "selected: (no usable seat)" in output
+    assert "selected: (no usable account)" in output
 
 
 def test_refresh_records_dead_when_401_survives_recovery(

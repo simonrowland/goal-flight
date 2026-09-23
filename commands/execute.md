@@ -197,12 +197,14 @@ code:
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --foreground
 ```
 
-Every dispatch — sequential and `--parallel N` — acquires one captive seat from
-`worktrees/<controller-label>/s-1` … `s-HWM`. Isolation is not a mode. Do not
+Every writable dispatch — sequential and `--parallel N` — acquires one pooled
+worktree from `worktrees/s-1` … `s-HWM`. Isolation is not a mode. Do not
 pass `--cwd` and do not pass `--worktree create`. `--at <ref>` prepares the
-seat at that git ref. `GOALFLIGHT_WORKTREE_SEATS` is a per-repository fuse
-(default 24), not a fan-out knob and not a per-controller cap. A full ring
-fails with occupant dispatch ids instead of creating another checkout (hard ceiling). Do not lower the fuse to shape concurrency.
+worktree at that git ref. Read-only dispatches share a commit-keyed checkout.
+`GOALFLIGHT_WORKTREES_PER_REPO` is a per-repository fuse (default 15), with
+`GOALFLIGHT_WORKTREE_SEATS` as a deprecated alias. A full pool fails with the
+busy count and oldest holder dispatch ids instead of creating another checkout.
+Do not lower the fuse to shape provider/account concurrency.
 
 Parallel worktrees start from committed `HEAD`; they do not include uncommitted
 controller-root edits. Preserve unrelated WIP. Dispatch from committed `HEAD`

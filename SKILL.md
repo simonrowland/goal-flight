@@ -375,50 +375,48 @@ Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md
 ```
 
-**★ VOCABULARY, and controllers get this wrong constantly.** A **seat** is a
-WORKTREE SLOT: one checkout directory at `worktrees/<controller-label>/s-N`
-that one worker occupies at a time. An **account** is a BILLING IDENTITY
+**★ VOCABULARY.** A **worktree** is a checkout directory that one writer
+occupies at a time. An **account** is a BILLING IDENTITY
 (`--account cf9f50`, `--account gmail`) and one account runs MANY concurrent
-sessions — roughly 20 for codex. They are different things and the counts are
-unrelated.
+sessions — roughly 20 for Codex. A **session** is a provider execution under
+an account. Worktrees and account/session capacity are different resources.
 
-Never call an account a seat. It reads as a capacity of one and misleads about
-real headroom: "three codex seats are walled" sounds like three workers lost
-when it means three billing identities, each of which could have run twenty.
-`goalflight_usage.py` gets this right — its column is **PROVIDER/ACCOUNT** —
-so when a report says "seat" and the tool says "account", the tool is right.
-The word "seat" belongs ONLY to the worktree pool below.
+Use **account** or **session** for provider capacity. `goalflight_usage.py`
+reports **PROVIDER/ACCOUNT**; do not describe that capacity as worktrees.
 
-Every dispatch acquires a **captive per-controller seat** at
-`worktrees/<controller-label>/s-N`. Isolation is not a mode. `--at <ref>`
-(alias `--worktree <ref>`) prepares that seat at a git ref; it is not an
-opt-in. Omit `--cwd`. `--cwd` is a lock: this controller's existing seat, the
-project root (`--in-place`), or resume's recorded `worker_cwd`. Anything else
-is refused and never created. Seats are **REUSED**, so the ring sustains that
-many *concurrent* workers indefinitely — it is not a budget of total
-dispatches. Exhaustion refuses and names every held seat; it never silently
-falls back to `git worktree add`.
+Every writable dispatch acquires a **repository-scoped pooled worktree** at
+`worktrees/s-N`; legacy `worktrees/<controller-label>/s-N` paths remain
+readable during migration. Isolation is not a mode. `--at <ref>` (alias
+`--worktree <ref>`) prepares that worktree at a git ref; it is not an opt-in.
+Omit `--cwd`. `--cwd` is a lock: an existing managed worktree, the project root
+(`--in-place`), or resume's recorded `worker_cwd`. Anything else is refused
+and never created. Worktrees are **REUSED**, so the repository pool sustains
+the configured number of *concurrent* writers indefinitely. Exhaustion refuses
+and names the oldest holders; it never silently falls back to `git worktree add`.
 
-**★ THE SEAT COUNT IS NOT A PARALLELISM CAP. Do not treat it as one.**
+**★ THE WORKTREE COUNT IS NOT A PARALLELISM CAP. Do not treat it as one.**
 Wide fan-out is wanted — parallelism is how this tool earns its keep. What is
 being prevented is **worktree sprawl**: disk exhaustion and codedb
 over-indexing, both of which scale with the number of checkout ROOTS, not with
-how many workers you run. Twenty workers through eight reused seats is healthy;
-twenty ad-hoc trees is the problem.
+how many workers you run. Twenty sessions through reused worktrees is healthy;
+twenty ad-hoc checkout roots is the problem.
 
-**The failure mode is well documented and recurs:** a controller reads the seat
-count as a worker cap, decides it needs more concurrency than that, and
+**The failure mode is well documented and recurs:** a controller treats the
+worktree count as a worker cap, decides it needs more concurrency, and
 hand-rolls `git worktree add` for the excess. That bypass is how one repo
 reached **210 ad-hoc worktrees of 211, 202GB, and a machine at 100% disk**. If
-you genuinely need more concurrent seats, raise `GOALFLIGHT_WORKTREE_SEATS` —
-**never** work around the pool, and never lower the seat count to "shape"
-fan-out.
+you genuinely need more concurrent worktrees, raise
+`GOALFLIGHT_WORKTREES_PER_REPO` (deprecated alias:
+`GOALFLIGHT_WORKTREE_SEATS`) — **never** work around the pool, and never lower
+the count to shape provider/account fan-out.
 
 Reclaim with `scripts/goalflight_worktree_gc.py` (report by default, `--apply`
 to remove). Its predicate is deliberately four-part — **merged, clean, unowned
 by a live dispatch, not checked out** — so do not hand-roll a cheaper one: a
 worker that has not yet reached its first commit looks exactly like an
 abandoned tree, and "clean and merged" alone will delete live work.
+Read-only dispatches use a shared checkout keyed by commit and do not consume
+an exclusive writer worktree; writable dispatches remain exclusive by default.
 
 ### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
 

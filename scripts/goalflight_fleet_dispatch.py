@@ -2,7 +2,7 @@
 """Fleet remote dispatch MVP (Track A goals 11a–11f).
 
 Explicit dispatch CLI with preview-first flow, thin defaults from steering,
-lock-order enforcement, allowlisted remote pooled-seat launch receipts, and
+lock-order enforcement, allowlisted remote pooled-worktree launch receipts, and
 auth/quarantine gates.
 """
 

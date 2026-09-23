@@ -615,20 +615,20 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
 
 
 def check_seat_state_freshness() -> dict:
-    """Is the seat-health daemon still writing, or has the fleet gone quiet?
+    """Is the account-health daemon still writing, or has the fleet gone quiet?
 
     A snapshot that stops being written does not announce itself. It simply
     keeps answering with whatever it last held, and every reader downstream
     treats that as the present. On 2026-09-06 the writing daemon had been
     refusing every 300s tick for 31.7h after the worker CLI moved past its
-    supported version pin, and the frozen snapshot -- every seat at 100%, all
+    supported version pin, and the frozen snapshot -- every account at 100%, all
     of them carrying a cooldown -- was still being read as current. Selection
-    then found no usable seat anywhere while a live probe measured two of them
+    then found no usable account anywhere while a live probe measured two of them
     with most of their headroom intact.
 
     The reader now ignores a stale snapshot, so that failure can no longer
     wedge selection. This check exists for what the reader cannot do: SAY that
-    seat health is unmanaged. Without it the fleet still runs blind, just
+    account health is unmanaged. Without it the fleet still runs blind, just
     without the wedge -- silently degraded to whatever the ledger alone can
     infer, for as long as nobody happens to look.
     """
@@ -643,6 +643,7 @@ def check_seat_state_freshness() -> dict:
             "ok": True,
             "fresh": True,
             "seats": len(seats),
+            "accounts": len(seats),
             "updated_at": payload.get("updated_at"),
         }
 
@@ -660,7 +661,7 @@ def check_seat_state_freshness() -> dict:
     }
     if not path.exists():
         detail["warning"] = (
-            "no seat-health snapshot: per-seat headroom is unmanaged and "
+            "no account-health snapshot: per-account headroom is unmanaged and "
             "selection is running on ledger inference alone"
         )
         return detail
@@ -679,14 +680,14 @@ def check_seat_state_freshness() -> dict:
 
     if age_s is None:
         detail["warning"] = (
-            "seat-health snapshot cannot say when it was taken, so it cannot "
-            "say it is current; per-seat headroom is unmanaged"
+            "account-health snapshot cannot say when it was taken, so it cannot "
+            "say it is current; per-account headroom is unmanaged"
         )
         return detail
     detail["age_s"] = round(age_s, 1)
     detail["warning"] = (
-        f"seat-health snapshot is {age_s / 3600:.1f}h stale, so the writing "
-        "daemon has stopped; per-seat headroom is unmanaged. Check its log "
+        f"account-health snapshot is {age_s / 3600:.1f}h stale, so the writing "
+        "daemon has stopped; per-account headroom is unmanaged. Check its log "
         "for a refusal (a worker-CLI version past the daemon's supported "
         "pin is the known cause)."
     )
@@ -2245,7 +2246,7 @@ def worker_linked_worktree_commit_probe(
                 "agent": agent,
                 "ok": False,
                 "state": "blocked",
-                "detail": f"worktree seat acquire failed: {exc}",
+                "detail": f"worktree acquire failed: {exc}",
             }
             return result
         worktree = worktree_lease.path
@@ -3106,9 +3107,9 @@ def _active_capacity_dispatches() -> tuple[set[tuple[str, str]], str | None]:
 
 
 def check_worktrees(project_root: Path) -> dict:
-    """Report reusable pool seats plus legacy per-dispatch worktrees.
+    """Report reusable pool worktrees plus legacy per-dispatch worktrees.
 
-    Pool ownership comes only from each seat's kernel lock. Capacity records
+    Pool ownership comes only from each worktree's kernel lock. Capacity records
     remain a compatibility signal for legacy task-named worktrees.
     """
     result = run(["git", "worktree", "list", "--porcelain"], cwd=project_root, timeout=8)
@@ -3190,12 +3191,14 @@ def check_worktrees(project_root: Path) -> dict:
         detail = {
             "path": path_text,
             "dispatch_id": leaf_name,
+            "worktree_id": leaf_name,
             "dirty": bool(status.get("stdout")),
             "head": head.get("stdout") or None,
             "branch": branch.get("stdout") or None,
         }
         if re.fullmatch(r"(?:wt|s)-[1-9][0-9]*", leaf_name):
             detail["seat"] = leaf_name
+            detail["worktree_state"] = None
             if ring_label:
                 detail["controller_ring"] = ring_label
             lock_path = goalflight_worktree_pool.worktree_seat_lock_path(
@@ -3209,9 +3212,11 @@ def check_worktrees(project_root: Path) -> dict:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except FileNotFoundError:
                 detail["seat_state"] = "free"
+                detail["worktree_state"] = "free"
                 detail["occupant_dispatch_id"] = None
             except BlockingIOError:
                 detail["seat_state"] = "held"
+                detail["worktree_state"] = "held"
                 try:
                     lock_file.seek(0)
                     occupant = json.load(lock_file)
@@ -3221,9 +3226,11 @@ def check_worktrees(project_root: Path) -> dict:
                 detail["occupant_pid"] = occupant.get("pid")
             except OSError as exc:
                 detail["seat_state"] = "unknown"
+                detail["worktree_state"] = "unknown"
                 detail["seat_error"] = f"{type(exc).__name__}: {exc}"
             else:
                 detail["seat_state"] = "free"
+                detail["worktree_state"] = "free"
                 detail["occupant_dispatch_id"] = None
             finally:
                 if lock_file is not None:
@@ -3555,6 +3562,7 @@ def doctor(
         worker_write_probe if isinstance(worker_write_probe, str)
         else "write-file" if worker_write_probe else None
     )
+    account_state_freshness = check_seat_state_freshness()
     payload = {
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
@@ -3580,7 +3588,8 @@ def doctor(
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
-        "seat_state_freshness": check_seat_state_freshness(),
+        "account_state_freshness": account_state_freshness,
+        "seat_state_freshness": account_state_freshness,
         "orphaned_listeners": check_orphaned_listeners(repo),
         "wake_coverage": check_wake_coverage(repo),
         "wake_webhook": check_wake_webhook(repo),

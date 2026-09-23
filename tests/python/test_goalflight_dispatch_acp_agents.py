@@ -135,6 +135,36 @@ def test_build_acp_cfg_agent_liveness_defaults() -> None:
         assert cfg.account == "explicit-seat"
 
 
+def test_macos_codex_acp_read_only_uses_shared_checkout() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="codex-ro")
+        args.read_only = True
+        args.worker = []
+        args.shape = "acp"
+        with patch.object(goalflight_acp_run.goalflight_compat, "is_macos", return_value=True):
+            assert goalflight_acp_run.acp_permission_read_only_supported("codex-acp")
+            cfg = dispatch_mod._build_acp_cfg(
+                args, status_json=tmp / "codex-ro.json"
+            )
+        assert cfg.worktree == "shared-read-only"
+
+
+def test_acp_help_describes_repository_worktree_pool() -> None:
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "goalflight_acp_run.py"), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "repository-scoped" in proc.stdout, proc.stdout
+    assert "worktrees/s-N" in proc.stdout, proc.stdout
+    assert "lazy seat" not in proc.stdout, proc.stdout
+    assert "wt-1..wt-N" not in proc.stdout, proc.stdout
+
+
 def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

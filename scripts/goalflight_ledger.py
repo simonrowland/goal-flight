@@ -1451,6 +1451,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     worker_cwd = getattr(args, "worker_cwd", None)
     if worker_cwd:
         record["worker_cwd"] = str(worker_cwd)
+    for key in ("worktree_id", "worktree_seat", "worktree_path", "worktree_base"):
+        value = getattr(args, key, None)
+        if value:
+            record[key] = str(value)
+    if record.get("worktree_id") and not record.get("worktree_seat"):
+        record["worktree_seat"] = record["worktree_id"]
     dispatch_argv = getattr(args, "dispatch_argv", None)
     if isinstance(dispatch_argv, list) and dispatch_argv:
         record["dispatch_argv"] = [str(part) for part in dispatch_argv]
@@ -1562,6 +1568,9 @@ def cmd_record(args: argparse.Namespace) -> int:
                 existing.get("dispatch_argv"), list
             ):
                 record["dispatch_argv"] = existing["dispatch_argv"]
+            for key in ("worktree_id", "worktree_seat", "worktree_path", "worktree_base"):
+                if key not in record and existing.get(key):
+                    record[key] = existing[key]
             existing_controller_session_id = existing.get("controller_session_id")
             existing_controller_pid = existing.get("controller_pid")
             if (
@@ -2805,6 +2814,10 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--stdout-path")
     rec.add_argument("--stderr-path")
     rec.add_argument("--status-path")
+    rec.add_argument("--worktree-id", help=argparse.SUPPRESS)
+    rec.add_argument("--worktree-seat", help=argparse.SUPPRESS)
+    rec.add_argument("--worktree-path", help=argparse.SUPPRESS)
+    rec.add_argument("--worktree-base", help=argparse.SUPPRESS)
     rec.add_argument("--os-sandbox-json")
     # RUNNING belongs to the worker's pre-exec journal claim. A bare record
     # command can truthfully prepare STARTING, but it cannot impersonate that

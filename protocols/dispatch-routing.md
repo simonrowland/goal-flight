@@ -90,9 +90,9 @@ Right-size the shape — three loop failure modes to avoid:
     --status-json <status.json>
   ```
   Standalone `goalflight_acp_run.py` launches (this form) and
-  `scripts/goalflight_dispatch.sh` do not bind a captive seat today; the
-  every-dispatch seat contract in `SKILL.md` §Dispatch Model holds for
-  `goalflight_dispatch.py` launches. Whether direct writable ACP should seat
+  `scripts/goalflight_dispatch.sh` do not bind a pooled worktree today; the
+  every-dispatch worktree contract in `SKILL.md` §Dispatch Model holds for
+  `goalflight_dispatch.py` launches. Whether direct writable ACP should bind
   by default is tracked in the store (b-318).
   The runner re-execs into `~/.goal-flight/venvs/acp-0.10/bin/python` when
   system `python3` cannot import `acp`; set `GOALFLIGHT_ACP_PYTHON` to override.
@@ -718,7 +718,7 @@ Three delivery forms, in order of preference by situation:
   FILE, not the original account — rebuild the dispatch home with the rollout
   intact and whatever account is currently healthy.
 
-  Seat continuity is worth a little, but only a little: staying on the same
+  Account continuity is worth a little, but only a little: staying on the same
   account may keep the vendor-side prompt cache warm (short-lived, on the order of
   minutes), while a lost session costs the entire accumulated context. So
   prefer the original account when it is healthy and free, and never refuse,

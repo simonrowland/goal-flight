@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read permission_mode from a grok seat home's config.toml.
+"""Read permission_mode from a grok account home's config.toml.
 
 A freshly provisioned grok home often has no ``[ui]`` table and therefore no
 ``permission_mode``. A worker launched into that home completes one turn and
@@ -50,7 +50,7 @@ def home_from_account_env(
     """HOME the dispatcher already resolved, else the host default.
 
     Callers must pass the dict ``_resolve_account_env`` returned rather than
-    re-deriving ``~/.goal-flight/accounts/<seat>/grok``.
+    re-deriving ``~/.goal-flight/accounts/<account>/grok``.
     """
     raw = (account_env or {}).get("HOME")
     if raw:
@@ -101,16 +101,16 @@ def refusal_message(inspection: GrokPermissionModeInspection) -> str:
     path = inspection.path
     if inspection.status == "unreadable":
         return (
-            f"grok seat config {path} could not be read "
+            f"grok account config {path} could not be read "
             f"({inspection.detail}); refusing to launch a grok worker that "
             "would otherwise die after one turn with no terminal marker "
             "(worker_dead_no_terminal_marker). Fix that file and retry. "
             "This dispatcher will not rewrite an operator-owned config."
         )
     if inspection.status == "missing":
-        problem = f"grok seat config {path} is missing"
+        problem = f"grok account config {path} is missing"
     else:
-        problem = f"grok seat config {path} has no permission_mode"
+        problem = f"grok account config {path} has no permission_mode"
     return (
         f"{problem}; a grok worker launched into this home dies after one "
         "turn with no terminal marker (worker_dead_no_terminal_marker). "

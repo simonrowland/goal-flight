@@ -413,7 +413,7 @@ def _wait_until_terminal(tmp: Path, dispatch_id: str) -> dict:
     return record
 
 
-def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
+def test_second_writer_refused_and_ordinary_force_rejected() -> None:
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -449,31 +449,9 @@ def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
                 ),
                 env,
             )
-            assert forced.returncode == 0, (forced.stdout, forced.stderr)
-            assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
-            assert "occ-incumbent" in forced.stderr, forced.stderr
-            assert "DISPATCH-END" in forced.stdout, forced.stdout
-            _wait_until_terminal(tmp, "occ-second")
-
-            env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
-            blocked_attempt = _run(
-                _dispatch_cmd(
-                    tmp,
-                    tree,
-                    "occ-capacity",
-                    _quick_writer("occ-capacity"),
-                    extra=["--occupied-worktree-forced", "--capacity-wait-s", "0"],
-                ),
-                env,
-            )
-            assert blocked_attempt.returncode == 2, (
-                blocked_attempt.stdout,
-                blocked_attempt.stderr,
-            )
-            assert "DISPATCH-BLOCKED" in blocked_attempt.stdout, blocked_attempt.stdout
-            blocked = _ledger_record(tmp, "occ-capacity")
-            assert blocked.get("state") == "blocked_capacity", blocked
-            assert not list((tmp / "state" / "dispatch-queue").glob("occ-capacity*.json"))
+            assert forced.returncode == 64, (forced.stdout, forced.stderr)
+            assert "deprecated and rejected for ordinary dispatch" in forced.stderr
+            assert not _ledger_record(tmp, "occ-second"), forced.stderr
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "occ-incumbent")
@@ -592,8 +570,9 @@ def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
             ),
             env,
         )
-        assert forced.returncode == 0, (forced.stdout, forced.stderr)
-        assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+        assert forced.returncode == 64, (forced.stdout, forced.stderr)
+        assert "deprecated and rejected for ordinary dispatch" in forced.stderr
+        assert not _ledger_record(tmp, "unk-writer"), forced.stderr
 
 
 def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
@@ -938,9 +917,9 @@ def test_matching_project_root_without_cwd_does_not_occupy() -> None:
             ),
             env,
         )
-        assert forced.returncode == 0, (forced.stdout, forced.stderr)
-        assert "DISPATCH-END" in forced.stdout, forced.stdout
-        assert "occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+        assert forced.returncode == 64, (forced.stdout, forced.stderr)
+        assert "deprecated and rejected for ordinary dispatch" in forced.stderr
+        assert not _ledger_record(tmp, "root-only-writer"), forced.stderr
 
 
 def test_matching_project_root_without_cwd_skips_when_identity_not_live() -> None:
@@ -1706,7 +1685,7 @@ def test_concurrent_four_writers_are_refused_on_every_trial() -> None:
 
 
 if __name__ == "__main__":
-    test_second_writer_refused_then_override_reaches_capacity_gate()
+    test_second_writer_refused_and_ordinary_force_rejected()
     test_declared_read_only_raw_worker_is_refused_into_occupied_worktree()
     test_enforced_read_only_reviewer_skips_occupancy()
     test_terminal_incumbent_vacates_the_tree()

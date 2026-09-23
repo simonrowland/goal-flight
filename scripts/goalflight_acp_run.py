@@ -303,16 +303,23 @@ import re as _re
 
 
 _ACP_PERMISSION_READ_ONLY_AGENTS = frozenset({"claude", "claude-acp"})
+_ACP_OS_SANDBOX_READ_ONLY_AGENTS = frozenset({"codex-acp"})
 
 
 def acp_permission_read_only_supported(agent: str | None) -> bool:
-    """Whether this adapter routes writes through ACP request_permission.
+    """Whether this adapter enforces an ACP read-only dispatch.
 
     Keep this allowlist explicit. Cursor/Grok bypass the permission gate for
-    writes, and Codex is deliberately excluded because its existing sandbox
-    behavior is outside the fallback introduced for Claude ACP.
+    writes. Claude uses the ACP permission boundary as a fallback; Codex ACP
+    uses its enforced read-only OS sandbox on macOS.
     """
-    return str(agent or "").strip().lower() in _ACP_PERMISSION_READ_ONLY_AGENTS
+    normalized = str(agent or "").strip().lower()
+    if normalized in _ACP_PERMISSION_READ_ONLY_AGENTS:
+        return True
+    return (
+        normalized in _ACP_OS_SANDBOX_READ_ONLY_AGENTS
+        and goalflight_compat.is_macos()
+    )
 
 
 def _read_only_permission_policy(tool_call, options, cwd):
@@ -4215,36 +4222,51 @@ async def _run_acp_dispatch_impl(
                 goalflight_dispatch._emit_dispatch_warnings(
                     [occupancy_warning], tail_path=Path(tail) if tail else None,
                 )
-            if worktree_mode == "create":
-                if worktree_seat is None:
-                    raise goalflight_worktree_pool.WorktreeSeatError(
-                        "central admission did not return a worktree seat"
+            if worktree_mode in {"create", "shared-read-only"}:
+                if worktree_mode == "create":
+                    if worktree_seat is None:
+                        raise goalflight_worktree_pool.WorktreeSeatError(
+                            "central admission did not return a worktree seat"
+                        )
+                    spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                        worktree_seat.fileno()
                     )
-                spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
-                    worktree_seat.fileno()
-                )
-                occupancy_fd = os.environ.get(
-                    goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
-                )
-                if occupancy_fd:
-                    spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
-                worker_cwd = str(worktree_seat.path)
+                    occupancy_fd = os.environ.get(
+                        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                    )
+                    if occupancy_fd:
+                        spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
+                    worker_cwd = str(worktree_seat.path)
+                    attach_worktree_to_lease(worktree_seat.path)
+                else:
+                    worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
                 prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
-                attach_worktree_to_lease(worktree_seat.path)
-                command, acp_args = agent_command(
-                    cfg.agent,
-                    model=getattr(cfg, "model", None),
-                )
-                acp_args = _codex_workspace_write_acp_args(
-                    cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
-                )
                 await update_status(
                     state="worktree_created",
                     worker_cwd=worker_cwd,
-                    worktree_path=str(worktree_seat.path),
-                    worktree_seat=worktree_seat.seat_name,
-                    worktree_branch=worktree_seat.branch,
-                    quarantine_branch=worktree_seat.quarantine_branch,
+                    worktree_path=worker_cwd,
+                    worktree_id=(
+                        worktree_seat.seat_name
+                        if worktree_seat is not None
+                        else Path(worker_cwd).name
+                    ),
+                    worktree_seat=(
+                        worktree_seat.seat_name
+                        if worktree_seat is not None
+                        else Path(worker_cwd).name
+                    ),
+                    worktree_branch=(worktree_seat.branch if worktree_seat is not None else None),
+                    quarantine_branch=(
+                        worktree_seat.quarantine_branch
+                        if worktree_seat is not None
+                        else None
+                    ),
+                    worktree_base=(
+                        getattr(cfg, "worktree_base", None)
+                        if worktree_seat is not None
+                        else getattr(cfg, "_worktree_base_commit", None)
+                    ),
+                    worktree_read_only=(worktree_seat is None),
                 )
             record_ledger_state(worker_pid=None, state="starting")
             ledger_recorded = True
@@ -5206,10 +5228,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cwd", required=True)
     parser.add_argument(
         "--worktree",
-        choices=["off", "create"],
+        choices=["off", "create", "shared-read-only"],
         default="off",
-        help="Dispatch worktree mode. 'create' leases and acquire-resets one "
-             "lazy seat from the configured wt-1..wt-N pool.",
+        help="Dispatch worktree mode. 'create' acquires and resets one "
+             "repository-scoped pooled worktree at worktrees/s-N; "
+             "'shared-read-only' uses a commit-keyed checkout.",
     )
     parser.add_argument(
         "--worktree-root",

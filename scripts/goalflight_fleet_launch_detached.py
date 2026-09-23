@@ -769,6 +769,7 @@ def _launch(args: argparse.Namespace) -> int:
         "started_at": _utc_now(),
         "worktree_base_sha": getattr(args, "base_sha", ""),
         "worktree_path": None,
+        "worktree_id": None,
         "worktree_seat": None,
         "worktree_branch": None,
         "quarantine_branch": None,

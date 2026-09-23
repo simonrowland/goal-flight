@@ -740,12 +740,12 @@ def _reattach_hint(record: dict) -> str:
 
 
 def _harvest_hint(record: dict) -> str:
-    """Name the seat when a dead dispatch left work behind.
+    """Name the worktree when a dead dispatch left work behind.
 
     A worker whose terminal marker was rejected still scores worker_dead, and
-    the operator's only recourse was to inspect every seat by hand. The
+    the operator's only recourse was to inspect every worktree by hand. The
     watcher now distinguishes "no marker" from "no work", so the row can say
-    WHICH seat is worth opening and with what command -- the capability
+    WHICH worktree is worth opening and with what command -- the capability
     belongs at the moment of the decision, not in a document.
     """
     reason = str(record.get("reason") or "")
@@ -753,17 +753,17 @@ def _harvest_hint(record: dict) -> str:
         return ""
     kind = "a commit" if reason.endswith("committed") else "uncommitted changes"
     leg = record.get("wedge_tree_leg")
-    seat = None
+    worktree = None
     if isinstance(leg, dict):
-        seat = leg.get("scan_root") or leg.get("worker_cwd")
-    if not seat:
+        worktree = leg.get("scan_root") or leg.get("worker_cwd")
+    if not worktree:
         return (
-            f"UNHARVESTED WORK ({kind}) — seat path not recorded; "
-            "find it via the dispatch's worktree before the seat is reused"
+            f"UNHARVESTED WORK ({kind}) — worktree path not recorded; "
+            "find it via the dispatch's worktree before it is reused"
         )
     return (
-        f"UNHARVESTED WORK ({kind}) in {seat}: "
-        f"git -C {seat} status --short && git -C {seat} log --oneline -3"
+        f"UNHARVESTED WORK ({kind}) in {worktree}: "
+        f"git -C {worktree} status --short && git -C {worktree} log --oneline -3"
     )
 
 
@@ -3028,8 +3028,8 @@ def render_text(payload: dict, limit: int) -> list[str]:
     for r in (live + terminal)[:limit]:
         did = (r.get("dispatch_id") or "?")[:30]
         account = r.get("effective_account")
-        seat = f" [seat {account}]" if isinstance(account, str) and account else ""
-        lines.append(f"  {did:<30} {_dispatch_cells(r)}{seat}  {r.get('status_path') or '-'}")
+        account_label = f" [account {account}]" if isinstance(account, str) and account else ""
+        lines.append(f"  {did:<30} {_dispatch_cells(r)}{account_label}  {r.get('status_path') or '-'}")
     for item in list(cooldowns.values())[:limit]:
         lines.append(
             f"  cooldown {item.get('agent')}: {item.get('reason')} until {item.get('until')}"

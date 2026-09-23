@@ -79,13 +79,13 @@ package repository; for normal target projects it is skipped as INFO.
     - `--prompt-file`
     - `--permission-mode`
     - `--os-sandbox`
-    - Each configured seat home must have `permission_mode` in that home's
+    - Each configured account home must have `permission_mode` in that home's
       `.grok/config.toml`. Doctor warns and dispatch refuses when the key is
       absent; do not add a grok CLI `--permission-mode` flag to compensate.
   - Claude compatibility path: CLI/plugin checks pass before Claude-specific
     compatibility examples are used. NOTE: presence/PATH only — a green doctor
     does NOT confirm the **remote** claude-acp credential. Headless subscription
-    seat readiness is verified per node by the fleet auth probe
+    account/session readiness is verified per node by the fleet auth probe
     (`claude auth status --json`), not by host-global doctor; pty headroom is
     covered by `pty_shim_health` (orphan reaping), not a pre-dispatch free-pty gate.
 - Check ACP worker adapters for presence/PATH only: `codex-acp`,

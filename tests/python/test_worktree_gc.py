@@ -31,6 +31,7 @@ if str(SCRIPTS) not in sys.path:
 
 import goalflight_compat  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_worktree_gc  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
 SCRIPT = SCRIPTS / "goalflight_worktree_gc.py"
@@ -360,6 +361,39 @@ def test_merged_clean_terminal_owned_worktree_is_removed_with_apply(
     assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
+def test_terminal_indeterminate_identity_retains_worktree(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal row with unknown liveness still owns its recorded cwd."""
+    wt = _add_worktree(repo, tmp_path, "terminal-unknown")
+    _commit_in(wt)
+    _merge_into_main(repo, "terminal-unknown")
+    _write_ledger(
+        "terminal-unknown-w1",
+        "complete",
+        wt,
+        terminal_state="complete",
+        worker_pid=os.getpid(),
+        worker_identity={"pid": os.getpid(), "start_token": "generation"},
+    )
+    monkeypatch.setattr(goalflight_worktree_gc, "_identity_live", lambda record: None)
+
+    current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+    entry = goalflight_worktree_gc.classify(
+        repo,
+        {"path": str(wt), "branch": "terminal-unknown", "detached": False},
+        into="main",
+        ledger_dir=goalflight_ledger.runs_dir(create=False),
+        main_path=goalflight_worktree_gc.main_worktree_path(repo),
+        current_checkout=current_checkout,
+        current_error=current_error,
+    )
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+    assert "identity" in entry["conditions"]["unowned"]["reason"]
+    assert wt.is_dir()
+
+
 def test_missing_directory_is_pruned_not_removed(tmp_path: Path, repo: Path) -> None:
     """Directory gone, admin entry left: pruned is a distinct outcome."""
     wt = _add_worktree(repo, tmp_path, "ghost")
@@ -412,10 +446,10 @@ def test_non_repository_exits_nonzero(tmp_path: Path) -> None:
     assert "cannot list worktrees" in done.stderr
 
 
-def test_pool_seat_is_never_reclaimed_as_litter(
+def test_registered_pool_worktree_is_reclaimed_only_after_full_gate(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A registered seat is retained even when merged+clean+unowned."""
+    """A registered worktree still passes through the same four-part gate."""
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "register-seat")
@@ -425,17 +459,18 @@ def test_pool_seat_is_never_reclaimed_as_litter(
 
     _done, report = _run(repo)
     entry = _entry(report, wt)
-    assert entry["decision"] == "retain", entry
-    assert "pool seat" in entry["reason"]
+    assert entry["decision"] == "remove", entry
+    assert "all four conditions hold" in entry["reason"]
     assert entry.get("pool_seat", {}).get("verdict") == "yes", entry
     assert wt.is_dir()
 
     done, report = _run(repo, "--apply")
     assert done.returncode == 0
     entry = _entry(report, wt)
-    assert entry["decision"] == "retain", entry
-    assert wt.is_dir()
-    assert os.path.realpath(wt) in _worktree_paths(repo)
+    assert entry.get("outcome") == "removed", entry
+    assert entry.get("keep_ref", "").startswith("refs/goalflight/keep/")
+    assert not wt.is_dir()
+    assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
 def test_adhoc_worktree_named_wt_n_is_reclaimable(
