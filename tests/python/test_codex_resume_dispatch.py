@@ -1051,6 +1051,161 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     assert "--account" not in launch
 
 
+def test_resume_reconnects_through_current_controller_after_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "stale-controller-parent"
+    child_id = "stale-controller-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "controller_label": "resume-controller",
+            "controller_pid": 17677,
+            "controller_session_id": "old-controller-session",
+            "dispatch_argv": [
+                "--agent",
+                "codex",
+                "--cwd",
+                str(tmp_path),
+                "--controller-label",
+                "resume-controller",
+                "--controller-beacon-pid",
+                "17677",
+                "--controller-session-id",
+                "old-controller-session",
+            ],
+        }
+    )
+    L.write_record(record)
+    authority = J.open_or_create_journal(tmp_path)
+    principal = L.process_identity(os.getpid())
+    assert principal is not None
+    claimed = authority.claim_or_renew_lease(
+        "resume-controller",
+        principal=principal,
+    )
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        tmp_path,
+        controller_label="resume-controller",
+        lease_nonce=claimed.value.nonce,
+    )
+    prompt = tmp_path / "restart-resume.md"
+    prompt.write_text("Continue after the controller restart.\n", encoding="utf-8")
+    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    _stub_detached_runtime(monkeypatch)
+
+    try:
+        assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    finally:
+        holder.close()
+
+
+def test_resume_explicit_controller_beacon_replaces_recorded_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "explicit-controller-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--cwd",
+        str(tmp_path),
+        "--controller-label",
+        "resume-controller",
+        "--controller-beacon-pid",
+        "17677",
+        "--controller-session-id",
+        "old-controller-session",
+    ]
+    L.write_record(record)
+    prompt = tmp_path / "explicit-controller.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: "explicit-child")
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert D._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--controller-beacon-pid",
+            "38272",
+        ]
+    ) == 0
+
+    launch = captured[0]
+    assert launch[launch.index("--controller-beacon-pid") + 1] == "38272"
+    assert "--controller-pid" not in launch
+    assert "--controller-session-id" not in launch
+
+
+def test_resumed_dispatch_refuses_without_live_controller(
+    tmp_path: Path,
+) -> None:
+    parent_id = "no-live-controller-parent"
+    prompt = tmp_path / "no-live-controller.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+    source = {
+        "record": {
+            "worker_cwd": str(tmp_path),
+            "controller_label": "resume-controller",
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--cwd",
+                str(tmp_path),
+                "--controller-label",
+                "resume-controller",
+                "--controller-beacon-pid",
+                "17677",
+                "--controller-session-id",
+                "old-controller-session",
+            ],
+        },
+        "engine": "grok",
+        "agent": "grok-code",
+        "shape": "bash",
+        "session_id": "grok-resume-session",
+    }
+    resume_args = SimpleNamespace(
+        dispatch_id=parent_id,
+        cwd=None,
+        unregistered_forced=False,
+        controller_label=None,
+        controller_beacon_pid=None,
+        controller_pid=None,
+        controller_session_id=None,
+        account=None,
+        os_sandbox=None,
+    )
+    launch = D._resume_launch_argv(
+        source,
+        child_dispatch_id="no-live-controller-child",
+        prompt_path=prompt,
+        resume_args=resume_args,
+    )
+    args = D._build_launch_parser().parse_args(launch)
+    D._stamp_controller_session(args, tmp_path)
+
+    with pytest.raises(D.DispatchUsageError) as error:
+        D._prepare_attempt_controller_registration(args, tmp_path)
+
+    assert "controller not connected; reconnect as:" in str(error.value)
+    assert "resume-controller" in str(error.value)
+
+
 def test_resume_by_single_registered_controller_records_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
