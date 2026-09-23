@@ -9640,12 +9640,12 @@ def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
         }
 
 
-def _withdraw_preflight(args):
+def _withdraw_preflight(args, queue_dir: Path | None = None):
     """Read authority and identity evidence without creating any state."""
     record = goalflight_ledger.read_record(args.dispatch_id)
     if goalflight_ledger.record_is_unreadable(record):
         raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
-    index = _build_queue_carrier_index(_queue_entry_path(args.dispatch_id).parent)
+    index = _build_queue_carrier_index(queue_dir or _queue_entry_path(args.dispatch_id).parent)
     statuses = index.carriers_by_id.get(args.dispatch_id, [])
     for active in ([index.listing_error] if index.listing_error is not None else statuses):
         if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
@@ -9668,6 +9668,15 @@ def _withdraw_preflight(args):
         raise ValueError("no attempt for this dispatch in the selected journal; check --project-root")
     attempt = dict(rows[0])
     owner = (record or entry).get("controller_label") or attempt.get("owner_controller_label")
+    if not args.operator and not args.controller_label:
+        matches = [
+            session for session in goalflight_session_status._registered_controller_records(root)
+            if session.get("lease_state") == goalflight_journal.LEASE_ACTIVE
+            and _controller_session_is_in_ancestry(session)
+        ]
+        if len(matches) != 1:
+            raise ValueError("caller controller is absent or ambiguous; pass --controller-label")
+        args.controller_label = matches[0]["label"]
     if not args.operator and (not args.controller_label or args.controller_label != owner):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
@@ -9697,9 +9706,98 @@ def _withdraw_preflight(args):
                 )
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
     withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
-    if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
-        raise ValueError("dispatch already has a different terminal outcome; preserve it instead of withdrawing")
     return root, authority, attempt, record, carriers, outcome, withdrawn
+
+
+def _archive_withdraw_carriers(carriers) -> list[str]:
+    archived_carriers = []
+    for carrier in carriers:
+        archive_dir = carrier.parent.parent / "dispatch-queue-withdrawn"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archived = archive_dir / f"{carrier.stem}.{stamp}.json"
+        carrier.replace(archived)
+        archived_carriers.append(str(archived))
+    return archived_carriers
+
+
+def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -> dict:
+    """Mirror final authority without writing the journal or touching a seat."""
+    with contextlib.ExitStack() as locks:
+        if not args.dry_run and not locks_held:
+            locks.enter_context(_queue_mutation_lock(queue_dir))
+            locks.enter_context(goalflight_ledger.StateLock())
+        root, authority, attempt, record, carriers, outcome, _ = _withdraw_preflight(args, queue_dir)
+        if attempt["lifecycle_state"] not in goalflight_journal.ATTEMPT_FINAL_STATES:
+            raise ValueError("attempt is no longer final; settlement refused")
+        journal_state = attempt["terminal_state"]
+        state = "withdrawn" if journal_state == "abandoned" else journal_state
+        if goalflight_ledger.terminal_state_for(state) == "unknown":
+            raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
+        events = authority.read_all(
+            "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
+            (attempt["attempt_id"], attempt["terminal_transition_id"]),
+        )
+        if not events:
+            raise ValueError("terminal attempt has no matching outbox event")
+        terminal = goalflight_journal.TerminalCommit(
+            attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+            transition_id=attempt["terminal_transition_id"],
+            event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
+            terminal_state=journal_state, observation={**outcome, "state": journal_state},
+            terminal_at=attempt["terminal_at"], idempotent=True,
+        )
+        projected = goalflight_ledger.terminal_record_projection(
+            record or {"dispatch_id": args.dispatch_id,
+                       "controller_label": attempt.get("owner_controller_label")},
+            terminal, outcome.get("reason") or journal_state,
+        )
+        projected["project_root"] = str(root)
+        payload = {"dispatch_id": args.dispatch_id, "status": "settled",
+                   "attempt_id": attempt["attempt_id"], "terminal_state": state,
+                   "journal_terminal_state": journal_state}
+        if args.dry_run:
+            payload.update(status="dry-run", action="settled", plan=[
+                {"record": str(authority.path), "table": "dispatch_attempts",
+                 "attempt_id": attempt["attempt_id"], "fields": {}, "terminal_outbox": {}},
+                {"record": str(goalflight_ledger.record_path(args.dispatch_id, create=False)),
+                 "fields": {k: v for k, v in projected.items() if (record or {}).get(k) != v},
+                 "remove_fields": [k for k in ("sidecar_hold", "sidecar_hold_reason") if k in (record or {})]},
+                *({"record": str(p), "move_to": str(p.parent.parent / "dispatch-queue-withdrawn" / f"{p.stem}.<utc-stamp>.json")}
+                  for p in carriers),
+            ])
+        else:
+            if projected != record:
+                goalflight_ledger.write_record(projected)
+            archived = _archive_withdraw_carriers(carriers)
+            payload.update(archived_carriers=archived,
+                           archived_carrier=archived[0] if archived else None)
+        return payload
+
+
+def _settle_final_for_drain(entry: dict, queue_dir: Path) -> dict | None:
+    """Unreadable authority retains the existing drain behavior; known finals cannot launch."""
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    try:
+        root = goalflight_task.resolve_project_root_for_read(entry.get("project_root"))
+        if root is None or not dispatch_id:
+            return None
+        # This guard is a peek, not a second busy-journal retry budget. The
+        # existing claim path owns retries and per-project skip accounting.
+        attempt = goalflight_journal.Journal.open_reader(
+            root, retry_budget_s=0.0, open_retry_budget_s=0.0,
+        ).attempt_for_dispatch(dispatch_id)
+    except (ValueError, OSError, goalflight_journal.JournalError):
+        return None
+    if attempt is None or attempt.lifecycle_state not in goalflight_journal.ATTEMPT_FINAL_STATES:
+        return None
+    try:
+        return _settle_final_dispatch(argparse.Namespace(
+            dispatch_id=dispatch_id, project_root=str(root), operator=True,
+            controller_label=None, dry_run=False,
+        ), queue_dir)
+    except (ValueError, OSError, goalflight_journal.JournalError) as exc:
+        return {"dispatch_id": dispatch_id, "status": "refused", "reason": str(exc)}
 
 
 def _cmd_withdraw(argv: list[str]) -> int:
@@ -9722,6 +9820,12 @@ def _cmd_withdraw(argv: list[str]) -> int:
         if args.superseded_by is not None and (not args.superseded_by.strip() or args.superseded_by == args.dispatch_id):
             raise ValueError("--superseded-by must name a different dispatch")
         root, authority, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(args)
+        if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
+            payload = _settle_final_dispatch(args, _queue_entry_path(args.dispatch_id).parent)
+            print(json.dumps(payload, sort_keys=True) if args.json else
+                  f"{args.dispatch_id}: {payload['status']} ({payload['terminal_state']})" +
+                  ("\n" + json.dumps(payload["plan"], indent=2) if "plan" in payload else ""))
+            return 0
         actor = outcome.get("withdrawn_by") if withdrawn else ("operator" if args.operator else args.controller_label)
         terminal_state = attempt["terminal_state"] if withdrawn else ("superseded" if args.superseded_by else "withdrawn")
         observation = outcome if withdrawn else {"reason": args.reason, "withdrawn_by": actor}
@@ -9764,6 +9868,13 @@ def _cmd_withdraw(argv: list[str]) -> int:
             # Block queue claims while rechecking evidence and publishing in authority order.
             with _queue_mutation_lock(_queue_entry_path(args.dispatch_id).parent), goalflight_ledger.StateLock():
                 root, _, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(args)
+                if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
+                    payload = _settle_final_dispatch(
+                        args, _queue_entry_path(args.dispatch_id).parent, locks_held=True,
+                    )
+                    print(json.dumps(payload, sort_keys=True) if args.json else
+                          f"{args.dispatch_id}: settled ({payload['terminal_state']})")
+                    return 0
                 if withdrawn and record and record.get("terminal_state") == attempt["terminal_state"] and not carriers:
                     payload.update(status="already withdrawn", withdrawn_by=outcome["withdrawn_by"])
                     print(json.dumps(payload, sort_keys=True) if args.json else
@@ -9785,14 +9896,7 @@ def _cmd_withdraw(argv: list[str]) -> int:
                 )
                 current["project_root"] = str(root)
                 goalflight_ledger.write_record(current)
-                archived_carriers = []
-                for carrier in carriers:
-                    archive_dir = carrier.parent.parent / "dispatch-queue-withdrawn"
-                    archive_dir.mkdir(parents=True, exist_ok=True)
-                    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                    archived = archive_dir / f"{carrier.stem}.{stamp}.json"
-                    carrier.replace(archived)
-                    archived_carriers.append(str(archived))
+                archived_carriers = _archive_withdraw_carriers(carriers)
                 payload.update(status="withdrawn", withdrawn_by=terminal.observation["withdrawn_by"],
                                attempt_id=terminal.attempt_id,
                                archived_carrier=archived_carriers[0] if archived_carriers else None,
@@ -11120,14 +11224,14 @@ def _entry_pre_worker(entry: dict) -> bool:
 def _ledger_is_restorable_prelaunch(record: dict | None) -> bool:
     """Whether a ledger row still names work that must return to QUEUED.
 
-    `blocked_capacity` is a terminal *label* but a transient refusal: b-216
-    made that state restorable so fire-and-forget does not discard the entry.
+    A capacity refusal remains retryable until a journal terminal event has
+    been projected; b-216 keeps nonfinal refusals from discarding the entry.
     """
     if not isinstance(record, dict):
         return False
     state = str(record.get("state") or "")
     if state == "blocked_capacity":
-        return True
+        return not record.get("terminal_event_uuid")
     if _dispatch_record_is_terminal(record):
         return False
     return state in PRE_WORKER_LEDGER_STATES
@@ -12915,6 +13019,7 @@ def _recover_claimed_queue_entries(
             "pending_launch": pending_launch,
             "quarantined": quarantined,
             "ledger_terminalized": ledger_terminalized,
+            "settled_details": ledger_stats.get("settled_details", []),
             "pending_reasons": pending_reasons,
             "queue_mutations": queue_mutations,
             "timing": timing,
@@ -13151,6 +13256,7 @@ def _reconcile_ledger_prelaunch_orphans(
     quarantined = 0
     preserved = 0
     restored = 0
+    settled_details: list[dict] = []
     pending_reasons: list[dict] = []
     queue_mutations = _empty_queue_mutations()
     try:
@@ -13205,6 +13311,17 @@ def _reconcile_ledger_prelaunch_orphans(
             )
 
         entry = _ledger_request_entry(record)
+        if _ledger_is_restorable_prelaunch(record) and not _claim_has_active_carrier(
+            queue_dir, dispatch_id, index=carrier_index
+        ):
+            settlement = _settle_final_for_drain(entry, queue_dir)
+            if settlement is not None:
+                if settlement["status"] == "settled":
+                    settled_details.append(settlement)
+                else:
+                    pending += 1
+                    pending_reasons.append(settlement)
+                continue
         if (
             record.get("transport") != "fleet-ssh"
             and not _claim_has_active_carrier(
@@ -13399,6 +13516,7 @@ def _reconcile_ledger_prelaunch_orphans(
         "quarantined": quarantined,
         "preserved": preserved,
         "restored": restored,
+        "settled_details": settled_details,
         "pending_reasons": pending_reasons,
         "queue_mutations": queue_mutations,
     }
@@ -16100,7 +16218,8 @@ def _drain_queue_once(args) -> dict:
     left_queued = 0
     failed = 0
     pending_claims = 0
-    details: list[dict] = []
+    details: list[dict] = list(recovery.get("settled_details") or [])
+    settled = len(details)
     for pending in recovery.get("pending_reasons") or []:
         if not isinstance(pending, dict):
             continue
@@ -16445,6 +16564,14 @@ def _drain_queue_once(args) -> dict:
                     "reason": "unreadable_queue_entry",
                 }
             )
+            continue
+        settlement = _settle_final_for_drain(_scan_entry or {}, queue_dir)
+        if settlement is not None:
+            details.append(settlement)
+            if settlement["status"] == "settled":
+                settled += 1
+            else:
+                drain_acc["left_queued"] += 1
             continue
         if project_key and project_key in drain_acc["skipped_projects_busy"]:
             _note_drain_journal_skip(
@@ -16893,6 +17020,7 @@ def _drain_queue_once(args) -> dict:
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": drain_acc["launched"],
+        "settled": settled,
         "left_queued": drain_acc["left_queued"],
         "failed": drain_acc["failed"],
         "remaining": remaining,

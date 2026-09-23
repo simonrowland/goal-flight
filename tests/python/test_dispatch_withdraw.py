@@ -175,8 +175,11 @@ def test_claimed_launch_ownership_rechecked_under_lock(prepared, claimed, monkey
 
 @pytest.mark.parametrize("kind", ["unknown", "worker", "worker-unknown", "intent", "undated-intent"])
 @pytest.mark.parametrize("under_lock", [False, True])
-def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, kind, under_lock):
-    _, authority, _, carrier = prepared
+@pytest.mark.parametrize("final", [False, True])
+def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, kind, under_lock, final):
+    _, authority, attempt, carrier = prepared
+    if final:
+        assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
     entry = json.loads(claimed.read_text())
     carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(entry, increment_recovery_count=False)))
     original_lock = dispatch._queue_mutation_lock
@@ -538,3 +541,203 @@ def test_withdraw_releases_seat_and_task(prepared, replacement):
     ledger.reconcile_terminal_outbox(project)
     assert ledger.read_record("withdraw-test")["terminal_state"] == terminal
     assert withdraw(*args)[1]["status"] == "already withdrawn"
+
+
+@pytest.mark.parametrize("terminal_state", ["blocked", "abandoned"])
+def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_state):
+    _, authority, attempt, carrier = prepared
+    # Include both plain and claimed carriers; all must be archived.
+    carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(
+        json.loads(claimed.read_text()), increment_recovery_count=False,
+    )))
+    assert authority.commit_terminal(
+        attempt.attempt_id, terminal_state=terminal_state,
+        observation={"reason": "original outcome", "state": "queued"},
+    ).committed
+    row = attempt_row(authority)
+    outbox = authority.read_all("SELECT * FROM terminal_outbox")
+    before = snapshot(tmp_path)
+    code, preview = withdraw("--dry-run")
+    assert code == 0 and preview["action"] == "settled", preview
+    assert preview["plan"][0]["fields"] == preview["plan"][0]["terminal_outbox"] == {}
+    assert snapshot(tmp_path) == before
+    code, result = withdraw()
+    assert code == 0 and result["status"] == "settled", result
+    expected = "withdrawn" if terminal_state == "abandoned" else terminal_state
+    record = ledger.read_record("withdraw-test")
+    assert record["state"] == record["terminal_state"] == expected
+    assert ledger.terminal_state_for(record["state"]) != "unknown"
+    if terminal_state == "abandoned":
+        assert record["journal_terminal_state"] == "abandoned"
+    assert attempt_row(authority) == row
+    assert authority.read_all("SELECT * FROM terminal_outbox") == outbox
+    assert not carrier.exists() and not claimed.exists()
+    assert len(result["archived_carriers"]) == 2
+    settled = snapshot(tmp_path)
+    assert withdraw()[1]["status"] == "settled"
+    assert snapshot(tmp_path) == settled
+
+
+def test_settle_refuses_live_worker_in_parallel_carrier(prepared, claimed):
+    _, authority, attempt, carrier = prepared
+    assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
+    entry = json.loads(claimed.read_text())
+    carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(entry, increment_recovery_count=False)))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        entry.update(queue_worker_pid=child.pid, queue_worker_identity=ledger.process_identity(child.pid))
+        claimed.write_text(json.dumps(entry))
+        row = attempt_row(authority)
+        original = ledger.record_path("withdraw-test").read_bytes()
+        code, result = withdraw()
+        assert code == 1 and "never kills" in result["reason"], result
+        assert carrier.exists() and claimed.exists()
+        assert ledger.record_path("withdraw-test").read_bytes() == original
+        assert attempt_row(authority) == row
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+
+def test_final_outcome_arriving_before_withdraw_lock_is_settled(prepared, monkeypatch):
+    _, authority, attempt, carrier = prepared
+    original_lock = dispatch._queue_mutation_lock
+    row = None
+
+    @contextlib.contextmanager
+    def queue_lock(path):
+        nonlocal row
+        assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
+        row = attempt_row(authority)
+        with original_lock(path):
+            yield
+
+    monkeypatch.setattr(dispatch, "_queue_mutation_lock", queue_lock)
+    code, result = withdraw()
+    assert code == 0 and result["status"] == "settled", result
+    assert attempt_row(authority) == row
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "blocked"
+    assert not carrier.exists()
+
+
+@pytest.fixture
+def drain_prepared(prepared, monkeypatch):
+    project, _, _, carrier = prepared
+    record = ledger.read_record("withdraw-test")
+    record.update(dispatch_argv=["--agent", "codex", "--dispatch-id", "withdraw-test"],
+                  agent="codex")
+    ledger.write_record(record)
+    carrier.write_text(json.dumps(record))
+    monkeypatch.setattr(dispatch, "_release_stale_capacity_for_drain", lambda: None)
+    monkeypatch.setattr(dispatch, "_run_drain_prelaunch_hook", lambda _: None)
+    monkeypatch.setattr(dispatch, "_drain_capacity_slots", lambda: {"global_remaining": 1})
+    def forbidden(*args, **kwargs):
+        pytest.fail("drain must not bind or launch a final dispatch")
+    monkeypatch.setattr(dispatch, "_drain_launch_argv", forbidden)
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", forbidden)
+    monkeypatch.setattr(dispatch, "_prepare_attempt_worktree_occupancy", forbidden)
+    return SimpleNamespace(queue_dir=None, claim_stale_s=0, capacity_wait_s=0, limit=0)
+
+
+@pytest.mark.parametrize("terminal_state", ["blocked", "blocked_capacity"])
+@pytest.mark.parametrize("carrier_present", [False, True])
+def test_drain_settles_before_restore_or_launch(prepared, drain_prepared, monkeypatch, carrier_present, terminal_state):
+    _, authority, attempt, carrier = prepared
+    assert authority.commit_terminal(attempt.attempt_id, terminal_state=terminal_state).committed
+    row = attempt_row(authority)
+    if not carrier_present:
+        carrier.unlink()
+    def no_restore(*args, **kwargs):
+        pytest.fail("final journal attempt must never restore a carrier")
+    monkeypatch.setattr(dispatch, "_republish_prelaunch_queue_carrier", no_restore)
+    result = dispatch._drain_queue_once(drain_prepared)
+    assert result["settled"] == 1, result
+    assert result["launched"] == result["created"] == result["remaining"] == 0
+    assert any(d.get("status") == "settled" for d in result["details"])
+    assert ledger.read_record("withdraw-test")["terminal_state"] == terminal_state
+    assert attempt_row(authority) == row
+    assert not carrier.exists()
+    again = dispatch._drain_queue_once(drain_prepared)
+    assert again["settled"] == again["launched"] == again["created"] == 0
+
+
+def test_abandoned_settlement_survives_sidecar_replay(prepared, tmp_path):
+    project, authority, attempt, _ = prepared
+    sidecar = tmp_path / "terminal-status.json"
+    sidecar.write_text(json.dumps({"dispatch_id": "withdraw-test", "state": "blocked"}))
+    record = ledger.read_record("withdraw-test")
+    record.update(status_path=str(sidecar), task_ids=["t-withdraw"])
+    ledger.write_record(record)
+    assert authority.commit_terminal(attempt.attempt_id, terminal_state="abandoned").committed
+    row = attempt_row(authority)
+    outbox = authority.read_all("SELECT * FROM terminal_outbox")
+    assert withdraw()[1]["status"] == "settled"
+    assert authority.read_all("SELECT * FROM terminal_outbox") == outbox
+    for _ in range(2):
+        result = ledger.reconcile_terminal_outbox(project)
+        assert result["already_terminal"] == 1, result
+        record = ledger.read_record("withdraw-test")
+        assert record["state"] == record["terminal_state"] == "withdrawn"
+        assert record["journal_terminal_state"] == "abandoned"
+        assert ledger.terminal_state_for(record["state"]) == "withdrawn"
+        assert dispatch._ledger_task_ids_advanced(
+            ["t-withdraw"], self_dispatch_id="replacement", self_project_root=str(project),
+        ) == (0, 0, "conclusive")
+        assert attempt_row(authority) == row
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+@pytest.mark.parametrize("state", ["queued", "blocked_capacity"])
+def test_drain_nonfinal_or_unreadable_still_reaches_launch(prepared, drain_prepared, monkeypatch, tmp_path, unreadable, state):
+    _, authority, _, carrier = prepared
+    record = ledger.read_record("withdraw-test")
+    record["state"] = state
+    ledger.write_record(record)
+    carrier.write_text(json.dumps(record))
+    if unreadable:
+        def broken(*args, **kwargs):
+            raise OSError("unreadable journal")
+        monkeypatch.setattr(journal.Journal, "open_reader", broken)
+    before = snapshot(tmp_path)
+    assert dispatch._settle_final_for_drain(json.loads(carrier.read_text()), carrier.parent) is None
+    assert snapshot(tmp_path) == before
+    class ReachedLaunch(Exception):
+        pass
+    def reached(*args, **kwargs):
+        raise ReachedLaunch()
+    # Instrument the existing claim boundary when its reader is unavailable;
+    # an error escaping the new guard must never satisfy this assertion.
+    monkeypatch.setattr(dispatch, "_queue_launch_token" if unreadable else "_drain_launch_argv", reached)
+    with pytest.raises(ReachedLaunch):
+        dispatch._drain_queue_once(drain_prepared)
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
+
+
+def test_withdraw_defaults_to_environment(prepared, monkeypatch):
+    def no_ancestry():
+        pytest.fail("explicit environment label must precede ancestry")
+    monkeypatch.setattr(dispatch.goalflight_session_status, "_controller_process_ancestry", no_ancestry)
+    code, result = withdraw()
+    assert code == 0 and result["withdrawn_by"] == "owner", result
+
+
+@pytest.mark.parametrize("matching_labels", [[], ["owner"], ["owner", "other"]])
+def test_withdraw_defaults_to_unique_active_ancestor(prepared, monkeypatch, tmp_path, matching_labels):
+    _, authority, _, _ = prepared
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL")
+    ancestor = {"pid": 123456, "start_token": "ancestor-start"}
+    monkeypatch.setattr(dispatch.goalflight_session_status, "_controller_process_ancestry", lambda: (ancestor,))
+    for label in matching_labels:
+        assert authority.claim_or_renew_lease(label, principal=ancestor).committed
+    # An ACTIVE non-ancestor must not introduce ambiguity (including PID reuse).
+    assert authority.claim_or_renew_lease(
+        "unrelated", principal={**ancestor, "start_token": "different-start"},
+    ).committed
+    before = snapshot(tmp_path)
+    code, result = withdraw()
+    if len(matching_labels) == 1:
+        assert code == 0 and result["withdrawn_by"] == "owner", result
+    else:
+        assert code == 1 and "--controller-label" in result["reason"], result
+        assert snapshot(tmp_path) == before

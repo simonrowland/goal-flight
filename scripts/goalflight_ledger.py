@@ -1835,11 +1835,16 @@ def terminal_record_projection(
     current = dict(record)
     current.pop("sidecar_hold", None)
     current.pop("sidecar_hold_reason", None)
+    terminal_state = terminal.terminal_state
+    state = str(terminal.observation.get("state") or terminal_state)
+    if terminal_state == "abandoned":
+        current["journal_terminal_state"] = terminal_state
+        state = terminal_state = "withdrawn"
     current.update(
-        state=str(terminal.observation.get("state") or terminal.terminal_state),
-        terminal_state=terminal.terminal_state,
+        state=state,
+        terminal_state=terminal_state,
         worker_still_alive=False,
-        liveness_state=goalflight_terminal.terminal_liveness_state(terminal.terminal_state),
+        liveness_state=goalflight_terminal.terminal_liveness_state(terminal_state),
         attempt_id=terminal.attempt_id,
         transition_id=terminal.transition_id,
         terminal_event_uuid=terminal.event_uuid,
