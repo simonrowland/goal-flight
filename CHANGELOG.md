@@ -23,6 +23,14 @@ incremented when meaningful skill behaviour changes.
   after the dashboard mirror is disabled; canonical task data remains intact. Old watchers that permit mirror repair can regenerate the full mirror
   until they finish or restart.
 
+- Listener polling no longer busy-loops or writes to the journal on every poll.
+- Each listener keeps one long-lived journal connection and uses cached integrity validation during polling.
+- Task-store saves clone snapshots and skips unchanged rewrites; dashboard mirror export is disabled by default.
+- Capacity reservations release at terminal transitions; owners can release their own reservations, and local reservations tolerate host-name changes.
+- Server logs rotate with bounded per-port files.
+- Admission checks capacity before worktree ownership; queued rows never own worktrees.
+- Watcher polling uses read-only checks and native liveness; it no longer rewrites state or spawns processes per poll.
+
 ### Fixed
 
 - Wake-pool contention loop: unreadable follow/journal state is no longer
@@ -33,18 +41,10 @@ incremented when meaningful skill behaviour changes.
   mint extra backups from a `listener-dead` passthrough). Before acting
   on `listener-dead`, positive control is `relay --new`.
 
-### Changed
-- Listener polling no longer busy-loops or writes to the journal on every poll.
-- Each listener keeps one long-lived journal connection and uses cached integrity validation during polling.
-- Task-store saves clone snapshots and skips unchanged rewrites; dashboard mirror export is disabled by default.
-- Capacity reservations release at terminal transitions; owners can release their own reservations, and local reservations tolerate host-name changes.
-- Server logs rotate with bounded per-port files.
-- Admission checks capacity before worktree ownership; queued rows never own worktrees.
-- Watcher polling uses read-only checks and native liveness; it no longer rewrites state or spawns processes per poll.
-
-### Fixed
 - Occupancy refusals exit with status 64.
 - The capacity lock is re-entrant per thread, preventing self-deadlock in nested lock use.
+- `goalflight_doctor.py --json` no longer fails when the dashboard mirror is disabled (the default).
+- Read-only capacity status no longer rewrites the capacity lock file.
 
 ### Deferred
 
