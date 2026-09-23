@@ -931,6 +931,7 @@ def main() -> None:
         test_sanitized_env_allows_oauth_token_exact_not_prefix,
         test_pid_identity_lstart_only_is_unknown,
         test_identity_after_spawn_is_one_ledger_probe,
+        test_identity_after_spawn_retries_one_transient_miss,
         test_ensure_local_bin_prepends_when_absent,
         test_ensure_local_bin_idempotent_when_present,
         test_ensure_local_bin_no_home_noop,
