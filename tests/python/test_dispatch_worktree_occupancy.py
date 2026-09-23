@@ -677,20 +677,41 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
             assert "acp-incumbent" in refused.stdout, refused.stdout
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
             assert not _ledger_record(tmp, "acp-second"), refused.stderr
-            forced = _run(
-                _prompt_writer_cmd(
-                    tmp,
-                    tree,
-                    "acp-forced",
-                    agent="codex-acp",
-                    extra=[
-                        "--shape", "acp", "--account", "occupancy-test",
-                        "--occupied-worktree-forced", "--foreground",
-                    ],
-                ),
-                env,
-            )
-            assert forced.returncode == 0, (forced.stdout, forced.stderr)
+            import pytest
+            from unittest.mock import patch
+            from test_dispatch_registration_gate import _register_controller
+
+            try:
+                ps_probe = _run(["ps", "-p", str(os.getpid()), "-o", "pid="], env)
+            except PermissionError:
+                pytest.skip("ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+            if ps_probe.returncode and any(
+                reason in ps_probe.stderr.lower()
+                for reason in ("operation not permitted", "permission denied")
+            ):
+                pytest.skip("ACP refusal verified; forced ACP launch requires sandbox-denied ps")
+            assert ps_probe.returncode == 0, ps_probe.stderr
+            env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "goal"
+            with patch.dict(os.environ, env, clear=True):
+                _authority, holder, _nonce = _register_controller(tree, env)
+                with contextlib.closing(holder):
+                    forced = _run(
+                        _prompt_writer_cmd(
+                            tmp,
+                            tree,
+                            "acp-forced",
+                            agent="codex-acp",
+                            extra=[
+                                "--shape", "acp", "--account", "occupancy-test",
+                                "--occupied-worktree-forced", "--foreground",
+                            ],
+                        ),
+                        env,
+                    )
+            forced_status = json.loads((tmp / "acp-forced.status.json").read_text(encoding="utf-8"))
+            assert forced.returncode == 0, (forced.stdout, forced.stderr, forced_status)
+            assert forced_status["state"] == "complete", forced_status
+            assert forced_status["controller_label"] == "registered-test", forced_status
             assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
             assert "acp-incumbent" in forced.stderr, forced.stderr
             assert "DISPATCH-END" in forced.stdout, forced.stdout
