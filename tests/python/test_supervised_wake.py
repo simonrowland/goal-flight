@@ -998,6 +998,106 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
     assert calls[3]["on_startup_probe"] is migration_callback
 
 
+def test_supervise_start_renews_lease_before_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A supervise start extends renew_deadline_at before the arm probe."""
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    project = tmp_path / "project"
+    project.mkdir()
+    label = "renew-on-arm"
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        label,
+        principal={"principal_id": "renew-on-arm"},
+        horizon_s=30,
+    )
+    assert claimed.committed and claimed.value is not None
+    before = claimed.value.renew_deadline_at
+    nonce = claimed.value.nonce
+    seen: dict[str, str] = {}
+
+    def arm(**kwargs: object) -> int:
+        lease = journal.Journal(project).active_lease(label)
+        assert lease is not None
+        seen["deadline"] = lease.renew_deadline_at
+        seen["nonce"] = str(kwargs["lease_nonce"])
+        return 0
+
+    monkeypatch.setattr(supervise, "run_supervisor", arm)
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=label,
+        lease_nonce=nonce,
+        heartbeat_secs=1.0,
+        coverage_secs=1.0,
+        debug=False,
+        chatty=False,
+    )
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=nonce
+    ):
+        result = supervise.cmd_supervise(args)
+    assert result == 0, capsys.readouterr().err
+    assert seen["nonce"] == nonce
+    assert seen["deadline"] > before
+    after = authority.active_lease(label)
+    assert after is not None
+    assert after.nonce == nonce
+    assert after.generation == claimed.value.generation
+    assert after.renew_deadline_at == seen["deadline"]
+
+
+def test_supervise_start_with_stale_nonce_does_not_renew(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Control on main: a mismatched nonce is refused and the deadline stays."""
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        supervise,
+        "run_supervisor",
+        lambda **_kwargs: pytest.fail("stale nonce must not arm"),
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    label = "stale-nonce"
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        label,
+        principal={"principal_id": "stale-nonce"},
+        horizon_s=30,
+    )
+    assert claimed.committed and claimed.value is not None
+    before = claimed.value.renew_deadline_at
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=label,
+        lease_nonce="stale-nonce-not-the-live-one",
+        heartbeat_secs=1.0,
+        coverage_secs=1.0,
+        debug=False,
+        chatty=False,
+    )
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.value.nonce
+    ):
+        result = supervise.cmd_supervise(args)
+    assert result != 0
+    assert "did-not-arm" in capsys.readouterr().err
+    after = authority.active_lease(label)
+    assert after is not None
+    assert after.renew_deadline_at == before
+    assert after.nonce == claimed.value.nonce
+
+
 def test_supervise_migration_refuses_second_live_supervisor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2653,9 +2753,10 @@ def test_controller_mail_documents_supervise_front_door() -> None:
     assert "--controller-label" in doctrine
     assert "live/" in doctrine
     assert "do **not** grep" in doctrine.lower()
-    assert "no timeout" in doctrine.lower()
-    assert "`persistent: true`" in doctrine
-    assert "`timeout_ms` inert" in doctrine
+    assert "30 minutes" in doctrine
+    assert "renews the lease" in doctrine
+    assert "`persistent: true`" not in doctrine
+    assert "timeout_ms` inert" not in doctrine
 
 
 def test_supervisor_signal_exit_contract_matches_installed_handlers(
@@ -2698,9 +2799,10 @@ def test_every_supervisor_arming_site_requires_session_lifetime_no_timeout(
     relative: str,
 ) -> None:
     doctrine = (ROOT / relative).read_text(encoding="utf-8")
-    assert "no timeout" in doctrine.lower()
-    assert "`persistent: true`" in doctrine
-    assert "`timeout_ms` inert" in doctrine
+    assert "30 minutes" in doctrine
+    assert "renews the lease" in doctrine
+    assert "`persistent: true`" not in doctrine
+    assert "timeout_ms` inert" not in doctrine
 
 
 def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:

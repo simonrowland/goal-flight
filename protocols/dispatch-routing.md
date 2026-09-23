@@ -215,8 +215,7 @@ the returned items, advances their server-known stream positions with
 is settled did-not-arm (dead or mismatched lease nonce): do not treat it as a ring
 and do not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead
 nonce. Peek again to derive remaining mail. Listener, drainer, mirror, and dashboard
-roles never claim or renew the controller lease; a verified watchdog tick may renew
-it.
+roles never claim or renew the controller lease. `supervise` renews the lease when it starts, before it arms; a watchdog tick does not.
 
 ### Controller correspondence addressing
 
@@ -288,18 +287,14 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 ## Event wake arming (the supervisor owns it)
 
 The controller's event wake is ONE `goalflight_messages.py supervise` process
-armed through the HOST'S PERSISTENT MONITOR — on Claude Code, the Monitor tool
-with `persistent: true`; never a bounded monitor, never shell `&`:
+armed through the host monitor. Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. Never shell `&`:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py \
   supervise --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
-- **Arm it with NO timeout.** Do not set, tune, or reason about a timeout
-  value: a bounded monitor is killed outside the supervisor, no `type=stop`
-  record appears, and the controller goes deaf without a diagnostic (the
-  fleet-wide one-hour coverage drop, b-248).
+- **Re-arm on expiry.** If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one.
 - **Stop any old direct listeners FIRST**, then arm supervise (b-242):
   starting it alongside running listeners permanently stops its slots.
 - `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` is optional at the shipped default of 2;

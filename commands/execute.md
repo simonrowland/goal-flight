@@ -71,12 +71,7 @@ duration; wait separately on anything you need back early.
 project lease. Prefer one generation-bound `goalflight_messages.py supervise
 --project-root "$PWD" --controller-label <label>` through
 the host persistent monitor; it owns the stream, backup doorbell pool, and
-watchdog as one feed and re-arms children itself. Arm it with **no timeout** so
-it runs for the life of the session. Never set, tune, or reason about a timeout
-value: a bounded monitor is killed outside the supervisor, so no `type=stop`
-record appears and the controller goes deaf without a diagnostic. On Claude
-Code use `persistent: true`; that makes `timeout_ms` inert, and a host-required
-value is only a placeholder, never a knob. In the decomposed fallback, only
+watchdog as one feed and re-arms children itself. Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one. In the decomposed fallback, only
 after supervisor absence is proven, arm one generation-bound
 `goalflight_messages.py follow --project-root
 "$PWD" --controller-label <label>` through that monitor —

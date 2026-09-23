@@ -6,8 +6,8 @@ One shared journal authority with JSONL carrier projection, not a private markdo
 
 Goal Flight controller entry points and compaction resume auto-claim a lease using the
 canonical project root. The claim is role-aware: listeners, drainers, mirrors, and
-dashboard children never claim or renew. A verified watchdog tick may renew the
-controller lease. A live different generation
+dashboard children never claim or renew. `supervise` renews the lease when it
+starts, before it arms; a watchdog tick does not. A live different generation
 is never stolen; `label in use` is visible and requires an explicit succession choice.
 
 Inspect or establish identity directly when needed:
@@ -22,8 +22,21 @@ python3 <skill-root>/scripts/goalflight_session_status.py \
 Carry the returned controller label and `session.lease_nonce` (as
 `GOALFLIGHT_CONTROLLER_SESSION_ID` or an explicit `--controller-session-id` on later
 entry calls). The lease is keyed by canonical project, label, and nonce; ancestry
-without the nonce cannot renew it. Only the controller or a verified watchdog tick
-renews it.
+without the nonce cannot renew it. `supervise` renews the lease on startup,
+before it arms; a watchdog tick does not.
+
+## Claude Code native session messaging
+
+Claude Code `ListAgents` / `SendMessage` is allowed between Claude Code
+sessions. It does not need a controller lease. Limits:
+
+- it does not reach grokbot controllers (battery-control, regolith-empirical);
+  use the goal-flight bus for those;
+- it addresses sessions by current title, which drifts, not by controller label;
+- it leaves no goal-flight bus record (no dispatch id, journal row, cursor, or
+  read-back), so trouble tickets and poll replies still go on the bus;
+- a native message lands in the recipient's conversation directly, so it is
+  closer to an interruption than a bus message delivered at a wake.
 
 ## Peek
 
@@ -146,10 +159,7 @@ python3 <skill-root>/scripts/goalflight_messages.py supervise \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL"
 ```
 
-Arm the supervisor with **no timeout**. It must run for the life of the session.
-Do not set, tune, or reason about a timeout value: a bounded monitor is killed
-from outside, so the supervisor never writes a `type=stop` record and the
-controller goes deaf with no diagnostic at all. A persistent (unbounded)
+Set `timeout_ms` to the host maximum. Claude Code caps a monitor at 30 minutes and has no persistent option; on expiry the controller is deaf until it re-arms `supervise`, which renews the lease before arming. If re-arm prints `did-not-arm: an existing supervisor remains live`, the prior supervisor survived; do not start a second one. A persistent (unbounded)
 monitor can also be killed for output volume: a child that falls behind its
 siblings re-emits the unread backlog every cycle, the host kills the monitor,
 no `type=stop` is written, and the controller goes deaf the same way.
@@ -164,9 +174,7 @@ memory never advances the journal cursor or survives an owner replacement.
 After acquiring its exclusive monitor slot, a new follow owner releases a
 matching unread ring reservation once. This permits recovery even when the
 previous child flushed to the supervisor pipe before the host write failed.
-On Claude Code, set
-`persistent: true`; that makes `timeout_ms` inert, and where the host requires
-the field to be present it is a placeholder, never a knob.
+Re-arm `supervise` when the host says the monitor expired. That start renews the lease before arming.
 
 `supervise` spawns the stream, the configured backup doorbell pool, and the
 watchdog from the same `coverage_rearm_commands` generator used everywhere else,
@@ -225,10 +233,19 @@ Default `coverage` is silent except for operator-actionable loss (for example
 4/4 → 0/4). `--chatty` restores change-driven `live` / `target` records.
 `--debug` restores per-tick coverage.
 
-Startup writes
-`{"kind":"supervise","type":"arm","owned":"stream/backup/watchdog"}`
-once. That is the one expected quiet-generation wake. A later heartbeat is an
-internal peer probe and does not print unless `--debug`.
+The CLI's first write is
+`{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}`.
+It proves stdout connectivity only, before migration and child spawn; it does
+not prove armed coverage. Confirm the current generation's stream, two backup
+listeners, and watchdog with a subsequent `--chatty` coverage record
+showing `live=target=4` (4/4). Use `--chatty` when verifying startup; optionally
+combine it with `--debug`. Bare `--debug` waits for the coverage tick
+(3600 seconds by default), beyond the 1800-second monitor cap.
+Default terse output has no full-coverage readiness record after the probe.
+Supervisor process presence alone is insufficient. A subsequent startup `stop`
+or child failure invalidates startup success and must be resolved before
+proceeding. A later heartbeat is an internal peer probe and does not print
+unless `--debug`.
 
 Supervisor coverage is state-driven under `--chatty`: it emits at startup,
 whenever `(live,target)` changes, and immediately when a slot stops or

@@ -3179,6 +3179,44 @@ class Journal:
 
         return self._domain_write(action)
 
+    def renew_active_lease(
+        self,
+        label: str,
+        *,
+        nonce: str,
+        generation: int,
+        horizon_s: float = DEFAULT_LEASE_HORIZON_S,
+    ) -> WriteResult[LeaseIdentity]:
+        """Renew only the pinned active generation, without expiry or creation.
+
+        The caller checks holder liveness. Death after that check can leave a
+        renewed lease to lapse at its next deadline; it never mints a generation.
+        """
+        resolved_label = self._identity_token(label, label="controller label")
+        resolved_nonce = self._identity_token(nonce, label="lease nonce")
+        if not 0 < horizon_s <= 7 * 24 * 60 * 60:
+            raise ValueError("lease horizon must be in (0, 604800] seconds")
+
+        def action(connection: sqlite3.Connection) -> LeaseIdentity:
+            cursor = connection.execute(
+                """UPDATE controller_leases SET renew_deadline_at = ?
+                   WHERE project_root = ? AND label = ? AND nonce = ?
+                     AND generation = ? AND state = 'ACTIVE'""",
+                (_utc_after(horizon_s), str(self.project_root), resolved_label,
+                 resolved_nonce, generation),
+            )
+            if cursor.rowcount != 1:
+                raise CASMismatch("active lease generation or nonce changed")
+            row = connection.execute(
+                """SELECT * FROM controller_leases
+                   WHERE project_root = ? AND label = ? AND generation = ?""",
+                (str(self.project_root), resolved_label, generation),
+            ).fetchone()
+            assert row is not None
+            return self._lease_identity(row)
+
+        return self._domain_write(action)
+
     def claim_or_renew_lease(
         self,
         label: str,

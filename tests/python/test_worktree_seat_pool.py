@@ -590,6 +590,180 @@ def test_classify_dispatch_cwd_lock() -> None:
             lease.release()
 
 
+@contextlib.contextmanager
+def isolated_git_excludes(root: Path, excludes_text: str = ""):
+    """Point git at an empty global exclude unless ``excludes_text`` is set.
+
+    A developer global ignore that names ``.goal-flight`` would make the
+    non-ignored control look ignored.
+    """
+    excludes = root / "excludes"
+    excludes.write_text(excludes_text, encoding="utf-8")
+    config = root / "gitconfig"
+    system = root / "gitconfig-system"
+    system.write_text("", encoding="utf-8")
+    config.write_text(
+        f"[core]\n\texcludesFile = {excludes}\n",
+        encoding="utf-8",
+    )
+    keys = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
+    prior = {key: os.environ.get(key) for key in keys}
+    os.environ["GIT_CONFIG_GLOBAL"] = str(config)
+    os.environ["GIT_CONFIG_SYSTEM"] = str(system)
+    try:
+        yield
+    finally:
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _quarantine_branch(repo: Path) -> str:
+    branches = [
+        line
+        for line in git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/goalflight/quarantine/",
+        ).splitlines()
+        if line
+    ]
+    assert_true("one quarantine branch", len(branches) == 1)
+    return branches[0]
+
+
+def _tree_names(repo: Path, branch: str) -> set[str]:
+    raw = git(repo, "ls-tree", "-r", "--name-only", branch)
+    return {line for line in raw.splitlines() if line}
+
+
+def _reclaim_dirty_seat(repo: Path, prepare) -> tuple[str, Path]:
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "abandoned")
+    try:
+        prepare(abandoned.path)
+        (abandoned.path / "abandoned.txt").write_text("preserve me\n", encoding="utf-8")
+    finally:
+        abandoned.release()
+    reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "next")
+    return _quarantine_branch(repo), reused.path
+
+
+def test_ignored_goal_flight_dir_does_not_block_quarantine() -> None:
+    """An ignored ``.goal-flight/`` must not make ``git add`` fail the reclaim."""
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
+        repo = make_repo(Path(td))
+        (repo / ".gitignore").write_text(".goal-flight/\n", encoding="utf-8")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-m", "ignore goal-flight")
+
+        def prepare(seat: Path) -> None:
+            notes = seat / ".goal-flight"
+            notes.mkdir()
+            (notes / "secret.txt").write_text("private\n", encoding="utf-8")
+            (seat / "tracked.txt").write_text("abandoned edit\n", encoding="utf-8")
+
+        branch, reused_path = _reclaim_dirty_seat(repo, prepare)
+        names = _tree_names(repo, branch)
+        assert_true("product file quarantined", "abandoned.txt" in names)
+        assert_true("tracked edit quarantined", "tracked.txt" in names)
+        assert_true(
+            "ignored goal-flight not quarantined",
+            ".goal-flight/secret.txt" not in names,
+        )
+        assert_true(
+            "seat reset",
+            (reused_path / "tracked.txt").read_text(encoding="utf-8") == "base\n",
+        )
+
+
+def test_empty_ignored_goal_flight_dir_does_not_block_quarantine() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
+        repo = make_repo(Path(td))
+        (repo / ".gitignore").write_text(".goal-flight/\n", encoding="utf-8")
+        git(repo, "add", ".gitignore")
+        git(repo, "commit", "-m", "ignore goal-flight")
+
+        def prepare(seat: Path) -> None:
+            (seat / ".goal-flight").mkdir()
+
+        branch, _reused = _reclaim_dirty_seat(repo, prepare)
+        names = _tree_names(repo, branch)
+        assert_true("product file quarantined", "abandoned.txt" in names)
+        assert_true(
+            "empty ignored dir added nothing",
+            not any(name.startswith(".goal-flight/") for name in names),
+        )
+
+
+def test_info_exclude_ignored_goal_flight_dir_does_not_block_quarantine() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
+        repo = make_repo(Path(td))
+        exclude = repo / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(".goal-flight/\n", encoding="utf-8")
+
+        def prepare(seat: Path) -> None:
+            notes = seat / ".goal-flight"
+            notes.mkdir()
+            (notes / "secret.txt").write_text("private\n", encoding="utf-8")
+
+        branch, _reused = _reclaim_dirty_seat(repo, prepare)
+        names = _tree_names(repo, branch)
+        assert_true("product file quarantined", "abandoned.txt" in names)
+        assert_true(
+            "info/exclude goal-flight not quarantined",
+            ".goal-flight/secret.txt" not in names,
+        )
+
+
+def test_global_exclude_ignored_goal_flight_dir_does_not_block_quarantine() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(
+        Path(td), ".goal-flight/\n"
+    ):
+        repo = make_repo(Path(td))
+
+        def prepare(seat: Path) -> None:
+            notes = seat / ".goal-flight"
+            notes.mkdir()
+            (notes / "secret.txt").write_text("private\n", encoding="utf-8")
+
+        branch, _reused = _reclaim_dirty_seat(repo, prepare)
+        names = _tree_names(repo, branch)
+        assert_true("product file quarantined", "abandoned.txt" in names)
+        assert_true(
+            "global-exclude goal-flight not quarantined",
+            ".goal-flight/secret.txt" not in names,
+        )
+
+
+def test_unignored_goal_flight_is_not_quarantined() -> None:
+    """Control: a tracked ``.goal-flight`` stays at HEAD in the quarantine commit."""
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
+        repo = make_repo(Path(td))
+        notes = repo / ".goal-flight"
+        notes.mkdir()
+        (notes / "keep.txt").write_text("keep\n", encoding="utf-8")
+        git(repo, "add", ".goal-flight/keep.txt")
+        git(repo, "commit", "-m", "track goal-flight")
+
+        def prepare(seat: Path) -> None:
+            (seat / ".goal-flight" / "keep.txt").write_text("changed\n", encoding="utf-8")
+
+        branch, reused = _reclaim_dirty_seat(repo, prepare)
+        assert_true("product file quarantined", "abandoned.txt" in _tree_names(repo, branch))
+        assert_true(
+            "tracked goal-flight stays at HEAD in the quarantine commit",
+            git(repo, "show", f"{branch}:.goal-flight/keep.txt") == "keep",
+        )
+        assert_true(
+            "tracked goal-flight file is back to HEAD after reset",
+            (reused / ".goal-flight" / "keep.txt").read_text(encoding="utf-8") == "keep\n",
+        )
+
+
 def test_hwm_stays_after_release() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(4):
         repo = make_repo(Path(td))
@@ -628,6 +802,11 @@ def main() -> None:
         test_skip_reset_keeps_dirty_product_files,
         test_two_controller_labels_get_separate_rings,
         test_classify_dispatch_cwd_lock,
+        test_ignored_goal_flight_dir_does_not_block_quarantine,
+        test_empty_ignored_goal_flight_dir_does_not_block_quarantine,
+        test_info_exclude_ignored_goal_flight_dir_does_not_block_quarantine,
+        test_global_exclude_ignored_goal_flight_dir_does_not_block_quarantine,
+        test_unignored_goal_flight_is_not_quarantined,
         test_hwm_stays_after_release,
     ]
     for test in tests:

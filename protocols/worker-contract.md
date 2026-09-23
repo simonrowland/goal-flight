@@ -3,6 +3,11 @@
 Dispatch prompts can reference or paste this file when they need the worker's
 status, delivery, return-shape, marker, and no-bypass contract in one place.
 
+## Git
+
+Never `git add -f` a gitignored path. Forcing an ignored path into the index
+publishes files the repository chose to keep private. Stage explicit paths.
+
 ## Ledger and status fields
 
 Every spawned worker must have:

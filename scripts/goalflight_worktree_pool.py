@@ -923,15 +923,12 @@ def _quarantine_dirty_worktree(
     if not product:
         return None
 
-    _git(
-        worktree_path,
-        "add",
-        "-A",
-        "--",
-        ".",
-        ":(exclude).goal-flight",
-        ":(exclude).goal-flight/**",
-    )
+    # `:(exclude)` of an ignored path makes `git add` exit 1, so a seat that
+    # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
+    # `.goal-flight`: ignored contents were never staged, and a tracked tree is
+    # put back to HEAD so it is not part of the quarantine commit.
+    _git(worktree_path, "add", "-A", "--", ".")
+    _git(worktree_path, "reset", "-q", "--", ".goal-flight")
     tree = _git(worktree_path, "write-tree")
     parent = _git(worktree_path, "rev-parse", "HEAD")
     parent_tree = _git(worktree_path, "rev-parse", "HEAD^{tree}")

@@ -4413,9 +4413,26 @@ def main() -> int:
                 )
             )
             if resume_engine == "moonshot":
+                # A pooled seat indexes every past session for this cwd, so an
+                # unbounded harvest sees several and refuses to guess. Bound it
+                # to this dispatch's start, minus a couple of seconds of clock
+                # skew so a session stamped just before the record still counts.
+                # Tail birth is the same fallback cursor uses when the ledger
+                # has no start.
+                started_at = _trace_ledger_started_epoch(args.dispatch_id)
+                if started_at is None:
+                    try:
+                        tail_stat = Path(tail).stat()
+                        started_at = getattr(
+                            tail_stat, "st_birthtime", tail_stat.st_ctime
+                        )
+                    except OSError:
+                        started_at = None
+                if started_at is not None:
+                    started_at -= 2.0
                 engine_session_id = (
                     goalflight_engine_sessions.harvest_kimi_session_id(
-                        Path.home(), work_dir
+                        Path.home(), work_dir, after_mtime=started_at
                     )
                 )
                 if engine_session_id is None:

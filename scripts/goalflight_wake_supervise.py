@@ -2684,10 +2684,58 @@ def resolve_startup_lease_nonce(
     return live, None, None
 
 
+def _renew_controller_lease_before_arm(
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    nonce: str,
+) -> str | None:
+    """Extend the live lease before supervise arms.
+
+    Only the pinned active generation may renew. A dead holder refuses without
+    expiring journal or coverage state. If the holder dies after the liveness
+    check, the renewed lease simply lapses at its next deadline; no generation
+    is created. Journal unreadability retains the runtime probe's retry path.
+    """
+    import goalflight_journal  # type: ignore
+
+    unavailable = (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    )
+    try:
+        authority = goalflight_journal.Journal(project_root)
+        lease = authority.active_lease(controller_label)
+    except unavailable:
+        return nonce
+    if lease is None or lease.nonce != nonce:
+        return None
+    if wake.lease_holder_alive(
+        Path(project_root), controller_label=controller_label,
+        lease_nonce=nonce, prune_dead=False,
+    ) is False:
+        return None
+    try:
+        result = authority.renew_active_lease(
+            controller_label,
+            nonce=lease.nonce,
+            generation=lease.generation,
+        )
+    except unavailable:
+        return nonce
+    if result.disposition == goalflight_journal.WriteDisposition.CAS_LOST:
+        return None
+    if not result.committed or result.value is None:
+        return nonce
+    return str(result.value.nonce)
+
+
 def cmd_supervise(
     args: Any,
     *,
     forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+    before_renewal: Callable[[Path, str, str], str | None] | None = None,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
@@ -2772,6 +2820,26 @@ def cmd_supervise(
         if coverage_s <= 0:
             print("supervise: coverage-secs must be positive", file=sys.stderr)
             return SUPERVISE_START_EXIT
+    if before_renewal is not None:
+        refusal = before_renewal(project_root, label, live_nonce)
+        if refusal:
+            print(f"supervise: did-not-arm: {refusal}", file=sys.stderr)
+            return SUPERVISE_START_EXIT
+    # Eligibility refusals must not extend the lease. Later startup I/O failures
+    # (including broken stdout or child-start failure) can follow renewal; this
+    # is not an atomic arm operation. Release still waits for stdout proof.
+    renewed_nonce = _renew_controller_lease_before_arm(
+        project_root=project_root,
+        controller_label=label,
+        nonce=live_nonce,
+    )
+    if not renewed_nonce:
+        print(
+            "supervise: did-not-arm: controller lease lost before arm",
+            file=sys.stderr,
+        )
+        return SUPERVISE_STOP_EXIT
+    live_nonce = renewed_nonce
     host = RealHost(
         project_root=project_root,
         controller_label=label,
