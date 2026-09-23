@@ -310,7 +310,7 @@ def choose_record(slug: str, records: list[dict[str, Any]], leases: list[dict[st
 
 def decision_hint(
     state: str,
-    worker_live: bool,
+    worker_live: bool | None,
     mins: int | None,
     *,
     retryable: bool = False,
@@ -336,6 +336,8 @@ def decision_hint(
         if retryable:
             return "cooldown_retry"
         return "investigate"
+    if worker_live is None:
+        return "unknown"
     if not worker_live:
         return "takeover"
     if mins is not None and mins > 30:

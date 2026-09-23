@@ -287,6 +287,39 @@ def case_lstart_only_identity_is_unknown() -> None:
         )
 
 
+def case_legacy_lstart_mismatch_is_pid_reuse_for_status_only() -> None:
+    pid = os.getpid()
+    current = {"pid": pid, "lstart": "current-start", "start_token": "current-token"}
+    record = {
+        "dispatch_id": "legacy-reuse",
+        "state": "watcher_stopped",
+        "classification": "watcher_stopped",
+        "worker_pid": pid,
+        "worker_identity": {"pid": pid, "lstart": "prior-start"},
+    }
+    with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_ledger.worker_identity_liveness(record) == (
+            "dead",
+            "pid_reused_lstart",
+        )
+        assert goalflight_status.worker_process_identity_liveness(record) is False
+
+
+def case_legacy_lstart_match_keeps_status_running_without_ownership() -> None:
+    pid = os.getpid()
+    current = {"pid": pid, "lstart": "same-second-start", "start_token": "current-token"}
+    record = {
+        "dispatch_id": "legacy-live",
+        "state": "watcher_stopped",
+        "classification": "watcher_stopped",
+        "worker_pid": pid,
+        "worker_identity": {"pid": pid, "lstart": current["lstart"]},
+    }
+    with patch("goalflight_ledger.process_identity", return_value=current):
+        assert goalflight_status.worker_process_identity_liveness(record) is None
+        assert goalflight_status.done_code(record) == 1
+
+
 def main() -> None:
     case_windows_pid_alive_does_not_call_os_kill()
     case_windows_access_denied_means_alive()
@@ -304,6 +337,8 @@ def main() -> None:
     case_reaped_pid_still_classifies_dead()
     case_ledger_windows_identity_indeterminate_not_expected_live()
     case_lstart_only_identity_is_unknown()
+    case_legacy_lstart_mismatch_is_pid_reuse_for_status_only()
+    case_legacy_lstart_match_keeps_status_running_without_ownership()
     print("OK: pid probe tests pass")
 
 

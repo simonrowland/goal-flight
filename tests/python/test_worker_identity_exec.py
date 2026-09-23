@@ -283,7 +283,7 @@ def test_fleet_partial_identity_without_start_token_is_unknown(monkeypatch, caps
     assert payload["identity_reason"] == "identity_indeterminate"
 
 
-def test_steer_liveness_warning_reports_missing_start_token(monkeypatch) -> None:
+def test_steer_liveness_warning_preserves_legacy_lstart_evidence(monkeypatch) -> None:
     expected = _identity(start_token=None, comm="python")
     current = _identity(start_token=None, comm="node")
     record = {
@@ -302,11 +302,11 @@ def test_steer_liveness_warning_reports_missing_start_token(monkeypatch) -> None
     assert warning and "identity indeterminate" in warning
 
 
-def test_lstart_without_comm_is_not_a_recorded_identity(monkeypatch) -> None:
+def test_lstart_without_fine_token_is_readable_but_not_confirmed(monkeypatch) -> None:
     identity = {"pid": PID, "lstart": LSTART}
 
     assert goalflight_dispatch._watch_identity_token(identity) is None
-    assert not goalflight_status._has_recorded_worker_identity(
+    assert goalflight_status._has_recorded_worker_identity(
         {"worker_identity": identity}
     )
 
@@ -346,9 +346,23 @@ def test_lstart_without_comm_is_not_a_recorded_identity(monkeypatch) -> None:
         "worker_identity": identity,
         "_wait_snapshot_complete": True,
     }
-    monkeypatch.setattr(goalflight_status.goalflight_compat, "pid_liveness", lambda _pid: True)
-    assert goalflight_status._rechecked_worker_alive(legacy_record) is None
-    assert goalflight_status.done_code(legacy_record) == 2
+    monkeypatch.setattr(
+        goalflight_status.goalflight_ledger,
+        "identity_matches",
+        lambda _record: (True, "identity_indeterminate"),
+    )
+    monkeypatch.setattr(
+        goalflight_status.goalflight_ledger,
+        "process_identity",
+        lambda _pid: {"pid": PID, "lstart": LSTART, "start_token": START_TOKEN},
+    )
+    assert goalflight_status._rechecked_worker_alive(legacy_record) is True
+    assert goalflight_status.done_code(legacy_record) == 1
+    marked = {
+        **legacy_record,
+        "terminal_marker": {"kind": "COMPLETE", "text": "legacy-live — done"},
+    }
+    assert goalflight_status.done_code(marked) == 1
 
 
 def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) -> None:

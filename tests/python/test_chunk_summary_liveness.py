@@ -151,6 +151,10 @@ def test_missing_identity_does_not_claim_pid_ownership() -> None:
     assert_eq("pid-only liveness is unknown", live, None)
 
 
+def test_unknown_liveness_does_not_suggest_takeover() -> None:
+    assert_eq("unknown liveness hint", summary.decision_hint("running", None, 1), "unknown")
+
+
 def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-summary-live-marker-") as d:
         base = Path(d)

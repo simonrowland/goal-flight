@@ -70,6 +70,10 @@ There is no `fetch`, no `Last-Modified`, and no `localhost` server anywhere. A
 server would only buy auto-refresh *without* a manual reload — the Reload button
 covers that, so it isn't worth a dependency.
 
+The exported dispatch field `idle_s` is the age of the worker's tail or trace
+mtime; it intentionally ignores watcher freshness because monitoring is
+read-only and writes no per-poll heartbeat.
+
 ## Autolinking (ids + file paths)
 
 `gf.js`'s linkify pass (HTML-escape → wrap matches) turns two things into links:
