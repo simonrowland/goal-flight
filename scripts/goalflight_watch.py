@@ -897,7 +897,7 @@ def _trace_from_lsof(
     lsof_runner=None,
     ps_runner=None,
 ) -> Path | None:
-    runner = lsof_runner or subprocess.run
+    runner = lsof_runner or wedge_watch.run_lsof
     pids = _worker_process_tree(pid, ps_runner=ps_runner)
     try:
         proc = runner(
@@ -915,7 +915,7 @@ def _trace_from_lsof(
             if _path_under_known_trace_root(path, roots) and path.is_file():
                 candidates.append(path.resolve(strict=False))
         return max(candidates, key=lambda path: (path.stat().st_mtime, str(path))) if candidates else None
-    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError):
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
         return None
 
 

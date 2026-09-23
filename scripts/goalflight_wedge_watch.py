@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import resource
 import subprocess
 from typing import Callable
 
@@ -61,6 +62,12 @@ from goalflight_liveness import cputime_delta_seconds, pgroup_cputime_snapshot
 DEFAULT_PROBATION_S = 1080.0
 CPU_EPSILON_S = 0.05
 SOCKET_LSOF_TIMEOUT_S = 1.0
+# lsof close()s every descriptor number up to its soft RLIMIT_NOFILE at start.
+# Dispatch shells raise that to 1048576, so each probe cost ~250k syscalls
+# (0.18 s wall vs 0.01 s at 256, measured 2026-09-22) and a fleet of
+# watchlisted watchers polling every 2 s drove ~1.5M file ops/s on the laptop.
+# lsof itself needs only a handful of descriptors.
+LSOF_NOFILE_SOFT_LIMIT = 256
 VERDICT_LIVE = "live"
 VERDICT_WEDGED = "wedged"
 VERDICT_UNKNOWN = "UNKNOWN"
@@ -273,6 +280,19 @@ def classify_socket_names(names: list[str]) -> str:
     return SOCKET_NONE
 
 
+def _lower_nofile_for_lsof() -> None:
+    _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    cap = LSOF_NOFILE_SOFT_LIMIT
+    if hard != resource.RLIM_INFINITY:
+        cap = min(cap, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (cap, hard))
+
+
+def run_lsof(args, **kwargs) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run`` for lsof with a small child descriptor limit."""
+    return subprocess.run(args, preexec_fn=_lower_nofile_for_lsof, **kwargs)
+
+
 def provider_socket_state(
     pids: list[int] | tuple[int, ...] | int | None,
     *,
@@ -292,7 +312,7 @@ def provider_socket_state(
         pid_list = [int(p) for p in pids if p is not None]
     if not pid_list:
         return SOCKET_UNKNOWN
-    runner = lsof_runner or subprocess.run
+    runner = lsof_runner or run_lsof
     try:
         proc = runner(
             [
@@ -310,7 +330,12 @@ def provider_socket_state(
             timeout=timeout_s,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ):
         return SOCKET_UNKNOWN
     # lsof returns 1 when there are no matching sockets; that is a look,
     # not a failure. Other non-zero (command error) is unknown.
