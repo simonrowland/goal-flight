@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 from contextlib import ExitStack
+import ctypes
 import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,7 @@ import select
 import shlex
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -223,6 +227,22 @@ def _wait_for_waiter_kind(
         interval_s=0.01,
         message=f"{kind} waiter for pid={pid}",
     )
+
+
+def _mac_disk_bytes_written(pid: int) -> int:
+    """Read macOS proc_pid_rusage V4's cumulative disk-write counter."""
+    if sys.platform != "darwin":
+        raise RuntimeError("macOS-only disk-write counter")
+    proc = ctypes.CDLL(None, use_errno=True).proc_pid_rusage
+    proc.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    proc.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(512)
+    if proc(pid, 4, ctypes.byref(buffer)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # uuid[16], followed by 17 uint64 fields through diskio_bytesread;
+    # diskio_byteswritten is the next field in rusage_info_v4.
+    return struct.unpack_from("<Q", buffer.raw, 16 + (17 * 8))[0]
 
 
 def _wait_for_monitor_slot(project: Path, label: str, pid: int) -> None:
@@ -2915,6 +2935,187 @@ def _pin_listener_resolution(
             "lease_generation": lease.generation,
         },
     )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
+def test_idle_listener_does_not_write_journal_each_poll(isolated) -> None:
+    project, env, lease = isolated
+    command = _backup_command(project, lease, timeout_s=3)
+    command[command.index("--listener-slots") + 1] = "2"
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+        time.sleep(0.05)
+        before = _mac_disk_bytes_written(listener.pid)
+        started = time.monotonic()
+        time.sleep(0.25)
+        elapsed = time.monotonic() - started
+        after = _mac_disk_bytes_written(listener.pid)
+        assert listener.poll() is None
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        stdout, stderr = listener.communicate(timeout=5)
+    assert listener.returncode in {0, 1, -signal.SIGTERM, 128 + signal.SIGTERM}
+    cycles = max(1, round(elapsed / 0.01))
+    written = after - before
+    assert written < 64 * 1024, (
+        f"idle listener wrote {written} bytes over ~{cycles} poll cycles "
+        f"({written / cycles:.0f} bytes/cycle); stdout={stdout!r}; "
+        f"stderr={stderr!r}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
+def test_listener_start_to_exit_writes_are_bounded(isolated) -> None:
+    project, env, lease = isolated
+    command = _backup_command(project, lease, timeout_s=3)
+    command.remove("--report-pending")
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    total_written = None
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+        _release_lease(project, lease)
+        assert listener.stdout is not None
+        exit_record = _JsonLineReader(listener.stdout).read(timeout_s=5)[1]
+        assert exit_record["kind"] == "exit", exit_record
+        total_written = _mac_disk_bytes_written(listener.pid)
+        stdout, stderr = listener.communicate(timeout=5)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        if listener.poll() is None:
+            listener.wait(timeout=5)
+    assert total_written is not None
+    assert listener.returncode == 3, (
+        f"unexpected listener exit {listener.returncode}; "
+        f"stdout={stdout!r}; stderr={stderr!r}"
+    )
+    assert total_written < 1024 * 1024, (
+        f"listener start-to-exit wrote {total_written} bytes"
+    )
+
+
+def test_idle_listener_reuses_journal_connection(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.01,
+        listener_slots=2,
+        timeout_s=0.5,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    opens = 0
+    real_connect = journal._sqlite_connect
+
+    def counted_connect(*args, **kwargs):
+        nonlocal opens
+        opens += 1
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(journal, "_sqlite_connect", counted_connect)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        time.sleep(0.15)
+        opens_at_arm = opens
+        time.sleep(0.2)
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result == [1], stderr.getvalue()
+    assert opens_at_arm <= 8
+    assert opens == opens_at_arm
+
+
+def test_pending_unclaimed_ring_obeys_poll_interval(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.2,
+        listener_slots=2,
+        timeout_s=1.5,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    checks = 0
+    real_data_version = journal.Journal._data_version
+
+    def counted_data_version(authority):
+        nonlocal checks
+        checks += 1
+        return real_data_version(authority)
+
+    monkeypatch.setattr(journal.Journal, "_data_version", counted_data_version)
+    monkeypatch.setattr(wake, "claim_ring", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        time.sleep(0.25)
+        before_event = checks
+        messages.post_message(
+            dispatch_id="unclaimed-ring",
+            msg_type="controller-notice",
+            payload={"text": "pending but not claimed"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        time.sleep(0.65)
+        after_event = checks
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result == [1], stderr.getvalue()
+    assert after_event > before_event
+    assert after_event - before_event <= 5
 
 
 def test_follow_survives_busy_during_constructor_startup(

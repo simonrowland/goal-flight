@@ -8422,6 +8422,43 @@ def cmd_listen(args) -> int:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
 
+    # Polling must not reopen a SQLite connection each cycle: the read helpers
+    # otherwise open and close one for every lease and cursor probe, and that
+    # close path can flush journal pages even when this listener changed
+    # nothing. Keep the writer for arm/exit lifecycle mutations and use one
+    # persistent read-only client for steady-state probes.
+    try:
+        read_authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal.open_reader(
+                project_root,
+                persistent=True,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        if getattr(exc, "pending_migration", False):
+            return _listen_pending_migration_exit(prefix, exc)
+        raise
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        print(f"listen: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
+        return 2
+
+    def close_read_authority() -> None:
+        connection = getattr(read_authority, "_reader_connection", None)
+        if connection is not None:
+            read_authority._reader_connection = None
+            read_authority._reader_pid = None
+            connection.close()
+
     # Acquire the kernel witness before superseding journal coverage.  If the
     # ledger is unavailable, the incumbent listener remains both ARMED and
     # locked instead of being displaced by a replacement that cannot stay live.
@@ -8729,6 +8766,7 @@ def cmd_listen(args) -> int:
             if waiter is not None:
                 waiter.close()
             death_watch.restore()
+            close_read_authority()
         emit_payload(payload, detail=None if args.json else payload.get("detail"))
         return code
 
@@ -8742,6 +8780,7 @@ def cmd_listen(args) -> int:
         )
         waiter.close()
         death_watch.restore()
+        close_read_authority()
         action = _wake_recovery_action(
             project_root,
             controller_label=label,
@@ -8791,6 +8830,7 @@ def cmd_listen(args) -> int:
         )
         waiter.close()
         death_watch.restore()
+        close_read_authority()
         status = goalflight_wake.coverage_status(
             project_root,
             controller_label=label,
@@ -8861,6 +8901,21 @@ def cmd_listen(args) -> int:
                     + f"; {_listener_signal_context()}"
                 ),
             )
+        return None
+
+    def wait_for_next_poll() -> int | None:
+        delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll
+        sleep_until = time.monotonic() + delay
+        while time.monotonic() < sleep_until:
+            parent_result = parent_exit()
+            if parent_result is not None:
+                return parent_result
+            signal_result = signal_or_stdio_exit()
+            if signal_result is not None:
+                return signal_result
+            if deadline is not None and time.monotonic() >= deadline:
+                return finish("timeout", code=1, detail="no waking event before timeout")
+            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
         return None
 
     emit_wake_entry_notice(
@@ -9054,6 +9109,8 @@ def cmd_listen(args) -> int:
         except (OSError, RuntimeError, ValueError):
             pending_report_settled = False
 
+    observed_data_version: int | None = None
+    observed_lease = None
     while True:
         parent_result = parent_exit()
         if parent_result is not None:
@@ -9129,7 +9186,16 @@ def cmd_listen(args) -> int:
             return finish("timeout", code=1, detail="no waking event before timeout")
         visible_ring_items: list[tuple[dict, dict]] | None = None
         try:
-            lease = authority.active_lease(label)
+            current_data_version = read_authority._data_version()
+            journal_changed = (
+                observed_data_version is None
+                or current_data_version != observed_data_version
+            )
+            lease = (
+                read_authority.active_lease(label)
+                if journal_changed
+                else observed_lease
+            )
             measured = (
                 {"pid": os.getpid(), "start_token": test_start_token}
                 if test_start_token
@@ -9198,59 +9264,61 @@ def cmd_listen(args) -> int:
                 )
                 if claim_state != "already-claimed":
                     return finish_watchdog_dead(claim_state=claim_state)
-            # With an arm-time backlog the cheap limit-1 peek would forever
-            # see the oldest (already-reported) item; peek wide and ring only
-            # for events beyond the arm-time high-water.
-            # Self-authored rows can sort before foreign mail indefinitely, so
-            # a limit-1 peek cannot implement skip-without-wedging semantics.
-            peek = authority.cursor_peek(label, nonce=nonce, limit=1000)
-            candidate_rows = [
-                item
-                for item in peek.items
-                if str(item.get("wake_class") or "") == "waking"
-                and (
-                    not arm_high
-                    or int(item.get("stream_seq") or 0)
-                    > arm_high.get(str(item.get("stream_id") or ""), 0)
+            wakeable_items = False
+            if journal_changed:
+                # With an arm-time backlog the cheap limit-1 peek would forever
+                # see the oldest (already-reported) item; peek wide and ring only
+                # for events beyond the arm-time high-water.
+                # Self-authored rows can sort before foreign mail indefinitely, so
+                # a limit-1 peek cannot implement skip-without-wedging semantics.
+                peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
+                candidate_rows = [
+                    item
+                    for item in peek.items
+                    if str(item.get("wake_class") or "") == "waking"
+                    and (
+                        not arm_high
+                        or int(item.get("stream_seq") or 0)
+                        > arm_high.get(str(item.get("stream_id") or ""), 0)
+                    )
+                ]
+                candidate_attention = _attention_items_for_rows(
+                    read_authority,
+                    candidate_rows,
                 )
-            ]
-            candidate_attention = _attention_items_for_rows(
-                authority,
-                candidate_rows,
-            )
-            candidate_items = _envelopes_with_rows(
-                authority,
-                candidate_rows,
-                controller_label=label,
-                attention_by_id=candidate_attention,
-            )
-            wakeable_items = bool(
-                _foreign_controller_items(
-                    candidate_items,
+                candidate_items = _envelopes_with_rows(
+                    read_authority,
+                    candidate_rows,
                     controller_label=label,
-                    lease_nonce=nonce,
+                    attention_by_id=candidate_attention,
                 )
-            )
-            if wakeable_items and not args.json:
-                # The non-JSON listener is the controller: it prints every
-                # buffered item before exiting. Materialize those envelopes
-                # while coverage and the kernel waiter are still live and before
-                # claiming the one ring for this cursor version.
-                # Reuse a waking synthetic candidate's attention read when the
-                # complete snapshot is rendered. When the candidate is a normal
-                # carrier, a quiet synthetic backlog is loaded once here.
-                visible_ring_items = _foreign_controller_items(
-                    _envelopes_with_rows(
-                        authority,
-                        list(peek.items),
+                wakeable_items = bool(
+                    _foreign_controller_items(
+                        candidate_items,
                         controller_label=label,
-                        attention_by_id=candidate_attention,
-                    ),
-                    controller_label=label,
-                    lease_nonce=nonce,
+                        lease_nonce=nonce,
+                    )
                 )
+                if wakeable_items and not args.json:
+                    # The non-JSON listener is the controller: it prints every
+                    # buffered item before exiting. Materialize those envelopes
+                    # while coverage and the kernel waiter are still live and before
+                    # claiming the one ring for this cursor version.
+                    # Reuse a waking synthetic candidate's attention read when the
+                    # complete snapshot is rendered. When the candidate is a normal
+                    # carrier, a quiet synthetic backlog is loaded once here.
+                    visible_ring_items = _foreign_controller_items(
+                        _envelopes_with_rows(
+                            read_authority,
+                            list(peek.items),
+                            controller_label=label,
+                            attention_by_id=candidate_attention,
+                        ),
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
         except goalflight_journal.CASMismatch as exc:
-            lease = authority.active_lease(label)
+            lease = read_authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
             return finish(reason, code=3, detail=str(exc))
         except goalflight_journal.JournalUpgradeRequired as exc:
@@ -9295,6 +9363,8 @@ def cmd_listen(args) -> int:
         except ValueError as exc:
             return finish("corrupt", code=2, detail=str(exc))
         else:
+            observed_data_version = current_data_version
+            observed_lease = lease
             recovered_s = journal_tolerance.note_success()
             if recovered_s is not None:
                 print(
@@ -9317,7 +9387,9 @@ def cmd_listen(args) -> int:
                     detail=f"listener ring stamp unavailable: {exc}",
                 )
             if not ring_claimed:
-                time.sleep(min(0.05, poll))
+                retry_result = wait_for_next_poll()
+                if retry_result is not None:
+                    return retry_result
                 continue
             positions = _cursor_positions(snapshot.items)
             advance_command = _cursor_advance_command(
@@ -9375,19 +9447,11 @@ def cmd_listen(args) -> int:
                 death_watch.restore()
                 raise
             death_watch.restore()
+            close_read_authority()
             return 0
-        delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll
-        sleep_until = time.monotonic() + delay
-        while time.monotonic() < sleep_until:
-            parent_result = parent_exit()
-            if parent_result is not None:
-                return parent_result
-            signal_result = signal_or_stdio_exit()
-            if signal_result is not None:
-                return signal_result
-            if deadline is not None and time.monotonic() >= deadline:
-                return finish("timeout", code=1, detail="no waking event before timeout")
-            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
+        poll_result = wait_for_next_poll()
+        if poll_result is not None:
+            return poll_result
 
 
 def cmd_listen_auto(args) -> int:
