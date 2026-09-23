@@ -19,6 +19,10 @@ run_setup() {
   bash "$REPO_ROOT/setup.sh" "$@"
 }
 
+# Default-on/off assertions measure the installer, not the operator's shell:
+# clear the add-on opt-in/opt-out switches; cases that need them set them.
+unset GOALFLIGHT_CODEX_CODEDB GOALFLIGHT_CODEX_CONTEXT_MODE
+
 list_out="$(run_setup --list-agents)"
 printf '%s\n' "$list_out" | grep -q 'controller codex-desktop-controller' || fail "codex desktop controller not listed"
 printf '%s\n' "$list_out" | grep -q 'controller grok-bot-workflows-controller' || fail "grok-bot controller not listed"
