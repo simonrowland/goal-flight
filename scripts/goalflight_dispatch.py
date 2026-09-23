@@ -9665,6 +9665,15 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         raise ValueError("no attempt for this dispatch in the selected journal; check --project-root")
     attempt = dict(rows[0])
     owner = (record or entry).get("controller_label") or attempt.get("owner_controller_label")
+    if not args.operator and not args.controller_label:
+        matches = [
+            session for session in goalflight_session_status._registered_controller_records(root)
+            if session.get("lease_state") == goalflight_journal.LEASE_ACTIVE
+            and _controller_session_is_in_ancestry(session)
+        ]
+        if len(matches) != 1:
+            raise ValueError("caller controller is absent or ambiguous; pass --controller-label")
+        args.controller_label = matches[0]["label"]
     if not args.operator and (not args.controller_label or args.controller_label != owner):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
@@ -9732,7 +9741,7 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
             transition_id=attempt["terminal_transition_id"],
             event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
-            terminal_state=state, observation={**outcome, "state": state},
+            terminal_state=journal_state, observation={**outcome, "state": journal_state},
             terminal_at=attempt["terminal_at"], idempotent=True,
         )
         projected = goalflight_ledger.terminal_record_projection(
@@ -9741,8 +9750,6 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             terminal, outcome.get("reason") or journal_state,
         )
         projected["project_root"] = str(root)
-        if journal_state != state:
-            projected["journal_terminal_state"] = journal_state
         payload = {"dispatch_id": args.dispatch_id, "status": "settled",
                    "attempt_id": attempt["attempt_id"], "terminal_state": state,
                    "journal_terminal_state": journal_state}
@@ -11214,14 +11221,14 @@ def _entry_pre_worker(entry: dict) -> bool:
 def _ledger_is_restorable_prelaunch(record: dict | None) -> bool:
     """Whether a ledger row still names work that must return to QUEUED.
 
-    `blocked_capacity` is a terminal *label* but a transient refusal: b-216
-    made that state restorable so fire-and-forget does not discard the entry.
+    A capacity refusal remains retryable until a journal terminal event has
+    been projected; b-216 keeps nonfinal refusals from discarding the entry.
     """
     if not isinstance(record, dict):
         return False
     state = str(record.get("state") or "")
     if state == "blocked_capacity":
-        return True
+        return not record.get("terminal_event_uuid")
     if _dispatch_record_is_terminal(record):
         return False
     return state in PRE_WORKER_LEDGER_STATES
