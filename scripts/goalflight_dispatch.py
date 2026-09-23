@@ -5223,7 +5223,7 @@ def _cmd_resume(argv: list[str]) -> int:
         ),
         usage_hint=(
             "try resume <dispatch-id> --prompt-file <path> [--account <account>] "
-            "[--os-sandbox <profile>]"
+            "[--os-sandbox <profile>] [--controller-beacon-pid <pid>]"
         ),
     )
     parser.add_argument("dispatch_id")
@@ -5255,6 +5255,11 @@ def _cmd_resume(argv: list[str]) -> int:
         "--controller-pid",
         type=int,
         help="Controller pid used to select a kernel-live project lease.",
+    )
+    parser.add_argument(
+        "--controller-beacon-pid",
+        type=int,
+        help="Controller beacon pid used to select a kernel-live project lease.",
     )
     parser.add_argument(
         "--controller-session-id",
@@ -5415,8 +5420,19 @@ def _resume_launch_argv(
     inject: list[str] = ["--skip-seat-reset"]
     if resume_args.unregistered_forced:
         inject.append("--unregistered-forced")
+    recorded_label = record.get("controller_label")
+    if (
+        resume_args.controller_label is None
+        and _option_value_before_worker_remainder(base, "--controller-label") is None
+        and recorded_label
+    ):
+        replace["--controller-label"] = str(recorded_label)
     for flag, value in (
         ("--controller-label", resume_args.controller_label),
+        (
+            "--controller-beacon-pid",
+            getattr(resume_args, "controller_beacon_pid", None),
+        ),
         ("--controller-pid", resume_args.controller_pid),
         ("--controller-session-id", resume_args.controller_session_id),
     ):
@@ -5536,6 +5552,12 @@ def _resume_launch_argv(
             "--status-json",
             "--prompt",
             "--worktree",
+            # Controller identity is per-attempt. The recorded values belong
+            # to the parent generation and must not block reconnection to the
+            # current live controller after a restart or reboot.
+            "--controller-beacon-pid",
+            "--controller-pid",
+            "--controller-session-id",
         )
         + sandbox_strip_options,
     )
