@@ -720,6 +720,7 @@ def _launch(args: argparse.Namespace) -> int:
         marker_path,
         {
             "worktree_path": str(worktree_seat.path),
+            "worktree_id": worktree_seat.seat_name,
             "worktree_seat": worktree_seat.seat_name,
             "worktree_branch": worktree_seat.branch,
             "quarantine_branch": worktree_seat.quarantine_branch,
@@ -851,6 +852,7 @@ def _launch(args: argparse.Namespace) -> int:
         "started_at": _utc_now(),
         "worktree_base_sha": getattr(args, "base_sha", ""),
         "worktree_path": str(worktree_seat.path),
+        "worktree_id": worktree_seat.seat_name,
         "worktree_seat": worktree_seat.seat_name,
         "worktree_branch": worktree_seat.branch,
         "quarantine_branch": worktree_seat.quarantine_branch,

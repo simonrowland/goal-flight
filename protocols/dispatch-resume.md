@@ -43,7 +43,7 @@ python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> \
 
 **Only write a fresh brief when the premise actually changed** — review findings
 to fix, a redirect, a corrected policy — or when the session genuinely cannot be
-recovered (no engine session handle, worktree seat recycled, context poisoned). Those
+recovered (no engine session handle, worktree recycled, context poisoned). Those
 cases are below. "The worker asked me a question" is never one of them.
 
 
@@ -91,7 +91,7 @@ you want to keep, not by what killed the worker.
   journal stay one story. The Goal Flight launch id is new because each
   spawn is a new process, lease, and status file; the conversation handle is
   not. Resume reattaches to the existing worktree, branch, and partial
-  artifacts — it does not acquire a sibling pooled seat. Quota-exhausted,
+  artifacts — it does not acquire a sibling pooled worktree. Quota-exhausted,
   dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
   continuable. `--account <account>` pins a surviving account; default selection
   skips recently quota-exhausted accounts until their reset.

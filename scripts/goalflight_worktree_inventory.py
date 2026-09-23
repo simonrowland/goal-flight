@@ -18,7 +18,7 @@ None of that was visible from inside any single repo. This tool makes it visible
 
 It is deliberately READ-ONLY. It reaps nothing and prunes nothing: deciding which
 of 456 worktrees may die is a judgement call about someone's in-flight work, and
-`goalflight_worktree_pool.py` already provides the bounded-seat discipline that
+`goalflight_worktree_pool.py` already provides the bounded-worktree discipline that
 prevents the accumulation in the first place. This reports; you decide.
 """
 
@@ -284,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nbusy repos (>= {args.threshold} worktrees): "
               f"{', '.join(report['busy_repos'])}")
         print("  goalflight_worktree_pool.py leases a bounded pool of reusable "
-              "seats; unbounded per-dispatch worktrees are what accumulate.")
+              "worktrees; unbounded per-dispatch worktrees are what accumulate.")
     return 0
 
 

@@ -660,6 +660,7 @@ def test_dispatch_payload_includes_worktree_branch(
     assert started.get("worktree_branch") == "worktree/report-branch", started
     assert launched.get("worktree_branch") == "worktree/report-branch", launched
     assert launched.get("worktree_seat") == "s-1", launched
+    assert launched.get("worktree_id") == launched.get("worktree_seat"), launched
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)

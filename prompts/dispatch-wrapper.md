@@ -18,7 +18,7 @@ PRE-FLIGHT (before reading the rest):
 4. If matched: continue.
 ```
 
-**Controller-side check, mandatory.** Before dispatching, run `git -C <worktree-path> rev-parse HEAD` and compare to expected SHA. If mismatched: don't dispatch. Recreate the worktree on the right base (`git -C <worktree> reset --hard <expected>` if branch can move; else recreate with `git worktree add -b <branch> <path> <expected>`). Prompt-side Layer 0 alone is honor-system; the controller-side check costs nothing and catches the issue before any executor tokens get spent.
+**Controller-side check, mandatory.** Before dispatching, run `git -C <worktree-path> rev-parse HEAD` and compare to expected SHA. If mismatched: don't dispatch. Rebind through the repository worktree pool at the expected base; do not hand-roll `git worktree add` or reset another owner's checkout. Prompt-side Layer 0 alone is honor-system; the controller-side check costs nothing and catches the issue before any executor tokens get spent.
 
 **Capture-timing rule** (load-bearing): capture the expected SHA AFTER any pre-dispatch admin commits (goal-queue Progress-table updates, RESUME-NOTES rev bumps, .gitignore additions) and BEFORE composing the dispatch prompt. Admin commits are part of the substrate the executor verifies against. Capture before they land and Layer 0 rejects: the worktree HEAD already includes commits the dispatch prompt does not know about. Codex correctly refuses such dispatches — the gate works as designed; the fix is capture order, not Layer 0 lenience.
 

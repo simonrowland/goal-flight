@@ -56,19 +56,19 @@ Writer inventory verified on the affected host (2026-09-13):
 | `drain-launchd.log` | `com.goalflight.drain`, one drain pass every 60 s |
 | `fleet-console-fleet-launchd.log` | `com.goalflight.fleet-console.fleet`, one producer tick every 60 s, 30 s budget |
 | `fleet-console-attention-launchd.log` | `com.goalflight.fleet-console.attention`, one producer tick every 20 s, 10 s budget |
-| `codex-seatd.log` | Installed `com.goalflight.codex-seatd`, external `scripts/ext/codex_seatd.py tick`, one pass every 300 s |
-| `grok-seatd.log` | Installed `com.goalflight.grok-seatd`, external `scripts/ext/grok_rotate.py --refresh --quiet`, one pass every 300 s |
+| `codex-accountd.log` | Installed provider-account rotator, external `scripts/ext/codex_seatd.py tick`, one pass every 300 s |
+| `grok-accountd.log` | Installed provider-account rotator, external `scripts/ext/grok_rotate.py --refresh --quiet`, one pass every 300 s |
 | `codex-rotate.log` | Retired poller; current external command refuses operation without opening the log. Existing file stays subject to the same threshold. |
 
 All five active writers use launchd `StandardOutPath` / `StandardErrorPath`,
-including the seat jobs; none uses an in-process file logger. Launchd opens
+including the provider-account jobs; none uses an in-process file logger. Launchd opens
 these descriptors with `O_APPEND` at each job start and does not overlap the
 same job's invocations. See [Apple's descriptor setup](https://github.com/apple-oss-distributions/launchd/blob/main/src/core.c#L4919)
 and [active-job check](https://github.com/apple-oss-distributions/launchd/blob/main/src/core.c#L4164).
 The fleet budgets and launch arguments are in `scripts/install-fleet-console.sh`
 and `scripts/templates/com.goalflight.fleet-console.plist.tmpl`. Detached drain
 workers receive their own stdout/stderr in `goalflight_dispatch.py`'s launch path.
-The seat implementations and installed plists are machine-local, not distributed
+The provider-account implementations and installed plists are machine-local, not distributed
 by this template. The retired poller's historical open flags were not established.
 
 Rotation uses **the same inode, no compression, no signals** (`BN`, plus `-s`).

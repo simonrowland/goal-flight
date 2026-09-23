@@ -439,6 +439,12 @@ def test_new_repo_cap_precedes_deprecated_seat_alias() -> None:
             os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = prior_old
 
 
+def test_branch_reader_accepts_new_and_legacy_prefixes() -> None:
+    assert goalflight_worktree_pool.is_worktree_branch("worktree/example")
+    assert goalflight_worktree_pool.is_worktree_branch("seat/example")
+    assert not goalflight_worktree_pool.is_worktree_branch("feature/example")
+
+
 def test_read_only_worktree_is_shared_by_commit() -> None:
     with tempfile.TemporaryDirectory() as td:
         repo = make_repo(Path(td))

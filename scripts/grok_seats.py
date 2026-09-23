@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Pick a grok login that still has headroom, the way codex picks a seat.
+"""Pick a grok account that still has headroom.
 
-Codex has a daemon that probes every seat, publishes ``codex-seat-states.json``
-and an active-seat pointer, and lets ``codex_seat_lib.resolve_codex_seat`` fall
+Codex has a daemon that probes every account, publishes the legacy
+``codex-seat-states.json`` snapshot and active-account pointer, and lets the
+legacy ``codex_seat_lib.resolve_codex_seat`` helper fall
 through explicit account -> per-repo table -> pointer -> host. Grok had none of
 that: every unpinned grok dispatch ran on the host ``~/.grok`` no matter how
 exhausted it was, and a second account could only be reached by pinning
@@ -17,13 +18,13 @@ Three rules carry the design:
 
 * **Unknown usage is not usable or exhausted.** A timeout, unreadable document,
   or absent measurement proves neither state. It is retried on the next select,
-  but never receives work merely because no measured seat is available.
+  but never receives work merely because no measured account is available.
 * **Only measured headroom is selectable.** HTTP 402, auth rejection, parsed
   token absence, and an explicit wall are unusable; a numeric reading below the
   flip threshold is usable.
 * **A 401 may be recoverable.** An optional local rotator (loaded from ``ext``
   if present, otherwise a no-op) may recover a failed probe before this module
-  records the seat unusable, and may mark a seat exhausted the moment a dispatch
+  records the account unusable, and may mark an account exhausted the moment a dispatch
   proves it. Most installs have no rotator; a missing one must never change or
   fail a dispatch.
 """
@@ -41,8 +42,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grok_usage  # noqa: E402
 
-# A seat at or above this much of its credit spent is "starved" and selection
-# flips away from it. Below 100 on purpose: a seat that is exactly empty has
+# An account at or above this much of its credit spent is "starved" and selection
+# flips away from it. Below 100 on purpose: an account that is exactly empty has
 # already begun failing dispatches, so the flip has to happen while there is
 # still usable headroom left to flip with.
 EXHAUSTED_AT_PERCENT = 98.0
@@ -50,7 +51,7 @@ EXHAUSTED_AT_PERCENT = 98.0
 STATE_PATH = Path.home() / ".goal-flight" / "grok-seat-states.json"
 STATE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 10.0
-HOST_KEY = ""  # the host ~/.grok login, which has no seat label
+HOST_KEY = ""  # the host ~/.grok login, which has no account label
 PROBE_STATES = {"usable", "unusable", "unknown"}
 AUTH_STATES = {"valid", "invalid", "unknown"}
 
@@ -119,7 +120,7 @@ def note_exhausted(
     path: Path | None = None,
     marker=None,
 ) -> bool:
-    """Tell the optional rotator this seat is starved. Never raises.
+    """Tell the optional rotator this account is starved. Never raises.
 
     Returns True only if a rotator accepted the mark. A missing rotator is
     the common case and must be indistinguishable from a no-op.
@@ -146,7 +147,7 @@ def note_exhausted_if_proven(
     path: Path | None = None,
     marker=None,
 ) -> bool:
-    """Mark a grok seat exhausted only when a dispatch just proved it.
+    """Mark a grok account exhausted only when a dispatch just proved it.
 
     Requires a terminal ``quota_exhausted`` outcome AND a non-empty
     ``effective_account`` on a grok record. Anything else -- another engine,
@@ -213,7 +214,7 @@ def ensure_project_trusted(home_dir: Path, project_root: Path) -> bool:
     exits within seconds writing nothing at all -- through the dispatcher that
     looks exactly like a worker that launched and died, with an empty tail and
     no error to read. A freshly created per-account home starts with an EMPTY
-    trust list, so every seat hits this in every repo until registered, and any
+    trust list, so every account hits this in every repo until registered, and any
     worktree counts as its own directory.
 
     Registering the directory the operator is explicitly dispatching INTO is not
@@ -350,7 +351,7 @@ def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool
         # login is observed without waiting out the cache TTL. States are
         # DERIVED, not read raw: the external rotator (scripts/ext) and older
         # recovery hooks write ``ok`` + ``used_percent`` without the typed keys,
-        # and a measured legacy entry is a fresh usable seat, not a stale one.
+        # and a measured legacy entry is a fresh usable account, not a stale one.
         return False
     return True
 
@@ -385,7 +386,7 @@ def refresh_states(
             record = {"ok": False, "error": "reader raised"}
         # A 401 is the kimi-style "lapsed, auto-heals" case: the login still
         # exists, the access token just expired. Recording it dead benches a
-        # live seat until the next TTL and can starve the whole fleet. Only
+        # live account until the next TTL and can starve the whole fleet. Only
         # a 401 is offered to the rotator; a 403/5xx/malformed body is left
         # as-is so we do not launch a recovery process per broken seat.
         if (
@@ -433,14 +434,14 @@ def refresh_states(
 
 
 def _rank(entry: object) -> tuple[int, float] | None:
-    """Sort key for one seat, or None when the seat is not eligible.
+    """Sort key for one account, or None when the account is not eligible.
 
     Only a measured usable probe receives a rank, ordered by least-used first.
     """
     if not isinstance(entry, dict):
         return None
     # Derive, never read raw: a legacy ``ok`` + ``used_percent`` record from the
-    # external rotator is a measured usable seat and must rank like one.
+    # external rotator is a measured usable account and must rank like one.
     if (
         _record_probe_state(entry) != "usable"
         or _record_auth_state(entry) != "valid"
@@ -462,14 +463,14 @@ def select_seat(
     refresher=None,
     exclude: set[str] | None = None,
 ) -> str | None:
-    """Return a usable seat label, None for a usable host, or raise if unknown."""
+    """Return a usable account label, None for a usable host, or raise if unknown."""
     try:
         document = load_states(path)
         if allow_refresh and not states_are_fresh(document, now=now):
             refresh = refresh_states if refresher is None else refresher
             document = refresh(path=path, now=now)
         if not document:
-            raise NoUsableSeat("no usable grok seat: probe state unavailable")
+            raise NoUsableSeat("no usable grok account: probe state unavailable")
 
         excluded = exclude or set()
         ranked: list[tuple[tuple[int, float], str]] = []
@@ -480,21 +481,21 @@ def select_seat(
             if rank is not None:
                 ranked.append((rank, key))
         if not ranked:
-            raise NoUsableSeat("no usable grok seat")
+            raise NoUsableSeat("no usable grok account")
         ranked.sort(key=lambda item: (item[0], item[1]))
         best = ranked[0][1]
         return None if best == HOST_KEY else best
     except NoUsableSeat:
         raise
     except grok_usage.GrokUsageError as exc:
-        raise NoUsableSeat(f"no usable grok seat: {exc}") from exc
+        raise NoUsableSeat(f"no usable grok account: {exc}") from exc
     except Exception as exc:
-        raise NoUsableSeat("no usable grok seat: probe failed") from exc
+        raise NoUsableSeat("no usable grok account: probe failed") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Show or refresh grok seat headroom and the selected seat."
+        description="Show or refresh grok account headroom and the selected account."
     )
     parser.add_argument("--refresh", action="store_true", help="probe now")
     parser.add_argument("--json", action="store_true")
@@ -508,13 +509,13 @@ def main(argv: list[str] | None = None) -> int:
         selected_text = selected or "(host ~/.grok)"
     except NoUsableSeat:
         selected = None
-        selected_text = "(no usable seat)"
+        selected_text = "(no usable account)"
 
     if args.json:
         print(json.dumps({"selected": selected, "states": document}, indent=2))
         return 0
     age = _now() - float(document.get("updated_at") or 0)
-    print(f"grok seat states (age {age / 60:.0f}m, flip at {EXHAUSTED_AT_PERCENT:.0f}% used):")
+    print(f"grok account states (age {age / 60:.0f}m, flip at {EXHAUSTED_AT_PERCENT:.0f}% used):")
     for key, entry in sorted(document.get("seats", {}).items()):
         name = key or "(host ~/.grok)"
         used = entry.get("used_percent")

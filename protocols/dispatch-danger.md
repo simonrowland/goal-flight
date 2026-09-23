@@ -16,7 +16,7 @@ Safe to run anytime, as often as you like.
 
 - **`/goal-flight execute [--parallel N]`** — dispatches queued chunks with the full
   `prompts/dispatch-wrapper.md` mandate. `--parallel N≥2` isolates each worker in a
-  leased pooled seat (`scripts/goalflight_acp_run.py --worktree create`); sequential
+  leased pooled worktree (`scripts/goalflight_acp_run.py --worktree create`); sequential
   dispatch stays in the project root.
 - **Dispatcher CLI (`scripts/goalflight_dispatch.py`)** — launches one worker
   immediately in default detached mode. It waits for the lane's capacity window;
@@ -49,7 +49,7 @@ dispatch attempt. `--dry-run` lists planned record fields without writing;
 a no-op. A spawn intent without a worker PID must age past the claim-stale window
 before withdrawal is allowed.
 Use `--superseded-by <replacement-id>` to record `superseded` instead. Both
-outcomes settle the journal as `TERMINAL`, release the seat, and do not hold
+outcomes settle the journal as `TERMINAL`, release the worktree lease, and do not hold
 linked tasks against a fresh dispatch. The replacement keeps its own task claim.
 
 Reconciliation is fail-closed. A record must be a stale local running dispatch
