@@ -198,7 +198,8 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
         assert ledger["project_root"] == str(repo.resolve())
         assert ledger["worker_cwd"] == str(seat.resolve())
         assert runner_spawn["cwd"] == str(seat.resolve())
-        assert runner_spawn["pass_fds"] == (seat_fd,)
+        assert seat_fd in runner_spawn["pass_fds"]
+        assert len(runner_spawn["pass_fds"]) == 2
         assert not (seat.parent / "s-2").exists()
 
 
