@@ -111,6 +111,11 @@ Always:
 Never load fork, ACP, corpus, review, or tool-specific details just because the
 skill loaded. Load those protocols on demand.
 
+Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
+For a file outside your worktree, use its known path.
+
 ## Session Pre-Flight
 
 For non-trivial commands, use `protocols/session-preflight.md`.

@@ -640,7 +640,9 @@ def _record_acp_ledger_state(
                 argparse.Namespace(
                     dispatch_id=dispatch_id,
                     prompt_id=cfg.prompt_id,
-                    prompt_path=cfg.prompt,
+                    # The prompt is now delivered inline (prompt_text); record the
+                    # brief's file so prompt hashing and echo filtering keep working.
+                    prompt_path=cfg.prompt or getattr(cfg, "original_prompt_file", None),
                     task_ids=getattr(cfg, "task_ids", []),
                     agent=cfg.agent,
                     engine=goalflight_ledger.infer_engine(cfg.agent),

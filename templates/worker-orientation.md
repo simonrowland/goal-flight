@@ -4,6 +4,11 @@
 
 This brief is the per-project north-star pointer for substantive workers. Keep it terse, factual, and stable enough to re-read before judgment-bearing work.
 
+Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
+For a file outside your worktree, use its known path.
+
 ## North Star
 
 {{ONE_PARAGRAPH_NORTH_STAR}}

@@ -1057,6 +1057,14 @@ WORKER_EXECUTION_PREAMBLE = (
 )
 
 
+SEARCH_SCOPE_PREAMBLE = (
+    "Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.\n"
+    "Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,\n"
+    "`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.\n"
+    "For a file outside your worktree, use its known path."
+)
+
+
 # Workers routinely deliver a correct fix wrapped in scaffolding nobody asked
 # for: a config knob with one caller, a compatibility shim for a case that
 # cannot occur, a parallel implementation left beside the one it replaces.
@@ -5333,6 +5341,7 @@ def _worker_prompt_preamble(
     if agent in {"grok-code", "grok-research", "moonshot"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
     preambles.append(SCOPE_GUARD_PREAMBLE)
+    preambles.append(SEARCH_SCOPE_PREAMBLE)
     return "\n\n".join(preambles)
 
 
@@ -17433,17 +17442,17 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         project_root,
         disabled=bool(getattr(args, "no_orientation", False)),
     )
-    acp_prompt_path = prompt_path
     acp_prompt_text = None if prompt_path else args.prompt
     if orientation_path is not None and prompt_path:
         body = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
-        acp_prompt_path = None
         acp_prompt_text = f"{_project_orientation_preamble(orientation_path)}\n\n{body}"
     delivered_body = (
         acp_prompt_text
         if acp_prompt_text is not None
         else Path(prompt_path).read_text(encoding="utf-8", errors="replace")
     )
+    acp_prompt_text = f"{SEARCH_SCOPE_PREAMBLE}\n\n{delivered_body}"
+    delivered_body = acp_prompt_text
     delivered_prompt = (
         f"{PROMPT_FILE_PREAMBLE}\n\n{delivered_body}"
         if prompt_path
@@ -17489,7 +17498,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         capacity_wait_s=_capacity_wait_seconds(args),
         preserve_capacity_refusal_attempt=_capacity_refusal_attempt_stays_prepared(args),
         prompt_id=None,
-        prompt=acp_prompt_path,
+        prompt=None,
         prompt_text=acp_prompt_text,
         prompt_b64=None,
         original_prompt_file=prompt_path,

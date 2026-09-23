@@ -116,11 +116,13 @@ def test_build_acp_cfg_agent_liveness_defaults() -> None:
             args = _base_acp_args(tmp, agent=agent, dispatch_id=f"{agent}-cfg")
             cfg = dispatch_mod._build_acp_cfg(args, status_json=tmp / f"{agent}.json")
             assert cfg.agent == agent
+            assert dispatch_mod.SEARCH_SCOPE_PREAMBLE in cfg.prompt_text
             assert cfg.liveness_profile == "remote_api"
 
         args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="codex-cfg")
         cfg = dispatch_mod._build_acp_cfg(args, status_json=tmp / "codex.json")
         assert cfg.agent == "codex-acp"
+        assert dispatch_mod.SEARCH_SCOPE_PREAMBLE in cfg.prompt_text
         assert cfg.liveness_profile is None
 
         args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="priority-cfg")
@@ -399,11 +401,12 @@ def test_build_acp_cfg_injects_orientation_prompt_text() -> None:
         assert f"Path: {orientation.resolve()}" in cfg.prompt_text
         assert dispatch_mod.PROJECT_ORIENTATION_SCOPE_RULE in cfg.prompt_text
         assert "Do ACP work." in cfg.prompt_text
+        assert dispatch_mod.SEARCH_SCOPE_PREAMBLE in cfg.prompt_text
 
         args.no_orientation = True
         suppressed = dispatch_mod._build_acp_cfg(args, status_json=tmp / "suppressed.json")
-        assert suppressed.prompt == str(prompt.resolve())
-        assert suppressed.prompt_text is None
+        assert suppressed.prompt is None
+        assert suppressed.prompt_text == f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\nDo ACP work.\n"
         assert suppressed.original_prompt_file == str(prompt.resolve())
 
 
@@ -505,7 +508,8 @@ def test_acp_inline_prompt_uses_same_assembled_prompt_path() -> None:
             "inline-acp.assembled.prompt"
         )
         assert watcher_prompt.read_text(encoding="utf-8") == (
-            f"{dispatch_mod.PROMPT_FILE_PREAMBLE}\n\n{args.prompt}"
+            f"{dispatch_mod.PROMPT_FILE_PREAMBLE}\n\n"
+            f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\n{args.prompt}"
         )
 
 
