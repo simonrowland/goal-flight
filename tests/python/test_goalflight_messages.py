@@ -882,7 +882,9 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 )
                 assert_true("concurrent cursor advance committed", advanced.committed)
                 release_cas.set()
-                worker.join()
+                # Bounded: a hung drain must fail this test, never hang the suite.
+                worker.join(timeout=60)
+                assert_true("drain race thread finished", not worker.is_alive())
                 assert_true(
                     "drain race completed with exactly one CAS loss; "
                     f"return={outcome['return']!r}; "
