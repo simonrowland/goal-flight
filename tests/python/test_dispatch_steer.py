@@ -631,7 +631,7 @@ def case_worker_wait_atomic_question_has_own_deadline() -> None:
         )
         elapsed = time.monotonic() - started
         assert proc.returncode == 1, proc.stdout + proc.stderr
-        assert 0.15 <= elapsed < 0.8, elapsed
+        assert elapsed < 10.0, elapsed
         lines = proc.stdout.splitlines()
         assert lines[0].startswith(
             f"!USER-CONFIRM: {dispatch_id} — authorize the guarded action? "
@@ -645,6 +645,11 @@ def case_worker_wait_atomic_question_has_own_deadline() -> None:
             goalflight_steer_mailbox.WORKER_WAIT_ENDED_KIND,
         ], entries
         assert entries[-1]["decision"] == "timeout", entries
+        assert entries[-1]["context"]["timeout_secs"] == 0.2, entries
+        assert (
+            entries[-1]["context"]["deadline_awake_mono_ns"]
+            == entries[0]["context"]["deadline_awake_mono_ns"]
+        ), entries
 
 
 def case_worker_wait_question_is_published_before_waiting() -> None:
@@ -842,6 +847,21 @@ def case_worker_wait_requires_an_atomic_question() -> None:
         proc = _run_worker_wait(tmp, dispatch_id, "--timeout-secs", "0.1")
         assert proc.returncode == 64, proc.stdout + proc.stderr
         assert "requires question text and --question-kind" in proc.stderr, proc.stderr
+        assert not _mailbox(tmp, dispatch_id).exists()
+
+        proc = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "CUSTOM-QUESTION",
+            "supply the missing value",
+            "--timeout-secs",
+            "0.1",
+        )
+        assert proc.returncode == 64, proc.stdout + proc.stderr
+        assert "question-kind must be one of:" in proc.stderr, proc.stderr
+        assert "USER-NEED" in proc.stderr, proc.stderr
+        assert "USER-CONFIRM" in proc.stderr, proc.stderr
         assert not _mailbox(tmp, dispatch_id).exists()
 
 

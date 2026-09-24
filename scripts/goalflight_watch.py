@@ -275,7 +275,7 @@ def _count_from_snapshot(
     return wedge_watch.TreeWriteSample(count=count, available=True)
 
 
-REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
+REPLY_WAIT_MARKER_KINDS = goalflight_terminal.WORKER_WAIT_QUESTION_KINDS
 WORKER_WAIT_ARM_GRACE_SECS = 1.0
 # Live salvage CANDIDATE: tail stale + tree quiet + cumulative CPU flat.
 # Detection only; the watcher never kills. Probation is

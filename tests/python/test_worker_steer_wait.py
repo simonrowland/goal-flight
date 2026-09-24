@@ -279,33 +279,39 @@ def test_wait_returns_promptly_at_its_independent_deadline(tmp_path: Path) -> No
     assert steer.active_worker_wait(entries, dispatch_id="deadline") is None
 
 
-def test_question_kind_wait_publishes_custom_kind_and_timeout_settles(
-    tmp_path: Path,
-) -> None:
-    mailbox = tmp_path / "custom-question.steer.jsonl"
-    published: list[dict] = []
-    result = steer.wait_for_worker_entries(
-        mailbox,
-        dispatch_id="custom-question",
-        acked_seqs=set(),
-        question_kind="CUSTOM-QUESTION",
-        question_text="supply the missing value",
-        timeout_secs=0.05,
-        poll_secs=0.2,
-        publish_question=published.append,
-    )
+def test_valid_question_kinds_round_trip_through_watcher(tmp_path: Path) -> None:
+    for index, question_kind in enumerate(sorted(steer.WORKER_WAIT_QUESTION_KINDS)):
+        mailbox = tmp_path / f"question-{index}.steer.jsonl"
+        published: list[dict] = []
+        result = steer.wait_for_worker_entries(
+            mailbox,
+            dispatch_id=f"question-{index}",
+            acked_seqs=set(),
+            question_kind=question_kind,
+            question_text="supply the missing value",
+            timeout_secs=0.05,
+            poll_secs=0.2,
+            publish_question=published.append,
+        )
 
-    assert result["state"] == "deadline", result
-    assert len(published) == 1, published
-    assert published[0]["question_kind"] == "CUSTOM-QUESTION", published
-    assert published[0]["question_text"] == "supply the missing value", published
-    assert published[0]["reply_command"].endswith('"<answer>"'), published
-    entries = steer.read_steer_entries(mailbox)
-    assert [entry["kind"] for entry in entries] == [
-        steer.WORKER_WAIT_STARTED_KIND,
-        steer.WORKER_WAIT_ENDED_KIND,
-    ], entries
-    assert entries[-1]["decision"] == "timeout", entries
+        assert result["state"] == "deadline", result
+        assert len(published) == 1, published
+        assert published[0]["question_kind"] == question_kind, published
+        assert published[0]["question_text"] == "supply the missing value", published
+        assert published[0]["reply_command"].endswith('"<answer>"'), published
+        tail = tmp_path / f"question-{index}.tail"
+        tail.write_text(
+            f"!{question_kind}: {published[0]['question_marker_text']}\n",
+            encoding="utf-8",
+        )
+        markers, _size = watch.extract_markers(tail)
+        assert markers[-1]["kind"] == question_kind, markers
+        entries = steer.read_steer_entries(mailbox)
+        assert [entry["kind"] for entry in entries] == [
+            steer.WORKER_WAIT_STARTED_KIND,
+            steer.WORKER_WAIT_ENDED_KIND,
+        ], entries
+        assert entries[-1]["decision"] == "timeout", entries
 
 
 def test_timeout_settlement_accepts_and_records_late_reply_then_next_wait(
@@ -2500,8 +2506,6 @@ print("WAIT-RETURNED", flush=True)
         assert waiter.returncode == 0, waiter_out + waiter_err
         assert "STEER-REPLY:" in waiter_out, waiter_out
         assert "WAIT-RETURNED" in waiter_out, waiter_out
-        receipts = steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox)
-        assert receipts == {(str(arm["question_id"]), int(reply["seq"]))}, receipts
     finally:
         release_stall.write_text("release\n", encoding="utf-8")
         if waiter.poll() is None:

@@ -4542,13 +4542,22 @@ def _cmd_steer(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 64
+        question_kind = str(args.question_kind).strip()
+        if question_kind not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
+            valid = ", ".join(sorted(goalflight_terminal.WORKER_WAIT_QUESTION_KINDS))
+            print(
+                "goalflight_dispatch: --question-kind must be one of: "
+                f"{valid}",
+                file=sys.stderr,
+            )
+            return 64
         try:
             result = goalflight_steer_mailbox.wait_for_worker_entries(
                 _worker_wait_mailbox(args.dispatch_id),
                 dispatch_id=args.dispatch_id,
                 acked_seqs=_acked_steer_seqs(record),
                 consumed_reply_receipts=_consumed_worker_wait_receipts(args.dispatch_id, record),
-                question_kind=args.question_kind,
+                question_kind=question_kind,
                 question_text=args.message,
                 timeout_secs=args.timeout_secs,
                 poll_secs=args.poll_secs,

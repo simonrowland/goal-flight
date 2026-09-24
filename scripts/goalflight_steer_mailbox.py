@@ -34,6 +34,7 @@ WORKER_WAIT_STARTED_KIND = "worker_wait_started"
 WORKER_WAIT_ENDED_KIND = "worker_wait_ended"
 WORKER_WAIT_REPLY_KIND = "worker_wait_reply"
 WORKER_WAIT_SETTLED_DECISIONS = frozenset({"failed", "reply", "timeout"})
+WORKER_WAIT_QUESTION_KINDS = goalflight_terminal.WORKER_WAIT_QUESTION_KINDS
 USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
@@ -962,16 +963,10 @@ def _positive_finite_seconds(value: object, *, field: str, maximum: float) -> fl
 
 def _validate_worker_question(question_kind: str, question_text: object) -> str:
     normalized_kind = str(question_kind or "").strip()
-    if (
-        not normalized_kind
-        or len(normalized_kind) > 64
-        or any(char in normalized_kind for char in "\r\n")
-        or not normalized_kind[0].isalpha()
-        or any(not (char.isalnum() or char in "_-") for char in normalized_kind)
-    ):
+    if normalized_kind not in WORKER_WAIT_QUESTION_KINDS:
+        valid = ", ".join(sorted(WORKER_WAIT_QUESTION_KINDS))
         raise ValueError(
-            "question_kind must be a non-empty one-line marker name using letters, "
-            "numbers, '-' or '_'"
+            f"question_kind must be one of: {valid}"
         )
     normalized = str(question_text or "").strip()
     if not normalized:
