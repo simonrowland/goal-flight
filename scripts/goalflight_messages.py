@@ -491,12 +491,16 @@ def mail_lock(path: Path, *, timeout_secs: float | None = None):
                         )
                         break
                     except OSError as exc:
-                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                        if (
+                            not isinstance(exc, BlockingIOError)
+                            and exc.errno
+                            not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
+                        ):
                             raise
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError(
-                                f"{lock}: carrier lock deadline reached (lock contention)"
+                                f"{lock}: mailbox lock busy for {timeout:g}s"
                             ) from exc
                         time.sleep(min(0.01, remaining))
             acquired = True

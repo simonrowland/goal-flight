@@ -511,6 +511,38 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
         holder.wait(timeout=5)
 
 
+def test_bounded_mailbox_read_retries_and_times_out_typed(
+    tmp_path: Path,
+) -> None:
+    mailbox = tmp_path / "read-lock.steer.jsonl"
+    ready = threading.Event()
+
+    def hold_lock(seconds: float) -> None:
+        with messages.mail_lock(mailbox):
+            ready.set()
+            time.sleep(seconds)
+
+    holder = threading.Thread(target=hold_lock, args=(0.3,))
+    holder.start()
+    assert ready.wait(timeout=2), "mailbox lock holder did not become ready"
+    try:
+        assert steer.read_steer_entries(mailbox, lock_timeout_secs=5.0) == []
+    finally:
+        holder.join(timeout=5)
+    assert not holder.is_alive(), "mailbox lock holder did not release"
+
+    ready.clear()
+    holder = threading.Thread(target=hold_lock, args=(0.3,))
+    holder.start()
+    assert ready.wait(timeout=2), "mailbox lock holder did not become ready"
+    try:
+        with pytest.raises(TimeoutError, match=r"mailbox lock busy for 0.05s"):
+            steer.read_steer_entries(mailbox, lock_timeout_secs=0.05)
+    finally:
+        holder.join(timeout=5)
+    assert not holder.is_alive(), "mailbox lock holder did not release"
+
+
 def test_timeout_settlement_does_not_wait_on_mailbox_lock(tmp_path: Path) -> None:
     mailbox = tmp_path / "timeout-lock.steer.jsonl"
     ready = tmp_path / "timeout-lock.ready"
