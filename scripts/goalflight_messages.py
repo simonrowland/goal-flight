@@ -3960,7 +3960,6 @@ def _listener_envelope(
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
     carrier_errors: list[dict[str, object]] | None = None,
-    settled_rows: list[dict[str, object]] | None = None,
 ) -> dict | None:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
@@ -4018,15 +4017,6 @@ def _listener_envelope(
         ),
         None,
     )
-    if result.status is CarrierReadStatus.CARRIER_UNREADABLE:
-        details = "; ".join(
-            str(error.get("error") or error.get("reason") or result.status.value)
-            for error in result.errors
-        )
-        raise MessageError(
-            f"CARRIER-UNREADABLE: retryable carrier read: {path}"
-            + (f": {details}" if details else "")
-        )
     if envelope is not None:
         return envelope
     if envelope is None:
@@ -4034,22 +4024,6 @@ def _listener_envelope(
             str(error.get("error") or error.get("reason") or result.status.value)
             for error in result.errors
         )
-        if result.status not in {
-            CarrierReadStatus.OK,
-            CarrierReadStatus.CARRIER_MISSING,
-        }:
-            recipient = str(row.get("recipient_label") or "").strip()
-            if (
-                controller_label is not None
-                and recipient
-                and recipient not in {"*", controller_label}
-            ):
-                return None
-            raise MessageError(
-                "STUCK: carrier corruption; "
-                f"path={path}; reason={details or result.status.value}; "
-                f"delivery_id={event_uuid}"
-            )
         assignments = authority.read_all(
             """SELECT recipient_label, projected_at, withdrawn_at FROM delivery_events
                WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
@@ -4076,33 +4050,26 @@ def _listener_envelope(
                 for item in live_assignments
             ):
                 return None
+        # Carrier state is never a settlement decision. Only returning the
+        # matching envelope lets the caller show and advance this delivery.
+        diagnostic = "journal delivery assignment has no projected carrier row"
         if result.status is CarrierReadStatus.CARRIER_MISSING:
-            raise MessageError(
-                "journal delivery assignment has no projected carrier row: "
-                f"event_uuid={event_uuid} origin_node={origin_node} "
-                f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
-                f"carrier row absent from {path}; carrier is missing; "
-                "delivery remains pending; projection/withdrawal evidence incomplete; "
-                f"inspect delivery_events in {authority.path}"
+            details = (
+                f"{diagnostic}; {details or 'carrier is missing'}; carrier row absent; "
+                "delivery remains pending; projection/withdrawal evidence "
+                f"incomplete; inspect delivery_events in {authority.path}"
             )
-        withdrawal_error = _withdraw_carrier_delivery(
-            authority,
-            row,
-            controller_label=controller_label,
-        )
-        if withdrawal_error is None and settled_rows is not None:
-            settled_rows.append(row)
+        elif result.status is CarrierReadStatus.OK:
+            details = (
+                f"{diagnostic}; valid carrier row does not match the journal delivery identity "
+                f"(event/source/sequence); {details or 'no matching envelope'}"
+            )
+        else:
+            details = f"{diagnostic}; {details or result.status.value}"
         raise MessageError(
-            "journal delivery assignment has no projected carrier row: "
-            f"event_uuid={event_uuid} origin_node={origin_node} "
-            f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
-            f"carrier row absent from {path}; projection/withdrawal evidence incomplete; "
-            f"inspect delivery_events in {authority.path}"
-            + (
-                f"; delivery withdrawal failed: {withdrawal_error}"
-                if withdrawal_error
-                else "; delivery assignment withdrawn"
-            )
+            "STUCK: carrier delivery is not reportable; "
+            f"path={path}; reason={details}; delivery_id={event_uuid}; "
+            f"event_uuid={event_uuid}"
         )
     return envelope
 
@@ -5607,45 +5574,6 @@ def _attention_items_for_rows(
     }
 
 
-def _withdraw_carrier_delivery(
-    authority,
-    row: dict[str, object],
-    *,
-    controller_label: str | None = None,
-) -> str | None:
-    """Withdraw a skipped physical-carrier assignment from the journal."""
-    import goalflight_journal  # type: ignore
-
-    carrier_path = str(row.get("carrier_path") or "")
-    if not carrier_path or carrier_path.startswith("journal:"):
-        return None
-    recipient = str(row.get("recipient_label") or controller_label or "*").strip()
-    origin = str(row.get("origin_node") or "").strip()
-    event_uuid = str(row.get("event_uuid") or "").strip()
-    if not recipient or not origin or not event_uuid:
-        return "delivery assignment identity is incomplete"
-    try:
-        writer = authority
-        if bool(getattr(authority, "_read_only_client", False)):
-            writer = goalflight_journal.Journal(
-                getattr(authority, "project_root"),
-                retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
-                open_retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
-            )
-        result = writer.withdraw_delivery_event(
-            recipient_label=recipient,
-            origin_node=origin,
-            event_uuid=event_uuid,
-        )
-        if not result.committed:
-            return str(result.reason or "delivery assignment withdrawal was not committed")
-    except goalflight_journal.JournalError:
-        raise
-    except Exception as exc:
-        return f"{type(exc).__name__}: {exc}"
-    return None
-
-
 def _envelopes_with_rows(
     authority,
     rows: list[dict] | tuple[dict, ...],
@@ -5653,7 +5581,6 @@ def _envelopes_with_rows(
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
     carrier_errors: list[dict[str, object]] | None = None,
-    settled_rows: list[dict[str, object]] | None = None,
 ) -> list[tuple[dict, dict]]:
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
@@ -5667,7 +5594,6 @@ def _envelopes_with_rows(
                 controller_label=controller_label,
                 attention_by_id=attention_by_id,
                 carrier_errors=observed_errors,
-                settled_rows=settled_rows,
             )
         except MessageError as exc:
             carrier_path = str(row.get("carrier_path") or "")
@@ -5763,11 +5689,9 @@ def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
 def _cursor_positions_for_shown_rows(
     rows: list[dict] | tuple[dict, ...],
     shown_items: list[tuple[dict, dict]],
-    settled_rows: list[dict] | tuple[dict, ...] = (),
 ) -> dict[str, int]:
-    """Return positions only for streams whose peek rows were shown or settled."""
+    """Return positions only for streams whose peek rows were shown."""
     shown_rows = {id(row) for row, _envelope in shown_items}
-    shown_rows.update(id(row) for row in settled_rows)
     positions: dict[str, int] = {}
     blocked: set[str] = set()
     for row in rows:
@@ -6012,13 +5936,11 @@ def cmd_relay(args: argparse.Namespace) -> int:
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
         carrier_errors: list[dict[str, object]] = []
-        settled_rows: list[dict[str, object]] = []
         items_with_rows = _envelopes_with_rows(
             authority,
             rows,
             controller_label=controller_label,
             carrier_errors=carrier_errors,
-            settled_rows=settled_rows,
         )
         if since is not None:
             items_with_rows = [
@@ -6050,7 +5972,6 @@ def cmd_relay(args: argparse.Namespace) -> int:
     positions = _cursor_positions_for_shown_rows(
         rows,
         shown_items,
-        settled_rows,
     )
     position_snapshots = {
         stream_id: peek.stream_snapshots[stream_id]
@@ -8862,18 +8783,16 @@ def cmd_listen(args) -> int:
     pending_report_settled = True
     prearmed_visible_items: list[tuple[dict, dict]] | None = None
     prearmed_materialized_items: list[tuple[dict, dict]] | None = None
-    prearmed_settled_rows: list[dict] = []
     reported_carrier_errors: set[tuple[str, str]] = set()
-    missing_carrier_seen = False
+    stuck_carrier_seen = False
 
     def listener_envelopes(
         source,
         rows: list[dict] | tuple[dict, ...],
         *,
         attention_by_id: dict[str, dict[str, object]] | None = None,
-        settled_rows: list[dict[str, object]] | None = None,
     ) -> list[tuple[dict, dict]]:
-        nonlocal missing_carrier_seen
+        nonlocal stuck_carrier_seen
         errors: list[dict[str, object]] = []
         items = _envelopes_with_rows(
             source,
@@ -8881,10 +8800,9 @@ def cmd_listen(args) -> int:
             controller_label=label,
             attention_by_id=attention_by_id,
             carrier_errors=errors,
-            settled_rows=settled_rows,
         )
-        missing_carrier_seen = missing_carrier_seen or any(
-            error.get("carrier_status") == CarrierReadStatus.CARRIER_MISSING.value
+        stuck_carrier_seen = stuck_carrier_seen or any(
+            error.get("status") == "STUCK"
             for error in errors
         )
         for error in errors:
@@ -8979,12 +8897,10 @@ def cmd_listen(args) -> int:
                 # carrier fault must not stamp a high-water no arm actually
                 # reported. JSON still validates carriers; it only omits bodies
                 # from the wake record.
-                prearmed_settled_rows = []
                 prearmed_items = _retry_listener_journal_busy(
                     lambda: listener_envelopes(
                         authority,
                         list(arm_snapshot.items),
-                        settled_rows=prearmed_settled_rows,
                     ),
                     busy_error=goalflight_journal.JournalBusy,
                     tolerance=journal_tolerance,
@@ -9005,7 +8921,6 @@ def cmd_listen(args) -> int:
                 local_high = _cursor_positions_for_shown_rows(
                     list(arm_snapshot.items),
                     prearmed_items,
-                    prearmed_settled_rows,
                 )
                 prearmed_visible_items = reported_items
                 # The first arm publishes a complete claim atomically. A loser
@@ -9497,13 +9412,11 @@ def cmd_listen(args) -> int:
             quarantine_claim_unit()
             return True
         claimed_positions = dict(report_positions)
-        settled_rows: list[dict] = []
         if visible_items is None:
             materialized_items = _retry_listener_journal_busy(
                 lambda: listener_envelopes(
                     authority,
                     list(report_items),
-                    settled_rows=settled_rows,
                 ),
                 busy_error=goalflight_journal.JournalBusy,
                 tolerance=journal_tolerance,
@@ -9519,12 +9432,10 @@ def cmd_listen(args) -> int:
             shown_items = materialized_items if args.json else visible_arm_items
         else:
             visible_arm_items = visible_items
-            settled_rows = prearmed_settled_rows
             shown_items = prearmed_materialized_items or visible_arm_items
         report_positions = _cursor_positions_for_shown_rows(
             list(report_items),
             shown_items,
-            settled_rows,
         )
         # Never retain a durable claim's water for a row that this attempt did
         # not show or successfully quarantine. A partial report remains
@@ -9625,9 +9536,9 @@ def cmd_listen(args) -> int:
     observed_data_version: int | None = None
     observed_lease = None
     peek_needed = True
-    missing_carrier_retry = False
+    stuck_carrier_retry = False
     while True:
-        missing_carrier_seen = False
+        stuck_carrier_seen = False
         parent_result = parent_exit()
         if parent_result is not None:
             return parent_result
@@ -9697,7 +9608,7 @@ def cmd_listen(args) -> int:
                     pending_report_settled = True
             except (OSError, RuntimeError, ValueError):
                 pending_report_settled = False
-        if missing_carrier_seen:
+        if stuck_carrier_seen:
             peek_needed = True
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
@@ -9796,10 +9707,10 @@ def cmd_listen(args) -> int:
                 # events beyond the live claim's durable high-water.
                 # Self-authored rows can sort before foreign mail indefinitely, so
                 # a limit-1 peek cannot implement skip-without-wedging semantics.
-                # A missing carrier can be restored without a journal write. Keep
+                # A stuck carrier can be restored without a journal write. Keep
                 # polling its durable row, but avoid a SQLite peek storm until the
                 # data version changes or the carrier becomes readable.
-                if not (missing_carrier_retry and not journal_changed):
+                if not (stuck_carrier_retry and not journal_changed):
                     peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
                 visible_rows = [
                     item
@@ -9830,8 +9741,8 @@ def cmd_listen(args) -> int:
                     )
                 )
                 # A carrier can be restored without changing SQLite data_version.
-                missing_carrier_retry = missing_carrier_seen
-                peek_needed = wakeable_items or missing_carrier_seen
+                stuck_carrier_retry = stuck_carrier_seen
+                peek_needed = wakeable_items or stuck_carrier_seen
                 if wakeable_items:
                     # The non-JSON listener is the controller: it prints every
                     # buffered item before exiting. Materialize the complete
@@ -9842,12 +9753,10 @@ def cmd_listen(args) -> int:
                     # Reuse a waking synthetic candidate's attention read when the
                     # complete snapshot is rendered. When the candidate is a normal
                     # carrier, a quiet synthetic backlog is loaded once here.
-                    visible_ring_settled_rows: list[dict] = []
                     ring_materialized_items = listener_envelopes(
                         read_authority,
                         visible_rows,
                         attention_by_id=visible_attention,
-                        settled_rows=visible_ring_settled_rows,
                     )
                     visible_ring_items = _foreign_controller_items(
                         ring_materialized_items,
@@ -9944,7 +9853,6 @@ def cmd_listen(args) -> int:
             positions = _cursor_positions_for_shown_rows(
                 visible_rows,
                 ring_materialized_items,
-                visible_ring_settled_rows,
             )
             position_snapshots = {
                 stream_id: snapshot.stream_snapshots[stream_id]

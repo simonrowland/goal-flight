@@ -1158,6 +1158,54 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
             )
             assert_true("stuck warning is emitted", "STUCK:" in stderr.getvalue())
 
+            # A valid envelope for the same carrier can still be the wrong
+            # journal event. It is stuck mail, not a reason to withdraw the
+            # assignment or advance its stream.
+            mismatched = _carrier_messages.markers_to_envelopes(
+                {"STATUS": ["valid but wrong event"]},
+                dispatch_id="corrupt-drain",
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+            )[0]
+            carrier.write_text(
+                json.dumps(mismatched, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "--fleet-dir",
+                        env["GOALFLIGHT_FLEET_DIR"],
+                        "relay",
+                        "--drain",
+                        "--json",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            assert_true("mismatched drain is blocked", rc == 3)
+            assert_true("mismatched drain reports blocked", payload["status"] == "blocked")
+            errors = payload.get("carrier_errors") or []
+            assert_true("mismatched drain reports one stuck delivery", len(errors) == 1)
+            assert_true("mismatched carrier is explicit STUCK", errors[0].get("status") == "STUCK")
+            assert_true("mismatched carrier names event", "does not match" in errors[0]["reason"])
+            assignment = authority.read_all(
+                "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+                (bad["envelope"]["id"],),
+            )
+            assert_true(
+                "mismatched delivery remains pending",
+                assignment
+                and assignment[0]["projected_at"] is not None
+                and assignment[0]["withdrawn_at"] is None,
+            )
+            assert_true(
+                "mismatched drain cursor remains pending",
+                authority.cursor_peek(label, nonce=lease.nonce).items,
+            )
+
 
 def test_duplicate_carrier_sequence_is_quarantined_without_hiding_valid_rows() -> None:
     with tempfile.TemporaryDirectory() as td:

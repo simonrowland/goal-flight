@@ -103,10 +103,6 @@ def unreadable_once(path, *args, **kwargs):
 
 goalflight_messages.read_envelopes_result = unreadable_once
 
-def fail_withdraw(*args, **kwargs):
-    return "injected carrier withdrawal failure"
-
-goalflight_messages._withdraw_carrier_delivery = fail_withdraw
 raise SystemExit(goalflight_messages.main(sys.argv[1:]))
 """
 
@@ -581,16 +577,25 @@ def test_unread_reported_flush_is_re_reported_after_reporter_dies(
 
 
 @pytest.mark.parametrize(
-    ("phase", "zombie_probe"),
-    [("reported", None), ("claimed", False)],
-    ids=["unknown-reported-owner", "known-live-claimed-owner"],
+    ("phase", "zombie_probe", "expect_ring"),
+    [
+        ("reported", None, True),
+        ("claimed", False, True),
+        ("reported", False, False),
+    ],
+    ids=[
+        "unknown-reported-owner",
+        "known-live-claimed-owner",
+        "known-live-reported-owner",
+    ],
 )
-def test_pending_report_suppression_allows_unseen_or_unknown_mail(
+def test_pending_report_suppression_distinguishes_reported_mail(
     isolated: tuple[Path, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     phase: str,
     zombie_probe: bool | None,
+    expect_ring: bool,
 ) -> None:
     """Only a known-live reported owner may suppress a duplicate report."""
     project, env = isolated
@@ -636,11 +641,17 @@ def test_pending_report_suppression_allows_unseen_or_unknown_mail(
     with wake.register_lease_holder(
         project, controller_label=lease.label, lease_nonce=lease.nonce
     ):
-        assert messages.cmd_listen(args) == 0
+        result = messages.cmd_listen(args)
 
     payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert payloads[-1]["kind"] == "ring", payloads
-    assert f"{dispatch_id}=1" in payloads[-1]["advance_command"]
+    if expect_ring:
+        assert result == 0
+        assert payloads[-1]["kind"] == "ring", payloads
+        assert f"{dispatch_id}=1" in payloads[-1]["advance_command"]
+    else:
+        assert result == 1
+        assert payloads[-1]["kind"] == "exit", payloads
+        assert payloads[-1]["reason"] == "timeout", payloads
 
 
 def test_missing_carrier_is_rechecked_until_restored(
@@ -1508,8 +1519,14 @@ def test_replacement_takes_over_claim_when_first_arm_dies_before_report(
     assert reported.phase == "reported"
 
 
+@pytest.mark.parametrize(
+    "healthy_followup",
+    [True, False],
+    ids=["healthy-followup", "timeout-with-stuck-carrier"],
+)
 def test_rearm_does_not_raise_unreportable_carrier_water(
     isolated: tuple[Path, dict[str, str]],
+    healthy_followup: bool,
 ) -> None:
     project, env = isolated
     authority = journal.open_or_create_journal(project)
@@ -1600,7 +1617,8 @@ def test_rearm_does_not_raise_unreportable_carrier_water(
             )
             assert pending.positions == {dispatch_id: 1}
             healthy_dispatch_id = "healthy-after-carrier-failure"
-            _post(env, project, "healthy after carrier failure", dispatch_id=healthy_dispatch_id)
+            if healthy_followup:
+                _post(env, project, "healthy after carrier failure", dispatch_id=healthy_dispatch_id)
             stdout, stderr = replacement.communicate(timeout=10)
         finally:
             os.chmod(carrier, 0o600)
@@ -1611,11 +1629,17 @@ def test_rearm_does_not_raise_unreportable_carrier_water(
     payloads = [
         json.loads(line) for line in stdout.splitlines() if line.strip()
     ]
-    assert replacement.returncode == 0, (stderr, payloads)
-    assert payloads[-1]["kind"] == "ring", payloads
-    assert f"{healthy_dispatch_id}=1" in payloads[-1]["advance_command"]
-    assert f"{dispatch_id}=" not in payloads[-1]["advance_command"]
+    if healthy_followup:
+        assert replacement.returncode == 0, (stderr, payloads)
+        assert payloads[-1]["kind"] == "ring", payloads
+        assert f"{healthy_dispatch_id}=1" in payloads[-1]["advance_command"]
+        assert f"{dispatch_id}=" not in payloads[-1]["advance_command"]
+    else:
+        assert replacement.returncode == 1, (stderr, payloads)
+        assert payloads[-1]["kind"] == "exit", payloads
+        assert payloads[-1]["reason"] == "timeout", payloads
     assert "WARNING: carrier corruption" in stderr
+    assert "STUCK:" in stderr
     assert str(carrier) in stderr
 
 

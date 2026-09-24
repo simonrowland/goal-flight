@@ -2337,8 +2337,9 @@ def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
         assert result == 1, output.err  # Quiet timeout: stale row never rings.
         assert "no projected carrier row" not in output.err
     else:
-        assert result == 2, output.err
+        assert result == 1, output.err
         assert "journal delivery assignment has no projected carrier row" in output.err
+        assert "STUCK:" in output.err
     if superseded:
         recorded = authority.read_all(
             "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",

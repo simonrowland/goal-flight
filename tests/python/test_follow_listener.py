@@ -1262,7 +1262,7 @@ def test_materialization_propagates_journal_failures(
         )
 
 
-def test_cursor_boundary_excludes_unshown_rows_but_accepts_settled_rows() -> None:
+def test_cursor_boundary_excludes_unshown_rows() -> None:
     first = {"stream_id": "stream", "stream_seq": 1}
     second = {"stream_id": "stream", "stream_seq": 2}
     other = {"stream_id": "other", "stream_seq": 1}
@@ -1271,9 +1271,6 @@ def test_cursor_boundary_excludes_unshown_rows_but_accepts_settled_rows() -> Non
     assert messages._cursor_positions_for_shown_rows(
         [first, second, other], shown
     ) == {"other": 1}
-    assert messages._cursor_positions_for_shown_rows(
-        [first, second, other], shown, [first]
-    ) == {"stream": 2, "other": 1}
 
 
 def test_listener_survives_present_journal_open_failure_and_times_out(
