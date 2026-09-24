@@ -3482,9 +3482,12 @@ def _withdraw_recovery_plan(
         controller_label=None,
         dry_run=True,
     )
-    root, _, attempt, record, _, _, _ = (
+    root, _, attempt, record, carriers, _, _ = (
         _withdraw_preflight(probe)
     )
+    carrier_reason = _plain_withdrawal_carrier_reason(dispatch_id, carriers)
+    if carrier_reason:
+        raise ValueError(carrier_reason)
     owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
     owner = str(owner).strip() if owner else None
     settlement_args = argparse.Namespace(
@@ -3524,6 +3527,26 @@ def _withdraw_recovery_command(
     return shlex.join(command)
 
 
+def _plain_withdrawal_carrier_reason(dispatch_id: str, carriers: dict[Path, dict]) -> str | None:
+    expected = _queue_entry_path(dispatch_id)
+    candidates = set(carriers)
+    try:
+        candidates.update(path for path in _queue_dir_listing(expected.parent)
+                          if not path.name.endswith(".failed") and (path == expected or
+                          path.name.split(".json.claimed-", 1)[0].removesuffix(".json").casefold() == dispatch_id.casefold()))
+    except OSError as exc:
+        return f"queue carrier listing failed ({exc})"
+    if not candidates: return None
+    if len(candidates) == 1:
+        path, payload = next((path, carriers.get(path)) for path in candidates)
+        filename_id = path.name.split(".json.claimed-", 1)[0].removesuffix(".json")
+        if (filename_id == dispatch_id and isinstance(payload, dict)
+                and payload.get("dispatch_id") == dispatch_id):
+            return None
+    return (f"{len(candidates)} queue carriers are present" if len(candidates) != 1
+            else "carrier filename, payload, and holder IDs are not byte-identical")
+
+
 def _completion_refusal_guidance(
     diagnostics: list[str], project_root: str, *, args=None,
 ) -> str:
@@ -3534,7 +3557,6 @@ def _completion_refusal_guidance(
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
     if held:
         lines = []
-        withdrawable = 0
         blockers = []
         for dispatch_id, state in rows:
             if state not in _SELF_HELD_LEDGER_STATES:
@@ -3549,47 +3571,35 @@ def _completion_refusal_guidance(
             except Exception as exc:
                 liveness = getattr(exc, "liveness", None)
                 if liveness == "live":
-                    lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
-                    blockers.append(f"{dispatch_id} state={state}: holder is live")
+                    reason = "holder is LIVE; do not withdraw it"
                 elif liveness == "indeterminate":
-                    lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
-                    blockers.append(f"{dispatch_id} state={state}: liveness is indeterminate")
+                    reason = "liveness is indeterminate; do not withdraw it yet"
                 else:
-                    lines.append(
-                        f"{task_text} is held by {dispatch_id} (state {state}); "
-                        f"withdraw dry-run refused ({exc}). Do not withdraw it; "
-                        "resume it or wait for verification; opening a new task "
-                        "row is interim."
+                    reason = (
+                        f"withdraw dry-run refused ({exc}); resume it or wait for "
+                        "verification; opening a new task row is interim"
                     )
-                    blockers.append(f"{dispatch_id} state={state}: withdrawal refused")
+                blockers.append(f"{dispatch_id} state={state}: {reason}")
                 continue
             withdrawal_state = str(attempt.get("terminal_state") or state)
             if withdrawal_state not in _SELF_HELD_LEDGER_STATES:
-                lines.append(
-                    f"{task_text} is held by {dispatch_id} (state {state}); "
-                    f"withdrawal state is {withdrawal_state or 'unknown'}. "
-                    "No withdrawal command is safe; inspect the holder before retrying."
-                )
                 blockers.append(
-                    f"{dispatch_id} state={state}: withdrawal state is {withdrawal_state or 'unknown'}"
+                    f"{dispatch_id} state={state}: withdrawal state is "
+                    f"{withdrawal_state or 'unknown'}; no withdrawal command is safe"
                 )
                 continue
-            command = _withdraw_recovery_command(
-                dispatch_id,
-                str(root),
-                owner=owner,
-                operator=owner is None,
-            )
+            if len(rows) != 1:
+                blockers.append(f"{dispatch_id} state={state}: multiple task holders")
+                continue
             lines.append(
                 f"{task_text} is held by {dispatch_id} (state {state}). Run:\n"
-                f"  {command}"
+                f"  {_withdraw_recovery_command(dispatch_id, str(root), owner=owner, operator=owner is None)}"
             )
-            withdrawable += 1
-        if withdrawable and not blockers:
+        if not blockers:
             lines.append("then re-run your dispatch command")
         elif blockers:
             lines.append(
-                "Do not re-run your dispatch command; blockers: "
+                "Do not re-run your dispatch command; needs manual review: blockers: "
                 + "; ".join(blockers)
                 + "."
             )
@@ -10887,7 +10897,7 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     if goalflight_ledger.record_is_unreadable(record):
         raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
     index = _build_queue_carrier_index(queue_dir or _queue_entry_path(args.dispatch_id).parent)
-    statuses = index.carriers_by_id.get(args.dispatch_id.casefold(), [])
+    statuses = index.carriers_by_id.get(args.dispatch_id, [])
     for active in ([index.listing_error] if index.listing_error is not None else statuses):
         if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
             raise _WithdrawPreflightRefusal(
@@ -11574,7 +11584,7 @@ class _QueueCarrierIndex:
             return self.listing_error
         if not dispatch_id:
             return ClaimCarrierStatus()
-        return self.by_id.get(dispatch_id.casefold()) or ClaimCarrierStatus()
+        return self.by_id.get(dispatch_id) or ClaimCarrierStatus()
 
 
 def _build_queue_carrier_index(
@@ -11595,22 +11605,10 @@ def _build_queue_carrier_index(
             )
         collected: dict[str, list[ClaimCarrierStatus]] = {}
 
-        def _add(filename_id: str, status: ClaimCarrierStatus) -> None:
-            if not filename_id:
+        def _add(dispatch_id: str, status: ClaimCarrierStatus) -> None:
+            if not dispatch_id:
                 return
-            collected.setdefault(filename_id.casefold(), []).append(status)
-
-        def _payload_mismatch(
-            path: Path, filename_id: str, payload: dict,
-        ) -> ClaimCarrierStatus | None:
-            payload_id = payload.get("dispatch_id")
-            if payload_id not in (None, "") and str(payload_id).casefold() != filename_id.casefold():
-                return ClaimCarrierStatus(
-                    ClaimCarrierKind.UNKNOWN,
-                    "carrier_dispatch_id_mismatch",
-                    str(path),
-                )
-            return None
+            collected.setdefault(dispatch_id, []).append(status)
 
         for path in listing:
             if not path.name.endswith(".json"):
@@ -11630,11 +11628,10 @@ def _build_queue_carrier_index(
                 )
                 continue
             if isinstance(payload, dict):
-                filename_id = path.stem
-                mismatch = _payload_mismatch(path, filename_id, payload)
-                _add(filename_id, mismatch or ClaimCarrierStatus(
-                    ClaimCarrierKind.QUEUED, "queued_envelope", str(path),
-                ))
+                _add(
+                    str(payload.get("dispatch_id") or path.stem),
+                    ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path)),
+                )
         for claim in listing:
             if ".json.claimed-" not in claim.name:
                 continue
@@ -11647,8 +11644,10 @@ def _build_queue_carrier_index(
                 _add(filename_id, _adjudicate_claim_marker(claim, None))
                 continue
             if isinstance(payload, dict):
-                mismatch = _payload_mismatch(claim, filename_id, payload)
-                _add(filename_id, mismatch or _adjudicate_claim_marker(claim, payload))
+                _add(
+                    str(payload.get("dispatch_id") or filename_id),
+                    _adjudicate_claim_marker(claim, payload),
+                )
         by_id = {
             dispatch_id: _prefer_claim_carrier(statuses)
             for dispatch_id, statuses in collected.items()
