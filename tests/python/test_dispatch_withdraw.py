@@ -451,6 +451,38 @@ def test_starting_worker_without_identity_refused(prepared):
     assert carrier.exists()
 
 
+def test_active_missing_identity_evidence_refused_in_guidance_and_withdraw(prepared):
+    project, authority, attempt, carrier = prepared
+    started = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert started.committed and started.value is not None
+    stale_pid = 999_999_999
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        state="worker_dead",
+        worker_pid=stale_pid,
+        worker_identity={"pid": stale_pid, "start_token": "gone"},
+    )
+    ledger.write_record(record)
+
+    guidance = dispatch._completion_refusal_guidance(
+        ['dispatch_id="withdraw-test" state="worker_dead"'],
+        str(project),
+        args=SimpleNamespace(task_ids=["t-missing-evidence"]),
+    )
+
+    assert "goalflight_dispatch.py" not in guidance
+    assert "liveness is indeterminate" in guidance
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "dead journal worker identity" in result["reason"]
+    assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_STARTING
+    assert attempt_row(authority)["terminal_state"] is None
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
+    assert carrier.exists()
+
+
 def test_status_sidecar_live_vetoes_dead_ledger_worker(prepared, tmp_path):
     project, authority, attempt, carrier = prepared
     status_path = tmp_path / "live.status.json"
