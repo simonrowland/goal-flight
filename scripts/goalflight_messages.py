@@ -3835,45 +3835,6 @@ def _controller_label_for_owned_dispatches(
     return next(iter(labels))
 
 
-def _controller_scope_kind(
-    envelope: dict,
-    *,
-    owned_dispatch_ids: set[str],
-    legacy_addressed_dispatch_ids: set[str],
-    task_store_dispatch_id: str | None,
-    controller_label: str | None,
-    controller_project_root: str,
-) -> str | None:
-    """Single authority for whether one envelope belongs to this controller."""
-    dispatch_id = str(envelope.get("dispatch_id") or "")
-    addressee_label = controller_addressee_label(envelope)
-    if addressee_label is not None:
-        addressee_root = controller_addressee_project_root(envelope)
-        if addressee_root is None:
-            return None
-        try:
-            canonical_addressee_root = _canonical_project_root_text(addressee_root)
-            canonical_controller_root = _canonical_project_root_text(
-                controller_project_root
-            )
-        except Exception:
-            return None
-        if (
-            controller_label is not None
-            and addressee_label == controller_label
-            and canonical_addressee_root == canonical_controller_root
-        ):
-            return "controller"
-        return None
-    if dispatch_id in owned_dispatch_ids:
-        return "worker"
-    if dispatch_id == task_store_dispatch_id:
-        return "task-store"
-    if dispatch_id in legacy_addressed_dispatch_ids:
-        return "legacy-controller"
-    return None
-
-
 def _controller_scope_inputs(
     project_root: Path,
     *,
@@ -3972,6 +3933,7 @@ def _listener_envelope(
     *,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> dict | None:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
@@ -4004,32 +3966,17 @@ def _listener_envelope(
         }
     path = Path(carrier_path)
     result = read_envelopes_result(path)
-    if result.status is not CarrierReadStatus.OK:
-        details = "; ".join(
-            str(error.get("error") or error.get("reason") or result.status.value)
-            for error in result.errors
-        )
-        recipient = str(row.get("recipient_label") or "").strip()
-        if (
-            controller_label is not None
-            and recipient
-            and recipient not in {"*", controller_label}
+    for raw_error in result.errors:
+        error = dict(raw_error)
+        error.setdefault("carrier_path", str(path))
+        if carrier_errors is None:
+            _emit_carrier_error(error)
+        elif not any(
+            item.get("carrier_path") == error["carrier_path"]
+            and item.get("error") == error.get("error")
+            for item in carrier_errors
         ):
-            return None
-        withdrawal_error = _withdraw_carrier_delivery(
-            authority,
-            row,
-            controller_label=controller_label,
-        )
-        raise MessageError(
-            f"carrier is corrupt or unreadable: {path}"
-            + (f": {details}" if details else f": {result.status.value}")
-            + (
-                f"; delivery withdrawal failed: {withdrawal_error}"
-                if withdrawal_error
-                else "; delivery assignment withdrawn"
-            )
-        )
+            carrier_errors.append(error)
     origin_node = str(row.get("origin_node") or "")
     event_uuid = str(row.get("event_uuid") or "")
     stream_seq = int(row.get("stream_seq") or 0)
@@ -4044,7 +3991,44 @@ def _listener_envelope(
         ),
         None,
     )
+    if result.status is CarrierReadStatus.CARRIER_UNREADABLE:
+        details = "; ".join(
+            str(error.get("error") or error.get("reason") or result.status.value)
+            for error in result.errors
+        )
+        raise MessageError(
+            f"CARRIER-UNREADABLE: retryable carrier read: {path}"
+            + (f": {details}" if details else "")
+        )
+    if envelope is not None:
+        return envelope
     if envelope is None:
+        details = "; ".join(
+            str(error.get("error") or error.get("reason") or result.status.value)
+            for error in result.errors
+        )
+        if result.status is not CarrierReadStatus.OK:
+            recipient = str(row.get("recipient_label") or "").strip()
+            if (
+                controller_label is not None
+                and recipient
+                and recipient not in {"*", controller_label}
+            ):
+                return None
+            withdrawal_error = _withdraw_carrier_delivery(
+                authority,
+                row,
+                controller_label=controller_label,
+            )
+            raise MessageError(
+                f"carrier is corrupt or unreadable: {path}"
+                + (f": {details}" if details else f": {result.status.value}")
+                + (
+                    f"; delivery withdrawal failed: {withdrawal_error}"
+                    if withdrawal_error
+                    else "; delivery assignment withdrawn"
+                )
+            )
         assignments = authority.read_all(
             """SELECT recipient_label, projected_at, withdrawn_at FROM delivery_events
                WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
@@ -4526,15 +4510,26 @@ def controller_mail_summary(
     carrier_errors: list[dict[str, object]] = []
     for row in rows:
         try:
-            envelope = _listener_envelope(authority, row, controller_label=label)
+            envelope = _listener_envelope(
+                authority,
+                row,
+                controller_label=label,
+                carrier_errors=carrier_errors,
+            )
         except MessageError as exc:
             error = {"error": str(exc), "carrier_path": row.get("carrier_path")}
-            if not any(
-                item.get("carrier_path") == error["carrier_path"]
-                and item.get("error") == error["error"]
-                for item in carrier_errors
-            ):
+            existing_error = next(
+                (
+                    item
+                    for item in carrier_errors
+                    if item.get("carrier_path") == error["carrier_path"]
+                ),
+                None,
+            )
+            if existing_error is None:
                 carrier_errors.append(error)
+            else:
+                existing_error.update(error)
             continue
         if envelope is None:
             continue
@@ -5628,7 +5623,7 @@ def _envelopes_with_rows(
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
     items = []
-    reported: set[tuple[str, str]] = set()
+    observed_errors: list[dict[str, object]] = []
     for row in rows:
         try:
             envelope = _listener_envelope(
@@ -5636,30 +5631,44 @@ def _envelopes_with_rows(
                 row,
                 controller_label=controller_label,
                 attention_by_id=attention_by_id,
+                carrier_errors=observed_errors,
             )
         except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
             carrier_path = str(row.get("carrier_path") or "")
             detail = str(exc)
-            identity = (carrier_path, detail)
-            if identity not in reported:
-                reported.add(identity)
-                error = {
-                    "carrier_path": carrier_path,
-                    "error": detail,
-                    "reason": detail,
-                }
-                if carrier_errors is not None:
-                    if not any(
-                        item.get("carrier_path") == carrier_path
-                        and item.get("error") == detail
-                        for item in carrier_errors
-                    ):
-                        carrier_errors.append(error)
-                else:
-                    _emit_carrier_error(error)
+            existing_error = next(
+                (
+                    item
+                    for item in observed_errors
+                    if item.get("carrier_path") == carrier_path
+                ),
+                None,
+            )
+            if existing_error is None:
+                observed_errors.append(
+                    {
+                        "carrier_path": carrier_path,
+                        "error": detail,
+                        "reason": detail,
+                    }
+                )
+            else:
+                existing_error["error"] = detail
+                existing_error["reason"] = detail
             continue
         if envelope is not None:
             items.append((row, envelope))
+    if carrier_errors is not None:
+        for error in observed_errors:
+            if not any(
+                item.get("carrier_path") == error.get("carrier_path")
+                and item.get("error") == error.get("error")
+                for item in carrier_errors
+            ):
+                carrier_errors.append(error)
+    else:
+        for error in observed_errors:
+            _emit_carrier_error(error)
     return items
 
 
@@ -5707,6 +5716,28 @@ def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
             positions[stream_id] = max(
                 positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
             )
+    return positions
+
+
+def _cursor_positions_for_shown_rows(
+    rows: list[dict] | tuple[dict, ...],
+    shown_items: list[tuple[dict, dict]],
+) -> dict[str, int]:
+    """Return positions only for streams whose peek rows were all shown."""
+    shown_rows = {id(row) for row, _envelope in shown_items}
+    positions: dict[str, int] = {}
+    blocked: set[str] = set()
+    for row in rows:
+        stream_id = str(row.get("stream_id") or "")
+        if not stream_id or stream_id in blocked:
+            continue
+        if id(row) not in shown_rows:
+            blocked.add(stream_id)
+            positions.pop(stream_id, None)
+            continue
+        positions[stream_id] = max(
+            positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
+        )
     return positions
 
 
@@ -5970,7 +6001,12 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return 2
     for error in carrier_errors:
         _emit_carrier_error(error)
-    positions = _cursor_positions(rows)
+    shown_items = items_with_rows if drain else visible_items
+    positions = _cursor_positions_for_shown_rows(rows, shown_items)
+    position_snapshots = {
+        stream_id: peek.stream_snapshots[stream_id]
+        for stream_id in positions
+    }
     # --summary-only/--since are diagnostic: they must not look like a drain
     # recipe for a filtered subset, which would skip unshown mail.
     if summary_only or since_text:
@@ -5982,10 +6018,36 @@ def cmd_relay(args: argparse.Namespace) -> int:
             lease_nonce=lease.nonce,
             cursor_version=peek.cursor_version,
             positions=positions,
-            stream_snapshots=peek.stream_snapshots,
+            stream_snapshots=position_snapshots,
         )
     if drain:
         if not positions:
+            if items_with_rows or carrier_errors:
+                if getattr(args, "json", False):
+                    payload = {
+                        "controller_label": controller_label,
+                        "cursor_version": peek.cursor_version,
+                        "drained": 0,
+                        "items": envelopes,
+                        "status": "blocked",
+                    }
+                    if carrier_errors:
+                        payload["carrier_errors"] = carrier_errors
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    for row, envelope in items_with_rows:
+                        print(format_receipt_headline(row, envelope), flush=True)
+                        if getattr(args, "bodies", False):
+                            payload = envelope.get("payload")
+                            payload = payload if isinstance(payload, dict) else {}
+                            body = payload.get("text")
+                            if isinstance(body, str) and body:
+                                print(body, flush=True)
+                    print("drain blocked · unresolved mail remains", file=sys.stderr)
+                emit_listener_activity_signal(
+                    project_root=root, controller_label=controller_label
+                )
+                return 3
             if getattr(args, "json", False):
                 print(
                     json.dumps(
@@ -6024,7 +6086,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 controller_label,
                 nonce=lease.nonce,
                 expected_cursor_version=peek.cursor_version,
-                expected_stream_snapshots=peek.stream_snapshots,
+                expected_stream_snapshots=position_snapshots,
                 advances=positions,
                 actor=f"controller:{os.getpid()}:relay-drain",
             )
@@ -7861,7 +7923,7 @@ def cmd_follow(args) -> int:
     # advance the journal: a replacement must replay unacknowledged mail.
     delivered: set[tuple[str, int, str]] = set()
     seen_rewinds: dict[str, int] = {}
-    reported_carrier_errors: set[tuple[str, str]] = set()
+    active_carrier_errors: dict[tuple[str, str], dict[str, object]] = {}
     reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
@@ -7981,21 +8043,31 @@ def cmd_follow(args) -> int:
                     controller_label=label,
                     lease_nonce=nonce,
                 )
+                new_carrier_error = False
                 for error in carrier_errors:
                     identity = (
                         str(error.get("carrier_path") or ""),
                         str(error.get("error") or error.get("reason") or ""),
                     )
-                    if identity in reported_carrier_errors:
-                        continue
-                    reported_carrier_errors.add(identity)
-                    if not emit(
-                        _follow_fault_record(
-                            "carrier-corrupt",
-                            f"{identity[0]}: {identity[1]}",
-                        )
-                    ):
-                        return 0
+                    if identity not in active_carrier_errors:
+                        if not emit(
+                            _follow_fault_record(
+                                "carrier-corrupt",
+                                f"{identity[0]}: {identity[1]}",
+                            )
+                        ):
+                            return 0
+                        new_carrier_error = True
+                    active_carrier_errors[identity] = error
+                active_carrier_errors = {
+                    (
+                        str(error.get("carrier_path") or ""),
+                        str(error.get("error") or error.get("reason") or ""),
+                    ): error
+                    for error in carrier_errors
+                }
+                if new_carrier_error:
+                    next_heartbeat = time.monotonic() + heartbeat_s
                 try:
                     if reset_owner_ring:
                         # The exclusive monitor slot proves the prior follow
@@ -8107,6 +8179,14 @@ def cmd_follow(args) -> int:
                 # keeps an event from batching with a contradictory idle beat.
                 next_heartbeat = now + heartbeat_s
             elif now >= next_heartbeat:
+                for identity in active_carrier_errors:
+                    if not emit(
+                        _follow_fault_record(
+                            "carrier-corrupt",
+                            f"{identity[0]}: {identity[1]}",
+                        )
+                    ):
+                        return 0
                 heartbeat_seq += 1
                 if not emit(_follow_heartbeat_record(heartbeat_seq, heartbeat_s)):
                     return 0

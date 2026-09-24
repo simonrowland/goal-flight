@@ -1052,6 +1052,10 @@ def test_corrupt_carrier_is_reported_once_while_relay_delivers_healthy_mail() ->
                 any(item.get("dispatch_id") == "healthy-carrier" for item in payload["items"]),
             )
             assert_true(
+                "readable row remains visible",
+                any(item.get("dispatch_id") == "corrupt-carrier" for item in payload["items"]),
+            )
+            assert_true(
                 "corrupt carrier is reported once",
                 len(payload.get("carrier_errors") or []) == 1
                 and payload["carrier_errors"][0]["carrier_path"].endswith(
@@ -1063,8 +1067,8 @@ def test_corrupt_carrier_is_reported_once_while_relay_delivers_healthy_mail() ->
                 (bad["envelope"]["id"],),
             )
             assert_true(
-                "corrupt carrier assignment is withdrawn",
-                assignments and assignments[0]["withdrawn_at"] is not None,
+                "readable row assignment remains live",
+                assignments and assignments[0]["withdrawn_at"] is None,
             )
             assert_true(
                 "corruption warning is one line",
