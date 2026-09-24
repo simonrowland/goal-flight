@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+import goalflight_compat
+
 
 CONFIG_SCHEMA = "goalflight.remote-ci.config.v2"
 REQUEST_SCHEMA = "goalflight.remote-ci.request.v1"
@@ -539,28 +541,39 @@ class CommandResult:
     stdout: str = ""
     stderr: str = ""
     timed_out: bool = False
+    unknown: bool = False
 
 
 def _signal_process_group(
-    process: subprocess.Popen[Any], pgid: int, sig: signal.Signals
-) -> None:
-    """Signal the process's original group, never a reused numeric group id."""
-    if process.poll() is None:
-        try:
-            if os.getpgid(process.pid) != pgid:
-                return
-        except OSError:
-            return
-    else:
-        # A timed-out communicate means a descendant can still hold a pipe
-        # after the leader exits. The group must still exist in that case;
-        # while it has a member, its id cannot be reused by another session.
-        try:
-            os.killpg(pgid, 0)
-        except OSError:
-            return
-    with contextlib.suppress(OSError):
+    process: subprocess.Popen[Any], pgid: int | None,
+    leader_identity: Mapping[str, Any] | None, sig: signal.Signals
+) -> bool:
+    """Signal a process group only while its recorded leader still matches."""
+    if process.poll() is not None:
+        return False
+    if (not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 0
+            or not isinstance(leader_identity, Mapping)):
+        return False
+    try:
+        leader_pid = int(leader_identity["pid"])
+        leader_start = str(leader_identity["start_token"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if leader_pid != process.pid or not leader_start:
+        return False
+    if (goalflight_compat.process_identity_matches(leader_pid, leader_start)
+            is not True):
+        return False
+    try:
+        if os.getpgid(process.pid) != pgid:
+            return False
+    except OSError:
+        return False
+    try:
         os.killpg(pgid, sig)
+    except OSError:
+        return False
+    return True
 
 
 def run_command(
@@ -586,18 +599,39 @@ def run_command(
         )
     except OSError as exc:
         raise RemoteCIError(f"configured command could not start: {argv[0] if argv else '<empty>'}: {exc}") from exc
+    leader_identity = goalflight_compat.process_start_identity(process.pid)
     try:
         process_group = os.getpgid(process.pid)
     except OSError:
-        process_group = process.pid
+        process_group = None
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        _signal_process_group(process, process_group, signal.SIGTERM)
+        if not _signal_process_group(process, process_group, leader_identity, signal.SIGTERM):
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            return CommandResult(
+                124,
+                exc.stdout or "",
+                (exc.stderr or "") + "\nprocess group identity became unknown",
+                True,
+                True,
+            )
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            _signal_process_group(process, process_group, signal.SIGKILL)
+            if not _signal_process_group(process, process_group, leader_identity, signal.SIGKILL):
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+                return CommandResult(
+                    124,
+                    exc.stdout or "",
+                    (exc.stderr or "") + "\nprocess group identity became unknown",
+                    True,
+                    True,
+                )
             stdout, stderr = process.communicate()
         return CommandResult(
             124,
@@ -852,14 +886,33 @@ class RemoteRunner:
 
     @staticmethod
     def _owner() -> dict[str, Any]:
+        identity = goalflight_compat.process_start_identity(os.getpid())
+        start_token = identity.get("start_token") if isinstance(identity, Mapping) else ""
         return {"owner_identity": _owner_identity(), "owner_pid": os.getpid(),
+                "owner_start_token": str(start_token or ""),
                 "owner_host": socket.gethostname()}
 
     def _lease_key(self, record: Mapping[str, Any]) -> tuple[str, str]:
         return (str(record["run_directory"]), str(record["lease_token"]))
 
     def _owns(self, record: Mapping[str, Any]) -> bool:
-        return record.get("owner_host") == socket.gethostname() and record.get("owner_pid") == os.getpid()
+        return (
+            record.get("owner_host") == socket.gethostname()
+            and record.get("owner_pid") == os.getpid()
+            and self._owner_alive(record) is True
+        )
+
+    @staticmethod
+    def _owner_alive(record: Mapping[str, Any]) -> bool | None:
+        if record.get("owner_host") != socket.gethostname():
+            return None
+        pid = record.get("owner_pid")
+        token = record.get("owner_start_token")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if not isinstance(token, str) or not token:
+            return None
+        return goalflight_compat.process_identity_matches(pid, token)
 
     def _release_forgotten(self, node: "RemoteNode", record: Mapping[str, Any]) -> str:
         """Release a lease this live process admitted and then dropped.
@@ -874,7 +927,8 @@ class RemoteRunner:
             return "finished"
         if not self._owns(fresh) or self._lease_key(fresh) in self._inflight:
             return "owned"
-        expected = {name: fresh.get(name) for name in ("owner_host", "owner_pid", "owner_identity")}
+        expected = {name: fresh.get(name) for name in
+                    ("owner_host", "owner_pid", "owner_start_token", "owner_identity")}
         if fresh.get("state") == "running" and fresh.get("remote_run"):
             return node.call("cancel", **key, identity=fresh["remote_run"],
                              expected_owner=expected)["status"]
@@ -1036,8 +1090,7 @@ class RemoteRunner:
                     continue
                 status = "unknown"
                 # A PID from another controller host proves nothing locally.
-                alive = (_pid_alive(record.get("owner_pid"))
-                         if record.get("owner_host") == socket.gethostname() else None)
+                alive = self._owner_alive(record)
                 forgotten = (
                     alive is True
                     and self._owns(record)
@@ -1053,7 +1106,8 @@ class RemoteRunner:
                                        lease_token=record["lease_token"],
                                        identity=identity.to_dict(),
                                        expected_owner={key: record.get(key) for key in
-                                                       ("owner_host", "owner_pid", "owner_identity")})["status"]
+                                                       ("owner_host", "owner_pid", "owner_start_token",
+                                                        "owner_identity")})["status"]
                 results.append({"box": name, "lease_id": record["lease_id"], "status": status})
         return results
 
@@ -1288,24 +1342,6 @@ class GateDaemon:
             finally:
                 if self.config.pid_file is not None:
                     self.config.pid_file.unlink(missing_ok=True)
-
-
-def _pid_alive(pid: Any) -> bool | None:
-    try:
-        value = int(pid)
-    except (TypeError, ValueError):
-        return None
-    if value <= 0:
-        return None
-    try:
-        os.kill(value, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return None
-    return True
 
 
 def health_census(config: DaemonConfig, *, executor: Any = None) -> dict[str, Any]:

@@ -90,7 +90,6 @@ _REMOTE_CI_LABEL = "com.goalflight.remote-ci."
 # have no live member after the launchd job is gone.
 _swept_coalitions: list[int] = []
 _sweep_unknown: list[int] = []
-_sweep_unsignalled: list[tuple] = []
 
 
 # Bound before tests replace subprocess.run. Teardown must still see launchctl.
@@ -130,7 +129,7 @@ def _remote_ci_launchd_jobs():
 
 
 def _sweep_managed_jobs(managed: Path) -> None:
-    """Remove this root's launchd jobs and kill coalition members still alive."""
+    """Use production cleanup to remove jobs only after their trees are proven empty."""
     import goalflight_remote_ci_node as node
 
     runs = []
@@ -142,26 +141,18 @@ def _sweep_managed_jobs(managed: Path) -> None:
             lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        label = lease.get("launch_label") or ""
         cid = lease.get("coalition_id")
         holder = lease.get("holder_coalition_id")
-        if label:
-            _launchctl_run(["launchctl", "remove", label], capture_output=True, text=True)
         # The login-session coalition is never a kill target. A lease that
         # failed to record a private id must not take the test process with it.
         if (isinstance(cid, int) and not isinstance(cid, bool) and cid > 0
                 and cid != holder):
             _swept_coalitions.append(cid)
-            members = node._coalition_members(cid)
-            if members is None:
-                # Cannot prove the tree is empty. Do not treat that as gone.
+        result = node.finish_dead_workload(
+            managed / "admission", run, lease, "test-teardown")
+        if not isinstance(result, dict) or result.get("status") == "unknown":
+            if isinstance(cid, int) and not isinstance(cid, bool) and cid > 0:
                 _sweep_unknown.append(cid)
-                continue
-            for pid, start in members:
-                if pid <= 1 or pid == os.getpid():
-                    continue
-                if not node._signal_incarnation(lease, pid, start, cid):
-                    _sweep_unsignalled.append((cid, pid, start))
 
 
 def _live_coalition_members(coalitions: list[int]):
@@ -191,7 +182,6 @@ def no_leftover_remote_ci_job(request):
     before = _remote_ci_launchd_jobs()
     _swept_coalitions.clear()
     _sweep_unknown.clear()
-    _sweep_unsignalled.clear()
     yield
     after = _remote_ci_launchd_jobs()
     if before is None or after is None:
@@ -200,11 +190,10 @@ def no_leftover_remote_ci_job(request):
     leaked = {label: pid for label, pid in after.items() if label not in before}
     members, unknown = _live_coalition_members(list(_swept_coalitions))
     unknown = list(dict.fromkeys([*unknown, *_sweep_unknown]))
-    if leaked or members or unknown or _sweep_unsignalled:
+    if leaked or members or unknown:
         raise AssertionError(
             f"{request.node.nodeid} left remote CI state behind: "
-            f"jobs={leaked} members={members} unknown={unknown} "
-            f"unsignalled={_sweep_unsignalled}")
+            f"jobs={leaked} members={members} unknown={unknown}")
 
 
 class ScriptedExecutor:
@@ -246,7 +235,8 @@ class ScriptedExecutor:
             if record.get("state") == "UNREADABLE":
                 continue
             key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
-            owner = {name: record.get(name) for name in ("owner_host", "owner_pid", "owner_identity")}
+            owner = {name: record.get(name) for name in
+                     ("owner_host", "owner_pid", "owner_start_token", "owner_identity")}
             try:
                 if record.get("remote_run"):
                     node.call("cancel", **key, identity=record["remote_run"], expected_owner=owner)
@@ -374,6 +364,56 @@ def test_run_command_starts_driver_in_its_own_session() -> None:
     )
     assert result.returncode == 0
     assert result.stdout.strip() == "True"
+
+
+@pytest.mark.parametrize(("leader_status", "identity_match"), [(None, False), (0, True)])
+def test_run_command_reports_unknown_when_group_leader_is_not_signalable(
+    monkeypatch, leader_status, identity_match
+):
+    class Stream:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        pid = 4242
+
+        def __init__(self):
+            self.stdout = Stream()
+            self.stderr = Stream()
+
+        def poll(self):
+            return leader_status
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+
+    process = Process()
+    monkeypatch.setattr(ci.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(ci.goalflight_compat, "process_start_identity",
+                        lambda pid: {"pid": pid, "start_token": "old"})
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches",
+                        lambda *_: identity_match)
+    monkeypatch.setattr(ci.os, "getpgid", lambda pid: 4242)
+    monkeypatch.setattr(ci.os, "killpg", lambda *args: pytest.fail("reused group was signalled"))
+    result = run_command(["fake"], timeout=0.1)
+    assert result.unknown is True
+    assert result.timed_out is True
+    assert process.stdout.closed and process.stderr.closed
+
+
+def test_controller_owner_requires_its_process_start_token(tmp_path, monkeypatch):
+    owner = RemoteRunner._owner()
+    assert owner["owner_pid"] == os.getpid()
+    assert owner["owner_start_token"]
+    runner = RemoteRunner(_config(tmp_path), executor=lambda argv, env, timeout: None)
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches", lambda *_: None)
+    assert runner._owner_alive(owner) is None
+    assert runner._owns(owner) is False
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches", lambda *_: False)
+    assert runner._owner_alive(owner) is False
 
 
 def test_config_requires_v2_remote_exec_and_preserves_node_paths(tmp_path):
@@ -505,7 +545,7 @@ def test_crash_reaper_reads_node_identity_without_local_running_record(node_env,
     start(node, held)
     running = wait_state(node, held, {"running"})
     assert not (config.state_dir / "runs").exists()
-    monkeypatch.setattr(ci, "_pid_alive", lambda _: False)
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches", lambda *_: False)
     results = runner.reap()
     assert results[0]["status"] == "cancelled"
     final = node.call("status", **key(held))
@@ -528,7 +568,7 @@ def test_cancel_and_attach_refuse_unproven_identity(node_env, unknown):
 def test_reaper_retains_unknown_owner(node_env, monkeypatch):
     _, executor, runner, node = node_env
     wait_state(node, enqueue(node), {"admitted"})
-    monkeypatch.setattr(ci, "_pid_alive", lambda _: None)
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches", lambda *_: None)
     assert runner.reap()[0]["status"] == "unknown"
     assert "cancel" not in executor.calls
 
@@ -676,7 +716,7 @@ def test_corrected_cap_can_list_and_reap(node_env, monkeypatch):
     assert found[0]["lease_id"] == held["lease_id"]
     with pytest.raises(ci.RemoteCIError, match="policy differs"):
         enqueue(corrected.nodes["box-a"])
-    monkeypatch.setattr(ci, "_pid_alive", lambda _: False)
+    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches", lambda *_: False)
     assert corrected.reap()[0]["status"] == "cancelled"
     deadline = time.monotonic() + 5
     while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
@@ -828,7 +868,8 @@ def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp
         assert node.call("health")["tokens"]["in_use"] == 1
         result = node.call("cancel", **key(held), identity=held["remote_run"],
                            expected_owner={name: held[name] for name in
-                                           ("owner_host", "owner_pid", "owner_identity")})
+                                           ("owner_host", "owner_pid", "owner_start_token",
+                                            "owner_identity")})
         # The dead holder used to leave the launchd job until the deadline.
         assert result["status"] in {"cleared", "cancelled"}
         _wait_dead(child, node, held)
@@ -1155,7 +1196,8 @@ def test_poll_once_does_not_write_a_request_mirror(tmp_path):
 def _cancel(node, record):
     return node.call("cancel", **key(record), identity=record["remote_run"],
                      expected_owner={name: record[name] for name in
-                                     ("owner_host", "owner_pid", "owner_identity")})
+                                     ("owner_host", "owner_pid", "owner_start_token",
+                                      "owner_identity")})
 
 
 def test_cancel_kills_background_grandchildren_before_releasing_the_token(node_env, tmp_path):
@@ -1650,7 +1692,8 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
 
     monkeypatch.setattr(node, "_same_process", same)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 100)
-    monkeypatch.setattr(node, "_private_tree_proof", lambda state, cid, members=None: True)
+    monkeypatch.setattr(node, "_private_tree_proof",
+                        lambda state, cid, members=None, run=None: True)
     monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
     monkeypatch.setattr(node.os, "kill", fake_kill)
     assert node._signal_incarnation({}, 4321, (10, 20), 100) is True
@@ -1658,12 +1701,42 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
     assert signal.SIGKILL not in signals
 
 
-def test_private_tree_proof_uses_the_recorded_coalition_without_parentage(monkeypatch):
+def test_private_tree_proof_uses_the_recorded_coalition_without_parentage(tmp_path, monkeypatch):
     import goalflight_remote_ci_node as node
 
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 4242, "start": [1, 2], "coalition_id": 100,
+        "boot_session": "boot-a",
+    }), encoding="utf-8")
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 7)
-    state = {"coalition_id": 100, "holder_coalition_id": 5}
-    assert node._private_tree_proof(state, 100, [(99991, (1, 2))]) is True
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    state = {
+        "coalition_id": 100, "coalition_boot_session": "boot-a",
+        "holder_coalition_id": 5, "holder_coalition_boot_session": "boot-a",
+        "workload_pid": 4242, "workload_start": [1, 2],
+    }
+    assert node._private_tree_proof(state, 100, [(99991, (1, 2))], run=run) is True
+
+
+def test_stale_coalition_boot_session_is_not_proven_private(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 4242, "start": [1, 2], "coalition_id": 100,
+        "boot_session": "boot-old",
+    }), encoding="utf-8")
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 7)
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-new")
+    state = {
+        "coalition_id": 100, "coalition_boot_session": "boot-old",
+        "holder_coalition_id": 5, "holder_coalition_boot_session": "boot-old",
+        "workload_pid": 4242, "workload_start": [1, 2],
+    }
+    assert node._private_tree_proof(state, 100, run=run) is False
 
 
 def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
@@ -1677,7 +1750,8 @@ def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
 
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", coalition)
-    monkeypatch.setattr(node, "_private_tree_proof", lambda state, cid, members=None: True)
+    monkeypatch.setattr(node, "_private_tree_proof",
+                        lambda state, cid, members=None, run=None: True)
     monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
     monkeypatch.setattr(node.os, "kill", lambda pid, sig: signals.append(sig))
     assert node._signal_incarnation({}, 20, (99, 99), 100) is False
@@ -1778,6 +1852,13 @@ def test_job_label_is_durable_before_launchctl_submit(tmp_path, monkeypatch):
                 stdout = ""
 
             return Result()
+        if argv[:2] == ["sysctl", "-n"]:
+            class Result:
+                returncode = 0
+                stderr = ""
+                stdout = "boot-a\n"
+
+            return Result()
         if argv[:2] == ["launchctl", "submit"]:
             lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
             seen["label"] = lease.get("launch_label")
@@ -1825,17 +1906,21 @@ def test_gate_opens_only_after_the_coalition_is_recorded(tmp_path, monkeypatch):
         original(target, current)
 
     (run / "wrapper-identity.json").write_text(json.dumps(
-        {"pid": 42, "start": [10, 20], "coalition_id": 100}), encoding="utf-8")
+        {"pid": 42, "start": [10, 20], "coalition_id": 100,
+         "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node.subprocess, "run", fake_run)
     monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
-    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100, "boot-a"))
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
     monkeypatch.setattr(node, "_remember_identity", remember)
     launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
     assert launched[0] == 42
     lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
     assert lease["coalition_id"] == 100
+    assert lease["coalition_boot_session"] == "boot-a"
+    assert lease["holder_coalition_boot_session"] == "boot-a"
     assert lease["launch_label"] == "com.goalflight.remote-ci.abc"
     assert (run / "workload-go").is_file()
 
@@ -1872,13 +1957,15 @@ def test_gate_stays_closed_without_a_durable_coalition_id(tmp_path, monkeypatch)
         original(target, current)
 
     (run / "wrapper-identity.json").write_text(json.dumps(
-        {"pid": 42, "start": [10, 20], "coalition_id": 100}), encoding="utf-8")
+        {"pid": 42, "start": [10, 20], "coalition_id": 100,
+         "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node.subprocess, "run", lambda argv, **kwargs: type("R", (), {
         "returncode": 0, "stderr": "", "stdout": ""})())
     monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
-    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100, "boot-a"))
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
     monkeypatch.setattr(node, "_remember_identity", remember)
     launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
     assert isinstance(launched, str)
@@ -2076,10 +2163,17 @@ def test_failed_job_removal_stays_tracked_for_reap(tmp_path, monkeypatch):
     state = {
         "lease_id": "abc", "lease_token": "tok", "state": "running",
         "launch_label": "com.goalflight.remote-ci.abc",
-        "coalition_id": 100, "holder_coalition_id": 5,
+        "coalition_id": 100, "coalition_boot_session": "boot-a",
+        "holder_coalition_id": 5, "holder_coalition_boot_session": "boot-a",
         "workload_pid": "40", "workload_start": [1, 2],
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 40, "start": [1, 2], "coalition_id": 100,
+        "boot_session": "boot-a",
+    }), encoding="utf-8")
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     monkeypatch.setattr(node, "_job_view", lambda label: ("exited", None, 3))
     monkeypatch.setattr(node, "_remove_job", lambda label: False)
@@ -2147,17 +2241,25 @@ def _dead_holder_request(tmp_path, monkeypatch, *, state_name, deadline_offset):
         "host": "h", "pid": "44", "start_token": "st",
         "run_dir": str(run), "lease_id": "abc", "lease_token": "tok",
     }
-    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_start_token": "st",
+             "owner_identity": "t"}
     state = {
         "schema": "goalflight.remote-ci.lease.v1",
         "lease_id": "abc", "lease_token": "tok", "state": state_name,
         "token_index": 0, "launch_label": "com.goalflight.remote-ci.abc",
-        "coalition_id": 100, "holder_coalition_id": 5,
+        "coalition_id": 100, "coalition_boot_session": "boot-a",
+        "holder_coalition_id": 5, "holder_coalition_boot_session": "boot-a",
         "deadline_epoch": time.time() + deadline_offset,
         "remote_run": remote, "job_remove_pending": True,
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     (run / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 40, "start": [1, 2], "coalition_id": 100,
+        "boot_session": "boot-a",
+    }), encoding="utf-8")
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     return node, managed, run, remote, owner
 
 
@@ -2202,7 +2304,8 @@ def test_draining_lease_without_launch_identity_keeps_capacity(tmp_path, monkeyp
         "host": "h", "pid": "44", "start_token": "st",
         "run_dir": str(run), "lease_id": "abc", "lease_token": "tok",
     }
-    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_start_token": "st",
+             "owner_identity": "t"}
     state = {
         "schema": "goalflight.remote-ci.lease.v1",
         "lease_id": "abc", "lease_token": "tok", "state": "draining",
@@ -2363,7 +2466,8 @@ def test_live_wrapper_outside_an_empty_cwd_keeps_the_slot(tmp_path, monkeypatch)
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     (run / "wrapper-identity.json").write_text(json.dumps(
-        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100,
+         "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
     monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
@@ -2479,10 +2583,12 @@ def test_dead_wrapper_with_an_empty_coalition_can_release(tmp_path, monkeypatch)
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     (run / "wrapper-identity.json").write_text(json.dumps(
-        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100,
+         "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
     monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
     monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     assert node.clear_tree(tmp_path, state, run) is True
 
@@ -2522,10 +2628,11 @@ def test_stale_listing_does_not_adopt_a_reused_pid(tmp_path, monkeypatch):
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     (run / "wrapper-identity.json").write_text(json.dumps(
-        {"pid": 50, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+        {"pid": 50, "start": [1, 2], "coalition_id": 100,
+         "boot_session": "boot-a"}), encoding="utf-8")
     killed = []
     monkeypatch.setattr(node, "_job_view", lambda label: ("running", 50, None))
-    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((9, 9), 777))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((9, 9), 777, "boot-a"))
     monkeypatch.setattr(node, "_same_process", lambda pid, started: tuple(started) == (9, 9))
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [(50, (9, 9))])
@@ -2558,7 +2665,7 @@ def test_reused_job_pid_is_not_adopted(tmp_path, monkeypatch):
 
     killed = []
     monkeypatch.setattr(node, "_job_view", job_view)
-    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((1, 2), 777))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((1, 2), 777, "boot-a"))
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     monkeypatch.setattr(node, "_remove_job", lambda label: False)
@@ -2617,68 +2724,81 @@ def test_unlisted_submit_is_not_an_empty_tree(tmp_path, monkeypatch):
 
 
 def test_unreadable_coalition_is_not_an_empty_sweep(tmp_path, monkeypatch):
-    """A scan that cannot prove membership neither kills nor counts as empty."""
+    """A scan that cannot prove membership neither removes nor counts as empty."""
     import goalflight_remote_ci_node as node
 
     managed = tmp_path / "managed"
     run = managed / "runs" / "abc"
     run.mkdir(parents=True)
+    (managed / "admission").mkdir()
+    (managed / "admission" / "queue.lock").write_text("", encoding="utf-8")
     (run / "lease.json").write_text(json.dumps({
+        "lease_id": "abc", "lease_token": "tok", "state": "draining",
         "launch_label": "com.goalflight.remote-ci.abc",
         "coalition_id": 4242,
         "holder_coalition_id": 7,
     }), encoding="utf-8")
-    monkeypatch.setattr(node, "_coalition_members", lambda cid: None)
-    monkeypatch.setattr(
-        sys.modules[__name__], "_launchctl_run",
-        lambda *args, **kwargs: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(node, "_job_view", lambda label: "unknown")
+    monkeypatch.setattr(node, "_remove_job", lambda label: (_ for _ in ()).throw(
+        AssertionError("unknown tree must not remove the job")))
     _sweep_unknown.clear()
     try:
         _sweep_managed_jobs(managed)
         assert _sweep_unknown == [4242]
-        assert _sweep_unsignalled == []
     finally:
         _sweep_unknown.clear()
         _swept_coalitions.clear()
-        _sweep_unsignalled.clear()
 
 
 def test_sweep_rechecks_incarnation_before_kill(tmp_path, monkeypatch):
-    """The teardown sweep must not signal a pid whose incarnation was not re-read."""
+    """The teardown path uses production incarnation checks and keeps UNKNOWN held."""
     import goalflight_remote_ci_node as node
 
     managed = tmp_path / "managed"
     run = managed / "runs" / "abc"
     run.mkdir(parents=True)
+    (managed / "admission").mkdir()
+    (managed / "admission" / "queue.lock").write_text("", encoding="utf-8")
     (run / "lease.json").write_text(json.dumps({
+        "lease_id": "abc", "lease_token": "tok", "state": "draining",
         "launch_label": "com.goalflight.remote-ci.abc",
         "coalition_id": 4242,
+        "coalition_boot_session": "boot-a",
         "holder_coalition_id": 7,
+        "holder_coalition_boot_session": "boot-a",
+        "workload_pid": 4321,
+        "workload_start": [11, 22],
+    }), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 4321, "start": [11, 22], "coalition_id": 4242,
+        "boot_session": "boot-a",
     }), encoding="utf-8")
     started = (11, 22)
     calls = []
-    killed = []
 
-    def signal_incarnation(state, pid, started_at, cid):
+    def signal_incarnation(state, pid, started_at, cid, run=None):
         del state
-        calls.append((pid, started_at, cid))
+        calls.append((pid, started_at, cid, run))
         return False
 
+    def coalition(pid):
+        return 99 if pid == os.getpid() else 4242
+
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "_verify_incarnation", lambda pid, start: True)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [(4321, started)])
     monkeypatch.setattr(node, "_signal_incarnation", signal_incarnation)
-    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
-    monkeypatch.setattr(
-        sys.modules[__name__], "_launchctl_run",
-        lambda *args, **kwargs: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
+    monkeypatch.setattr(node, "_remove_job", lambda label: (_ for _ in ()).throw(
+        AssertionError("live members must prevent job removal")))
     try:
         _sweep_managed_jobs(managed)
-        assert calls == [(4321, started, 4242)]
-        assert killed == []
-        assert _sweep_unsignalled == [(4242, 4321, started)]
+        assert calls and all(call[:3] == (4321, started, 4242) for call in calls)
+        assert _sweep_unknown == [4242]
     finally:
         _sweep_unknown.clear()
         _swept_coalitions.clear()
-        _sweep_unsignalled.clear()
 
 
 def test_dead_running_holder_removes_the_launchd_job(tmp_path, monkeypatch):
@@ -2924,7 +3044,8 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
     managed = tmp_path / "managed"
-    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_start_token": "st",
+             "owner_identity": "t"}
     record = node.dispatch({
         "operation": "enqueue", "managed_root": str(managed), "box": "b",
         "p_cores": 100000, "token_pool_size": 1, "poll_seconds": 0.01,

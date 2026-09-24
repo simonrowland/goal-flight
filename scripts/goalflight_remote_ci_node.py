@@ -311,6 +311,15 @@ def _run_command(argv):
         return None
 
 
+def _boot_session_id():
+    """Return the kernel boot session token, or None when it is unreadable."""
+    proc = _run_command(["sysctl", "-n", "kern.bootsessionuuid"])
+    if proc is None or proc.returncode != 0:
+        return None
+    token = proc.stdout.strip()
+    return token or None
+
+
 def cwd_snapshot():
     """One lsof of every process cwd. None means the snapshot cannot be trusted."""
     proc = _run_command(["lsof", "-nP", "-d", "cwd", "-F", "pn"])
@@ -633,7 +642,7 @@ def _incarnation_in_coalition(pid, started, cid):
     return True
 
 
-def _private_tree_proof(state, cid, members=None):
+def _private_tree_proof(state, cid, members=None, run=None):
     """True when the durable job coalition is private to this cleanup."""
     del members
     if (not isinstance(state, dict)
@@ -641,16 +650,40 @@ def _private_tree_proof(state, cid, members=None):
             or state.get("coalition_id") != cid
             or not _positive_cid(cid)):
         return False
+    boot = state.get("coalition_boot_session")
+    if not isinstance(boot, str) or not boot or _boot_session_id() != boot:
+        return False
     holder = state.get("holder_coalition_id")
-    if not _positive_cid(holder) or cid == holder:
+    holder_boot = state.get("holder_coalition_boot_session")
+    if (not _positive_cid(holder) or cid == holder
+            or not isinstance(holder_boot, str) or holder_boot != boot):
         return False
     mine = _coalition_id(os.getpid())
     if not _positive_cid(mine) or cid == mine:
         return False
+    if run is None:
+        identity = state.get("wrapper_identity")
+    else:
+        identity = _read_wrapper_identity(Path(run))
+    if (not isinstance(identity, dict)
+            or identity.get("coalition_id") != cid
+            or identity.get("boot_session") != boot):
+        return False
+    if "workload_pid" in state:
+        try:
+            recorded_pid = int(state["workload_pid"])
+        except (TypeError, ValueError):
+            return False
+        if identity.get("pid") != recorded_pid:
+            return False
+    if "workload_start" in state:
+        recorded_start = _as_start(state["workload_start"])
+        if recorded_start is None or tuple(identity.get("start") or ()) != recorded_start:
+            return False
     return True
 
 
-def _signal_incarnation(state, pid, started, cid):
+def _signal_incarnation(state, pid, started, cid, run=None):
     """TERM, then KILL only after a positive private-tree proof.
 
     Returns True when that incarnation is gone. A reused pid is not signalled.
@@ -658,7 +691,7 @@ def _signal_incarnation(state, pid, started, cid):
     """
     pid = int(pid)
     if (pid <= 1 or pid == os.getpid() or started is None
-            or not _private_tree_proof(state, cid)):
+            or not _private_tree_proof(state, cid, run=run)):
         return False
 
     def gone():
@@ -734,15 +767,20 @@ def _store_members(run, state, members):
     lease["members"] = state["members"]
     if state.get("coalition_id"):
         lease["coalition_id"] = state["coalition_id"]
+    if state.get("coalition_boot_session"):
+        lease["coalition_boot_session"] = state["coalition_boot_session"]
     if state.get("workload_start"):
         lease["workload_start"] = state["workload_start"]
     if state.get("holder_coalition_id"):
         lease["holder_coalition_id"] = state["holder_coalition_id"]
+    if state.get("holder_coalition_boot_session"):
+        lease["holder_coalition_boot_session"] = state["holder_coalition_boot_session"]
     write_json(run / "lease.json", lease)
 
 
 _LEASE_KEYS = (
-    "launch_label", "coalition_id", "holder_coalition_id", "workload_pid",
+    "launch_label", "coalition_id", "coalition_boot_session",
+    "holder_coalition_id", "holder_coalition_boot_session", "workload_pid",
     "workload_start", "exit_code", "exit_known", "members", "job_remove_pending",
     "pending_result", "launch_submitted", "launch_seen", "launch_intent_at",
     "identity_status", "launch_rejected",
@@ -772,14 +810,10 @@ def _positive_cid(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _private_coalition(state):
+def _private_coalition(state, run=None):
     """A coalition id proven different from the holder and this process."""
     cid = state.get("coalition_id")
-    holder = state.get("holder_coalition_id")
-    if not _positive_cid(cid) or not _positive_cid(holder) or cid == holder:
-        return None
-    mine = _coalition_id(os.getpid())
-    if not _positive_cid(mine) or cid == mine:
+    if not _private_tree_proof(state, cid, run=run):
         return None
     return cid
 
@@ -805,14 +839,14 @@ def clear_tree(managed, state, run):
     """
     del managed
     label = state.get("launch_label") or ""
-    if label and _private_coalition(state) is None:
+    if label and _private_coalition(state, run) is None:
         adopted = _adopt_launch(run, state)
         if adopted == "unknown":
             return False
         if adopted == "empty":
             return True
     _capture_exit_status(run, state)
-    cid = _private_coalition(state)
+    cid = _private_coalition(state, run)
     if cid is None:
         if label or state.get("workload_pid") or state.get("members") or _gate_open(run):
             state["job_remove_pending"] = bool(label)
@@ -852,7 +886,11 @@ def _read_wrapper_identity(run):
         return "unreadable"
     if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
         cid = None
-    return {"pid": pid, "start": start, "coalition_id": cid}
+    boot = body.get("boot_session")
+    if not isinstance(boot, str) or not boot:
+        boot = None
+    return {"pid": pid, "start": start, "coalition_id": cid,
+            "boot_session": boot}
 
 
 def _identity_allows_release(run, state):
@@ -870,7 +908,12 @@ def _identity_allows_release(run, state):
     if _verify_incarnation(ident["pid"], ident["start"]) is not False:
         return False
     cid = ident.get("coalition_id")
-    if not cid:
+    boot = ident.get("boot_session")
+    if not cid or not isinstance(boot, str) or not boot or _boot_session_id() != boot:
+        return False
+    if state.get("coalition_id") not in (None, cid):
+        return False
+    if state.get("coalition_boot_session") not in (None, boot):
         return False
     members = _coalition_members(cid)
     if members is None or members:
@@ -916,6 +959,8 @@ def _recover_absent(run, state):
     state["workload_start"] = [ident["start"][0], ident["start"][1]]
     if ident.get("coalition_id"):
         state["coalition_id"] = ident["coalition_id"]
+    if ident.get("boot_session"):
+        state["coalition_boot_session"] = ident["boot_session"]
     if verdict is True or not _identity_allows_release(run, state):
         state["job_remove_pending"] = True
         if verdict is True and not _positive_cid(state.get("holder_coalition_id")):
@@ -923,7 +968,7 @@ def _recover_absent(run, state):
             _remember_identity(run, state)
             return "unknown"
         _remember_identity(run, state)
-        if verdict is True and _private_coalition(state):
+        if verdict is True and _private_coalition(state, run):
             return "ready"
         return "unknown"
     state["job_remove_pending"] = False
@@ -976,12 +1021,13 @@ def _adopt_launch(run, state):
         state["job_remove_pending"] = True
         _remember_identity(run, state)
         return "unknown"
-    identity = _identity_for_job(label, pid, started, persisted_cid)
+    identity = _identity_for_job(label, pid, started, persisted_cid,
+                                 ident.get("boot_session") if isinstance(ident, dict) else None)
     if identity is None:
         state["job_remove_pending"] = True
         _remember_identity(run, state)
         return "unknown"
-    start, cid = identity
+    start, cid, boot = identity
     holder = state.get("holder_coalition_id")
     state["workload_pid"] = str(pid)
     state["workload_start"] = [start[0], start[1]]
@@ -990,12 +1036,16 @@ def _adopt_launch(run, state):
         state["job_remove_pending"] = True
         _remember_identity(run, state)
         return "unknown"
-    if cid == holder or not _positive_cid(cid):
+    holder_boot = state.get("holder_coalition_boot_session")
+    if (cid == holder or not _positive_cid(cid)
+            or not isinstance(boot, str) or not boot
+            or holder_boot != boot):
         state["identity_status"] = "coalition-not-private"
         state["job_remove_pending"] = True
         _remember_identity(run, state)
         return "unknown"
     state["coalition_id"] = cid
+    state["coalition_boot_session"] = boot
     state["holder_coalition_id"] = holder
     _remember_identity(run, state)
     return "ready"
@@ -1032,7 +1082,7 @@ def _kill_members(run, state, cid, label):
             state["job_remove_pending"] = bool(label)
             _remember_identity(run, state)
             return False
-        if living and not _private_tree_proof(state, cid):
+        if living and not _private_tree_proof(state, cid, run=run):
             state["identity_status"] = "coalition-not-private"
             state["job_remove_pending"] = bool(label)
             _remember_identity(run, state)
@@ -1060,7 +1110,7 @@ def _kill_members(run, state, cid, label):
             _remember_identity(run, state)
             return True
         for pid, start in living.items():
-            _signal_incarnation(state, pid, start, cid)
+            _signal_incarnation(state, pid, start, cid, run=run)
         persisted = living
     state["job_remove_pending"] = bool(label)
     _store_members(run, state, persisted)
@@ -1173,19 +1223,20 @@ def _publish_pending(run, state):
 
 
 def _stable_identity(pid):
-    """(start, coalition) when two reads agree, else None."""
+    """(start, coalition, boot) when two reads agree, else None."""
     first = _coalition_id(pid)
     start = _start_time(pid)
     second = _coalition_id(pid)
     start_again = _start_time(pid)
+    boot = _boot_session_id()
     if (first is None or second is None or start is None
-            or first != second or start != start_again or first <= 0):
+            or first != second or start != start_again or first <= 0 or not boot):
         return None
-    return start, first
+    return start, first, boot
 
 
-def _identity_for_job(label, pid, started, coalition):
-    """(start, coalition) only when the live start token is the persisted one.
+def _identity_for_job(label, pid, started, coalition, boot_session):
+    """(start, coalition, boot) only when the live identity is persisted.
 
     ``started`` is the first observation (the wrapper's own record). The
     same pid with a different start is a different process: do not adopt it.
@@ -1195,25 +1246,28 @@ def _identity_for_job(label, pid, started, coalition):
     identity = _stable_identity(pid)
     if identity is None or identity[0] != started:
         return None
-    if coalition and identity[1] != coalition:
+    if not _positive_cid(coalition) or identity[1] != coalition:
+        return None
+    if not isinstance(boot_session, str) or not boot_session or identity[2] != boot_session:
         return None
     view = _job_view(label)
     if not (isinstance(view, tuple) and view[0] == "running" and view[1] == pid):
         return None
     if _verify_incarnation(pid, started) is not True:
         return None
-    return started, (coalition or identity[1])
+    return started, coalition, boot_session
 
 
 # Field layout matches _ProcBsdInfo and _CoalInfo. The wrapper is a separate
 # process and cannot import this module when the node is exec'd from a string.
 _WORKLOAD_WRAPPER = (
-    "import ctypes, json, os, sys, time\n"
+    "import ctypes, json, os, subprocess, sys, time\n"
     "from pathlib import Path\n"
     "def identity():\n"
     "    pid = os.getpid()\n"
     "    start = None\n"
     "    coalition = None\n"
+    "    boot = None\n"
     "    try:\n"
     "        lib = ctypes.CDLL('/usr/lib/libproc.dylib')\n"
     "        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]\n"
@@ -1241,9 +1295,14 @@ _WORKLOAD_WRAPPER = (
     "        size = lib.proc_pidinfo(pid, 20, 0, ctypes.byref(coal), ctypes.sizeof(coal))\n"
     "        if size == ctypes.sizeof(coal):\n"
     "            coalition = int(coal.ids[0])\n"
-    "    except OSError:\n"
+    "        result = subprocess.run(['sysctl', '-n', 'kern.bootsessionuuid'],\n"
+    "                                  capture_output=True, text=True, timeout=5)\n"
+    "        if result.returncode == 0:\n"
+    "            boot = result.stdout.strip() or None\n"
+    "    except (OSError, subprocess.TimeoutExpired):\n"
     "        pass\n"
-    "    return {'pid': pid, 'start': start, 'coalition_id': coalition}\n"
+    "    return {'pid': pid, 'start': start, 'coalition_id': coalition,\n"
+    "            'boot_session': boot}\n"
     "spec = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
     "run = Path(sys.argv[1]).resolve().parent\n"
     "raw = json.dumps(identity()).encode()\n"
@@ -1313,8 +1372,10 @@ def _submit_workload(run, state, argv, env, cwd):
     holder_cid = state.get("holder_coalition_id")
     if not _positive_cid(holder_cid):
         holder_cid = _coalition_id(os.getpid())
-        if _positive_cid(holder_cid):
+        holder_boot = _boot_session_id()
+        if _positive_cid(holder_cid) and holder_boot:
             state["holder_coalition_id"] = holder_cid
+            state["holder_coalition_boot_session"] = holder_boot
     state["launch_label"] = label
     # Intent is durable before the syscall. A holder killed during submit
     # must not recover as "the job never existed".
@@ -1373,19 +1434,23 @@ def _submit_workload(run, state, argv, env, cwd):
             time.sleep(0.02)
             continue
         identity = _identity_for_job(
-            label, pid, ident["start"], ident.get("coalition_id"))
+            label, pid, ident["start"], ident.get("coalition_id"),
+            ident.get("boot_session"))
         if identity is None:
             time.sleep(0.02)
             continue
-        start, cid = identity
+        start, cid, boot = identity
         state["workload_pid"] = str(pid)
         state["workload_start"] = [start[0], start[1]]
         holder_cid = state.get("holder_coalition_id")
-        if not _positive_cid(holder_cid) or cid == holder_cid:
+        holder_boot = state.get("holder_coalition_boot_session")
+        if (not _positive_cid(holder_cid) or cid == holder_cid
+                or not isinstance(boot, str) or not boot or holder_boot != boot):
             # Not a private coalition. Do not record it as a kill target.
             _remember_identity(run, state)
             return "coalition was not private"
         state["coalition_id"] = cid
+        state["coalition_boot_session"] = boot
         _remember_identity(run, state)
         # The wrapper execs only after the id is on disk and readable again.
         # A failed lease write must not open the gate: recovery cannot kill
@@ -1775,7 +1840,9 @@ def _release_holder(root, run, state, token):
         if state.get("release_reason"):
             lease["release_reason"] = state["release_reason"]
         for key in ("workload_pid", "workload_start", "launch_label", "coalition_id",
-                    "holder_coalition_id", "exit_code", "exit_known", "pending_result"):
+                    "coalition_boot_session", "holder_coalition_id",
+                    "holder_coalition_boot_session", "exit_code", "exit_known",
+                    "pending_result"):
             if key in state:
                 lease[key] = state[key]
         lease["state"] = "draining"
@@ -2069,11 +2136,13 @@ def dispatch(request):
                 'request_id': request['request_id'], 'arm': request['arm'],
             }
             holder_cid = _coalition_id(os.getpid())
-            if _positive_cid(holder_cid):
+            holder_boot = _boot_session_id()
+            if _positive_cid(holder_cid) and holder_boot:
                 # The forked holder remains in this coalition. Record it
                 # before any submit so recovery cannot mistake the session
                 # coalition for a private workload coalition.
                 state['holder_coalition_id'] = holder_cid
+                state['holder_coalition_boot_session'] = holder_boot
             write_json(run / 'lease.json', state)
             if not _fsync_file(run / 'lease.json'):
                 # Without a durability proof, absence of this field must
