@@ -232,6 +232,61 @@ def test_launch_wrapper_is_the_only_account_env_call_in_main() -> None:
     assert after_def.count("_resolve_account_env(args)") == 1
 
 
+def test_acp_missing_account_refuses_before_dispatch_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    env = _isolated_env(tmp_path, tmp_path / "home")
+    env["GOALFLIGHT_DISPATCH_ID_SEED"] = "acp-missing-account"
+    warnings: list[object] = []
+
+    monkeypatch.setattr(D, "_stamp_controller_session", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        D,
+        "_dispatch_warnings",
+        lambda *_args, **_kwargs: warnings.append("warnings") or [],
+    )
+    monkeypatch.setattr(
+        D,
+        "_run_acp_shape",
+        lambda *_args, **_kwargs: warnings.append("runner") or 0,
+    )
+    monkeypatch.setattr(
+        D,
+        "_admit_dispatch_worktree",
+        lambda *_args, **_kwargs: warnings.append("worktree") or None,
+    )
+    monkeypatch.setattr(
+        D,
+        "_acquire_capacity",
+        lambda *_args, **_kwargs: warnings.append("capacity") or "lease",
+    )
+
+    with pytest.MonkeyPatch.context() as isolated:
+        for key, value in env.items():
+            isolated.setenv(key, value)
+        rc = D.main(
+            [
+                "--shape",
+                "acp",
+                "--agent",
+                "codex-acp",
+                "--account",
+                "missing-account",
+                "--prompt",
+                "COMPLETE: no-op",
+                "--cwd",
+                str(tmp_path),
+                "--unregistered-forced",
+            ]
+        )
+
+    assert rc == 64
+    assert warnings == []
+    assert not (tmp_path / "dispatch" / ".dispatch-ids").exists()
+    assert not list((tmp_path / "dispatch").glob("*.json"))
+    assert not list((tmp_path / "tasks").glob("**/*"))
+
+
 def _isolated_env(tmp_path: Path, home: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
