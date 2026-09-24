@@ -9,9 +9,12 @@ then runs the same ``goalflight_messages.py`` commands an operator would:
 Wake webhooks stay nudge-only and are not served here.
 
 Bind defaults to loopback. ``0.0.0.0`` and ``::`` refuse to listen unless
-``GOALFLIGHT_MAIL_RPC_ALLOW_PUBLIC_BIND=1``. Pin
-``GOALFLIGHT_CONTROLLER_LABEL`` on the daemon so a caller cannot drain
-another controller's mailbox.
+``GOALFLIGHT_MAIL_RPC_ALLOW_PUBLIC_BIND=1``.
+
+Several controllers share one process when a users file is selected. Each
+bearer is pinned to one controller label and cannot peek, drain, or post as
+another. With no users file, a single ``GOALFLIGHT_MAIL_RPC_TOKEN`` still
+works, and an optional ``GOALFLIGHT_CONTROLLER_LABEL`` pins that mailbox.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +39,7 @@ from urllib import request as urllib_request
 
 
 TOKEN_ENV = "GOALFLIGHT_MAIL_RPC_TOKEN"
+USERS_FILE_ENV = "GOALFLIGHT_MAIL_RPC_USERS_FILE"
 BIND_ENV = "GOALFLIGHT_MAIL_RPC_BIND"
 ALLOW_PUBLIC_BIND_ENV = "GOALFLIGHT_MAIL_RPC_ALLOW_PUBLIC_BIND"
 URL_ENVS = ("GOALFLIGHT_MAIL_RPC_URL", "MAIL_RPC_URL")
@@ -54,6 +59,10 @@ _FALSE_FLAGS = frozenset({"0", "false", "no", "off"})
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MESSAGES_SCRIPT = SCRIPT_DIR / "goalflight_messages.py"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import goalflight_journal  # noqa: E402  # installs the repository import path
+import goalflight_task  # noqa: E402
 
 
 class MailRpcError(Exception):
@@ -83,12 +92,23 @@ class PayloadTooLarge(MailRpcError):
 
 
 @dataclass(frozen=True)
-class MailRpcConfig:
-    token: str
-    bind_host: str
-    bind_port: int
+class MailRpcUser:
+    """One bearer. Only the SHA-256 digest is kept; the token is not stored."""
+
+    token_digest: bytes
     controller_label: str
     project_root: str
+    pin_project_root: bool
+    configured_project_root: str = ""
+
+
+@dataclass(frozen=True)
+class MailRpcConfig:
+    users: tuple[MailRpcUser, ...]
+    bind_host: str
+    bind_port: int
+    project_root: str
+    users_from_file: bool
     invoke_timeout_s: float = INVOKE_TIMEOUT_S
 
 
@@ -121,48 +141,250 @@ def parse_bind(raw: str, *, allow_public: bool) -> tuple[str, int]:
     return host, port
 
 
-def load_config() -> MailRpcConfig:
-    """Read daemon config from the environment. The token is never logged."""
-    token = os.environ.get(TOKEN_ENV, "").strip()
+def default_users_file() -> Path:
+    """Documented path. Used only when no legacy token is set."""
+    return Path.home() / ".goal-flight" / "mail-rpc.users.json"
+
+
+def resolve_users_file() -> tuple[Path | None, bool]:
+    """Return ``(path, required)`` for the users file.
+
+    ``GOALFLIGHT_MAIL_RPC_USERS_FILE`` is the sole user source when it is
+    set, including when the legacy token is also set. Otherwise a non-empty
+    ``GOALFLIGHT_MAIL_RPC_TOKEN`` keeps single-token mode and does not read
+    the default file. The default path is consulted only when that token is
+    unset and the file is already present.
+    """
+    if USERS_FILE_ENV in os.environ:
+        override = os.environ[USERS_FILE_ENV].strip()
+        if not override:
+            raise MailRpcError(f"{USERS_FILE_ENV} is empty")
+        return Path(override).expanduser(), True
+    if os.environ.get(TOKEN_ENV, "").strip():
+        return None, False
+    default = default_users_file()
+    if default.is_file():
+        return default, True
+    return None, False
+
+
+def _token_digest(token: str) -> bytes:
+    return hashlib.sha256(token.encode("utf-8")).digest()
+
+
+def _reject_loose_users_file(info: os.stat_result) -> None:
+    """Refuse a users file that group or other can access. Mode 600 is the bar."""
+    mode = info.st_mode
+    if not stat.S_ISREG(mode):
+        raise MailRpcError(f"{USERS_FILE_ENV} must be a regular file")
+    if info.st_uid != os.geteuid():
+        raise MailRpcError(f"{USERS_FILE_ENV} owner must be the effective UID")
+    if stat.S_IMODE(mode) & 0o077:
+        raise MailRpcError(
+            f"{USERS_FILE_ENV} is group- or world-accessible; chmod 600 the users file"
+        )
+
+
+def _load_user_entry(
+    entry: object,
+    *,
+    index: int,
+    global_project_root: str,
+    seen_digests: list[bytes],
+    seen_labels: set[str],
+) -> MailRpcUser:
+    if not isinstance(entry, dict):
+        raise MailRpcError(f"users[{index}] must be an object")
+    unknown = set(entry) - {"token", "controller_label", "project_root"}
+    if unknown:
+        names = ", ".join(sorted(str(key) for key in unknown))
+        raise MailRpcError(f"users[{index}] has unknown keys: {names}")
+    token = entry.get("token", "")
+    if not isinstance(token, str):
+        raise MailRpcError(f"users[{index}].token must be a string")
+    token = token.strip()
     if len(token) < MIN_TOKEN_LEN:
         raise MailRpcError(
-            f"{TOKEN_ENV} must be at least {MIN_TOKEN_LEN} characters "
-            "(generate with openssl rand -hex 32 on the journal host)"
+            f"users[{index}].token must be at least {MIN_TOKEN_LEN} characters"
         )
+    label = entry.get("controller_label", "")
+    if label is None or not isinstance(label, str):
+        raise MailRpcError(f"users[{index}].controller_label must be a string")
+    label = label.strip()
+    if not label:
+        raise MailRpcError(f"users[{index}].controller_label is required")
+    if _LABEL_RE.fullmatch(label) is None:
+        raise MailRpcError(
+            f"users[{index}].controller_label is not a bounded identity token"
+        )
+    if label in seen_labels:
+        raise MailRpcError(f"users[{index}] duplicates controller_label {label!r}")
+    seen_labels.add(label)
+    root = entry.get("project_root", "")
+    if root is None:
+        root = ""
+    if not isinstance(root, str):
+        raise MailRpcError(f"users[{index}].project_root must be a string")
+    root = root.strip() or global_project_root
+    configured_root = ""
+    if root:
+        path = Path(root).expanduser()
+        if not path.is_absolute():
+            raise MailRpcError(f"users[{index}].project_root must be absolute")
+        configured_root = str(path)
+        try:
+            root = str(goalflight_task.resolve_project_root(configured_root))
+        except goalflight_task.TaskError as exc:
+            raise MailRpcError("project_root cannot be resolved") from exc
+    digest = _token_digest(token)
+    for previous in seen_digests:
+        if hmac.compare_digest(digest, previous):
+            raise MailRpcError(f"users[{index}] duplicates another token")
+    seen_digests.append(digest)
+    return MailRpcUser(
+        token_digest=digest,
+        controller_label=label,
+        project_root=root,
+        pin_project_root=bool(root or global_project_root),
+        configured_project_root=configured_root,
+    )
+
+
+def load_users_file(path: Path, *, global_project_root: str) -> tuple[MailRpcUser, ...]:
+    """Load bearers from JSON. Tokens are digested and then discarded."""
+    fd = -1
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        _reject_loose_users_file(os.fstat(fd))
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            text = handle.read()
+    except FileNotFoundError as exc:
+        raise MailRpcError(f"{USERS_FILE_ENV} is not a file: {path}") from exc
+    except OSError as exc:
+        raise MailRpcError(f"{USERS_FILE_ENV} is not readable") from exc
+    except UnicodeError:
+        raise MailRpcError(f"{USERS_FILE_ENV} must be UTF-8")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise MailRpcError(f"{USERS_FILE_ENV} is not valid JSON")
+    if not isinstance(parsed, dict) or "users" not in parsed:
+        raise MailRpcError(f"{USERS_FILE_ENV} must be an object with a users array")
+    extra = set(parsed) - {"users"}
+    if extra:
+        names = ", ".join(sorted(str(key) for key in extra))
+        raise MailRpcError(f"{USERS_FILE_ENV} has unknown keys: {names}")
+    raw_users = parsed["users"]
+    if not isinstance(raw_users, list) or not raw_users:
+        raise MailRpcError(f"{USERS_FILE_ENV} users must be a non-empty array")
+    seen: list[bytes] = []
+    seen_labels: set[str] = set()
+    loaded = tuple(
+        _load_user_entry(
+            entry,
+            index=index,
+            global_project_root=global_project_root,
+            seen_digests=seen,
+            seen_labels=seen_labels,
+        )
+        for index, entry in enumerate(raw_users)
+    )
+    return loaded
+
+
+def load_config() -> MailRpcConfig:
+    """Read daemon config. Bearer tokens are never logged or retained."""
     allow_public = os.environ.get(ALLOW_PUBLIC_BIND_ENV, "").strip() == "1"
     host, port = parse_bind(
         os.environ.get(BIND_ENV, DEFAULT_BIND),
         allow_public=allow_public,
     )
+    root = os.environ.get("GOALFLIGHT_PROJECT_ROOT", "").strip()
+    users_path, _ = resolve_users_file()
+    if users_path is not None:
+        # File mode ignores GOALFLIGHT_CONTROLLER_LABEL. Each entry carries
+        # its own label. A stale env label must not re-pin every user.
+        users = load_users_file(users_path, global_project_root=root)
+        if USERS_FILE_ENV not in os.environ:
+            sys.stderr.write(f"{SERVICE_NAME} using default users file: {users_path}\n")
+        return MailRpcConfig(
+            users=users,
+            bind_host=host,
+            bind_port=port,
+            project_root=root,
+            users_from_file=True,
+        )
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if len(token) < MIN_TOKEN_LEN:
+        raise MailRpcError(
+            f"{TOKEN_ENV} must be at least {MIN_TOKEN_LEN} characters "
+            "(generate with openssl rand -hex 32 on the journal host). "
+            f"For several controllers, set {USERS_FILE_ENV} instead"
+        )
     label = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL", "").strip()
     if label and _LABEL_RE.fullmatch(label) is None:
         raise MailRpcError("GOALFLIGHT_CONTROLLER_LABEL is not a bounded identity token")
-    root = os.environ.get("GOALFLIGHT_PROJECT_ROOT", "").strip()
     return MailRpcConfig(
-        token=token,
+        users=(
+            MailRpcUser(
+                token_digest=_token_digest(token),
+                controller_label=label,
+                project_root="",
+                pin_project_root=False,
+            ),
+        ),
         bind_host=host,
         bind_port=port,
-        controller_label=label,
         project_root=root,
+        users_from_file=False,
     )
+
+
+def _presented_bearer(header: str | None) -> str | None:
+    """Return the bearer token, or None when the header is not a single token."""
+    if not header:
+        return None
+    scheme, sep, presented = header.strip().partition(" ")
+    if not sep or scheme.lower() != "bearer":
+        return None
+    presented = presented.strip()
+    if not presented or presented != header.strip()[len(scheme) + 1 :].strip():
+        return None
+    # Extra whitespace after the token is a mismatch (already stripped once).
+    if " " in presented:
+        return None
+    return presented
 
 
 def token_matches(header: str | None, token: str) -> bool:
     """Compare ``Authorization: Bearer`` without leaking the token length."""
-    if not header or not token:
+    if not token:
         return False
-    scheme, sep, presented = header.strip().partition(" ")
-    if not sep or scheme.lower() != "bearer":
-        return False
-    presented = presented.strip()
-    if not presented or presented != header.strip()[len(scheme) + 1 :].strip():
-        return False
-    # Extra whitespace after the token is a mismatch (already stripped once).
-    if " " in presented:
+    presented = _presented_bearer(header)
+    if presented is None:
         return False
     presented_digest = hashlib.sha256(presented.encode("utf-8")).digest()
     token_digest = hashlib.sha256(token.encode("utf-8")).digest()
     return hmac.compare_digest(presented_digest, token_digest)
+
+
+def authenticate(header: str | None, config: MailRpcConfig) -> MailRpcUser:
+    """Match the bearer to one configured user. Digests only; scan every user."""
+    presented = _presented_bearer(header)
+    if presented is None or not config.users:
+        raise Unauthorized("unauthorized")
+    presented_digest = hashlib.sha256(presented.encode("utf-8")).digest()
+    matched: MailRpcUser | None = None
+    for user in config.users:
+        if hmac.compare_digest(presented_digest, user.token_digest):
+            matched = user
+    if matched is None:
+        raise Unauthorized("unauthorized")
+    return matched
 
 
 def _clean_label(value: object) -> str:
@@ -174,22 +396,24 @@ def _clean_label(value: object) -> str:
 
 
 def resolve_identity(
-    config: MailRpcConfig,
+    user: MailRpcUser,
     *,
     header_label: str | None,
     body_label: object = None,
 ) -> str:
-    """Honor the pinned daemon label, else the request header or body.
+    """Honor the user's pinned label, else the request header or body.
 
-    A pinned ``GOALFLIGHT_CONTROLLER_LABEL`` is the only mailbox this
-    process may relay or drain. A different requested label is forbidden.
+    A pinned label — from the users file, or from
+    ``GOALFLIGHT_CONTROLLER_LABEL`` in single-token mode — is the only
+    mailbox this bearer may relay or drain. A different requested label is
+    forbidden. Unpinned single-token mode still accepts the request label.
     """
     header = _clean_label(header_label)
     body = _clean_label(body_label)
     if header and body and header != body:
         raise Forbidden("controller label header and body disagree")
     requested = header or body
-    pinned = config.controller_label
+    pinned = user.controller_label
     if pinned:
         if requested and requested != pinned:
             raise Forbidden("refusing mail for a different controller")
@@ -204,21 +428,53 @@ def resolve_identity(
     return requested
 
 
-def resolve_project_root(requested: object, config: MailRpcConfig) -> Path:
-    """Use the request path, else ``GOALFLIGHT_PROJECT_ROOT``, else the checkout."""
+def _existing_project_dir(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_dir():
+        raise MailRpcError("project_root is not a directory on the journal host")
+    return path
+
+
+def resolve_project_root(
+    requested: object,
+    config: MailRpcConfig,
+    user: MailRpcUser,
+) -> Path:
+    """Resolve the checkout this bearer may touch.
+
+    Single-token mode keeps the old default: the request path wins, then
+    ``GOALFLIGHT_PROJECT_ROOT``, then the checkout discovery helper.
+
+    A users-file bearer with its own ``project_root``, or with only the
+    global root set, is confined to that directory. A different request
+    path is forbidden.
+    """
     if requested is not None and not isinstance(requested, str):
         raise MailRpcError("project_root must be a string")
-    raw = str(requested or "").strip() or config.project_root
-    if raw:
-        path = Path(raw).expanduser()
-        if not path.is_dir():
+    requested_text = str(requested or "").strip()
+    configured = user.project_root or config.project_root
+    if user.pin_project_root and configured:
+        pinned = Path(configured).expanduser()
+        if not pinned.is_absolute():
+            raise MailRpcError("project_root must be absolute")
+        original = user.configured_project_root or configured
+        if (goalflight_task.resolve_project_root_for_read(original) != pinned
+                or goalflight_task.resolve_project_root_for_read(str(pinned)) != pinned):
+            raise Forbidden("configured project_root changed since startup")
+        if requested_text:
+            asked = Path(requested_text).expanduser()
+            # Compare normalized paths before stating the request, so a
+            # foreign path is forbidden without revealing whether it exists.
+            if goalflight_task.resolve_project_root_for_read(str(asked)) != pinned:
+                raise Forbidden("refusing project_root for a different checkout")
+        if not pinned.is_dir():
             raise MailRpcError("project_root is not a directory on the journal host")
-        return path
-    if str(SCRIPT_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPT_DIR))
-    import goalflight_journal  # noqa: F401  # puts the repo root on sys.path
-    import goalflight_task
-
+        # Absolute path: a relative pin must not be resolved again from inside
+        # that directory by the messages CLI.
+        return pinned.resolve()
+    raw = requested_text or configured
+    if raw:
+        return _existing_project_dir(raw)
     found = goalflight_task.resolve_project_root_for_read(None)
     if found is None:
         raise MailRpcError(
@@ -276,9 +532,56 @@ def _query_map(path: str) -> dict[str, list[str]]:
 def _child_env(identity: str) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_CONTROLLER_LABEL"] = identity
-    # A leftover worker id would change post addressing. This RPC is a controller.
-    env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    # Bearers do not inherit the launching controller's authority or stores.
+    # Inventory: messages defaults, task root/store, journal, dispatch ledger.
+    for name in (
+        "GOALFLIGHT_DISPATCH_ID", "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID", "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_MESSAGES_DIR", "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_TASK_STORE_DIR", "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_STATE_DIR", "GOALFLIGHT_DISPATCH_DIR", "XDG_STATE_HOME",
+    ):
+        env.pop(name, None)
     return env
+
+
+def _confined_messages_main(argv: list[str], pinned_root: str) -> int:
+    """Run one CLI invocation with a checked delivery snapshot in its child.
+
+    Resolve using the CLI's own environment and actual post arguments, before
+    it opens a carrier. Reuse that snapshot during admission so a ledger change
+    cannot substitute a different destination after authorization. This module
+    substitution is local to the disposable, single-request subprocess.
+    """
+    import goalflight_messages as messages
+
+    post_message = messages.post_message
+    resolve_targets = messages._journal_delivery_targets
+    denied = False
+
+    def confined_post(**kwargs):
+        nonlocal denied
+        try:
+            root = Path(pinned_root)
+            if goalflight_task.resolve_project_root_for_read(pinned_root) != root:
+                raise Forbidden("configured project_root changed since startup")
+            targets = resolve_targets({
+                "dispatch_id": kwargs["dispatch_id"], "type": kwargs["msg_type"],
+                "payload": kwargs["payload"], "addressee": kwargs.get("addressee"),
+            })
+            if any(goalflight_task.resolve_project_root_for_read(str(target)) != root
+                   for target, _label, _active in targets):
+                raise Forbidden("refusing delivery to a different checkout")
+        except Forbidden as exc:
+            # messages.main catches exceptions; preserve HTTP's 403 separately.
+            denied = True
+            raise messages.MessageError(exc.detail) from exc
+        messages._journal_delivery_targets = lambda _envelope: targets
+        return post_message(**kwargs)
+
+    messages.post_message = confined_post
+    code = messages.main(argv)
+    return 4 if denied else code
 
 
 def run_messages(
@@ -287,13 +590,22 @@ def run_messages(
     identity: str,
     cwd: Path,
     timeout_s: float,
+    pinned_root: str | None = None,
 ) -> tuple[int, str, str]:
     """Run the messages CLI. Callers map its exit code; they do not reimplement SQL."""
     if not MESSAGES_SCRIPT.is_file():
         raise MailRpcError("goalflight_messages.py is not beside the mail RPC")
     try:
+        command = [sys.executable, str(MESSAGES_SCRIPT), *argv]
+        if pinned_root is not None:
+            command = [sys.executable, "-c",
+                       "import sys; sys.path.insert(0, sys.argv.pop(1)); "
+                       "from goalflight_mail_rpc import _confined_messages_main; "
+                       "root = sys.argv.pop(1); "
+                       "sys.exit(_confined_messages_main(sys.argv[1:], root))",
+                       str(SCRIPT_DIR), pinned_root, *argv]
         completed = subprocess.run(
-            [sys.executable, str(MESSAGES_SCRIPT), *argv],
+            command,
             cwd=str(cwd),
             env=_child_env(identity),
             text=True,
@@ -303,6 +615,8 @@ def run_messages(
         )
     except subprocess.TimeoutExpired as exc:
         raise MailRpcError("messages CLI timed out") from exc
+    if pinned_root is not None and completed.returncode == 4:
+        raise Forbidden("refusing delivery to a different checkout")
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
@@ -449,18 +763,19 @@ def build_post_argv(
 
 def handle_relay(
     config: MailRpcConfig,
+    user: MailRpcUser,
     *,
     header_label: str | None,
     query: Mapping[str, list[str]],
     body: Mapping[str, object],
 ) -> tuple[int, dict[str, object]]:
     identity = resolve_identity(
-        config,
+        user,
         header_label=header_label,
         body_label=body.get("controller_label"),
     )
     mode = relay_mode(query, body)
-    project_root = resolve_project_root(body.get("project_root"), config)
+    project_root = resolve_project_root(body.get("project_root"), config, user)
     argv = build_relay_argv(
         mode=mode,
         project_root=project_root,
@@ -476,27 +791,66 @@ def handle_relay(
     return cli_payload(code, stdout, stderr)
 
 
+def confine_controller_project_root(
+    requested: object,
+    *,
+    project_root: Path,
+    user: MailRpcUser,
+) -> None:
+    """Hold post's ``controller_project_root`` to a users-file pin.
+
+    Single-token mode does not pin checkouts, so this is a no-op there.
+    """
+    if not user.pin_project_root:
+        return
+    if requested is None:
+        return
+    if not isinstance(requested, str):
+        raise MailRpcError("controller_project_root must be a string")
+    text = requested.strip()
+    if not text:
+        return
+    asked = Path(text).expanduser()
+    if goalflight_task.resolve_project_root_for_read(str(asked)) != project_root:
+        raise Forbidden("refusing project_root for a different checkout")
+
+
 def handle_post(
     config: MailRpcConfig,
+    user: MailRpcUser,
     *,
     header_label: str | None,
     body: Mapping[str, object],
 ) -> tuple[int, dict[str, object]]:
     identity = resolve_identity(
-        config,
+        user,
         header_label=header_label,
         body_label=body.get("controller_label"),
     )
-    project_root = resolve_project_root(body.get("project_root"), config)
+    project_root = resolve_project_root(body.get("project_root"), config, user)
+    confine_controller_project_root(
+        body.get("controller_project_root"),
+        project_root=project_root,
+        user=user,
+    )
+    post_body: Mapping[str, object] = body
+    if user.pin_project_root:
+        # The messages CLI resolves a relative controller_project_root from
+        # the checkout cwd. Keep the authorized absolute directory.
+        post_body = dict(body)
+        post_body["controller_project_root"] = str(project_root)
     text = _optional_str(body, "text")
     text_file = _write_text_file(text) if text is not None else None
     try:
-        argv = build_post_argv(project_root=project_root, body=body, text_file=text_file)
+        argv = build_post_argv(
+            project_root=project_root, body=post_body, text_file=text_file
+        )
         code, stdout, stderr = run_messages(
             argv,
             identity=identity,
             cwd=project_root,
             timeout_s=config.invoke_timeout_s,
+            pinned_root=str(project_root) if user.pin_project_root else None,
         )
     finally:
         if text_file is not None:
@@ -535,18 +889,21 @@ class MailRpcHandler(BaseHTTPRequestHandler):
             return
         config = self.server.config
         try:
-            self._require_auth(config)
+            user = self._require_auth(config)
             body = self._read_body()
             header = self.headers.get(LABEL_HEADER)
             if path == "/v1/relay":
                 status, payload = handle_relay(
                     config,
+                    user,
                     header_label=header,
                     query=_query_map(self.path),
                     body=body,
                 )
             else:
-                status, payload = handle_post(config, header_label=header, body=body)
+                status, payload = handle_post(
+                    config, user, header_label=header, body=body
+                )
         except MailRpcError as exc:
             status = exc.status
             payload = {"ok": False, "error": exc.error}
@@ -561,9 +918,8 @@ class MailRpcHandler(BaseHTTPRequestHandler):
             }
         self._send(status, payload)
 
-    def _require_auth(self, config: MailRpcConfig) -> None:
-        if not token_matches(self.headers.get("Authorization"), config.token):
-            raise Unauthorized("unauthorized")
+    def _require_auth(self, config: MailRpcConfig) -> MailRpcUser:
+        return authenticate(self.headers.get("Authorization"), config)
 
     def _read_body(self) -> dict[str, object]:
         raw_length = self.headers.get("Content-Length")
@@ -606,9 +962,13 @@ class MailRpcHandler(BaseHTTPRequestHandler):
 
 
 def serve(config: MailRpcConfig) -> None:
+    for user in config.users:
+        if user.pin_project_root:
+            resolve_project_root(None, config, user)
     server = MailRpcServer((config.bind_host, config.bind_port), config)
     sys.stderr.write(
-        f"{SERVICE_NAME} listening on {config.bind_host}:{config.bind_port}\n"
+        f"{SERVICE_NAME} listening on {config.bind_host}:{config.bind_port} "
+        f"({len(config.users)} users)\n"
     )
     try:
         server.serve_forever()

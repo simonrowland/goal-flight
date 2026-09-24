@@ -1,0 +1,13 @@
+{
+  "users": [
+    {
+      "token": "<openssl rand -hex 32>",
+      "controller_label": "goalflight-grokbot",
+      "project_root": "/absolute/path/on/journal/host"
+    },
+    {
+      "token": "<openssl rand -hex 32>",
+      "controller_label": "second-controller"
+    }
+  ]
+}

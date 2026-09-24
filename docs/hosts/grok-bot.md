@@ -189,8 +189,10 @@ drain if it rang (`relay --drain`, act), flush RESUME-NOTES (Compaction
 below), quote-check Hard Invariants from a fresh disk read, re-arm,
 then `goalflight_task.py next`. The 900s quiet timeout is this host's
 substitute for Claude's 80% context-meter hint. The portable
-four-listen pool is full depth
-(resilience; see `protocols/controller-mail.md`). One listen is the MVP.
+listener pool uses `--listener-slots` as a concurrency ceiling, not a required
+four-listener depth (see `protocols/controller-mail.md`). One listen is the MVP.
+Do not raise the ceiling to cure a missed wake: inspect listener/lease state
+and drain the journal, which remains the authoritative inbox.
 If you arm more than one listen, put `--timeout-s 900` on a single slot
 and leave the others at `--timeout-s 0` so four quiet timeouts do not
 fire together. Branch on listen exit codes instead of blindly
@@ -391,9 +393,12 @@ nudge: it does not carry mail bodies.
 
 Provisioning (generate the token on the journal host, run the daemon, set
 Grok secret-request env `MAIL_RPC_URL` / `MAIL_RPC_TOKEN`) is
-[mail-rpc.md](mail-rpc.md). Startup prompts name those env vars and
+[mail-rpc.md](mail-rpc.md). Several bots share one daemon and one bind:
+each token in the users file is pinned to one controller label. A second
+port per bot is not required. Startup prompts name those env vars and
 `docs/hosts/mail-rpc.md` only. Never paste token values into chat.
-Template: `configs/grok-bot/mail-rpc.env.example`.
+Templates: `configs/grok-bot/mail-rpc.env.example`,
+`configs/grok-bot/mail-rpc.users.json.example`.
 
 ## Optional outbound wake webhook
 
