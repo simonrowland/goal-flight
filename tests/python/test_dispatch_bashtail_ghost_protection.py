@@ -440,6 +440,7 @@ def case_dead_worker_pidfile_unlinked_not_marked() -> None:
             "controller_pid": os.getpid(),
             "pid": dead_pid,
             "pgid": dead_pid,
+            "worker_identity": {"pid": dead_pid, "start_token": "dead-worker"},
             "agent": "codex-bash-tail",
             "session_id": "bashtail-dead",
         }, sort_keys=True) + "\n", encoding="utf-8")

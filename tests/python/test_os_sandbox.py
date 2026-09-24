@@ -345,6 +345,7 @@ def case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior() -> None:
         permission_user_timeout_s=None,
         max_idle_secs=30.0,
         poll_secs=0.2,
+        worker=[],
     )
     try:
         goalflight_dispatch.goalflight_compat.is_macos = lambda: False
@@ -373,6 +374,7 @@ def case_claude_read_only_requests_profile_on_unsupported_platform() -> None:
         permission_user_timeout_s=None,
         max_idle_secs=30.0,
         poll_secs=0.2,
+        worker=[],
     )
     try:
         goalflight_dispatch.goalflight_compat.is_macos = lambda: False

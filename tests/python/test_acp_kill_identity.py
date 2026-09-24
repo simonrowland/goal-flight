@@ -340,8 +340,8 @@ def case_indeterminate_connection_kill_retains_tracking() -> None:
                 "goalflight_ledger.goalflight_compat.process_start_identity",
                 return_value=None,
             ), patch(
-                "goalflight_ledger._posix_ps_available",
-                return_value=False,
+                "goalflight_ledger._ps_identity",
+                return_value=(None, False),
             ), patch(
                 "goalflight_acp_client.goalflight_compat.kill_pid",
                 side_effect=AssertionError("indeterminate worker signaled"),

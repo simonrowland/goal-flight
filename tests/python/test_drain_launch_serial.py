@@ -127,7 +127,6 @@ def _write_entry(
         "--status-json",
         str(project_root / f"{dispatch_id}.status.json"),
         "--unregistered-forced",
-        "--occupied-worktree-forced",
     ]
     if task_ids:
         argv.extend(["--task", ",".join(task_ids)])
@@ -207,7 +206,6 @@ def _write_missing_prompt_entry(
         "--status-json",
         str(status),
         "--unregistered-forced",
-        "--occupied-worktree-forced",
         "--ignore-git-warn",
     ]
     payload = {
@@ -264,7 +262,6 @@ def _write_prompt_file_entry(
         "--status-json",
         str(status),
         "--unregistered-forced",
-        "--occupied-worktree-forced",
         "--ignore-git-warn",
     ]
     if extra_argv:
@@ -1787,7 +1784,6 @@ def test_controller_label_in_use_handler_does_not_emit_proven_prefix(
             "--cwd",
             str(tmp_path),
             "--unregistered-forced",
-            "--occupied-worktree-forced",
             "--",
             sys.executable,
             "-c",
@@ -1848,7 +1844,6 @@ def test_real_worktree_seat_child_does_not_emit_proven_prefix_or_spend_budget(
                 "--worktree",
                 "HEAD",
                 "--unregistered-forced",
-                "--occupied-worktree-forced",
                 "--ignore-git-warn",
                 "--",
                 sys.executable,
