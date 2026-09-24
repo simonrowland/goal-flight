@@ -69,6 +69,8 @@ SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
 ATTENTION_MARKERS = {"BLOCKED", "USER-NEED", "USER-CONFIRM", "FAILED"}
 TEMPLATE_GUARDED_MARKERS = {"BLOCKED", "USER-NEED", "USER-CONFIRM"}
 TERMINAL_MARKERS = SUCCESS_TERMINAL_MARKERS | ATTENTION_MARKERS
+# Worker waits may only emit question markers the watcher understands.
+WORKER_WAIT_QUESTION_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
 TOKEN_COUNT_RE = re.compile(r"^\d[\d,]*$")
 TEMPLATE_PLACEHOLDER_RE = re.compile(r"<[^<>\r\n]+>")
 FENCE_RUN_RE = re.compile(r"^[ \t]*(?P<run>`{3,}|~{3,})(?P<rest>.*)$")

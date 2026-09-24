@@ -275,7 +275,7 @@ def _count_from_snapshot(
     return wedge_watch.TreeWriteSample(count=count, available=True)
 
 
-REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
+REPLY_WAIT_MARKER_KINDS = goalflight_terminal.WORKER_WAIT_QUESTION_KINDS
 WORKER_WAIT_ARM_GRACE_SECS = 1.0
 # Live salvage CANDIDATE: tail stale + tree quiet + cumulative CPU flat.
 # Detection only; the watcher never kills. Probation is
@@ -1605,37 +1605,43 @@ def post_worker_wait_attention(
     try:
         if post_func is None:
             import goalflight_messages as gm
-
-            def post_func(**kwargs):
-                return gm.post_message(messages_dir=gm.default_messages_dir(), **kwargs)
-
-            marker_type = gm.marker_type(str(marker["kind"]))
-            payload = gm.marker_payload(
-                str(marker["kind"]),
-                str(marker.get("text") or ""),
+            gm.post_worker_wait_question(
+                dispatch_id=dispatch_id,
+                wait_id=wait_id,
+                question_kind=str(wait_state.get("question_kind") or marker["kind"]),
+                question_text=str(wait_state.get("question_text") or ""),
+                reply_command=goalflight_steer_mailbox.worker_wait_reply_command(
+                    dispatch_id,
+                    wait_id,
+                    str(wait_state.get("question_kind") or marker["kind"]),
+                ),
+                event_id=goalflight_steer_mailbox.worker_wait_question_event_id(
+                    dispatch_id,
+                    wait_id,
+                ),
             )
         else:
             marker_type = (
                 "user_need" if marker["kind"] == "USER-NEED" else "user_confirm"
             )
             payload = {"text": str(marker.get("text") or "")}
-        payload.update({"awaiting_reply": True, "wait_id": wait_id})
-        post_func(
-            dispatch_id=dispatch_id,
-            msg_type=marker_type,
-            payload=payload,
-            source={
-                "node": "local",
-                "adapter": "watcher",
-                "transport": "steer-wait",
-            },
-            event_id=str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"goalflight:steer-wait:{dispatch_id}:{wait_id}:{line}:{marker['kind']}",
-                )
-            ),
-        )
+            payload.update({"awaiting_reply": True, "wait_id": wait_id})
+            post_func(
+                dispatch_id=dispatch_id,
+                msg_type=marker_type,
+                payload=payload,
+                source={
+                    "node": "local",
+                    "adapter": "watcher",
+                    "transport": "steer-wait",
+                },
+                event_id=str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"goalflight:steer-wait:{dispatch_id}:{wait_id}:{line}:{marker['kind']}",
+                    )
+                ),
+            )
         posted.add(key)
     except Exception:
         # A stable event id makes the next poll an idempotent retry if the

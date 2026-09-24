@@ -2048,6 +2048,125 @@ def test_concurrent_controller_posts_preserve_worker_view_order() -> None:
         assert_true("worker view follows canonical message order", envelope_seqs == [1, 2])
 
 
+def test_controller_steer_read_replays_projection_after_commit_failure() -> None:
+    import tempfile
+    import goalflight_steer_mailbox as steer
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        (project / "README.md").write_text("fixture\n", encoding="utf-8")
+        for args in (
+            ("config", "user.email", "test@example.test"),
+            ("config", "user.name", "Test"),
+            ("add", "README.md"),
+            ("commit", "-m", "fixture"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(project), *args],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        linked = base / "linked"
+        subprocess.run(
+            ["git", "-C", str(project), "worktree", "add", "--detach", str(linked), "HEAD"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        dispatch_id = "d-controller-replay"
+        write_ledger_record(base, dispatch_id, project, worker_pid=os.getpid())
+        env = {
+            **_journal_test_env(base),
+            "GOALFLIGHT_PROJECT_ROOT": str(linked),
+            "GOALFLIGHT_CONTROLLER_LABEL": "replay-controller",
+            "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(
+                _carrier_messages,
+                "_deliver_message_to_worker",
+                side_effect=RuntimeError("projection process died"),
+            ):
+                with contextlib.suppress(RuntimeError):
+                    _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
+
+            messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+            first = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+            assert len(first) == 1, first
+            first_id = first[0]["id"]
+            first_identity = first[0]["source"].get("project_identity")
+            assert isinstance(first_identity, list), first
+            subprocess.run(
+                ["git", "-C", str(project), "worktree", "remove", "--force", str(linked)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(project)
+
+            retry_source = dict(first[0]["source"])
+            retry_source["project_root"] = str(project)
+            retry_payload = dict(first[0]["payload"])
+            retry_sender = dict(retry_payload["sender"])
+            retry_sender["project_root"] = str(project)
+            retry_payload["sender"] = retry_sender
+            replay = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type=first[0]["type"],
+                payload=retry_payload,
+                messages_dir=messages_dir,
+                source=retry_source,
+                priority=first[0]["priority"],
+                event_id=first_id,
+                deliver_to_worker=True,
+                retain_terminal_worker_view=True,
+                project_journal_delivery=False,
+            )
+            assert replay["recorded"] is False, replay
+
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert _carrier_messages.cmd_read(mock.Mock(
+                        dispatch_id=dispatch_id, messages_dir=messages_dir,
+                        fleet_dir=base / "fleet", last=None, json=True,
+                    )) == 0
+
+            entries = steer.worker_entries(
+                steer.read_steer_entries(steer.steer_file(dispatch_id))
+            )
+            assert len(entries) == 1, entries
+            assert entries[0]["context"]["message_envelope"]["id"] == first_id
+
+            second = _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
+            assert second["recorded"] is True, second
+            assert second["envelope"]["id"] != first_id, second
+            canonical = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+            assert len(canonical) == 2, canonical
+            assert [item["id"] for item in canonical] == [first_id, second["envelope"]["id"]]
+            assert canonical[1]["source"]["project_identity"] == first_identity
+
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert _carrier_messages.cmd_read(mock.Mock(
+                        dispatch_id=dispatch_id, messages_dir=messages_dir,
+                        fleet_dir=base / "fleet", last=None, json=True,
+                    )) == 0
+            entries = steer.worker_entries(
+                steer.read_steer_entries(steer.steer_file(dispatch_id))
+            )
+            assert len(entries) == 2, entries
+            assert {entry["context"]["message_envelope"]["id"] for entry in entries} == {
+                first_id,
+                second["envelope"]["id"],
+            }
+
+
 def test_live_controller_post_delivery_failure_is_nonzero_and_recorded() -> None:
     import tempfile
     from goalflight_messages import read_envelopes

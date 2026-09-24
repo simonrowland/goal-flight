@@ -4357,29 +4357,61 @@ def _find_dispatch_record(dispatch_id: str) -> dict | None:
         _pass_time("ledger_lookup_s", time.monotonic() - t0, count_key="ledger_lookup_n")
 
 
-def _worker_liveness_warning(record: dict) -> str | None:
+def _worker_liveness_warning(record: dict, *, in_process: bool = False) -> str | None:
     dispatch_id = record.get("dispatch_id") or "unknown"
     pid = record.get("worker_pid")
     if not pid:
-        return f"WARN: dispatch {dispatch_id} has no worker pid; message appended but may not be observed"
+        if record.get("state") in {"queued", "waiting_capacity"}:
+            return (
+                f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+                "and queued in the worker-visible steer mailbox; no worker is running yet"
+            )
+        return (
+            f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+            "but worker delivery was not attempted"
+        )
+    if in_process:
+        import goalflight_messages
+
+        classification = goalflight_messages._steer_worker_classification(record)
+        if classification in {"expected_live", "queued_capacity"}:
+            return None
+        if classification == "unknown_no_pid":
+            return (
+                f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+                "but worker delivery was not attempted"
+            )
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
+        )
     try:
         current = goalflight_ledger.process_identity(int(pid))
     except (TypeError, ValueError, OSError) as exc:
         return f"WARN: dispatch {dispatch_id} worker identity check failed: {exc}"
     if current is None:
-        return f"WARN: dispatch {dispatch_id} worker pid {pid} is not alive; message appended but may not be observed"
+        return (
+            f"WARN: dispatch {dispatch_id} worker pid {pid} is not alive; "
+            "message recorded but worker delivery was not attempted"
+        )
     prior = record.get("worker_identity") or {}
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
-        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
+        )
     matched, reason = goalflight_ledger.compare_process_identities(
         int(pid), prior, current
     )
     if reason == "identity_indeterminate":
-        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
+        )
     if not matched:
         return (
             f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
-            f"({reason}); message appended but may target stale state"
+            f"({reason}); message recorded but worker delivery was not attempted"
         )
     return None
 
@@ -4398,6 +4430,7 @@ def _append_steer_message(
     *,
     reply_to: str | None = None,
     decision: str | None = None,
+    cross_project: bool = False,
 ) -> dict:
     import goalflight_messages
 
@@ -4406,6 +4439,7 @@ def _append_steer_message(
         text,
         reply_to=reply_to,
         decision=decision,
+        cross_project=cross_project,
     )
 
 
@@ -4521,7 +4555,7 @@ def _cmd_steer(argv: list[str]) -> int:
         default=goalflight_steer_mailbox.DEFAULT_WORKER_WAIT_POLL_SECS,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--question-kind", choices=("USER-NEED", "USER-CONFIRM"))
+    parser.add_argument("--question-kind")
     parser.add_argument(
         "--reply-to",
         help="Correlate this typed controller reply to an active worker wait id.",
@@ -4530,6 +4564,11 @@ def _cmd_steer(argv: list[str]) -> int:
         "--decision",
         choices=("yes", "no"),
         help="Explicit USER-CONFIRM decision; requires --reply-to.",
+    )
+    parser.add_argument(
+        "--cross-project",
+        action="store_true",
+        help="Allow a controller steer from a different project root.",
     )
     args = parser.parse_args(argv)
 
@@ -4540,6 +4579,12 @@ def _cmd_steer(argv: list[str]) -> int:
 
     if args.list_messages and args.wait_for_message:
         print("goalflight_dispatch: steer --list and --wait are mutually exclusive", file=sys.stderr)
+        return 64
+    if args.cross_project and (args.list_messages or args.wait_for_message):
+        print(
+            "goalflight_dispatch: steer --cross-project applies only to controller steers",
+            file=sys.stderr,
+        )
         return 64
     if args.list_messages and (args.reply_to or args.decision):
         print("goalflight_dispatch: steer --list cannot carry reply fields", file=sys.stderr)
@@ -4560,13 +4605,22 @@ def _cmd_steer(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 64
+        question_kind = str(args.question_kind).strip()
+        if question_kind not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
+            valid = ", ".join(sorted(goalflight_terminal.WORKER_WAIT_QUESTION_KINDS))
+            print(
+                "goalflight_dispatch: --question-kind must be one of: "
+                f"{valid}",
+                file=sys.stderr,
+            )
+            return 64
         try:
             result = goalflight_steer_mailbox.wait_for_worker_entries(
                 _worker_wait_mailbox(args.dispatch_id),
                 dispatch_id=args.dispatch_id,
                 acked_seqs=_acked_steer_seqs(record),
                 consumed_reply_receipts=_consumed_worker_wait_receipts(args.dispatch_id, record),
-                question_kind=args.question_kind,
+                question_kind=question_kind,
                 question_text=args.message,
                 timeout_secs=args.timeout_secs,
                 poll_secs=args.poll_secs,
@@ -4591,36 +4645,41 @@ def _cmd_steer(argv: list[str]) -> int:
         print("goalflight_dispatch: --decision requires --reply-to", file=sys.stderr)
         return 64
 
-    shape = goalflight_ledger.infer_shape(record)
-    if shape == "acp":
-        warning = _worker_liveness_warning(record)
-        if warning:
-            print(warning, file=sys.stderr)
-        return _report_steer_result(
-            args.dispatch_id,
-            _append_steer_message(
+    def append_controller_steer() -> int:
+        try:
+            result = _append_steer_message(
                 args.dispatch_id,
                 args.message,
                 reply_to=args.reply_to,
                 decision=args.decision,
-            ),
-        )
+                cross_project=args.cross_project,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            return 64
+        except Exception as exc:
+            import goalflight_messages
+
+            if not isinstance(exc, goalflight_messages.MessageError):
+                raise
+            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            return 64
+        return _report_steer_result(args.dispatch_id, result)
+
+    shape = goalflight_ledger.infer_shape(record)
+    if shape == "acp":
+        warning = _worker_liveness_warning(record, in_process=True)
+        if warning:
+            print(warning, file=sys.stderr)
+        return append_controller_steer()
     if shape != "bash":
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
         return 64
 
-    warning = _worker_liveness_warning(record)
+    warning = _worker_liveness_warning(record, in_process=True)
     if warning:
         print(warning, file=sys.stderr)
-    return _report_steer_result(
-        args.dispatch_id,
-        _append_steer_message(
-            args.dispatch_id,
-            args.message,
-            reply_to=args.reply_to,
-            decision=args.decision,
-        ),
-    )
+    return append_controller_steer()
 
 
 def _codex_dispatch_homes_dir() -> Path:

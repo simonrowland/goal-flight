@@ -6,9 +6,11 @@ Deploy this lock convention only after REV 5's zero-live-dispatch cutover gate.
 from __future__ import annotations
 
 import errno
+import contextlib
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -31,7 +33,8 @@ USER_CONFIRM_KIND = "user_confirm"
 WORKER_WAIT_STARTED_KIND = "worker_wait_started"
 WORKER_WAIT_ENDED_KIND = "worker_wait_ended"
 WORKER_WAIT_REPLY_KIND = "worker_wait_reply"
-WORKER_WAIT_SETTLED_DECISIONS = frozenset({"reply"})
+WORKER_WAIT_SETTLED_DECISIONS = frozenset({"failed", "reply", "timeout"})
+WORKER_WAIT_QUESTION_KINDS = goalflight_terminal.WORKER_WAIT_QUESTION_KINDS
 USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
@@ -39,6 +42,9 @@ DEFAULT_WORKER_WAIT_POLL_SECS = 0.25
 WORKER_WAIT_CLEANUP_MODE = "--worker-wait-cleanup"
 WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
 WORKER_WAIT_CLEANUP_END = "end"
+WORKER_WAIT_CLEANUP_TIMEOUT = "timeout"
+WORKER_WAIT_CLEANUP_FAILED = "failed"
+CONTROLLER_STEER_LOCK_TIMEOUT_SECS = 5.0
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -132,12 +138,13 @@ def worker_wait_cleanup_slot_path(
     wait_id: str,
     reply_seq: int,
 ) -> Path:
-    """Return the flock file that bounds one in-flight cleanup helper.
-
-    The bound is one live process per ``(wait_id, reply_seq, operation)``, so
-    at most two live cleanup helpers for one exact typed reply.
-    """
-    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+    """Return the flock file that bounds one in-flight cleanup helper."""
+    if operation not in {
+        WORKER_WAIT_CLEANUP_RECEIPT,
+        WORKER_WAIT_CLEANUP_END,
+        WORKER_WAIT_CLEANUP_TIMEOUT,
+        WORKER_WAIT_CLEANUP_FAILED,
+    }:
         raise ValueError("worker wait cleanup slot requires a known operation")
     token = str(wait_id or "").strip()
     if (
@@ -158,7 +165,7 @@ def _append_worker_wait_reply_receipt(
     path: Path,
     reply: dict,
     *,
-    lock_timeout_secs: float | None,
+    lock_timeout_secs: float,
 ) -> None:
     """Append and fsync one exact receipt, raising on any incomplete write."""
     payload = json.dumps(
@@ -195,7 +202,7 @@ def record_worker_wait_reply_receipt(
         _append_worker_wait_reply_receipt(
             path,
             reply,
-            lock_timeout_secs=None,
+            lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
         )
     except (OSError, RuntimeError, TimeoutError, ValueError):
         # Mirrors the independent end row: receipt persistence must never
@@ -278,17 +285,9 @@ def _cleanup_arm_and_reply_from_mailbox(
     dispatch_id: str,
     wait_id: str,
     arm_seq: int,
-    reply_seq: int,
-) -> tuple[dict, dict]:
-    """Confirm argv names the mailbox's exact typed reply without taking its lock.
-
-    End-row re-validates under the mailbox write lock because it appends there.
-    Receipt writes a different carrier; waiting on the mailbox lock would let a
-    wedged end-row fsync stall the sidecar and recouple the two evidence paths.
-    An unlocked read is enough to refuse a forged receipt: renewal still needs
-    the real typed reply, and this check keeps the sidecar from recording one
-    that the mailbox does not contain.
-    """
+    reply_seq: int | None,
+) -> tuple[dict, dict | None]:
+    """Confirm argv names one durable arm and, when requested, its reply."""
     try:
         data = Path(path).read_bytes()
     except OSError as exc:
@@ -307,6 +306,8 @@ def _cleanup_arm_and_reply_from_mailbox(
     )
     if arm is None:
         raise ValueError("worker wait cleanup does not match one durable arm")
+    if reply_seq is None:
+        return arm, None
     replies = _worker_wait_replies(
         entries,
         dispatch_id=dispatch_id,
@@ -322,29 +323,23 @@ def _worker_wait_cleanup_command(
     operation: str,
     path: Path,
     arm: dict,
-    reply: dict,
+    reply: dict | None,
 ) -> list[str]:
     """Build one self-contained cleanup helper command from validated rows."""
     wait_id = str(arm.get("question_id") or "").strip()
     dispatch_id = str(arm.get("dispatch_id") or "").strip()
     try:
         arm_seq = int(arm["seq"])
-        reply_seq = int(reply["seq"])
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError("worker wait cleanup requires valid row sequences") from exc
-    if (
-        operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}
-        or not wait_id
-        or not wait_id.isalnum()
-        or not dispatch_id
-        or arm_seq <= 0
-        or reply_seq <= 0
-        or reply.get("kind") != WORKER_WAIT_REPLY_KIND
-        or reply.get("reply_to") != wait_id
-        or reply.get("dispatch_id") != dispatch_id
-    ):
+    if operation not in {
+        WORKER_WAIT_CLEANUP_RECEIPT,
+        WORKER_WAIT_CLEANUP_END,
+        WORKER_WAIT_CLEANUP_TIMEOUT,
+        WORKER_WAIT_CLEANUP_FAILED,
+    } or not wait_id or not wait_id.isalnum() or not dispatch_id or arm_seq <= 0:
         raise ValueError("worker wait cleanup requires one exact correlated reply")
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         WORKER_WAIT_CLEANUP_MODE,
@@ -353,8 +348,23 @@ def _worker_wait_cleanup_command(
         dispatch_id,
         wait_id,
         str(arm_seq),
-        str(reply_seq),
     ]
+    if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
+        if reply is not None:
+            raise ValueError("settlement cleanup cannot carry a reply")
+        return command
+    if (
+        reply is None
+        or not isinstance(reply.get("seq"), int)
+        or isinstance(reply.get("seq"), bool)
+        or reply["seq"] <= 0
+        or reply.get("kind") != WORKER_WAIT_REPLY_KIND
+        or reply.get("reply_to") != wait_id
+        or reply.get("dispatch_id") != dispatch_id
+    ):
+        raise ValueError("worker wait cleanup requires one exact correlated reply")
+    command.append(str(reply["seq"]))
+    return command
 
 
 def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> None:
@@ -395,25 +405,86 @@ def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> No
             pass
 
 
+def schedule_worker_wait_settlement_cleanup(
+    path: Path,
+    arm: dict,
+    *,
+    decision: str,
+) -> None:
+    """Finish one bounded waiter settlement after its caller returns."""
+    operation = {
+        "timeout": WORKER_WAIT_CLEANUP_TIMEOUT,
+        "failed": WORKER_WAIT_CLEANUP_FAILED,
+    }.get(decision)
+    if operation is None:
+        raise ValueError("worker wait cleanup requires timeout or failed decision")
+    try:
+        command = _worker_wait_cleanup_command(
+            operation,
+            path,
+            arm,
+            None,
+        )
+        wait_id = str(arm.get("question_id") or "").strip()
+        arm_seq = int(arm["seq"])
+        if _worker_wait_cleanup_slot_held(path, operation, wait_id, arm_seq):
+            return
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError):
+        # A later wait can settle the arm or recover a reply that won the
+        # race. The durable arm must not turn a bounded wait into a process
+        # failure merely because cleanup launch was unavailable.
+        pass
+
+
+def schedule_worker_wait_timeout_cleanup(path: Path, arm: dict) -> None:
+    """Finish a deadline settlement after a bounded waiter return."""
+    schedule_worker_wait_settlement_cleanup(path, arm, decision="timeout")
+
+
+def schedule_worker_wait_failed_cleanup(path: Path, arm: dict) -> None:
+    """Finish a failed question publication after a bounded waiter return."""
+    schedule_worker_wait_settlement_cleanup(path, arm, decision="failed")
+
+
 def _run_worker_wait_cleanup(argv: list[str]) -> int:
     """Run one detached cleanup operation to completion."""
-    if len(argv) != 7 or argv[0] != WORKER_WAIT_CLEANUP_MODE:
+    if len(argv) not in {6, 7} or argv[0] != WORKER_WAIT_CLEANUP_MODE:
         return 64
-    _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq, raw_reply_seq = argv
+    _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq = argv[:6]
+    raw_reply_seq = argv[6] if len(argv) == 7 else None
+    if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
+        if raw_reply_seq is not None:
+            return 64
+    elif operation in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+        if raw_reply_seq is None:
+            return 64
+    else:
+        return 64
     try:
         arm_seq = int(raw_arm_seq)
-        reply_seq = int(raw_reply_seq)
     except (TypeError, ValueError, OverflowError):
         return 64
-    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
-        return 64
+    reply_seq = None
+    if raw_reply_seq is not None:
+        try:
+            reply_seq = int(raw_reply_seq)
+        except (TypeError, ValueError, OverflowError):
+            return 64
     path = Path(raw_path)
     try:
         slot = _try_acquire_worker_wait_cleanup_slot(
             path,
             operation,
             wait_id,
-            reply_seq,
+            reply_seq if reply_seq is not None else arm_seq,
         )
     except ValueError:
         return 64
@@ -422,6 +493,34 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
     if slot is None:
         return 0
     try:
+        if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
+            arm, _reply = _cleanup_arm_and_reply_from_mailbox(
+                path,
+                dispatch_id=dispatch_id,
+                wait_id=wait_id,
+                arm_seq=arm_seq,
+                reply_seq=None,
+            )
+            append_worker_wait_ended(
+                path,
+                arm,
+                decision=(
+                    "timeout"
+                    if operation == WORKER_WAIT_CLEANUP_TIMEOUT
+                    else "failed"
+                ),
+                context={
+                    "reason": (
+                        "deadline_lock_timeout"
+                        if operation == WORKER_WAIT_CLEANUP_TIMEOUT
+                        else "question_publication_failed"
+                    )
+                },
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+            )
+            return 0
+        if reply_seq is None:
+            return 64
         arm, reply = _cleanup_arm_and_reply_from_mailbox(
             path,
             dispatch_id=dispatch_id,
@@ -433,7 +532,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
             _append_worker_wait_reply_receipt(
                 path,
                 reply,
-                lock_timeout_secs=None,
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
             )
         else:
             append_worker_wait_ended(
@@ -441,7 +540,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
                 arm,
                 decision="reply",
                 reply_seq=reply_seq,
-                lock_timeout_secs=None,
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
             )
     except (OSError, RuntimeError, TimeoutError, ValueError):
         return 1
@@ -610,7 +709,7 @@ def _parse_steer_carrier(
 def read_steer_entries(
     path: Path,
     *,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
     quarantine_errors: bool = True,
 ) -> list[dict]:
     messages = _carrier_module()
@@ -637,9 +736,11 @@ def append_steer_entry(
     reply_to: str | None = None,
     decision: str | None = None,
     context: dict | None = None,
+    sender: dict | None = None,
+    cross_project: bool = False,
     awake_mono_ns: int | None = None,
-    lock_timeout_secs: float | None = None,
-    validate_existing: Callable[[list[dict]], None] | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+    validate_existing: Callable[[list[dict]], dict | None] | None = None,
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
@@ -658,12 +759,12 @@ def append_steer_entry(
         existing = _parse_steer_carrier(
             carrier.path,
             carrier.read_bytes(),
-            # A deadline-bounded caller must not enter a second, unbounded
-            # quarantine-sidecar lock while it owns the mailbox carrier.
-            quarantine_errors=lock_timeout_secs is None,
+            quarantine_errors=True,
         )
         if validate_existing is not None:
-            validate_existing(existing)
+            existing_entry = validate_existing(existing)
+            if existing_entry is not None:
+                return existing_entry
         next_seq = max((entry["seq"] for entry in existing), default=0) + 1 if seq is None else seq
         entry = {
             "seq": next_seq,
@@ -684,6 +785,10 @@ def append_steer_entry(
             entry["decision"] = decision
         if context:
             entry["context"] = context
+        if sender:
+            entry["sender"] = dict(sender)
+        if cross_project:
+            entry["cross_project"] = True
         try:
             encoded = (
                 json.dumps(entry, allow_nan=False, sort_keys=True, separators=(",", ":"))
@@ -708,7 +813,55 @@ def append_message_view(
     text = payload.get("text")
     if text is None:
         text = json.dumps(payload, sort_keys=True) if payload else str(envelope.get("type") or "message")
+    source = envelope.get("source")
+    source = source if isinstance(source, dict) else {}
+    sender = source.get("sender") if isinstance(source.get("sender"), dict) else None
+    if sender is None:
+        sender = {
+            key: source[key]
+            for key in ("controller_label", "controller_pid", "project_root")
+            if key in source
+        }
+    if not {
+        "controller_label",
+        "controller_pid",
+        "project_root",
+    }.issubset(sender or {}):
+        payload_sender = payload.get("sender")
+        sender = dict(payload_sender) if isinstance(payload_sender, dict) else None
+    if sender and {
+        "controller_label",
+        "controller_pid",
+        "project_root",
+    }.issubset(sender):
+        text = (
+            f"{text} [sender "
+            f"controller_label={sender['controller_label']} "
+            f"controller_pid={sender['controller_pid']} "
+            f"project_root={sender['project_root']}]"
+        )
+    else:
+        sender = None
+    cross_project = bool(
+        source.get("cross_project") is True
+        or payload.get("cross_project") is True
+        or (isinstance(sender, dict) and sender.get("cross_project") is True)
+    )
     path = steer_file(dispatch_id, state_dir=state_dir)
+    message_id = envelope.get("id")
+
+    def reuse_message(entries: list[dict]) -> dict | None:
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        for entry in entries:
+            if entry.get("kind") != "message":
+                continue
+            context = entry.get("context")
+            projected = context.get("message_envelope") if isinstance(context, dict) else None
+            if isinstance(projected, dict) and projected.get("id") == message_id:
+                return entry
+        return None
+
     reply_to = payload.get("reply_to")
     decision = payload.get("decision")
     if reply_to is not None:
@@ -718,6 +871,10 @@ def append_message_view(
             wait_id=str(reply_to),
             text=str(text),
             decision=None if decision is None else str(decision),
+            sender=sender,
+            cross_project=cross_project,
+            message_id=message_id if isinstance(message_id, str) else None,
+            lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
         )
     if decision is not None:
         raise ValueError("worker wait reply decision requires reply_to")
@@ -727,6 +884,10 @@ def append_message_view(
         dispatch_id=dispatch_id,
         kind="message",
         context={"message_envelope": envelope},
+        sender=sender,
+        cross_project=cross_project,
+        lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+        validate_existing=reuse_message,
     )
 
 
@@ -801,14 +962,42 @@ def _positive_finite_seconds(value: object, *, field: str, maximum: float) -> fl
 
 
 def _validate_worker_question(question_kind: str, question_text: object) -> str:
-    if question_kind not in {"USER-NEED", "USER-CONFIRM"}:
-        raise ValueError("question_kind must be USER-NEED or USER-CONFIRM")
+    normalized_kind = str(question_kind or "").strip()
+    if normalized_kind not in WORKER_WAIT_QUESTION_KINDS:
+        valid = ", ".join(sorted(WORKER_WAIT_QUESTION_KINDS))
+        raise ValueError(
+            f"question_kind must be one of: {valid}"
+        )
     normalized = str(question_text or "").strip()
     if not normalized:
         raise ValueError("question_text must not be empty")
     if "\n" in normalized or "\r" in normalized:
         raise ValueError("question_text must be one line")
     return normalized
+
+
+def worker_wait_question_event_id(dispatch_id: str, wait_id: str) -> str:
+    """Return the stable event id shared by the wait publisher and watcher fallback."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"goalflight:steer-wait:{dispatch_id}:{wait_id}",
+        )
+    )
+
+
+def worker_wait_reply_command(
+    dispatch_id: str,
+    wait_id: str,
+    question_kind: str,
+) -> str:
+    """Render the controller command that answers one wait."""
+    command = "goalflight_dispatch.py steer " + shlex.join(
+        [str(dispatch_id), "--reply-to", str(wait_id)]
+    )
+    if question_kind == "USER-CONFIRM":
+        command += ' --decision "<yes|no>"'
+    return command + ' "<answer>"'
 
 
 def _latest_worker_wait_arm(entries: list[dict], dispatch_id: str) -> dict | None:
@@ -836,6 +1025,8 @@ def _worker_wait_settlement(
             and entry.get("reply_to") == wait_id
             and entry.get("decision") in WORKER_WAIT_SETTLED_DECISIONS
         ):
+            if entry.get("decision") in {"failed", "timeout"}:
+                return entry
             context = entry.get("context")
             reply_seq = context.get("reply_seq") if isinstance(context, dict) else None
             if (
@@ -922,10 +1113,7 @@ def _recoverable_worker_wait_reply(
     if question_kind == "USER-CONFIRM":
         if decision not in USER_CONFIRM_DECISIONS:
             return None
-    elif question_kind == "USER-NEED":
-        if decision is not None and decision not in USER_CONFIRM_DECISIONS:
-            return None
-    else:
+    elif decision is not None and decision not in USER_CONFIRM_DECISIONS:
         return None
     return arm, reply
 
@@ -937,7 +1125,10 @@ def append_worker_wait_reply(
     wait_id: str,
     text: str,
     decision: str | None = None,
-    lock_timeout_secs: float | None = None,
+    sender: dict | None = None,
+    cross_project: bool = False,
+    message_id: str | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
 ) -> dict:
     """Durably admit one typed, exactly-correlated reply to one active wait.
 
@@ -952,8 +1143,10 @@ def append_worker_wait_reply(
     if not text or "\n" in text or "\r" in text:
         raise ValueError("worker wait reply text must be one non-empty line")
     normalized_decision = None if decision is None else str(decision).strip().lower()
-
-    def validate(entries: list[dict]) -> None:
+    # Keep the classification explicit on every admitted row; a timeout race
+    # must never turn a late reply into an absent context field.
+    reply_context: dict[str, object] = {"late": False, **({"message_id": message_id} if message_id else {})}
+    def validate(entries: list[dict]) -> dict | None:
         arm = next(
             (
                 entry
@@ -980,32 +1173,37 @@ def append_worker_wait_reply(
         if (
             not isinstance(deadline_ns, int)
             or isinstance(deadline_ns, bool)
-            or int(active_monotonic() * 1_000_000_000) >= deadline_ns
+            or deadline_ns <= 0
         ):
-            raise ValueError(f"worker wait {wait_id!r} is expired")
-        if _worker_wait_settlement(
-            entries,
-            wait_id=wait_id,
-            after_seq=arm_seq,
-        ) is not None:
-            raise ValueError(f"worker wait {wait_id!r} is already settled")
-        if _worker_wait_replies(
+            raise ValueError(f"worker wait {wait_id!r} has invalid deadline")
+        replies = _worker_wait_replies(
             entries,
             dispatch_id=dispatch_id,
             wait_id=wait_id,
             after_seq=arm_seq,
-        ):
+        )
+        existing_context = replies[0].get("context") if len(replies) == 1 else None
+        if message_id and isinstance(existing_context, dict) and existing_context.get("message_id") == message_id:
+            return replies[0]
+        settlement = _worker_wait_settlement(
+            entries,
+            wait_id=wait_id,
+            after_seq=arm_seq,
+        )
+        if settlement is not None:
+            raise ValueError(f"worker wait {wait_id!r} is already settled")
+        if replies:
             raise ValueError(f"worker wait {wait_id!r} already has a reply")
         question_kind = context.get("question_kind") if isinstance(context, dict) else None
         if question_kind == "USER-CONFIRM":
             if normalized_decision not in USER_CONFIRM_DECISIONS:
                 raise ValueError("USER-CONFIRM reply requires decision=yes or decision=no")
-        elif question_kind == "USER-NEED":
-            if normalized_decision is not None and normalized_decision not in USER_CONFIRM_DECISIONS:
-                raise ValueError("worker wait reply decision must be yes or no")
-        else:
-            raise ValueError("worker wait arm has invalid question_kind")
+        elif normalized_decision is not None and normalized_decision not in USER_CONFIRM_DECISIONS:
+            raise ValueError("worker wait reply decision must be yes or no")
+        if int(active_monotonic() * 1_000_000_000) >= deadline_ns:
+            reply_context["late"] = True
 
+    lock_timeout_secs = CONTROLLER_STEER_LOCK_TIMEOUT_SECS if lock_timeout_secs is None else lock_timeout_secs
     return append_steer_entry(
         path,
         text,
@@ -1013,6 +1211,9 @@ def append_worker_wait_reply(
         kind=WORKER_WAIT_REPLY_KIND,
         reply_to=wait_id,
         decision=normalized_decision,
+        context=reply_context or None,
+        sender=sender,
+        cross_project=cross_project,
         validate_existing=validate,
         lock_timeout_secs=lock_timeout_secs,
     )
@@ -1026,7 +1227,7 @@ def append_worker_wait_started(
     question_kind: str,
     question_text: str,
     deadline_mono: float | None = None,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
     consumed_reply_receipts: set[tuple[str, int]] | None = None,
 ) -> dict:
     """Durably arm one bounded, lease-free worker wait in its steer mailbox."""
@@ -1035,6 +1236,7 @@ def append_worker_wait_started(
         field="timeout_secs",
         maximum=MAX_WORKER_WAIT_TIMEOUT_SECS,
     )
+    question_kind = str(question_kind or "").strip()
     question_text = _validate_worker_question(question_kind, question_text)
     consumed_reply_receipts = consumed_reply_receipts or set()
     wait_id = uuid.uuid4().hex
@@ -1062,6 +1264,112 @@ def append_worker_wait_started(
         context["waiter_start_token"] = identity["start_token"]
     if waiter_pgid is not None:
         context["waiter_pgid"] = waiter_pgid
+
+    lock_deadline = (
+        float(deadline_mono)
+        if deadline_mono is not None
+        else (
+            active_monotonic() + float(lock_timeout_secs)
+            if lock_timeout_secs is not None
+            else None
+        )
+    )
+
+    def lock_budget() -> float | None:
+        if lock_deadline is None:
+            return None
+        return max(0.0, lock_deadline - active_monotonic())
+
+    def settle_stale_prior_wait() -> None:
+        """Close a prior arm that can no longer suspend its worker."""
+        entries = read_steer_entries(
+            path,
+            lock_timeout_secs=lock_budget(),
+            quarantine_errors=False,
+        )
+        prior = _latest_worker_wait_arm(entries, dispatch_id)
+        if prior is None:
+            return
+        wait_id = str(prior.get("question_id") or "")
+        if not wait_id:
+            return
+        try:
+            prior_seq = int(prior["seq"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("prior worker wait arm has invalid seq") from exc
+        if _worker_wait_settlement(
+            entries,
+            wait_id=wait_id,
+            after_seq=prior_seq,
+        ) is not None:
+            return
+        prior_context = prior.get("context")
+        started_ns = prior.get("awake_mono_ns")
+        deadline_ns = (
+            prior_context.get("deadline_awake_mono_ns")
+            if isinstance(prior_context, dict)
+            else None
+        )
+        if (
+            not isinstance(started_ns, int)
+            or isinstance(started_ns, bool)
+            or started_ns <= 0
+            or not isinstance(deadline_ns, int)
+            or isinstance(deadline_ns, bool)
+            or deadline_ns <= started_ns
+        ):
+            # An unverifiable arm stays unsettled. Renewal must not turn
+            # malformed or incomplete identity into a fabricated timeout.
+            return
+        effective_deadline_ns = min(
+            deadline_ns,
+            started_ns + int(MAX_WORKER_WAIT_TIMEOUT_SECS * 1_000_000_000),
+        )
+        decision = None
+        if int(active_monotonic() * 1_000_000_000) >= effective_deadline_ns:
+            decision = "timeout"
+        else:
+            waiter_pid = prior_context.get("waiter_pid") if isinstance(prior_context, dict) else None
+            waiter_start_token = (
+                prior_context.get("waiter_start_token")
+                if isinstance(prior_context, dict)
+                else None
+            )
+            if (
+                isinstance(waiter_pid, bool)
+                or not isinstance(waiter_pid, int)
+                or waiter_pid <= 0
+                or not isinstance(waiter_start_token, str)
+                or not waiter_start_token
+            ):
+                return
+            identity_state = goalflight_compat.process_identity_matches(
+                waiter_pid,
+                waiter_start_token,
+            )
+            if identity_state is False:
+                decision = "failed"
+            elif identity_state is None:
+                # UNKNOWN is not proof that the waiter is dead. Keep the arm
+                # so a later reply remains correlated to its live owner.
+                return
+            else:
+                return
+        if decision is None:
+            return
+        try:
+            append_worker_wait_ended(
+                path,
+                prior,
+                decision=decision,
+                context={"reason": "prior_wait_not_active"},
+                lock_timeout_secs=lock_budget(),
+            )
+        except ValueError as exc:
+            if "already settled" not in str(exc):
+                raise
+
+    settle_stale_prior_wait()
 
     def reject_unsettled_prior_wait(entries: list[dict]) -> None:
         prior = _latest_worker_wait_arm(entries, dispatch_id)
@@ -1119,7 +1427,7 @@ def append_worker_wait_started(
         question_id=wait_id,
         context=context,
         awake_mono_ns=started_mono_ns,
-        lock_timeout_secs=lock_timeout_secs,
+        lock_timeout_secs=lock_budget(),
         validate_existing=reject_unsettled_prior_wait,
     )
 
@@ -1133,22 +1441,51 @@ def worker_wait_question_marker_text(
     return f"{dispatch_id} — {question_text} [wait-id:{wait_id}]"
 
 
+def publish_worker_wait_question(event: dict) -> dict:
+    """Publish one wait question before the worker enters its blocking loop."""
+    import goalflight_messages
+
+    return goalflight_messages.post_worker_wait_question(
+        dispatch_id=str(event["dispatch_id"]),
+        wait_id=str(event["wait_id"]),
+        question_kind=str(event["question_kind"]),
+        question_text=str(event["question_text"]),
+        reply_command=str(event["reply_command"]),
+        event_id=worker_wait_question_event_id(
+            str(event["dispatch_id"]),
+            str(event["wait_id"]),
+        ),
+    )
+
+
 def append_worker_wait_ended(
     path: Path,
     arm: dict,
     *,
     decision: str,
     reply_seq: int | None = None,
-    lock_timeout_secs: float | None = None,
+    context: dict | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
 ) -> dict:
+    lock_timeout_secs = CONTROLLER_STEER_LOCK_TIMEOUT_SECS if lock_timeout_secs is None else lock_timeout_secs
     wait_id = str(arm.get("question_id") or "").strip()
     if not wait_id:
         raise ValueError("worker wait arm is missing question_id")
     if decision not in WORKER_WAIT_SETTLED_DECISIONS:
-        raise ValueError("worker wait end requires a consumed reply")
-    if isinstance(reply_seq, bool) or not isinstance(reply_seq, int) or reply_seq <= 0:
-        raise ValueError("worker wait end requires a positive consumed reply_seq")
-    context = {"reply_seq": reply_seq}
+        raise ValueError("worker wait end requires reply, timeout, or failed")
+    if decision == "reply":
+        if isinstance(reply_seq, bool) or not isinstance(reply_seq, int) or reply_seq <= 0:
+            raise ValueError("worker wait reply end requires a positive reply_seq")
+        end_context = dict(context or {})
+        end_context["reply_seq"] = reply_seq
+    else:
+        if reply_seq is not None:
+            raise ValueError("non-reply worker wait end cannot carry reply_seq")
+        end_context = dict(context or {})
+        end_context.setdefault(
+            "settled_awake_mono_ns",
+            int(active_monotonic() * 1_000_000_000),
+        )
 
     def validate(entries: list[dict]) -> None:
         try:
@@ -1161,8 +1498,13 @@ def append_worker_wait_ended(
             wait_id=wait_id,
             after_seq=arm_seq,
         )
-        if len(replies) != 1 or replies[0].get("seq") != reply_seq:
-            raise ValueError("worker wait end does not match one consumed typed reply")
+        if decision == "reply":
+            if len(replies) != 1 or replies[0].get("seq") != reply_seq:
+                raise ValueError("worker wait end does not match one consumed typed reply")
+        elif decision in {"timeout", "failed"} and replies:
+            # A controller reply won the settlement race. Let the caller
+            # deliver it instead of recording a misleading terminal row.
+            raise WorkerWaitReplyPending(arm, replies[0])
         if _worker_wait_settlement(
             entries,
             wait_id=wait_id,
@@ -1178,7 +1520,7 @@ def append_worker_wait_ended(
         kind=WORKER_WAIT_ENDED_KIND,
         reply_to=wait_id,
         decision=decision,
-        context=context,
+        context=end_context,
         lock_timeout_secs=lock_timeout_secs,
         validate_existing=validate,
     )
@@ -1268,7 +1610,12 @@ def active_worker_wait(
         question_kind = context.get("question_kind")
         question_text = str(context.get("question_text") or "").strip()
         if (
-            question_kind not in {"USER-NEED", "USER-CONFIRM"}
+            not isinstance(question_kind, str)
+            or not question_kind
+            or len(question_kind) > 64
+            or any(char in question_kind for char in "\r\n")
+            or not question_kind[0].isalpha()
+            or any(not (char.isalnum() or char in "_-") for char in question_kind)
             or not question_text
             or "\n" in question_text
             or "\r" in question_text
@@ -1287,6 +1634,8 @@ def active_worker_wait(
             decision = reply.get("decision")
             if question_kind == "USER-CONFIRM" and decision not in USER_CONFIRM_DECISIONS:
                 return None
+            if question_kind != "USER-CONFIRM" and decision is not None and decision not in USER_CONFIRM_DECISIONS:
+                return None
             reply_awake_mono_ns = reply.get("awake_mono_ns")
             if (
                 not isinstance(reply_awake_mono_ns, int)
@@ -1303,6 +1652,7 @@ def active_worker_wait(
             "deadline_awake_mono_ns": effective_deadline_ns,
             "remaining_secs": max(0.0, (effective_deadline_ns - now_ns) / 1_000_000_000),
             "question_kind": question_kind,
+            "question_text": question_text,
             "phase": "reply_pending" if reply is not None else "awaiting_reply",
             "reply_seq": reply.get("seq") if reply is not None else None,
             "reply_decision": reply.get("decision") if reply is not None else None,
@@ -1330,6 +1680,7 @@ def wait_for_worker_entries(
     timeout_secs: float = DEFAULT_WORKER_WAIT_TIMEOUT_SECS,
     poll_secs: float = DEFAULT_WORKER_WAIT_POLL_SECS,
     notify: Callable[[dict], None] | None = None,
+    publish_question: Callable[[dict], object] | None = None,
 ) -> dict:
     """Poll the steer mailbox until backlog/reply or the independent deadline.
 
@@ -1347,7 +1698,10 @@ def wait_for_worker_entries(
         field="poll_secs",
         maximum=MAX_WORKER_WAIT_TIMEOUT_SECS,
     )
+    question_kind = str(question_kind or "").strip()
     question_text = _validate_worker_question(question_kind, question_text)
+    if publish_question is None:
+        publish_question = publish_worker_wait_question
     consumed_reply_receipts = consumed_reply_receipts or set()
 
     def report(event: dict) -> None:
@@ -1355,13 +1709,6 @@ def wait_for_worker_entries(
             notify(event)
 
     deadline = active_monotonic() + timeout_secs
-
-    def deadline_result(wait_id: str | None = None) -> dict:
-        result = {"state": "deadline", "entries": []}
-        if wait_id:
-            result["wait_id"] = wait_id
-        report(result)
-        return result
 
     def remaining_secs() -> float:
         return max(0.0, deadline - active_monotonic())
@@ -1380,6 +1727,58 @@ def wait_for_worker_entries(
         # for at-least-once redelivery on the next wait.
         report(result)
         schedule_worker_wait_reply_cleanup(path, arm, reply)
+        return result
+
+    def deadline_result(arm: dict | None = None) -> dict:
+        if arm is not None:
+            try:
+                append_worker_wait_ended(
+                    path,
+                    arm,
+                    decision="timeout",
+                    context={
+                        "timeout_secs": timeout_secs,
+                        "deadline_awake_mono_ns": (
+                            arm.get("context", {}).get("deadline_awake_mono_ns")
+                            if isinstance(arm.get("context"), dict)
+                            else None
+                        ),
+                    },
+                    # The deadline also bounds the final settlement lock. A
+                    # contended lock is a retryable outcome, not a deadline:
+                    # the mailbox lock must decide the reply-versus-timeout
+                    # race before this waiter reports a settled deadline.
+                    lock_timeout_secs=remaining_secs(),
+                )
+            except WorkerWaitReplyPending as pending_reply:
+                return deliver_reply(
+                    pending_reply.arm,
+                    pending_reply.reply,
+                    recovered=False,
+                )
+            except ValueError as exc:
+                if "already settled" not in str(exc):
+                    raise
+            except TimeoutError:
+                schedule_worker_wait_timeout_cleanup(
+                    path,
+                    arm,
+                )
+                result = {
+                    "state": "retry",
+                    "entries": [],
+                    "timed_out": False,
+                    "settled": False,
+                    "reason": "worker wait settlement lock deadline reached",
+                }
+                result["wait_id"] = arm["question_id"]
+                report(result)
+                return result
+        result = {"state": "deadline", "entries": [], "timed_out": True}
+        if arm is not None:
+            result["wait_id"] = arm["question_id"]
+            result["settled"] = True
+        report(result)
         return result
 
     try:
@@ -1431,24 +1830,71 @@ def wait_for_worker_entries(
         )
     except TimeoutError:
         return deadline_result()
+    question_marker_text = worker_wait_question_marker_text(
+        dispatch_id,
+        question_text,
+        str(arm["question_id"]),
+    )
+    try:
+        publish_question(
+            {
+                "dispatch_id": dispatch_id,
+                "wait_id": str(arm["question_id"]),
+                "question_kind": question_kind,
+                "question_text": question_text,
+                "reply_command": worker_wait_reply_command(
+                    dispatch_id,
+                    str(arm["question_id"]),
+                    question_kind,
+                ),
+                "question_marker_text": question_marker_text,
+                "arm": arm,
+            }
+        )
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        try:
+            append_worker_wait_ended(
+                path,
+                arm,
+                decision="failed",
+                context={
+                    "reason": "question_publication_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                lock_timeout_secs=remaining_secs(),
+            )
+        except TimeoutError as settlement_exc:
+            schedule_worker_wait_failed_cleanup(path, arm)
+            raise ValueError(
+                "worker wait question publication failed: "
+                f"{failure}; failed to settle wait within its deadline: "
+                f"{type(settlement_exc).__name__}: {settlement_exc}"
+            ) from exc
+        except Exception as settlement_exc:
+            raise ValueError(
+                "worker wait question publication failed: "
+                f"{failure}; failed to settle wait: "
+                f"{type(settlement_exc).__name__}: {settlement_exc}"
+            ) from exc
+        raise ValueError(
+            "worker wait question publication failed: "
+            f"{failure}"
+        ) from exc
     report(
         {
             "state": "armed",
             "arm": arm,
             "timeout_secs": timeout_secs,
             "question_kind": question_kind,
-            "question_marker_text": worker_wait_question_marker_text(
-                dispatch_id,
-                question_text,
-                str(arm["question_id"]),
-            ),
+            "question_marker_text": question_marker_text,
         }
     )
     carrier_read_error_reported = False
     while True:
         remaining = remaining_secs()
         if remaining <= 0:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         try:
             current_entries = read_steer_entries(
                 path,
@@ -1456,7 +1902,7 @@ def wait_for_worker_entries(
                 quarantine_errors=False,
             )
         except TimeoutError:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         except Exception as exc:
             if not isinstance(exc, OSError) and not is_carrier_error(exc):
                 raise
@@ -1472,7 +1918,7 @@ def wait_for_worker_entries(
                 carrier_read_error_reported = True
             remaining = remaining_secs()
             if remaining <= 0:
-                return deadline_result(str(arm["question_id"]))
+                return deadline_result(arm)
             time.sleep(min(poll_secs, remaining))
             continue
         replies = _worker_wait_replies(
@@ -1487,7 +1933,7 @@ def wait_for_worker_entries(
             raise ValueError("worker wait has multiple correlated replies")
         remaining = remaining_secs()
         if remaining <= 0:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         time.sleep(min(poll_secs, remaining))
 
 
@@ -1534,7 +1980,10 @@ def acked_steer_seqs(record: dict) -> set[int]:
 
 def list_steer_messages(dispatch_id: str, record: dict) -> int:
     mailbox = steer_file(dispatch_id)
-    entries = read_steer_entries(mailbox)
+    entries = read_steer_entries(
+        mailbox,
+        lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+    )
     acked = acked_steer_seqs(record)
     print(f"steer mailbox: {mailbox}")
     if not entries:

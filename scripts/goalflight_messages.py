@@ -491,12 +491,16 @@ def mail_lock(path: Path, *, timeout_secs: float | None = None):
                         )
                         break
                     except OSError as exc:
-                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                        if (
+                            not isinstance(exc, BlockingIOError)
+                            and exc.errno
+                            not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
+                        ):
                             raise
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError(
-                                f"{lock}: carrier lock deadline reached (lock contention)"
+                                f"{lock}: mailbox lock busy for {timeout:g}s"
                             ) from exc
                         time.sleep(min(0.01, remaining))
             acquired = True
@@ -516,7 +520,7 @@ def _next_ingestion_order(messages_dir: Path) -> int:
     """Allocate a controller-local causal order that survives restarts and clock rollback."""
     path = messages_dir / INGESTION_ORDER_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(path):
+    with mail_lock(path, timeout_secs=5.0):
         try:
             previous = max(0, int(path.read_text(encoding="utf-8").strip()))
         except (OSError, TypeError, ValueError, UnicodeDecodeError):
@@ -1537,7 +1541,11 @@ def _record_quarantine(row: dict) -> None:
     canonical_row = {**row, "path": str(carrier)}
     sidecar = quarantine_path(carrier)
     identity = (canonical_row["path"], canonical_row["offset"], canonical_row["hash"])
-    with carrier_transaction(sidecar, quarantine_sidecar=True) as transaction:
+    with carrier_transaction(
+        sidecar,
+        quarantine_sidecar=True,
+        lock_timeout_secs=5.0,
+    ) as transaction:
         existing = transaction.read_bytes()
         for raw in existing.splitlines():
             try:
@@ -1994,7 +2002,13 @@ def post_message(
     # carrier/ingestion state is touched. The final seq-bearing form is validated
     # and serialized again under the transaction lock.
     validate_envelope(envelope, expected_dispatch_id=dispatch_id)
-    with carrier_transaction(path) as transaction:
+    steer_retry = deliver_to_worker or base_source.get("transport") in {"steer", "steer-wait"}
+    steer_lock_timeout = (
+        goalflight_steer_mailbox.CONTROLLER_STEER_LOCK_TIMEOUT_SECS
+        if steer_retry
+        else None
+    )
+    with carrier_transaction(path, lock_timeout_secs=steer_lock_timeout) as transaction:
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
             (
@@ -2020,7 +2034,35 @@ def post_message(
                 "addressee",
                 "author_digest",
             )
-            if any(same_identity.get(key) != envelope.get(key) for key in comparable_fields):
+
+            def retry_fields(item: dict) -> dict:
+                fields = {key: item.get(key) for key in comparable_fields}
+                if steer_retry:
+                    fields.pop("ts", None)
+                    source = fields.get("source")
+                    has_project_identity = (
+                        isinstance(source, dict) and "project_identity" in source
+                    )
+                    for key in ("source", "payload"):
+                        value = fields.get(key)
+                        if not isinstance(value, dict):
+                            continue
+                        value = dict(value)
+                        value.pop("controller_pid", None)
+                        value.pop("controller_session_id", None)
+                        if has_project_identity:
+                            value.pop("project_root", None)
+                            sender = value.get("sender")
+                            if isinstance(sender, dict):
+                                sender = dict(sender)
+                                sender.pop("controller_pid", None)
+                                sender.pop("project_root", None)
+                                value["sender"] = sender
+                        fields[key] = value
+                return fields
+
+            same_content = retry_fields(same_identity) == retry_fields(envelope)
+            if not same_content:
                 raise MessageError(
                     "event identity integrity conflict: same origin_node + event_uuid has different content"
                 )
@@ -2030,18 +2072,16 @@ def post_message(
                 else ()
             )
             controller_deliveries = _mark_journal_delivery(assignment)
+            delivery = (_deliver_message_to_worker(dispatch_id, same_identity,
+                retain_terminal_worker_view=retain_terminal_worker_view) if deliver_to_worker else {
+                    "requested": False, "delivered": False, "worker_view_written": False,
+                    "status": "duplicate", "detail": "matching event identity already exists"})
             result = {
                 "envelope": same_identity,
                 "line": serialize_envelope_line(same_identity),
                 "path": str(path),
                 "recorded": False,
-                "delivery": {
-                    "requested": False,
-                    "delivered": False,
-                    "worker_view_written": False,
-                    "status": "duplicate",
-                    "detail": "matching event identity already exists",
-                },
+                "delivery": delivery,
             }
             if not deliver_to_worker:
                 result["controller_delivery"] = _controller_delivery_report(
@@ -2428,6 +2468,33 @@ def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
             )
 
 
+def _steer_worker_classification(record: dict) -> str:
+    state = str(record.get("state") or "running")
+    detached_live = bool(record.get("detached")) and (
+        state == "controller_dead"
+        or (state == "orphaned" and (record.get("reason") or record.get("error")) == "controller_dead")
+    )
+    if _record_is_terminal(record) and not detached_live:
+        return str(record.get("terminal_state") or state)
+    if state in {"queued", "waiting_capacity"}:
+        return "queued_capacity"
+    pid = record.get("worker_pid") or record.get("claimant_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "unknown_no_pid"
+    prior = record.get("worker_identity") or record.get("claimant_identity") or {}
+    start_token = prior.get("start_token") if isinstance(prior, dict) else None
+    if not isinstance(start_token, str) or not start_token:
+        return "identity_indeterminate"
+    try:
+        return (
+            "expected_live"
+            if goalflight_compat.process_identity_matches(pid, start_token) is True
+            else "identity_indeterminate"
+        )
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return "identity_indeterminate"
+
+
 def _deliver_message_to_worker(
     dispatch_id: str,
     envelope: dict,
@@ -2452,9 +2519,12 @@ def _deliver_message_to_worker(
             "detail": "message recorded; no matching dispatch record, so no worker delivery was attempted",
         }
     try:
-        import goalflight_ledger  # type: ignore
+        if envelope.get("source", {}).get("transport") == "steer":
+            classification = _steer_worker_classification(record)
+        else:
+            import goalflight_ledger  # type: ignore
 
-        classification = goalflight_ledger.classify(record)
+            classification = goalflight_ledger.classify(record)
     except _EXPECTED_OPTIONAL_ERRORS as exc:
         return {
             "requested": True,
@@ -2624,33 +2694,167 @@ def _stamp_controller_source_label(source: dict) -> None:
 
 
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
-    """Return the declared live controller that authored an outbound steer.
+    """Return an explicitly carried controller session, without acquiring.
 
-    Missing or ambiguous identity stays ``None``. Wake filtering treats that as
-    unknown correspondence and wakes; it must never guess an author and silence
-    mail that may have come from another controller.
+    Steer is a short-lived sideband command. Re-probing the controller lease
+    here used the project-root write/read canonicalizer, which shells out to
+    git before the message carrier was written. A missing or ambiguous session
+    stays ``None``; source metadata is descriptive and wake filtering must not
+    guess an author.
     """
+    for key in ("GOALFLIGHT_CONTROLLER_SESSION_ID", "GOALFLIGHT_CONTROLLER_LEASE_NONCE"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
     record, _classification = _dispatch_record(dispatch_id)
-    project_root = (record or {}).get("project_root")
-    if not project_root:
+    session_id = (record or {}).get("controller_session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def _steer_sender_project_root() -> Path:
+    """Resolve the controller command's project identity without acquiring."""
+    requested = os.environ.get("GOALFLIGHT_PROJECT_ROOT")
+    try:
+        requested = requested or str(Path.cwd())
+        return Path(requested).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise MessageError(
+            f"cannot resolve steer sender project_root {requested!r}: {exc}"
+        ) from exc
+
+
+def _steer_sender_identity() -> dict[str, object]:
+    """Return the sender fields stamped on every controller steer."""
+    label = _controller_post_source_label() or UNKNOWN_CONTROLLER_LABEL
+    raw_pid = str(os.environ.get("GOALFLIGHT_CONTROLLER_PID") or "").strip()
+    try:
+        pid = int(raw_pid) if raw_pid else os.getpid()
+    except (TypeError, ValueError):
+        pid = os.getpid()
+    if pid <= 0:
+        pid = os.getpid()
+    return {
+        "controller_label": str(label),
+        "controller_pid": pid,
+        "project_root": str(_steer_sender_project_root()),
+    }
+
+
+def _canonical_steer_project_root(value: object) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
         return None
     try:
-        import goalflight_session_status  # type: ignore
+        root = Path(value).expanduser().resolve(strict=False)
+        return root if root.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
 
-        label = goalflight_session_status.resolve_controller_label()
-        pid = goalflight_session_status.resolve_controller_pid()
-        if label is None or pid is None:
+
+def _steer_project_identity(root: Path) -> tuple[object, ...] | None:
+    """Return a worktree-invariant identity using only local metadata.
+
+    Ledger roots are collapsed through git when they are written. A steer must
+    not run git again, but a controller may invoke it from a linked worktree.
+    The linked worktree's ``.git`` file points at a gitdir whose ``commondir``
+    names the same repository metadata directory as the main checkout.
+    """
+    current = root
+    while True:
+        marker = current / ".git"
+        try:
+            marker_stat = marker.stat()
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+            continue
+        except OSError:
             return None
-        session = goalflight_session_status.live_session(
-            Path(str(project_root)),
-            label=label,
-            pid=pid,
+
+        if stat.S_ISDIR(marker_stat.st_mode):
+            try:
+                common_stat = marker.stat()
+            except OSError:
+                return None
+            return ("git", common_stat.st_dev, common_stat.st_ino)
+        if not stat.S_ISREG(marker_stat.st_mode):
+            return None
+        try:
+            line = marker.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError, UnicodeError):
+            return None
+        prefix = "gitdir:"
+        if not line.lower().startswith(prefix):
+            return None
+        gitdir = Path(line[len(prefix) :].strip())
+        if not gitdir.is_absolute():
+            gitdir = marker.parent / gitdir
+        try:
+            gitdir = gitdir.resolve(strict=False)
+            common_file = gitdir / "commondir"
+            common = common_file.read_text(encoding="utf-8").strip()
+            common_path = Path(common)
+            if not common_path.is_absolute():
+                common_path = gitdir / common_path
+            common_stat = common_path.resolve(strict=False).stat()
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return ("git", common_stat.st_dev, common_stat.st_ino)
+
+    try:
+        path_stat = root.stat()
+    except OSError:
+        return None
+    return ("path", path_stat.st_dev, path_stat.st_ino)
+
+
+def _validate_steer_sender_project(
+    dispatch_id: str,
+    sender: dict[str, object],
+    *,
+    cross_project: bool,
+) -> tuple[object, ...]:
+    """Refuse a foreign-project steer before writing carrier or worker bytes."""
+    record, lookup_error = _dispatch_record(dispatch_id)
+    if lookup_error is not None:
+        raise MessageError(
+            f"cannot validate steer sender for dispatch {dispatch_id}: {lookup_error}"
         )
-    except _EXPECTED_OPTIONAL_ERRORS:
-        return None
-    if not session or session.get("conflicting_beacons") or not session.get("id"):
-        return None
-    return str(session["id"])
+    target_root = _canonical_steer_project_root(
+        record.get("project_root") if isinstance(record, dict) else None
+    )
+    sender_root = _canonical_steer_project_root(sender.get("project_root"))
+    target_identity = (
+        _steer_project_identity(target_root) if target_root is not None else None
+    )
+    sender_identity = (
+        _steer_project_identity(sender_root) if sender_root is not None else None
+    )
+    if target_identity is None or sender_identity is None:
+        if cross_project:
+            return sender_identity or ("unknown",)
+        raise MessageError(
+            "steer refused: project_root identity is unknown for the sender or "
+            f"target dispatch {dispatch_id}; pass --cross-project to override"
+        )
+    if target_identity == sender_identity:
+        return sender_identity
+    if cross_project:
+        return sender_identity
+    raise MessageError(
+        "steer refused: sender project_root "
+        f"{sender_root} differs from target dispatch {dispatch_id} project_root "
+        f"{target_root}; pass --cross-project to override"
+    )
+
+
+def _steer_sender_payload(sender: dict[str, object], cross_project: bool) -> dict[str, object]:
+    payload = dict(sender)
+    payload["cross_project"] = bool(cross_project)
+    return payload
 
 
 def post_result_is_error(result: dict) -> bool:
@@ -2675,13 +2879,30 @@ def post_controller_steer(
     *,
     reply_to: str | None = None,
     decision: str | None = None,
+    cross_project: bool = False,
 ) -> dict:
     """Record a legacy steer command, then materialize its worker-visible view."""
-    source = {"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"}
+    sender = _steer_sender_identity()
+    project_identity = _validate_steer_sender_project(
+        dispatch_id,
+        sender,
+        cross_project=cross_project,
+    )
+    source = {
+        "node": "local",
+        "adapter": "goalflight-dispatch",
+        "transport": "steer",
+        **sender,
+        "cross_project": bool(cross_project),
+        "project_identity": list(project_identity),
+    }
     sender_session_id = _controller_sender_session_id(dispatch_id)
     if sender_session_id is not None:
         source["controller_session_id"] = sender_session_id
-    payload = {"text": text}
+    payload = {
+        "text": text,
+        "sender": _steer_sender_payload(sender, cross_project),
+    }
     if reply_to is not None:
         payload["reply_to"] = reply_to
     if decision is not None:
@@ -2695,6 +2916,48 @@ def post_controller_steer(
         author_capability=_presented_ambient_controller_capability(),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
+        # A steer is controller-to-worker mail. Its carrier record and worker
+        # view are authoritative; journal target resolution would only add a
+        # git-dependent side path before the record is durable.
+        project_journal_delivery=False,
+    )
+
+
+def post_worker_wait_question(
+    *,
+    dispatch_id: str,
+    wait_id: str,
+    question_kind: str,
+    question_text: str,
+    reply_command: str,
+    event_id: str | None = None,
+) -> dict:
+    """Publish a worker wait question on the dispatch's controller stream."""
+    msg_type = {
+        "USER-NEED": "user_need",
+        "USER-CONFIRM": "user_confirm",
+    }.get(question_kind, "controller-question")
+    payload = {
+        "text": question_text,
+        "question": question_text,
+        "question_kind": question_kind,
+        "question_id": wait_id,
+        "wait_id": wait_id,
+        "reply_command": reply_command,
+        "awaiting_reply": True,
+    }
+    return post_message(
+        dispatch_id=dispatch_id,
+        msg_type=msg_type,
+        payload=payload,
+        messages_dir=default_messages_dir(),
+        source={
+            "node": "local",
+            "adapter": "goalflight-dispatch",
+            "transport": "steer-wait",
+        },
+        event_id=event_id,
+        deliver_to_worker=False,
     )
 
 
@@ -3425,8 +3688,22 @@ def cmd_post(args: argparse.Namespace) -> int:
     return 0
 
 
+def _replay_controller_steer_views(dispatch_id: str, envelopes: list[dict]) -> None:
+    for envelope in envelopes:
+        if (
+            envelope.get("type") != "controller-notice"
+            or envelope.get("source", {}).get("transport") != "steer"
+        ):
+            continue
+        _deliver_message_to_worker(
+            dispatch_id,
+            envelope,
+            retain_terminal_worker_view=True,
+        )
+
+
 def cmd_read(args: argparse.Namespace) -> int:
-    """Read a carrier for diagnostics; journal delivery state is not mutated."""
+    """Read a carrier for diagnostics and replay committed steer projections."""
     paths = collect_inbox_paths(
         args.messages_dir,
         args.fleet_dir,
@@ -3439,6 +3716,7 @@ def cmd_read(args: argparse.Namespace) -> int:
         tolerate_errors=True,
         carrier_errors=carrier_errors,
     )
+    _replay_controller_steer_views(str(args.dispatch_id), envelopes)
     if args.last is not None and args.last >= 0:
         envelopes = envelopes[-args.last:] if args.last else []
     envelopes = [_without_inbox_metadata(envelope) for envelope in envelopes]
@@ -5216,6 +5494,7 @@ DRAIN_SIGNAL_TYPES = frozenset(
         "finding",
         "controller-question",
         "user_need",
+        "user_confirm",
         "blocked",
     }
 )

@@ -114,6 +114,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    env["GOALFLIGHT_PROJECT_ROOT"] = str(_project(tmp))
     env["GOALFLIGHT_ROOT"] = str(ROOT)
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
     env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
@@ -956,8 +957,9 @@ def case_post_deadline_yes_before_delayed_read_is_denied() -> None:
         late_reply = [
             row
             for row in rows
-            if row.get("text")
-            == f"USER-CONFIRM-ANSWER: {question['question_id']} yes"
+            if row.get("text", "").startswith(
+                f"USER-CONFIRM-ANSWER: {question['question_id']} yes"
+            )
         ]
         assert (
             status["state"] == "blocked_user_confirm_denied"
@@ -1048,7 +1050,9 @@ def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
                 for line in mailbox.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             )
-            if entry.get("text") == "USER-CONFIRM-ANSWER: wrong-question-id yes"
+            if entry.get("text", "").startswith(
+                "USER-CONFIRM-ANSWER: wrong-question-id yes"
+            )
         )
         assert status["state"] == "blocked_user_confirm_denied", status
         assert status["ok"] is False, status
