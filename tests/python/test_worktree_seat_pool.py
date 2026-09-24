@@ -612,7 +612,7 @@ def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
             ).splitlines()
             assert_true("quarantine captured RESULT.md", len(branches) == 1)
             assert_true(
-                "ignored notes remain outside quarantine",
+                "untracked notes remain outside quarantine",
                 ".goal-flight/seat/memory.md" not in _tree_names(repo, branches[0]),
             )
             assert_true("RESULT.md cleared", not (reused.path / "RESULT.md").exists())
@@ -964,8 +964,8 @@ def test_global_exclude_ignored_goal_flight_dir_does_not_block_quarantine() -> N
         )
 
 
-def test_unignored_goal_flight_is_not_quarantined() -> None:
-    """Control: a tracked ``.goal-flight`` stays at HEAD in the quarantine commit."""
+def test_tracked_goal_flight_is_quarantined() -> None:
+    """Tracked ``.goal-flight`` edits follow the same quarantine rule as product files."""
     with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
         repo = make_repo(Path(td))
         notes = repo / ".goal-flight"
@@ -980,8 +980,8 @@ def test_unignored_goal_flight_is_not_quarantined() -> None:
         branch, reused = _reclaim_dirty_seat(repo, prepare)
         assert_true("product file quarantined", "abandoned.txt" in _tree_names(repo, branch))
         assert_true(
-            "tracked goal-flight stays at HEAD in the quarantine commit",
-            git(repo, "show", f"{branch}:.goal-flight/keep.txt") == "keep",
+            "tracked goal-flight edit quarantined",
+            git(repo, "show", f"{branch}:.goal-flight/keep.txt") == "changed",
         )
         assert_true(
             "tracked goal-flight file is back to HEAD after reset",
@@ -1032,7 +1032,7 @@ def main() -> None:
         test_empty_ignored_goal_flight_dir_does_not_block_quarantine,
         test_info_exclude_ignored_goal_flight_dir_does_not_block_quarantine,
         test_global_exclude_ignored_goal_flight_dir_does_not_block_quarantine,
-        test_unignored_goal_flight_is_not_quarantined,
+        test_tracked_goal_flight_is_quarantined,
         test_hwm_stays_after_release,
     ]
     for test in tests:

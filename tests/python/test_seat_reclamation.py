@@ -137,45 +137,124 @@ def test_quarantine_preserves_tracked_goalflight_edits(holder):
         assert _git(repo, "show", refs[0] + ":.goal-flight/seat/staged.md") == "keep staged"
 
 
-def test_quarantine_refuses_clean_filter_bytes(holder, monkeypatch):
+def test_ignored_collision_retains_seat(holder):
+    repo, path, row = holder
+    base_collision = repo / "generated"
+    base_collision.mkdir()
+    (base_collision / "out.bin").write_text("base\n")
+    _git(repo, "add", "generated/out.bin")
+    _git(repo, "commit", "-m", "add base collision")
+    collision = path / "generated"
+    (path / ".gitignore").write_text("generated/out.bin\n")
+    _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "add ignored collision")
+    collision.mkdir()
+    (collision / "out.bin").write_text("must survive\n")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="cannot reset worktree"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert (collision / "out.bin").read_text() == "must survive\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_hidden_index_edit_retains_seat(holder, flag):
+    repo, path, row = holder
+    tracked = path / "tracked.txt"
+    tracked.write_text("hidden bytes\n")
+    _git(path, "update-index", flag, "tracked.txt")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="hidden index entry"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert tracked.read_text() == "hidden bytes\n"
+
+
+@pytest.mark.parametrize("operation", ["delete", "rename"])
+def test_quarantine_tree_check_accepts_deleted_and_renamed_paths(holder, operation):
+    repo, path, row = holder
+    if operation == "delete":
+        _git(path, "rm", "tracked.txt")
+    else:
+        _git(path, "mv", "tracked.txt", "renamed.txt")
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == path
+    assert (path / "tracked.txt").read_text() == "base\n"
+    assert not (path / "renamed.txt").exists()
+
+
+def test_quarantine_refuses_worktree_encoding(holder):
+    repo, path, row = holder
+    (path / ".gitattributes").write_text("encoded.txt working-tree-encoding=UTF-16LE-BOM\n")
+    _git(path, "add", ".gitattributes")
+    _git(path, "commit", "-m", "add working tree encoding")
+    encoded = path / "encoded.txt"
+    encoded.write_bytes(b"\xff\xfe" + "before\n".encode("utf-16le"))
+    _git(path, "add", "encoded.txt")
+    _git(path, "commit", "-m", "track encoded file")
+    encoded.write_bytes(b"\xff\xfe" + "secret\n".encode("utf-16le"))
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="working-tree-encoding"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert encoded.read_bytes() == b"\xff\xfe" + "secret\n".encode("utf-16le")
+
+
+def test_dirty_submodule_retains_seat(holder, tmp_path):
+    repo, path, row = holder
+    subrepo = tmp_path / "subrepo"
+    _git(tmp_path, "init", str(subrepo))
+    _git(subrepo, "config", "user.email", "goalflight-test@example.invalid")
+    _git(subrepo, "config", "user.name", "Goal Flight Test")
+    (subrepo / "tracked.txt").write_text("submodule\n")
+    _git(subrepo, "add", "tracked.txt")
+    _git(subrepo, "commit", "-m", "submodule base")
+    _git(
+        path,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(subrepo),
+        "modules/sub",
+    )
+    _git(path, "commit", "-m", "add submodule")
+    _git(path, "config", "submodule.recurse", "true")
+    (path / "modules" / "sub" / "local.txt").write_text("local\n")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="dirty submodule"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert (path / "modules" / "sub" / "local.txt").read_text() == "local\n"
+
+
+def test_quarantine_refuses_clean_filter_bytes(holder):
     repo, path, row = holder
     payload = path / "note.dat"
     payload.write_text("secret-bytes\n")
     _git(path, "add", "note.dat")
+    _git(path, "commit", "-m", "track raw note")
     (path / ".gitattributes").write_text("*.dat filter=pointer\n")
     _git(path, "config", "filter.pointer.clean", "printf POINTER")
     _git(path, "config", "filter.pointer.smudge", "cat")
     _git(path, "config", "filter.pointer.required", "true")
-    real_git = pool._git
-    def dirty_status(cwd, *args, **kwargs):
-        if args[:2] == ("status", "--porcelain=v1"):
-            return " M note.dat\n"
-        return real_git(cwd, *args, **kwargs)
-    monkeypatch.setattr(pool, "_git", dirty_status)
+    _git(path, "add", ".gitattributes")
+    _git(path, "commit", "-m", "activate pointer filter")
     with pytest.raises(pool.WorktreeSeatResetRefused, match="active filter"):
         pool.acquire_worktree_seat(repo, "next")
     assert payload.read_text() == "secret-bytes\n"
     assert _git(path, "branch", "--show-current") == "worktree/old"
 
 
-def test_smudged_clean_filter_seat_is_reusable(holder, monkeypatch):
+def test_smudged_clean_filter_seat_is_reusable(holder):
     repo, path, row = holder
     payload = path / "valuable.dat"
-    payload.write_text("pointer\n")
-    _git(path, "add", "valuable.dat")
     (path / ".gitattributes").write_text("*.dat filter=pointer\n")
-    _git(path, "add", ".gitattributes")
-    _git(path, "commit", "-m", "track filtered file")
     _git(path, "config", "filter.pointer.clean", "printf POINTER")
     _git(path, "config", "filter.pointer.smudge", "cat")
     _git(path, "config", "filter.pointer.required", "true")
     payload.write_text("smudged bytes\n")
-    real_git = pool._git
-    def clean_status(cwd, *args, **kwargs):
-        if args and args[0] == "status":
-            return ""
-        return real_git(cwd, *args, **kwargs)
-    monkeypatch.setattr(pool, "_git", clean_status)
+    _git(path, "add", ".gitattributes", "valuable.dat")
+    _git(path, "commit", "-m", "track filtered file")
+    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
 
     with pool.acquire_worktree_seat(repo, "next") as lease:
         assert lease.path == path
@@ -214,6 +293,42 @@ def test_quarantine_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatc
         assert lease.path == good_path
     assert nested.exists()
     assert bad_path != good_path
+
+
+def test_checkout_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo = _make_repo(tmp_path)
+    bad = pool.acquire_worktree_seat(repo, "bad")
+    good = pool.acquire_worktree_seat(repo, "good")
+    bad_path = bad.path
+    good_path = good.path
+    bad.release()
+    good.release()
+    records = {
+        ident: {
+            "dispatch_id": ident,
+            "state": "complete",
+            "worker_pid": 34567,
+            "worker_identity": {"pid": 34567, "start_token": f"{ident}-token"},
+        }
+        for ident in ("bad", "good")
+    }
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: False,
+    )
+    original = pool._prepare_seat_checkout
+
+    def fail_bad_checkout(worktree_path, **kwargs):
+        if worktree_path == bad_path:
+            raise pool.WorktreeSeatError("injected checkout failure")
+        return original(worktree_path, **kwargs)
+
+    monkeypatch.setattr(pool, "_prepare_seat_checkout", fail_bad_checkout)
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == good_path
 
 
 def test_quarantine_refuses_separate_staged_and_working_versions(holder):

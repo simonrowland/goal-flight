@@ -817,11 +817,18 @@ def _porcelain_relpaths(line: str) -> list[str]:
     if len(text) < 4:
         return []
     rest = text[3:]
-    if text[0] not in {" ", "?"} and text[1] == " ":
-        rest = text[2:]
-    if " -> " in rest:
+    if any(code in {"R", "C"} for code in text[:2]) and " -> " in rest:
         return [part.replace("\\", "/").strip() for part in rest.split(" -> ", 1)]
     return [rest.replace("\\", "/").strip()]
+
+
+def _porcelain_tree_paths(line: str) -> list[str]:
+    paths = _porcelain_relpaths(line)
+    if "D" in line[:2]:
+        return []
+    if any(code in {"R", "C"} for code in line[:2]):
+        return paths[-1:]
+    return paths
 
 
 def _porcelain_is_product(line: str) -> bool:
@@ -1408,11 +1415,33 @@ def _prepare_seat_checkout(
     tracked_status = _git(
         worktree_path, "status", "--porcelain", "--untracked-files=no"
     )
-    if current_branch != branch or current_head != base_commit or tracked_status:
-        _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
+    needs_checkout = (
+        current_branch != branch or current_head != base_commit or tracked_status
+    )
+    if needs_checkout:
+        _git(
+            worktree_path,
+            "-c",
+            "submodule.recurse=false",
+            "reset",
+            "--hard",
+            "HEAD",
+        )
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
-    # when a temp repo has not gitignored ``.goal-flight/``.
+    # when a temp repo has not gitignored ``.goal-flight/``. Clean before the
+    # non-forced checkout so quarantined untracked files cannot block it.
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
+    if needs_checkout:
+        _git(
+            worktree_path,
+            "-c",
+            "submodule.recurse=false",
+            "checkout",
+            "--no-overwrite-ignore",
+            "-B",
+            branch,
+            base_commit,
+        )
 
 
 def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
@@ -1451,7 +1480,56 @@ def _quarantine_dirty_worktree(
     seat_name: str,
     abandoned_dispatch_id: str,
 ) -> str | None:
-    dirty = _git(worktree_path, "status", "--porcelain=v1", "--untracked-files=all")
+    hidden_entries = _git(worktree_path, "ls-files", "-v", "-z").split("\0")
+    for entry in hidden_entries:
+        if not entry:
+            continue
+        tag, _, path = entry.partition(" ")
+        if (tag.islower() or tag == "S") and (
+            (worktree_path / path).exists() or (worktree_path / path).is_symlink()
+        ):
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} has hidden index entry {path!r}; "
+                "refusing reset"
+            )
+
+    status = _git_proc(
+        worktree_path,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    if status is None or status.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect dirty worktree {seat_name}; refusing reset"
+        )
+    dirty = status.stdout
+    submodule_paths = set()
+    for entry in _git(worktree_path, "ls-files", "--stage").splitlines():
+        fields = entry.split(None, 3)
+        if len(fields) == 4 and fields[0] == "160000":
+            submodule_paths.add(fields[3])
+    for line in dirty.splitlines():
+        paths = _porcelain_relpaths(line)
+        if any(
+            path == submodule or path.startswith(submodule + "/")
+            for path in paths
+            for submodule in submodule_paths
+        ):
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} has dirty submodule; refusing reset"
+            )
+
+    reserved_untracked = list(
+        dict.fromkeys(
+            path
+            for line in dirty.splitlines()
+            if line[:2] == "??"
+            for path in _porcelain_relpaths(line)
+            if is_reserved_seat_notes_path(path)
+        )
+    )
     product = [
         line for line in dirty.splitlines() if line.strip() and _porcelain_is_product(line)
     ]
@@ -1469,7 +1547,7 @@ def _quarantine_dirty_worktree(
         )
 
     dirty_paths = list(
-        dict.fromkeys(path for line in product for path in _porcelain_relpaths(line))
+        dict.fromkeys(path for line in product for path in _porcelain_tree_paths(line))
     )
     if dirty_paths:
         attributes = _git(
@@ -1477,18 +1555,48 @@ def _quarantine_dirty_worktree(
             "check-attr",
             "--stdin",
             "filter",
+            "working-tree-encoding",
+            "eol",
+            "text",
             input_text="\n".join(dirty_paths) + "\n",
         )
         for line in attributes.splitlines():
             fields = line.rsplit(": ", 2)
-            if len(fields) != 3 or fields[1] != "filter":
+            if len(fields) != 3:
                 continue
-            filter_name = fields[2].strip()
-            if filter_name in {"", "unspecified", "unset"}:
+            attribute = fields[1]
+            value = fields[2].strip()
+            active_filter = attribute == "filter" and value not in {
+                "",
+                "unspecified",
+                "unset",
+            }
+            reencodes = False
+            if attribute == "working-tree-encoding":
+                reencodes = value not in {"", "unspecified", "unset"}
+            elif (
+                attribute == "eol" and value in {"lf", "crlf"}
+            ) or (attribute == "text" and value in {"set", "auto"}):
+                try:
+                    data = (worktree_path / fields[0]).read_bytes()
+                except OSError:
+                    reencodes = True
+                else:
+                    if attribute == "eol":
+                        reencodes = (
+                            b"\r\n" in data
+                            if value == "lf"
+                            else b"\n" in data.replace(b"\r\n", b"")
+                        )
+                    else:
+                        reencodes = b"\r\n" in data and (
+                            value == "set" or b"\x00" not in data
+                        )
+            if not active_filter and not reencodes:
                 continue
             raise WorktreeSeatResetRefused(
-                f"dirty worktree {seat_name} path {fields[0]} uses active filter "
-                f"{filter_name!r}; refusing reset"
+                f"dirty worktree {seat_name} path {fields[0]} uses active "
+                f"{attribute} {value!r}; refusing reset"
             )
     if not product:
         return None
@@ -1509,6 +1617,15 @@ def _quarantine_dirty_worktree(
             ) from exc
         index_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
         _git(worktree_path, "add", "-A", "--", ".", env=index_env)
+        if reserved_untracked:
+            _git(
+                worktree_path,
+                "reset",
+                "-q",
+                "--",
+                *reserved_untracked,
+                env=index_env,
+            )
         tree = _git(worktree_path, "write-tree", env=index_env)
     parent = _git(worktree_path, "rev-parse", "HEAD")
     parent_tree = _git(worktree_path, "rev-parse", "HEAD^{tree}")
@@ -1687,25 +1804,30 @@ def _prepare_claimed_seat_locked(
         raise WorktreeSeatResetRefused(
             f"cannot quarantine dirty worktree {seat_name}: {exc}"
         ) from exc
-    _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
-    remaining = _git(
-        worktree_path,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    )
-    leftover = [
-        line
-        for line in remaining.splitlines()
-        if line.strip() and _porcelain_is_product(line)
-    ]
-    if leftover:
-        raise WorktreeSeatError(
-            f"worktree {seat_name} is not clean after acquire-time reset"
+    try:
+        _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
+        remaining = _git(
+            worktree_path,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
         )
-    actual_branch = _assert_seat_on_named_branch(
-        worktree_path, seat_name=seat_name, branch=branch
-    )
+        leftover = [
+            line
+            for line in remaining.splitlines()
+            if line.strip() and _porcelain_is_product(line)
+        ]
+        if leftover:
+            raise WorktreeSeatError(
+                f"worktree {seat_name} is not clean after acquire-time reset"
+            )
+        actual_branch = _assert_seat_on_named_branch(
+            worktree_path, seat_name=seat_name, branch=branch
+        )
+    except (WorktreeSeatError, OSError) as exc:
+        raise WorktreeSeatResetRefused(
+            f"cannot reset worktree {seat_name}: {exc}"
+        ) from exc
     try:
         _write_occupant(
             lock_file,
@@ -1896,14 +2018,31 @@ def acquire_worktree_seat(
         ) from exc
     allocation_file = os.fdopen(allocation_fd, "r+", encoding="utf-8")
     try:
-        # Serialize the short acquire/reset transaction. This is not seat
-        # ownership; it only ensures a contender never reads an occupant's old
-        # diagnostic metadata between that occupant's flock and metadata write.
+        # Serialize candidate claims and occupant metadata only. This is not
+        # seat ownership; quarantine and checkout run under the seat lock after
+        # the allocation lock is released.
         _acquire_allocation_lock(
             allocation_file,
             allocation_lock_path,
             deadline=capacity_deadline,
         )
+        allocation_locked = True
+
+        def release_allocation_lock() -> None:
+            nonlocal allocation_locked
+            if allocation_locked:
+                fcntl.flock(allocation_file.fileno(), fcntl.LOCK_UN)
+                allocation_locked = False
+
+        def reacquire_allocation_lock() -> None:
+            nonlocal allocation_locked
+            if not allocation_locked:
+                _acquire_allocation_lock(
+                    allocation_file,
+                    allocation_lock_path,
+                    deadline=capacity_deadline,
+                )
+                allocation_locked = True
 
         # Count every held global or legacy-ring lock before any checkout/reset
         # or directory creation. Legacy rings are migration input, not extra
@@ -2000,6 +2139,7 @@ def acquire_worktree_seat(
                         f"{prior_dispatch_id}; expected recorded holder "
                         f"{expected_prior_dispatch_id}; refusing to reset or recreate it"
                     )
+                release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,
@@ -2063,6 +2203,7 @@ def acquire_worktree_seat(
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
                 )
+                release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,
@@ -2078,6 +2219,7 @@ def acquire_worktree_seat(
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
                 lock_file.close()
+                reacquire_allocation_lock()
                 return None
             except WorktreeSeatUnavailable:
                 resolved_path = worktree_path.resolve(strict=False)
@@ -2085,6 +2227,7 @@ def acquire_worktree_seat(
                     occupied_paths.add(resolved_path)
                     occupants.append((str(worktree_path), _lock_metadata(lock_file)))
                 lock_file.close()
+                reacquire_allocation_lock()
                 return None
             except BaseException:
                 lock_file.close()
