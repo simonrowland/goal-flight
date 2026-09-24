@@ -40,6 +40,7 @@ import re
 import shlex
 import socket
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -968,7 +969,18 @@ def _permission_denial_cause(
     if not _is_cantopen(exc):
         return None
     try:
-        descriptor = os.open(path, os.O_WRONLY)
+        metadata = os.lstat(path)
+    except OSError as probe_exc:
+        if _is_permission_denied(probe_exc):
+            return probe_exc
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    flags = os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
     except OSError as probe_exc:
         if _is_permission_denied(probe_exc):
             return probe_exc
@@ -1674,6 +1686,7 @@ class Journal:
                         raise self._open_io_failure(
                             open_started, open_failures, exc
                         ) from exc
+                    self._raise_disappeared_or_unverified(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "

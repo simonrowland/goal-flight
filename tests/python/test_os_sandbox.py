@@ -739,6 +739,15 @@ def _sandboxed_journal_open(workspace: Path, journal_path: Path):
     return prepared, result
 
 
+def _assert_journal_permission_denial(
+    result: subprocess.CompletedProcess, journal_path: Path
+) -> None:
+    assert result.returncode != 0, result
+    combined = result.stdout + result.stderr
+    assert "journal open permission denied" in combined, result
+    assert str(journal_path) in combined, result
+
+
 def case_journal_dir_is_not_a_write_root() -> None:
     """Watcher owns the RUNNING claim; the seatbelt must not grant the journal."""
     with _isolated_journal_workspace() as (workspace, journal_path):
@@ -758,13 +767,8 @@ def case_sandboxed_journal_open_is_denied() -> None:
         return
     with _isolated_journal_workspace() as (workspace, journal_path):
         _prepared, result = _sandboxed_journal_open(workspace, journal_path)
-        assert result.returncode != 0, result
-        combined = result.stdout + result.stderr
         assert "journal-ok" not in result.stdout, result
-        assert (
-            "PermissionError" in combined
-            or "Operation not permitted" in combined
-        ), result
+        _assert_journal_permission_denial(result, journal_path)
 
 
 def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
@@ -774,7 +778,7 @@ def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
     ):
         return
     launcher = ROOT / "scripts" / "goalflight_launch_worker.py"
-    with _isolated_journal_workspace() as (workspace, _journal_path):
+    with _isolated_journal_workspace() as (workspace, journal_path):
         prepared = prepare_os_sandbox_command(
             sys.executable,
             [
@@ -806,13 +810,8 @@ def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
             check=False,
             env=env,
         )
-        combined = result.stdout + result.stderr
-        assert result.returncode != 0, result
         assert "journal-ok" not in result.stdout, result
-        assert (
-            "PermissionError" in combined
-            or "Operation not permitted" in combined
-        ), result
+        _assert_journal_permission_denial(result, journal_path)
 
 
 def case_dispatch_help_exposes_title_allow_pattern() -> None:
@@ -1000,42 +999,57 @@ def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
             status_path = tmp_path / "status.json"
+            cfg = argparse.Namespace(
+                agent="fake-sandbox",
+                unregistered_forced=True,
+                cwd=str(workspace),
+                session_id="title-allow-warn-session",
+                dispatch_id=f"test-title-allow-warn-{os.getpid()}",
+                prompt_id=None,
+                prompt=None,
+                prompt_text="COMPLETE: warn probe",
+                mode="one-shot",
+                status_json=str(status_path),
+                idle_timeout=5.0,
+                heartbeat_interval=0.2,
+                wedge_samples=100,
+                max_tool_s=60.0,
+                max_quiet_s=60.0,
+                progress_stall_s=60.0,
+                liveness_profile="local_compute",
+                remote_turn_silence_s=None,
+                remote_turn_cancel_grace_s=0.0,
+                cpu_epsilon=0.1,
+                context_mode="disabled",
+                permission_mode="auto",
+                permission_dir=None,
+                permission_inline_timeout_s=None,
+                permission_user_timeout_s=None,
+                permission_allow_tool_title_pattern=[".*"],
+                os_sandbox=OS_SANDBOX_OFF,
+                json=True,
+            )
+            early_manifest = tmp_path / "fake-sandbox.json"
+            early_manifest.write_text("{not-json")
+            early_cfg = argparse.Namespace(**vars(cfg))
+            early_cfg.dispatch_id = f"test-title-allow-early-{os.getpid()}"
+            early_cfg.session_id = "title-allow-early-session"
+            early_cfg.status_json = str(tmp_path / "early-status.json")
+            early_stderr = io.StringIO()
+            with registered_child_environment(
+                workspace, controller_label="title-allow-early"
+            ):
+                with contextlib.redirect_stderr(early_stderr):
+                    early_payload = asyncio.run(goalflight_acp_run.run(early_cfg))
+            assert "WARNING — broad title-allow pattern" in early_stderr.getvalue()
+            assert early_payload["state"] == "blocked_adapter_gate", early_payload
+
+            _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
             stderr = io.StringIO()
             with registered_child_environment(workspace):
                 with contextlib.redirect_stderr(stderr):
                     payload = asyncio.run(
-                        goalflight_acp_run.run(
-                            argparse.Namespace(
-                                agent="fake-sandbox",
-                                unregistered_forced=True,
-                                cwd=str(workspace),
-                                session_id="title-allow-warn-session",
-                                dispatch_id=f"test-title-allow-warn-{os.getpid()}",
-                                prompt_id=None,
-                                prompt=None,
-                                prompt_text="COMPLETE: warn probe",
-                                mode="one-shot",
-                                status_json=str(status_path),
-                                idle_timeout=5.0,
-                                heartbeat_interval=0.2,
-                                wedge_samples=100,
-                                max_tool_s=60.0,
-                                max_quiet_s=60.0,
-                                progress_stall_s=60.0,
-                                liveness_profile="local_compute",
-                                remote_turn_silence_s=None,
-                                remote_turn_cancel_grace_s=0.0,
-                                cpu_epsilon=0.1,
-                                context_mode="disabled",
-                                permission_mode="auto",
-                                permission_dir=None,
-                                permission_inline_timeout_s=None,
-                                permission_user_timeout_s=None,
-                                permission_allow_tool_title_pattern=[".*"],
-                                os_sandbox=OS_SANDBOX_OFF,
-                                json=True,
-                            )
-                        )
+                        goalflight_acp_run.run(cfg)
                     )
             text = stderr.getvalue()
             assert "WARNING — broad title-allow pattern" in text, text

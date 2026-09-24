@@ -461,6 +461,84 @@ def test_permission_denied_journal_open_fails_without_retry(
     assert attempts == 1
 
 
+def test_pragma_failure_after_journal_disappears_keeps_disappearance_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "pragma-disappeared"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    real_connect = journal._sqlite_connect
+
+    class DisappearingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, *args: object, **kwargs: object):
+            if "PRAGMA foreign_keys = ON" in sql:
+                authority.path.unlink()
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    def disappearing_connect(
+        database: str | Path,
+        *,
+        uri: bool = False,
+        timeout: float = 5.0,
+        isolation_level: str | None = "",
+    ) -> DisappearingConnection:
+        return DisappearingConnection(
+            real_connect(
+                database,
+                uri=uri,
+                timeout=timeout,
+                isolation_level=isolation_level,
+            )
+        )
+
+    monkeypatch.setattr(journal, "_sqlite_connect", disappearing_connect)
+    with pytest.raises(journal.JournalDisappeared, match="vanished"):
+        journal.Journal(project)
+
+
+def test_fifo_journal_open_probe_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO paths are unavailable on this platform")
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "fifo-open-probe"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    authority.path.unlink()
+    os.mkfifo(authority.path)
+    attempts = 0
+
+    def reject_every_open(*_args: object, **_kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(journal, "_sqlite_connect", reject_every_open)
+    started = time.monotonic()
+    try:
+        with pytest.raises(journal.JournalIOError, match="still present"):
+            journal.Journal(
+                project,
+                open_retry_budget_s=0.02,
+                jitter_min_s=0.001,
+                jitter_max_s=0.002,
+            )
+    finally:
+        authority.path.unlink(missing_ok=True)
+
+    assert attempts > 1
+    assert time.monotonic() - started < 0.5
+
+
 def test_genuinely_absent_journal_keeps_disappearance_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
