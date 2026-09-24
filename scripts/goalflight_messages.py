@@ -8870,6 +8870,7 @@ def cmd_listen(args) -> int:
     prearmed_materialized_items: list[tuple[dict, dict]] | None = None
     prearmed_settled_rows: list[dict] = []
     reported_carrier_errors: set[tuple[str, str]] = set()
+    missing_carrier_seen = False
 
     def listener_envelopes(
         source,
@@ -8878,6 +8879,7 @@ def cmd_listen(args) -> int:
         attention_by_id: dict[str, dict[str, object]] | None = None,
         settled_rows: list[dict[str, object]] | None = None,
     ) -> list[tuple[dict, dict]]:
+        nonlocal missing_carrier_seen
         errors: list[dict[str, object]] = []
         items = _envelopes_with_rows(
             source,
@@ -8886,6 +8888,10 @@ def cmd_listen(args) -> int:
             attention_by_id=attention_by_id,
             carrier_errors=errors,
             settled_rows=settled_rows,
+        )
+        missing_carrier_seen = missing_carrier_seen or any(
+            error.get("carrier_status") == CarrierReadStatus.CARRIER_MISSING.value
+            for error in errors
         )
         for error in errors:
             identity = (
@@ -8919,8 +8925,12 @@ def cmd_listen(args) -> int:
                 controller_label=label,
                 lease_nonce=nonce,
             )
-            if state is None or state.phase == "acknowledged":
+            # A claim becomes a suppression boundary only after its report is
+            # emitted to the controller; a merely claimed boundary is unseen.
+            if state is None or state.phase != "reported":
                 return {}
+            # Unknown zombie state fails open here: a duplicate report is
+            # recoverable by the controller, while hiding mail is not.
             if (
                 goalflight_wake._pending_report_owner_liveness(state) is not True
                 or goalflight_compat.pid_is_zombie(state.owner_pid) is not False
@@ -9622,6 +9632,7 @@ def cmd_listen(args) -> int:
     observed_lease = None
     peek_needed = True
     while True:
+        missing_carrier_seen = False
         parent_result = parent_exit()
         if parent_result is not None:
             return parent_result
@@ -9691,6 +9702,8 @@ def cmd_listen(args) -> int:
                     pending_report_settled = True
             except (OSError, RuntimeError, ValueError):
                 pending_report_settled = False
+        if missing_carrier_seen:
+            peek_needed = True
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
         # untracked process consume the ring during the grace window.
@@ -9782,7 +9795,8 @@ def cmd_listen(args) -> int:
                     return finish_watchdog_dead(claim_state=claim_state)
             wakeable_items = False
             if journal_changed or peek_needed:
-                # With a pending report the cheap limit-1 peek would forever see
+                # With a reported pending report, the cheap limit-1 peek would
+                # forever see
                 # the oldest already-reported item; peek wide and ring only for
                 # events beyond the live claim's durable high-water.
                 # Self-authored rows can sort before foreign mail indefinitely, so
@@ -9816,7 +9830,8 @@ def cmd_listen(args) -> int:
                         lease_nonce=nonce,
                     )
                 )
-                peek_needed = wakeable_items
+                # A carrier can be restored without changing SQLite data_version.
+                peek_needed = wakeable_items or missing_carrier_seen
                 if wakeable_items:
                     # The non-JSON listener is the controller: it prints every
                     # buffered item before exiting. Materialize the complete
