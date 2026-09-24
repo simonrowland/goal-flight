@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.7.1
+version: 1.7.2
 description: "Use when the user invokes /goal-flight or asks for long-running grok-bot Goal Flight orchestration: plan, dispatch, review, recover, or resume from file-backed state."
 disable-model-invocation: true
 ---
