@@ -2186,9 +2186,58 @@ def _validate_resume_worktree_source(
         raise DispatchUsageError(f"resume refused: dispatch {parent_dispatch_id} is missing a project root")
     try:
         project_root = goalflight_task.resolve_project_root(str(raw_root))
-        if not goalflight_worktree_pool.is_managed_worktree_path(
+        managed = goalflight_worktree_pool.is_managed_worktree_path(
             cwd, project_root=project_root
-        ):
+        )
+        if not managed:
+            source_identity = goalflight_worktree_pool._git_identity(cwd)
+            project_identity = goalflight_worktree_pool._git_identity(project_root)
+            if source_identity is None:
+                # Preserve existing non-Git project behavior. A Git project
+                # with an unidentifiable resume checkout must fail closed.
+                if project_identity is None:
+                    return
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: could not establish Git identity for "
+                    f"recorded checkout {cwd}"
+                )
+            if project_identity is None or source_identity[1] != project_identity[1]:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded checkout {cwd} belongs to a "
+                    "different Git repository"
+                )
+            try:
+                actual_branch = goalflight_worktree_pool._git(
+                    cwd, "rev-parse", "--abbrev-ref", "HEAD"
+                )
+                actual_head = goalflight_worktree_pool._git(cwd, "rev-parse", "HEAD")
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise DispatchUsageError(
+                    f"resume refused: could not inspect recorded worktree {cwd}: {exc}"
+                ) from exc
+            expected_branch = str(record.get("worktree_branch") or "").strip()
+            expected_head = record.get("worktree_head") or record.get("worktree_base")
+            if expected_head:
+                resolved_head = _resume_worktree_ref_commit(
+                    project_root, str(expected_head)
+                )
+                if resolved_head is None:
+                    raise goalflight_worktree_pool.WorktreeCwdRefused(
+                        f"resume refused: recorded checkout {cwd} has "
+                        f"unresolvable recorded head {expected_head}"
+                    )
+                expected_branch = expected_branch or "HEAD"
+                if actual_branch != expected_branch or actual_head != resolved_head:
+                    raise goalflight_worktree_pool.WorktreeCwdRefused(
+                        f"resume refused: recorded checkout {cwd} has actual branch "
+                        f"{actual_branch} at {actual_head}; expected branch "
+                        f"{expected_branch} at {resolved_head}"
+                    )
+            elif expected_branch and actual_branch != expected_branch:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded checkout {cwd} has actual branch "
+                    f"{actual_branch}; expected branch {expected_branch}"
+                )
             return
         if not any(
             record.get(key)
@@ -2254,6 +2303,29 @@ def _validate_resume_worktree_source(
         raise DispatchUsageError(f"resume refused: parent project_root {raw_root} is missing or invalid") from exc
     except goalflight_worktree_pool.WorktreeSeatError as exc:
         raise DispatchUsageError(str(exc)) from exc
+
+
+def _revalidate_read_only_resume_worktree(
+    args, *, resume_plan: dict | None = None
+) -> None:
+    """Recheck a read-only resume after capacity admission and before spawn."""
+    if not (
+        getattr(args, "parent_dispatch_id", None)
+        and _occupancy_exempt_read_only(args)
+    ):
+        return
+    if resume_plan is not None:
+        source = resume_plan["source"]
+    else:
+        source = _validate_resume_source(
+            str(args.parent_dispatch_id),
+            exclude_dispatch_id=getattr(args, "dispatch_id", None),
+        )
+    _validate_resume_worktree_source(
+        str(args.parent_dispatch_id),
+        source["record"],
+        _worker_cwd(args),
+    )
 
 
 def _emit_resume_worktree_recovery_refs(args, lease) -> None:
@@ -19776,6 +19848,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
         agent=args.agent,
+        shape="acp",
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
@@ -22188,6 +22261,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         _mark_queue_claim_worker_spawn_intent(args)
         if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
             raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
+        _revalidate_read_only_resume_worktree(args, resume_plan=resume_plan)
         worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,

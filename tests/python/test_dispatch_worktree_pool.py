@@ -598,6 +598,146 @@ def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
     assert launched == []
 
 
+def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(tmp_path / "codex-state"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "readonly-capacity-parent"
+    child_id = "readonly-capacity-child"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "worktree/readonly-foreign", recorded_head)
+    parent.release()
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": parent_id,
+        "agent": "grok-code",
+        "engine": "grok",
+        "shape": "bash",
+        "state": "blocked",
+        "terminal_state": "blocked",
+        "project_root": str(repo),
+        "worker_cwd": str(seat),
+        "worktree_id": seat.name,
+        "worktree_path": str(seat),
+        "worktree_branch": f"worktree/{parent_id}",
+        "worktree_head": recorded_head,
+        "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+        "dispatch_argv": [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--cwd",
+            str(seat),
+            "--read-only",
+        ],
+    }
+    goalflight_ledger.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the worker.\n", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+
+    def acquire_capacity(*_args, **_kwargs):
+        _git(seat, "checkout", "worktree/readonly-foreign")
+        return "lease-readonly-capacity"
+
+    monkeypatch.setattr(goalflight_dispatch, "_account_engine", lambda _agent: None)
+    monkeypatch.setattr(goalflight_dispatch, "_validate_before_side_effects", lambda *_a, **_k: {})
+    monkeypatch.setattr(goalflight_dispatch, "_validate_os_sandbox_boundary", lambda _args: None)
+    monkeypatch.setattr(goalflight_dispatch, "_resolve_launch_account_env", lambda _args: {})
+    monkeypatch.setattr(goalflight_dispatch, "_wrap_grok_read_only_os_sandbox", lambda argv, _args: argv)
+    monkeypatch.setattr(goalflight_dispatch, "_acquire_capacity", acquire_capacity)
+    monkeypatch.setattr(
+        goalflight_dispatch.goalflight_capacity,
+        "mark_lease_spawning",
+        lambda _lease_id: True,
+    )
+    monkeypatch.setattr(
+        goalflight_dispatch.goalflight_capacity,
+        "mark_lease_spawn_failed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_stamp_controller_session", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_controller_registration",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_reap_quota_stuck_before_bash_launch", lambda: None)
+    monkeypatch.setattr(goalflight_dispatch, "_record_ledger", lambda *_a, **_k: None)
+    monkeypatch.setattr(goalflight_dispatch, "_finish_ledger", lambda *_a, **_k: None)
+    monkeypatch.setattr(goalflight_dispatch, "_release_capacity", lambda *_a, **_k: None)
+    monkeypatch.setattr(goalflight_dispatch, "_terminal_worktree_gc", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        goalflight_dispatch.goalflight_cursor,
+        "cleanup_dispatch_data",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_mark_queue_claim_launch_started", lambda _args: None)
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_mark_queue_claim_worker_spawn_intent",
+        lambda _args: None,
+    )
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_attempt_claiming_worker_argv",
+        lambda _root, _dispatch_id, argv: (argv, False),
+    )
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_materialize_steer_prompt",
+        lambda path, *_a, **_k: Path(path),
+    )
+    spawned: list[object] = []
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_spawn_daemonized_process",
+        lambda *_a, **_k: spawned.append(True) or 42001,
+    )
+
+    assert goalflight_dispatch._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    error = capsys.readouterr().err
+    assert "actual branch worktree/readonly-foreign" in error
+    assert f"expected branch worktree/{parent_id}" in error
+    assert spawned == []
+
+
+def test_resume_validates_unmanaged_git_checkout_identity_and_head(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    checkout = tmp_path / "readonly-checkout"
+    _git(repo, "worktree", "add", "--detach", str(checkout), "HEAD")
+    head = _git(repo, "rev-parse", "HEAD")
+    record = {"project_root": str(repo), "worktree_base": head}
+
+    goalflight_dispatch._validate_resume_worktree_source(
+        "unmanaged-resume", record, checkout
+    )
+    _git(checkout, "checkout", "-b", "foreign")
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError,
+        match=r"actual branch foreign.*expected branch HEAD",
+    ):
+        goalflight_dispatch._validate_resume_worktree_source(
+            "unmanaged-resume", record, checkout
+        )
+
+
 def test_resume_in_place_accepts_recorded_linked_worktree_without_seat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
