@@ -38,9 +38,6 @@ TREE_GRACE_SECONDS = 0.3
 EXIT_CAPACITY = 75
 EXIT_CANCELLED = 130
 EXIT_DEADLINE = 124
-# Exported into the workload only. A descendant that scrubs this and is
-# reparented before the snapshot cannot be found; that lease stays draining.
-RUN_MARKER = "GOALFLIGHT_REMOTE_CI_RUN"
 PROC_PIDTBSDINFO = 3
 # Not in the public SDK header. The kernel accepts flavor 20 and returns
 # 40 bytes: two coalition ids, then three reserved uint64s. The first id is
@@ -300,7 +297,12 @@ def cwd_snapshot():
     return rows
 
 
-def cwd_intruders(paths, allowed_pgid):
+def cwd_intruders(paths):
+    """Pids whose cwd is under ``paths``. None means the snapshot failed.
+
+    Slot, GC, and pre-launch checks only. This is not proof a workload tree
+    is dead; that proof is the launchd coalition.
+    """
     snap = cwd_snapshot()
     if snap is None:
         return None
@@ -311,10 +313,8 @@ def cwd_intruders(paths, allowed_pgid):
         if not any(cwd_n == root or cwd_n.startswith(root + os.sep) for root in roots):
             continue
         try:
-            pgid = os.getpgid(pid)
+            os.getpgid(pid)
         except OSError:
-            continue
-        if allowed_pgid is not None and pgid == int(allowed_pgid):
             continue
         found.append(pid)
     return found
@@ -334,8 +334,13 @@ def _start_time(pid):
 
 
 def _pid_exists(pid):
+    """False for exited processes and zombies. None if liveness is unreadable.
+
+    ``kill(pid, 0)`` succeeds on a zombie, and a zombie is not a live member.
+    ``getpgid`` fails with ESRCH for both, which is the check cleanup needs.
+    """
     try:
-        os.kill(int(pid), 0)
+        os.getpgid(int(pid))
     except ProcessLookupError:
         return False
     except OSError:
@@ -356,10 +361,6 @@ def _same_process(pid, started):
     return now == started
 
 
-def _proven_dead(pid, started):
-    return _same_process(pid, started) is False
-
-
 def _as_start(value):
     if isinstance(value, (list, tuple)) and len(value) == 2:
         try:
@@ -370,7 +371,11 @@ def _as_start(value):
 
 
 def _coalition_id(pid):
-    """Resource coalition, or None when this pid cannot be queried."""
+    """Resource coalition id, or None when the query fails.
+
+    Zero is a successful read of "no resource coalition", not a failure.
+    Callers must not treat None as non-membership.
+    """
     try:
         lib = _libproc()
         info = _CoalInfo()
@@ -380,8 +385,7 @@ def _coalition_id(pid):
         return None
     if size != ctypes.sizeof(info):
         return None
-    cid = int(info.ids[0])
-    return cid or None
+    return int(info.ids[0])
 
 
 def _all_pids():
@@ -409,34 +413,138 @@ def _all_pids():
     return None
 
 
-def _coalition_members(cid):
-    """(pid, start) for every process in this resource coalition.
+def _classify_pid(pid, cid):
+    """One pid against one coalition.
 
-    None means the pid list failed. An empty list means the coalition has
-    no live members we can see. Pids we cannot query are not members of a
-    job we launched; those jobs are same-user and readable.
+    Returns ('member', start), 'other', or None. None is UNKNOWN: the query
+    failed, the pid disappeared, or membership and start time did not describe
+    the same incarnation. A successful read of a different coalition is 'other'.
+    """
+    found = _coalition_id(pid)
+    if found is None:
+        return None
+    if found != cid:
+        return "other"
+    start = _start_time(pid)
+    again = _coalition_id(pid)
+    start_again = _start_time(pid)
+    if again != found or start is None or start_again != start:
+        return None
+    return ("member", start)
+
+
+def _collect_members(cid, pids, found):
+    """Classify ``pids`` into ``found``. None if a live pid cannot be named."""
+    for pid in pids:
+        kind = _classify_pid(pid, cid)
+        if kind is None:
+            if _pid_exists(pid) is False:
+                found.pop(pid, None)
+                continue
+            return None
+        if kind == "other":
+            found.pop(pid, None)
+            continue
+        found[pid] = kind[1]
+    return found
+
+
+def _scan_coalition_once(cid):
+    """One complete pass. None if the pass is not proof.
+
+    A pid that is already gone, including a zombie, is not a live member.
+    A pid that appears during the pass is classified too: it may be the child
+    of the one that disappeared. A live pid whose coalition and start time
+    cannot be read together is UNKNOWN. Unrelated new pids are not.
     """
     pids = _all_pids()
     if pids is None:
         return None
-    found = []
-    for pid in pids:
-        if _coalition_id(pid) != cid:
-            continue
-        found.append((pid, _start_time(pid)))
-    return found
+    found = {}
+    seen = set(pids)
+    if _collect_members(cid, pids, found) is None:
+        return None
+    # Fold in births until a snapshot adds nobody. A parent that exits after
+    # fork has already created its child, so the child is in a later snapshot.
+    for _ in range(8):
+        again = _all_pids()
+        if again is None:
+            return None
+        born = [pid for pid in again if pid not in seen]
+        if not born:
+            break
+        if _collect_members(cid, born, found) is None:
+            return None
+        seen.update(again)
+    else:
+        return None
+    living = []
+    for pid, start in found.items():
+        verdict = _incarnation_in_coalition(pid, start, cid)
+        if verdict is None:
+            return None
+        if verdict is True:
+            living.append((pid, start))
+    return living
 
 
-def _signal_incarnation(pid, started):
-    """TERM, then KILL only if the pid is still that same start time.
+def _coalition_members(cid):
+    """(pid, start) for every process in this resource coalition.
+
+    None means UNKNOWN. An empty list is one finished pass that saw nobody.
+    A live pid that cannot be classified, or a birth that never settles,
+    is not that proof. A later clean pass may still show the coalition empty.
+    """
+    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
+        return None
+    for _ in range(20):
+        found = _scan_coalition_once(cid)
+        if found is not None:
+            return found
+    return None
+
+
+def _incarnation_in_coalition(pid, started, cid):
+    """True if this start time is in ``cid``, False if it is gone, else None.
+
+    Membership and start time are re-read together. A pid reused into another
+    coalition is not this incarnation and is not signalled.
+    """
+    same = _same_process(pid, started)
+    if same is not True:
+        return False if same is False else None
+    found = _coalition_id(pid)
+    if found is None:
+        return None
+    after = _same_process(pid, started)
+    if after is not True:
+        return False if after is False else None
+    if found != cid:
+        return None
+    return True
+
+
+def _signal_incarnation(pid, started, cid):
+    """TERM, then KILL only while pid, start time, and coalition still agree.
 
     Returns True when that incarnation is gone. A reused pid is not signalled.
     """
     pid = int(pid)
-    if pid <= 1 or pid == os.getpid() or started is None:
+    if (pid <= 1 or pid == os.getpid() or started is None
+            or isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0):
         return False
-    if _same_process(pid, started) is not True:
-        return _proven_dead(pid, started)
+
+    def gone():
+        verdict = _incarnation_in_coalition(pid, started, cid)
+        if verdict is True:
+            return False
+        return True if verdict is False else None
+
+    ready = gone()
+    if ready is None:
+        return False
+    if ready:
+        return True
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -445,15 +553,17 @@ def _signal_incarnation(pid, started):
         return False
     deadline = time.monotonic() + TREE_GRACE_SECONDS
     while time.monotonic() < deadline:
-        same = _same_process(pid, started)
-        if same is False:
-            return True
-        if same is None:
+        ready = gone()
+        if ready is None:
             return False
+        if ready:
+            return True
         time.sleep(0.02)
-    # The grace elapsed. The pid may have been reused since TERM.
-    if _same_process(pid, started) is not True:
-        return _proven_dead(pid, started)
+    ready = gone()
+    if ready is None:
+        return False
+    if ready:
+        return True
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -461,7 +571,8 @@ def _signal_incarnation(pid, started):
     except OSError:
         return False
     time.sleep(0.05)
-    return _proven_dead(pid, started)
+    ready = gone()
+    return ready is True
 
 
 def _member_map(state):
@@ -503,53 +614,193 @@ def _store_members(run, state, members):
     write_json(run / "lease.json", lease)
 
 
+_LEASE_KEYS = (
+    "launch_label", "coalition_id", "holder_coalition_id", "workload_pid",
+    "workload_start", "exit_code", "exit_known", "members", "job_remove_pending",
+    "pending_result",
+)
+
+
+def _remember_identity(run, state):
+    """Merge launch ownership onto the lease. Never drop a label already there."""
+    if run is None:
+        return
+    try:
+        lease = read_json(run / "lease.json")
+    except (OSError, ValueError):
+        return
+    for key in _LEASE_KEYS:
+        if key in state:
+            lease[key] = state[key]
+    write_json(run / "lease.json", lease)
+
+
+def _private_coalition(state):
+    cid = state.get("coalition_id")
+    holder = state.get("holder_coalition_id")
+    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
+        return None
+    if cid == holder:
+        return None
+    return cid
+
+
+def _gate_open(run):
+    return run is not None and (run / "workload-go").is_file()
+
+
+def _workload_released(run, state):
+    """True when the real command was allowed to exec."""
+    return _gate_open(run) or bool(state.get("members"))
+
+
 def clear_tree(managed, state, run):
     """Kill every member of this run's coalition. False keeps the lease.
 
     Membership is the launchd resource coalition recorded at launch. A child
     reparented to launchd, or a grandchild spawned while its parent handles
     SIGTERM, stays in that coalition. The session coalition is never a
-    target: signalling it would hit every process in the login session.
-    Incarnations are re-checked before SIGTERM and again before SIGKILL.
+    target. An incomplete enumeration is UNKNOWN, not an empty tree. The
+    launchd job is removed only after exit status is captured, and only a
+    verified removal lets the lease go.
     """
     del managed
-    _remove_job(state.get("launch_label"))
-    cid = state.get("coalition_id")
-    holder_cid = state.get("holder_coalition_id")
-    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0 or cid == holder_cid:
-        # No private coalition was recorded. A run that never launched has
-        # no tree. Anything else is incomplete and stays held.
-        return not state.get("workload_pid") and not state.get("members")
+    label = state.get("launch_label") or ""
+    if label and _private_coalition(state) is None:
+        adopted = _adopt_launch(run, state)
+        if adopted == "unknown":
+            return False
+        if adopted == "empty":
+            return True
+    _capture_exit_status(run, state)
+    cid = _private_coalition(state)
+    if cid is None:
+        if label or state.get("workload_pid") or state.get("members") or _gate_open(run):
+            state["job_remove_pending"] = bool(label)
+            _remember_identity(run, state)
+            return False
+        return True
+    return _kill_members(run, state, cid, label)
+
+
+def _adopt_launch(run, state):
+    """Name a job whose coalition was not recorded yet.
+
+    'ready' means state now has a private coalition. 'empty' means the
+    workload never exec'd and the job is verified gone. 'unknown' keeps
+    the lease.
+    """
+    label = state.get("launch_label") or ""
+    view = _job_view(label)
+    if view == "unknown":
+        state["job_remove_pending"] = True
+        _remember_identity(run, state)
+        return "unknown"
+    if view == "absent":
+        if _workload_released(run, state):
+            state["job_remove_pending"] = False
+            _remember_identity(run, state)
+            return "unknown"
+        state["job_remove_pending"] = False
+        _remember_identity(run, state)
+        return "empty"
+    kind, pid, code = view
+    if kind == "exited":
+        if isinstance(code, int) and not isinstance(code, bool):
+            state["exit_code"] = code
+            state["exit_known"] = True
+        if _workload_released(run, state):
+            _remember_identity(run, state)
+            return "unknown"
+        if not _remove_job(label):
+            state["job_remove_pending"] = True
+            _remember_identity(run, state)
+            return "unknown"
+        state["job_remove_pending"] = False
+        _remember_identity(run, state)
+        return "empty"
+    identity = _stable_identity(pid)
+    if identity is None:
+        state["job_remove_pending"] = True
+        _remember_identity(run, state)
+        return "unknown"
+    start, cid = identity
+    holder = state.get("holder_coalition_id")
+    if isinstance(holder, bool) or not isinstance(holder, int) or holder <= 0:
+        holder = _coalition_id(os.getpid())
+    state["workload_pid"] = str(pid)
+    state["workload_start"] = [start[0], start[1]]
+    if holder is None or cid == holder or cid <= 0:
+        _remember_identity(run, state)
+        if _workload_released(run, state):
+            return "unknown"
+        if not _remove_job(label):
+            state["job_remove_pending"] = True
+            _remember_identity(run, state)
+            return "unknown"
+        if _same_process(pid, start) is not False:
+            state["job_remove_pending"] = True
+            _remember_identity(run, state)
+            return "unknown"
+        state["job_remove_pending"] = False
+        _remember_identity(run, state)
+        return "empty"
+    state["coalition_id"] = cid
+    state["holder_coalition_id"] = holder
+    _remember_identity(run, state)
+    return "ready"
+
+
+def _kill_members(run, state, cid, label):
     persisted = _member_map(state)
     for _ in range(5):
         scanned = _coalition_members(cid)
         if scanned is None:
+            state["job_remove_pending"] = bool(label)
             _store_members(run, state, persisted)
+            _remember_identity(run, state)
             return False
         current = dict(persisted)
         for pid, start in scanned:
             if pid <= 1 or pid == os.getpid():
                 continue
-            if start is None:
-                _store_members(run, state, persisted)
-                return False
             current[pid] = start
         living = {}
         for pid, start in current.items():
-            same = _same_process(pid, start)
-            if same is False:
+            verdict = _incarnation_in_coalition(pid, start, cid)
+            if verdict is False:
                 continue
-            if same is None:
+            if verdict is None:
+                state["job_remove_pending"] = bool(label)
                 _store_members(run, state, current)
+                _remember_identity(run, state)
                 return False
             living[pid] = start
         _store_members(run, state, living)
         if not living:
+            if not _remove_job(label):
+                state["job_remove_pending"] = True
+                _remember_identity(run, state)
+                return False
+            again = _coalition_members(cid)
+            if again is None:
+                state["job_remove_pending"] = bool(label)
+                _remember_identity(run, state)
+                return False
+            leftovers = [(pid, start) for pid, start in again
+                         if pid > 1 and pid != os.getpid()]
+            if leftovers:
+                persisted = dict(leftovers)
+                continue
+            state["job_remove_pending"] = False
+            _remember_identity(run, state)
             return True
         for pid, start in living.items():
-            _signal_incarnation(pid, start)
+            _signal_incarnation(pid, start, cid)
         persisted = living
+    state["job_remove_pending"] = bool(label)
     _store_members(run, state, persisted)
+    _remember_identity(run, state)
     return False
 
 
@@ -557,39 +808,129 @@ def _job_label(lease_id):
     return "com.goalflight.remote-ci." + str(lease_id)
 
 
-def _launchctl_job(label):
-    """(pid or None, status) from `launchctl list`, or None if the job is absent."""
+def _launchctl_jobs():
+    """label -> (pid or None, exit code or None). None if the list failed."""
     try:
         listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
     except OSError:
         return None
     if listed.returncode != 0:
         return None
+    jobs = {}
     for line in listed.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
             parts = line.split()
-        if len(parts) < 3 or parts[-1] != label:
+        if len(parts) < 3:
             continue
+        label = parts[-1]
         pid_text, status = parts[0], parts[1]
+        if label == "Label" and pid_text == "PID":
+            continue
         pid = int(pid_text) if pid_text.isdigit() else None
         code = int(status) if status.lstrip("-").isdigit() else None
-        return pid, code
-    return None
+        jobs[label] = (pid, code)
+    return jobs
+
+
+def _job_view(label):
+    """'absent', 'unknown', or ('running'|'exited', pid or None, code or None)."""
+    if not label:
+        return "absent"
+    jobs = _launchctl_jobs()
+    if jobs is None:
+        return "unknown"
+    if label not in jobs:
+        return "absent"
+    pid, code = jobs[label]
+    if pid:
+        return ("running", pid, code)
+    return ("exited", None, code)
 
 
 def _remove_job(label):
+    """True only when a successful listing proves the label is gone."""
     if not label:
-        return
+        return True
+    if _job_view(label) == "absent":
+        return True
+    if _job_view(label) == "unknown":
+        return False
     try:
         subprocess.run(["launchctl", "remove", label], capture_output=True, text=True)
     except OSError:
-        pass
+        return False
+    return _job_view(label) == "absent"
+
+
+def _capture_exit_status(run, state, wait=False):
+    """Read launchd's exit code while the job still exists.
+
+    Does not remove the job. A missing code is not success. Returns the
+    code, or None when it is not known yet.
+    """
+    code = state.get("exit_code")
+    if (state.get("exit_known") is True and isinstance(code, int)
+            and not isinstance(code, bool)):
+        return code
+    label = state.get("launch_label")
+    if not label:
+        return None
+    deadline = time.monotonic() + (2.0 if wait else 0.0)
+    while True:
+        view = _job_view(label)
+        if isinstance(view, tuple) and view[0] == "exited":
+            found = view[2]
+            if isinstance(found, int) and not isinstance(found, bool):
+                state["exit_code"] = found
+                state["exit_known"] = True
+                _remember_identity(run, state)
+                return found
+        if view == "absent" or time.monotonic() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
+def _terminal_result(state):
+    """Structured outcome from a captured exit code. Unknown is not success."""
+    code = state.get("exit_code")
+    if (state.get("exit_known") is True and isinstance(code, int)
+            and not isinstance(code, bool)):
+        return {"returncode": code, "timed_out": False,
+                "status": "completed" if code == 0 else "died"}
+    return {"returncode": 2, "timed_out": False, "status": "died"}
+
+
+def _publish_pending(run, state):
+    """Write result.json from the outcome recorded before job removal."""
+    if run is None or (run / "result.json").exists():
+        return
+    pending = state.get("pending_result")
+    if not isinstance(pending, dict) or not pending.get("status"):
+        if state.get("exit_known") is not True:
+            return
+        pending = _terminal_result(state)
+    write_json(run / "result.json", pending)
+
+
+def _stable_identity(pid):
+    """(start, coalition) when two reads agree, else None."""
+    first = _coalition_id(pid)
+    start = _start_time(pid)
+    second = _coalition_id(pid)
+    start_again = _start_time(pid)
+    if (first is None or second is None or start is None
+            or first != second or start != start_again or first <= 0):
+        return None
+    return start, first
 
 
 _WORKLOAD_WRAPPER = (
-    "import json, os, sys\n"
+    "import json, os, sys, time\n"
     "spec = json.loads(open(sys.argv[1], encoding='utf-8').read())\n"
+    "gate = sys.argv[2]\n"
+    "while not os.path.exists(gate):\n"
+    "    time.sleep(0.02)\n"
     "cwd = spec.get('cwd') or ''\n"
     "if cwd:\n"
     "    os.chdir(cwd)\n"
@@ -597,50 +938,95 @@ _WORKLOAD_WRAPPER = (
 )
 
 
+def _command_line(pid):
+    try:
+        proc = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                              capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def _await_workload_exec(pid, started):
+    """True once this incarnation is no longer the launch wrapper.
+
+    The coalition is recorded before exec. The workload timeout starts after
+    exec, so launch delay is not part of the command's deadline.
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _same_process(pid, started) is not True:
+            return False
+        command = _command_line(pid)
+        if command is None:
+            return False
+        if command and "workload-launch.py" not in command:
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def _submit_workload(run, state, argv, env, cwd):
-    """Start the command as its own launchd job. Returns (pid, start, coalition) or an error string."""
+    """Start the command as its own launchd job.
+
+    The label is on the lease before submit. The workload waits until the
+    coalition id is on that lease. Returns (pid, start, coalition), None if
+    the waiter exited before the gate opened, or an error string.
+    """
     label = _job_label(state["lease_id"])
     spec_path = run / "workload-spec.json"
     wrapper_path = run / "workload-launch.py"
+    gate_path = run / "workload-go"
     spec_path.write_text(json.dumps({"cwd": cwd or "", "argv": list(argv), "env": env}))
     wrapper_path.write_text(_WORKLOAD_WRAPPER)
     stdout = run / "stdout"
     stderr = run / "stderr"
     stdout.touch()
     stderr.touch()
+    state["launch_label"] = label
+    state["job_remove_pending"] = True
+    write_json(run / "lease.json", state)
     try:
         submitted = subprocess.run(
             ["launchctl", "submit", "-l", label, "-o", str(stdout), "-e", str(stderr),
-             "--", sys.executable, str(wrapper_path), str(spec_path)],
+             "--", sys.executable, str(wrapper_path), str(spec_path), str(gate_path)],
             capture_output=True, text=True)
     except OSError as exc:
         return str(exc)
     if submitted.returncode != 0:
         return submitted.stderr.strip() or "launchctl submit failed"
-    state["launch_label"] = label
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        job = _launchctl_job(label)
-        if job is None:
+        view = _job_view(label)
+        if view == "unknown" or view == "absent":
             time.sleep(0.02)
             continue
-        pid, code = job
-        if pid:
-            start = _start_time(pid)
-            cid = _coalition_id(pid)
-            holder_cid = _coalition_id(os.getpid())
-            if start is None or cid is None or cid == holder_cid:
-                state["workload_pid"] = str(pid)
-                if start is not None:
-                    state["workload_start"] = [start[0], start[1]]
-                return "coalition was not private"
-            state["workload_pid"] = str(pid)
-            state["workload_start"] = [start[0], start[1]]
-            state["coalition_id"] = cid
-            state["holder_coalition_id"] = holder_cid
-            return pid, start, cid
-        state["exit_code"] = code
-        return None
+        kind, pid, code = view
+        if kind == "exited":
+            if isinstance(code, int) and not isinstance(code, bool):
+                state["exit_code"] = code
+                state["exit_known"] = True
+            _remember_identity(run, state)
+            return None
+        identity = _stable_identity(pid)
+        if identity is None:
+            time.sleep(0.02)
+            continue
+        start, cid = identity
+        holder_cid = _coalition_id(os.getpid())
+        state["workload_pid"] = str(pid)
+        state["workload_start"] = [start[0], start[1]]
+        state["holder_coalition_id"] = holder_cid
+        if holder_cid is None or cid == holder_cid:
+            # Not a private coalition. Do not record it as a kill target.
+            _remember_identity(run, state)
+            return "coalition was not private"
+        state["coalition_id"] = cid
+        _remember_identity(run, state)
+        gate_path.write_text("1")
+        return pid, start, cid
     return "launchctl job did not appear"
 
 def past_deadline(state):
@@ -684,7 +1070,7 @@ def gc_run_bodies(managed, request, apply):
         if not prunable(path, state) or state.get("lease_id") not in indexed:
             continue
         # The slot is reused by the next run. Only this body path can keep it.
-        intruders = cwd_intruders([path], None)
+        intruders = cwd_intruders([path])
         if intruders is None or intruders:
             rows.append({"class": "UNKNOWN" if intruders is None else "LIVE",
                          "bytes": directory_bytes(path), "path": str(path)})
@@ -814,7 +1200,7 @@ def reclaim_dead_prestart(managed):
         if locked(run / "holder.lock"):
             continue
         paths = [p for p in (run, lease.get("slot")) if p]
-        intruders = cwd_intruders(paths, None)
+        intruders = cwd_intruders(paths)
         if intruders is None or intruders:
             continue
         _mark_released(managed, run, lease, lease.get("release_reason") or "dead-before-start")
@@ -850,7 +1236,10 @@ def finish_dead_workload(root, run, state, action):
             audit(managed / "admission", {"action": action, "result": "kept",
                                           "lease_id": current.get("lease_id"), "at": time.time()})
             return {"status": "unknown"}
+        _publish_pending(run, current)
         reason = "deadline" if action == "deadline" else "operator-clear"
+        if isinstance(current.get("pending_result"), dict):
+            reason = current["pending_result"].get("status") or reason
         _mark_released(managed, run, current, reason)
         audit(managed / "admission", {"action": action, "result": "cleared",
                                       "lease_id": current.get("lease_id"),
@@ -934,7 +1323,7 @@ def lease_slot(managed, repo, count, state):
                 if not reusable:
                     lock.close()
                     continue
-        intruders = cwd_intruders([slot], None)
+        intruders = cwd_intruders([slot])
         if intruders is None or intruders:
             lock.close()
             continue
@@ -991,17 +1380,20 @@ def _release_holder(root, run, state, token):
         lease = read_json(run / "lease.json")
         if state.get("release_reason"):
             lease["release_reason"] = state["release_reason"]
-        if state.get("workload_pid"):
-            lease["workload_pid"] = state["workload_pid"]
+        for key in ("workload_pid", "workload_start", "launch_label", "coalition_id",
+                    "holder_coalition_id", "exit_code", "exit_known", "pending_result"):
+            if key in state:
+                lease[key] = state[key]
         lease["state"] = "draining"
         write_json(run / "lease.json", lease)
     finally:
         guard.close()
-    if lease.get("workload_pid"):
+    launched = lease.get("workload_pid") or lease.get("launch_label") or lease.get("coalition_id")
+    if launched:
         ok = clear_tree(managed, lease, run)
     else:
         paths = [p for p in (run, lease.get("slot")) if p]
-        intruders = cwd_intruders(paths, None)
+        intruders = cwd_intruders(paths)
         ok = intruders is not None and not intruders
     guard = _with_queue_lock(root)
     try:
@@ -1015,6 +1407,7 @@ def _release_holder(root, run, state, token):
             write_json(run / "lease.json", current)
             return
         else:
+            _publish_pending(run, current)
             reason = state.get("release_reason") or current.get("release_reason") or "completed"
             _mark_released(managed, run, current, reason)
     finally:
@@ -1133,47 +1526,67 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         env['GOALFLIGHT_REMOTE_CI_SLOT_DIR'] = state.get('slot') or ''
         env['GOALFLIGHT_REMOTE_CI_RUN_DIR'] = str(run)
         env['GOALFLIGHT_REMOTE_CI_RESULT_INDEX'] = str(root.parent / 'results' / 'index.jsonl')
-        # Set after the command env so a caller cannot substitute another run.
-        env[RUN_MARKER] = state['lease_id']
         # launchd starts a new job, so it cannot inherit the token fd. The
         # holder keeps that fd. Admission follows the lease, not the flock.
         launched = _submit_workload(run, state, command['argv'], env, state.get('slot') or '')
         if isinstance(launched, str):
             state['release_reason'] = 'launch-failed'
-            write_json(run / 'result.json', {
-                'returncode': 2, 'timed_out': False, 'status': 'died', 'error': launched})
+            state['pending_result'] = {
+                'returncode': 2, 'timed_out': False, 'status': 'died', 'error': launched}
+            _remember_identity(run, state)
+            write_json(run / 'result.json', state['pending_result'])
         elif launched is None:
             tree_started = False
-            code = state.get('exit_code')
-            code = 0 if code is None else code
-            write_json(run / 'result.json', {
-                'returncode': code, 'timed_out': False,
-                'status': 'completed' if code == 0 else 'died'})
             if not clear_tree(root.parent, state, run):
                 state['release_reason'] = 'unknown-tree'
+            else:
+                result = _terminal_result(state)
+                result['status'] = 'died'
+                result['error'] = 'workload exited before its coalition was recorded'
+                if result['returncode'] == 0:
+                    result['returncode'] = 2
+                write_json(run / 'result.json', result)
         else:
             tree_started = True
-            write_json(run / 'lease.json', state)
             leader, leader_start, _cid = launched
+            # The lease already names the job. Start the command deadline only
+            # once the wrapper has exec'd, so a slow launch is not a timeout.
+            if _await_workload_exec(leader, leader_start):
+                state['deadline_epoch'] = time.time() + float(command['timeout'])
+            write_json(run / 'lease.json', state)
             deadline = time.monotonic() + command['timeout']
             last_scan = 0.0
-            while _same_process(leader, leader_start) is True:
+            while True:
+                same = _same_process(leader, leader_start)
                 cancel_path = run / 'cancel.json'
                 cancelled = cancel_path.exists() and identity_matches(run, read_json(cancel_path))
                 if cancelled or time.monotonic() >= deadline:
+                    # Keep clearing after the leader dies. Falling through to
+                    # the natural-exit result would replace this outcome and
+                    # could release nothing while a child is still unknown.
+                    pending = ({
+                        'returncode': EXIT_CANCELLED, 'timed_out': False,
+                        'status': 'cancelled',
+                    } if cancelled else {
+                        'returncode': EXIT_DEADLINE, 'timed_out': True,
+                        'status': 'deadline',
+                    })
+                    state['pending_result'] = pending
+                    _remember_identity(run, state)
                     if not clear_tree(root.parent, state, run):
                         time.sleep(0.2)
                         continue
-                    if cancelled:
-                        write_json(run / 'result.json', {
-                            'returncode': EXIT_CANCELLED, 'timed_out': False,
-                            'status': 'cancelled'})
-                        state['release_reason'] = 'cancelled'
+                    write_json(run / 'result.json', pending)
+                    state['release_reason'] = 'cancelled' if cancelled else 'node-timeout'
+                    break
+                if same is not True:
+                    _capture_exit_status(run, state, wait=True)
+                    state['pending_result'] = _terminal_result(state)
+                    _remember_identity(run, state)
+                    if not clear_tree(root.parent, state, run):
+                        state['release_reason'] = 'unknown-tree'
                     else:
-                        write_json(run / 'result.json', {
-                            'returncode': EXIT_DEADLINE, 'timed_out': True,
-                            'status': 'deadline'})
-                        state['release_reason'] = 'node-timeout'
+                        write_json(run / 'result.json', state['pending_result'])
                     break
                 now = time.monotonic()
                 if now - last_scan >= 0.5:
@@ -1183,16 +1596,6 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
                         _store_members(run, state, living)
                     last_scan = now
                 time.sleep(0.05)
-            else:
-                if not clear_tree(root.parent, state, run):
-                    state['release_reason'] = 'unknown-tree'
-                else:
-                    job = _launchctl_job(state.get('launch_label'))
-                    code = job[1] if job is not None else state.get('exit_code')
-                    code = 0 if code is None else code
-                    write_json(run / 'result.json', {
-                        'returncode': code, 'timed_out': False,
-                        'status': 'completed' if code == 0 else 'died'})
             if tree_started and state.get('release_reason') != 'unknown-tree':
                 while not clear_tree(root.parent, state, run):
                     time.sleep(0.2)
@@ -1204,7 +1607,17 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         try:
             _release_holder(root, run, state, token)
         finally:
-            _remove_job(state.get('launch_label'))
+            if not _remove_job(state.get('launch_label')):
+                state['job_remove_pending'] = True
+                try:
+                    lease = read_json(run / 'lease.json')
+                    lease['launch_label'] = state.get('launch_label')
+                    lease['job_remove_pending'] = True
+                    if lease.get('state') == 'released':
+                        lease['state'] = 'draining'
+                    write_json(run / 'lease.json', lease)
+                except (OSError, ValueError):
+                    pass
             if slot_lock is not None:
                 slot_lock.close()
             ticket_lock.close()

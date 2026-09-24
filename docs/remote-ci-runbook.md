@@ -117,8 +117,7 @@ it does not create another directory. A dirty git slot is moved into
 deleted by GC.
 
 The node command receives `GOALFLIGHT_REMOTE_CI_SLOT_DIR`,
-`GOALFLIGHT_REMOTE_CI_RUN_DIR`, `GOALFLIGHT_REMOTE_CI_RESULT_INDEX`, and
-`GOALFLIGHT_REMOTE_CI_RUN` set to the lease id
+`GOALFLIGHT_REMOTE_CI_RUN_DIR`, and `GOALFLIGHT_REMOTE_CI_RESULT_INDEX`
 (`{slot_dir}` / `{checkout_dir}` is the slot). Adapters (battery, pm2, kiln)
 must checkout `--detach <sha>` inside that slot only. They must not
 `git worktree add` a per-SHA path or write a checkout under `$HOME`. Migrating
@@ -216,9 +215,14 @@ Cancellation checks all three fields against the node record and requires
 under, not a fresh read of the lease. A reattach changes the owner; a stale
 controller's cancel then returns owned and does not write `cancel.json`. The
 holder reads the cancellation request and kills the workload's launchd
-coalition, one pid at a time, after checking that pid's start time. It does
-not signal a pid whose start time changed, including the SIGKILL after the
-grace period. No controller process signals a guessed or reused node PID.
+coalition, one pid at a time. It re-reads coalition membership together with
+that pid's start time before SIGTERM and again before SIGKILL, and does not
+signal a pid whose incarnation changed. No controller process signals a
+guessed or reused node PID. The job label is stored on the lease before
+`launchctl submit`, and the workload does not exec until the coalition id is
+stored too. Exit status is read from `launchctl list` before the job is
+removed. A missing status is not success. A failed `launchctl remove` leaves
+the label on the draining lease so reap can retry it.
 
 Unknown identity stays unknown and is kept. A dead holder is kept until the
 command deadline stored on the lease. After that deadline, reap sets the
@@ -226,9 +230,11 @@ lease to `draining` and signals every member of the coalition recorded when
 the workload was submitted to launchd. Descendants stay in that coalition
 across `setsid` and after the parent is reparented. The login session's
 coalition is not a kill target. Each member's pid and start time is kept on
-the lease and checked again before SIGKILL. The token is released only after
-every recorded incarnation is gone. If the job never got a private coalition,
-or the pid list cannot be read, the lease stays `draining`. A parent-version
+the lease and checked again, with its coalition, before SIGKILL. A failed or
+partial member read is unknown, not an empty tree. The token is released only
+after a complete enumeration shows nobody left and the launchd job is verified
+gone. If the job never got a private coalition, or the pid list cannot be
+read, the lease stays `draining`. A parent-version
 slot with `slot/slot.lock` held or `slot/SLOT.json` for a lease that is not
 released is not granted to a new run. `clear` is the same kill for a holder
 that is already dead. It writes `<managed-root>/admission/audit.log`. A live

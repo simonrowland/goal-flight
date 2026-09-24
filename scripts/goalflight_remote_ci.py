@@ -958,7 +958,7 @@ class RemoteRunner:
                 if kind == "deadline" or completed.get("timed_out"):
                     return ArmOutcome(spec.arm, "timeout", 124, None, identity,
                                       timed_out=True, cancelled=True, lease=record)
-                if kind == "died" and not (completed.get("stdout") or "").strip():
+                if kind == "died":
                     return ArmOutcome(spec.arm, "died", int(completed.get("returncode", 2)),
                                       None, identity, error=completed.get("error"), lease=record)
                 try:

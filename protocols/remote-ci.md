@@ -136,7 +136,9 @@ current lease is the run being cleaned, so a stale reap cannot kill the next
 occupant. An unresolved slot stays reserved.
 
 The workload is a launchd job (`launchctl submit`), not a child of the
-holder. launchd gives that job its own resource coalition. Descendants
+holder. The job label is written to the lease before submit, and the
+workload waits until that lease also records the coalition id. launchd gives
+that job its own resource coalition. Descendants
 inherit the coalition across `fork`, `setsid`, and a parent exiting.
 `proc_listcoalitions` is not in libproc. Members are enumerated without root
 by `proc_listallpids` plus `proc_pidinfo` flavor 20
@@ -147,8 +149,12 @@ the login session was `(5738, 5739)` (891 processes). After the job's
 parent exited, the setsid child was reparented to pid 1 and was still the
 only member of the job coalition. A grandchild spawned from a `SIGTERM`
 handler was in the same coalition. Cleanup signals each member only when
-its pid and start time still match the incarnation recorded for it,
-including the `SIGKILL` after the grace period. The login-session coalition
+its pid, start time, and coalition still match the incarnation recorded for
+it, including the `SIGKILL` after the grace period. A failed, partial, or
+inconsistent member read is unknown, not an empty tree. Exit status is taken
+from `launchctl list` before the job is removed; a missing status is not
+success. A failed `launchctl remove` stays on the draining lease and reap
+retries it. The login-session coalition
 is never a kill target. If submit does not yield a private coalition, or
 the pid list cannot be read, the lease stays `draining`. That is the
 residual: a workload that was not launched as its own job cannot be named

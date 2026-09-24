@@ -1347,6 +1347,8 @@ def test_unreachable_keep_machinery_is_gone():
     source = (ROOT / "scripts" / "goalflight_remote_ci_node.py").read_text(encoding="utf-8")
     assert "unknown-descendants" not in source
     assert "def token_held" not in source
+    assert "RUN_MARKER" not in source
+    assert "allowed_pgid" not in source
 
 
 def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
@@ -1412,6 +1414,21 @@ def test_sigterm_grandchild_is_killed_with_the_coalition(node_env, tmp_path):
         time.sleep(0.02)
         running = node.call("status", **key(held))
     assert running.get("coalition_id")
+    # The coalition is recorded before the workload execs. Wait until this
+    # process is the command, so SIGTERM hits its handler rather than the
+    # launcher that is still waiting to exec.
+    exec_deadline = time.monotonic() + 5
+    command = ""
+    while time.monotonic() < exec_deadline:
+        probed = subprocess.run(
+            ["ps", "-p", str(running["workload_pid"]), "-o", "command="],
+            capture_output=True, text=True)
+        command = probed.stdout
+        if command and "workload-launch.py" not in command:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("workload did not exec: " + command)
     assert _cancel(node, held)["status"] == "cancelled"
     child = _child_pid(pidfile)
     with pytest.raises(ProcessLookupError):
@@ -1423,21 +1440,38 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
     import goalflight_remote_ci_node as node
 
     signals = []
-    seen = {"n": 0}
 
     def same(pid, started):
         del pid, started
-        seen["n"] += 1
-        return seen["n"] == 1
+        return not signals
 
     def fake_kill(pid, sig):
         del pid
         signals.append(sig)
 
     monkeypatch.setattr(node, "_same_process", same)
-    monkeypatch.setattr(node, "_proven_dead", lambda pid, started: True)
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 100)
+    monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
     monkeypatch.setattr(node.os, "kill", fake_kill)
-    assert node._signal_incarnation(4321, (10, 20)) is True
+    assert node._signal_incarnation(4321, (10, 20), 100) is True
+    assert signals == [signal.SIGTERM]
+    assert signal.SIGKILL not in signals
+
+
+def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    signals = []
+
+    def coalition(pid):
+        del pid
+        return 100 if not signals else 300
+
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(node.os, "kill", lambda pid, sig: signals.append(sig))
+    assert node._signal_incarnation(20, (99, 99), 100) is False
     assert signals == [signal.SIGTERM]
     assert signal.SIGKILL not in signals
 
@@ -1504,3 +1538,313 @@ def test_directory_fsync_is_repeated_after_an_interrupted_append(tmp_path, monke
     node.append_result(managed, state, run)
     assert directory_fsyncs["n"] >= 1
     assert (managed / "results" / "index.jsonl").exists()
+
+
+def _lease_run(tmp_path, **fields):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {"lease_id": "abc", "state": "running"}
+    state.update(fields)
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    return node, run, state
+
+
+def test_job_label_is_durable_before_launchctl_submit(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {"lease_id": "abc", "state": "running"}
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        del kwargs
+        if argv[:2] == ["launchctl", "submit"]:
+            lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+            seen["label"] = lease.get("launch_label")
+            seen["gate"] = (run / "workload-go").exists()
+
+            class Result:
+                returncode = 1
+                stderr = "submit refused"
+                stdout = ""
+
+            return Result()
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(node.subprocess, "run", fake_run)
+    assert node._submit_workload(run, state, ["/bin/true"], {}, "") == "submit refused"
+    assert seen["label"] == "com.goalflight.remote-ci.abc"
+    assert seen["gate"] is False
+
+
+def test_gate_opens_only_after_the_coalition_is_recorded(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {"lease_id": "abc", "state": "running"}
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def fake_run(argv, **kwargs):
+        del argv, kwargs
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return Result()
+
+    original = node._remember_identity
+
+    def remember(target, current):
+        if current.get("coalition_id") and (target / "workload-go").exists():
+            raise AssertionError("gate opened before the coalition was durable")
+        original(target, current)
+
+    monkeypatch.setattr(node.subprocess, "run", fake_run)
+    monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_remember_identity", remember)
+    launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
+    assert launched[0] == 42
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["coalition_id"] == 100
+    assert lease["launch_label"] == "com.goalflight.remote-ci.abc"
+    assert (run / "workload-go").is_file()
+
+
+def test_unrecorded_coalition_does_not_count_as_an_empty_tree(tmp_path, monkeypatch):
+    node, run, state = _lease_run(
+        tmp_path, launch_label="com.goalflight.remote-ci.abc")
+    monkeypatch.setattr(node, "_job_view", lambda label: ("running", 40, None))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: None)
+    assert node.clear_tree(tmp_path, state, run) is False
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["launch_label"] == "com.goalflight.remote-ci.abc"
+    assert lease["job_remove_pending"] is True
+
+
+def test_failed_coalition_query_of_a_live_pid_is_unknown(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(node, "_all_pids", lambda: [10, 11])
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: True)
+
+    def coalition(pid):
+        if pid == 10:
+            return None
+        return 7
+
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    assert node._coalition_members(100) is None
+
+
+def test_child_born_during_the_scan_is_not_an_empty_tree(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    calls = {"n": 0}
+
+    def all_pids():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [10]
+        return [11]
+
+    monkeypatch.setattr(node, "_all_pids", all_pids)
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: pid != 10)
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: None if pid == 10 else 100)
+    monkeypatch.setattr(node, "_start_time", lambda pid: (5, 5))
+    assert node._coalition_members(100) == [(11, (5, 5))]
+
+
+def test_complete_scan_with_no_members_is_empty(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(node, "_all_pids", lambda: [10])
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 7)
+    assert node._coalition_members(100) == []
+
+
+def test_membership_and_start_must_name_one_incarnation(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    calls = {"n": 0}
+
+    def coalition(pid):
+        del pid
+        calls["n"] += 1
+        return 100 if calls["n"] % 2 == 1 else 300
+
+    monkeypatch.setattr(node, "_all_pids", lambda: [20])
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "_start_time", lambda pid: (99, 99))
+    assert node._coalition_members(100) is None
+
+
+def test_exit_status_is_stored_before_the_job_is_removed(tmp_path, monkeypatch):
+    node, run, state = _lease_run(
+        tmp_path,
+        launch_label="com.goalflight.remote-ci.abc",
+        coalition_id=100,
+        holder_coalition_id=5,
+        workload_pid="40",
+        workload_start=[1, 2],
+    )
+    order = []
+
+    def view(label):
+        del label
+        order.append("view")
+        return ("exited", None, 19)
+
+    def remove(label):
+        del label
+        order.append("remove")
+        return True
+
+    monkeypatch.setattr(node, "_job_view", view)
+    monkeypatch.setattr(node, "_remove_job", remove)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    assert node.clear_tree(tmp_path, state, run) is True
+    assert state["exit_known"] is True
+    assert state["exit_code"] == 19
+    assert order[0] == "view"
+    assert "remove" in order
+    assert order.index("view") < order.index("remove")
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["exit_code"] == 19
+    assert node._terminal_result({"exit_known": False})["status"] == "died"
+    assert node._terminal_result({"exit_known": False})["returncode"] == 2
+    assert node._terminal_result({"exit_known": True, "exit_code": 19})["status"] == "died"
+
+
+def test_failed_job_removal_stays_tracked_for_reap(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    managed = tmp_path / "managed"
+    root = managed / "admission"
+    run = managed / "runs" / "abc"
+    root.mkdir(parents=True)
+    run.mkdir(parents=True)
+    (root / "queue.lock").write_text("", encoding="utf-8")
+    state = {
+        "lease_id": "abc", "lease_token": "tok", "state": "running",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "coalition_id": 100, "holder_coalition_id": 5,
+        "workload_pid": "40", "workload_start": [1, 2],
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "_job_view", lambda label: ("exited", None, 3))
+    monkeypatch.setattr(node, "_remove_job", lambda label: False)
+    first = node.finish_dead_workload(root, run, dict(state), "deadline")
+    assert first["status"] == "unknown"
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["state"] == "draining"
+    assert lease["launch_label"] == "com.goalflight.remote-ci.abc"
+    assert lease["job_remove_pending"] is True
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    second = node.finish_dead_workload(root, run, lease, "deadline")
+    assert second["status"] == "cancelled"
+    assert json.loads((run / "lease.json").read_text(encoding="utf-8"))["state"] == "released"
+
+
+@pytest.mark.parametrize("kind,status,code,extra", [
+    ("capacity-refused", "capacity", 75, {}),
+    ("cancelled", "cancelled", 130, {}),
+    ("deadline", "timeout", 124, {"timed_out": True}),
+    ("died", "died", 9, {}),
+])
+def test_structured_outcome_ignores_stdout(tmp_path, kind, status, code, extra):
+    config = _config(tmp_path)
+    runner = RemoteRunner(config, executor=lambda argv, env, timeout: None)
+    identity = {
+        "host": "measured-node", "pid": "4", "start_token": "tok",
+        "run_dir": "/runs/abc", "lease_id": "abc", "lease_token": "lease",
+    }
+    record = {
+        "remote_run": identity,
+        "holder_alive": True,
+        "sample": {"hostname": "measured-node"},
+        "result": {
+            "status": kind,
+            "returncode": code,
+            "stdout": "initializing tests\n",
+            "stderr": "",
+            **extra,
+        },
+    }
+
+    class Node:
+        def call(self, operation, **kwargs):
+            assert operation == "status"
+            return record
+
+    outcome = runner._watch(
+        spec(), Node(), {"run_dir": "/runs/abc", "lease_token": "lease"}, {})
+    assert outcome.status == status
+    assert outcome.returncode == code
+
+
+# HOST-ONLY TESTS
+# These start real launchd jobs. The regressions above do not.
+
+def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "fast-child.pid"
+    node.call("start", **key(held), command={
+        "argv": [sys.executable, "-c",
+                 "import os, time\n"
+                 f"path = {str(pidfile)!r}\n"
+                 "pid = os.fork()\n"
+                 "if pid == 0:\n"
+                 "    os.setsid()\n"
+                 "    os.chdir('/')\n"
+                 "    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)\n"
+                 "    os.write(fd, str(os.getpid()).encode())\n"
+                 "    os.close(fd)\n"
+                 "    time.sleep(60)\n"
+                 "    os._exit(0)\n"
+                 "while True:\n"
+                 "    try:\n"
+                 "        if os.path.getsize(path) > 0:\n"
+                 "            break\n"
+                 "    except OSError:\n"
+                 "        pass\n"
+                 "    time.sleep(0.01)\n"
+                 "os._exit(19)\n"],
+        "env": {},
+        "timeout": 30,
+    })
+    child = _child_pid(pidfile)
+    try:
+        deadline = time.monotonic() + 8
+        result = None
+        while time.monotonic() < deadline:
+            current = node.call("status", **key(held))
+            result = current.get("result")
+            if result:
+                break
+            time.sleep(0.05)
+        assert result is not None
+        assert result["status"] == "died"
+        assert result["returncode"] == 19
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        _free_tokens(node)
+        listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        assert held["lease_id"] not in listed.stdout
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
