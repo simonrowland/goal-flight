@@ -336,19 +336,25 @@ def _add_clean_lfs_file(
     return lfs_object
 
 
-@pytest.mark.parametrize("object_present", [True, False])
-def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present):
+@pytest.mark.parametrize("object_state", ["valid", "missing", "empty", "wrong"])
+def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_state):
     repo, path, row = holder
     lfs_object = _add_clean_lfs_file(
         path, tmp_path, "valuable.dat", b"smudged bytes\n"
     )
     assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
-    if object_present:
+    if object_state == "missing":
+        lfs_object.unlink()
+    elif object_state == "empty":
+        lfs_object.write_bytes(b"")
+    elif object_state == "wrong":
+        lfs_object.write_bytes(b"corrupt bytes\n")
+
+    if object_state == "valid":
         with pool.acquire_worktree_seat(repo, "next") as lease:
             assert lease.path == path
             assert lfs_object.read_bytes() == b"smudged bytes\n"
     else:
-        lfs_object.unlink()
         with pytest.raises(pool.WorktreeSeatResetRefused, match="LFS object"):
             pool.acquire_worktree_seat(repo, "next")
         assert _git(path, "branch", "--show-current") == "worktree/old"
@@ -667,6 +673,27 @@ def test_saved_head_is_never_overwritten(holder):
         pool.acquire_worktree_seat(repo, "next")
     assert _git(path, "rev-parse", "HEAD") == head
     assert _git(path, "rev-parse", "refs/goalflight/keep/old/head") == base
+
+
+def test_unique_target_branch_is_pinned_before_reset(holder):
+    repo, path, row = holder
+    _git(repo, "checkout", "-b", "worktree/new")
+    (repo / "tracked.txt").write_text("target-only\n")
+    _git(repo, "commit", "-am", "unique target branch")
+    target_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "main")
+
+    with pool.acquire_worktree_seat(repo, "new") as lease:
+        assert lease.path == path
+        assert lease.branch == "worktree/new"
+        refs = _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/new/prior-target-*",
+        ).splitlines()
+        assert len(refs) == 1
+        assert _git(repo, "rev-parse", refs[0]) == target_sha
 
 
 def test_full_pool_waits_then_launches_same_id(tmp_path, monkeypatch):

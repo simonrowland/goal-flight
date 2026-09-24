@@ -2121,6 +2121,7 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     # Zero is an immediate non-blocking lock budget; positive deadlines poll.
     args._worktree_capacity_deadline = deadline if wait_s else 0.0
     last_wait_error = None
+    lease = None
     try:
         while True:
             try:
@@ -2146,11 +2147,19 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 pass
         else:
             args._worktree_capacity_deadline = previous_deadline
-    warning = _prepare_attempt_worktree_occupancy(args)
-    args._worktree_occupancy_warning = warning
-    if warning is not None:
-        args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
-    return lease
+    try:
+        warning = _prepare_attempt_worktree_occupancy(args)
+        args._worktree_occupancy_warning = warning
+        if warning is not None:
+            args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
+        return lease
+    except BaseException:
+        if lease is not None:
+            with contextlib.suppress(Exception):
+                lease.release()
+            if getattr(args, "_worktree_seat", None) is lease:
+                args._worktree_seat = None
+        raise
 
 
 def _parse_task_ids(values: list[str] | None) -> list[str]:

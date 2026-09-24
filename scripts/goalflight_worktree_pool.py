@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1256,6 +1257,83 @@ def pin_unique_commits(
     }
 
 
+def _pin_existing_target_branch(
+    cwd: Path,
+    *,
+    branch: str,
+    base_commit: str,
+    keep_id: str,
+) -> str | None:
+    """Pin an existing target branch before a forced checkout can move it."""
+    target_ref = f"refs/heads/{branch}"
+    target = _git_proc(
+        cwd, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"
+    )
+    if target is None or target.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect target branch {branch}; refusing reset"
+        )
+    if target.returncode == 1:
+        return None
+    target_tip = target.stdout.strip()
+    if not target_tip:
+        raise WorktreeSeatResetRefused(
+            f"target branch {branch} has no readable tip; refusing reset"
+        )
+
+    from_base = _git_proc(
+        cwd, "merge-base", "--is-ancestor", target_tip, base_commit
+    )
+    if from_base is None or from_base.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot compare target branch {branch} with reset base; refusing reset"
+        )
+    if from_base.returncode == 0:
+        return None
+
+    kept = _git_proc(
+        cwd,
+        "for-each-ref",
+        "--contains",
+        target_tip,
+        "--format=%(refname)",
+        f"refs/{KEEP_REF_PREFIX}/",
+    )
+    if kept is None or kept.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect keep refs for target branch {branch}; refusing reset"
+        )
+    if any(line.strip() for line in kept.stdout.splitlines()):
+        return None
+
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(keep_id)).strip(".-") or "worktree"
+    keep_ref = f"refs/{KEEP_REF_PREFIX}/{safe_id}/prior-target-{target_tip[:12]}"
+    existing = _git_proc(
+        cwd, "rev-parse", "--verify", "--quiet", f"{keep_ref}^{{commit}}"
+    )
+    if existing is None or existing.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect saved target branch {branch}; refusing reset"
+        )
+    if existing.returncode == 0:
+        if existing.stdout.strip() != target_tip:
+            raise WorktreeSeatResetRefused(
+                f"saved target branch {branch} pin points elsewhere; refusing reset"
+            )
+        return keep_ref
+    updated = _git_proc(cwd, "update-ref", keep_ref, target_tip, "")
+    if updated is None or updated.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            f"cannot pin target branch {branch}; refusing reset"
+        )
+    verified = _git_proc(cwd, "rev-parse", "--verify", f"{keep_ref}^{{commit}}")
+    if verified is None or verified.returncode != 0 or verified.stdout.strip() != target_tip:
+        raise WorktreeSeatResetRefused(
+            f"target branch {branch} pin did not verify; refusing reset"
+        )
+    return keep_ref
+
+
 def evaluate_seat_reset_safety(
     worktree_path: Path,
     *,
@@ -1348,6 +1426,7 @@ def _create_seat_worktree(
     *,
     branch: str,
     base_commit: str,
+    keep_id: str,
 ) -> None:
     ref = f"refs/heads/{branch}"
     exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
@@ -1361,16 +1440,12 @@ def _create_seat_worktree(
             f"cannot determine whether worktree branch {branch} exists ({detail})"
         )
     if exists.returncode == 0:
-        commits = check_reset_preserves_commits(
+        _pin_existing_target_branch(
             project_root,
-            start=ref,
+            branch=branch,
             base_commit=base_commit,
-            moving_ref=ref,
+            keep_id=keep_id,
         )
-        if commits["verdict"] != YES:
-            raise WorktreeSeatResetRefused(
-                f"refusing to reset {branch}: {commits['reason']}"
-            )
         _git(
             project_root,
             "worktree",
@@ -1546,18 +1621,28 @@ def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
     common_lfs = _git_common_dir(worktree_path) / "lfs" / "objects"
     for path, blob_id in zip(paths, blob_ids):
         pointer = contents.get(blob_id, "")
-        match = re.search(r"(?m)^oid sha256:([0-9a-f]{64})$", pointer)
-        if match is None:
+        oid_match = re.search(r"(?m)^oid sha256:([0-9a-f]{64})$", pointer)
+        size_match = re.search(r"(?m)^size ([0-9]+)$", pointer)
+        if oid_match is None or size_match is None:
             raise WorktreeSeatResetRefused(
                 f"LFS pointer for {path!r} is unparseable; refusing reset"
             )
-        digest = match.group(1)
+        digest = oid_match.group(1)
+        expected_size = int(size_match.group(1))
         object_path = common_lfs / digest[:2] / digest[2:4] / digest
         try:
             if not object_path.is_file():
                 raise OSError("object is missing")
+            if object_path.stat().st_size != expected_size:
+                raise OSError("object size does not match pointer")
+            actual = hashlib.sha256()
+            actual_size = 0
             with object_path.open("rb") as object_file:
-                object_file.read(1)
+                for chunk in iter(lambda: object_file.read(1024 * 1024), b""):
+                    actual.update(chunk)
+                    actual_size += len(chunk)
+            if actual_size != expected_size or actual.hexdigest() != digest:
+                raise OSError("object hash does not match pointer")
         except OSError as exc:
             raise WorktreeSeatResetRefused(
                 f"LFS object for {path!r} is missing or unreadable; refusing reset"
@@ -1598,7 +1683,7 @@ def _refuse_ignored_tree_collisions(
 
 
 def _prepare_seat_checkout(
-    worktree_path: Path, *, branch: str, base_commit: str
+    worktree_path: Path, *, branch: str, base_commit: str, keep_id: str
 ) -> None:
     current_branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
     current_head = _git(worktree_path, "rev-parse", "HEAD")
@@ -1609,6 +1694,13 @@ def _prepare_seat_checkout(
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
     # when a temp repo has not gitignored ``.goal-flight/``. Clean before the
     # forced checkout so quarantined untracked files cannot block it.
+    if needs_checkout:
+        _pin_existing_target_branch(
+            worktree_path,
+            branch=branch,
+            base_commit=base_commit,
+            keep_id=keep_id,
+        )
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
     if needs_checkout:
         _git(
@@ -1946,6 +2038,7 @@ def _prepare_claimed_seat_locked(
             worktree_path,
             branch=branch,
             base_commit=base_commit,
+            keep_id=dispatch_id,
         )
         _verify_existing_seat(project_root, worktree_path)
     if not reset:
@@ -2033,7 +2126,12 @@ def _prepare_claimed_seat_locked(
             f"cannot quarantine dirty worktree {seat_name}: {exc}"
         ) from exc
     try:
-        _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
+        _prepare_seat_checkout(
+            worktree_path,
+            branch=branch,
+            base_commit=base_commit,
+            keep_id=dispatch_id,
+        )
         leftover = [record for record in _status_records(worktree_path) if _status_is_product(record)]
         if leftover:
             raise WorktreeSeatError(

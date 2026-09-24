@@ -359,6 +359,43 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
         resumed.release()
 
 
+def test_occupancy_refusal_releases_bound_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    args = SimpleNamespace(
+        agent="test-dispatch",
+        project_root=str(repo),
+        cwd=None,
+        worktree="HEAD",
+        worktree_root=None,
+        dispatch_id="occupancy-refused",
+        controller_label=None,
+        skip_seat_reset=False,
+        in_place=False,
+        from_queue=False,
+        capacity_wait_s=0,
+        dispatch_warnings=[],
+        _worktree_seat=None,
+    )
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_worktree_incumbent_reason",
+        lambda _args: ("live incumbent", None, "starting"),
+    )
+
+    with pytest.raises(goalflight_dispatch.DispatchUsageError, match="live incumbent"):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert args._worktree_seat is None
+
+    record_finished_holder("occupancy-refused")
+    replacement = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "after-occupancy-refusal"
+    )
+    replacement.release()
+
+
 def test_resume_in_place_accepts_recorded_linked_worktree_without_seat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
