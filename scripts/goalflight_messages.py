@@ -1994,7 +1994,10 @@ def post_message(
     # carrier/ingestion state is touched. The final seq-bearing form is validated
     # and serialized again under the transaction lock.
     validate_envelope(envelope, expected_dispatch_id=dispatch_id)
-    with carrier_transaction(path) as transaction:
+    steer_lock_timeout = (goalflight_steer_mailbox.CONTROLLER_STEER_LOCK_TIMEOUT_SECS
+                          if deliver_to_worker or base_source.get("transport") in {"steer", "steer-wait"}
+                          else None)
+    with carrier_transaction(path, lock_timeout_secs=steer_lock_timeout) as transaction:
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
             (
@@ -2020,7 +2023,25 @@ def post_message(
                 "addressee",
                 "author_digest",
             )
-            if any(same_identity.get(key) != envelope.get(key) for key in comparable_fields):
+
+            def retry_fields(item: dict) -> dict:
+                fields = {key: item.get(key) for key in comparable_fields}
+                if steer_retry:
+                    fields.pop("ts", None)
+                    for key in ("source", "payload"):
+                        value = fields.get(key)
+                        if isinstance(value, dict):
+                            value = dict(value)
+                            value.pop("controller_pid", None)
+                            value.pop("controller_session_id", None)
+                            if isinstance(value.get("sender"), dict):
+                                value["sender"] = dict(value["sender"])
+                                value["sender"].pop("controller_pid", None)
+                            fields[key] = value
+                return fields
+
+            same_content = retry_fields(same_identity) == retry_fields(envelope)
+            if not same_content:
                 raise MessageError(
                     "event identity integrity conflict: same origin_node + event_uuid has different content"
                 )
@@ -2030,18 +2051,16 @@ def post_message(
                 else ()
             )
             controller_deliveries = _mark_journal_delivery(assignment)
+            delivery = (_deliver_message_to_worker(dispatch_id, same_identity,
+                retain_terminal_worker_view=retain_terminal_worker_view) if deliver_to_worker else {
+                    "requested": False, "delivered": False, "worker_view_written": False,
+                    "status": "duplicate", "detail": "matching event identity already exists"})
             result = {
                 "envelope": same_identity,
                 "line": serialize_envelope_line(same_identity),
                 "path": str(path),
                 "recorded": False,
-                "delivery": {
-                    "requested": False,
-                    "delivered": False,
-                    "worker_view_written": False,
-                    "status": "duplicate",
-                    "detail": "matching event identity already exists",
-                },
+                "delivery": delivery,
             }
             if not deliver_to_worker:
                 result["controller_delivery"] = _controller_delivery_report(
@@ -2843,6 +2862,10 @@ def post_controller_steer(
         messages_dir=default_messages_dir(),
         source=source,
         author_capability=_presented_ambient_controller_capability(),
+        event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, repr((
+            dispatch_id, text, reply_to, decision,
+            sender.get("controller_label"), sender.get("project_root"), cross_project,
+        )))),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
         # A steer is controller-to-worker mail. Its carrier record and worker
@@ -3617,8 +3640,22 @@ def cmd_post(args: argparse.Namespace) -> int:
     return 0
 
 
+def _replay_controller_steer_views(dispatch_id: str, envelopes: list[dict]) -> None:
+    for envelope in envelopes:
+        if (
+            envelope.get("type") != "controller-notice"
+            or envelope.get("source", {}).get("transport") != "steer"
+        ):
+            continue
+        _deliver_message_to_worker(
+            dispatch_id,
+            envelope,
+            retain_terminal_worker_view=True,
+        )
+
+
 def cmd_read(args: argparse.Namespace) -> int:
-    """Read a carrier for diagnostics; journal delivery state is not mutated."""
+    """Read a carrier for diagnostics and replay committed steer projections."""
     paths = collect_inbox_paths(
         args.messages_dir,
         args.fleet_dir,
@@ -3631,6 +3668,7 @@ def cmd_read(args: argparse.Namespace) -> int:
         tolerate_errors=True,
         carrier_errors=carrier_errors,
     )
+    _replay_controller_steer_views(str(args.dispatch_id), envelopes)
     if args.last is not None and args.last >= 0:
         envelopes = envelopes[-args.last:] if args.last else []
     envelopes = [_without_inbox_metadata(envelope) for envelope in envelopes]

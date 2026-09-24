@@ -338,6 +338,8 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
                     "same repository from linked worktree",
                 )
             assert linked["recorded"] is True, linked
+            messages_before_refusal = _read_messages(tmp, dispatch_id)
+            mailbox_before_refusal = _read_mailbox(tmp, dispatch_id)
 
             os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(foreign)
             with _state_dir(tmp, project_root=foreign):
@@ -353,8 +355,8 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
             assert "sender project_root" in refusal, refusal
             assert "target dispatch" in refusal, refusal
             assert "--cross-project" in refusal, refusal
-            assert len(_read_messages(tmp, dispatch_id)) == 2
-            assert len(_read_mailbox(tmp, dispatch_id)) == 2
+            assert _read_messages(tmp, dispatch_id) == messages_before_refusal
+            assert _read_mailbox(tmp, dispatch_id) == mailbox_before_refusal
 
             with _state_dir(tmp, project_root=foreign), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = goalflight_dispatch.main(
@@ -677,7 +679,7 @@ def case_worker_wait_question_is_published_before_waiting() -> None:
         ), payload
 
 
-def case_controller_reply_reaches_waiter_and_late_reply_is_retained() -> None:
+def case_controller_reply_reaches_waiter_and_late_reply_is_recorded_but_refused() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         dispatch_id = "wait-reply-roundtrip"
@@ -760,16 +762,19 @@ def case_controller_reply_reaches_waiter_and_late_reply_is_retained() -> None:
         ), entries
 
         late = _run_steer(tmp, dispatch_id, "--reply-to", wait_id, "arrived late")
-        assert late.returncode == 0, late.stdout + late.stderr
+        assert late.returncode == 1, late.stdout + late.stderr
+        assert "worker delivery failed" in late.stderr, late.stderr
         entries = _read_mailbox(tmp, dispatch_id)
-        late_entry = next(
-            entry
-            for entry in entries
-            if entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
+        assert not any(
+            entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
             and entry.get("reply_to") == wait_id
             and entry.get("text", "").startswith("arrived late")
+            for entry in entries
         )
-        assert late_entry["context"]["late"] is True, late_entry
+        assert any(
+            envelope.get("payload", {}).get("text") == "arrived late"
+            for envelope in _read_messages(tmp, dispatch_id)
+        )
 
 
 def case_worker_wait_publication_failure_fails_fast_and_settles() -> None:
@@ -1419,7 +1424,7 @@ def _run_cases() -> None:
     case_worker_confirm_does_not_accept_decision_free_backlog()
     case_worker_wait_atomic_question_has_own_deadline()
     case_worker_wait_question_is_published_before_waiting()
-    case_controller_reply_reaches_waiter_and_late_reply_is_retained()
+    case_controller_reply_reaches_waiter_and_late_reply_is_recorded_but_refused()
     case_worker_wait_publication_failure_fails_fast_and_settles()
     case_worker_wait_requires_an_atomic_question()
     case_worker_wait_carrier_error_is_reported()

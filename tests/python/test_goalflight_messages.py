@@ -1996,6 +1996,48 @@ def test_concurrent_controller_posts_preserve_worker_view_order() -> None:
         assert_true("worker view follows canonical message order", envelope_seqs == [1, 2])
 
 
+def test_controller_steer_read_replays_projection_after_commit_failure() -> None:
+    import tempfile
+    import goalflight_steer_mailbox as steer
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        dispatch_id = "d-controller-replay"
+        write_ledger_record(base, dispatch_id, project, worker_pid=os.getpid())
+        env = {
+            **_journal_test_env(base),
+            "GOALFLIGHT_PROJECT_ROOT": str(project),
+            "GOALFLIGHT_CONTROLLER_LABEL": "replay-controller",
+            "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(
+                _carrier_messages,
+                "_deliver_message_to_worker",
+                side_effect=RuntimeError("projection process died"),
+            ):
+                with contextlib.suppress(RuntimeError):
+                    _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
+
+            messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+            canonical = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert _carrier_messages.cmd_read(mock.Mock(
+                        dispatch_id=dispatch_id, messages_dir=messages_dir,
+                        fleet_dir=base / "fleet", last=None, json=True,
+                    )) == 0
+
+            entries = steer.worker_entries(
+                steer.read_steer_entries(steer.steer_file(dispatch_id))
+            )
+            assert len(entries) == 1, entries
+            assert entries[0]["context"]["message_envelope"]["id"] == canonical[0]["id"]
+
+
 def test_live_controller_post_delivery_failure_is_nonzero_and_recorded() -> None:
     import tempfile
     from goalflight_messages import read_envelopes

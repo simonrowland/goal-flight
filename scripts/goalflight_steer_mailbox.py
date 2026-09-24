@@ -43,8 +43,7 @@ WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
 WORKER_WAIT_CLEANUP_END = "end"
 WORKER_WAIT_CLEANUP_TIMEOUT = "timeout"
 WORKER_WAIT_CLEANUP_FAILED = "failed"
-WORKER_WAIT_CLEANUP_ADMISSION = "admission"
-WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS = 1.0
+CONTROLLER_STEER_LOCK_TIMEOUT_SECS = 5.0
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -144,7 +143,6 @@ def worker_wait_cleanup_slot_path(
         WORKER_WAIT_CLEANUP_END,
         WORKER_WAIT_CLEANUP_TIMEOUT,
         WORKER_WAIT_CLEANUP_FAILED,
-        WORKER_WAIT_CLEANUP_ADMISSION,
     }:
         raise ValueError("worker wait cleanup slot requires a known operation")
     token = str(wait_id or "").strip()
@@ -160,42 +158,6 @@ def worker_wait_cleanup_slot_path(
     return mailbox.with_name(
         f".{mailbox.stem}.cleanup.{operation}.{token}.{reply_seq}.lock"
     )
-
-
-@contextlib.contextmanager
-def _worker_wait_reply_admission(
-    path: Path,
-    wait_id: str,
-):
-    """Reserve a reply-writer slot before its mailbox validation begins."""
-    slot = _try_acquire_worker_wait_cleanup_slot(
-        path,
-        WORKER_WAIT_CLEANUP_ADMISSION,
-        wait_id,
-        1,
-    )
-    if slot is None:
-        raise TimeoutError("worker wait reply admission is already in flight")
-    try:
-        yield
-    finally:
-        slot.release()
-
-
-def _worker_wait_reply_admission_held(
-    path: Path,
-    wait_id: str,
-) -> bool:
-    """Probe whether a reply writer still owns its admission slot."""
-    try:
-        return _worker_wait_cleanup_slot_held(
-            path,
-            WORKER_WAIT_CLEANUP_ADMISSION,
-            wait_id,
-            1,
-        )
-    except (OSError, ValueError):
-        return False
 
 
 def _append_worker_wait_reply_receipt(
@@ -777,7 +739,7 @@ def append_steer_entry(
     cross_project: bool = False,
     awake_mono_ns: int | None = None,
     lock_timeout_secs: float | None = None,
-    validate_existing: Callable[[list[dict]], None] | None = None,
+    validate_existing: Callable[[list[dict]], dict | None] | None = None,
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
@@ -801,7 +763,9 @@ def append_steer_entry(
             quarantine_errors=lock_timeout_secs is None,
         )
         if validate_existing is not None:
-            validate_existing(existing)
+            existing_entry = validate_existing(existing)
+            if existing_entry is not None:
+                return existing_entry
         next_seq = max((entry["seq"] for entry in existing), default=0) + 1 if seq is None else seq
         entry = {
             "seq": next_seq,
@@ -885,6 +849,20 @@ def append_message_view(
         or (isinstance(sender, dict) and sender.get("cross_project") is True)
     )
     path = steer_file(dispatch_id, state_dir=state_dir)
+    message_id = envelope.get("id")
+
+    def reuse_message(entries: list[dict]) -> dict | None:
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        for entry in entries:
+            if entry.get("kind") != "message":
+                continue
+            context = entry.get("context")
+            projected = context.get("message_envelope") if isinstance(context, dict) else None
+            if isinstance(projected, dict) and projected.get("id") == message_id:
+                return entry
+        return None
+
     reply_to = payload.get("reply_to")
     decision = payload.get("decision")
     if reply_to is not None:
@@ -896,6 +874,8 @@ def append_message_view(
             decision=None if decision is None else str(decision),
             sender=sender,
             cross_project=cross_project,
+            message_id=message_id if isinstance(message_id, str) else None,
+            lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
         )
     if decision is not None:
         raise ValueError("worker wait reply decision requires reply_to")
@@ -907,6 +887,8 @@ def append_message_view(
         context={"message_envelope": envelope},
         sender=sender,
         cross_project=cross_project,
+        lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+        validate_existing=reuse_message,
     )
 
 
@@ -1152,6 +1134,7 @@ def append_worker_wait_reply(
     decision: str | None = None,
     sender: dict | None = None,
     cross_project: bool = False,
+    message_id: str | None = None,
     lock_timeout_secs: float | None = None,
 ) -> dict:
     """Durably admit one typed, exactly-correlated reply to one active wait.
@@ -1169,8 +1152,8 @@ def append_worker_wait_reply(
     normalized_decision = None if decision is None else str(decision).strip().lower()
     # Keep the classification explicit on every admitted row; a timeout race
     # must never turn a late reply into an absent context field.
-    reply_context: dict[str, object] = {"late": False}
-    def validate(entries: list[dict]) -> None:
+    reply_context: dict[str, object] = {"late": False, **({"message_id": message_id} if message_id else {})}
+    def validate(entries: list[dict]) -> dict | None:
         arm = next(
             (
                 entry
@@ -1200,19 +1183,23 @@ def append_worker_wait_reply(
             or deadline_ns <= 0
         ):
             raise ValueError(f"worker wait {wait_id!r} has invalid deadline")
+        replies = _worker_wait_replies(
+            entries,
+            dispatch_id=dispatch_id,
+            wait_id=wait_id,
+            after_seq=arm_seq,
+        )
+        existing_context = replies[0].get("context") if len(replies) == 1 else None
+        if message_id and isinstance(existing_context, dict) and existing_context.get("message_id") == message_id:
+            return replies[0]
         settlement = _worker_wait_settlement(
             entries,
             wait_id=wait_id,
             after_seq=arm_seq,
         )
-        if settlement is not None and settlement.get("decision") != "timeout":
+        if settlement is not None:
             raise ValueError(f"worker wait {wait_id!r} is already settled")
-        if _worker_wait_replies(
-            entries,
-            dispatch_id=dispatch_id,
-            wait_id=wait_id,
-            after_seq=arm_seq,
-        ):
+        if replies:
             raise ValueError(f"worker wait {wait_id!r} already has a reply")
         question_kind = context.get("question_kind") if isinstance(context, dict) else None
         if question_kind == "USER-CONFIRM":
@@ -1220,26 +1207,23 @@ def append_worker_wait_reply(
                 raise ValueError("USER-CONFIRM reply requires decision=yes or decision=no")
         elif normalized_decision is not None and normalized_decision not in USER_CONFIRM_DECISIONS:
             raise ValueError("worker wait reply decision must be yes or no")
-        if (
-            settlement is not None
-            or int(active_monotonic() * 1_000_000_000) >= deadline_ns
-        ):
+        if int(active_monotonic() * 1_000_000_000) >= deadline_ns:
             reply_context["late"] = True
 
-    with _worker_wait_reply_admission(path, wait_id):
-        return append_steer_entry(
-            path,
-            text,
-            dispatch_id=dispatch_id,
-            kind=WORKER_WAIT_REPLY_KIND,
-            reply_to=wait_id,
-            decision=normalized_decision,
-            context=reply_context or None,
-            sender=sender,
-            cross_project=cross_project,
-            validate_existing=validate,
-            lock_timeout_secs=lock_timeout_secs,
-        )
+    lock_timeout_secs = CONTROLLER_STEER_LOCK_TIMEOUT_SECS if lock_timeout_secs is None else lock_timeout_secs
+    return append_steer_entry(
+        path,
+        text,
+        dispatch_id=dispatch_id,
+        kind=WORKER_WAIT_REPLY_KIND,
+        reply_to=wait_id,
+        decision=normalized_decision,
+        context=reply_context or None,
+        sender=sender,
+        cross_project=cross_project,
+        validate_existing=validate,
+        lock_timeout_secs=lock_timeout_secs,
+    )
 
 
 def append_worker_wait_started(
@@ -1490,6 +1474,7 @@ def append_worker_wait_ended(
     context: dict | None = None,
     lock_timeout_secs: float | None = None,
 ) -> dict:
+    lock_timeout_secs = CONTROLLER_STEER_LOCK_TIMEOUT_SECS if lock_timeout_secs is None else lock_timeout_secs
     wait_id = str(arm.get("question_id") or "").strip()
     if not wait_id:
         raise ValueError("worker wait arm is missing question_id")
@@ -1751,47 +1736,9 @@ def wait_for_worker_entries(
         schedule_worker_wait_reply_cleanup(path, arm, reply)
         return result
 
-    def recover_admitted_reply(arm: dict) -> dict | None:
-        """Recover a reply whose validated writer still owns the mailbox lock."""
-        wait_id = str(arm.get("question_id") or "").strip()
-        if not wait_id or not _worker_wait_reply_admission_held(path, wait_id):
-            return None
-        recovery_deadline = (
-            active_monotonic() + WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS
-        )
-        while True:
-            remaining = recovery_deadline - active_monotonic()
-            if remaining <= 0:
-                return None
-            try:
-                entries = read_steer_entries(
-                    path,
-                    lock_timeout_secs=min(0.05, remaining),
-                    quarantine_errors=False,
-                )
-            except TimeoutError:
-                entries = None
-            if entries is not None:
-                replies = _worker_wait_replies(
-                    entries,
-                    dispatch_id=dispatch_id,
-                    wait_id=wait_id,
-                    after_seq=int(arm["seq"]),
-                )
-                if len(replies) > 1:
-                    raise ValueError("worker wait has multiple correlated replies")
-                if replies:
-                    return replies[0]
-                if not _worker_wait_reply_admission_held(path, wait_id):
-                    return None
-            time.sleep(min(poll_secs, max(0.0, recovery_deadline - active_monotonic())))
-
     def deadline_result(arm: dict | None = None) -> dict:
         settled = True
         if arm is not None:
-            admitted_reply = recover_admitted_reply(arm)
-            if admitted_reply is not None:
-                return deliver_reply(arm, admitted_reply, recovered=True)
             try:
                 append_worker_wait_ended(
                     path,

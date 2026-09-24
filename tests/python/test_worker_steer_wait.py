@@ -322,13 +322,13 @@ def test_timeout_settlement_accepts_and_records_late_reply_then_next_wait(
         publish_question=lambda _event: None,
     )
     assert first["state"] == "deadline", first
-    late = steer.append_worker_wait_reply(
-        mailbox,
-        dispatch_id="late-reply",
-        wait_id=str(first["wait_id"]),
-        text="arrived after timeout",
-    )
-    assert late["context"]["late"] is True, late
+    with pytest.raises(ValueError, match="already settled"):
+        steer.append_worker_wait_reply(
+            mailbox,
+            dispatch_id="late-reply",
+            wait_id=str(first["wait_id"]),
+            text="arrived after timeout",
+        )
 
     second = steer.wait_for_worker_entries(
         mailbox,
@@ -409,60 +409,6 @@ def test_next_wait_recovers_reply_written_during_final_sleep(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
         for entry in entries
     )
-
-
-def test_reply_writer_reserves_admission_before_mailbox_validation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    mailbox = tmp_path / "reply-admission-order.steer.jsonl"
-    dispatch_id = "reply-admission-order"
-    arm = steer.append_worker_wait_started(
-        mailbox,
-        dispatch_id=dispatch_id,
-        timeout_secs=2,
-        question_kind="USER-NEED",
-        question_text="reserve before locking",
-    )
-    entered_transaction = threading.Event()
-    release_transaction = threading.Event()
-    writer_errors: list[BaseException] = []
-    real_transaction = messages.carrier_transaction
-
-    @contextlib.contextmanager
-    def blocked_transaction(*args, **kwargs):
-        entered_transaction.set()
-        release_transaction.wait(timeout=5)
-        with real_transaction(*args, **kwargs) as transaction:
-            yield transaction
-
-    monkeypatch.setattr(messages, "carrier_transaction", blocked_transaction)
-
-    def write_reply() -> None:
-        try:
-            steer.append_worker_wait_reply(
-                mailbox,
-                dispatch_id=dispatch_id,
-                wait_id=str(arm["question_id"]),
-                text="reply writer admitted",
-            )
-        except BaseException as exc:  # pragma: no cover - asserted below
-            writer_errors.append(exc)
-
-    writer = threading.Thread(target=write_reply)
-    writer.start()
-    try:
-        assert entered_transaction.wait(timeout=5), "reply writer did not reach mailbox transaction"
-        assert steer._worker_wait_reply_admission_held(
-            mailbox,
-            str(arm["question_id"]),
-        )
-    finally:
-        release_transaction.set()
-        writer.join(timeout=5)
-
-    assert not writer.is_alive(), "reply writer did not finish"
-    assert not writer_errors, writer_errors
 
 
 def test_wait_deadline_includes_mailbox_lock_acquisition(tmp_path: Path) -> None:
