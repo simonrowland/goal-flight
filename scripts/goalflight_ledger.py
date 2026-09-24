@@ -1472,6 +1472,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         "codex_home_owner_dispatch_id",
         "parent_dispatch_id",
         "resume_mode",
+        "model",
+        "reasoning_effort",
     ):
         value = getattr(args, key, None)
         if value:
@@ -1489,7 +1491,17 @@ def cmd_record(args: argparse.Namespace) -> int:
     worker_cwd = getattr(args, "worker_cwd", None)
     if worker_cwd:
         record["worker_cwd"] = str(worker_cwd)
-    for key in ("worktree_id", "worktree_seat", "worktree_path", "worktree_base"):
+    for key in (
+        "worktree_id",
+        "worktree_seat",
+        "worktree_path",
+        "worktree_base",
+        "worktree_head",
+        "worktree_branch",
+        "worktree_keep_ref",
+        "worktree_quarantine_ref",
+        "worktree_reclaimed_dispatch_id",
+    ):
         value = getattr(args, key, None)
         if value:
             record[key] = str(value)
@@ -1606,7 +1618,17 @@ def cmd_record(args: argparse.Namespace) -> int:
                 existing.get("dispatch_argv"), list
             ):
                 record["dispatch_argv"] = existing["dispatch_argv"]
-            for key in ("worktree_id", "worktree_seat", "worktree_path", "worktree_base"):
+            for key in (
+                "worktree_id",
+                "worktree_seat",
+                "worktree_path",
+                "worktree_base",
+                "worktree_head",
+                "worktree_branch",
+                "worktree_keep_ref",
+                "worktree_quarantine_ref",
+                "worktree_reclaimed_dispatch_id",
+            ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
             existing_controller_session_id = existing.get("controller_session_id")
@@ -1635,6 +1657,8 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "codex_home",
                 "codex_home_owner_dispatch_id",
                 "parent_dispatch_id",
+                "model",
+                "reasoning_effort",
             ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
@@ -2481,12 +2505,22 @@ def status_payload() -> dict:
             "shape": infer_shape(r),
             "account": r.get("account") or "unknown",
             "effective_account": r.get("effective_account"),
+            "model": r.get("model"),
+            "reasoning_effort": r.get("reasoning_effort"),
             "codex_session_id": r.get("codex_session_id"),
             "codex_home": r.get("codex_home"),
             "codex_home_owner_dispatch_id": r.get(
                 "codex_home_owner_dispatch_id"
             ),
             "parent_dispatch_id": r.get("parent_dispatch_id"),
+            "worktree_id": r.get("worktree_id"),
+            "worktree_seat": r.get("worktree_seat"),
+            "worktree_path": r.get("worktree_path"),
+            "worktree_base": r.get("worktree_base"),
+            "worktree_head": r.get("worktree_head"),
+            "worktree_branch": r.get("worktree_branch"),
+            "worktree_keep_ref": r.get("worktree_keep_ref"),
+            "worktree_quarantine_ref": r.get("worktree_quarantine_ref"),
             "transport": r.get("transport"),
             "state": r.get("state"),
             "classification": classification,
@@ -2860,6 +2894,9 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--worktree-seat", help=argparse.SUPPRESS)
     rec.add_argument("--worktree-path", help=argparse.SUPPRESS)
     rec.add_argument("--worktree-base", help=argparse.SUPPRESS)
+    rec.add_argument(
+        "--worktree-reclaimed-dispatch-id", help=argparse.SUPPRESS
+    )
     rec.add_argument("--os-sandbox-json")
     # RUNNING belongs to the worker's pre-exec journal claim. A bare record
     # command can truthfully prepare STARTING, but it cannot impersonate that

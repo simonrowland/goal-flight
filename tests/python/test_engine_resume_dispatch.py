@@ -214,7 +214,7 @@ def test_resume_refuses_grok_without_recorded_handle(
     prompt.write_text("continue.\n", encoding="utf-8")
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_a, **_k: pytest.fail("missing handle must not allocate a child"),
     )
     rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
@@ -223,6 +223,67 @@ def test_resume_refuses_grok_without_recorded_handle(
         "goalflight_dispatch: dispatch grok-no-handle has no recorded "
         "grok session handle\n"
     )
+
+
+def test_resume_refuses_parent_missing_project_root_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "grok-missing-project-root"
+    record = _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="grok-code",
+        engine="grok",
+        session_id=GROK_SESSION,
+    )
+    record.pop("project_root")
+    L.write_record(record)
+    prompt = tmp_path / "missing-root.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-missing-project-root-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    assert "missing a project root" in capsys.readouterr().err
+    assert not L.record_path(child_id).exists()
+    assert not (
+        D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
+    ).exists()
+
+
+def test_resume_refuses_invalid_parent_project_root_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "grok-invalid-project-root"
+    record = _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="grok-code",
+        engine="grok",
+        session_id=GROK_SESSION,
+    )
+    record["project_root"] = str(tmp_path / "gone")
+    L.write_record(record)
+    prompt = tmp_path / "invalid-root.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-invalid-project-root-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    err = capsys.readouterr().err
+    assert f"parent project_root {tmp_path / 'gone'}" in err
+    assert "missing or invalid" in err
+    assert not L.record_path(child_id).exists()
 
 
 def test_resume_verb_passes_grok_lineage(
@@ -242,13 +303,15 @@ def test_resume_verb_passes_grok_lineage(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda agent, _base: f"{agent}-child",
+        "_default_dispatch_id",
+        lambda agent: f"{agent}-child",
     )
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **_kwargs: None)
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
     assert D._cmd_resume(
         [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
@@ -301,13 +364,14 @@ def test_resume_honors_explicit_grok_account(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda agent, _base: f"{agent}-child",
+        "_default_dispatch_id",
+        lambda agent: f"{agent}-child",
     )
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
     assert (
         D._cmd_resume(
@@ -453,7 +517,7 @@ def test_resume_refuses_live_grok_source(
     monkeypatch.setattr(L, "identity_matches", lambda _record: (True, "live"))
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_a, **_k: pytest.fail("live-source refusal must not allocate"),
     )
     rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])

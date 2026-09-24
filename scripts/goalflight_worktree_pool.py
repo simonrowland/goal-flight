@@ -16,7 +16,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from typing import TextIO
+from typing import Callable, TextIO
 
 import goalflight_compat
 import goalflight_ledger
@@ -168,6 +168,7 @@ class WorktreeSeatLease:
         quarantine_branch: str | None,
         branch: str,
         keep_ref: str | None = None,
+        reclaimed_dispatch_id: str | None = None,
         controller_label: str | None = None,
     ) -> None:
         self.path = path
@@ -176,6 +177,7 @@ class WorktreeSeatLease:
         self.quarantine_branch = quarantine_branch
         self.branch = branch
         self.keep_ref = keep_ref
+        self.reclaimed_dispatch_id = reclaimed_dispatch_id
         self.controller_label = controller_label
         self._lock_file: TextIO | None = lock_file
 
@@ -1008,6 +1010,12 @@ def _lock_metadata(lock_file: TextIO) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _known_lock_dispatch_id(lock_file: TextIO) -> str | None:
+    value = _lock_metadata(lock_file).get("dispatch_id")
+    text = str(value or "").strip()
+    return text or None
+
+
 def _occupant_description(lock_file: TextIO, seat_name: str) -> str:
     payload = _lock_metadata(lock_file)
     return _holder_description(seat_name, payload)
@@ -1428,6 +1436,11 @@ def _create_seat_worktree(
     base_commit: str,
     keep_id: str,
 ) -> None:
+    # A deleted checkout can remain in Git's worktree admin list. The path is
+    # proven absent at this point, so prune stale registration before the
+    # replacement add; never prune an occupied or merely unreadable path.
+    if not worktree_path.exists() and not worktree_path.is_symlink():
+        _git(project_root, "worktree", "prune")
     ref = f"refs/heads/{branch}"
     exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
     if exists is None:
@@ -1937,7 +1950,12 @@ def _quarantine_dirty_worktree(
         )
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    branch = f"{QUARANTINE_REF_PREFIX}/{seat_name}-{stamp}"
+    safe_dispatch_id = (
+        re.sub(r"[^A-Za-z0-9._-]+", "-", str(abandoned_dispatch_id))
+        .strip(".-")
+        or "unknown-dispatch"
+    )
+    branch = f"{QUARANTINE_REF_PREFIX}/{seat_name}-{safe_dispatch_id}-{stamp}"
     message = (
         f"quarantine abandoned {seat_name}\n\n"
         f"Previous dispatch: {abandoned_dispatch_id}\n"
@@ -2008,16 +2026,19 @@ def _prepare_claimed_seat_locked(
     seat_name: str,
     lock_file: TextIO,
     dispatch_id: str,
-    prior_dispatch_id: str,
+    prior_dispatch_id: str | None,
     branch: str,
     base_commit: str,
     reset: bool,
     controller_label: str | None = None,
+    before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
     existing = worktree_path.exists() or worktree_path.is_symlink()
     safety: dict | None = None
     if existing:
         _verify_existing_seat(project_root, worktree_path)
+        if before_reset is not None:
+            before_reset(worktree_path)
         if reset:
             prior_dispatch_id = _validate_holder(worktree_path, prior_dispatch_id)
             safety = evaluate_seat_reset_safety(
@@ -2032,6 +2053,9 @@ def _prepare_claimed_seat_locked(
             f"refusing to create missing --cwd {worktree_path}; "
             "resume and occupy only attach an existing tree"
         )
+    # Keep the previous diagnostic record until the new lease is durable. If
+    # reset fails, the old owner (or an unknown owner) must remain visible so
+    # a later allocator cannot mistake a partial checkout for a free seat.
     if not existing:
         _create_seat_worktree(
             project_root,
@@ -2060,6 +2084,7 @@ def _prepare_claimed_seat_locked(
             lock_file=lock_file,
             quarantine_branch=None,
             branch=actual,
+            reclaimed_dispatch_id=None,
             controller_label=controller_label,
         )
     precheck = None
@@ -2087,7 +2112,7 @@ def _prepare_claimed_seat_locked(
             worktree_path,
             base_commit=base_commit,
             moving_ref=safety.get("moving_ref"),
-            worktree_id=seat_name,
+            worktree_id=f"{seat_name}-{prior_dispatch_id or 'unknown-dispatch'}",
         )
         if pinned["verdict"] != YES:
             raise WorktreeSeatResetRefused(
@@ -2162,6 +2187,7 @@ def _prepare_claimed_seat_locked(
         quarantine_branch=quarantine_branch,
         branch=actual_branch,
         keep_ref=keep_ref,
+        reclaimed_dispatch_id=prior_dispatch_id,
         controller_label=controller_label,
     )
 
@@ -2187,8 +2213,7 @@ def _legacy_ring_candidates(project_root: Path) -> list[tuple[Path, Path]]:
             lock_path = _seat_lock_root(project_root, controller_label=label_root.name) / (
                 f"{path.name}.lock"
             )
-            if lock_path.is_file():
-                found.append((path, lock_path))
+            found.append((path, lock_path))
     return found
 
 
@@ -2276,12 +2301,14 @@ def acquire_worktree_seat(
     dispatch_id: str,
     *,
     base: str | None = None,
+    branch: str | None = None,
     managed_root: Path | None = None,
     controller_label: str | None = None,
     reset: bool = True,
     occupy_path: Path | None = None,
     expected_prior_dispatch_id: str | None = None,
     capacity_deadline: float | None = None,
+    before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -2296,7 +2323,16 @@ def acquire_worktree_seat(
     label = default_controller_ring_label(controller_label, project_root=project_root)
     resolved_base = base if base is not None else default_seat_base(project_root)
     base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
-    branch = seat_branch_name(dispatch_id)
+    branch = str(branch or seat_branch_name(dispatch_id)).strip()
+    branch_suffix = branch.split("/", 1)[1] if "/" in branch else ""
+    if (
+        not is_worktree_branch(branch)
+        or not branch_suffix
+        or not _SAFE_RING_LABEL.fullmatch(branch_suffix)
+    ):
+        raise WorktreeSeatError(
+            f"invalid managed worktree branch {branch!r}; expected worktree/<id> or seat/<id>"
+        )
 
     worktrees_root = project_root / "worktrees"
     if worktrees_root.is_symlink():
@@ -2360,9 +2396,6 @@ def acquire_worktree_seat(
                 )
                 allocation_locked = True
 
-        # Count every held global or legacy-ring lock before any checkout/reset
-        # or directory creation. Legacy rings are migration input, not extra
-        # capacity, so a full set of old holders must refuse immediately.
         global_candidates = [
             (
                 managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
@@ -2375,23 +2408,36 @@ def acquire_worktree_seat(
         capacity_occupied_paths: set[Path] = set()
         probe_flags = flags & ~os.O_CREAT
 
+        def note_capacity_occupant(candidate_path: Path, metadata: dict) -> None:
+            resolved_candidate = candidate_path.resolve(strict=False)
+            if resolved_candidate not in capacity_occupied_paths:
+                capacity_occupied_paths.add(resolved_candidate)
+                capacity_occupants.append((str(candidate_path), metadata))
+
+        occupied_target = Path(occupy_path).expanduser().resolve(strict=False) if occupy_path is not None else None
         for candidate_path, candidate_lock in [*global_candidates, *legacy_candidates]:
+            if occupied_target is not None and candidate_path.resolve(strict=False) == occupied_target:
+                continue
             if not candidate_lock.is_file():
+                if candidate_path.exists():
+                    note_capacity_occupant(candidate_path, {})
                 continue
             try:
                 probe_fd = os.open(candidate_lock, probe_flags, 0o600)
             except OSError:
+                note_capacity_occupant(candidate_path, {})
                 continue
             probe_file = os.fdopen(probe_fd, "r+", encoding="utf-8")
             try:
                 fcntl.flock(probe_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                resolved_candidate = candidate_path.resolve(strict=False)
-                if resolved_candidate not in capacity_occupied_paths:
-                    capacity_occupied_paths.add(resolved_candidate)
-                    capacity_occupants.append(
-                        (str(candidate_path), _lock_metadata(probe_file))
-                    )
+                note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
+            else:
+                # An empty lock left by a failed first bind has no checkout
+                # or bytes to protect. Unknown owners still occupy any seat
+                # whose checkout exists; lock-only artifacts are reusable.
+                if _known_lock_dispatch_id(probe_file) is None and candidate_path.exists():
+                    note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
             finally:
                 probe_file.close()
 
@@ -2443,9 +2489,15 @@ def acquire_worktree_seat(
                     "refusing to git worktree add a new unmanaged path"
                 )
             try:
-                prior_dispatch_id = str(
-                    _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
-                )
+                prior_dispatch_id = _known_lock_dispatch_id(lock_file)
+                if (
+                    expected_prior_dispatch_id is not None
+                    and prior_dispatch_id is None
+                ):
+                    raise WorktreeSeatUnavailable(
+                        f"resume refused: worktree {seat_name} has unknown ownership; "
+                        "its lock metadata is empty or unreadable, so it is not reclaimable"
+                    )
                 if (
                     expected_prior_dispatch_id is not None
                     and prior_dispatch_id != expected_prior_dispatch_id
@@ -2467,6 +2519,7 @@ def acquire_worktree_seat(
                     base_commit=base_commit,
                     reset=reset,
                     controller_label=label,
+                    before_reset=before_reset,
                 )
             except BaseException:
                 lock_file.close()
@@ -2491,6 +2544,8 @@ def acquire_worktree_seat(
             *,
             require_ancestor: bool = False,
         ):
+            lock_existed = lock_path.is_file()
+            path_existed = worktree_path.exists()
             try:
                 lock_fd = os.open(lock_path, flags, 0o600)
             except OSError as exc:
@@ -2516,9 +2571,15 @@ def acquire_worktree_seat(
                     lock_file.close()
                     return None
                 seat_name = worktree_path.name
-                prior_dispatch_id = str(
-                    _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
-                )
+                prior_dispatch_id = _known_lock_dispatch_id(lock_file)
+                # A present checkout with no readable occupant is not a free
+                # seat. A resume cannot prove whether resetting it would erase
+                # another dispatch's uncommitted work; leave it untouched.
+                # Brand-new slots remain allocatable because they have no
+                # checkout to protect yet.
+                if prior_dispatch_id is None and worktree_path.exists():
+                    lock_file.close()
+                    return None
                 release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
@@ -2531,6 +2592,7 @@ def acquire_worktree_seat(
                     base_commit=base_commit,
                     reset=reset,
                     controller_label=label,
+                    before_reset=before_reset,
                 )
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
@@ -2546,7 +2608,25 @@ def acquire_worktree_seat(
                 reacquire_allocation_lock()
                 return None
             except BaseException:
-                lock_file.close()
+                try:
+                    if not lock_existed and not path_existed and worktree_path.exists():
+                        # A failed first bind may have created a checkout after
+                        # the lock was opened. It contains only the requested
+                        # base; remove that unclaimed checkout so a retry does
+                        # not leave a phantom seat or Git registration.
+                        lock_file.close()
+                        try:
+                            _git(
+                                project_root,
+                                "worktree",
+                                "remove",
+                                "--force",
+                                str(worktree_path),
+                            )
+                        except Exception:
+                            pass
+                finally:
+                    lock_file.close()
                 raise
 
         slots = list(range(1, hwm + 1))

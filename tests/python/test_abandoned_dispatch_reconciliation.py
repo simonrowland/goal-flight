@@ -196,14 +196,6 @@ def _stub_resume_runtime(
     # The fake lease is never written to capacity state, so the launcher's
     # "lease still held before spawn" check must be faked alongside it.
     monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda _root, _parent, expected_home, _session, **_kwargs: (
-            str(expected_home),
-            "fixture-seat",
-        ),
-    )
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
     monkeypatch.setattr(D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None)
     monkeypatch.setattr(D, "_mark_queue_claim_worker_spawned", lambda _args, _pid: None)
@@ -1297,7 +1289,7 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
 
     prompt = tmp_path / "resume.md"
     prompt.write_text("Add one more feature.", encoding="utf-8")
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_args: fresh_child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_args: fresh_child_id)
     spawn_calls, worker_pids = _stub_resume_runtime(monkeypatch)
 
     def identity_matches(probe: dict) -> tuple[bool, str]:

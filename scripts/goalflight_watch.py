@@ -1977,12 +1977,18 @@ def _status_snapshot(payload: dict) -> dict:
         "dispatch_id",
         "agent",
         "shape",
+        "model",
+        "reasoning_effort",
         "effective_account",
         "codex_session_id",
         "engine_session_id",
         "codex_home",
         "codex_home_owner_dispatch_id",
         "parent_dispatch_id",
+        "worktree_branch",
+        "worktree_head",
+        "worktree_keep_ref",
+        "worktree_quarantine_ref",
         "state",
         "reason",
         "worker_pid",
@@ -4624,6 +4630,16 @@ def main() -> int:
             payload["codex_home_owner_dispatch_id"] = (
                 args.codex_home_owner_dispatch_id
             )
+        for key in (
+            "model",
+            "reasoning_effort",
+            "worktree_branch",
+            "worktree_head",
+            "worktree_keep_ref",
+            "worktree_quarantine_ref",
+        ):
+            if isinstance(dispatch_record, dict) and dispatch_record.get(key):
+                payload[key] = dispatch_record[key]
         if args.parent_dispatch_id:
             payload["parent_dispatch_id"] = args.parent_dispatch_id
         if args.resume_mode:
@@ -5555,6 +5571,17 @@ def main() -> int:
             ),
             "updated_at": int(now),
         }
+        if isinstance(dispatch_record, dict):
+            for key in (
+                "model",
+                "reasoning_effort",
+                "worktree_branch",
+                "worktree_head",
+                "worktree_keep_ref",
+                "worktree_quarantine_ref",
+            ):
+                if dispatch_record.get(key):
+                    payload[key] = dispatch_record[key]
         if starvation_verdict is None:
             # A failed host-health probe cannot safely disable the only bounded
             # starvation grace. Unknown is retried because it is not cached.

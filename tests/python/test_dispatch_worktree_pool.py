@@ -26,6 +26,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch  # noqa: E402
 import goalflight_capacity  # noqa: E402
+import goalflight_ledger  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 from test_worktree_seat_pool import finish_seat_holder, record_finished_holder
 
@@ -245,6 +246,135 @@ def test_resume_refuses_missing_or_relative_recorded_seat(tmp_path: Path, monkey
         )
 
 
+def test_unknown_free_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "unknown-holder")
+    seat = holder.path
+    holder.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).write_text(
+        "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert "s-1=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
+def test_existing_checkout_without_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "missing-lock")
+    seat = holder.path
+    holder.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).unlink()
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert f"{seat.name}=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
+def test_legacy_label_checkout_without_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    legacy = repo / "worktrees" / "old-label" / "s-1"
+    legacy.parent.mkdir(parents=True)
+    _git(repo, "worktree", "add", "--detach", str(legacy), "HEAD")
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert "s-1=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
+def test_occupancy_refuses_before_existing_seat_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "old-holder")
+    seat = holder.path
+    holder.release()
+    branch_before = _git(seat, "rev-parse", "--abbrev-ref", "HEAD")
+    seen_branches: list[str] = []
+
+    def refuse(args) -> None:
+        seen_branches.append(_git(seat, "rev-parse", "--abbrev-ref", "HEAD"))
+        raise goalflight_dispatch.DispatchUsageError("occupancy refused")
+
+    monkeypatch.setattr(
+        goalflight_dispatch, "_prepare_attempt_worktree_occupancy", refuse
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=None,
+        dispatch_id="new-dispatch",
+        cwd=str(seat),
+        skip_seat_reset=False,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+        dispatch_warnings=[],
+    )
+
+    with pytest.raises(goalflight_dispatch.DispatchUsageError, match="occupancy refused"):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert seen_branches == [branch_before]
+    assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == branch_before
+
+
+def test_occupancy_is_rechecked_when_resume_falls_back_to_another_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "s-1"
+    second = tmp_path / "s-2"
+    args = SimpleNamespace(
+        cwd=str(first),
+        dispatch_id="resume-child",
+        _worktree_occupancy_checked=False,
+        _worktree_occupancy_checked_path=str(first.resolve()),
+        _worktree_occupancy_warning=None,
+        _worktree_occupancy_lock=None,
+    )
+    seen: list[str] = []
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_worktree_occupancy",
+        lambda current: seen.append(current.cwd) or None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_worker_cwd", lambda current: Path(current.cwd))
+
+    def bind(current):
+        goalflight_dispatch._worktree_occupancy_before_reset(current)(first)
+        current.cwd = str(second)
+        return object()
+
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", bind)
+
+    goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert seen == [str(first), str(second)]
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -394,6 +524,74 @@ def test_occupancy_refusal_releases_bound_seat(
         repo, "after-occupancy-refusal"
     )
     replacement.release()
+@pytest.mark.parametrize("legacy", [False, True], ids=["recorded", "legacy"])
+def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    legacy: bool,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent"
+    child_id = "resume-child"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "worktree/foreign", recorded_head)
+    _git(seat, "checkout", "worktree/foreign")
+    parent.release()
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": parent_id,
+        "agent": "grok-code",
+        "engine": "grok",
+        "shape": "bash",
+        "state": "blocked",
+        "terminal_state": "blocked",
+        "project_root": str(repo),
+        "worker_cwd": str(seat),
+        "worktree_id": seat.name,
+        "worktree_path": str(seat),
+        "worktree_branch": f"worktree/{parent_id}",
+        "worktree_head": recorded_head,
+        "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+        "dispatch_argv": [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--cwd",
+            str(seat),
+        ],
+    }
+    if legacy:
+        record.pop("worktree_branch")
+        record.pop("worktree_head")
+    goalflight_ledger.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the worker.\n", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "grok_selected_account", lambda _args: None)
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "main",
+        lambda argv=None, **_kwargs: launched.append(list(argv or [])) or 0,
+    )
+
+    assert goalflight_dispatch._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    error = capsys.readouterr().err
+    assert "actual branch worktree/foreign" in error
+    assert f"expected branch worktree/{parent_id}" in error
+    if not legacy:
+        assert recorded_head in error
+    assert launched == []
 
 
 def test_resume_in_place_accepts_recorded_linked_worktree_without_seat(
@@ -438,6 +636,7 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     repo = _make_repo(tmp_path)
     monkeypatch.chdir(repo)
     parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
@@ -455,21 +654,755 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         controller_label=None,
         _worktree_seat=None,
     )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": _git(repo, "rev-parse", "worktree/resume-parent"),
+        }
+    )
     try:
         with pytest.raises(
             goalflight_worktree_pool.WorktreeSeatUnavailable,
-            match=r"s-1=reclaimer.*worker identity unknown",
+            match=r"(?=.*1/1 worktrees busy)(?=.*s-1=reclaimer)(?=.*worker identity unknown)",
         ):
             goalflight_dispatch._bind_dispatch_worktree(args)
     finally:
         reclaimer.release()
 
+    record_finished_holder("reclaimer")
+    resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+    try:
+        assert resumed.path == seat
+        assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == (
+            "worktree/resume-parent"
+        )
+    finally:
+        resumed.release()
+
+
+def test_resume_unknown_lock_refuses_before_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-unknown-parent"
+    child_id = "resume-unknown-child"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    head = _git(repo, "rev-parse", "worktree/resume-unknown-parent")
+    parent.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).write_text(
+        "\n", encoding="utf-8"
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "account": "old-seat",
+            "effective_account": "old-seat",
+            "engine_session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": "worktree/resume-unknown-parent",
+            "worktree_head": head,
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+                "--account",
+                "old-seat",
+            ],
+        }
+    )
+    prompt = tmp_path / "resume-unknown.md"
+    prompt.write_text("Continue without resetting the seat.\n", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "_resolve_launch_account_env", lambda _args: {})
+    monkeypatch.setattr(goalflight_dispatch, "_acquire_capacity", lambda *_a, **_k: "lease-unknown")
+    monkeypatch.setattr(goalflight_dispatch, "_release_capacity", lambda *_a, **_k: None)
+    monkeypatch.setattr(goalflight_dispatch, "_stamp_controller_session", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_controller_registration",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_reap_quota_stuck_before_bash_launch", lambda: None)
+    monkeypatch.setattr(goalflight_dispatch, "_mark_queue_claim_launch_started", lambda _args: None)
+    monkeypatch.setattr(goalflight_dispatch, "_terminal_worktree_gc", lambda *_a, **_k: None)
+
+    rc = goalflight_dispatch._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "old-seat",
+            "--unregistered-forced",
+        ]
+    )
+
+    assert rc == 2
+    assert "unknown ownership" in capsys.readouterr().err
+    assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == (
+        "worktree/resume-unknown-parent"
+    )
+    assert (seat / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+
+
+def test_resume_reseats_a_recycled_worktree_on_the_parent_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    committed_head = _commit_in(old_seat, "worker committed before stopping")
+    assert committed_head != recorded_head
+    parent.release()
+    record_finished_holder("resume-parent")
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "resume-parent-other"
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_id": old_seat.name,
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": recorded_head,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    try:
+        resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+        try:
+            assert resumed.path != old_seat
+            assert resumed.path.name == "s-2"
+            assert _git(resumed.path, "rev-parse", "--abbrev-ref", "HEAD") == (
+                "worktree/resume-parent"
+            )
+            assert _git(resumed.path, "rev-parse", "HEAD") == committed_head
+            assert args._worktree_branch == "worktree/resume-parent"
+            assert args._worktree_head == committed_head
+        finally:
+            resumed.release()
+        assert _git(old_seat, "rev-parse", "--abbrev-ref", "HEAD") == (
+            "worktree/resume-parent-other"
+        )
+    finally:
+        reclaimer.release()
+
+
+def test_resume_recycled_branch_divergence_is_refused_before_new_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_id": old_seat.name,
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": recorded_head,
+        }
+    )
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=str(repo),
+        input="diverged\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "mktree"],
+        cwd=str(repo),
+        input=f"100644 blob {blob}\tdiverged.txt\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    diverged = _git(repo, "commit-tree", tree)
+    _git(
+        repo,
+        "update-ref",
+        "refs/heads/worktree/resume-parent",
+        diverged,
+        recorded_head,
+    )
+    parent.release()
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo,
+        "reclaimer",
+        occupy_path=old_seat,
+        reset=False,
+        expected_prior_dispatch_id="resume-parent",
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    try:
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeCwdRefused,
+            match=r"worktree/resume-parent.*diverged.*recorded head",
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
+        assert not (repo / "worktrees" / "s-2").exists()
+    finally:
+        reclaimer.release()
+
+
+def test_resume_recycled_branch_accepts_root_resume_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    root = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-root")
+    old_seat = root.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-root")
+    root.release()
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-root",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "worker_pid": 2147483647,
+            "worker_identity": {
+                "pid": 2147483647,
+                "start_token": "exited-test-worker",
+            },
+            "project_root": str(repo),
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-child",
+            "parent_dispatch_id": "resume-root",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_id": old_seat.name,
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-root",
+            "worktree_head": recorded_head,
+        }
+    )
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-child",
+        dispatch_id="resume-grandchild",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+    try:
+        resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+        try:
+            assert resumed.path.name == "s-2"
+            assert resumed.branch == "worktree/resume-root"
+        finally:
+            resumed.release()
+    finally:
+        reclaimer.release()
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("cycle", "lineage cycle"),
+        ("missing", "missing or unreadable lineage ancestor"),
+        ("missing-project-root", "missing a project root"),
+    ],
+)
+def test_resume_rejects_inconsistent_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+
+    def record(dispatch_id: str, *, parent: str | None = None, root: Path = repo, branch: str | None = None) -> dict:
+        value = {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(root),
+        }
+        if parent:
+            value["parent_dispatch_id"] = parent
+        if branch:
+            value["worktree_branch"] = branch
+        return value
+
+    if case == "cycle":
+        goalflight_ledger.write_record(record("lineage-child", parent="lineage-root"))
+        goalflight_ledger.write_record(record("lineage-root", parent="lineage-child"))
+    elif case == "missing":
+        goalflight_ledger.write_record(record("lineage-child", parent="missing"))
+    elif case == "missing-project-root":
+        goalflight_ledger.write_record(record("lineage-child", parent="lineage-root"))
+        root_record = record("lineage-root")
+        root_record.pop("project_root")
+        goalflight_ledger.write_record(root_record)
+    else:
+        goalflight_ledger.write_record(
+            record("lineage-child", parent="lineage-root")
+        )
+        goalflight_ledger.write_record(
+            record("lineage-root", branch="worktree/not-the-root")
+        )
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused, match=expected):
+        goalflight_dispatch._resume_lineage_dispatch_ids("lineage-child")
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("different-project-root", "different project root"),
+        ("wrong-root-branch", "does not belong to root dispatch lineage-root"),
+    ],
+)
+def test_resume_command_rejects_inconsistent_lineage_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "lineage-parent"
+    root_id = "lineage-root"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    head = _git(repo, "rev-parse", f"worktree/{parent_id}")
+    parent.release()
+    if case == "different-project-root":
+        other_root = tmp_path / "other"
+        other_root.mkdir()
+        root_project = _make_repo(other_root)
+        root_branch = f"worktree/{root_id}"
+    else:
+        root_project = repo
+        root_branch = "worktree/not-the-root"
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": root_id,
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(root_project),
+            "worktree_branch": root_branch,
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "parent_dispatch_id": root_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "account": "default",
+            "engine_session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_branch": f"worktree/{root_id}",
+            "worktree_head": head,
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+            ],
+        }
+    )
+    prompt = tmp_path / "lineage-resume.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = f"{case}-resume-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "_validate_before_side_effects", lambda *_args: {})
+    monkeypatch.setattr(goalflight_dispatch, "grok_selected_account", lambda _args: None)
+
+    assert goalflight_dispatch._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    assert expected in capsys.readouterr().err
+    assert not goalflight_ledger.record_path(child_id).exists()
+    assert not (
+        goalflight_dispatch._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
+    ).exists()
+
+
+@pytest.mark.parametrize("reclaimed_for", ["resume-parent", "other-parent"])
+def test_resume_recycled_dirty_state_uses_reclaim_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reclaimed_for: str,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    (old_seat / "unfinished.txt").write_text("preserve this\n", encoding="utf-8")
+    parent.release()
+    record_finished_holder("resume-parent")
+
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+    assert reclaimer.quarantine_branch
+    if reclaimed_for == "other-parent":
+        _git(repo, "update-ref", "-d", f"refs/heads/{reclaimer.quarantine_branch}")
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": recorded_head,
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "reclaimer",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "starting",
+            "terminal_state": "unknown",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_path": str(old_seat),
+            "worktree_quarantine_ref": reclaimer.quarantine_branch,
+            "worktree_reclaimed_dispatch_id": reclaimed_for,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    try:
+        if reclaimed_for == "resume-parent":
+            with pytest.raises(
+                goalflight_worktree_pool.WorktreeCwdRefused,
+                match=reclaimer.quarantine_branch,
+            ) as exc_info:
+                goalflight_dispatch._bind_dispatch_worktree(args)
+            assert "git worktree add <recovery-path>" in str(exc_info.value)
+            assert not (repo / "worktrees" / "s-2").exists()
+        else:
+            resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+            try:
+                assert resumed.path.name == "s-2"
+                assert resumed.branch == "worktree/resume-parent"
+            finally:
+                resumed.release()
+    finally:
+        reclaimer.release()
+
+
+def test_resume_recycled_dirty_state_finds_archived_reclaimer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    (old_seat / "unfinished.txt").write_text("preserve this\n", encoding="utf-8")
+    parent.release()
+    record_finished_holder("resume-parent")
+
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+    assert reclaimer.quarantine_branch
+    recovery_ref = reclaimer.quarantine_branch
+    reclaimer.release()
+    # Simulate a crash after the reclaim ref was published but before the
+    # reclaimer could publish its ledger row.
+    old = "2000-01-01T00:00:00+00:00"
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": recorded_head,
+            "ended_at": old,
+            "updated_at": old,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
     with pytest.raises(
-        goalflight_worktree_pool.WorktreeSeatUnavailable,
-        match=r"reclaimed by reclaimer.*expected recorded holder resume-parent",
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match=recovery_ref,
     ):
         goalflight_dispatch._bind_dispatch_worktree(args)
-    assert args._worktree_seat is None
+
+
+def test_resume_reseats_when_recorded_worktree_checkout_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    parent.release()
+    # Remove the checkout while retaining the managed seat registration. This
+    # is the missing-path variant of a recycled recorded seat.
+    shutil.rmtree(old_seat)
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_id": old_seat.name,
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": recorded_head,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        project_root=str(repo),
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+    try:
+        assert resumed is not None
+        assert _git(resumed.path, "rev-parse", "--abbrev-ref", "HEAD") == (
+            "worktree/resume-parent"
+        )
+    finally:
+        resumed.release()
+
+
+def test_resume_refuses_recorded_branch_owned_by_another_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    old_seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "worktree/resume-parent")
+    parent.release()
+    record_finished_holder("resume-parent")
+    _git(repo, "branch", "worktree/other-dispatch", recorded_head)
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(old_seat),
+            "worktree_id": old_seat.name,
+            "worktree_path": str(old_seat),
+            "worktree_branch": "worktree/other-dispatch",
+            "worktree_head": recorded_head,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(old_seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    try:
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeCwdRefused,
+            match=r"worktree/other-dispatch.*resume-parent",
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
+        assert not (repo / "worktrees" / "s-2").exists()
+    finally:
+        reclaimer.release()
+
+
+def test_resume_keeps_a_seat_held_by_the_original_dispatch_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(parent.path),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    try:
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeSeatUnavailable,
+            match=r"s-1=resume-parent",
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
+        assert _git(parent.path, "rev-parse", "--abbrev-ref", "HEAD") == (
+            "worktree/resume-parent"
+        )
+        assert not (repo / "worktrees" / "s-2").exists()
+    finally:
+        parent.release()
 
 
 def test_dispatch_quarantines_dirty_seat_instead_of_destroying(
