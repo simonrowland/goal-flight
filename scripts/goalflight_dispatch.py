@@ -85,6 +85,7 @@ import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_fleet_billing
 import goalflight_fs
+import goalflight_messages
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -10765,11 +10766,11 @@ def _read_capacity_state_for_reconciliation() -> dict:
 def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
     """Read status evidence, treating every unreadable case as indeterminate.
 
-    Returns ``(payload, evidence)``. **Every failure returns ``None``, and
-    ``None`` vetoes reconciliation** at the caller (``status_indeterminate``).
-    That includes a recorded ``status_path`` whose file is missing:
-    never-created, write-failed and unlinked are indistinguishable from here,
-    so absence is "could not tell", never proof the dispatch is closable.
+    Returns ``(payload, evidence)``. Every failure returns ``None``. The
+    caller normally treats that as ``status_indeterminate``; a dispatch-bound
+    terminal marker may override it only after the worker identity is proven
+    dead. That includes a recorded ``status_path`` whose file is missing:
+    absence alone is "could not tell", never proof the dispatch is closable.
 
     Only a payload that reads, parses, and names this same ``dispatch_id`` is
     returned as evidence.
@@ -10997,6 +10998,14 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
     return True, ",".join(evidence)
 
 
+def _abandoned_worker_pid_present(record: dict, status: dict) -> bool:
+    """Require a recorded worker pid before trusting a terminal tail marker."""
+    return any(
+        value not in (None, "") and not isinstance(value, bool)
+        for value in (record.get("worker_pid"), status.get("worker_pid"))
+    )
+
+
 def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool, str]:
     leases = capacity_state.get("leases")
     if not isinstance(leases, dict):
@@ -11121,7 +11130,14 @@ def _evaluate_abandoned_dispatch(
         }
 
     status, status_evidence = _abandoned_status_payload(record)
+    terminal_marker = None
     if status is None:
+        # A dead worker's dispatch-bound terminal marker is stronger than a
+        # missing or stale status mirror. The ledger row and tail are the
+        # durable evidence left when the foreground launcher dies before the
+        # watcher can publish its sidecar.
+        _marker_state, _marker_reason, terminal_marker = _abandoned_terminal_outcome(record)
+    if status is None and terminal_marker is None:
         return {
             **result,
             "eligible": False,
@@ -11136,13 +11152,20 @@ def _evaluate_abandoned_dispatch(
             "reason": "output_indeterminate",
             "output_evidence": output_evidence,
         }
-    process_inactive, process_evidence = _abandoned_process_evidence(record, status)
+    process_inactive, process_evidence = _abandoned_process_evidence(record, status or {})
     if not process_inactive:
         return {
             **result,
             "eligible": False,
             "reason": "worker_live_or_indeterminate",
             "process_evidence": process_evidence,
+        }
+    if terminal_marker is not None and not _abandoned_worker_pid_present(record, status or {}):
+        return {
+            **result,
+            "eligible": False,
+            "reason": "worker_identity_indeterminate",
+            "process_evidence": "worker_identity_absent",
         }
     lease_inactive, lease_evidence = _abandoned_lease_evidence(record, capacity_state)
     if not lease_inactive:
@@ -11154,6 +11177,9 @@ def _evaluate_abandoned_dispatch(
         }
     controller_inactive, controller_evidence = _abandoned_controller_evidence(record)
     if not controller_inactive:
+        if terminal_marker is None:
+            _marker_state, _marker_reason, terminal_marker = _abandoned_terminal_outcome(record)
+    if not controller_inactive and terminal_marker is None:
         held = {
             **result,
             "eligible": False,
@@ -11168,7 +11194,7 @@ def _evaluate_abandoned_dispatch(
         if controller_evidence == "controller_indeterminate":
             held["detail"] = _abandoned_controller_indeterminate_unlock(record)
         return held
-    latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status)
+    latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status or {})
     if latest_progress_s is None:
         return {**result, "eligible": False, "reason": "progress_time_indeterminate"}
     progress_age_s = now_s - latest_progress_s
@@ -11193,6 +11219,9 @@ def _evaluate_abandoned_dispatch(
         "output_evidence": output_evidence,
         "lease_evidence": lease_evidence,
         "controller_evidence": controller_evidence,
+        "terminal_marker_evidence": (
+            terminal_marker.get("kind") if isinstance(terminal_marker, dict) else None
+        ),
         "progress_age_s": round(progress_age_s, 3),
         "progress_fingerprint": progress_fingerprint,
     }
@@ -11238,45 +11267,75 @@ def _commit_abandoned_dispatch(
         )
     winner = committed.value
     terminal_state = winner.terminal_state
+    winner_observation = (
+        winner.observation if isinstance(winner.observation, dict) else {}
+    )
+    winner_outcome = winner_observation.get("outcome")
+    winner_envelope = dict(winner_outcome) if isinstance(winner_outcome, dict) else {}
+    winner_state = str(winner_observation.get("state") or terminal_state)
+    state = winner_state
     ended_at = goalflight_ledger.preserve_first_terminal_time(
         record,
         winner.terminal_at,
     )
-    basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
-    reconciliation = {
-        "source": "goalflight_dispatch.drain",
-        "basis": basis,
-        "reason": evaluation.get("reason"),
-        "process_evidence": evaluation.get("process_evidence"),
-        "status_evidence": evaluation.get("status_evidence"),
-        "output_evidence": evaluation.get("output_evidence"),
-        "lease_evidence": evaluation.get("lease_evidence"),
-        "controller_evidence": evaluation.get("controller_evidence"),
-        "progress_age_s": evaluation.get("progress_age_s"),
-        "checked_output": True,
-        "observed_outcome": marker is not None,
-    }
-    if marker is not None:
-        reconciliation["terminal_marker_kind"] = marker.get("kind")
-        record["terminal_marker"] = marker
-    record.update(
-        {
-            "state": state,
-            "terminal_state": terminal_state,
-            "liveness_state": goalflight_terminal.terminal_liveness_state(state),
-            "worker_still_alive": False,
-            "reason": reason,
-            "outcome": {
+    if winner.idempotent:
+        # The journal winner is authoritative when a watcher committed before
+        # dying. Do not merge this reconciler's marker or inferred outcome into
+        # the winner's terminal state, event, or failure envelope.
+        record.pop("reason", None)
+        record.pop("error", None)
+        record.pop("terminal_marker", None)
+        record.update(
+            {
+                "state": state,
                 "terminal_state": terminal_state,
-                "reason": reason,
-                "reconciliation": reconciliation,
-            },
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+                "worker_still_alive": winner_observation.get("worker_still_alive"),
+                "outcome": {"terminal_state": terminal_state, **winner_envelope},
+            }
+        )
+        record.update(winner_envelope)
+        headline = winner_observation.get("headline")
+        if isinstance(headline, str) and headline.strip():
+            record["headline"] = headline.strip()
+        else:
+            record.pop("headline", None)
+    else:
+        record.pop("error", None)
+        basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
+        reconciliation = {
+            "source": "goalflight_dispatch.drain",
+            "basis": basis,
+            "reason": evaluation.get("reason"),
+            "process_evidence": evaluation.get("process_evidence"),
+            "status_evidence": evaluation.get("status_evidence"),
+            "output_evidence": evaluation.get("output_evidence"),
+            "lease_evidence": evaluation.get("lease_evidence"),
+            "controller_evidence": evaluation.get("controller_evidence"),
+            "progress_age_s": evaluation.get("progress_age_s"),
+            "checked_output": True,
+            "observed_outcome": marker is not None,
         }
-    )
+        if marker is not None:
+            reconciliation["terminal_marker_kind"] = marker.get("kind")
+            record["terminal_marker"] = marker
+        record.update(
+            {
+                "state": state,
+                "terminal_state": terminal_state,
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+                "worker_still_alive": False,
+                "reason": reason,
+                "outcome": {
+                    "terminal_state": terminal_state,
+                    "reason": reason,
+                    "reconciliation": reconciliation,
+                },
+            }
+        )
     record["attempt_id"] = winner.attempt_id
     record["transition_id"] = winner.transition_id
     record["terminal_event_uuid"] = winner.event_uuid
-    record.pop("error", None)
     elapsed_s = goalflight_ledger.elapsed_seconds(record, ended_at)
     if elapsed_s is not None:
         record["elapsed_s"] = elapsed_s
@@ -11381,7 +11440,19 @@ def reconcile_abandoned_dispatches(
                         continue
                     state, reason, marker = _abandoned_terminal_outcome(fresh)
                     post_status, post_status_evidence = _abandoned_status_payload(fresh)
-                    if post_status is None:
+                    if marker is not None and not _abandoned_worker_pid_present(
+                        fresh, post_status or {}
+                    ):
+                        entries.append(
+                            {
+                                **final_evaluation,
+                                "eligible": False,
+                                "reason": "worker_identity_indeterminate",
+                                "process_evidence": "worker_identity_absent",
+                            }
+                        )
+                        continue
+                    if post_status is None and marker is None:
                         entries.append(
                             {
                                 **final_evaluation,
@@ -11391,6 +11462,7 @@ def reconcile_abandoned_dispatches(
                             }
                         )
                         continue
+                    post_status = post_status or {}
                     _post_progress_s, post_fingerprint = _abandoned_progress_snapshot(
                         fresh, post_status
                     )
@@ -11438,6 +11510,9 @@ def reconcile_abandoned_dispatches(
                             marker=marker,
                         )
                         committed_record = fresh
+                        state = str(committed_record.get("state") or state)
+                        committed_marker = committed_record.get("terminal_marker")
+                        marker = committed_marker if isinstance(committed_marker, dict) else None
                 finally:
                     ledger_lock.release()
         finally:
@@ -11467,6 +11542,17 @@ def reconcile_abandoned_dispatches(
     for project_root in changed_projects:
         _export_dashboard_status_for_project(project_root)
     if not dry_run:
+        # Terminal authority and its result event are one durable journal
+        # transition, but the inbox is a derived projection. Reuse the
+        # existing journal outbox projector so a launcher-death recovery
+        # publishes the event exactly once even when the watcher never got
+        # that far.
+        for project_root in changed_projects:
+            with contextlib.suppress(Exception):
+                authority = goalflight_journal.open_or_create_journal(project_root)
+                authority.project_terminal_outbox(
+                    messages_dir=goalflight_messages.default_messages_dir()
+                )
         goalflight_cursor.cleanup_dispatch_data()
     closed = [entry for entry in entries if entry.get("action") == "closed"]
     would_close = [entry for entry in entries if entry.get("action") == "would_close"]
@@ -13795,7 +13881,14 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
     status_json = Path(str(request.get("status_json") or record.get("status_path") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
     state = str(record.get("state") or record.get("terminal_state") or "worker_dead")
-    reason = record.get("reason") or record.get("error") or "claim_reconciliation"
+    outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+    reason = (
+        record.get("reason")
+        or record.get("error")
+        or outcome.get("reason")
+        or outcome.get("error")
+        or "claim_reconciliation"
+    )
     # Derived post-commit mirror only: losing it gives up status freshness, not
     # the durable terminal journal row or its outbox event. Reconciliation will
     # rebuild it, so this must not unwind the already-committed queue cleanup.
@@ -22038,7 +22131,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             worker_cwd=_worker_cwd(args),
             task_ids=getattr(args, "task_ids", None),
             worker_identity=worker_identity_token,
-            launch_detached=bool(args.launch_detached),
+            # Implicit background mode is detached too. Keep the watcher's
+            # controller-death policy aligned with the launcher's actual
+            # lifetime, for both seat and read-only dispatches.
+            launch_detached=background_launch,
             codex_dispatch_home=codex_dispatch_home,
             codex_session_id=codex_session_id,
             engine_session_id=engine_session_id,
@@ -22062,7 +22158,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     codex_session_id=codex_session_id,
                 ),
                 "worker_pid": worker_pid,
-                "detached": bool(args.launch_detached),
+                "detached": background_launch,
                 "pgid": pgid,
                 "worker_alive": True,
                 "worker_identity": worker_identity_token,

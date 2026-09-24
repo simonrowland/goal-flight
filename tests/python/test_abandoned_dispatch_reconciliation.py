@@ -24,6 +24,7 @@ import goalflight_capacity as C  # noqa: E402
 import goalflight_compat  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_messages as M  # noqa: E402
 
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
@@ -668,10 +669,13 @@ def test_conflicting_identities_for_same_pid_probe_both(
 
 def test_terminal_marker_reconciles_observed_real_outcome(tmp_path: Path) -> None:
     dispatch_id = "observed-complete"
+    worker_pid, worker_identity = _dead_worker_identity()
     _record(
         tmp_path,
         dispatch_id,
         tail_text=f"work log\nCOMPLETE: {dispatch_id} — verified result\n",
+        worker_pid=worker_pid,
+        worker_identity=worker_identity,
         **_gone_controller(),
     )
 
@@ -688,12 +692,153 @@ def test_terminal_marker_reconciles_observed_real_outcome(tmp_path: Path) -> Non
     assert reconciliation["terminal_marker_kind"] == "COMPLETE"
 
 
+def test_dead_worker_terminal_markers_reconcile_without_status_and_publish_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Stuck launcher rows close from identity-qualified worker death + tail."""
+    fixtures = (
+        ("stuck-complete-missing-status", "COMPLETE", True),
+        ("stuck-complete-frozen-status", "COMPLETE", False),
+        ("stuck-blocked-missing-status", "BLOCKED", True),
+    )
+    records: list[tuple[str, str]] = []
+    for dispatch_id, marker_kind, missing_status in fixtures:
+        worker_pid, worker_identity = _dead_worker_identity()
+        claimant_pid, claimant_identity = _dead_worker_identity()
+        record = _record(
+            tmp_path,
+            dispatch_id,
+            tail_text=f"review output\n!{marker_kind}: {dispatch_id} — verdict\n",
+            worker_pid=worker_pid,
+            worker_identity=worker_identity,
+            claimant_pid=claimant_pid,
+            claimant_identity=claimant_identity,
+            lease_id=f"lease-{dispatch_id}",
+            queue_launch_token=f"launch-{dispatch_id}",
+            **_gone_controller(),
+        )
+        if missing_status:
+            Path(str(record["status_path"])).unlink()
+        else:
+            _write_status(
+                tmp_path,
+                dispatch_id,
+                state="starting",
+                reason="watcher_launching",
+                worker_alive=True,
+                worker_pid=worker_pid,
+                expected_worker_identity=worker_identity,
+            )
+        records.append((dispatch_id, marker_kind))
+
+    # The real stuck rows may retain a live controller registry entry even
+    # though their worker is gone. A dispatch-bound terminal marker is the
+    # additional proof that makes this fallback safe.
+    monkeypatch.setattr(
+        D,
+        "_abandoned_controller_evidence",
+        lambda _record: (False, "controller_indeterminate"),
+    )
+
+    first = _run(tmp_path)
+    assert first["closed"] == len(records)
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    delivered: dict[str, list[dict]] = {}
+    for dispatch_id, marker_kind in records:
+        closed = _read(dispatch_id)
+        assert closed["state"] == ("blocked" if marker_kind == "BLOCKED" else "complete")
+        assert closed["outcome"]["reconciliation"]["terminal_marker_kind"] == marker_kind
+        inbox = M.inbox_path(messages_dir, dispatch_id)
+        delivered[dispatch_id] = M.read_envelopes(inbox)
+        assert len(delivered[dispatch_id]) == 1
+        assert delivered[dispatch_id][0]["type"] == (
+            "blocked" if marker_kind == "BLOCKED" else "result"
+        )
+
+    second = _run(tmp_path)
+    assert second["closed"] == 0
+    for dispatch_id, _marker_kind in records:
+        assert M.read_envelopes(M.inbox_path(messages_dir, dispatch_id)) == delivered[dispatch_id]
+
+
+def test_reconciliation_adopts_existing_terminal_authority(tmp_path: Path) -> None:
+    dispatch_id = "watcher-authority-wins"
+    worker_pid, worker_identity = _dead_worker_identity()
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text=f"review output\nCOMPLETE: {dispatch_id} — late marker\n",
+        worker_pid=worker_pid,
+        worker_identity=worker_identity,
+        **_gone_controller(),
+    )
+    winner = L.commit_terminal_authority(
+        record,
+        state="inconclusive_timeout",
+        reason={"reason": "watcher_post_terminal_timeout"},
+        terminal_state="inconclusive_timeout",
+        worker_still_alive=True,
+    )
+    assert winner.committed and winner.value is not None
+    Path(str(record["status_path"])).unlink()
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert closed["state"] == "inconclusive_timeout"
+    assert closed["terminal_state"] == "inconclusive_timeout"
+    assert closed["terminal_event_uuid"] == winner.value.event_uuid
+    assert closed["worker_still_alive"] is True
+    assert closed["error"] == {"reason": "watcher_post_terminal_timeout"}
+    assert closed["outcome"] == {
+        "terminal_state": "inconclusive_timeout",
+        "error": {"reason": "watcher_post_terminal_timeout"},
+    }
+    assert "terminal_marker" not in closed
+    status = json.loads(Path(str(record["status_path"])).read_text(encoding="utf-8"))
+    assert status["state"] == "inconclusive_timeout"
+    assert status["terminal_state"] == "inconclusive_timeout"
+    assert status["reason"] == {"reason": "watcher_post_terminal_timeout"}
+    assert status["terminal_marker"] is None
+    delivered = M.read_envelopes(
+        M.inbox_path(Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id)
+    )
+    assert len(delivered) == 1
+    assert delivered[0]["type"] == "blocked"
+
+
+def test_terminal_marker_without_worker_identity_stays_open(tmp_path: Path) -> None:
+    dispatch_id = "marker-without-worker-identity"
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text=f"review output\nCOMPLETE: {dispatch_id} — verdict\n",
+        **_gone_controller(),
+    )
+    Path(str(record["status_path"])).unlink()
+
+    result = _run(tmp_path)
+
+    assert result["closed"] == 0
+    assert result["kept_reasons"] == {"worker_identity_indeterminate": 1}
+    assert _read(dispatch_id)["state"] == "running"
+
+
 def test_terminal_marker_arriving_after_final_evaluation_wins(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     dispatch_id = "marker-during-close"
-    record = _record(tmp_path, dispatch_id, **_gone_controller())
+    worker_pid, worker_identity = _dead_worker_identity()
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        worker_pid=worker_pid,
+        worker_identity=worker_identity,
+        **_gone_controller(),
+    )
     tail = Path(record["stdout_path"])
     original = D._abandoned_terminal_outcome
     injected = False
