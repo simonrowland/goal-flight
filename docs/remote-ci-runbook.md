@@ -2,7 +2,7 @@
 
 The controller runs `scripts/goalflight_remote_ci.py`. All admission and run
 state lives on the configured node; no shared filesystem mount is required.
-The node needs POSIX process groups, Python 3, and flock support.
+The node needs Python 3, flock, and `launchctl submit` for a per-run coalition.
 
 ## Configuration (v2)
 
@@ -81,10 +81,10 @@ The shared directory contains `tokens/`, `tickets/`, a monotonic
 `<managed-root>/admission/runs/` are still listed, statused, cancelled, and
 cleared, and a non-released one still reserves its token index. Persistent
 token sentinels must never be unlinked. The holder keeps a separate
-incarnation lock. The workload inherits the token flock. SIGKILL of the
-holder releases that flock only when the workload did not inherit the
-descriptor; the lease stays `running` or `draining` until cleanup proves the
-tree dead and writes `released` under `queue.lock`. A second admission cannot
+incarnation lock. The holder keeps the token flock; launchd cannot inherit
+it. SIGKILL of the holder drops that flock, and the lease stays `running`
+or `draining` until cleanup proves the coalition empty and writes
+`released` under `queue.lock`. A second admission cannot
 take the token or the slot while that lease is unresolved. Numbered tickets
 are allocated under the shared queue lock;
 project request names and controller clocks do not determine cross-project
@@ -126,10 +126,18 @@ those scripts is a later change; this runner is the contract they call.
 Project commands may add artifacts inside the run directory but must not
 overwrite the holder's records.
 
+`result.json` `status` is one of `capacity-refused` (exit 75, retryable, not a dead workload), `died` (the workload's own exit, or 2 if it never produced one), `cancelled` (exit 130), or `deadline` (exit 124). Exit 77 is not a capacity refusal. A host memory or CPU guard refuses the start by writing `<managed-root>/admission/resource-floor.json`:
+
+```json
+{"refuse": "capacity"}
+```
+
+The node then does not exec, releases the token, and records `capacity-refused`. A normal exit is `status: completed`.
+
 On release the node appends one JSON line to `results/index.jsonl`
 (`run_id`, `repo`, `sha`, `slot`, `host`, `start`, `finish`, `status`,
 `exit_code`, `body_path`, `bytes`), fsyncs that file, and fsyncs the results
-directory when creating it, before any body is removed. GC deletes only
+directory on every append, before any body is removed. GC deletes only
 a released body that already has that line, has no live `pid + start_token +
 run_dir`, and has no process whose cwd is the run directory. Successful
 bodies are kept for 7 days and the newest 20. Other terminal bodies are kept
@@ -159,7 +167,7 @@ behind `runner.command` as node-local argv. v2 rejects `token_key` and
 Move live caps to the node file above.
 
 Remove `watch_command`, `collect_command`, and `cancel_command`: the node
-holder records output, watches completion, and cancels its own process group.
+holder records output, watches completion, and cancels that job's coalition.
 Remove `chunk_size` and `verbose_option`. Their former helper was never
 connected to execution. The canon no longer claims automatic chunking;
 project test policy can explicitly select `-v` and bounded selections.
@@ -207,25 +215,25 @@ Cancellation checks all three fields against the node record and requires
 `expected_owner`. The owner is the one this controller admitted or attached
 under, not a fresh read of the lease. A reattach changes the owner; a stale
 controller's cancel then returns owned and does not write `cancel.json`. The
-holder reads the cancellation request and kills **its own** process group. No
-controller process signals a guessed or reused node PID.
+holder reads the cancellation request and kills the workload's launchd
+coalition, one pid at a time, after checking that pid's start time. It does
+not signal a pid whose start time changed, including the SIGKILL after the
+grace period. No controller process signals a guessed or reused node PID.
 
 Unknown identity stays unknown and is kept. A dead holder is kept until the
 command deadline stored on the lease. After that deadline, reap sets the
-lease to `draining` and kills the workload's session with SIGTERM, a short
-grace, then SIGKILL. It also kills descendants found by `proc_listchildpids`
-while their parent is alive, any same-user process whose environment still
-has `GOALFLIGHT_REMOTE_CI_RUN=<lease_id>`, and a cwd inside the run directory.
-A cwd inside the slot is signalled only when the slot's current lease is this
-run. The token is released only after that tree is proved dead. If a
-descendant cannot be proved dead, the lease stays `draining` and the token
-index stays reserved even if the flock is gone. A descendant that removes the
-marker and is reparented before the snapshot (parent already dead) is not
-visible to `ps -axwwE` on macOS 27, which does not show another process's
-environment; that residual case stays held. `clear` is the same tree kill for
-a holder that is already dead and should not wait out the deadline. It writes
-`<managed-root>/admission/audit.log`. A live holder is not cleared. The
-controller does not keep a request-state mirror beside `result_dir`.
+lease to `draining` and signals every member of the coalition recorded when
+the workload was submitted to launchd. Descendants stay in that coalition
+across `setsid` and after the parent is reparented. The login session's
+coalition is not a kill target. Each member's pid and start time is kept on
+the lease and checked again before SIGKILL. The token is released only after
+every recorded incarnation is gone. If the job never got a private coalition,
+or the pid list cannot be read, the lease stays `draining`. A parent-version
+slot with `slot/slot.lock` held or `slot/SLOT.json` for a lease that is not
+released is not granted to a new run. `clear` is the same kill for a holder
+that is already dead. It writes `<managed-root>/admission/audit.log`. A live
+holder is not cleared. The controller does not keep a request-state mirror
+beside `result_dir`.
 
 The reaper reads node leases directly. It acts only when the owning controller
 PID is proven absent on its recorded controller hostname. A different

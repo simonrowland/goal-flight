@@ -135,31 +135,46 @@ proved tree. Cleanup signals a process in a slot only when that slot's
 current lease is the run being cleaned, so a stale reap cannot kill the next
 occupant. An unresolved slot stays reserved.
 
-The workload is started with `GOALFLIGHT_REMOTE_CI_RUN=<lease_id>`. The
-verifier looks for that marker in same-user environments (`ps -axwwE -o pid=
--o command=` and the env region of `sysctl kern.procargs2`), keeps the
-process-group check, and keeps a cwd check of the run directory. On macOS 27
-(build 26A428) `ps -axwwE` does not show another process's environment: a
-`/bin/sleep` started with the marker in its env appeared as `/bin/sleep 30`
-and nothing else, and `KERN_PROCARGS2` returned only argc and argv. While the
-parent is still alive, `proc_listchildpids` still sees a child that called
-`setsid`, changed directory to `/`, and closed its descriptors, because
-`setsid` does not reparent. That walk is what makes cancel and reap find the
-child. A descendant that scrubs `GOALFLIGHT_REMOTE_CI_RUN` and whose parent
-has already exited (the child was reparented before the snapshot) cannot be
-found. That is a residual risk: the lease stays `draining` when a recorded
-pid cannot be proved dead, and it is released when the parent was still alive
-for the snapshot and every captured pid is gone.
+The workload is a launchd job (`launchctl submit`), not a child of the
+holder. launchd gives that job its own resource coalition. Descendants
+inherit the coalition across `fork`, `setsid`, and a parent exiting.
+`proc_listcoalitions` is not in libproc. Members are enumerated without root
+by `proc_listallpids` plus `proc_pidinfo` flavor 20
+(`PROC_PIDCOALITIONINFO`): two `uint64` ids and three reserved fields, 40
+bytes. The first id is the resource coalition. On this Mac (uid 501, no
+root) a submitted `/bin/sleep` landed in coalition `(35944, 35945)` while
+the login session was `(5738, 5739)` (891 processes). After the job's
+parent exited, the setsid child was reparented to pid 1 and was still the
+only member of the job coalition. A grandchild spawned from a `SIGTERM`
+handler was in the same coalition. Cleanup signals each member only when
+its pid and start time still match the incarnation recorded for it,
+including the `SIGKILL` after the grace period. The login-session coalition
+is never a kill target. If submit does not yield a private coalition, or
+the pid list cannot be read, the lease stays `draining`. That is the
+residual: a workload that was not launched as its own job cannot be named
+without sweeping the session, so it is left held. A slot still owned by a
+parent-version `slot/SLOT.json` or `slot/slot.lock` is not granted again.
 
 Checkouts are the fixed slots `repos/<repo>/slots/s-01`…`s-N`, not a
 directory per SHA and not under `$HOME`. The controller passes `repo` from
 its config (omitted means `default`). Slot bookkeeping lives in
 `repos/<repo>/slot-meta/`, outside the checkout, so a clean git tree is not
-quarantined. The result index is fsync'd, and its directory is fsync'd when
-the file is created, before a body can be deleted. Released run bodies are
+quarantined. The result index and its directory are fsync'd on every
+append, before a body can be deleted. Released run bodies are
 capped by age and count; `results/index.jsonl` keeps one line each. Token
 sentinel files are not deleted. A conflicting cap still refuses enqueue; list
 and reap do not, so a corrected config can recover.
+
+A finished run names one of four outcomes in `result.json` `status`. They are not interchangeable, and a capacity refusal is never a dead workload:
+
+| Outcome | `status` | exit | Meaning |
+| --- | --- | --- | --- |
+| Refused to start | `capacity-refused` | 75 | Retryable. Memory or CPU floor, or the pool cannot start the job. Not death. Exit 77 is not used. |
+| Workload died | `died` | the process exit, or 2 when the process never produced one | The workload started and then failed, or launch itself failed. |
+| Cancelled | `cancelled` | 130 | An owner cancelled the run. |
+| Deadline | `deadline` | 124 | The run's deadline passed. |
+
+The host guard refuses a start by writing `<managed-root>/admission/resource-floor.json` as `{"refuse": "capacity"}`. The node does not exec, frees the token, and records `capacity-refused`. A normal completion is `status: completed` with the workload's exit code.
 
 Receipts must contain the answering node's measured hostname. Health returns
 node-measured load, hostname, and actual token locks. Shared live caps reside

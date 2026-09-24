@@ -33,10 +33,24 @@ SUCCESS_AGE_SECONDS = 7 * 24 * 3600
 FAILURE_KEEP = 50
 FAILURE_AGE_SECONDS = 14 * 24 * 3600
 TREE_GRACE_SECONDS = 0.3
+# Distinct from a dead workload. 75 is the retryable capacity refusal.
+# 77 is not used: callers were treating 77 as remote death.
+EXIT_CAPACITY = 75
+EXIT_CANCELLED = 130
+EXIT_DEADLINE = 124
 # Exported into the workload only. A descendant that scrubs this and is
 # reparented before the snapshot cannot be found; that lease stays draining.
 RUN_MARKER = "GOALFLIGHT_REMOTE_CI_RUN"
 PROC_PIDTBSDINFO = 3
+# Not in the public SDK header. The kernel accepts flavor 20 and returns
+# 40 bytes: two coalition ids, then three reserved uint64s. The first id is
+# the resource coalition. proc_listcoalitions is not in libproc; members are
+# found by scanning proc_listallpids.
+PROC_PIDCOALITIONINFO = 20
+
+
+class _CoalInfo(ctypes.Structure):
+    _fields_ = [("ids", ctypes.c_uint64 * 2), ("reserved", ctypes.c_uint64 * 3)]
 
 
 class _ProcBsdInfo(ctypes.Structure):
@@ -71,8 +85,8 @@ def _libproc():
     if lib is not None:
         return lib
     lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-    lib.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-    lib.proc_listchildpids.restype = ctypes.c_int
+    lib.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.proc_listallpids.restype = ctypes.c_int
     lib.proc_pidinfo.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
     lib.proc_pidinfo.restype = ctypes.c_int
@@ -218,7 +232,6 @@ def append_result(managed, state, run):
     }
     path = managed / "results" / "index.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    created = not path.exists()
     fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -226,13 +239,14 @@ def append_result(managed, state, run):
         os.fsync(fd)
     finally:
         os.close(fd)
-    # The directory entry has to survive before a body may be deleted.
-    if created:
-        dirfd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
+    # Every append fsyncs the directory. A retry after a crash between the
+    # file fsync and the directory fsync must not skip it just because the
+    # file is already visible.
+    dirfd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
 
 
 def result_ids(managed):
@@ -265,54 +279,6 @@ def _limit(request, key, default, numeric):
     if isinstance(value, bool) or not isinstance(value, numeric) or value < 0:
         return default
     return min(default, value)
-
-
-def group_alive(pgid):
-    try:
-        os.killpg(int(pgid), 0)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def signal_one(pid, group=False):
-    """SIGTERM, a short grace, then SIGKILL. True when the target is gone."""
-    killer = os.killpg if group else os.kill
-    try:
-        killer(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    deadline = time.monotonic() + TREE_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        if group:
-            if not group_alive(pid):
-                return True
-        else:
-            try:
-                os.kill(int(pid), 0)
-            except ProcessLookupError:
-                return True
-            except OSError:
-                return False
-        time.sleep(0.02)
-    try:
-        killer(int(pid), signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    time.sleep(0.05)
-    if group:
-        return not group_alive(pid)
-    try:
-        os.kill(int(pid), 0)
-        return False
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
 
 
 def cwd_snapshot():
@@ -352,32 +318,6 @@ def cwd_intruders(paths, allowed_pgid):
             continue
         found.append(pid)
     return found
-
-
-def _children(pid):
-    """Direct children. None means the walk itself failed.
-
-    A NULL buffer is not a count on this macOS: pass a real buffer and grow
-    until the result fits, because a short buffer returns a truncated list
-    with no overflow flag.
-    """
-    try:
-        lib = _libproc()
-    except OSError:
-        return None
-    cap = 8
-    while cap <= 4096:
-        buf = (ctypes.c_int * cap)()
-        try:
-            got = lib.proc_listchildpids(int(pid), ctypes.byref(buf), ctypes.sizeof(buf))
-        except OSError:
-            return None
-        if got < 0:
-            return None
-        if got < cap:
-            return [int(buf[i]) for i in range(got) if int(buf[i]) > 1]
-        cap *= 2
-    return None
 
 
 def _start_time(pid):
@@ -420,208 +360,288 @@ def _proven_dead(pid, started):
     return _same_process(pid, started) is False
 
 
-def _tree_pids(root_pid):
-    """Live descendant pids, including root, mapped to start times.
-
-    None means a child walk failed. setsid does not reparent, so this still
-    sees a child that called setsid, chdir'd to /, and closed its fds, for
-    as long as the recorded parent is alive. After the parent is gone the
-    child belongs to launchd and this walk cannot find it.
-    """
-    root_pid = int(root_pid)
-    seen = {}
-    stack = [root_pid]
-    while stack:
-        pid = stack.pop()
-        if pid in seen or pid <= 1:
-            continue
-        kids = _children(pid)
-        if kids is None:
-            return None
-        seen[pid] = _start_time(pid)
-        stack.extend(kid for kid in kids if kid not in seen)
-    return seen
-
-
-def _env_block(pid):
-    """Env region of KERN_PROCARGS2. Empty when the kernel strips it.
-
-    On macOS the kernel omits another process's environment, so an empty
-    block is not proof the marker is absent. The argv region is skipped so
-    a command line that mentions the variable is not a hit.
-    """
-    libc = getattr(_env_block, "libc", None)
-    if libc is None:
-        libc = ctypes.CDLL(None)
-        libc.sysctl.argtypes = [
-            ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
-        libc.sysctl.restype = ctypes.c_int
-        _env_block.libc = libc
-    mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-    size = ctypes.c_size_t(0)
-    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
-        return b""
-    if size.value <= 4 or size.value > 2_000_000:
-        return b""
-    buf = ctypes.create_string_buffer(size.value + 1)
-    size = ctypes.c_size_t(size.value)
-    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-        return b""
-    data = buf.raw[:size.value]
-    argc = int.from_bytes(data[:4], "little")
-    if argc < 0 or argc > 100000:
-        return b""
-    offset = 4
-    for _ in range(argc + 1):  # executable path, then argv
-        end = data.find(b"\0", offset)
-        if end < 0:
-            return b""
-        offset = end + 1
-    while offset < len(data) and data[offset] == 0:
-        offset += 1
-    return data[offset:]
-
-
-def _marker_pids(lease_id):
-    """Pids whose environment still carries this run's marker.
-
-    ``ps -axwwE`` is consulted because that is the documented same-user
-    interface. On macOS 27 it does not include another process's environment
-    (a sleep started with the marker produced a command line of ``/bin/sleep``
-    only). procargs2 is the second look, and it strips the env block too.
-    A positive hit is killed. No hit is not proof of absence.
-    """
-    if not isinstance(lease_id, str) or not lease_id:
-        return []
-    needle = RUN_MARKER + "=" + lease_id
-    found = []
-    try:
-        listed = subprocess.run(["ps", "-axwwE", "-o", "pid=", "-o", "command="],
-                                capture_output=True, text=True)
-    except OSError:
-        listed = None
-    if listed is not None and listed.returncode == 0:
-        for line in listed.stdout.splitlines():
-            stripped = line.strip()
-            if needle not in stripped:
-                continue
-            pid_text = stripped.split(None, 1)[0]
-            if pid_text.isdigit():
-                found.append(int(pid_text))
-    try:
-        owned = subprocess.run(["ps", "-ax", "-o", "pid=", "-o", "uid="],
-                               capture_output=True, text=True)
-    except OSError:
-        return list(dict.fromkeys(found))
-    if owned.returncode != 0:
-        return list(dict.fromkeys(found))
-    uid = str(os.getuid())
-    raw = needle.encode()
-    for line in owned.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2 or not parts[0].isdigit() or parts[1] != uid:
-            continue
-        pid = int(parts[0])
+def _as_start(value):
+    if isinstance(value, (list, tuple)) and len(value) == 2:
         try:
-            blob = _env_block(pid)
+            return (int(value[0]), int(value[1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coalition_id(pid):
+    """Resource coalition, or None when this pid cannot be queried."""
+    try:
+        lib = _libproc()
+        info = _CoalInfo()
+        size = lib.proc_pidinfo(int(pid), PROC_PIDCOALITIONINFO, 0,
+                                ctypes.byref(info), ctypes.sizeof(info))
+    except OSError:
+        return None
+    if size != ctypes.sizeof(info):
+        return None
+    cid = int(info.ids[0])
+    return cid or None
+
+
+def _all_pids():
+    """Every pid. None means the list itself failed.
+
+    A short buffer returns a truncated count with no overflow flag, same as
+    proc_listchildpids. Grow until the result fits.
+    """
+    try:
+        lib = _libproc()
+    except OSError:
+        return None
+    cap = 256
+    while cap <= 65536:
+        buf = (ctypes.c_int * cap)()
+        try:
+            got = lib.proc_listallpids(ctypes.byref(buf), ctypes.sizeof(buf))
         except OSError:
+            return None
+        if got < 0:
+            return None
+        if got < cap:
+            return [int(buf[i]) for i in range(got) if int(buf[i]) > 1]
+        cap *= 2
+    return None
+
+
+def _coalition_members(cid):
+    """(pid, start) for every process in this resource coalition.
+
+    None means the pid list failed. An empty list means the coalition has
+    no live members we can see. Pids we cannot query are not members of a
+    job we launched; those jobs are same-user and readable.
+    """
+    pids = _all_pids()
+    if pids is None:
+        return None
+    found = []
+    for pid in pids:
+        if _coalition_id(pid) != cid:
             continue
-        if raw in blob:
-            found.append(pid)
-    return list(dict.fromkeys(found))
+        found.append((pid, _start_time(pid)))
+    return found
 
 
-def _signal_if_same(pid, started, group=False):
-    """Signal only the process generation captured before the call."""
-    if pid <= 1 or pid == os.getpid():
+def _signal_incarnation(pid, started):
+    """TERM, then KILL only if the pid is still that same start time.
+
+    Returns True when that incarnation is gone. A reused pid is not signalled.
+    """
+    pid = int(pid)
+    if pid <= 1 or pid == os.getpid() or started is None:
         return False
     if _same_process(pid, started) is not True:
         return _proven_dead(pid, started)
-    return signal_one(pid, group=group)
-
-
-def _slot_marker(slot):
-    slot = Path(slot)
-    if slot.parent.name != "slots":
-        return None
-    return slot.parent.parent / "slot-meta" / (slot.name + ".json")
-
-
-def _slot_leased_by(slot, lease_id):
-    marker = _slot_marker(slot)
-    if marker is None or not marker.is_file():
-        return False
     try:
-        current = read_json(marker)
-    except (OSError, ValueError):
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
         return False
-    return current.get("state") != "free" and current.get("lease_id") == lease_id
+    deadline = time.monotonic() + TREE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        same = _same_process(pid, started)
+        if same is False:
+            return True
+        if same is None:
+            return False
+        time.sleep(0.02)
+    # The grace elapsed. The pid may have been reused since TERM.
+    if _same_process(pid, started) is not True:
+        return _proven_dead(pid, started)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    time.sleep(0.05)
+    return _proven_dead(pid, started)
+
+
+def _member_map(state):
+    found = {}
+    for member in state.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        pid = member.get("pid")
+        start = _as_start(member.get("start"))
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or start is None:
+            continue
+        found[pid] = start
+    try:
+        leader = int(state.get("workload_pid"))
+    except (TypeError, ValueError):
+        leader = None
+    leader_start = _as_start(state.get("workload_start"))
+    if leader and leader > 1 and leader_start is not None:
+        found.setdefault(leader, leader_start)
+    return found
+
+
+def _store_members(run, state, members):
+    state["members"] = [{"pid": pid, "start": [start[0], start[1]]}
+                        for pid, start in sorted(members.items())]
+    if run is None:
+        return
+    try:
+        lease = read_json(run / "lease.json")
+    except (OSError, ValueError):
+        return
+    lease["members"] = state["members"]
+    if state.get("coalition_id"):
+        lease["coalition_id"] = state["coalition_id"]
+    if state.get("workload_start"):
+        lease["workload_start"] = state["workload_start"]
+    if state.get("holder_coalition_id"):
+        lease["holder_coalition_id"] = state["holder_coalition_id"]
+    write_json(run / "lease.json", lease)
 
 
 def clear_tree(managed, state, run):
-    """Kill this run's tree. False means death was not proved.
+    """Kill every member of this run's coalition. False keeps the lease.
 
-    The process group and a cwd under the run directory are extra signals.
-    A cwd under the slot is signalled only when that slot's current lease is
-    still this run, so a stale reap cannot kill the successor. Descendants
-    that called setsid are found with proc_listchildpids while their parent
-    is alive, and by the run marker when the kernel actually exposes env.
+    Membership is the launchd resource coalition recorded at launch. A child
+    reparented to launchd, or a grandchild spawned while its parent handles
+    SIGTERM, stays in that coalition. The session coalition is never a
+    target: signalling it would hit every process in the login session.
+    Incarnations are re-checked before SIGTERM and again before SIGKILL.
     """
     del managed
-    raw = state.get("workload_pid")
-    pgid = None
-    if raw:
-        try:
-            pgid = int(raw)
-        except (TypeError, ValueError):
+    _remove_job(state.get("launch_label"))
+    cid = state.get("coalition_id")
+    holder_cid = state.get("holder_coalition_id")
+    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0 or cid == holder_cid:
+        # No private coalition was recorded. A run that never launched has
+        # no tree. Anything else is incomplete and stays held.
+        return not state.get("workload_pid") and not state.get("members")
+    persisted = _member_map(state)
+    for _ in range(5):
+        scanned = _coalition_members(cid)
+        if scanned is None:
+            _store_members(run, state, persisted)
             return False
-    owned = [str(run)]
-    slot = state.get("slot")
-    if slot and _slot_leased_by(slot, state.get("lease_id")):
-        owned.append(slot)
-    tracked = {}
-    if pgid:
-        tree = _tree_pids(pgid)
-        if tree is None:
-            return False
-        tracked.update(tree)
-    for pid in _marker_pids(state.get("lease_id")):
-        if pid <= 1 or pid == os.getpid():
-            continue
-        tracked.setdefault(pid, _start_time(pid))
-    if pgid:
-        _signal_if_same(pgid, tracked.get(pgid), group=True)
-    for pid, started in list(tracked.items()):
-        if pgid and pid == pgid:
-            continue
-        _signal_if_same(pid, started, group=False)
-    intruders = cwd_intruders(owned, pgid)
-    if intruders is None:
-        return False
-    for pid in intruders:
-        if pid <= 1 or pid == os.getpid():
-            continue
-        started = tracked.get(pid)
-        if started is None:
-            started = _start_time(pid)
-            tracked[pid] = started
-        _signal_if_same(pid, started, group=False)
-    if pgid and _same_process(pgid, tracked.get(pgid)) is True and group_alive(pgid):
-        return False
-    for pid, started in tracked.items():
-        if not _proven_dead(pid, started):
-            return False
-    again = cwd_intruders(owned, pgid)
-    if again is None or again:
-        return False
-    for pid in _marker_pids(state.get("lease_id")):
-        if pid <= 1 or pid == os.getpid():
-            continue
-        if not _proven_dead(pid, _start_time(pid)):
-            return False
-    return True
+        current = dict(persisted)
+        for pid, start in scanned:
+            if pid <= 1 or pid == os.getpid():
+                continue
+            if start is None:
+                _store_members(run, state, persisted)
+                return False
+            current[pid] = start
+        living = {}
+        for pid, start in current.items():
+            same = _same_process(pid, start)
+            if same is False:
+                continue
+            if same is None:
+                _store_members(run, state, current)
+                return False
+            living[pid] = start
+        _store_members(run, state, living)
+        if not living:
+            return True
+        for pid, start in living.items():
+            _signal_incarnation(pid, start)
+        persisted = living
+    _store_members(run, state, persisted)
+    return False
 
+
+def _job_label(lease_id):
+    return "com.goalflight.remote-ci." + str(lease_id)
+
+
+def _launchctl_job(label):
+    """(pid or None, status) from `launchctl list`, or None if the job is absent."""
+    try:
+        listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if listed.returncode != 0:
+        return None
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) < 3 or parts[-1] != label:
+            continue
+        pid_text, status = parts[0], parts[1]
+        pid = int(pid_text) if pid_text.isdigit() else None
+        code = int(status) if status.lstrip("-").isdigit() else None
+        return pid, code
+    return None
+
+
+def _remove_job(label):
+    if not label:
+        return
+    try:
+        subprocess.run(["launchctl", "remove", label], capture_output=True, text=True)
+    except OSError:
+        pass
+
+
+_WORKLOAD_WRAPPER = (
+    "import json, os, sys\n"
+    "spec = json.loads(open(sys.argv[1], encoding='utf-8').read())\n"
+    "cwd = spec.get('cwd') or ''\n"
+    "if cwd:\n"
+    "    os.chdir(cwd)\n"
+    "os.execvpe(spec['argv'][0], spec['argv'], spec['env'])\n"
+)
+
+
+def _submit_workload(run, state, argv, env, cwd):
+    """Start the command as its own launchd job. Returns (pid, start, coalition) or an error string."""
+    label = _job_label(state["lease_id"])
+    spec_path = run / "workload-spec.json"
+    wrapper_path = run / "workload-launch.py"
+    spec_path.write_text(json.dumps({"cwd": cwd or "", "argv": list(argv), "env": env}))
+    wrapper_path.write_text(_WORKLOAD_WRAPPER)
+    stdout = run / "stdout"
+    stderr = run / "stderr"
+    stdout.touch()
+    stderr.touch()
+    try:
+        submitted = subprocess.run(
+            ["launchctl", "submit", "-l", label, "-o", str(stdout), "-e", str(stderr),
+             "--", sys.executable, str(wrapper_path), str(spec_path)],
+            capture_output=True, text=True)
+    except OSError as exc:
+        return str(exc)
+    if submitted.returncode != 0:
+        return submitted.stderr.strip() or "launchctl submit failed"
+    state["launch_label"] = label
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = _launchctl_job(label)
+        if job is None:
+            time.sleep(0.02)
+            continue
+        pid, code = job
+        if pid:
+            start = _start_time(pid)
+            cid = _coalition_id(pid)
+            holder_cid = _coalition_id(os.getpid())
+            if start is None or cid is None or cid == holder_cid:
+                state["workload_pid"] = str(pid)
+                if start is not None:
+                    state["workload_start"] = [start[0], start[1]]
+                return "coalition was not private"
+            state["workload_pid"] = str(pid)
+            state["workload_start"] = [start[0], start[1]]
+            state["coalition_id"] = cid
+            state["holder_coalition_id"] = holder_cid
+            return pid, start, cid
+        state["exit_code"] = code
+        return None
+    return "launchctl job did not appear"
 
 def past_deadline(state):
     deadline = state.get("deadline_epoch")
@@ -743,6 +763,13 @@ def reserved_token_indexes(managed):
     return found
 
 
+def _slot_marker(slot):
+    slot = Path(slot)
+    if slot.parent.name != "slots":
+        return None
+    return slot.parent.parent / "slot-meta" / (slot.name + ".json")
+
+
 def _free_slot_marker(lease):
     slot = lease.get("slot")
     if not slot:
@@ -834,6 +861,45 @@ def finish_dead_workload(root, run, state, action):
     return {"status": "cancelled" if action == "deadline" else "cleared", "killed": True}
 
 
+def _legacy_slot_held(slot):
+    """Parent-version ownership: slot/slot.lock and slot/SLOT.json.
+
+    Do not create those files. A missing lock is not ownership. An unreadable
+    marker stays reserved.
+    """
+    lock_path = slot / "slot.lock"
+    if lock_path.exists() and locked(lock_path):
+        return True
+    marker = slot / "SLOT.json"
+    if not marker.is_file():
+        return False
+    try:
+        current = read_json(marker)
+    except (OSError, ValueError):
+        return True
+    if current.get("state") == "free":
+        return False
+    run_dir = current.get("run_dir")
+    if not run_dir:
+        return True
+    try:
+        previous = read_json(Path(run_dir) / "lease.json")
+    except (OSError, ValueError):
+        return True
+    return previous.get("state") != "released"
+
+
+def _drop_legacy_slot_files(slot):
+    """Remove a released generation's metadata from inside the checkout."""
+    for name in ("SLOT.json", "slot.lock"):
+        path = slot / name
+        if path.is_file() and not path.is_symlink():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def lease_slot(managed, repo, count, state):
     """Reuse s-01..s-N. Never create s-(N+1). An unresolved lease stays reserved."""
     meta_root = managed / "repos" / repo / "slot-meta"
@@ -845,6 +911,10 @@ def lease_slot(managed, repo, count, state):
         lock = try_lock(meta_root / (name + ".lock"))
         if lock is None:
             continue
+        if _legacy_slot_held(slot):
+            lock.close()
+            continue
+        _drop_legacy_slot_files(slot)
         marker = meta_root / (name + ".json")
         if marker.exists():
             try:
@@ -1043,6 +1113,19 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         state['started_at'] = time.time()
         state['deadline_epoch'] = state['started_at'] + float(command['timeout'])
         write_json(run / 'lease.json', state)
+        floor = root.parent / 'admission' / 'resource-floor.json'
+        if floor.is_file():
+            try:
+                decision = read_json(floor)
+            except (OSError, ValueError):
+                decision = {'refuse': 'capacity'}
+            if decision.get('refuse') == 'capacity':
+                # The host guard refused the start. This is not a dead workload.
+                state['release_reason'] = 'capacity-refused'
+                write_json(run / 'result.json', {
+                    'returncode': EXIT_CAPACITY, 'timed_out': False,
+                    'status': 'capacity-refused'})
+                return
         env = os.environ.copy()
         env.update(command['env'])
         env['GOALFLIGHT_REMOTE_CI_REMOTE_PID'] = state['remote_run']['pid']
@@ -1052,43 +1135,76 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         env['GOALFLIGHT_REMOTE_CI_RESULT_INDEX'] = str(root.parent / 'results' / 'index.jsonl')
         # Set after the command env so a caller cannot substitute another run.
         env[RUN_MARKER] = state['lease_id']
-        with (run / 'stdout').open('w') as out, (run / 'stderr').open('w') as err:
-            # The workload is its own session so killing the holder does not
-            # silently reap it, and so cancel can signal that group alone.
-            # The token fd is inherited and stays held until the tree is gone.
-            token_fd = token.fileno()
-            os.set_inheritable(token_fd, True)
-            child = subprocess.Popen(command['argv'], env=env, stdout=out,
-                                     stderr=err, stdin=subprocess.DEVNULL,
-                                     cwd=state.get('slot') or None,
-                                     start_new_session=True, pass_fds=(token_fd,))
+        # launchd starts a new job, so it cannot inherit the token fd. The
+        # holder keeps that fd. Admission follows the lease, not the flock.
+        launched = _submit_workload(run, state, command['argv'], env, state.get('slot') or '')
+        if isinstance(launched, str):
+            state['release_reason'] = 'launch-failed'
+            write_json(run / 'result.json', {
+                'returncode': 2, 'timed_out': False, 'status': 'died', 'error': launched})
+        elif launched is None:
+            tree_started = False
+            code = state.get('exit_code')
+            code = 0 if code is None else code
+            write_json(run / 'result.json', {
+                'returncode': code, 'timed_out': False,
+                'status': 'completed' if code == 0 else 'died'})
+            if not clear_tree(root.parent, state, run):
+                state['release_reason'] = 'unknown-tree'
+        else:
             tree_started = True
-            state['workload_pid'] = str(child.pid)
             write_json(run / 'lease.json', state)
+            leader, leader_start, _cid = launched
             deadline = time.monotonic() + command['timeout']
-            while child.poll() is None:
+            last_scan = 0.0
+            while _same_process(leader, leader_start) is True:
                 cancel_path = run / 'cancel.json'
                 cancelled = cancel_path.exists() and identity_matches(run, read_json(cancel_path))
                 if cancelled or time.monotonic() >= deadline:
                     if not clear_tree(root.parent, state, run):
                         time.sleep(0.2)
                         continue
-                    write_json(run / 'result.json', {'returncode': 124, 'timed_out': True})
-                    state['release_reason'] = 'cancelled' if cancelled else 'node-timeout'
+                    if cancelled:
+                        write_json(run / 'result.json', {
+                            'returncode': EXIT_CANCELLED, 'timed_out': False,
+                            'status': 'cancelled'})
+                        state['release_reason'] = 'cancelled'
+                    else:
+                        write_json(run / 'result.json', {
+                            'returncode': EXIT_DEADLINE, 'timed_out': True,
+                            'status': 'deadline'})
+                        state['release_reason'] = 'node-timeout'
                     break
-                time.sleep(0.02)
+                now = time.monotonic()
+                if now - last_scan >= 0.5:
+                    scanned = _coalition_members(state['coalition_id'])
+                    if scanned is not None:
+                        living = {pid: start for pid, start in scanned if start}
+                        _store_members(run, state, living)
+                    last_scan = now
+                time.sleep(0.05)
             else:
-                write_json(run / 'result.json', {'returncode': child.returncode, 'timed_out': False})
-            if tree_started:
+                if not clear_tree(root.parent, state, run):
+                    state['release_reason'] = 'unknown-tree'
+                else:
+                    job = _launchctl_job(state.get('launch_label'))
+                    code = job[1] if job is not None else state.get('exit_code')
+                    code = 0 if code is None else code
+                    write_json(run / 'result.json', {
+                        'returncode': code, 'timed_out': False,
+                        'status': 'completed' if code == 0 else 'died'})
+            if tree_started and state.get('release_reason') != 'unknown-tree':
                 while not clear_tree(root.parent, state, run):
                     time.sleep(0.2)
     except BaseException as exc:
-        write_json(run / 'result.json', {'returncode': 2, 'timed_out': False, 'error': str(exc)})
+        write_json(run / 'result.json', {
+            'returncode': 2, 'timed_out': False, 'status': 'died', 'error': str(exc)})
     finally:
         ticket.unlink(missing_ok=True)
         try:
             _release_holder(root, run, state, token)
         finally:
+            _remove_job(state.get('launch_label'))
             if slot_lock is not None:
                 slot_lock.close()
             ticket_lock.close()

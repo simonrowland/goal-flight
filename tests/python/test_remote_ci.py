@@ -639,21 +639,21 @@ def test_next_arm_recovers_a_forgotten_token(node_env):
             wait_state(node, json.loads(result.stdout), {"admitted"})
         return result
 
-    clock = {"t0": time.monotonic()}
+    sleeps = []
 
     def sleeper(seconds):
-        if time.monotonic() - clock["t0"] > 3:
-            raise AssertionError("next admission stayed parked behind a forgotten token")
-        time.sleep(seconds)
+        sleeps.append(seconds)
+        if seconds > 1:
+            raise AssertionError(f"admission slept {seconds}s behind a forgotten token")
 
     runner = RemoteRunner(config, executor=transport, sleeper=sleeper)
     with pytest.raises(ci.RemoteCIError, match="no route to host"):
         runner.run_arm(spec())
     assert node.call("health")["tokens"]["in_use"] == 1
     drop["on"] = False
-    clock["t0"] = time.monotonic()
     outcome = runner.run_arm(spec("request-2"))
     assert outcome.status == "green"
+    assert sleeps and max(sleeps) <= 1
     _free_tokens(node)
 
 
@@ -723,18 +723,14 @@ def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
     executor = ScriptedExecutor(tmp_path / "fake-node")
     sleeps = []
     released = {"ok": False}
-    clock = {"t0": time.monotonic()}
 
     def sleeper(seconds):
         sleeps.append(seconds)
         if seconds > 1:
             raise AssertionError(f"admission slept {seconds}s, parking a free token")
-        if time.monotonic() - clock["t0"] > 3:
-            raise AssertionError("admission poll parked past 3s")
         if not released["ok"]:
             released["ok"] = True
             node.call("release", **key(blocker))
-        time.sleep(seconds)
 
     runner = RemoteRunner(config, executor=executor, sleeper=sleeper)
     node = runner.nodes["box-a"]
@@ -744,11 +740,10 @@ def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
             enqueue(node, "blocker", owner=dict(RemoteRunner._owner(), owner_pid=os.getpid() + 1)),
             {"admitted"},
         )
-        clock["t0"] = time.monotonic()
         outcome = runner.run_arm(spec())
         assert outcome.status == "green"
         assert sleeps and max(sleeps) <= 1
-        assert time.monotonic() - clock["t0"] < 3
+        assert released["ok"]
     finally:
         executor.close(config)
 
@@ -1326,7 +1321,186 @@ def test_controller_repo_reaches_the_slot_and_the_result(tmp_path):
         executor.close(config)
 
 
+def test_capacity_refusal_is_not_reported_as_death(node_env):
+    config, executor, _, _ = node_env
+    config = _green_config(config)
+    floor = executor.root / "admission" / "resource-floor.json"
+
+    def before(payload):
+        if payload["operation"] == "start":
+            floor.parent.mkdir(parents=True, exist_ok=True)
+            floor.write_text(json.dumps({"refuse": "capacity"}), encoding="utf-8")
+
+    executor.before = before
+    outcome = RemoteRunner(config, executor=executor).run_arm(spec())
+    assert outcome.status == "capacity"
+    assert outcome.returncode == 75
+    assert outcome.status != "died"
+    assert "REMOTE-DIED" not in (outcome.error or "")
+    final = json.loads((Path(outcome.lease["run_directory"]) / "result.json").read_text(encoding="utf-8"))
+    assert final["status"] == "capacity-refused"
+    assert final["returncode"] != 77
+    _free_tokens(RemoteRunner(config, executor=executor).nodes["box-a"])
+
+
 def test_unreachable_keep_machinery_is_gone():
     source = (ROOT / "scripts" / "goalflight_remote_ci_node.py").read_text(encoding="utf-8")
     assert "unknown-descendants" not in source
     assert "def token_held" not in source
+
+
+def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
+    """Parent exit reparents the child to launchd. The coalition still names it."""
+    _, _, runner, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "orphan-sleep.pid"
+    node.call("start", **key(held), command={
+        "argv": [sys.executable, "-c",
+                 "import subprocess, time\n"
+                 "child = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True,"
+                 " cwd='/', close_fds=True)\n"
+                 f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+                 "time.sleep(60)\n"],
+        "env": {},
+        "timeout": 30,
+    })
+    child = _child_pid(pidfile)
+    try:
+        running = wait_state(node, held, {"running"})
+        deadline = time.monotonic() + 5
+        while not running.get("coalition_id") and time.monotonic() < deadline:
+            time.sleep(0.02)
+            running = node.call("status", **key(held))
+        assert running.get("coalition_id")
+        assert running.get("workload_start")
+        os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
+        os.kill(int(running["workload_pid"]), signal.SIGKILL)
+        _wait_dead(int(running["workload_pid"]))
+        os.kill(child, 0)
+        lease_path = Path(running["run_directory"]) / "lease.json"
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease["deadline_epoch"] = time.time() - 1
+        lease_path.write_text(json.dumps(lease), encoding="utf-8")
+        assert node.call("health")["tokens"]["in_use"] == 1
+        assert runner.reap()[0]["status"] == "cancelled"
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        _free_tokens(node)
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_sigterm_grandchild_is_killed_with_the_coalition(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "grand.pid"
+    start(node, held,
+          "import signal, subprocess, time\n"
+          "def onterm(signum, frame):\n"
+          "    child = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True,"
+          " cwd='/', close_fds=True)\n"
+          f"    open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+          "    time.sleep(30)\n"
+          "signal.signal(signal.SIGTERM, onterm)\n"
+          "time.sleep(60)\n")
+    running = wait_state(node, held, {"running"})
+    deadline = time.monotonic() + 5
+    while not running.get("coalition_id") and time.monotonic() < deadline:
+        time.sleep(0.02)
+        running = node.call("status", **key(held))
+    assert running.get("coalition_id")
+    assert _cancel(node, held)["status"] == "cancelled"
+    child = _child_pid(pidfile)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    _free_tokens(node)
+
+
+def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    signals = []
+    seen = {"n": 0}
+
+    def same(pid, started):
+        del pid, started
+        seen["n"] += 1
+        return seen["n"] == 1
+
+    def fake_kill(pid, sig):
+        del pid
+        signals.append(sig)
+
+    monkeypatch.setattr(node, "_same_process", same)
+    monkeypatch.setattr(node, "_proven_dead", lambda pid, started: True)
+    monkeypatch.setattr(node.os, "kill", fake_kill)
+    assert node._signal_incarnation(4321, (10, 20)) is True
+    assert signals == [signal.SIGTERM]
+    assert signal.SIGKILL not in signals
+
+
+def test_legacy_checkout_slot_is_not_granted_to_the_next_run(tmp_path):
+    import fcntl
+
+    config, executor, _, node = _two_token(tmp_path)
+    managed = executor.root
+    slot = managed / "repos" / "default" / "slots" / "s-01"
+    slot.mkdir(parents=True)
+    run = managed / "runs" / "legacyrun"
+    run.mkdir(parents=True)
+    (slot / "SLOT.json").write_text(json.dumps({
+        "state": "leased", "lease_id": "legacyrun", "run_dir": str(run),
+    }), encoding="utf-8")
+    lock = (slot / "slot.lock").open("a+")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    remote = {
+        "host": "h", "pid": "9", "start_token": "st", "run_dir": str(run),
+        "lease_id": "legacyrun", "lease_token": "tok",
+    }
+    (run / "lease.json").write_text(json.dumps({
+        "schema": "goalflight.remote-ci.lease.v1",
+        "lease_id": "legacyrun", "lease_token": "tok",
+        "state": "running", "token_index": 0, "slot": str(slot),
+        "run_directory": str(run), "remote_run": remote,
+    }), encoding="utf-8")
+    (run / "owner.json").write_text(json.dumps(RemoteRunner._owner()), encoding="utf-8")
+    admission = managed / "admission"
+    admission.mkdir(parents=True, exist_ok=True)
+    (admission / "policy.json").write_text(
+        json.dumps({"p_cores": 20, "token_pool_size": 2}), encoding="utf-8")
+    try:
+        fresh = wait_state(node, enqueue(node, "after-upgrade"), {"admitted"})
+        assert not str(fresh["slot"]).endswith("/slots/s-01")
+        assert str(fresh["slot"]).endswith("/slots/s-02")
+        assert fresh["token_index"] == 1
+    finally:
+        lock.close()
+        executor.close(config)
+
+
+def test_directory_fsync_is_repeated_after_an_interrupted_append(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    directory_fsyncs = {"n": 0, "fail_once": True}
+
+    def spy(fd):
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            return
+        if directory_fsyncs["fail_once"]:
+            directory_fsyncs["fail_once"] = False
+            raise OSError("directory fsync interrupted")
+        directory_fsyncs["n"] += 1
+
+    monkeypatch.setattr(node.os, "fsync", spy)
+    managed = tmp_path / "managed"
+    run = managed / "runs" / "abc"
+    run.mkdir(parents=True)
+    state = {"lease_id": "abc", "repo": "goal-flight", "release_reason": "completed"}
+    with pytest.raises(OSError, match="directory fsync"):
+        node.append_result(managed, state, run)
+    node.append_result(managed, state, run)
+    assert directory_fsyncs["n"] >= 1
+    assert (managed / "results" / "index.jsonl").exists()

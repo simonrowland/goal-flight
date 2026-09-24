@@ -949,9 +949,18 @@ class RemoteRunner:
             identity = RemoteRunIdentity.from_mapping(record["remote_run"])
             completed = record.get("result")
             if completed is not None:
-                if completed.get("timed_out"):
+                kind = completed.get("status")
+                if kind == "capacity-refused":
+                    return ArmOutcome(spec.arm, "capacity", 75, None, identity, lease=record)
+                if kind == "cancelled":
+                    return ArmOutcome(spec.arm, "cancelled", int(completed.get("returncode", 130)),
+                                      None, identity, cancelled=True, lease=record)
+                if kind == "deadline" or completed.get("timed_out"):
                     return ArmOutcome(spec.arm, "timeout", 124, None, identity,
                                       timed_out=True, cancelled=True, lease=record)
+                if kind == "died" and not (completed.get("stdout") or "").strip():
+                    return ArmOutcome(spec.arm, "died", int(completed.get("returncode", 2)),
+                                      None, identity, error=completed.get("error"), lease=record)
                 try:
                     receipt = receipt_from_output(completed.get("stdout", "") + "\n" + completed.get("stderr", ""))
                     if receipt.hostname != record["sample"]["hostname"]:
