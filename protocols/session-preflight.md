@@ -11,6 +11,8 @@ python3 <skill-root>/scripts/goalflight_session_status.py --controller-startup -
 python3 <skill-root>/scripts/goalflight_session_status.py --list-controllers
 ```
 
+Controller registration refuses volatile temporary project roots; register from the durable repository root.
+
 The repo-name default uses the task store canonicalizer, so a main checkout and linked
 worktree share one lease. Set `GOALFLIGHT_CONTROLLER_LABEL` only when multiple
 controllers share a project. Carry the returned `session.pid`, label, and

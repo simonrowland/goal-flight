@@ -102,6 +102,19 @@ _EXPECTED_OPTIONAL_ERRORS = (
 )
 
 
+def _controller_project_root_refusal(project_root: Path) -> str | None:
+    if os.environ.get(goalflight_task.ALLOW_VOLATILE_PROJECT_ROOT_ENV) == "1":
+        return None
+    match = goalflight_task.volatile_project_root_match(project_root)
+    if match is None:
+        return None
+    resolved, _base = match
+    return (
+        f"refusing controller registration for volatile project root {resolved}: "
+        "a reboot wipes it; register from the durable repo root"
+    )
+
+
 # --- session id (per-terminal) ----------------------------------------------
 
 
@@ -945,6 +958,9 @@ def claim_session(
 ) -> dict:
     """Claim or renew one journal lease without stealing a live generation."""
     root = goalflight_task.resolve_project_root(str(project_root))
+    refusal = _controller_project_root_refusal(root)
+    if refusal is not None:
+        raise RuntimeError(refusal)
     measured_identity = _controller_process_identity(pid)
     if measured_identity is None:
         raise RuntimeError("controller process generation is unavailable")
@@ -1227,6 +1243,13 @@ def claim_controller_startup(
     resolved_label: str | None = None
     try:
         env = os.environ if environ is None else environ
+        refusal = _controller_project_root_refusal(project_root)
+        if refusal is not None:
+            return {
+                "claimed": False,
+                "reason": "volatile_project_root",
+                "message": refusal,
+            }
         resolved_role = str(role or env.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
         if resolved_role in NON_CONTROLLER_ROLES:
             return {"claimed": False, "reason": "role_does_not_claim", "role": resolved_role}
@@ -1379,6 +1402,13 @@ def register_controller(
     hold_lock: bool = False,
 ) -> dict:
     """Create one active lease; a live incumbent returns ``label in use``."""
+    refusal = _controller_project_root_refusal(project_root)
+    if refusal is not None:
+        return {
+            "registered": False,
+            "reason": "volatile_project_root",
+            "message": refusal,
+        }
     label = _normalize_controller_label(name)
     if label is None:
         return {"registered": False, "reason": "missing_controller_label"}
@@ -1494,6 +1524,13 @@ def join_controller(
     hold_lock: bool = False,
 ) -> dict:
     """Renew the incumbent or perform an explicit generation takeover."""
+    refusal = _controller_project_root_refusal(project_root)
+    if refusal is not None:
+        return {
+            "joined": False,
+            "reason": "volatile_project_root",
+            "message": refusal,
+        }
     label = _normalize_controller_label(name)
     if label is None:
         return {"joined": False, "reason": "missing_controller_label"}
@@ -3597,6 +3634,18 @@ def main(argv: list[str] | None = None) -> int:
         except goalflight_journal.JournalError:
             raise
         except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            detail = str(exc)
+            if detail.startswith("refusing controller registration for volatile project root"):
+                print(
+                    json.dumps(
+                        {
+                            "claimed": False,
+                            "reason": "volatile_project_root",
+                            "message": detail,
+                        }
+                    )
+                )
+                return 0
             print(
                 json.dumps(
                     {

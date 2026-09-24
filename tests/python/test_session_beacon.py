@@ -21,6 +21,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_compat as compat  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_task as task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
@@ -40,6 +41,37 @@ def _root(
     root = tmp_path / name
     root.mkdir()
     return root
+
+
+def test_controller_registration_refuses_volatile_root_before_registry_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    assert task.volatile_project_root_match(root) is not None
+    monkeypatch.delenv(task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, raising=False)
+
+    def unexpected_registry_write(*_args, **_kwargs):
+        raise AssertionError("registry must not be opened")
+
+    monkeypatch.setattr(
+        sessions.goalflight_journal,
+        "open_or_create_journal",
+        unexpected_registry_write,
+    )
+    registered = sessions.register_controller(root, "engine", session_id="nonce")
+    joined = sessions.join_controller(root, "engine", session_id="nonce")
+    startup = sessions.claim_controller_startup(root, label="engine", environ={})
+
+    for result, key in (
+        (registered, "registered"),
+        (joined, "joined"),
+        (startup, "claimed"),
+    ):
+        assert result[key] is False
+        assert result["reason"] == "volatile_project_root"
+        assert str(root.resolve()) in result["message"]
+        assert "a reboot wipes it" in result["message"]
+        assert "durable repo root" in result["message"]
 
 
 def test_controller_startup_adopts_live_incumbent_label_and_advertises_reseat(
