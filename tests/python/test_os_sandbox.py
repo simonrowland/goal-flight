@@ -365,6 +365,16 @@ def case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior() -> None:
         goalflight_dispatch.goalflight_compat.is_macos = old_is_macos
 
 
+def case_dispatch_read_only_acp_cfg_without_worker_is_exempt() -> None:
+    cfg = argparse.Namespace(
+        agent="claude",
+        shape="acp",
+        os_sandbox=OS_SANDBOX_READ_ONLY,
+        read_only=False,
+    )
+    assert goalflight_dispatch._occupancy_exempt_read_only(cfg) is True
+
+
 def case_claude_read_only_requests_profile_on_unsupported_platform() -> None:
     old_is_macos = goalflight_dispatch.goalflight_compat.is_macos
     args = argparse.Namespace(
@@ -1554,6 +1564,7 @@ def main() -> None:
     case_os_sandbox_request_distinguishes_manifest_read_failures()
     case_repo_runner_sandbox_adapters_are_platform_scoped()
     case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior()
+    case_dispatch_read_only_acp_cfg_without_worker_is_exempt()
     case_claude_read_only_requests_profile_on_unsupported_platform()
     case_shell_wrapper_guards_os_sandbox_to_darwin()
     case_prepare_wrapper_blocks_home_write()

@@ -3073,7 +3073,8 @@ def _steer_file(dispatch_id: str) -> Path:
 
 
 def _raw_worker_args(args) -> list[str]:
-    return args.worker[1:] if args.worker and args.worker[0] == "--" else args.worker
+    worker = getattr(args, "worker", None) or []
+    return worker[1:] if worker and worker[0] == "--" else worker
 
 
 def _prompt_requested(args) -> bool:

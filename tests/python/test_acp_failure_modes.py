@@ -1460,8 +1460,11 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             process_table_file,
             delay_s=0.2,
         )
+        # The outer-bound verdict is intentionally indeterminate and the
+        # worker must still exist while the delayed probes finish. Reuse the
+        # blocking fixture so host load cannot make a finite fake exit first.
         returncode, status, stdout, stderr = _run_fake_runner(
-            "thought_stream_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.02,
             wedge_samples=99,
@@ -1469,8 +1472,7 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             max_quiet_s=0.05,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.1",
-                "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
                 "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
@@ -2763,11 +2765,12 @@ def case_env_ipc_paths_are_constrained() -> None:
     try:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            state = tmp / "state"
+            # The isolated wrapper owns this state root; do not replace it
+            # with a test-local root while validating the path guard.
+            state = goalflight_compat.resolve_state_dir()
             dispatch = state / "dispatch"
-            dispatch.mkdir(parents=True)
+            dispatch.mkdir(parents=True, exist_ok=True)
 
-            os.environ["GOALFLIGHT_STATE_DIR"] = str(state)
             os.environ["GOALFLIGHT_STEER_FILE"] = str(dispatch / "worker.steer.jsonl")
             os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
             steer, steer_source = _resolve_steer_file(argparse.Namespace(steer_file=None), "worker")
