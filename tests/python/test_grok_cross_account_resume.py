@@ -355,12 +355,15 @@ def test_failed_carry_reconstructs_prompt_and_starts_fresh(
 
     controller_prompt = tmp_path / "controller.md"
     controller_prompt.write_text("Controller says: continue from the dirty tree.\n", encoding="utf-8")
+    final_cwd = tmp_path / "reclaimed-seat"
+    final_cwd.mkdir()
     argv, _prompt_path, _session_id = _finalize_resume(
         record,
         _resume_args(),
         child_id="grok-child",
         prompt_path=controller_prompt,
         dispatch_base=tmp_path / "dispatch",
+        final_cwd=final_cwd,
     )
 
     reconstructed = Path(_option(argv, "--prompt-file"))

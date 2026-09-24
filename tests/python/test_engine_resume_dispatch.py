@@ -256,6 +256,36 @@ def test_resume_refuses_parent_missing_project_root_before_side_effects(
     ).exists()
 
 
+def test_resume_refuses_invalid_parent_project_root_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "grok-invalid-project-root"
+    record = _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="grok-code",
+        engine="grok",
+        session_id=GROK_SESSION,
+    )
+    record["project_root"] = str(tmp_path / "gone")
+    L.write_record(record)
+    prompt = tmp_path / "invalid-root.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-invalid-project-root-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    err = capsys.readouterr().err
+    assert f"parent project_root {tmp_path / 'gone'}" in err
+    assert "missing or invalid" in err
+    assert not L.record_path(child_id).exists()
+
+
 def test_resume_verb_passes_grok_lineage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

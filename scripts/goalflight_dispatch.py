@@ -2131,6 +2131,8 @@ def _validate_resume_worktree_source(
         ):
             return
         _resume_worktree_branch_spec(project_root, parent_dispatch_id, record)
+    except goalflight_task.TaskError as exc:
+        raise DispatchUsageError(f"resume refused: parent project_root {raw_root} is missing or invalid") from exc
     except goalflight_worktree_pool.WorktreeSeatError as exc:
         raise DispatchUsageError(str(exc)) from exc
 
@@ -3760,7 +3762,7 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
             candidate_root = goalflight_task.resolve_project_root(
                 str(record["project_root"])
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, goalflight_task.TaskError) as exc:
             raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: lineage ancestor {current} has an invalid project root") from exc
         if project_root is not None and candidate_root != project_root:
             raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: lineage ancestor {current} belongs to a different project root")
@@ -5980,7 +5982,8 @@ def _finalize_grok_resume(
         else:
             reconstruction_prompt = _build_grok_reconstruction_prompt(
                 record, parent_dispatch_id=str(args.parent_dispatch_id), child_dispatch_id=str(args.dispatch_id),
-                session_id=source["session_id"], cwd=final_cwd, controller_prompt=prompt_path,
+                session_id=source["session_id"], cwd=final_cwd, session_cwd=source_cwd,
+                controller_prompt=prompt_path,
             )
             resume_mode = "reconstructed"
             print("goalflight_dispatch: Grok session carry was unavailable; using resumed-by-reconstruction", file=sys.stderr)
@@ -6090,7 +6093,10 @@ def _preflight_resume_dispatch(
         resume_lock = _engine_resume_lock(engine, source["session_id"])
     else:
         resume_lock = contextlib.nullcontext()
-    resume_lock.__enter__()
+    try: resume_lock.__enter__()
+    except BaseException:
+        cleanup_codex_dispatch_home(dispatch_id) if preflight_home is not None else None
+        raise
     try:
         if engine == "codex":
             _revalidate_codex_resume_claim(
@@ -7033,6 +7039,11 @@ def _seat_session_dir(account: str, engine: str, worker_cwd: str, session_id: st
     return _account_home(account, engine) / dot / "sessions" / encoded / str(session_id)
 
 
+def _grok_session_files_present(path: Path | None) -> bool:
+    return bool(path and path.is_dir() and all(
+        (path / name).is_file() for name in ("summary.json", "chat_history.jsonl")))
+
+
 def no_healthy_seat_message(engine: str, owner_account: str, seats: list[str]) -> str:
     """Why a resume is refused when no account can run it, and what to do instead.
 
@@ -7083,9 +7094,9 @@ def migrate_seat_session(
     dst = _seat_session_dir(to_account, engine, destination_cwd, session_id)
     if src is None or dst is None:
         return False, f"engine {engine!r} has no known seat-scoped session layout"
-    if not src.is_dir():
+    if not _grok_session_files_present(src):
         return False, f"session not present on the owning seat: {src}"
-    if dst.is_dir() and any(dst.iterdir()):
+    if _grok_session_files_present(dst):
         return True, f"already present on {to_account}: {dst}"
     dst.parent.mkdir(parents=True, exist_ok=True)
     # Skip lock files: they are the ORIGINAL process's flocks. Copying them
@@ -7096,6 +7107,8 @@ def migrate_seat_session(
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
+        if dst.is_dir() and not dst.is_symlink(): shutil.rmtree(dst)
+        elif dst.exists() or dst.is_symlink(): dst.unlink()
         os.replace(tmp, dst)
     except OSError:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -7150,14 +7163,15 @@ def _build_grok_reconstruction_prompt(
     child_dispatch_id: str,
     session_id: str,
     cwd: Path,
+    session_cwd: Path | None = None,
     controller_prompt: Path,
 ) -> Path:
     """Build the bounded context given to a fresh Grok session after a carry miss."""
     owner_account = record.get("effective_account") or record.get("account")
     owner_account = owner_account if isinstance(owner_account, str) else None
-    session_dir = _seat_session_dir(
-        owner_account or "", "grok", str(cwd), session_id
-    )
+    source_session_dir = _seat_session_dir(owner_account or "", "grok", str(session_cwd or cwd), session_id)
+    final_session_dir = _seat_session_dir(owner_account or "", "grok", str(cwd), session_id)
+    session_dir = next((candidate for candidate in (source_session_dir, final_session_dir) if _grok_session_files_present(candidate)), source_session_dir)
     original_prompt = record.get("prompt_path")
     original_text = _read_reconstruction_excerpt(
         Path(original_prompt).expanduser() if isinstance(original_prompt, str) else None,
@@ -8336,12 +8350,6 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
     it into their own warnings. Only when no worker was spawned does a
     refusal raise, unchanged.
     """
-    if state == "waiting_capacity":
-        # Re-check the fused snapshot from stamp/prepare. Do not take a second
-        # registry read: a later contended open is what turned an already
-        # identified owner into "did not identify it" / unknown.
-        _prepare_attempt_controller_registration(args, project_root)
-
     spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
 
     def _record_once() -> tuple[int, dict | None]:
@@ -20915,22 +20923,12 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     + str(controller_claim.get("reason") or "unknown"),
                     file=sys.stderr,
                 )
-        # Controller ownership is checked before worktree admission so a
-        # foreign beacon cannot touch a seat. The worktree is then the last
-        # refusal point before prompt, mailbox, and tail writes.
-        worktree_seat = _admit_dispatch_worktree(args)
-        occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
-        try:
-            registration_warning = _prepare_attempt_controller_registration(
-                args,
-                project_root,
-            )
-        except DispatchUsageError as e:
-            print(f"goalflight_dispatch: {e}", file=sys.stderr)
-            return 64
+        registration_warning = _prepare_attempt_controller_registration(args, project_root)
         if registration_warning is not None:
             dispatch_warnings = [*dispatch_warnings, registration_warning]
             worker_stdout_mode = "ab"
+        worktree_seat = _admit_dispatch_worktree(args)
+        occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
         if occupancy_warning is not None:
             dispatch_warnings = [*dispatch_warnings, occupancy_warning]
             worker_stdout_mode = "ab"

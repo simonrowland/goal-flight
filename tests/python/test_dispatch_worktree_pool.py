@@ -162,6 +162,25 @@ def test_unknown_free_lock_counts_against_pool_capacity(
     assert "none recorded" not in message
 
 
+def test_existing_checkout_without_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "missing-lock")
+    seat = holder.path
+    holder.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).unlink()
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert f"{seat.name}=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

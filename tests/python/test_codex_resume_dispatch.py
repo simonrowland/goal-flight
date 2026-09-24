@@ -485,6 +485,43 @@ def test_canonical_home_launch_harvests_handle_and_validates_resume(
     assert session_id == CANONICAL_SESSION_ID
 
 
+def test_registration_check_precedes_worktree_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    account = "old-seat"
+    home = _canonical_codex_home(tmp_path, account)
+    home.mkdir(parents=True)
+    prompt = tmp_path / "registration-order.md"
+    prompt.write_text("Check registration before touching a seat.\n", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(D, "_codex_seat_api", lambda: None)
+    events: list[str] = []
+
+    def registration(*_args, **_kwargs):
+        events.append("registration")
+        return None
+
+    monkeypatch.setattr(D, "_prepare_attempt_controller_registration", registration)
+    monkeypatch.setattr(
+        D,
+        "_admit_dispatch_worktree",
+        lambda _args: events.append("worktree") or None,
+    )
+
+    assert D.main(
+        [
+            "--agent", "codex", "--account", account, "--unregistered-forced",
+            "--shape", "bash", "--dispatch-id", "registration-order",
+            "--cwd", str(tmp_path), "--prompt-file", str(prompt),
+            "--tail", str(tmp_path / "registration-order.tail"),
+            "--status-json", str(tmp_path / "registration-order.status.json"),
+            "--launch-detached",
+        ]
+    ) == 0
+    assert events == ["registration", "worktree"]
+
+
 def test_canonical_resume_home_is_exactly_bound_to_recorded_account(
     tmp_path: Path,
 ) -> None:
@@ -1011,6 +1048,68 @@ def test_resume_command_reuses_one_effective_account_preflight(
     assert child["effective_account"] == "effective-seat"
     assert child["codex_home"] == str(target)
     assert S.rollout_path(target, SESSION_ID) is not None
+
+
+def test_preflight_lock_failure_removes_its_new_codex_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "preflight-lock-parent"
+    child_id = "preflight-lock-child"
+    source_home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source_home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source_home)
+    target_home = _dispatch_home(tmp_path, child_id)
+    source = {
+        "record": record,
+        "engine": "codex",
+        "agent": "codex",
+        "shape": "bash",
+        "session_id": SESSION_ID,
+        "codex_home": source_home,
+        "codex_home_owner_dispatch_id": parent_id,
+    }
+    prompt = tmp_path / "preflight-lock.md"
+    prompt.write_text("Resume after the lock failure.\n", encoding="utf-8")
+
+    def resolve(_root: str, _account: str, dispatch_id: str):
+        assert dispatch_id == child_id
+        target_home.mkdir(parents=True)
+        return str(target_home), "new-seat"
+
+    class FailingLock:
+        def __enter__(self):
+            raise OSError("lock unavailable")
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(
+            resolve_codex_seat=resolve,
+            cleanup_dispatch_home=lambda dispatch_id: shutil.rmtree(
+                _dispatch_home(tmp_path, dispatch_id), ignore_errors=True
+            ),
+        ),
+    )
+    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
+    monkeypatch.setattr(D, "_validate_resume_worktree_source", lambda *_args: None)
+    monkeypatch.setattr(D, "_refuse_launch_blocked_by_completion_authority", lambda *_args: None)
+    monkeypatch.setattr(D, "_validate_codex_reasoning_effort", lambda *_args: None)
+    monkeypatch.setattr(D, "_codex_resume_lock", lambda *_args: FailingLock())
+
+    with pytest.raises(OSError, match="lock unavailable"):
+        D._preflight_resume_dispatch(
+            source,
+            candidate_argv=[
+                "--agent", "codex", "--shape", "bash", "--dispatch-id", child_id,
+                "--parent-dispatch-id", parent_id, "--cwd", str(tmp_path),
+                "--prompt-file", str(prompt), "--account", "new-seat",
+                "--codex-session-id", SESSION_ID, "--codex-resume-home", str(source_home),
+                "--codex-home-owner-dispatch-id", parent_id,
+            ],
+            dispatch_id=child_id,
+        )
+    assert not target_home.exists()
 
 
 def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(

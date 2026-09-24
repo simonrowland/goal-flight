@@ -115,6 +115,22 @@ def test_migration_is_idempotent(gfd, monkeypatch, tmp_path):
     assert "already present" in second[1]
 
 
+def test_incomplete_destination_is_replaced(gfd, monkeypatch, tmp_path):
+    _seed(gfd, monkeypatch, tmp_path, "gmail")
+    dst = gfd._seat_session_dir("rpp", "grok", CWD, SID)
+    dst.mkdir(parents=True)
+    (dst / "session.lock").write_text("")
+
+    ok, detail = gfd.migrate_seat_session(
+        engine="grok", session_id=SID, worker_cwd=CWD,
+        from_account="gmail", to_account="rpp",
+    )
+
+    assert ok, detail
+    assert (dst / "chat_history.jsonl").is_file()
+    assert not (dst / "session.lock").exists()
+
+
 def test_same_seat_is_a_noop(gfd, monkeypatch, tmp_path):
     _seed(gfd, monkeypatch, tmp_path, "gmail")
     ok, detail = gfd.migrate_seat_session(

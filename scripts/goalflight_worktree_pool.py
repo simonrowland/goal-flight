@@ -1517,6 +1517,8 @@ def acquire_worktree_seat(
             if occupied_target is not None and candidate_path.resolve(strict=False) == occupied_target:
                 continue
             if not candidate_lock.is_file():
+                if candidate_path.exists():
+                    note_capacity_occupant(candidate_path, {})
                 continue
             try:
                 probe_fd = os.open(candidate_lock, probe_flags, 0o600)
