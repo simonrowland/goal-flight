@@ -156,6 +156,8 @@ def _record(
     *,
     shape: str = "bash",
     worker_pid: int | None = None,
+    controller_label: str | None = None,
+    controller_session_id: str | None = None,
     stdout_path: Path | None = None,
     status_path: Path | None = None,
 ) -> None:
@@ -174,6 +176,8 @@ def _record(
                 transport="dispatch",
                 project_root=str(ROOT),
                 controller_pid=os.getpid(),
+                controller_label=controller_label,
+                controller_session_id=controller_session_id,
                 worker_pid=worker_pid,
                 acp_session_id="session-1" if shape == "acp" else None,
                 logical_session_id=dispatch_id,
@@ -349,8 +353,8 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
             assert "sender project_root" in refusal, refusal
             assert "target dispatch" in refusal, refusal
             assert "--cross-project" in refusal, refusal
-            assert len(_read_messages(tmp, dispatch_id)) == 1
-            assert len(_read_mailbox(tmp, dispatch_id)) == 1
+            assert len(_read_messages(tmp, dispatch_id)) == 2
+            assert len(_read_mailbox(tmp, dispatch_id)) == 2
 
             with _state_dir(tmp, project_root=foreign), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = goalflight_dispatch.main(
@@ -462,7 +466,12 @@ def case_steer_is_no_worker_early_exit() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         dispatch_id = "no-worker"
-        _record(tmp, dispatch_id)
+        _record(
+            tmp,
+            dispatch_id,
+            controller_label="controller-test",
+            controller_session_id="controller-session",
+        )
 
         def boom(*_args, **_kwargs):
             raise AssertionError("steer path must not acquire leases, materialize prompts, or spawn workers")

@@ -43,6 +43,7 @@ WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
 WORKER_WAIT_CLEANUP_END = "end"
 WORKER_WAIT_CLEANUP_TIMEOUT = "timeout"
 WORKER_WAIT_CLEANUP_FAILED = "failed"
+WORKER_WAIT_CLEANUP_ADMISSION = "admission"
 WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS = 1.0
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
@@ -143,6 +144,7 @@ def worker_wait_cleanup_slot_path(
         WORKER_WAIT_CLEANUP_END,
         WORKER_WAIT_CLEANUP_TIMEOUT,
         WORKER_WAIT_CLEANUP_FAILED,
+        WORKER_WAIT_CLEANUP_ADMISSION,
     }:
         raise ValueError("worker wait cleanup slot requires a known operation")
     token = str(wait_id or "").strip()
@@ -164,15 +166,13 @@ def worker_wait_cleanup_slot_path(
 def _worker_wait_reply_admission(
     path: Path,
     wait_id: str,
-    *,
-    arm_seq: int,
 ):
-    """Mark a validated reply writer while its mailbox append is in flight."""
+    """Reserve a reply-writer slot before its mailbox validation begins."""
     slot = _try_acquire_worker_wait_cleanup_slot(
         path,
-        WORKER_WAIT_CLEANUP_END,
+        WORKER_WAIT_CLEANUP_ADMISSION,
         wait_id,
-        arm_seq,
+        1,
     )
     if slot is None:
         raise TimeoutError("worker wait reply admission is already in flight")
@@ -185,15 +185,14 @@ def _worker_wait_reply_admission(
 def _worker_wait_reply_admission_held(
     path: Path,
     wait_id: str,
-    arm_seq: int,
 ) -> bool:
-    """Probe whether a validated reply writer still owns its admission mark."""
+    """Probe whether a reply writer still owns its admission slot."""
     try:
         return _worker_wait_cleanup_slot_held(
             path,
-            WORKER_WAIT_CLEANUP_END,
+            WORKER_WAIT_CLEANUP_ADMISSION,
             wait_id,
-            arm_seq,
+            1,
         )
     except (OSError, ValueError):
         return False
@@ -779,7 +778,6 @@ def append_steer_entry(
     awake_mono_ns: int | None = None,
     lock_timeout_secs: float | None = None,
     validate_existing: Callable[[list[dict]], None] | None = None,
-    write_guard: Callable[[], object] | None = None,
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
@@ -835,9 +833,7 @@ def append_steer_entry(
             ).encode("utf-8")
         except (TypeError, ValueError, OverflowError, RecursionError) as exc:
             raise ValueError(f"steer entry is not JSON-serializable: {exc}") from exc
-        guard = write_guard() if write_guard is not None else contextlib.nullcontext()
-        with guard:
-            carrier.append_bytes(encoded)
+        carrier.append_bytes(encoded)
         return entry
 
 
@@ -1174,8 +1170,6 @@ def append_worker_wait_reply(
     # Keep the classification explicit on every admitted row; a timeout race
     # must never turn a late reply into an absent context field.
     reply_context: dict[str, object] = {"late": False}
-    reply_arm_seq: list[int] = []
-
     def validate(entries: list[dict]) -> None:
         arm = next(
             (
@@ -1194,7 +1188,6 @@ def append_worker_wait_reply(
             arm_seq = int(arm["seq"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("worker wait arm has invalid seq") from exc
-        reply_arm_seq[:] = [arm_seq]
         context = arm.get("context")
         deadline_ns = (
             context.get("deadline_awake_mono_ns")
@@ -1233,24 +1226,20 @@ def append_worker_wait_reply(
         ):
             reply_context["late"] = True
 
-    return append_steer_entry(
-        path,
-        text,
-        dispatch_id=dispatch_id,
-        kind=WORKER_WAIT_REPLY_KIND,
-        reply_to=wait_id,
-        decision=normalized_decision,
-        context=reply_context or None,
-        sender=sender,
-        cross_project=cross_project,
-        validate_existing=validate,
-        lock_timeout_secs=lock_timeout_secs,
-        write_guard=lambda: _worker_wait_reply_admission(
+    with _worker_wait_reply_admission(path, wait_id):
+        return append_steer_entry(
             path,
-            wait_id,
-            arm_seq=reply_arm_seq[0],
-        ),
-    )
+            text,
+            dispatch_id=dispatch_id,
+            kind=WORKER_WAIT_REPLY_KIND,
+            reply_to=wait_id,
+            decision=normalized_decision,
+            context=reply_context or None,
+            sender=sender,
+            cross_project=cross_project,
+            validate_existing=validate,
+            lock_timeout_secs=lock_timeout_secs,
+        )
 
 
 def append_worker_wait_started(
@@ -1534,9 +1523,9 @@ def append_worker_wait_ended(
         if decision == "reply":
             if len(replies) != 1 or replies[0].get("seq") != reply_seq:
                 raise ValueError("worker wait end does not match one consumed typed reply")
-        elif decision == "timeout" and replies:
-            # A controller reply won the deadline race. Let the caller deliver
-            # it instead of recording a misleading timeout settlement.
+        elif decision in {"timeout", "failed"} and replies:
+            # A controller reply won the settlement race. Let the caller
+            # deliver it instead of recording a misleading terminal row.
             raise WorkerWaitReplyPending(arm, replies[0])
         if _worker_wait_settlement(
             entries,
@@ -1765,11 +1754,7 @@ def wait_for_worker_entries(
     def recover_admitted_reply(arm: dict) -> dict | None:
         """Recover a reply whose validated writer still owns the mailbox lock."""
         wait_id = str(arm.get("question_id") or "").strip()
-        if not wait_id or not _worker_wait_reply_admission_held(
-            path,
-            wait_id,
-            int(arm["seq"]),
-        ):
+        if not wait_id or not _worker_wait_reply_admission_held(path, wait_id):
             return None
         recovery_deadline = (
             active_monotonic() + WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS
@@ -1797,11 +1782,7 @@ def wait_for_worker_entries(
                     raise ValueError("worker wait has multiple correlated replies")
                 if replies:
                     return replies[0]
-                if not _worker_wait_reply_admission_held(
-                    path,
-                    wait_id,
-                    int(arm["seq"]),
-                ):
+                if not _worker_wait_reply_admission_held(path, wait_id):
                     return None
             time.sleep(min(poll_secs, max(0.0, recovery_deadline - active_monotonic())))
 

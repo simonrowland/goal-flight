@@ -411,6 +411,60 @@ def test_next_wait_recovers_reply_written_during_final_sleep(
     )
 
 
+def test_reply_writer_reserves_admission_before_mailbox_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = tmp_path / "reply-admission-order.steer.jsonl"
+    dispatch_id = "reply-admission-order"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2,
+        question_kind="USER-NEED",
+        question_text="reserve before locking",
+    )
+    entered_transaction = threading.Event()
+    release_transaction = threading.Event()
+    writer_errors: list[BaseException] = []
+    real_transaction = messages.carrier_transaction
+
+    @contextlib.contextmanager
+    def blocked_transaction(*args, **kwargs):
+        entered_transaction.set()
+        release_transaction.wait(timeout=5)
+        with real_transaction(*args, **kwargs) as transaction:
+            yield transaction
+
+    monkeypatch.setattr(messages, "carrier_transaction", blocked_transaction)
+
+    def write_reply() -> None:
+        try:
+            steer.append_worker_wait_reply(
+                mailbox,
+                dispatch_id=dispatch_id,
+                wait_id=str(arm["question_id"]),
+                text="reply writer admitted",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            writer_errors.append(exc)
+
+    writer = threading.Thread(target=write_reply)
+    writer.start()
+    try:
+        assert entered_transaction.wait(timeout=5), "reply writer did not reach mailbox transaction"
+        assert steer._worker_wait_reply_admission_held(
+            mailbox,
+            str(arm["question_id"]),
+        )
+    finally:
+        release_transaction.set()
+        writer.join(timeout=5)
+
+    assert not writer.is_alive(), "reply writer did not finish"
+    assert not writer_errors, writer_errors
+
+
 def test_wait_deadline_includes_mailbox_lock_acquisition(tmp_path: Path) -> None:
     mailbox = tmp_path / "locked.steer.jsonl"
     ready = tmp_path / "lock-ready"
@@ -561,9 +615,10 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
         while not ready.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert ready.exists(), "publication lock holder did not become ready"
+        settlement_started.append(time.monotonic())
         raise RuntimeError("controller carrier unavailable")
 
-    started = time.monotonic()
+    settlement_started: list[float] = []
     try:
         with pytest.raises(ValueError, match="question publication failed"):
             steer.wait_for_worker_entries(
@@ -576,7 +631,8 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
                 poll_secs=0.05,
                 publish_question=broken_publish,
             )
-        elapsed = time.monotonic() - started
+        assert settlement_started, "publication callback did not reach its lock boundary"
+        elapsed = time.monotonic() - settlement_started[0]
         assert elapsed < 0.6, f"publication settlement waited on mailbox lock: {elapsed:.3f}s"
         assert holder is not None
         holder.wait(timeout=3)
@@ -739,6 +795,64 @@ def test_unknown_waiter_identity_keeps_prior_arm_unsettled(
     assert not any(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
         and entry.get("reply_to") == arm["question_id"]
+        for entry in entries
+    ), entries
+
+
+def test_dead_waiter_failed_settlement_preserves_reply_admitted_during_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = tmp_path / "dead-waiter-reply-race.steer.jsonl"
+    dispatch_id = "dead-waiter-reply-race"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=5,
+        question_kind="USER-NEED",
+        question_text="preserve the answer",
+    )
+    monkeypatch.setattr(
+        steer.goalflight_compat,
+        "process_identity_matches",
+        lambda _pid, _token: False,
+    )
+    real_end = steer.append_worker_wait_ended
+    injected = False
+
+    def append_reply_before_failed_end(path, prior, **kwargs):
+        nonlocal injected
+        if kwargs.get("decision") == "failed" and not injected:
+            injected = True
+            steer.append_worker_wait_reply(
+                path,
+                dispatch_id=dispatch_id,
+                wait_id=str(arm["question_id"]),
+                text="durable answer",
+            )
+        return real_end(path, prior, **kwargs)
+
+    monkeypatch.setattr(steer, "append_worker_wait_ended", append_reply_before_failed_end)
+    with pytest.raises(steer.WorkerWaitReplyPending) as pending:
+        steer.append_worker_wait_started(
+            mailbox,
+            dispatch_id=dispatch_id,
+            timeout_secs=1,
+            question_kind="USER-NEED",
+            question_text="replacement question",
+        )
+
+    assert pending.value.reply["text"] == "durable answer", pending.value.reply
+    entries = steer.read_steer_entries(mailbox)
+    assert any(
+        entry.get("kind") == steer.WORKER_WAIT_REPLY_KIND
+        and entry.get("text") == "durable answer"
+        for entry in entries
+    ), entries
+    assert not any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+        and entry.get("reply_to") == arm["question_id"]
+        and entry.get("decision") == "failed"
         for entry in entries
     ), entries
 

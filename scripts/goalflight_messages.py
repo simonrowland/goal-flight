@@ -2845,6 +2845,10 @@ def post_controller_steer(
         author_capability=_presented_ambient_controller_capability(),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
+        # A steer is controller-to-worker mail. Its carrier record and worker
+        # view are authoritative; journal target resolution would only add a
+        # git-dependent side path before the record is durable.
+        project_journal_delivery=False,
     )
 
 

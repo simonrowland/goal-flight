@@ -4328,8 +4328,7 @@ def _worker_liveness_warning(record: dict) -> str | None:
     if not matched:
         return (
             f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
-            f"({reason}); message recorded but worker delivery was not attempted "
-            "and may target stale state"
+            f"({reason}); message recorded but worker delivery was not attempted"
         )
     return None
 
