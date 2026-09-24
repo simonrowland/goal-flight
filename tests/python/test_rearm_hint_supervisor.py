@@ -14,6 +14,7 @@ import subprocess
 import time
 import sys
 from types import SimpleNamespace
+from typing import BinaryIO
 
 import pytest
 
@@ -2082,6 +2083,51 @@ def test_supervise_migration_never_signals_caller_ancestor(
     assert killed == []
 
 
+def _hold_watchdog_slot(project: Path, lease: journal.LeaseIdentity) -> BinaryIO:
+    # Induce child contention without registering pytest as an incumbent.
+    # Migration correctly refuses to signal the supervisor's caller/ancestor.
+    path = wake._generation_lock_path(
+        project,
+        kind=wake.WATCHDOG_KIND,
+        label=lease.label,
+        generation_key=lease.nonce,
+    )
+    held = path.open("ab")
+    try:
+        wake._lock_nonblocking(held.fileno())
+    except BaseException:
+        held.close()
+        raise
+    return held
+
+
+def test_doctor_watchdog_contention_does_not_register_caller_for_migration(
+    isolated: tuple[Path, journal.LeaseIdentity],
+) -> None:
+    project, lease = isolated
+    with _hold_watchdog_slot(project, lease):
+        # The reporting fixture needs contention, not a migratable incumbent
+        # owned by pytest (the supervisor's caller/ancestor).
+        assert wake.live_waiters(
+            project,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+            kinds={wake.WATCHDOG_KIND},
+        ) == []
+        with pytest.raises(BlockingIOError):
+            wake.register_watchdog_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+            )
+    with wake.register_watchdog_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+    ):
+        pass
+
+
 def test_doctor_wake_coverage_reports_supervisor_state(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
@@ -2098,11 +2144,7 @@ def test_doctor_wake_coverage_reports_supervisor_state(
     parts[0] = sys.executable
     supervise_env = dict(os.environ)
     supervise_env.pop("GOALFLIGHT_DISPATCH_ID", None)
-    held_watchdog = wake.register_watchdog_waiter(
-        project,
-        controller_label=lease.label,
-        generation_key=lease.nonce,
-    )
+    held_watchdog = _hold_watchdog_slot(project, lease)
     supervisor = subprocess.Popen(
         parts,
         cwd=project,
@@ -2117,7 +2159,7 @@ def test_doctor_wake_coverage_reports_supervisor_state(
         assert stop["child"] == "watchdog"
         assert supervisor.poll() is None
 
-        # The competing watchdog is gone, but spawn_due retains the real
+        # The contention lock is released, but spawn_due retains the real
         # slot's stopped_reason.  The remaining three children stay armed.
         held_watchdog.close()
         held_watchdog = None

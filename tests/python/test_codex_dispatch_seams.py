@@ -19,7 +19,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-os.environ["GOALFLIGHT_ACP_PYTHON"] = str(ROOT / ".missing-acp-test-python")
 
 import goalflight_acp_run as A  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
@@ -35,6 +34,9 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(
+        "GOALFLIGHT_ACP_PYTHON", str(ROOT / ".missing-acp-test-python")
+    )
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))

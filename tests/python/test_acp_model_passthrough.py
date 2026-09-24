@@ -19,7 +19,6 @@ skip_posix_on_native_windows("ACP runner import is POSIX-only in this suite")
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
-os.environ.setdefault("GOALFLIGHT_ACP_PYTHON", sys.executable)
 
 import goalflight_acp_run as acp  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
