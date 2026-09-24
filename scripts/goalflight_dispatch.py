@@ -19973,6 +19973,10 @@ def main(argv: list[str] | None = None) -> int:
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
+            # Billing refusal is a pre-write guard. ID reservation, prompt
+            # materialization, occupancy bind, and capacity leases must not
+            # land first.
+            _resolve_account_env(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
