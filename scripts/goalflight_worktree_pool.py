@@ -12,9 +12,12 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import tempfile
 from typing import TextIO
 
 import goalflight_compat
+import goalflight_ledger
+from goalflight_agent_limits import load_local_overrides
 
 
 WORKTREES_PER_REPO_ENV = "GOALFLIGHT_WORKTREES_PER_REPO"
@@ -174,6 +177,9 @@ class WorktreeSeatLease:
 
 
 def configured_worktree_seats() -> int:
+    configured = load_local_overrides().get("worktrees_per_repo")
+    if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+        return configured
     raw = os.environ.get(WORKTREES_PER_REPO_ENV)
     env_name = WORKTREES_PER_REPO_ENV
     if raw is None or not raw.strip():
@@ -758,10 +764,101 @@ def _lock_metadata(lock_file: TextIO) -> dict:
 
 def _occupant_description(lock_file: TextIO, seat_name: str) -> str:
     payload = _lock_metadata(lock_file)
-    dispatch_id = str(payload.get("dispatch_id") or "unknown-dispatch")
-    pid = payload.get("pid")
-    suffix = f" pid={pid}" if isinstance(pid, int) else ""
-    return f"{seat_name}={dispatch_id}{suffix}"
+    return _holder_description(seat_name, payload)
+
+
+def _holder_record(dispatch_id: str) -> tuple[dict, bool | None]:
+    """Read worker evidence, never the allocator PID from lock metadata."""
+    record = goalflight_ledger.read_record(dispatch_id)
+    if not record or goalflight_ledger.record_is_unreadable(record):
+        return {}, None
+    record = dict(record)
+    status_path = record.get("status_path")
+    if status_path:
+        try:
+            status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return record, None
+        if not isinstance(status, dict) or status.get("dispatch_id") != dispatch_id:
+            return record, None
+        for key in ("state", "worker_pid", "wrapper_pid"):
+            if status.get(key) is not None:
+                if key == "state" and status[key] != "cancelled" and goalflight_ledger.terminal_state_for(status[key]) == "unknown":
+                    continue
+                record[key] = status[key]
+        # Watchers publish the current process snapshot (empty after exit, or
+        # a reused PID). Only the launch generation can prove this worker dead.
+        expected = status.get("expected_worker_identity") or record.get("worker_identity")
+        if expected:
+            record["worker_identity"] = expected
+        elif status.get("worker_identity"):
+            record["worker_identity"] = status["worker_identity"]
+    identity = record.get("worker_identity") or {}
+    if not isinstance(identity, dict):
+        return record, None
+    pid = record.get("worker_pid")
+    token = identity.get("start_token")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not token:
+        return record, None
+    if identity.get("pid", pid) != pid:
+        return record, None
+    return record, goalflight_compat.process_identity_matches(pid, token)
+
+
+def _holder_description(name: str, metadata: dict) -> str:
+    dispatch_id = str(metadata.get("dispatch_id") or "unknown-dispatch")
+    if Path(name).is_absolute() and Path(name).is_dir():
+        branch = _git_proc(Path(name), "rev-parse", "--abbrev-ref", "HEAD")
+        if branch is not None and branch.returncode == 0:
+            for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
+                if branch.stdout.strip().startswith(prefix + "/"):
+                    branch_id = branch.stdout.strip()[len(prefix) + 1:]
+                    if branch_id != dispatch_id:
+                        return (
+                            _holder_description(Path(name).name, {"dispatch_id": branch_id})
+                            + " / lock holder: "
+                            + _holder_description(Path(name).name, metadata)
+                        )
+                    break
+    record, live = _holder_record(dispatch_id)
+    detail = (
+        f"{Path(name).name}={dispatch_id} "
+        f"controller={record.get('controller_label') or 'unknown'} "
+        f"state={record.get('state') or 'unknown'}"
+    )
+    if live is True:
+        detail += f" worker_pid={record['worker_pid']}"
+    elif live is False:
+        detail += " worker exited"
+    else:
+        detail += " worker identity unknown"
+    if record.get("wrapper_pid"):
+        detail += f" wrapper_pid={record['wrapper_pid']}"
+    return detail
+
+
+def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
+    """Existing branch names identify holders; directory labels never do."""
+    metadata_dispatch_id = prior_dispatch_id
+    branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
+        if branch.startswith(prefix + "/"):
+            prior_dispatch_id = branch[len(prefix) + 1:]
+            break
+    holders = {prior_dispatch_id, metadata_dispatch_id} - {"unknown-dispatch"}
+    if not holders:
+        raise WorktreeSeatUnavailable(f"worktree {worktree_path} has unknown ownership")
+    for holder in holders:
+        # Resumes keep the original branch but update lock ownership. Both
+        # identities must be settled before a later dispatch may reset it.
+        record, live = _holder_record(holder)
+        state = str(record.get("state") or "")
+        terminal = goalflight_ledger.terminal_state_for(state, record.get("reason"))
+        if live is not False or (state != "cancelled" and terminal in {"", "unknown", "watcher_stopped"}):
+            raise WorktreeSeatUnavailable(
+                _holder_description(worktree_path.name, {"dispatch_id": holder})
+            )
+    return prior_dispatch_id
 
 
 def _refnames(cwd: Path) -> tuple[list[str] | None, str]:
@@ -1152,9 +1249,13 @@ def _quarantine_dirty_worktree(
     # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
     # `.goal-flight`: ignored contents were never staged, and a tracked tree is
     # put back to HEAD so it is not part of the quarantine commit.
-    _git(worktree_path, "add", "-A", "--", ".")
-    _git(worktree_path, "reset", "-q", "--", ".goal-flight")
-    tree = _git(worktree_path, "write-tree")
+    # A failed quarantine must leave both the working tree and real index intact.
+    with tempfile.TemporaryDirectory(prefix="goalflight-quarantine-") as temporary:
+        index_env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        _git(worktree_path, "read-tree", "HEAD", env=index_env)
+        _git(worktree_path, "add", "-A", "--", ".", env=index_env)
+        _git(worktree_path, "reset", "-q", "--", ".goal-flight", env=index_env)
+        tree = _git(worktree_path, "write-tree", env=index_env)
     parent = _git(worktree_path, "rev-parse", "HEAD")
     parent_tree = _git(worktree_path, "rev-parse", "HEAD^{tree}")
     if tree == parent_tree:
@@ -1200,10 +1301,24 @@ def _quarantine_dirty_worktree(
             f"quarantine commit for dirty worktree {seat_name} is empty; refusing reset"
         )
     _git(worktree_path, "update-ref", f"refs/heads/{branch}", commit, "")
+    _git(worktree_path, "update-ref", f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}", commit, "")
     return branch
 
 
-def _prepare_claimed_seat(
+def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
+    """Exclude writers using the path lock before any checkout or reset."""
+    path = kwargs["worktree_path"]
+    if path.exists() and kwargs["reset"]:
+        try:
+            occupancy = try_acquire_worktree_path_lock(path, kwargs["dispatch_id"])
+        except (WorktreePathLockBusy, WorktreePathLockUnknown) as exc:
+            raise WorktreeSeatUnavailable(str(exc)) from exc
+        with occupancy:
+            return _prepare_claimed_seat_locked(**kwargs)
+    return _prepare_claimed_seat_locked(**kwargs)
+
+
+def _prepare_claimed_seat_locked(
     *,
     project_root: Path,
     worktree_path: Path,
@@ -1218,12 +1333,10 @@ def _prepare_claimed_seat(
 ) -> WorktreeSeatLease:
     existing = worktree_path.exists() or worktree_path.is_symlink()
     safety: dict | None = None
-    # The kernel lock is the transaction guard. Remove stale diagnostic data
-    # before any bind step so a later failure cannot strand the prior holder.
-    _clear_occupant(lock_file)
     if existing:
         _verify_existing_seat(project_root, worktree_path)
         if reset:
+            prior_dispatch_id = _validate_holder(worktree_path, prior_dispatch_id)
             safety = evaluate_seat_reset_safety(
                 worktree_path,
                 base_commit=base_commit,
@@ -1278,6 +1391,16 @@ def _prepare_claimed_seat(
                 f"refusing to reset worktree {seat_name}: {pinned['reason']}"
             )
         keep_ref = str(pinned.get("keep_ref") or "") or None
+    if existing and reset:
+        keep_ref = f"refs/{KEEP_REF_PREFIX}/{prior_dispatch_id}/head"
+        head = _git(worktree_path, "rev-parse", "HEAD")
+        previous = _git_proc(worktree_path, "rev-parse", "--verify", "--quiet", keep_ref)
+        if previous is None or previous.returncode not in (0, 1):
+            raise WorktreeSeatResetRefused(f"cannot inspect saved head {keep_ref}")
+        if previous.returncode == 0 and previous.stdout.strip() != head:
+            raise WorktreeSeatResetRefused(f"refusing to overwrite saved head {keep_ref}")
+        if previous.returncode != 0:
+            _git(worktree_path, "update-ref", keep_ref, head, "")
     quarantine_branch = _quarantine_dirty_worktree(
         worktree_path,
         seat_name=seat_name,
@@ -1389,9 +1512,8 @@ def _busy_worktree_message(
         key=lambda item: str(item[1].get("acquired_at") or "9999"),
     )
     oldest = ", ".join(
-        f"{Path(name).name}={payload.get('dispatch_id') or 'unknown-dispatch'}"
-        + (f" pid={payload['pid']}" if isinstance(payload.get("pid"), int) else "")
-        for name, payload in ordered[:5]
+        _holder_description(name, payload)
+        for name, payload in ordered
     ) or "none recorded"
     return (
         f"{len(occupants)}/{limit} worktrees busy in {project_root.name}; "
@@ -1638,6 +1760,13 @@ def acquire_worktree_seat(
                 )
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
+                lock_file.close()
+                return None
+            except WorktreeSeatUnavailable:
+                resolved_path = worktree_path.resolve(strict=False)
+                if resolved_path not in occupied_paths:
+                    occupied_paths.add(resolved_path)
+                    occupants.append((str(worktree_path), _lock_metadata(lock_file)))
                 lock_file.close()
                 return None
             except BaseException:

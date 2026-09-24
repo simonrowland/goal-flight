@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_worktree_pool
+import goalflight_compat
+import goalflight_ledger
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -54,6 +56,29 @@ def make_repo(root: Path) -> Path:
     git(repo, "add", "tracked.txt")
     git(repo, "commit", "-m", "base")
     return repo
+
+
+def record_finished_holder(
+    dispatch_id: str, identity: dict | None = None, *, state: str = "complete"
+) -> None:
+    """Record exited synthetic workers separately from releasing allocator locks."""
+    identity = identity or {"pid": 2147483647, "start_token": "exited-test-worker"}
+    assert goalflight_compat.process_identity_matches(
+        identity["pid"], identity["start_token"]
+    ) is False
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": dispatch_id,
+            "state": state,
+            "worker_pid": identity["pid"],
+            "worker_identity": identity,
+        }
+    )
+
+
+def finish_seat_holder(lease: goalflight_worktree_pool.WorktreeSeatLease) -> None:
+    lease.release()
+    record_finished_holder(lease.dispatch_id)
 
 
 @contextlib.contextmanager
@@ -145,8 +170,8 @@ def test_hard_ceiling_is_lazy_and_reuses_seats() -> None:
             not any(path.name == "s-3" for path in pooled_worktrees(repo)),
         )
 
-        first.release()
-        second.release()
+        finish_seat_holder(first)
+        finish_seat_holder(second)
 
         # Acceptance property: task count is unbounded but checkout count is not.
         # Three times N sequential dispatches must reuse the existing range.
@@ -155,7 +180,7 @@ def test_hard_ceiling_is_lazy_and_reuses_seats() -> None:
                 repo, f"sequential-{index}"
             )
             assert_true("sequential reuse chooses existing seat", lease.path.name == "s-1")
-            lease.release()
+            finish_seat_holder(lease)
             assert_true("sequential count stays bounded", len(pooled_worktrees(repo)) <= 2)
         assert_true(
             "ceiling remains exact",
@@ -208,7 +233,7 @@ def test_dirty_seat_is_quarantined_then_reset_on_acquire() -> None:
         abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "abandoned")
         (abandoned.path / "tracked.txt").write_text("abandoned edit\n", encoding="utf-8")
         (abandoned.path / "abandoned.txt").write_text("preserve me\n", encoding="utf-8")
-        abandoned.release()
+        finish_seat_holder(abandoned)
 
         reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "next")
         try:
@@ -276,8 +301,12 @@ def test_sigkill_releases_kernel_lease_without_cleanup() -> None:
             else:
                 raise AssertionError("live child did not hold the kernel lease")
 
+            identity = goalflight_compat.process_start_identity(proc.pid)
+            assert identity is not None
             os.kill(proc.pid, signal.SIGKILL)
             proc.wait(timeout=10)
+
+            record_finished_holder("killed-worker", identity, state="worker_dead")
 
             replacement = goalflight_worktree_pool.acquire_worktree_seat(
                 repo, "replacement-worker"
@@ -387,8 +416,11 @@ def test_parent_release_keeps_inherited_worker_lease_until_worker_dies() -> None
             else:
                 raise AssertionError("parent release unlocked a live inherited worker seat")
 
+            identity = goalflight_compat.process_start_identity(proc.pid)
+            assert identity is not None
             os.kill(proc.pid, signal.SIGKILL)
             proc.wait(timeout=10)
+            record_finished_holder("inherited-worker", identity, state="worker_dead")
             replacement = goalflight_worktree_pool.acquire_worktree_seat(
                 repo, "after-inherited-worker-kill"
             )
@@ -471,7 +503,7 @@ def test_failed_bind_has_no_phantom_holder(
                 git(seed.path, "commit", "-m", "unique")
             elif bind_step == "quarantine":
                 (seed.path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
-            seed.release()
+            finish_seat_holder(seed)
 
         target = {
             "create": "_create_seat_worktree",
@@ -487,13 +519,16 @@ def test_failed_bind_has_no_phantom_holder(
                 return {"verdict": goalflight_worktree_pool.UNKNOWN, "reason": "injected pin failure", "keep_ref": None}
             raise RuntimeError(f"injected {bind_step} failure")
 
+        lock_path = goalflight_worktree_pool.worktree_seat_lock_path(repo, "s-1")
+        prior_occupant = lock_path.read_text(encoding="utf-8") if lock_path.exists() else ""
         monkeypatch.setattr(goalflight_worktree_pool, target, fail)
         with pytest.raises(Exception, match=f"injected {bind_step} failure"):
             goalflight_worktree_pool.acquire_worktree_seat(repo, "failed-bind")
         monkeypatch.setattr(goalflight_worktree_pool, target, original)
 
-        lock_path = goalflight_worktree_pool.worktree_seat_lock_path(repo, "s-1")
-        assert lock_path.read_text(encoding="utf-8") == ""
+        assert lock_path.read_text(encoding="utf-8") == prior_occupant
+        if bind_step == "verify":
+            record_finished_holder("failed-bind", state="failed")
         retry = goalflight_worktree_pool.acquire_worktree_seat(repo, "retry-bind")
         try:
             assert retry.path.name == "s-1"
@@ -559,7 +594,7 @@ def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
         notes.parent.mkdir(parents=True)
         notes.write_text("keep me\n", encoding="utf-8")
         (first.path / "RESULT.md").write_text("old result\n", encoding="utf-8")
-        first.release()
+        finish_seat_holder(first)
 
         reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "notes-two")
         try:
@@ -596,8 +631,8 @@ def test_free_seat_nearest_to_target_base_is_selected() -> None:
             repo, "warm-base", base=base
         )
         warm_path = warm.path
-        old.release()
-        warm.release()
+        finish_seat_holder(old)
+        finish_seat_holder(warm)
 
         (repo / "target.txt").write_text("target\n", encoding="utf-8")
         git(repo, "add", "target.txt")
@@ -612,7 +647,7 @@ def test_free_seat_nearest_to_target_base_is_selected() -> None:
             base=target,
             occupy_path=warm_path,
         )
-        exact.release()
+        finish_seat_holder(exact)
 
         selected = goalflight_worktree_pool.acquire_worktree_seat(
             repo, "target-dispatch", base=target
@@ -648,8 +683,8 @@ def test_free_ancestor_base_beats_lower_slot_unrelated_base() -> None:
         )
         lower_path = lower_unrelated.path
         higher_path = higher_ancestor.path
-        lower_unrelated.release()
-        higher_ancestor.release()
+        finish_seat_holder(lower_unrelated)
+        finish_seat_holder(higher_ancestor)
 
         selected = goalflight_worktree_pool.acquire_worktree_seat(
             repo, "target-dispatch", base=target
@@ -668,7 +703,7 @@ def test_exact_retry_base_skips_checkout() -> None:
         first = goalflight_worktree_pool.acquire_worktree_seat(
             repo, "retry-dispatch", base=base
         )
-        first.release()
+        finish_seat_holder(first)
 
         real_git = goalflight_worktree_pool._git
         checkout_calls: list[tuple[str, ...]] = []
@@ -832,7 +867,7 @@ def _reclaim_dirty_seat(repo: Path, prepare) -> tuple[str, Path]:
         prepare(abandoned.path)
         (abandoned.path / "abandoned.txt").write_text("preserve me\n", encoding="utf-8")
     finally:
-        abandoned.release()
+        finish_seat_holder(abandoned)
     reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "next")
     return _quarantine_branch(repo), reused.path
 
@@ -960,8 +995,8 @@ def test_hwm_stays_after_release() -> None:
             repo, "hwm-b", controller_label="lab"
         )
         assert_true("grew to two", {first.path.name, second.path.name} == {"s-1", "s-2"})
-        first.release()
-        second.release()
+        finish_seat_holder(first)
+        finish_seat_holder(second)
         third = goalflight_worktree_pool.acquire_worktree_seat(
             repo, "hwm-c", controller_label="lab"
         )

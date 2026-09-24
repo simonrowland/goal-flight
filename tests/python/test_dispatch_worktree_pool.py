@@ -27,6 +27,13 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch  # noqa: E402
 import goalflight_capacity  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
+from test_worktree_seat_pool import finish_seat_holder, record_finished_holder
+
+
+@pytest.fixture(autouse=True)
+def pool_ledger_matches_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -184,6 +191,8 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
         time.sleep(0.05)
     assert marker.exists(), combined
     worker_pid = int(marker.read_text(encoding="utf-8"))
+    worker_identity = goalflight_worktree_pool.goalflight_compat.process_start_identity(worker_pid)
+    assert worker_identity and worker_identity.get("start_token")
     try:
         try:
             goalflight_worktree_pool.acquire_worktree_seat(repo, "blocked-while-live")
@@ -199,6 +208,9 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             except ProcessLookupError:
                 break
             time.sleep(0.05)
+        # Killing the process releases the lock; a terminal dispatch verdict
+        # is separately required before the pool may reuse its work.
+        record_finished_holder("inherit-seat", worker_identity, state="worker_dead")
         replacement = goalflight_worktree_pool.acquire_worktree_seat(
             repo, "after-worker-death"
         )
@@ -294,7 +306,7 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
     monkeypatch.chdir(repo)
     parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
     seat = parent.path
-    parent.release()
+    finish_seat_holder(parent)
     reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
 
     args = SimpleNamespace(
@@ -310,7 +322,7 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
     try:
         with pytest.raises(
             goalflight_worktree_pool.WorktreeSeatUnavailable,
-            match=rf"s-1=reclaimer pid={os.getpid()}",
+            match=r"s-1=reclaimer.*worker identity unknown",
         ):
             goalflight_dispatch._bind_dispatch_worktree(args)
     finally:
@@ -333,7 +345,7 @@ def test_dispatch_quarantines_dirty_seat_instead_of_destroying(
     abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "abandoned")
     (abandoned.path / "tracked.txt").write_text("abandoned edit\n", encoding="utf-8")
     (abandoned.path / "abandoned.txt").write_text("preserve me\n", encoding="utf-8")
-    abandoned.release()
+    finish_seat_holder(abandoned)
 
     marker = tmp_path / "second-ready"
     worker = (
@@ -709,7 +721,9 @@ raise SystemExit(dispatch.main(sys.argv[1:]))
     assert not _launched_payload(proc.stdout), combined
     assert not marker.exists(), combined
     # A refused launch must release its seat, including on a failed SHA probe.
-    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "after-refusal")
+    lease = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "after-refusal", reset=False
+    )
     lease.release()
 
 
@@ -721,7 +735,7 @@ def test_dispatch_records_resolved_base_and_launches_from_it(
     repo = _make_repo(tmp_path)
     # Reuse a seat left at an older commit, after the project's base advances.
     previous = goalflight_worktree_pool.acquire_worktree_seat(repo, "previous-base")
-    previous.release()
+    finish_seat_holder(previous)
     base = _commit_in(repo, "advance base", "new base\n")
     marker = tmp_path / "launched-base"
     worker = (
@@ -759,7 +773,7 @@ def test_pin_and_reset_detached_ahead_of_base(
     _git(lease.path, "checkout", "--detach")
     sha = _commit_in(lease.path, "unique detached commit")
     short = _git(lease.path, "rev-parse", "--short", "HEAD")
-    lease.release()
+    finish_seat_holder(lease)
 
     nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "next-occupant")
     try:
@@ -778,7 +792,7 @@ def test_detached_ahead_seat_is_skipped_for_a_free_sibling(
     first = goalflight_worktree_pool.acquire_worktree_seat(repo, "keep-me")
     _git(first.path, "checkout", "--detach")
     sha = _commit_in(first.path, "do not clobber")
-    first.release()
+    finish_seat_holder(first)
 
     second = goalflight_worktree_pool.acquire_worktree_seat(repo, "use-wt-2")
     try:
@@ -799,7 +813,7 @@ def test_reuse_keeps_prior_named_branch_reachable(
     first = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-a")
     sha = _commit_in(first.path, "worker a finished")
     assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "worktree/worker-a"
-    first.release()
+    finish_seat_holder(first)
 
     second = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-b")
     try:
@@ -819,7 +833,7 @@ def test_pin_and_reset_when_same_branch_uniquely_holds_commits(
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
     sha = _commit_in(lease.path, "retry must not rewind this branch")
     short = _git(lease.path, "rev-parse", "--short", "HEAD")
-    lease.release()
+    finish_seat_holder(lease)
 
     nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
     try:
@@ -839,7 +853,7 @@ def test_saved_detached_commit_does_not_block_reset(
     _git(lease.path, "checkout", "--detach")
     sha = _commit_in(lease.path, "saved elsewhere")
     _git(lease.path, "branch", "rescue/already-saved")
-    lease.release()
+    finish_seat_holder(lease)
 
     reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "after-rescue")
     try:
@@ -915,7 +929,7 @@ def test_sequential_default_dispatch_reuses_one_seat(
     for name in ("seq-a", "seq-b"):
         marker = tmp_path / f"{name}.cwd"
         worker = (
-            "from pathlib import Path; import os; "
+            "from pathlib import Path; import os, time; time.sleep(0.5); "
             f"Path({str(marker)!r}).write_text(os.getcwd()); "
             f"print('COMPLETE: {name} — ok', flush=True)"
         )
