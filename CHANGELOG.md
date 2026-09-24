@@ -32,6 +32,9 @@ incremented when meaningful skill behaviour changes.
 - Watcher polling uses read-only checks and native liveness; it no longer rewrites state or spawns processes per poll.
 - Capacity is enforced per provider account as well as per engine pool (codex 30 and grok 50 sessions per account by default; configurable in the machine-local capacity profile). Existing engine-wide reservations migrate to their accounts.
 - Dispatch-ledger status reads recent records and archives old ones instead of rereading full history; liveness probing is combined and retries back off.
+- Worktree pool: writable dispatches share one repository-wide pool (default 15 worktrees) across controller labels, with safe reclaim, dirty-tree quarantine before reset, and read-only ACP dispatches never taking an exclusive worktree. Agent-facing text says worktree/account/session instead of seat; old flags remain as deprecated aliases. Downgrading to an earlier release returns to per-label worktree limits.
+- `resume` reattaches to the live controller for the dispatch's recorded label after a controller restart or reboot, instead of refusing on the original launch's controller process; a different label's controller is refused.
+- Grok resume prefers the recorded account and falls back to another healthy account by carrying the local session over, instead of refusing.
 
 ### Fixed
 
@@ -47,6 +50,10 @@ incremented when meaningful skill behaviour changes.
 - The capacity lock is re-entrant per thread, preventing self-deadlock in nested lock use.
 - `goalflight_doctor.py --json` no longer fails when the dashboard mirror is disabled (the default).
 - Read-only capacity status no longer rewrites the capacity lock file.
+- Supervisor migration never signals its caller, the caller's ancestors, or the caller's process group.
+- Reap grace loops are bounded independently of the clock; unknown process liveness is never treated as dead or as reclaimable.
+- Account validation runs before any dispatch side effect on every launch path.
+- Test-suite reliability: a hanging reap test, stale fixtures, test isolation, and environment-dependent tests were fixed across six batches.
 
 ### Deferred
 
