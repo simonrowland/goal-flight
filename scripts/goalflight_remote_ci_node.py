@@ -1,7 +1,8 @@
 """Node-side admission authority, sent through the configured remote executor.
 
 Standard library only. One managed root identifies one physical box's pool.
-The detached holder owns both its incarnation lock and its token until exit.
+The holder keeps the incarnation lock. The workload inherits the token flock,
+so the slot stays taken after the holder exits until that workload exits.
 """
 from __future__ import annotations
 
@@ -135,8 +136,15 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
                 admission_sleep(run, request['poll_seconds'])
         ticket_lock.close()
         # Admission precedes controller rendering/pushing and command creation.
+        # The controller does that bookkeeping and then writes command.json.
+        # If the reply was dropped, nobody will. Waiting forever pins the token
+        # on a live owner that reap will not touch.
+        command_deadline = time.monotonic() + float(request.get('command_wait_seconds', 30))
         while not (run / 'command.json').exists():
             if (run / 'release.json').exists():
+                return
+            if time.monotonic() >= command_deadline:
+                state['release_reason'] = 'command-wait'
                 return
             time.sleep(min(request['poll_seconds'], 0.1))
         command = read_json(run / 'command.json')
@@ -147,9 +155,14 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         env['GOALFLIGHT_REMOTE_CI_REMOTE_PID'] = state['remote_run']['pid']
         env['GOALFLIGHT_REMOTE_CI_REMOTE_START_TOKEN'] = state['remote_run']['start_token']
         with (run / 'stdout').open('w') as out, (run / 'stderr').open('w') as err:
-            # Child stays in our session/group; only this holder owns the locks.
+            # Same process group as this holder. The token fd is inherited so
+            # SIGKILL of the holder does not free the slot while the workload
+            # still runs. holder.lock is not inherited.
+            token_fd = token.fileno()
+            os.set_inheritable(token_fd, True)
             child = subprocess.Popen(command['argv'], env=env, stdout=out,
-                                     stderr=err, stdin=subprocess.DEVNULL)
+                                     stderr=err, stdin=subprocess.DEVNULL,
+                                     pass_fds=(token_fd,))
             deadline = time.monotonic() + command['timeout']
             while child.poll() is None:
                 cancel_path = run / 'cancel.json'
@@ -182,16 +195,17 @@ def dispatch(request):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     for name in ('runs', 'tokens', 'tickets'):
         (root / name).mkdir(exist_ok=True, mode=0o700)
+    operation = request['operation']
     with (root / 'queue.lock').open('a+') as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
         policy_path = root / 'policy.json'
         policy = {key: request[key] for key in ('p_cores', 'token_pool_size')}
-        if policy_path.exists():
-            if read_json(policy_path) != policy:
-                raise ValueError('shared box policy differs; use the same configured caps')
-        else:
+        if not policy_path.exists():
             write_json(policy_path, policy)
-    operation = request['operation']
+        elif operation == 'enqueue' and read_json(policy_path) != policy:
+            # A wrong cap must not take a token. Recovery (list, reap, cancel)
+            # still has to run, or the corrected config cannot clean the box.
+            raise ValueError('shared box policy differs; use the same configured caps')
     if operation == 'enqueue':
         with (root / 'queue.lock').open('a+') as guard:
             fcntl.flock(guard, fcntl.LOCK_EX)
@@ -303,6 +317,9 @@ def dispatch(request):
     if operation == 'release':
         with (run / 'command.lock').open('a+') as guard:
             fcntl.flock(guard, fcntl.LOCK_EX)
+            expected = request.get('expected_owner')
+            if expected is not None and expected != read_json(run / 'owner.json'):
+                return {'status': 'owned'}  # A reattach won the race.
             if (run / 'command.json').exists():
                 raise ValueError('started runs release only on completion or proven cancellation')
             write_json(run / 'release.json', {})

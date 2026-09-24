@@ -63,22 +63,28 @@ inside the admission token. Keep credentials out of configuration and logs.
 `daemon.pid_file` may be null. Every project targeting one physical box must
 use the **same node managed root and P-core/token defaults**, including through
 different SSH aliases. The first call pins those defaults in
-`<managed-root>/admission/policy.json`; conflicting callers fail closed.
+`<managed-root>/admission/policy.json`. A conflicting enqueue fails closed.
+list, reap, cancel, and the other recovery operations still run, so a corrected
+config can clean the box without hand-editing `policy.json`.
 The root must be absolute and durable, never under `/tmp`.
 
 The shared directory contains `tokens/`, `tickets/`, a monotonic
 `sequence.json`, `queue.lock`, and `runs/<lease-id>/`. Persistent token
-sentinels must never be unlinked. One detached node holder owns a flock token
-and a separate incarnation lock for its entire workload. SIGKILL releases its
-kernel locks. Numbered tickets are allocated under the shared queue lock;
+sentinels must never be unlinked. The holder keeps a separate incarnation
+lock. The workload inherits the token flock, so SIGKILL of the holder releases
+the incarnation lock but not the token while that workload is still running.
+A second admission cannot take the slot. Numbered tickets are allocated under the shared queue lock;
 project request names and controller clocks do not determine cross-project
 order. Abandoned tickets are removed only when their holder lock is free.
 
 Admission requires a free token **and** node-measured `load1 <= p_cores`.
-Unknown load/caps do not admit. The node polls admission at
-`queue_wait_seconds`; cancellation remains responsive during that wait.
-Tokens precede command expansion, checkout, object movement, rendering, and
-test execution.
+Unknown load/caps do not admit. The node and the controller retry a free token
+at `min(queue_wait_seconds, daemon.poll_seconds, 1)`, not at the raw queue
+wait, so a freed token is not parked for minutes. Cancellation stays
+responsive during that retry. After admission, the holder waits up to 30
+seconds for `command.json` or `release.json`, then releases the token itself.
+That bounds a dropped enqueue or release reply. Tokens precede command
+expansion, checkout, object movement, rendering, and test execution.
 
 The node holder owns the run directory's lease, identity, command, output, and
 result files. Project commands may add their artifacts there but must not
@@ -100,8 +106,9 @@ under their original admission.
 ## Migration from v1
 
 Set schema to v2 and add `boxes.<id>.remote_exec`. Move the old remote command
-behind `runner.command` as node-local argv. Remove `token_key`,
-`load_command`, `admission.token_directory`, and
+behind `runner.command` as node-local argv. v2 rejects `token_key` and
+`load_command` (they used to gate admission and are not implied by
+`getloadavg`), and rejects `admission.token_directory` and
 `admission.live_cap_file`; the node root is the shared authority.
 Move live caps to the node file above.
 
@@ -143,13 +150,14 @@ Before accepting a command, the node holder writes its PID, a node-issued
 incarnation nonce (`start_token`), and run directory to `lease.json` and
 `launch.log`. The nonce is fenced by a kernel-held `holder.lock`; it is
 not a controller-supplied PID claim. The record survives loss of the controller
-or launch response. Local running records are convenience mirrors only.
+or launch response. The controller does not keep a second copy of the lease.
 
 Cancellation checks all three fields against the node record. The holder
 reads the cancellation request and kills **its own** process group. No
 controller process signals a guessed or reused node PID. Unknown identity or
 a dead holder without a completion result remains unknown/manual; the system
-does not kill surviving processes by inference.
+does not kill surviving processes by inference. The surviving workload keeps
+the token until it exits, so the kept work does not free a pool slot.
 
 The reaper reads node leases directly. It acts only when the owning controller
 PID is proven absent on its recorded controller hostname. A different

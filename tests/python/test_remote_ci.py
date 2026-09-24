@@ -259,6 +259,17 @@ def test_obsolete_runner_settings_are_not_silently_ignored(tmp_path, field):
         DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
 
 
+@pytest.mark.parametrize("field,value", [
+    ("token_key", "old-token"),
+    ("load_command", ["custom-load-probe"]),
+])
+def test_removed_box_admission_probes_are_not_silently_ignored(tmp_path, field, value):
+    raw = _raw_config(tmp_path)
+    raw["boxes"]["box-a"][field] = value
+    with pytest.raises(ci.ConfigError, match="obsolete"):
+        DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
+
+
 def test_node_admission_never_creates_controller_paths(node_env, monkeypatch):
     config, executor, runner, node = node_env
     original = Path.mkdir
@@ -334,9 +345,9 @@ def test_run_persists_identity_before_start_and_receipt_is_measured(node_env):
     runner = RemoteRunner(config, executor=executor)
     def before(payload):
         if payload["operation"] == "start":
-            mirror = json.loads((config.state_dir / "runs" / "request-1-candidate.json").read_text())
+            mirror = config.state_dir / "runs" / "request-1-candidate.json"
+            assert not mirror.exists()
             durable = json.loads((Path(payload["run_dir"]) / "lease.json").read_text())
-            assert mirror["remote_run"] == durable["remote_run"]
             assert durable["remote_run"]["pid"]
             assert durable["remote_run"]["start_token"]
             assert durable["remote_run"]["run_dir"] == payload["run_dir"]
@@ -514,6 +525,24 @@ def test_cap_policy_mismatch_fails_closed(node_env):
         enqueue(other)
 
 
+def test_corrected_cap_can_list_and_reap(node_env, monkeypatch):
+    config, executor, _, node = node_env
+    node.call("health")
+    held = wait_state(node, enqueue(node), {"admitted"})
+    box = replace(config.boxes["box-a"], token_pool_size=2)
+    corrected = RemoteRunner(replace(config, boxes={"box-a": box}), executor=executor)
+    found = corrected.nodes["box-a"].call("list")
+    assert found[0]["lease_id"] == held["lease_id"]
+    with pytest.raises(ci.RemoteCIError, match="policy differs"):
+        enqueue(corrected.nodes["box-a"])
+    monkeypatch.setattr(ci, "_pid_alive", lambda _: False)
+    assert corrected.reap()[0]["status"] == "cancelled"
+    deadline = time.monotonic() + 5
+    while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert node.call("health")["tokens"]["in_use"] == 0
+
+
 def test_base_overlay_selection_contract(node_env):
     config, _, _, _ = node_env
     request = {"request_id": "r", "tip_sha": "a"*40, "candidate_sha": "b"*40,
@@ -530,3 +559,190 @@ def test_queue_order_is_stable(tmp_path):
     for name in ("request-002", "request-001"):
         (config.queue_dir / f"{name}.json").write_text("{}")
     assert [p.stem for p in GateDaemon(config).pending_paths()] == ["request-001", "request-002"]
+
+
+def _green_config(config):
+    receipt = (FIXTURES / "receipt-pass.json").read_text().replace(
+        "ci-worker.example.invalid", "measured-node")
+    command = (
+        sys.executable, "-c",
+        "import base64;print(base64.b64decode("
+        + repr(base64.b64encode(receipt.encode()).decode())
+        + ").decode())",
+    )
+    return replace(config, runner=replace(config.runner, command=command))
+
+
+def _free_tokens(node):
+    deadline = time.monotonic() + 5
+    while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert node.call("health")["tokens"]["in_use"] == 0
+
+
+def test_dropped_enqueue_response_does_not_stick_the_token(node_env):
+    config, executor, _, node = node_env
+    config = _green_config(config)
+
+    def transport(argv, env, timeout):
+        result = executor(argv, env, timeout)
+        if executor.calls[-1] == "enqueue":
+            return CommandResult(255, stdout=result.stdout, stderr="connection reset by peer")
+        return result
+
+    outcome = RemoteRunner(config, executor=transport).run_arm(spec())
+    assert outcome.status == "green"
+    _free_tokens(node)
+
+
+def test_live_owner_reaps_admission_whose_release_never_landed(node_env):
+    config, executor, _, node = node_env
+    config = _green_config(config)
+    drop = {"on": True}
+
+    def transport(argv, env, timeout):
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        if drop["on"] and payload["operation"] in {"status", "release", "cancel"}:
+            return CommandResult(255, stderr="no route to host")
+        result = executor(argv, env, timeout)
+        if drop["on"] and payload["operation"] == "enqueue":
+            wait_state(node, json.loads(result.stdout), {"admitted"})
+        return result
+
+    runner = RemoteRunner(config, executor=transport)
+    with pytest.raises(ci.RemoteCIError, match="no route to host"):
+        runner.run_arm(spec())
+    assert node.call("health")["tokens"]["in_use"] == 1
+    drop["on"] = False
+    assert runner.reap()[0]["status"] == "releasing"
+    _free_tokens(node)
+
+
+def test_next_arm_recovers_a_forgotten_token(node_env):
+    config, executor, _, node = node_env
+    config = _green_config(config)
+    drop = {"on": True}
+
+    def transport(argv, env, timeout):
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        if drop["on"] and payload["operation"] in {"status", "release", "cancel"}:
+            return CommandResult(255, stderr="no route to host")
+        result = executor(argv, env, timeout)
+        if drop["on"] and payload["operation"] == "enqueue":
+            wait_state(node, json.loads(result.stdout), {"admitted"})
+        return result
+
+    clock = {"t0": time.monotonic()}
+
+    def sleeper(seconds):
+        if time.monotonic() - clock["t0"] > 3:
+            raise AssertionError("next admission stayed parked behind a forgotten token")
+        time.sleep(seconds)
+
+    runner = RemoteRunner(config, executor=transport, sleeper=sleeper)
+    with pytest.raises(ci.RemoteCIError, match="no route to host"):
+        runner.run_arm(spec())
+    assert node.call("health")["tokens"]["in_use"] == 1
+    drop["on"] = False
+    clock["t0"] = time.monotonic()
+    outcome = runner.run_arm(spec("request-2"))
+    assert outcome.status == "green"
+    _free_tokens(node)
+
+
+def test_admitted_holder_releases_when_the_command_never_arrives(node_env):
+    _, _, _, node = node_env
+    forgotten = node.call(
+        "enqueue", request_id="forgotten", arm="candidate",
+        owner=RemoteRunner._owner(), command_wait_seconds=0.3,
+    )
+    other = enqueue(node, "other")
+    admitted = wait_state(node, other, {"admitted"})
+    assert admitted["lease_id"] != forgotten["lease_id"]
+    released = wait_state(node, forgotten, {"released"})
+    assert released.get("release_reason") == "command-wait"
+
+
+def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "workload.pid"
+    start(node, held,
+          "import os,time\n"
+          f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
+          "time.sleep(30)\n")
+    deadline = time.monotonic() + 5
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pidfile.exists()
+    child = int(pidfile.read_text())
+    waiting = None
+    try:
+        os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while node.call("status", **key(held))["holder_alive"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not node.call("status", **key(held))["holder_alive"]
+        os.kill(child, 0)
+        assert node.call("health")["tokens"]["in_use"] == 1
+        waiting = enqueue(node, "request-2")
+        time.sleep(0.25)
+        assert node.call("status", **key(waiting))["state"] == "queued"
+        assert node.call("health")["tokens"]["in_use"] == 1
+        result = node.call("cancel", **key(held), identity=held["remote_run"])
+        assert result["status"] == "unknown"
+        os.kill(child, 0)
+        assert node.call("health")["tokens"]["in_use"] == 1
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if waiting is not None:
+            try:
+                node.call("release", **key(waiting))
+            except ci.RemoteCIError:
+                pass
+        deadline = time.monotonic() + 5
+        while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+
+def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
+    raw = _raw_config(tmp_path, token_pool_size=1)
+    raw["admission"]["queue_wait_seconds"] = 30
+    raw["daemon"]["poll_seconds"] = 0.05
+    path = tmp_path / "remote-ci.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _green_config(load_config(path))
+    executor = ScriptedExecutor(tmp_path / "fake-node")
+    sleeps = []
+    released = {"ok": False}
+    clock = {"t0": time.monotonic()}
+
+    def sleeper(seconds):
+        sleeps.append(seconds)
+        if seconds > 1:
+            raise AssertionError(f"admission slept {seconds}s, parking a free token")
+        if time.monotonic() - clock["t0"] > 3:
+            raise AssertionError("admission poll parked past 3s")
+        if not released["ok"]:
+            released["ok"] = True
+            node.call("release", **key(blocker))
+        time.sleep(seconds)
+
+    runner = RemoteRunner(config, executor=executor, sleeper=sleeper)
+    node = runner.nodes["box-a"]
+    try:
+        blocker = wait_state(
+            node,
+            enqueue(node, "blocker", owner=dict(RemoteRunner._owner(), owner_pid=os.getpid() + 1)),
+            {"admitted"},
+        )
+        clock["t0"] = time.monotonic()
+        outcome = runner.run_arm(spec())
+        assert outcome.status == "green"
+        assert sleeps and max(sleeps) <= 1
+        assert time.monotonic() - clock["t0"] < 3
+    finally:
+        executor.close(config)

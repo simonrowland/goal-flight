@@ -104,16 +104,22 @@ Admission requires a free token and measured `load1 <= p_cores`; it precedes
 command expansion, checkout, object movement, and rendering.
 
 The node writes durable PID + incarnation token + run directory before it
-accepts the command. Its detached holder owns the token for the entire
-workload, including controller crashes. SIGKILL releases the holder's kernel
-locks. Local daemon records are convenience mirrors; reaping and lease listing
-read authoritative node state through the same `remote_exec` primitive.
+accepts the command. The workload inherits the token flock, so the slot
+outlives the holder, including a holder SIGKILL, until that workload exits.
+Reaping and lease listing read authoritative node state through the same
+`remote_exec` primitive. There is no controller-side copy of the lease. A
+live owner that has dropped the lease (lost enqueue or release reply) releases
+it on its next reap or admission wait. Another host still treats that live
+owner as busy. An admitted holder that never receives a command or a release
+drops the token after 30 seconds.
 
 Cancellation compares all identity fields and asks the proven holder to kill
 its own group. It never signals a guessed PID. Reaping also requires proof
 that the owning controller is dead; liveness from another controller host or
 an unavailable probe is unknown and cannot authorize cancellation. A dead node
-holder without completion evidence remains unknown/manual.
+holder without completion evidence remains unknown/manual, and its workload
+keeps the token. A conflicting cap still refuses enqueue; list and reap do
+not, so a corrected config can recover.
 
 Receipts must contain the answering node's measured hostname. Health returns
 node-measured load, hostname, and actual token locks. Shared live caps reside

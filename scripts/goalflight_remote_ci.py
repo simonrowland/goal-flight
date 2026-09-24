@@ -240,6 +240,11 @@ class DaemonConfig:
         for raw_name, raw_box in raw_boxes.items():
             name = _safe_id(raw_name, "box name")
             box = _mapping(raw_box, f"boxes.{name}")
+            removed = {"token_key", "load_command"} & set(box)
+            if removed:
+                raise ConfigError(
+                    f"obsolete v2 box fields: {', '.join(sorted(removed))}"
+                )
             host = _string(box.get("host"), f"boxes.{name}.host")
             remote_exec = _command(box.get("remote_exec"), f"boxes.{name}.remote_exec")
             if "{script}" not in remote_exec:
@@ -341,18 +346,33 @@ def load_config(path: str | os.PathLike[str]) -> DaemonConfig:
     return DaemonConfig.from_mapping(raw, path=config_path)
 
 
+def admission_poll_interval(queue_wait_seconds: float, poll_seconds: float) -> float:
+    """How often to retry a free token.
+
+    queue_wait_seconds is the caller's patience, not the sleep. Sleeping that
+    long (and the same interval on the node) left a freed token idle for minutes.
+    Poll at least once a second, sooner when either configured interval is shorter.
+    """
+    return min(queue_wait_seconds, poll_seconds, 1.0)
+
+
 class RemoteNode:
     """One transport primitive; all admission operations execute on the node."""
 
-    def __init__(self, box: BoxConfig, admission: AdmissionConfig, executor: Any) -> None:
+    def __init__(self, box: BoxConfig, admission: AdmissionConfig, executor: Any,
+                 *, poll_seconds: float) -> None:
         self.box, self.admission, self.executor = box, admission, executor
+        self.poll_seconds = poll_seconds
 
     def call(self, operation: str, **values: Any) -> Any:
         payload = {
             "operation": operation, "box": self.box.name,
             "managed_root": str(self.box.managed_run_directory),
             "p_cores": self.box.p_cores, "token_pool_size": self.box.token_pool_size,
-            "poll_seconds": self.admission.queue_wait_seconds, **values,
+            "poll_seconds": admission_poll_interval(
+                self.admission.queue_wait_seconds, self.poll_seconds
+            ),
+            **values,
         }
         source = Path(__file__).with_name("goalflight_remote_ci_node.py").read_text()
         encoded = base64.b64encode(json.dumps(payload).encode()).decode()
@@ -364,12 +384,20 @@ class RemoteNode:
         argv = expand_command(self.box.remote_exec, {"box": self.box.name, "host": self.box.host},
                               script=[script])
         result = self.executor(argv, {**os.environ, **self.box.env}, 30)
+        # The helper prints one JSON document only after the operation finishes,
+        # and errors go to stderr. ssh can still exit 255 after that write.
+        # Discarding the body admits a holder the caller can never name.
+        parsed: Any = None
+        if not result.timed_out and result.stdout.strip():
+            try:
+                parsed = json.loads(result.stdout)
+            except (ValueError, TypeError):
+                parsed = None
+        if isinstance(parsed, (dict, list)):
+            return parsed
         if result.returncode != 0 or result.timed_out:
             raise RemoteCIError(f"node {operation} failed: {result.stderr.strip()}")
-        try:
-            return json.loads(result.stdout)
-        except (ValueError, TypeError) as exc:
-            raise RemoteCIError(f"node {operation} returned invalid JSON") from exc
+        raise RemoteCIError(f"node {operation} returned invalid JSON")
 
 
 def list_remote_leases(config: DaemonConfig, *, executor: Any = None) -> list[dict[str, Any]]:
@@ -784,35 +812,74 @@ class RemoteRunner:
         self.config = config
         self.executor = executor or (lambda argv, env, timeout: run_command(argv, env=env, timeout=timeout))
         self.sleeper = sleeper
-        self.nodes = {name: RemoteNode(box, config.admission, self.executor)
-                      for name, box in config.boxes.items()}
+        self._inflight: set[tuple[str, str]] = set()
+        self.nodes = {
+            name: RemoteNode(box, config.admission, self.executor, poll_seconds=config.poll_seconds)
+            for name, box in config.boxes.items()
+        }
 
     @staticmethod
     def _owner() -> dict[str, Any]:
         return {"owner_identity": _owner_identity(), "owner_pid": os.getpid(),
                 "owner_host": socket.gethostname()}
 
-    def _save_running(self, spec: ArmSpec, record: Mapping[str, Any]) -> None:
-        # Node state is authoritative even if the controller dies before this mirror.
-        _atomic_write_json(self.config.state_dir / "runs" / f"{spec.request_id}-{spec.arm}.json",
-                           {"state": "running", "request_id": spec.request_id,
-                            "box": spec.box, **self._owner(), "lease": dict(record),
-                            "remote_run": record.get("remote_run")})
+    def _lease_key(self, record: Mapping[str, Any]) -> tuple[str, str]:
+        return (str(record["run_directory"]), str(record["lease_token"]))
+
+    def _owns(self, record: Mapping[str, Any]) -> bool:
+        return record.get("owner_host") == socket.gethostname() and record.get("owner_pid") == os.getpid()
+
+    def _release_forgotten(self, node: "RemoteNode", record: Mapping[str, Any]) -> str:
+        """Release a lease this live process admitted and then dropped.
+
+        Reap treats a live owner as busy. That is right for a run this process
+        is inside, and wrong for one whose enqueue or release reply was lost:
+        the owner pid is still the daemon, so nobody else will cancel it.
+        """
+        key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
+        fresh = node.call("status", **key)
+        if fresh.get("state") == "released":
+            return "finished"
+        if not self._owns(fresh) or self._lease_key(fresh) in self._inflight:
+            return "owned"
+        expected = {name: fresh.get(name) for name in ("owner_host", "owner_pid", "owner_identity")}
+        if fresh.get("state") == "running" and fresh.get("remote_run"):
+            return node.call("cancel", **key, identity=fresh["remote_run"],
+                             expected_owner=expected)["status"]
+        try:
+            return node.call("release", **key, expected_owner=expected)["status"]
+        except RemoteCIError:
+            if not fresh.get("remote_run"):
+                return "unknown"
+            return node.call("cancel", **key, identity=fresh["remote_run"],
+                             expected_owner=expected)["status"]
+
+    def _recover_other_forgotten(self, node: "RemoteNode") -> None:
+        for record in node.call("list"):
+            if record.get("state") == "released" or not self._owns(record):
+                continue
+            if self._lease_key(record) in self._inflight:
+                continue
+            self._release_forgotten(node, record)
 
     def run_arm(self, spec: ArmSpec) -> ArmOutcome:
         node = self.nodes[spec.box]
-        record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm, owner=self._owner())
-        key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
+        key: dict[str, str] | None = None
         started = False
         try:
+            record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm, owner=self._owner())
+            key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
+            self._inflight.add((key["run_dir"], key["lease_token"]))
             while True:
                 record = node.call("status", **key)
                 if record["state"] == "admitted":
                     break
-                if not record["holder_alive"]:
+                if record.get("state") == "released" or not record.get("holder_alive"):
                     raise AdmissionError("node admission holder exited before admission")
-                self.sleeper(self.config.admission.queue_wait_seconds)
-            self._save_running(spec, record)
+                self._recover_other_forgotten(node)
+                self.sleeper(admission_poll_interval(
+                    self.config.admission.queue_wait_seconds, self.config.poll_seconds
+                ))
             # Token ownership precedes rendering, checkout, push and test work.
             values = {
                 "box": spec.box, "host": node.box.host, "arm": spec.arm,
@@ -842,22 +909,28 @@ class RemoteRunner:
                                               "timeout": self.config.runner.timeout_seconds})
             return self._watch(spec, node, key)
         except BaseException:
-            if started:
+            if started and key is not None:
                 # A lost response can follow a successful launch. Cancel the
                 # fenced node identity; never just drop its admission token.
                 with contextlib.suppress(RemoteCIError):
                     node.call("cancel", **key, identity=record["remote_run"])
             raise
         finally:
-            if not started:
-                node.call("release", **key)
+            if key is not None:
+                try:
+                    if not started:
+                        # The holder is already forked. A release that never
+                        # reaches the node is recovered by reap / the next arm.
+                        with contextlib.suppress(RemoteCIError):
+                            node.call("release", **key)
+                finally:
+                    self._inflight.discard((key["run_dir"], key["lease_token"]))
 
     def _watch(self, spec: ArmSpec, node: RemoteNode, key: dict[str, str]) -> ArmOutcome:
         deadline = time.monotonic() + self.config.runner.timeout_seconds
         while True:
             record = node.call("status", **key)
             identity = RemoteRunIdentity.from_mapping(record["remote_run"])
-            self._save_running(spec, record)
             completed = record.get("result")
             if completed is not None:
                 if completed.get("timed_out"):
@@ -892,7 +965,11 @@ class RemoteRunner:
         node = self.nodes[spec.box]
         key = {"run_dir": identity.run_dir, "lease_token": identity.lease_token}
         node.call("attach", **key, identity=identity.to_dict(), owner=self._owner())
-        return self._watch(spec, node, key)
+        self._inflight.add((key["run_dir"], key["lease_token"]))
+        try:
+            return self._watch(spec, node, key)
+        finally:
+            self._inflight.discard((key["run_dir"], key["lease_token"]))
 
     def reap(self) -> list[dict[str, Any]]:
         results = []
@@ -904,7 +981,14 @@ class RemoteRunner:
                 # A PID from another controller host proves nothing locally.
                 alive = (_pid_alive(record.get("owner_pid"))
                          if record.get("owner_host") == socket.gethostname() else None)
-                if alive is True:
+                forgotten = (
+                    alive is True
+                    and self._owns(record)
+                    and self._lease_key(record) not in self._inflight
+                )
+                if forgotten:
+                    status = self._release_forgotten(node, record)
+                elif alive is True:
                     status = "owned"
                 elif alive is False and record.get("remote_run"):
                     identity = RemoteRunIdentity.from_mapping(record["remote_run"])
