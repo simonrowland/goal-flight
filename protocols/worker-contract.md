@@ -39,6 +39,10 @@ full investigation report in conversation — that defeats the dispatch and
 silently doubles the context cost (worker read + orchestrator read of same
 content).
 
+A host subagent that cannot write the findings path returns the TL;DR and
+findings in text; the controller writes that content to the same path before
+accepting `READY: <findings-path>`.
+
 The final non-empty line for file-backed investigator findings is
 `READY: <findings-path>`.
 

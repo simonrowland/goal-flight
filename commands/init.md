@@ -78,7 +78,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
 Dispatch examples in this repo assume the direct default is background:
-`python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .`.
+`python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --at <ref>`.
 The dispatcher launches immediately, waits for capacity, and refuses visibly with
 `DISPATCH-BLOCKED` plus a nonzero exit if capacity remains unavailable. Use
 `--foreground` only for synchronous scripts/tests. The drain command exists only
@@ -188,7 +188,12 @@ dispatch metadata or the prompt path.
     Flight Routing block + top-of-file blockquote activation directive
     from the template (idempotent — check for the section header first).
     Don't change the file's git-tracking state.
-  - **present, already has the section**: skip (no-op).
+  - **present, already has the section**: init preserves the existing block's
+    local dispatch examples; it does not regenerate them or refresh stale
+    snippets, including obsolete `--submit` flags. It may still update the
+    managed skill-root and RESUME-NOTES pointer lines. To refresh the examples,
+    compare the section with `<skill-root>/templates/project-agents.md` and
+    manually replace only those examples, preserving project-specific additions.
   - For projects with multiple operators / public history that want the
     goal-flight routing tracked: maintain `.agent-context/goal-flight.md`
     separately, tracked, and reference it from the (per-operator,

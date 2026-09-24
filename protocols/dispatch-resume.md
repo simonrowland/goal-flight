@@ -6,6 +6,58 @@ Withdrawal never kills a live worker. It requires no live worker, preserves a
 carrier audit copy, and prevents drain from restoring the retired dispatch.
 See `protocols/dispatch-danger.md` for ownership, moved roots, and dry-run flags.
 
+## Pin before resume or redispatch
+
+Before resuming or redispatching a worker that died or stopped, the controller
+must preserve the worker's repository state. The refs below live in the
+dispatch's own repository (the repository that owns `<worktree>`), not in an
+unrelated checkout.
+
+For a fresh redispatch into a pooled seat, use the normal controller dispatch
+path. `goalflight_worktree_pool.acquire_worktree_seat(..., reset=True)` is
+called by `goalflight_dispatch.py`; it quarantines product changes, including
+untracked non-ignored files, and pins unique commits under
+`refs/goalflight/keep/` before reset. Do not call its private helper directly.
+A resume skips that reset path, and a controller taking over a non-pooled or
+held worktree must use the explicit pin below.
+
+Pin `HEAD` first, even when the tree is clean; this handles a clean tree whose
+latest commits would otherwise become unreachable. Then snapshot tracked and
+untracked (but not ignored) files with a temporary index:
+
+```bash
+repo=<dispatch-repository>
+worktree=<worktree>
+head=$(git -C "$worktree" rev-parse HEAD^{commit})
+git -C "$repo" update-ref "refs/goalflight/keep/<dispatch-id>/head" "$head"
+
+index=$(mktemp)
+rm -f "$index"
+trap 'rm -f "$index"' EXIT
+GIT_INDEX_FILE="$index" git -C "$worktree" read-tree HEAD
+GIT_INDEX_FILE="$index" git -C "$worktree" add -A
+tree=$(GIT_INDEX_FILE="$index" git -C "$worktree" write-tree)
+head_tree=$(git -C "$repo" rev-parse "$head^{tree}")
+if test "$tree" != "$head_tree"; then
+  commit=$(git -C "$repo" commit-tree "$tree" -p "$head" \
+    -m "preserve <dispatch-id> dirty worktree")
+  git -C "$repo" update-ref \
+    "refs/goalflight/keep/<dispatch-id>/dirty-<date>" "$commit"
+fi
+```
+
+`git add -A` records untracked files that are not ignored; ignored files stay
+out of the snapshot. If `tree == head_tree`, no dirty ref is needed, but the
+`.../head` ref remains the required pin. Verify each ref with
+`git -C "$repo" rev-parse --verify <ref>^{commit}` before changing the tree.
+Before deciding that a worker is dead, reconcile process identity (including
+PID start time), status and ledger, terminal markers, output growth, and the
+dirty tree; quiet network waits or tests are not proof of death. COMPLETE,
+RESULT, and READY still need idle/controller-dead reconciliation. A rollover
+can lose notifications, not durable status, ledger, resume, or reconcile state.
+Workers cannot update refs. Only after this pin may the controller resume,
+redispatch, or let the seat be reused.
+
 ## ★ The most expensive miss: a worker that stopped to ASK YOU something
 
 **If the worker ended because it needs something from you, RESUME it with the
@@ -93,8 +145,10 @@ you want to keep, not by what killed the worker.
   not. Resume reattaches to the existing worktree, branch, and partial
   artifacts — it does not acquire a sibling pooled worktree. Quota-exhausted,
   dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
-  continuable. `--account <account>` pins a surviving account; default selection
-  skips recently quota-exhausted accounts until their reset.
+  continuable. Account selection prefers the original healthy account; an
+  explicit `--account <account>` selects the account for a supported
+  cross-account resume. Default selection skips recently quota-exhausted
+  accounts until their reset.
 - Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
   (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume

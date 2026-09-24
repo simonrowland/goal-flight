@@ -133,7 +133,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 Surface only actionable warnings: install ambiguity, missing required tool,
 capacity cooldown, stale dispatch, surplus worker-like process, or fingerprint
 drift against an in-flight queue.
-Mail is journal-assigned, not a private markdown file: `relay --new` peeks without acknowledging, `--list-controllers` lists leases, `post --to-controller` sends, and a generation-bound one-shot `listen` wakes. See `protocols/controller-mail.md`.
+Mail is journal-assigned, not a private file: `relay --new` peeks without acknowledging, `goalflight_session_status.py --list-controllers` lists leases, `post --to-controller` sends, and a generation-bound one-shot `listen` wakes. See `protocols/controller-mail.md`.
 
 ## Commands
 
@@ -255,13 +255,16 @@ than silently dropping the setting.
 
 - Verification first. Every executor prompt starts by checking repo state,
   target files, and assumptions before editing.
-- Background anything expected to run longer than 10 seconds.
+- Background anything expected to run longer than 10 seconds; never wrap
+  `goalflight_dispatch.py` in `timeout` or a backgrounded subshell (`( ... & )`).
 - Subagent / Agent / Task / Explore dispatches whose returns may exceed
   ~5KB MUST write findings to
   `docs-private/research/<date>-<slug>/findings.md` and return a TL;DR +
   severity count, then `READY: <path>` as the **last**
   non-empty line (terminal marker — emit TL;DR/findings before it). The
   orchestrator reads the TL;DR and opens the file only when it signals real action.
+- Host subagents that cannot write return findings to the controller, which
+  persists the file.
 - Read >5KB without an expected Edit follow-up within 2 turns → use
   `Agent`/Explore with a defined prompt; do not pull recon bodies into
   controller context.
@@ -299,12 +302,7 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 - **Stdin wedge.** `codex exec` reads stdin to EOF even with a positional prompt; missing `< /dev/null` on bash-tail review hangs.
 - **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
 - **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
-- **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
-- **Stopped is not failed — RESUME it, with your answer.** A worker that hit a quota wall, returned `BLOCKED:`, or paused for a clarification/plan approval needs an ANSWER, not a new brief; redispatching re-derives its whole context to deliver one sentence (append the answer to its brief file, then `resume --prompt-file <that same file>`).
-- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <the SAME brief, with your answer appended>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
-- **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
-- **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
-- **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
+- **Worker recovery:** reconcile identity, status, markers, output, and dirty tree before pinning; use `protocols/dispatch-resume.md` for the full procedure.
 
 ## Capacity and rate limits
 
@@ -571,6 +569,7 @@ Use three state layers:
 
 Repository files are the canonical memory backend.
 Memory writeback requires migration lock ownership.
+Append friction immediately to `~/.goal-flight/friction/<controller-label>.md`; weekly polls summarize it.
 
 ### Status plane and liveness
 
