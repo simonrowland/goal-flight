@@ -365,14 +365,14 @@ def case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior() -> None:
         goalflight_dispatch.goalflight_compat.is_macos = old_is_macos
 
 
-def case_dispatch_read_only_acp_cfg_without_worker_is_exempt() -> None:
+def case_dispatch_read_only_acp_cfg_without_worker_fails_closed() -> None:
     cfg = argparse.Namespace(
         agent="claude",
         shape="acp",
         os_sandbox=OS_SANDBOX_READ_ONLY,
         read_only=False,
     )
-    assert goalflight_dispatch._occupancy_exempt_read_only(cfg) is True
+    assert goalflight_dispatch._occupancy_exempt_read_only(cfg) is False
 
 
 def case_claude_read_only_requests_profile_on_unsupported_platform() -> None:
@@ -764,7 +764,6 @@ def case_sandboxed_journal_open_is_denied() -> None:
         assert (
             "PermissionError" in combined
             or "Operation not permitted" in combined
-            or "unable to open database file" in combined
         ), result
 
 
@@ -813,7 +812,6 @@ def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
         assert (
             "PermissionError" in combined
             or "Operation not permitted" in combined
-            or "unable to open database file" in combined
         ), result
 
 
@@ -1564,7 +1562,7 @@ def main() -> None:
     case_os_sandbox_request_distinguishes_manifest_read_failures()
     case_repo_runner_sandbox_adapters_are_platform_scoped()
     case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior()
-    case_dispatch_read_only_acp_cfg_without_worker_is_exempt()
+    case_dispatch_read_only_acp_cfg_without_worker_fails_closed()
     case_claude_read_only_requests_profile_on_unsupported_platform()
     case_shell_wrapper_guards_os_sandbox_to_darwin()
     case_prepare_wrapper_blocks_home_write()

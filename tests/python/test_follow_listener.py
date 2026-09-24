@@ -1229,7 +1229,7 @@ def test_journal_failure_is_a_waking_stdout_record(
     )
 
 
-def test_listener_fails_fast_on_present_journal_open_failure(
+def test_listener_survives_present_journal_open_failure_and_times_out(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1265,16 +1265,15 @@ def test_listener_fails_fast_on_present_journal_open_failure(
         ]
     )
 
-    captured = capsys.readouterr()
     records = [
         json.loads(line)
-        for line in captured.out.splitlines()
+        for line in capsys.readouterr().out.splitlines()
         if line.strip()
     ]
     assert failed_opens == 1
-    assert result == 2
-    assert records == []
-    assert "journal-io-failure" in captured.err
+    assert result == 1
+    assert records[-1]["reason"] == "timeout"
+    assert all(record.get("reason") != "journal-unavailable" for record in records)
 
 
 def test_watchdog_dead_audit_reason_is_registered() -> None:

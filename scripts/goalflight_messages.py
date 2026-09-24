@@ -6510,8 +6510,10 @@ SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S = 3.0
 # Journal.open_reader (1.0s): they want to fail fast. The writer-capable
 # Journal() default is a separate 5.0s contract and must not be the peek path.
 LISTENER_JOURNAL_BUSY_BUDGET_S = 10.0
-# Continuous journal-busy failure past this window is no longer transient;
-# permission and CANTOPEN failures are already terminal at journal open.
+# Continuous journal-busy failure past this window is no longer transient.
+# The journal's own open budget (goalflight_journal.JOURNAL_OPEN_RETRY_BUDGET_S,
+# 75s) was sized from a measured one-minute live incident; four of those spans
+# without one successful read means a human should hear about it.
 LISTENER_JOURNAL_TOLERANCE_S = 300.0
 LISTENER_JOURNAL_BACKOFF_CAP_S = 30.0
 # Every bounded read/write used by these listener paths carries one absolute

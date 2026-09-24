@@ -29,6 +29,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass
 import datetime as dt
+import errno
 from enum import Enum
 import hashlib
 import json
@@ -139,8 +140,14 @@ OUTBOX_RETRY_BASE_S = 1.0
 WAKE_WEBHOOK_OUTBOX_RETRY_BASE_S = 1.0
 WAKE_WEBHOOK_OUTBOX_RETRY_CAP_S = 60.0
 WAKE_WEBHOOK_OUTBOX_FLUSH_LIMIT = 8
-# Retained for callers that still pass an open retry budget. Permission and
-# CANTOPEN failures are terminal; only SQLite busy contention uses retry_budget_s.
+# The live incident cleared within roughly one minute while the journal stayed
+# healthy. Seventy-five seconds covers that measured minute plus 15 seconds of
+# scheduler/load margin. A smaller bound repeats the observed false teardown;
+# doubling it to 150 seconds would add 75 seconds of unwitnessed failure before
+# a genuinely unreachable journal is reported and re-armed, with no measured
+# recovery benefit. Per-process exponential jitter keeps the three witnesses'
+# probes independent inside the shared bound. Permission-denied opens are
+# classified separately and never consume this budget.
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
@@ -929,6 +936,47 @@ def _is_cantopen(exc: BaseException) -> bool:
     )
 
 
+def _is_permission_denied(exc: BaseException) -> bool:
+    """Recognize OS permission failures, including wrapped sandbox errors."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, PermissionError) or getattr(current, "errno", None) in {
+            errno.EPERM,
+            errno.EACCES,
+        }:
+            return True
+        message = str(current).lower()
+        if "operation not permitted" in message or "permission denied" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _permission_denial_cause(
+    path: Path, exc: BaseException
+) -> BaseException | None:
+    """Return a permission cause, probing CANTOPEN for a seatbelt denial.
+
+    SQLite reports a macOS seatbelt denial as the generic CANTOPEN message.
+    Opening the already-present journal for write is a narrow, side-effect-free
+    way to distinguish that denial from the measured transient CANTOPEN case.
+    """
+    if _is_permission_denied(exc):
+        return exc
+    if not _is_cantopen(exc):
+        return None
+    try:
+        descriptor = os.open(path, os.O_WRONLY)
+    except OSError as probe_exc:
+        if _is_permission_denied(probe_exc):
+            return probe_exc
+    else:
+        os.close(descriptor)
+    return None
+
+
 def _is_corruption_error(exc: BaseException) -> bool:
     corruption_codes = {
         code
@@ -972,11 +1020,25 @@ def _open_readonly_connection(
         # this readonly open instead of a later schema query being mislabeled.
         readonly.execute("PRAGMA schema_version").fetchone()
         return readonly
+    except OSError as primary_exc:
+        if readonly is not None:
+            readonly.close()
+        permission = _permission_denial_cause(path, primary_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
+        raise
     except sqlite3.DatabaseError as primary_exc:
         primary_failure = primary_exc
         opened = readonly is not None
         if readonly is not None:
             readonly.close()
+        permission = _permission_denial_cause(path, primary_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
         if not os.path.lexists(path):
             # Preserve each caller's existing absent/disappeared-file handling.
             raise
@@ -1006,7 +1068,19 @@ def _open_readonly_connection(
             timeout=timeout,
             isolation_level=isolation_level,
         )
+    except OSError as fallback_exc:
+        permission = _permission_denial_cause(path, fallback_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
+        raise
     except sqlite3.DatabaseError as fallback_exc:
+        permission = _permission_denial_cause(path, fallback_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
         if _is_busy(fallback_exc):
             raise
         raise JournalIOError(
@@ -1016,8 +1090,21 @@ def _open_readonly_connection(
         fallback.execute("PRAGMA query_only = ON")
         fallback.execute("PRAGMA schema_version").fetchone()
         return fallback
+    except OSError as fallback_exc:
+        fallback.close()
+        permission = _permission_denial_cause(path, fallback_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
+        raise
     except sqlite3.DatabaseError as fallback_exc:
         fallback.close()
+        permission = _permission_denial_cause(path, fallback_exc)
+        if permission is not None:
+            raise JournalIOError(
+                f"journal readonly probe permission denied for {path}: {permission}"
+            ) from permission
         if _is_corruption_error(fallback_exc) or _is_busy(fallback_exc):
             raise
         raise JournalIOError(
@@ -1492,7 +1579,9 @@ class Journal:
                     raise
                 return self._reader_connection
         started = time.monotonic()
+        open_started = started
         attempts = 0
+        open_failures = 0
         while True:
             attempts += 1
             self._require_existing_database()
@@ -1510,16 +1599,29 @@ class Journal:
                         timeout=0,
                         isolation_level=None,
                     )
-            except JournalDisappeared:
+            except (JournalDisappeared, JournalIOError) as exc:
+                permission = _permission_denial_cause(self.path, exc)
+                if permission is not None:
+                    self._raise_permission_open_failure(permission)
+                open_failures += 1
+                self._raise_disappeared_or_unverified(exc)
+                if self._open_retry_delay(open_started, open_failures):
+                    continue
+                raise self._open_io_failure(open_started, open_failures, exc) from exc
+            except OSError as exc:
+                permission = _permission_denial_cause(self.path, exc)
+                if permission is not None:
+                    self._raise_permission_open_failure(permission)
                 raise
-            except JournalIOError as exc:
-                self._raise_terminal_open_failure(exc)
             except sqlite3.DatabaseError as exc:
                 # Busy is stage- and client-agnostic: a read-write client can
                 # hit it here at connect (WAL shared-memory recovery/checkpoint
                 # contention) exactly as the pragma stage below, and escaping
                 # raw would bypass every caller's JournalUnavailable handling —
                 # including the write paths that document busy as RETRYABLE.
+                permission = _permission_denial_cause(self.path, exc)
+                if permission is not None:
+                    self._raise_permission_open_failure(permission)
                 if _is_busy(exc):
                     if self._retry_delay(started, deadline_s=busy_deadline_s):
                         continue
@@ -1530,7 +1632,11 @@ class Journal:
                 if _is_corruption_error(exc):
                     self._handle_corruption(exc, run_integrity_check=False)
                 if _is_cantopen(exc):
-                    self._raise_terminal_open_failure(exc)
+                    open_failures += 1
+                    self._raise_disappeared_or_unverified(exc)
+                    if self._open_retry_delay(open_started, open_failures):
+                        continue
+                    raise self._open_io_failure(open_started, open_failures, exc) from exc
                 if self._read_only_client:
                     raise JournalIOError(
                         f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1554,11 +1660,20 @@ class Journal:
                     if not configured:
                         connection.close()
             except sqlite3.OperationalError as exc:
+                permission = _permission_denial_cause(self.path, exc)
+                if permission is not None:
+                    self._raise_permission_open_failure(permission)
                 if _is_corruption_error(exc):
                     self._handle_corruption(exc, run_integrity_check=False)
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
-                        self._raise_terminal_open_failure(exc)
+                        open_failures += 1
+                        self._raise_disappeared_or_unverified(exc)
+                        if self._open_retry_delay(open_started, open_failures):
+                            continue
+                        raise self._open_io_failure(
+                            open_started, open_failures, exc
+                        ) from exc
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -2553,7 +2668,13 @@ class Journal:
         return time.monotonic() < deadline
 
     def _raise_disappeared_or_unverified(self, cause: BaseException) -> None:
-        """Reclassify a low-level failure by the journal path's presence."""
+        """Reclassify a low-level open/read failure by path presence.
+
+        Present: return, so the caller keeps its own retry/IO-failure path.
+        Genuinely absent: JournalDisappeared. Unverifiable (unreadable):
+        JournalIOError — an unreadable path is not absence, and the IO
+        verdict is what the caller's budget-exhausted path would raise anyway.
+        """
         presence = _lstat_presence(self.path)
         if presence == "absent":
             raise JournalDisappeared(
@@ -2565,16 +2686,41 @@ class Journal:
                 f"unverified: {self.path}"
             ) from cause
 
-    def _raise_terminal_open_failure(self, cause: BaseException) -> None:
-        """Fail closed on an open failure instead of retrying it as contention."""
-        self._require_existing_database()
-        if isinstance(cause, JournalIOError):
-            raise JournalIOError(
-                f"journal open failed for {self.path}: {cause}"
-            ) from cause
+    def _raise_permission_open_failure(self, cause: BaseException) -> None:
+        """Fail immediately on a verified filesystem permission denial."""
         raise JournalIOError(
-            f"journal open failed for {self.path}: {cause}; failing closed"
+            f"journal open permission denied for {self.path}: {cause}"
         ) from cause
+
+    def _open_retry_delay(self, started: float, failures: int) -> bool:
+        remaining = self.open_retry_budget_s - (time.monotonic() - started)
+        if remaining <= 0:
+            return False
+        exponent = min(max(0, failures - 1), 16)
+        ceiling = min(
+            JOURNAL_OPEN_RETRY_INITIAL_S * (2**exponent),
+            JOURNAL_OPEN_RETRY_MAX_S,
+        )
+        # Full jitter avoids phase-locking the stream, backup, and watchdog.
+        delay = min(random.uniform(ceiling / 2, ceiling), remaining)
+        if delay > 0:
+            time.sleep(delay)
+        # Permit one final measured attempt at the deadline; the next failure
+        # observes the exhausted bound and returns a durable IO verdict.
+        return True
+
+    def _open_io_failure(
+        self,
+        started: float,
+        failures: int,
+        cause: BaseException,
+    ) -> JournalIOError:
+        elapsed = time.monotonic() - started
+        return JournalIOError(
+            f"journal IO open failure after {failures} attempts within "
+            f"{elapsed:.3f}s (budget {self.open_retry_budget_s:.3f}s); "
+            f"journal path is still present: {self.path}: {cause}"
+        )
 
     def _assert_identity(self, connection: sqlite3.Connection) -> None:
         try:

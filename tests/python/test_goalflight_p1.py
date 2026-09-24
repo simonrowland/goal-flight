@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -375,7 +376,7 @@ def test_existing_journal_missing_required_tables_and_bad_epoch_types_fail_close
         opened.epochs()
 
 
-def test_present_journal_open_failure_fails_fast(
+def test_present_journal_open_failure_retries_then_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
@@ -393,19 +394,19 @@ def test_present_journal_open_failure_fails_fast(
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
-    with pytest.raises(journal.JournalIOError, match="journal open failed"):
-        journal.Journal(
-            project,
-            open_retry_budget_s=0.1,
-            jitter_min_s=0.001,
-            jitter_max_s=0.002,
-        )
+    reopened = journal.Journal(
+        project,
+        open_retry_budget_s=0.1,
+        jitter_min_s=0.001,
+        jitter_max_s=0.002,
+    )
 
     assert failed_opens == 1
-    assert authority.path.exists()
+    assert reopened.path == authority.path
+    assert reopened.epochs().schema == journal.CURRENT_SCHEMA_EPOCH
 
 
-def test_present_journal_open_failure_is_terminal_io_not_disappearance(
+def test_present_journal_permanent_open_failure_is_bounded_io_not_disappearance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
@@ -431,10 +432,33 @@ def test_present_journal_open_failure_is_terminal_io_not_disappearance(
     elapsed = time.monotonic() - started
 
     assert authority.path.exists(), "the injected opener must not remove the journal"
-    assert attempts == 2, "readonly and rw probes are required, but must not retry"
+    assert attempts > 1, "a first-open exit silently defeats transient survival"
     assert elapsed < 0.5, "the retry budget must remain a bound"
-    assert "journal open failed" in str(captured.value)
+    assert "still present" in str(captured.value)
+    assert "after" in str(captured.value)
     assert not isinstance(captured.value, journal.JournalDisappeared)
+
+
+def test_permission_denied_journal_open_fails_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "permission-denied-open"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    attempts = 0
+
+    def deny_open(*_args: object, **_kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(journal, "_sqlite_connect", deny_open)
+    with pytest.raises(journal.JournalIOError, match="permission denied"):
+        journal.Journal(project, open_retry_budget_s=0.1)
+
+    assert authority.path.exists()
+    assert attempts == 1
 
 
 def test_genuinely_absent_journal_keeps_disappearance_verdict(
@@ -466,7 +490,7 @@ def test_unreadable_journal_parent_is_io_not_disappearance(
         os.chmod(journal_dir, 0o700)
 
 
-def test_open_failure_still_detects_replacement_database(
+def test_open_retry_still_detects_replacement_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)

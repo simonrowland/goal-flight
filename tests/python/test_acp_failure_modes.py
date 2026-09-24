@@ -16,6 +16,7 @@ skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and 
 import asyncio
 import argparse
 import contextlib
+from functools import wraps
 import io
 import json
 import os
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from unittest.mock import patch
 
@@ -94,6 +96,7 @@ def env_override_fields(text: str, env_name: str) -> dict[str, str]:
 
 def skipif(condition: bool, reason: str):
     def _decorator(func):
+        @wraps(func)
         def _wrapped(*args, **kwargs):
             if condition:
                 print(f"SKIP: {func.__name__}: {reason}")
@@ -1301,8 +1304,10 @@ def case_runner_outer_bound_classifies_measured_idle() -> None:
         tmp = Path(td)
         process_table_file = tmp / "process-table.txt"
         bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        # Keep the worker alive until the measured-idle verdict; sibling
+        # modules in the isolated wrapper can delay a finite fake past 0.6s.
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.05,
             wedge_samples=99,
@@ -1310,7 +1315,6 @@ def case_runner_outer_bound_classifies_measured_idle() -> None:
             max_quiet_s=0.15,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
                 "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
@@ -1338,7 +1342,7 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
         process_table_file = tmp / "process-table.txt"
         bindir = _descendant_ps_table_bindir(tmp, process_table_file)
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=30.0,
             wedge_samples=99,
@@ -1349,7 +1353,6 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
             max_quiet_s=2.0,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "30",
                 "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
@@ -1371,8 +1374,10 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
+    # The CPU percentage is supplied by the test hook; use a blocking worker
+    # so wrapper concurrency cannot let a finite fake exit before the probes.
     returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_busy",
+        "progress_then_silent",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
@@ -1380,7 +1385,6 @@ def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
         max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
-            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
             "GOALFLIGHT_TEST_MODE": "1",
             "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
         },
@@ -2454,7 +2458,7 @@ def case_runner_indeterminate_liveness_does_not_kill() -> None:
         assert probe.returncode != 0, "precondition failed: descendant ps probe succeeded"
         state_snapshot: dict = {}
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.05,
             wedge_samples=99,
@@ -2463,7 +2467,6 @@ def case_runner_indeterminate_liveness_does_not_kill() -> None:
             max_tool_s=30.0,
             extra_env={
                 "PATH": env["PATH"],
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "8",
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
@@ -2964,73 +2967,86 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
         ], rows
 
 
+def _run_case(case) -> None:
+    try:
+        case()
+    except BaseException:
+        print(f"FAIL: {case.__name__}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        raise
+
+
 def main() -> None:
-    case_unimportable_sdk_permission_path_names_acp_import_error()
-    case_vendor_flood_idle_waits_for_quiet_backstop()
-    case_dropped_frame_records_are_bounded()
-    case_empty_oversized_head_assumes_request_for_reply()
-    case_vendor_flood_cpu_busy_is_alive()
-    case_standard_progress_resets_wedge_streak()
-    case_permission_timeout_unblocks_wedge()
-    case_progress_stall_wall_ignores_raw_vendor_noise()
-    case_adapter_manifest_liveness_defaults()
-    case_manifest_acp_command_defaults()
-    case_json_rpc_stdout_filter()
-    case_matrix_timeout_reaps_runner_process_group()
-    case_permission_router_audit_bounded_and_truncated()
-    case_normal_dispatch_hides_matrix_audit_surface()
-    case_matrix_env_surfaces_bounded_audit()
-    case_matrix_claude_defer_skips_remaining_cases()
-    case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
-    case_runner_preserves_live_controller_beacon_pair()
-    case_runner_progress_stall_detaches_by_default()
-    case_detached_pidfile_entry_survives_ghost_cleanup()
-    case_runner_progress_then_silent_wedges_and_reaps()
-    case_runner_remote_long_reasoning_pause_survives_old_walls()
-    case_read_only_acp_buffered_work_survives_incident_duration()
-    case_runner_remote_dead_silent_turn_hits_remote_wall()
-    case_runner_outer_bound_with_unknown_cpu_and_idle_disabled()
-    case_runner_outer_bound_classifies_measured_idle()
-    case_runner_idle_callback_uses_same_outer_classifier()
-    case_runner_outer_bound_with_busy_cpu_and_idle_disabled()
-    case_runner_outer_bound_kills_zero_cpu_without_progress()
-    case_runner_outer_bound_rechecks_progress_after_probe()
-    case_runner_thought_stream_survives_progress_stall_wall()
-    case_runner_auth_failure_output_records_blocked_terminal()
-    case_runner_trivial_probe_working_engine_writes_file()
-    case_terminal_state_endturn_beats_tail_race_wedge()
-    case_runner_blocked_none_completes()
-    case_runner_blocked_substantive_cancels()
-    case_runner_user_confirm_then_blocked_preserves_denial_and_partial()
-    case_user_confirm_denial_arbitration_is_order_independent_and_sticky()
-    case_user_confirm_scope_requires_every_member_yes()
-    case_user_confirm_generation_key_is_hashable_and_fail_closed()
-    case_steer_prompt_sanitizes_quoted_authorize_grammar()
-    case_post_user_confirm_denial_keeps_continuation_read_only()
-    case_user_confirm_clocks_are_independent_without_sleeping()
-    case_user_confirm_arrival_stamp_is_strict_and_round_trips()
-    case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no()
-    case_later_denial_preserves_finalized_question_history_and_closes_future()
-    case_user_confirm_wait_is_not_remote_silence_reaped()
-    case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()
-    case_runner_user_need_none_completes()
-    case_runner_idle_silent_idle_timeout_reaps()
-    case_runner_idle_descendant_cannot_override_hard_wall()
-    case_runner_unknown_descendants_cannot_override_hard_wall()
-    case_runner_indeterminate_liveness_does_not_kill()
-    case_runner_oversized_frame_dropped_then_completes()
-    case_runner_oversized_request_gets_safe_reply()
-    case_runner_oversized_request_late_id_gets_safe_reply()
-    case_runner_oversized_no_newline_kills_worker()
-    case_runner_goal_mode_progress_stall_backstop()
-    case_runner_goal_mode_heartbeat_backstop()
-    case_runner_tool_timeout_reaps()
-    case_handshake_wedge_kills_before_respawn()
-    case_pool_exhaustion_then_drain()
-    case_env_ipc_paths_are_constrained()
-    case_env_override_warning_shell_tokens_round_trip()
-    case_test_mode_hooks_require_gate()
-    case_acp_missing_prompt_commits_terminal_outbox()
+    cases = (
+        case_unimportable_sdk_permission_path_names_acp_import_error,
+        case_vendor_flood_idle_waits_for_quiet_backstop,
+        case_dropped_frame_records_are_bounded,
+        case_empty_oversized_head_assumes_request_for_reply,
+        case_vendor_flood_cpu_busy_is_alive,
+        case_standard_progress_resets_wedge_streak,
+        case_permission_timeout_unblocks_wedge,
+        case_progress_stall_wall_ignores_raw_vendor_noise,
+        case_adapter_manifest_liveness_defaults,
+        case_manifest_acp_command_defaults,
+        case_json_rpc_stdout_filter,
+        case_matrix_timeout_reaps_runner_process_group,
+        case_permission_router_audit_bounded_and_truncated,
+        case_normal_dispatch_hides_matrix_audit_surface,
+        case_matrix_env_surfaces_bounded_audit,
+        case_matrix_claude_defer_skips_remaining_cases,
+        case_runner_raw_vendor_flood_hits_progress_stall_and_reaps,
+        case_runner_preserves_live_controller_beacon_pair,
+        case_runner_progress_stall_detaches_by_default,
+        case_detached_pidfile_entry_survives_ghost_cleanup,
+        case_runner_progress_then_silent_wedges_and_reaps,
+        case_runner_remote_long_reasoning_pause_survives_old_walls,
+        case_read_only_acp_buffered_work_survives_incident_duration,
+        case_runner_remote_dead_silent_turn_hits_remote_wall,
+        case_runner_outer_bound_with_unknown_cpu_and_idle_disabled,
+        case_runner_outer_bound_classifies_measured_idle,
+        case_runner_idle_callback_uses_same_outer_classifier,
+        case_runner_outer_bound_with_busy_cpu_and_idle_disabled,
+        case_runner_outer_bound_kills_zero_cpu_without_progress,
+        case_runner_outer_bound_rechecks_progress_after_probe,
+        case_runner_thought_stream_survives_progress_stall_wall,
+        case_runner_auth_failure_output_records_blocked_terminal,
+        case_runner_trivial_probe_working_engine_writes_file,
+        case_terminal_state_endturn_beats_tail_race_wedge,
+        case_runner_blocked_none_completes,
+        case_runner_blocked_substantive_cancels,
+        case_runner_user_confirm_then_blocked_preserves_denial_and_partial,
+        case_user_confirm_denial_arbitration_is_order_independent_and_sticky,
+        case_user_confirm_scope_requires_every_member_yes,
+        case_user_confirm_generation_key_is_hashable_and_fail_closed,
+        case_steer_prompt_sanitizes_quoted_authorize_grammar,
+        case_post_user_confirm_denial_keeps_continuation_read_only,
+        case_user_confirm_clocks_are_independent_without_sleeping,
+        case_user_confirm_arrival_stamp_is_strict_and_round_trips,
+        case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no,
+        case_later_denial_preserves_finalized_question_history_and_closes_future,
+        case_user_confirm_wait_is_not_remote_silence_reaped,
+        case_user_confirm_midturn_deadline_reenables_remote_silence_terminal,
+        case_runner_user_need_none_completes,
+        case_runner_idle_silent_idle_timeout_reaps,
+        case_runner_idle_descendant_cannot_override_hard_wall,
+        case_runner_unknown_descendants_cannot_override_hard_wall,
+        case_runner_indeterminate_liveness_does_not_kill,
+        case_runner_oversized_frame_dropped_then_completes,
+        case_runner_oversized_request_gets_safe_reply,
+        case_runner_oversized_request_late_id_gets_safe_reply,
+        case_runner_oversized_no_newline_kills_worker,
+        case_runner_goal_mode_progress_stall_backstop,
+        case_runner_goal_mode_heartbeat_backstop,
+        case_runner_tool_timeout_reaps,
+        case_handshake_wedge_kills_before_respawn,
+        case_pool_exhaustion_then_drain,
+        case_env_ipc_paths_are_constrained,
+        case_env_override_warning_shell_tokens_round_trip,
+        case_test_mode_hooks_require_gate,
+        case_acp_missing_prompt_commits_terminal_outbox,
+    )
+    for case in cases:
+        _run_case(case)
     print("OK: ACP SDK failure-mode tests pass")
 
 
