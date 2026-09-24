@@ -5894,7 +5894,7 @@ class Journal:
             superseding_final = (
                 str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES
                 and _allow_final_supersession
-                and terminal == "superseded"
+                and terminal in {"superseded", "withdrawn"}
                 and str(existing["terminal_state"]) in {"worker_dead", "stale_dead"}
             )
             if str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES and not superseding_final:
@@ -5913,10 +5913,8 @@ class Journal:
                     terminal_at=journal_terminal_at(existing["terminal_at"]),
                     idempotent=True,
                 )
-            if superseding_final and (not existing["terminal_transition_id"] or not existing["event_uuid"]):
-                raise JournalIntegrityError(
-                    "terminal attempt exists without its transition/outbox row"
-                )
+            # Withdrawal is the repair path for a dead final attempt whose
+            # terminal outbox publication was lost before the process stopped.
             if not superseding_final and str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
                 raise CASMismatch(
                     f"terminal commit lost: attempt state is {existing['lifecycle_state']}"

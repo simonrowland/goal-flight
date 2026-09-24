@@ -38,13 +38,13 @@ def _dispatch_status_payloads(
     dispatch_dir: Path,
     *,
     limit: int = STATUS_SCAN_LIMIT,
-) -> tuple[list[dict[str, object]], str | None]:
+) -> tuple[list[dict[str, object]], str | None, int]:
     try:
         if not dispatch_dir.is_dir():
-            return [], f"status directory unavailable: {dispatch_dir}"
+            return [], f"status directory unavailable: {dispatch_dir}", 1
         paths = list(dispatch_dir.glob("*.status.json"))
     except OSError as exc:
-        return [], f"status directory unreadable: {type(exc).__name__}: {exc}"
+        return [], f"status directory unreadable: {type(exc).__name__}: {exc}", 1
     if limit > 0 and len(paths) > limit:
         def _mtime(path: Path) -> float:
             try:
@@ -56,13 +56,21 @@ def _dispatch_status_payloads(
     else:
         paths.sort()
     payloads = []
+    unreadable_paths: list[str] = []
     for path in paths:
         payload = _read_json_mapping(path)
         if payload is None or not payload.get("dispatch_id"):
+            unreadable_paths.append(str(path))
             continue
         payload.setdefault("status_path", str(path))
         payloads.append(payload)
-    return payloads, None
+    if unreadable_paths:
+        return (
+            payloads,
+            "status files unreadable or malformed: " + ", ".join(unreadable_paths),
+            len(unreadable_paths),
+        )
+    return payloads, None, 0
 
 
 def _timestamp(value: object) -> float | None:
@@ -146,7 +154,7 @@ def _dispatch_records(
     # Status directories retain terminal history on some installations. A
     # bounded recent scan keeps status-only launches visible without reopening
     # every historical sidecar on each /usage invocation.
-    status_payloads, status_error = _dispatch_status_payloads(status_dir)
+    status_payloads, status_error, status_error_count = _dispatch_status_payloads(status_dir)
     status_ids = {str(payload["dispatch_id"]) for payload in status_payloads}
     now = time.time()
     for record in list(records.values()):
@@ -228,7 +236,7 @@ def _dispatch_records(
         source_records.append(
             {
                 "_source_unverified_reason": status_error,
-                "_source_unverified_count": 1,
+                "_source_unverified_count": status_error_count,
             }
         )
     if ledger_unreadable:
@@ -257,7 +265,9 @@ def _dispatch_records(
             {
                 "_source_unverified_reason": reason,
                 "_source_unverified_count": (
-                    unaccounted_sidecars if status_payloads else 1
+                    unaccounted_sidecars + status_error_count
+                    if status_payloads or status_error_count
+                    else 1
                 ),
             }
         )

@@ -3498,47 +3498,16 @@ def _withdraw_recovery_plan(
     return root, attempt, owner
 
 
-def _reserve_unused_recovery_dispatch_id(
-    agent: str, project_root: Path,
-) -> str:
-    """Reserve an auto-style id after proving every durable source is clear."""
-    base = _dispatch_base_dir()
-    queue_dir = _dispatch_queue_dir()
-    for _ in range(1000):
-        candidate = _reserve_auto_dispatch_id(agent, base)
-        if goalflight_ledger.read_record(candidate) is not None:
-            continue
-        authority = goalflight_journal.Journal.open_reader(
-            project_root, retry_budget_s=0.0, open_retry_budget_s=0.0,
-        )
-        if authority.attempt_for_dispatch(candidate) is not None:
-            continue
-        carriers = _build_queue_carrier_index(queue_dir)
-        if carriers.listing_error is not None:
-            raise ValueError(
-                f"cannot verify recovery dispatch id {candidate!r}: "
-                f"{carriers.listing_error.reason}"
-            )
-        if carriers.carriers_by_id.get(candidate):
-            continue
-        return candidate
-    raise DispatchUsageError("could not reserve an unused recovery dispatch id")
-
-
 def _withdraw_recovery_command(
     held_id: str,
-    replacement_id: str,
     project_root: str,
     *,
-    state: str,
     owner: str | None = None,
     operator: bool = False,
 ) -> str:
     command = [
         sys.executable, str(Path(__file__).resolve()), "withdraw", held_id,
     ]
-    if state in {"worker_dead", "stale_dead"}:
-        command.extend(("--superseded-by", replacement_id))
     command.extend((
         "--reason", "retry same task after held dispatch ended",
         "--project-root", project_root,
@@ -3550,19 +3519,6 @@ def _withdraw_recovery_command(
     return shlex.join(command)
 
 
-def _rerun_dispatch_command(args, replacement_id: str) -> str:
-    original = list(getattr(args, "_original_argv", None) or [])
-    if original:
-        original = _set_option_before_worker_remainder(
-            original, "--dispatch-id", replacement_id
-        )
-    else:
-        original = ["--dispatch-id", replacement_id]
-    return shlex.join([
-        sys.executable, str(Path(__file__).resolve()), *original,
-    ])
-
-
 def _completion_refusal_guidance(
     diagnostics: list[str], project_root: str, *, args=None,
 ) -> str:
@@ -3572,9 +3528,9 @@ def _completion_refusal_guidance(
     live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
     task_ids = list(getattr(args, "task_ids", []) or [])
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
-    replacement: str | None = None
     if held and not live:
         lines = []
+        withdrawable = False
         for dispatch_id, state in held:
             try:
                 root, attempt, owner = _withdraw_recovery_plan(
@@ -3594,35 +3550,27 @@ def _completion_refusal_guidance(
                         "row is interim."
                     )
                 continue
-            withdrawal_state = str(
-                attempt.get("terminal_state") or state
-            )
-            if withdrawal_state not in {"worker_dead", "stale_dead", "abandoned"}:
+            withdrawal_state = str(attempt.get("terminal_state") or state)
+            if withdrawal_state not in _SELF_HELD_LEDGER_STATES:
                 lines.append(
                     f"{task_text} is held by {dispatch_id} (state {state}); "
                     f"withdrawal state is {withdrawal_state or 'unknown'}. "
                     "No withdrawal command is safe; inspect the holder before retrying."
                 )
                 continue
-            if replacement is None:
-                replacement = _reserve_unused_recovery_dispatch_id(
-                    str(getattr(args, "agent", None) or "codex"), root
-                )
             command = _withdraw_recovery_command(
                 dispatch_id,
-                replacement,
                 str(root),
-                state=withdrawal_state,
                 owner=owner,
                 operator=owner is None,
             )
-            rerun = _rerun_dispatch_command(args, replacement)
             lines.append(
-                f"{task_text} is held by {dispatch_id} (state {state}). "
-                "Run these steps to retry the same task:\n"
-                f"  1. {command}\n"
-                f"  2. {rerun}"
+                f"{task_text} is held by {dispatch_id} (state {state}). Run:\n"
+                f"  {command}"
             )
+            withdrawable = True
+        if withdrawable:
+            lines.append("then re-run your dispatch command")
         text = "\n".join(lines)
         return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     if held and live:
@@ -10866,19 +10814,23 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
         if attempt["lifecycle_state"] not in goalflight_journal.ATTEMPT_FINAL_STATES:
             raise ValueError("attempt is no longer final; settlement refused")
         journal_state = attempt["terminal_state"]
-        final_supersession = bool(
-            getattr(args, "superseded_by", None)
-            and journal_state in {"worker_dead", "stale_dead"}
+        replacement_id = getattr(args, "superseded_by", None)
+        final_retirement = bool(
+            journal_state in {"worker_dead", "stale_dead"}
             and not args.dry_run
         )
-        if final_supersession:
+        if final_retirement:
             actor = "operator" if getattr(args, "operator", False) else args.controller_label
+            terminal_state = "superseded" if replacement_id else "withdrawn"
             observation = {
-                "reason": args.reason, "withdrawn_by": actor,
-                "superseded_by": args.superseded_by, "state": "superseded",
+                "reason": getattr(args, "reason", "terminal dispatch cleanup"),
+                "withdrawn_by": actor,
+                "state": terminal_state,
             }
+            if replacement_id:
+                observation["superseded_by"] = replacement_id
             committed = goalflight_journal.Journal(root).commit_terminal(
-                attempt["attempt_id"], terminal_state="superseded",
+                attempt["attempt_id"], terminal_state=terminal_state,
                 event_type="blocked", observation=observation,
                 _allow_final_supersession=True,
             )
@@ -10937,7 +10889,7 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
-            if final_supersession:
+            if final_retirement:
                 _release_withdrawn_worktree(projected, args.dispatch_id)
             archived = _archive_withdraw_carriers(carriers)
             payload.update(archived_carriers=archived,

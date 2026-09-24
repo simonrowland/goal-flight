@@ -778,6 +778,7 @@ def test_json_cli_shape_and_unavailable_exit_zero(
         "total",
         "unverified_total",
         "models",
+        "unknown_reasons",
     }
 
 
