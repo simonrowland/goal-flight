@@ -3467,7 +3467,7 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
 
 def _withdraw_recovery_plan(
     dispatch_id: str, project_root: str,
-) -> tuple[Path, dict | None, dict, dict[Path, dict], str | None]:
+) -> tuple[Path, dict, str | None]:
     """Run the exact withdrawal dry-run preflight and return its actor details.
 
     The first probe discovers the recorded owner without changing state. The
@@ -3481,7 +3481,7 @@ def _withdraw_recovery_plan(
         controller_label=None,
         dry_run=True,
     )
-    root, _authority, attempt, record, carriers, _outcome, _withdrawn = (
+    root, _, attempt, record, _, _, _ = (
         _withdraw_preflight(probe)
     )
     owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
@@ -3495,7 +3495,34 @@ def _withdraw_recovery_plan(
             dry_run=True,
         )
     )
-    return root, record, attempt, carriers, owner
+    return root, attempt, owner
+
+
+def _reserve_unused_recovery_dispatch_id(
+    agent: str, project_root: Path,
+) -> str:
+    """Reserve an auto-style id after proving every durable source is clear."""
+    base = _dispatch_base_dir()
+    queue_dir = _dispatch_queue_dir()
+    for _ in range(1000):
+        candidate = _reserve_auto_dispatch_id(agent, base)
+        if goalflight_ledger.read_record(candidate) is not None:
+            continue
+        authority = goalflight_journal.Journal.open_reader(
+            project_root, retry_budget_s=0.0, open_retry_budget_s=0.0,
+        )
+        if authority.attempt_for_dispatch(candidate) is not None:
+            continue
+        carriers = _build_queue_carrier_index(queue_dir)
+        if carriers.listing_error is not None:
+            raise ValueError(
+                f"cannot verify recovery dispatch id {candidate!r}: "
+                f"{carriers.listing_error.reason}"
+            )
+        if carriers.carriers_by_id.get(candidate):
+            continue
+        return candidate
+    raise DispatchUsageError("could not reserve an unused recovery dispatch id")
 
 
 def _withdraw_recovery_command(
@@ -3545,12 +3572,12 @@ def _completion_refusal_guidance(
     live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
     task_ids = list(getattr(args, "task_ids", []) or [])
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
-    replacement = str(getattr(args, "dispatch_id", "") or "<new-dispatch-id>")
+    replacement: str | None = None
     if held and not live:
         lines = []
         for dispatch_id, state in held:
             try:
-                root, _record, attempt, _carriers, owner = _withdraw_recovery_plan(
+                root, attempt, owner = _withdraw_recovery_plan(
                     dispatch_id, project_root
                 )
             except Exception as exc:
@@ -3577,6 +3604,10 @@ def _completion_refusal_guidance(
                     "No withdrawal command is safe; inspect the holder before retrying."
                 )
                 continue
+            if replacement is None:
+                replacement = _reserve_unused_recovery_dispatch_id(
+                    str(getattr(args, "agent", None) or "codex"), root
+                )
             command = _withdraw_recovery_command(
                 dispatch_id,
                 replacement,

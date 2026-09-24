@@ -224,6 +224,13 @@ def _dispatch_records(
             records[dispatch_id]["_ledger_unverified"] = True
 
     source_records: list[dict[str, object]] = []
+    if status_error and not ledger_unreadable:
+        source_records.append(
+            {
+                "_source_unverified_reason": status_error,
+                "_source_unverified_count": 1,
+            }
+        )
     if ledger_unreadable:
         reason = f"ledger unreadable rows=1: {ledger_read_error or 'unknown error'}"
         if status_error:

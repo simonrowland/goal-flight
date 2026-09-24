@@ -314,6 +314,23 @@ def test_unreadable_ledger_and_status_dir_report_unknown(
     assert "UNKNOWN:" in traffic.live_mix_pointer(summary)
 
 
+def test_readable_empty_ledger_with_unreadable_status_dir_reports_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "missing-dispatch"
+    monkeypatch.setattr(traffic.goalflight_ledger, "read_records", lambda **_kwargs: [])
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"status directory unavailable: {dispatch_dir}"
+    ]
+    assert "total live (lower bound; unverified): 0" in traffic.render(summary)
+
+
 def test_unreadable_ledger_with_empty_status_dir_reports_unknown(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

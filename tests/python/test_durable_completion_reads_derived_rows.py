@@ -145,8 +145,11 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
         D,
         "_withdraw_recovery_plan",
         lambda _dispatch_id, project_root: (
-            Path(project_root), records[0], {"owner_controller_label": "owner"}, {}, "owner"
+            Path(project_root), records[0], "owner"
         ),
+    )
+    monkeypatch.setattr(
+        D, "_reserve_unused_recovery_dispatch_id", lambda *_args: "followup"
     )
 
     with pytest.raises(D.DispatchUsageError):

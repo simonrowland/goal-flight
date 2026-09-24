@@ -724,6 +724,120 @@ def test_guidance_withdraw_step_runs_for_each_holder_state(
     ) == (0, 0, "conclusive")
 
 
+def test_guidance_recovery_runs_with_fresh_id_and_preserves_terminal_id(
+    prepared, monkeypatch
+):
+    project, authority, attempt, carrier = prepared
+    holder = ledger.read_record("withdraw-test")
+    holder.update(
+        task_ids=["t-900"],
+        state="worker_dead",
+        terminal_state="worker_dead",
+        worker_still_alive=False,
+    )
+    ledger.write_record(holder)
+    carrier.write_text(json.dumps(holder))
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="worker_dead",
+        observation={"state": "worker_dead", "reason": "stale worker"},
+    ).committed
+
+    terminal_attempt = authority.prepare_attempt("explicit-terminal-id")
+    assert terminal_attempt.committed and terminal_attempt.value is not None
+    terminal_record = {
+        "dispatch_id": "explicit-terminal-id",
+        "project_root": str(project),
+        "state": "complete",
+        "terminal_state": "complete",
+        "task_ids": [],
+        "worker_still_alive": False,
+    }
+    ledger.write_record(terminal_record)
+    assert authority.commit_terminal(
+        terminal_attempt.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "reason": "already finished"},
+    ).committed
+    terminal_before = ledger.read_record("explicit-terminal-id")
+    terminal_journal_before = authority.read_all(
+        "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?",
+        ("explicit-terminal-id",),
+    )[0]
+
+    monkeypatch.setenv("GOALFLIGHT_ALLOW_VOLATILE_PROJECT_ROOT", str(project.parent))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", "explicit-terminal-id")
+    original_argv = [
+        "--unregistered-forced",
+        "--agent", "test",
+        "--cwd", str(project),
+        "--dispatch-id", "explicit-terminal-id",
+        "--task", "t-900",
+        "--tail", str(project / "explicit-terminal-id.tail"),
+        "--status-json", str(project / "explicit-terminal-id.status.json"),
+        "--poll-secs", "0.05",
+        "--max-idle-secs", "5",
+        "--foreground",
+        "--ignore-git-warn",
+        "--",
+        sys.executable,
+        "-c",
+        "import os; print(f\"!COMPLETE: {os.environ['GOALFLIGHT_DISPATCH_ID']} — fresh recovery admitted\", flush=True)",
+    ]
+    guidance = dispatch._completion_refusal_guidance(
+        ['dispatch_id="withdraw-test" state="worker_dead"'],
+        str(project),
+        args=SimpleNamespace(
+            agent="test",
+            task_ids=["t-900"],
+            dispatch_id="explicit-terminal-id",
+            _original_argv=original_argv,
+        ),
+    )
+    commands = [
+        line.removeprefix(prefix)
+        for line in guidance.splitlines()
+        for prefix in ("  1. ", "  2. ")
+        if line.startswith(prefix)
+    ]
+    assert len(commands) == 2, guidance
+    withdraw_command, rerun_command = commands
+    withdraw_args = shlex.split(withdraw_command)
+    superseded_by = withdraw_args[withdraw_args.index("--superseded-by") + 1]
+    rerun_args = shlex.split(rerun_command)
+    assert rerun_args[rerun_args.index("--dispatch-id") + 1] == superseded_by
+    assert superseded_by != "explicit-terminal-id"
+    assert superseded_by != "withdraw-test"
+    assert ledger.read_record(superseded_by) is None
+    assert authority.attempt_for_dispatch(superseded_by) is None
+    assert not dispatch._build_queue_carrier_index(
+        dispatch._queue_entry_path(superseded_by).parent
+    ).carriers_by_id.get(superseded_by)
+
+    withdrawn = subprocess.run(
+        withdraw_args, cwd=project, text=True, capture_output=True, timeout=30,
+    )
+    assert withdrawn.returncode == 0, withdrawn.stdout + withdrawn.stderr
+    assert ledger.read_record("explicit-terminal-id") == terminal_before
+    assert authority.read_all(
+        "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?",
+        ("explicit-terminal-id",),
+    )[0] == terminal_journal_before
+
+    rerun = subprocess.run(
+        rerun_args, cwd=project, text=True, capture_output=True, timeout=60,
+    )
+    assert rerun.returncode == 0, rerun.stdout + rerun.stderr
+    fresh = ledger.read_record(superseded_by)
+    assert fresh is not None, rerun.stdout + rerun.stderr
+    assert fresh["dispatch_id"] == superseded_by
+    assert ledger.read_record("explicit-terminal-id") == terminal_before
+    assert authority.read_all(
+        "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?",
+        ("explicit-terminal-id",),
+    )[0] == terminal_journal_before
+
+
 def test_main_guidance_uses_journal_worker_identity_for_liveness(
     prepared, monkeypatch, capsys
 ):
