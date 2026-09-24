@@ -272,8 +272,84 @@ def test_wait_returns_promptly_at_its_independent_deadline(tmp_path: Path) -> No
     entries = steer.read_steer_entries(mailbox)
     assert [entry["kind"] for entry in entries] == [
         steer.WORKER_WAIT_STARTED_KIND,
+        steer.WORKER_WAIT_ENDED_KIND,
     ]
+    assert entries[-1]["decision"] == "timeout"
     assert steer.active_worker_wait(entries, dispatch_id="deadline") is None
+
+
+def test_question_kind_wait_publishes_custom_kind_and_timeout_settles(
+    tmp_path: Path,
+) -> None:
+    mailbox = tmp_path / "custom-question.steer.jsonl"
+    published: list[dict] = []
+    result = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id="custom-question",
+        acked_seqs=set(),
+        question_kind="CUSTOM-QUESTION",
+        question_text="supply the missing value",
+        timeout_secs=0.05,
+        poll_secs=0.2,
+        publish_question=published.append,
+    )
+
+    assert result["state"] == "deadline", result
+    assert len(published) == 1, published
+    assert published[0]["question_kind"] == "CUSTOM-QUESTION", published
+    assert published[0]["question_text"] == "supply the missing value", published
+    assert published[0]["reply_command"].endswith('"<answer>"'), published
+    entries = steer.read_steer_entries(mailbox)
+    assert [entry["kind"] for entry in entries] == [
+        steer.WORKER_WAIT_STARTED_KIND,
+        steer.WORKER_WAIT_ENDED_KIND,
+    ], entries
+    assert entries[-1]["decision"] == "timeout", entries
+
+
+def test_timeout_settlement_accepts_and_records_late_reply_then_next_wait(
+    tmp_path: Path,
+) -> None:
+    mailbox = tmp_path / "late-reply.steer.jsonl"
+    first = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id="late-reply",
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="first question",
+        timeout_secs=0.05,
+        poll_secs=0.2,
+        publish_question=lambda _event: None,
+    )
+    assert first["state"] == "deadline", first
+    late = steer.append_worker_wait_reply(
+        mailbox,
+        dispatch_id="late-reply",
+        wait_id=str(first["wait_id"]),
+        text="arrived after timeout",
+    )
+    assert late["context"]["late"] is True, late
+
+    second = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id="late-reply",
+        acked_seqs=set(),
+        question_kind="USER-CONFIRM",
+        question_text="second question",
+        timeout_secs=0.05,
+        poll_secs=0.2,
+        publish_question=lambda _event: None,
+    )
+    assert second["state"] == "deadline", second
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 2, entries
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+        and entry.get("decision") == "timeout"
+        for entry in entries
+    ) == 2, entries
 
 
 def test_next_wait_recovers_reply_written_during_final_sleep(
@@ -319,26 +395,12 @@ def test_next_wait_recovers_reply_written_during_final_sleep(
     )
 
     assert reply_written
-    assert first["state"] == "deadline"
-
-    second = steer.wait_for_worker_entries(
-        mailbox,
-        dispatch_id="final-sleep",
-        acked_seqs=set(),
-        question_kind="USER-NEED",
-        question_text="recover the boundary answer",
-        timeout_secs=1.0,
-        poll_secs=0.05,
-    )
-
-    assert second["state"] == "messages"
-    assert second["entries"][0]["text"] == "accepted before the deadline"
-    assert second["wait_id"] == first["wait_id"]
-    assert second["recovered_admitted_reply"] is True
+    assert first["state"] == "messages"
+    assert first["entries"][0]["text"] == "accepted before the deadline"
     entries, _receipts = _wait_for_cleanup_evidence(
         mailbox,
         wait_id=str(first["wait_id"]),
-        reply_seq=int(second["entries"][0]["seq"]),
+        reply_seq=int(first["entries"][0]["seq"]),
     )
     assert sum(
         entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
@@ -2455,9 +2517,8 @@ def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
 
     The writer validates inside the mailbox lock before the deadline, then
     remains in append/fsync while the waiter's ordinary pre-deadline read
-    exhausts its lock budget. The first waiter may be late and report its
-    deadline, but the next wait must recover the durable typed reply instead
-    of permanently refusing renewal.
+    exhausts its lock budget. The waiter must deliver the durable typed reply
+    after the writer releases the lock instead of recording a false timeout.
     """
     mailbox = tmp_path / "admitted-writer-race.steer.jsonl"
     dispatch_id = "admitted-writer-race"
@@ -2519,9 +2580,6 @@ def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
         notify=report,
     )
     assert stall_started_at[0] - wait_started_at < timeout_secs
-    assert writers[0].is_alive(), "writer did not remain in fsync across the deadline"
-    assert first["state"] == "deadline", first
-
     for writer in writers:
         writer.join(timeout=10)
 
@@ -2534,20 +2592,8 @@ def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
         if entry.get("kind") == steer.WORKER_WAIT_REPLY_KIND
     )
 
-    second = steer.wait_for_worker_entries(
-        mailbox,
-        dispatch_id=dispatch_id,
-        acked_seqs=set(),
-        question_kind="USER-NEED",
-        question_text="recover the prior boundary answer",
-        timeout_secs=1.0,
-        poll_secs=0.05,
-    )
-
-    assert second["state"] == "messages", second
-    assert second["entries"] == [durable_reply]
-    assert second["wait_id"] == first["wait_id"]
-    assert second["recovered_admitted_reply"] is True
+    assert first["state"] == "messages", first
+    assert first["entries"] == [durable_reply]
     reply_seq = int(durable_reply["seq"])
     entries, receipts = _wait_for_cleanup_evidence(
         mailbox,
@@ -2673,24 +2719,10 @@ def test_next_wait_recovers_durable_reply_after_errors_through_deadline(
     elapsed = time.monotonic() - started
 
     assert posted_reply, "reply was not durable before carrier errors began"
-    assert first["state"] == "deadline", first
+    assert first["state"] == "messages", first
     assert elapsed < 5.0, f"unbounded unreadable wait: {elapsed:.3f}s"
+    assert first["entries"] == posted_reply
     unreadable.clear()
-
-    second = steer.wait_for_worker_entries(
-        mailbox,
-        dispatch_id=dispatch_id,
-        acked_seqs=set(),
-        question_kind="USER-NEED",
-        question_text="recover the durable answer",
-        timeout_secs=1.0,
-        poll_secs=0.05,
-    )
-
-    assert second["state"] == "messages", second
-    assert second["entries"] == posted_reply
-    assert second["wait_id"] == first["wait_id"]
-    assert second["recovered_admitted_reply"] is True
     entries = steer.read_steer_entries(mailbox)
     assert sum(
         entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries

@@ -9,6 +9,7 @@ import errno
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -31,7 +32,7 @@ USER_CONFIRM_KIND = "user_confirm"
 WORKER_WAIT_STARTED_KIND = "worker_wait_started"
 WORKER_WAIT_ENDED_KIND = "worker_wait_ended"
 WORKER_WAIT_REPLY_KIND = "worker_wait_reply"
-WORKER_WAIT_SETTLED_DECISIONS = frozenset({"reply"})
+WORKER_WAIT_SETTLED_DECISIONS = frozenset({"failed", "reply", "timeout"})
 USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
@@ -637,6 +638,8 @@ def append_steer_entry(
     reply_to: str | None = None,
     decision: str | None = None,
     context: dict | None = None,
+    sender: dict | None = None,
+    cross_project: bool = False,
     awake_mono_ns: int | None = None,
     lock_timeout_secs: float | None = None,
     validate_existing: Callable[[list[dict]], None] | None = None,
@@ -684,6 +687,10 @@ def append_steer_entry(
             entry["decision"] = decision
         if context:
             entry["context"] = context
+        if sender:
+            entry["sender"] = dict(sender)
+        if cross_project:
+            entry["cross_project"] = True
         try:
             encoded = (
                 json.dumps(entry, allow_nan=False, sort_keys=True, separators=(",", ":"))
@@ -708,6 +715,40 @@ def append_message_view(
     text = payload.get("text")
     if text is None:
         text = json.dumps(payload, sort_keys=True) if payload else str(envelope.get("type") or "message")
+    source = envelope.get("source")
+    source = source if isinstance(source, dict) else {}
+    sender = source.get("sender") if isinstance(source.get("sender"), dict) else None
+    if sender is None:
+        sender = {
+            key: source[key]
+            for key in ("controller_label", "controller_pid", "project_root")
+            if key in source
+        }
+    if not {
+        "controller_label",
+        "controller_pid",
+        "project_root",
+    }.issubset(sender or {}):
+        payload_sender = payload.get("sender")
+        sender = dict(payload_sender) if isinstance(payload_sender, dict) else None
+    if sender and {
+        "controller_label",
+        "controller_pid",
+        "project_root",
+    }.issubset(sender):
+        text = (
+            f"{text} [sender "
+            f"controller_label={sender['controller_label']} "
+            f"controller_pid={sender['controller_pid']} "
+            f"project_root={sender['project_root']}]"
+        )
+    else:
+        sender = None
+    cross_project = bool(
+        source.get("cross_project") is True
+        or payload.get("cross_project") is True
+        or (isinstance(sender, dict) and sender.get("cross_project") is True)
+    )
     path = steer_file(dispatch_id, state_dir=state_dir)
     reply_to = payload.get("reply_to")
     decision = payload.get("decision")
@@ -718,6 +759,8 @@ def append_message_view(
             wait_id=str(reply_to),
             text=str(text),
             decision=None if decision is None else str(decision),
+            sender=sender,
+            cross_project=cross_project,
         )
     if decision is not None:
         raise ValueError("worker wait reply decision requires reply_to")
@@ -727,6 +770,8 @@ def append_message_view(
         dispatch_id=dispatch_id,
         kind="message",
         context={"message_envelope": envelope},
+        sender=sender,
+        cross_project=cross_project,
     )
 
 
@@ -801,14 +846,48 @@ def _positive_finite_seconds(value: object, *, field: str, maximum: float) -> fl
 
 
 def _validate_worker_question(question_kind: str, question_text: object) -> str:
-    if question_kind not in {"USER-NEED", "USER-CONFIRM"}:
-        raise ValueError("question_kind must be USER-NEED or USER-CONFIRM")
+    normalized_kind = str(question_kind or "").strip()
+    if (
+        not normalized_kind
+        or len(normalized_kind) > 64
+        or any(char in normalized_kind for char in "\r\n")
+        or not normalized_kind[0].isalpha()
+        or any(not (char.isalnum() or char in "_-") for char in normalized_kind)
+    ):
+        raise ValueError(
+            "question_kind must be a non-empty one-line marker name using letters, "
+            "numbers, '-' or '_'"
+        )
     normalized = str(question_text or "").strip()
     if not normalized:
         raise ValueError("question_text must not be empty")
     if "\n" in normalized or "\r" in normalized:
         raise ValueError("question_text must be one line")
     return normalized
+
+
+def worker_wait_question_event_id(dispatch_id: str, wait_id: str) -> str:
+    """Return the stable event id shared by the wait publisher and watcher fallback."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"goalflight:steer-wait:{dispatch_id}:{wait_id}",
+        )
+    )
+
+
+def worker_wait_reply_command(
+    dispatch_id: str,
+    wait_id: str,
+    question_kind: str,
+) -> str:
+    """Render the controller command that answers one wait."""
+    command = "goalflight_dispatch.py steer " + shlex.join(
+        [str(dispatch_id), "--reply-to", str(wait_id)]
+    )
+    if question_kind == "USER-CONFIRM":
+        command += ' --decision "<yes|no>"'
+    return command + ' "<answer>"'
 
 
 def _latest_worker_wait_arm(entries: list[dict], dispatch_id: str) -> dict | None:
@@ -836,6 +915,8 @@ def _worker_wait_settlement(
             and entry.get("reply_to") == wait_id
             and entry.get("decision") in WORKER_WAIT_SETTLED_DECISIONS
         ):
+            if entry.get("decision") in {"failed", "timeout"}:
+                return entry
             context = entry.get("context")
             reply_seq = context.get("reply_seq") if isinstance(context, dict) else None
             if (
@@ -922,10 +1003,7 @@ def _recoverable_worker_wait_reply(
     if question_kind == "USER-CONFIRM":
         if decision not in USER_CONFIRM_DECISIONS:
             return None
-    elif question_kind == "USER-NEED":
-        if decision is not None and decision not in USER_CONFIRM_DECISIONS:
-            return None
-    else:
+    elif decision is not None and decision not in USER_CONFIRM_DECISIONS:
         return None
     return arm, reply
 
@@ -937,6 +1015,8 @@ def append_worker_wait_reply(
     wait_id: str,
     text: str,
     decision: str | None = None,
+    sender: dict | None = None,
+    cross_project: bool = False,
     lock_timeout_secs: float | None = None,
 ) -> dict:
     """Durably admit one typed, exactly-correlated reply to one active wait.
@@ -952,6 +1032,7 @@ def append_worker_wait_reply(
     if not text or "\n" in text or "\r" in text:
         raise ValueError("worker wait reply text must be one non-empty line")
     normalized_decision = None if decision is None else str(decision).strip().lower()
+    reply_context: dict[str, object] = {}
 
     def validate(entries: list[dict]) -> None:
         arm = next(
@@ -980,14 +1061,15 @@ def append_worker_wait_reply(
         if (
             not isinstance(deadline_ns, int)
             or isinstance(deadline_ns, bool)
-            or int(active_monotonic() * 1_000_000_000) >= deadline_ns
+            or deadline_ns <= 0
         ):
-            raise ValueError(f"worker wait {wait_id!r} is expired")
-        if _worker_wait_settlement(
+            raise ValueError(f"worker wait {wait_id!r} has invalid deadline")
+        settlement = _worker_wait_settlement(
             entries,
             wait_id=wait_id,
             after_seq=arm_seq,
-        ) is not None:
+        )
+        if settlement is not None and settlement.get("decision") != "timeout":
             raise ValueError(f"worker wait {wait_id!r} is already settled")
         if _worker_wait_replies(
             entries,
@@ -1000,11 +1082,13 @@ def append_worker_wait_reply(
         if question_kind == "USER-CONFIRM":
             if normalized_decision not in USER_CONFIRM_DECISIONS:
                 raise ValueError("USER-CONFIRM reply requires decision=yes or decision=no")
-        elif question_kind == "USER-NEED":
-            if normalized_decision is not None and normalized_decision not in USER_CONFIRM_DECISIONS:
-                raise ValueError("worker wait reply decision must be yes or no")
-        else:
-            raise ValueError("worker wait arm has invalid question_kind")
+        elif normalized_decision is not None and normalized_decision not in USER_CONFIRM_DECISIONS:
+            raise ValueError("worker wait reply decision must be yes or no")
+        if (
+            settlement is not None
+            or int(active_monotonic() * 1_000_000_000) >= deadline_ns
+        ):
+            reply_context["late"] = True
 
     return append_steer_entry(
         path,
@@ -1013,6 +1097,9 @@ def append_worker_wait_reply(
         kind=WORKER_WAIT_REPLY_KIND,
         reply_to=wait_id,
         decision=normalized_decision,
+        context=reply_context or None,
+        sender=sender,
+        cross_project=cross_project,
         validate_existing=validate,
         lock_timeout_secs=lock_timeout_secs,
     )
@@ -1035,6 +1122,7 @@ def append_worker_wait_started(
         field="timeout_secs",
         maximum=MAX_WORKER_WAIT_TIMEOUT_SECS,
     )
+    question_kind = str(question_kind or "").strip()
     question_text = _validate_worker_question(question_kind, question_text)
     consumed_reply_receipts = consumed_reply_receipts or set()
     wait_id = uuid.uuid4().hex
@@ -1133,22 +1221,50 @@ def worker_wait_question_marker_text(
     return f"{dispatch_id} — {question_text} [wait-id:{wait_id}]"
 
 
+def publish_worker_wait_question(event: dict) -> dict:
+    """Publish one wait question before the worker enters its blocking loop."""
+    import goalflight_messages
+
+    return goalflight_messages.post_worker_wait_question(
+        dispatch_id=str(event["dispatch_id"]),
+        wait_id=str(event["wait_id"]),
+        question_kind=str(event["question_kind"]),
+        question_text=str(event["question_text"]),
+        reply_command=str(event["reply_command"]),
+        event_id=worker_wait_question_event_id(
+            str(event["dispatch_id"]),
+            str(event["wait_id"]),
+        ),
+    )
+
+
 def append_worker_wait_ended(
     path: Path,
     arm: dict,
     *,
     decision: str,
     reply_seq: int | None = None,
+    context: dict | None = None,
     lock_timeout_secs: float | None = None,
 ) -> dict:
     wait_id = str(arm.get("question_id") or "").strip()
     if not wait_id:
         raise ValueError("worker wait arm is missing question_id")
     if decision not in WORKER_WAIT_SETTLED_DECISIONS:
-        raise ValueError("worker wait end requires a consumed reply")
-    if isinstance(reply_seq, bool) or not isinstance(reply_seq, int) or reply_seq <= 0:
-        raise ValueError("worker wait end requires a positive consumed reply_seq")
-    context = {"reply_seq": reply_seq}
+        raise ValueError("worker wait end requires reply, timeout, or failed")
+    if decision == "reply":
+        if isinstance(reply_seq, bool) or not isinstance(reply_seq, int) or reply_seq <= 0:
+            raise ValueError("worker wait reply end requires a positive reply_seq")
+        end_context = dict(context or {})
+        end_context["reply_seq"] = reply_seq
+    else:
+        if reply_seq is not None:
+            raise ValueError("non-reply worker wait end cannot carry reply_seq")
+        end_context = dict(context or {})
+        end_context.setdefault(
+            "settled_awake_mono_ns",
+            int(active_monotonic() * 1_000_000_000),
+        )
 
     def validate(entries: list[dict]) -> None:
         try:
@@ -1161,8 +1277,13 @@ def append_worker_wait_ended(
             wait_id=wait_id,
             after_seq=arm_seq,
         )
-        if len(replies) != 1 or replies[0].get("seq") != reply_seq:
-            raise ValueError("worker wait end does not match one consumed typed reply")
+        if decision == "reply":
+            if len(replies) != 1 or replies[0].get("seq") != reply_seq:
+                raise ValueError("worker wait end does not match one consumed typed reply")
+        elif decision == "timeout" and replies:
+            # A controller reply won the deadline race. Let the caller deliver
+            # it instead of recording a misleading timeout settlement.
+            raise WorkerWaitReplyPending(arm, replies[0])
         if _worker_wait_settlement(
             entries,
             wait_id=wait_id,
@@ -1178,7 +1299,7 @@ def append_worker_wait_ended(
         kind=WORKER_WAIT_ENDED_KIND,
         reply_to=wait_id,
         decision=decision,
-        context=context,
+        context=end_context,
         lock_timeout_secs=lock_timeout_secs,
         validate_existing=validate,
     )
@@ -1268,7 +1389,12 @@ def active_worker_wait(
         question_kind = context.get("question_kind")
         question_text = str(context.get("question_text") or "").strip()
         if (
-            question_kind not in {"USER-NEED", "USER-CONFIRM"}
+            not isinstance(question_kind, str)
+            or not question_kind
+            or len(question_kind) > 64
+            or any(char in question_kind for char in "\r\n")
+            or not question_kind[0].isalpha()
+            or any(not (char.isalnum() or char in "_-") for char in question_kind)
             or not question_text
             or "\n" in question_text
             or "\r" in question_text
@@ -1287,6 +1413,8 @@ def active_worker_wait(
             decision = reply.get("decision")
             if question_kind == "USER-CONFIRM" and decision not in USER_CONFIRM_DECISIONS:
                 return None
+            if question_kind != "USER-CONFIRM" and decision is not None and decision not in USER_CONFIRM_DECISIONS:
+                return None
             reply_awake_mono_ns = reply.get("awake_mono_ns")
             if (
                 not isinstance(reply_awake_mono_ns, int)
@@ -1303,6 +1431,7 @@ def active_worker_wait(
             "deadline_awake_mono_ns": effective_deadline_ns,
             "remaining_secs": max(0.0, (effective_deadline_ns - now_ns) / 1_000_000_000),
             "question_kind": question_kind,
+            "question_text": question_text,
             "phase": "reply_pending" if reply is not None else "awaiting_reply",
             "reply_seq": reply.get("seq") if reply is not None else None,
             "reply_decision": reply.get("decision") if reply is not None else None,
@@ -1330,6 +1459,7 @@ def wait_for_worker_entries(
     timeout_secs: float = DEFAULT_WORKER_WAIT_TIMEOUT_SECS,
     poll_secs: float = DEFAULT_WORKER_WAIT_POLL_SECS,
     notify: Callable[[dict], None] | None = None,
+    publish_question: Callable[[dict], object] | None = None,
 ) -> dict:
     """Poll the steer mailbox until backlog/reply or the independent deadline.
 
@@ -1347,7 +1477,10 @@ def wait_for_worker_entries(
         field="poll_secs",
         maximum=MAX_WORKER_WAIT_TIMEOUT_SECS,
     )
+    question_kind = str(question_kind or "").strip()
     question_text = _validate_worker_question(question_kind, question_text)
+    if publish_question is None:
+        publish_question = publish_worker_wait_question
     consumed_reply_receipts = consumed_reply_receipts or set()
 
     def report(event: dict) -> None:
@@ -1355,13 +1488,6 @@ def wait_for_worker_entries(
             notify(event)
 
     deadline = active_monotonic() + timeout_secs
-
-    def deadline_result(wait_id: str | None = None) -> dict:
-        result = {"state": "deadline", "entries": []}
-        if wait_id:
-            result["wait_id"] = wait_id
-        report(result)
-        return result
 
     def remaining_secs() -> float:
         return max(0.0, deadline - active_monotonic())
@@ -1380,6 +1506,42 @@ def wait_for_worker_entries(
         # for at-least-once redelivery on the next wait.
         report(result)
         schedule_worker_wait_reply_cleanup(path, arm, reply)
+        return result
+
+    def deadline_result(arm: dict | None = None) -> dict:
+        if arm is not None:
+            try:
+                append_worker_wait_ended(
+                    path,
+                    arm,
+                    decision="timeout",
+                    context={
+                        "timeout_secs": timeout_secs,
+                        "deadline_awake_mono_ns": (
+                            arm.get("context", {}).get("deadline_awake_mono_ns")
+                            if isinstance(arm.get("context"), dict)
+                            else None
+                        ),
+                    },
+                    # A timeout must be durable before the worker can issue
+                    # another question. Wait for the mailbox writer rather
+                    # than returning an unsettled arm.
+                    lock_timeout_secs=None,
+                )
+            except WorkerWaitReplyPending as pending_reply:
+                return deliver_reply(
+                    pending_reply.arm,
+                    pending_reply.reply,
+                    recovered=False,
+                )
+            except ValueError as exc:
+                if "already settled" not in str(exc):
+                    raise
+        result = {"state": "deadline", "entries": [], "timed_out": True}
+        if arm is not None:
+            result["wait_id"] = arm["question_id"]
+            result["settled"] = True
+        report(result)
         return result
 
     try:
@@ -1431,24 +1593,63 @@ def wait_for_worker_entries(
         )
     except TimeoutError:
         return deadline_result()
+    question_marker_text = worker_wait_question_marker_text(
+        dispatch_id,
+        question_text,
+        str(arm["question_id"]),
+    )
+    try:
+        publish_question(
+            {
+                "dispatch_id": dispatch_id,
+                "wait_id": str(arm["question_id"]),
+                "question_kind": question_kind,
+                "question_text": question_text,
+                "reply_command": worker_wait_reply_command(
+                    dispatch_id,
+                    str(arm["question_id"]),
+                    question_kind,
+                ),
+                "question_marker_text": question_marker_text,
+                "arm": arm,
+            }
+        )
+    except Exception as exc:
+        try:
+            append_worker_wait_ended(
+                path,
+                arm,
+                decision="failed",
+                context={
+                    "reason": "question_publication_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                lock_timeout_secs=None,
+            )
+        except Exception as settlement_exc:
+            raise ValueError(
+                "worker wait question publication failed: "
+                f"{type(exc).__name__}: {exc}; failed to settle wait: "
+                f"{type(settlement_exc).__name__}: {settlement_exc}"
+            ) from exc
+        raise ValueError(
+            "worker wait question publication failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     report(
         {
             "state": "armed",
             "arm": arm,
             "timeout_secs": timeout_secs,
             "question_kind": question_kind,
-            "question_marker_text": worker_wait_question_marker_text(
-                dispatch_id,
-                question_text,
-                str(arm["question_id"]),
-            ),
+            "question_marker_text": question_marker_text,
         }
     )
     carrier_read_error_reported = False
     while True:
         remaining = remaining_secs()
         if remaining <= 0:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         try:
             current_entries = read_steer_entries(
                 path,
@@ -1456,7 +1657,7 @@ def wait_for_worker_entries(
                 quarantine_errors=False,
             )
         except TimeoutError:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         except Exception as exc:
             if not isinstance(exc, OSError) and not is_carrier_error(exc):
                 raise
@@ -1472,7 +1673,7 @@ def wait_for_worker_entries(
                 carrier_read_error_reported = True
             remaining = remaining_secs()
             if remaining <= 0:
-                return deadline_result(str(arm["question_id"]))
+                return deadline_result(arm)
             time.sleep(min(poll_secs, remaining))
             continue
         replies = _worker_wait_replies(
@@ -1487,7 +1688,7 @@ def wait_for_worker_entries(
             raise ValueError("worker wait has multiple correlated replies")
         remaining = remaining_secs()
         if remaining <= 0:
-            return deadline_result(str(arm["question_id"]))
+            return deadline_result(arm)
         time.sleep(min(poll_secs, remaining))
 
 

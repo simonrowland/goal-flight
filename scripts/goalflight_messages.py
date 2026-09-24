@@ -2653,6 +2653,88 @@ def _controller_sender_session_id(dispatch_id: str) -> str | None:
     return str(session["id"])
 
 
+def _steer_sender_project_root() -> Path:
+    """Resolve the controller command's project identity for steer attribution."""
+    requested = os.environ.get("GOALFLIGHT_PROJECT_ROOT") or str(Path.cwd())
+    try:
+        import goalflight_task  # type: ignore
+
+        return goalflight_task.resolve_project_root(requested)
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return Path(requested).expanduser().resolve(strict=False)
+    except Exception as exc:
+        raise MessageError(
+            f"cannot resolve steer sender project_root {requested!r}: {exc}"
+        ) from exc
+
+
+def _steer_sender_identity() -> dict[str, object]:
+    """Return the sender fields stamped on every controller steer."""
+    label = _controller_post_source_label() or UNKNOWN_CONTROLLER_LABEL
+    raw_pid = str(os.environ.get("GOALFLIGHT_CONTROLLER_PID") or "").strip()
+    try:
+        pid = int(raw_pid) if raw_pid else os.getpid()
+    except (TypeError, ValueError):
+        pid = os.getpid()
+    if pid <= 0:
+        pid = os.getpid()
+    return {
+        "controller_label": str(label),
+        "controller_pid": pid,
+        "project_root": str(_steer_sender_project_root()),
+    }
+
+
+def _canonical_steer_project_root(value: object) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        import goalflight_task  # type: ignore
+
+        resolved = goalflight_task.resolve_project_root_for_read(value)
+        if resolved is not None:
+            return resolved
+    except _EXPECTED_OPTIONAL_ERRORS:
+        pass
+    try:
+        return Path(value).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _validate_steer_sender_project(
+    dispatch_id: str,
+    sender: dict[str, object],
+    *,
+    cross_project: bool,
+) -> None:
+    """Refuse a foreign-project steer before writing carrier or worker bytes."""
+    record, lookup_error = _dispatch_record(dispatch_id)
+    if lookup_error is not None:
+        raise MessageError(
+            f"cannot validate steer sender for dispatch {dispatch_id}: {lookup_error}"
+        )
+    target_root = _canonical_steer_project_root(
+        record.get("project_root") if isinstance(record, dict) else None
+    )
+    sender_root = _canonical_steer_project_root(sender.get("project_root"))
+    if target_root is None or sender_root is None or target_root == sender_root:
+        return
+    if cross_project:
+        return
+    raise MessageError(
+        "steer refused: sender project_root "
+        f"{sender_root} differs from target dispatch {dispatch_id} project_root "
+        f"{target_root}; pass --cross-project to override"
+    )
+
+
+def _steer_sender_payload(sender: dict[str, object], cross_project: bool) -> dict[str, object]:
+    payload = dict(sender)
+    payload["cross_project"] = bool(cross_project)
+    return payload
+
+
 def post_result_is_error(result: dict) -> bool:
     delivery = result["delivery"]
     worker_error = bool(
@@ -2675,13 +2757,29 @@ def post_controller_steer(
     *,
     reply_to: str | None = None,
     decision: str | None = None,
+    cross_project: bool = False,
 ) -> dict:
     """Record a legacy steer command, then materialize its worker-visible view."""
-    source = {"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"}
+    sender = _steer_sender_identity()
+    _validate_steer_sender_project(
+        dispatch_id,
+        sender,
+        cross_project=cross_project,
+    )
+    source = {
+        "node": "local",
+        "adapter": "goalflight-dispatch",
+        "transport": "steer",
+        **sender,
+        "cross_project": bool(cross_project),
+    }
     sender_session_id = _controller_sender_session_id(dispatch_id)
     if sender_session_id is not None:
         source["controller_session_id"] = sender_session_id
-    payload = {"text": text}
+    payload = {
+        "text": text,
+        "sender": _steer_sender_payload(sender, cross_project),
+    }
     if reply_to is not None:
         payload["reply_to"] = reply_to
     if decision is not None:
@@ -2695,6 +2793,44 @@ def post_controller_steer(
         author_capability=_presented_ambient_controller_capability(),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
+    )
+
+
+def post_worker_wait_question(
+    *,
+    dispatch_id: str,
+    wait_id: str,
+    question_kind: str,
+    question_text: str,
+    reply_command: str,
+    event_id: str | None = None,
+) -> dict:
+    """Publish a worker wait question on the dispatch's controller stream."""
+    msg_type = {
+        "USER-NEED": "user_need",
+        "USER-CONFIRM": "user_confirm",
+    }.get(question_kind, "controller-question")
+    payload = {
+        "text": question_text,
+        "question": question_text,
+        "question_kind": question_kind,
+        "question_id": wait_id,
+        "wait_id": wait_id,
+        "reply_command": reply_command,
+        "awaiting_reply": True,
+    }
+    return post_message(
+        dispatch_id=dispatch_id,
+        msg_type=msg_type,
+        payload=payload,
+        messages_dir=default_messages_dir(),
+        source={
+            "node": "local",
+            "adapter": "goalflight-dispatch",
+            "transport": "steer-wait",
+        },
+        event_id=event_id,
+        deliver_to_worker=False,
     )
 
 
@@ -5216,6 +5352,7 @@ DRAIN_SIGNAL_TYPES = frozenset(
         "finding",
         "controller-question",
         "user_need",
+        "user_confirm",
         "blocked",
     }
 )

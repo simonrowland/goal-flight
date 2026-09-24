@@ -4335,6 +4335,7 @@ def _append_steer_message(
     *,
     reply_to: str | None = None,
     decision: str | None = None,
+    cross_project: bool = False,
 ) -> dict:
     import goalflight_messages
 
@@ -4343,6 +4344,7 @@ def _append_steer_message(
         text,
         reply_to=reply_to,
         decision=decision,
+        cross_project=cross_project,
     )
 
 
@@ -4458,7 +4460,7 @@ def _cmd_steer(argv: list[str]) -> int:
         default=goalflight_steer_mailbox.DEFAULT_WORKER_WAIT_POLL_SECS,
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--question-kind", choices=("USER-NEED", "USER-CONFIRM"))
+    parser.add_argument("--question-kind")
     parser.add_argument(
         "--reply-to",
         help="Correlate this typed controller reply to an active worker wait id.",
@@ -4467,6 +4469,11 @@ def _cmd_steer(argv: list[str]) -> int:
         "--decision",
         choices=("yes", "no"),
         help="Explicit USER-CONFIRM decision; requires --reply-to.",
+    )
+    parser.add_argument(
+        "--cross-project",
+        action="store_true",
+        help="Allow a controller steer from a different project root.",
     )
     args = parser.parse_args(argv)
 
@@ -4477,6 +4484,12 @@ def _cmd_steer(argv: list[str]) -> int:
 
     if args.list_messages and args.wait_for_message:
         print("goalflight_dispatch: steer --list and --wait are mutually exclusive", file=sys.stderr)
+        return 64
+    if args.cross_project and (args.list_messages or args.wait_for_message):
+        print(
+            "goalflight_dispatch: steer --cross-project applies only to controller steers",
+            file=sys.stderr,
+        )
         return 64
     if args.list_messages and (args.reply_to or args.decision):
         print("goalflight_dispatch: steer --list cannot carry reply fields", file=sys.stderr)
@@ -4528,20 +4541,33 @@ def _cmd_steer(argv: list[str]) -> int:
         print("goalflight_dispatch: --decision requires --reply-to", file=sys.stderr)
         return 64
 
+    def append_controller_steer() -> int:
+        try:
+            result = _append_steer_message(
+                args.dispatch_id,
+                args.message,
+                reply_to=args.reply_to,
+                decision=args.decision,
+                cross_project=args.cross_project,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            return 64
+        except Exception as exc:
+            import goalflight_messages
+
+            if not isinstance(exc, goalflight_messages.MessageError):
+                raise
+            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            return 64
+        return _report_steer_result(args.dispatch_id, result)
+
     shape = goalflight_ledger.infer_shape(record)
     if shape == "acp":
         warning = _worker_liveness_warning(record)
         if warning:
             print(warning, file=sys.stderr)
-        return _report_steer_result(
-            args.dispatch_id,
-            _append_steer_message(
-                args.dispatch_id,
-                args.message,
-                reply_to=args.reply_to,
-                decision=args.decision,
-            ),
-        )
+        return append_controller_steer()
     if shape != "bash":
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
         return 64
@@ -4549,15 +4575,7 @@ def _cmd_steer(argv: list[str]) -> int:
     warning = _worker_liveness_warning(record)
     if warning:
         print(warning, file=sys.stderr)
-    return _report_steer_result(
-        args.dispatch_id,
-        _append_steer_message(
-            args.dispatch_id,
-            args.message,
-            reply_to=args.reply_to,
-            decision=args.decision,
-        ),
-    )
+    return append_controller_steer()
 
 
 def _codex_dispatch_homes_dir() -> Path:

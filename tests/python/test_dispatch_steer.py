@@ -25,6 +25,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch  # noqa: E402
 import goalflight_journal  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_messages  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_terminal  # noqa: E402
 
@@ -74,6 +75,17 @@ def _read_mailbox(tmp: Path, dispatch_id: str) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _read_messages(tmp: Path, dispatch_id: str) -> list[dict]:
+    path = tmp / "messages" / f"{dispatch_id}.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _record(
@@ -164,7 +176,10 @@ def case_bash_append_and_list_with_ack() -> None:
 
         entries = _read_mailbox(tmp, dispatch_id)
         assert [entry["seq"] for entry in entries] == [1, 2], entries
-        assert [entry["text"] for entry in entries] == ["hello one", "hello two"], entries
+        assert [
+            entry["text"].startswith(text)
+            for entry, text in zip(entries, ("hello one", "hello two"))
+        ] == [True, True], entries
         envelopes = [
             json.loads(line)
             for line in (tmp / "messages" / f"{dispatch_id}.jsonl").read_text(encoding="utf-8").splitlines()
@@ -174,8 +189,8 @@ def case_bash_append_and_list_with_ack() -> None:
         listed = _run_steer(tmp, dispatch_id, "--list")
         assert listed.returncode == 0, listed.stderr
         assert "seq\tts\tacked\ttext" in listed.stdout, listed.stdout
-        assert "\ttrue\thello one" in listed.stdout, listed.stdout
-        assert "\tfalse\thello two" in listed.stdout, listed.stdout
+        assert "\ttrue\t" in listed.stdout and "hello one" in listed.stdout, listed.stdout
+        assert "\tfalse\t" in listed.stdout and "hello two" in listed.stdout, listed.stdout
 
 
 def case_shape_routing_and_missing_record() -> None:
@@ -186,11 +201,113 @@ def case_shape_routing_and_missing_record() -> None:
         assert acp.returncode == 0, acp.stdout + acp.stderr
         assert "steer appended:" in acp.stdout, acp.stdout
         entries = _read_mailbox(tmp, "acp-mailbox")
-        assert len(entries) == 1 and entries[0]["text"] == "redirect", entries
+        assert len(entries) == 1 and entries[0]["text"].startswith("redirect"), entries
 
         missing = _run_steer(tmp, "missing-dispatch", "redirect")
         assert missing.returncode != 0, missing.stdout + missing.stderr
         assert "no ledger record" in missing.stderr
+
+
+def case_steer_sender_identity_and_cross_project_guard() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "steer-sender-identity"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        old_env = {
+            key: os.environ.get(key)
+            for key in (
+                "GOALFLIGHT_CONTROLLER_LABEL",
+                "GOALFLIGHT_CONTROLLER_PID",
+                "GOALFLIGHT_PROJECT_ROOT",
+            )
+        }
+        old_delivery = goalflight_messages._deliver_message_to_worker
+
+        def pretend_delivery(_dispatch_id: str, _envelope: dict, **_kwargs) -> dict:
+            return {
+                "requested": True,
+                "delivered": True,
+                "worker_view_written": True,
+                "status": "worker_view_written",
+                "steer_seq": 2,
+                "steer_path": str(_mailbox(tmp, dispatch_id)),
+            }
+
+        foreign = tmp / "foreign-project"
+        foreign.mkdir()
+        try:
+            os.environ["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-alpha"
+            os.environ["GOALFLIGHT_CONTROLLER_PID"] = "4242"
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(ROOT)
+            goalflight_messages._deliver_message_to_worker = pretend_delivery
+            with _state_dir(tmp):
+                first = goalflight_messages.post_controller_steer(
+                    dispatch_id,
+                    "inspect the worker state",
+                )
+                envelope = first["envelope"]
+                expected_sender_root = envelope["source"]["project_root"]
+                _path, entry = goalflight_steer_mailbox.append_message_view(
+                    dispatch_id,
+                    envelope,
+                    state_dir=tmp / "state",
+                )
+            sender = envelope["source"]
+            assert sender["controller_label"] == "controller-alpha", sender
+            assert sender["controller_pid"] == 4242, sender
+            assert Path(sender["project_root"]).is_absolute(), sender
+            assert entry["sender"] == {
+                "controller_label": "controller-alpha",
+                "controller_pid": 4242,
+                "project_root": expected_sender_root,
+            }, entry
+            assert "controller_label=controller-alpha" in entry["text"], entry
+            assert "controller_pid=4242" in entry["text"], entry
+            assert expected_sender_root in entry["text"], entry
+
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(foreign)
+            with _state_dir(tmp):
+                try:
+                    goalflight_messages.post_controller_steer(
+                        dispatch_id,
+                        "foreign directive",
+                    )
+                except goalflight_messages.MessageError as exc:
+                    refusal = str(exc)
+                else:
+                    raise AssertionError("foreign steer was not refused")
+            assert "sender project_root" in refusal, refusal
+            assert "target dispatch" in refusal, refusal
+            assert "--cross-project" in refusal, refusal
+            assert len(_read_messages(tmp, dispatch_id)) == 1
+            assert len(_read_mailbox(tmp, dispatch_id)) == 1
+
+            with _state_dir(tmp), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = goalflight_dispatch.main(
+                    [
+                        "steer",
+                        dispatch_id,
+                        "foreign directive",
+                        "--cross-project",
+                    ]
+                )
+            assert rc == 0
+            allowed = _read_messages(tmp, dispatch_id)[-1]
+            _path, allowed_entry = goalflight_steer_mailbox.append_message_view(
+                dispatch_id,
+                allowed,
+                state_dir=tmp / "state",
+            )
+            assert allowed["source"]["cross_project"] is True
+            assert allowed["payload"]["sender"]["cross_project"] is True
+            assert allowed_entry["cross_project"] is True, allowed_entry
+        finally:
+            goalflight_messages._deliver_message_to_worker = old_delivery
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def case_acp_list_reads_status_ack_dict() -> None:
@@ -206,7 +323,7 @@ def case_acp_list_reads_status_ack_dict() -> None:
 
         listed = _run_steer(tmp, dispatch_id, "--list")
         assert listed.returncode == 0, listed.stderr
-        assert "\ttrue\tredirect" in listed.stdout, listed.stdout
+        assert "\ttrue\t" in listed.stdout and "redirect" in listed.stdout, listed.stdout
 
 
 def case_prefixed_ack_is_parsed_by_both_call_sites() -> None:
@@ -397,7 +514,192 @@ def case_worker_wait_atomic_question_has_own_deadline() -> None:
         entries = _read_mailbox(tmp, dispatch_id)
         assert [entry.get("kind") for entry in entries] == [
             goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND,
+            goalflight_steer_mailbox.WORKER_WAIT_ENDED_KIND,
         ], entries
+        assert entries[-1]["decision"] == "timeout", entries
+
+
+def case_worker_wait_question_is_published_before_waiting() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-question-published"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+
+        proc = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "USER-NEED",
+            "need a controller decision",
+            "--timeout-secs",
+            "0.2",
+            "--poll-secs",
+            "1",
+        )
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        envelopes = _read_messages(tmp, dispatch_id)
+        assert len(envelopes) == 1, envelopes
+        envelope = envelopes[0]
+        assert envelope["type"] == "user_need", envelope
+        payload = envelope["payload"]
+        assert payload["question_kind"] == "USER-NEED", payload
+        assert payload["question"] == "need a controller decision", payload
+        assert payload["text"] == "need a controller decision", payload
+        wait_id = payload["wait_id"]
+        assert payload["question_id"] == wait_id, payload
+        assert payload["awaiting_reply"] is True, payload
+        assert payload["reply_command"] == (
+            f"goalflight_dispatch.py steer {dispatch_id} --reply-to {wait_id} \"<answer>\""
+        ), payload
+
+
+def case_controller_reply_reaches_waiter_and_late_reply_is_retained() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-reply-roundtrip"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        env = _env(tmp)
+        env["GOALFLIGHT_DISPATCH_ID"] = dispatch_id
+        env["GOALFLIGHT_STEER_FILE"] = str(_mailbox(tmp, dispatch_id))
+        waiter = subprocess.Popen(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "steer",
+                dispatch_id,
+                "--wait",
+                "--question-kind",
+                "USER-NEED",
+                "approve the next step",
+                "--timeout-secs",
+                "2",
+                "--poll-secs",
+                "0.02",
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            question: dict | None = None
+            while time.monotonic() < deadline:
+                envelopes = _read_messages(tmp, dispatch_id)
+                question = next(
+                    (
+                        item
+                        for item in envelopes
+                        if item.get("payload", {}).get("awaiting_reply") is True
+                    ),
+                    None,
+                )
+                if question is not None:
+                    break
+                time.sleep(0.02)
+            assert question is not None, _read_messages(tmp, dispatch_id)
+            wait_id = str(question["payload"]["wait_id"])
+            reply = _run_steer(tmp, dispatch_id, "--reply-to", wait_id, "approved")
+            assert reply.returncode == 0, reply.stdout + reply.stderr
+            stdout, stderr = waiter.communicate(timeout=5)
+            assert waiter.returncode == 0, stdout + stderr
+            assert "approved" in stdout, stdout
+            entries = _read_mailbox(tmp, dispatch_id)
+            typed = next(
+                entry
+                for entry in entries
+                if entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
+            )
+            assert typed["reply_to"] == wait_id, entries
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+                waiter.wait(timeout=5)
+
+        timeout_wait = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "USER-CONFIRM",
+            "authorize the next step",
+            "--timeout-secs",
+            "0.1",
+            "--poll-secs",
+            "1",
+        )
+        assert timeout_wait.returncode == 1, timeout_wait.stdout + timeout_wait.stderr
+        entries = _read_mailbox(tmp, dispatch_id)
+        assert any(
+            entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_ENDED_KIND
+            and entry.get("decision") == "timeout"
+            for entry in entries
+        ), entries
+
+        late = _run_steer(tmp, dispatch_id, "--reply-to", wait_id, "arrived late")
+        assert late.returncode == 0, late.stdout + late.stderr
+        entries = _read_mailbox(tmp, dispatch_id)
+        late_entry = next(
+            entry
+            for entry in entries
+            if entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
+            and entry.get("reply_to") == wait_id
+            and entry.get("text", "").startswith("arrived late")
+        )
+        assert late_entry["context"]["late"] is True, late_entry
+
+
+def case_worker_wait_publication_failure_fails_fast_and_settles() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-publish-failure"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        old_publish = goalflight_steer_mailbox.publish_worker_wait_question
+        old_dispatch_id = os.environ.get("GOALFLIGHT_DISPATCH_ID")
+        old_steer_file = os.environ.get("GOALFLIGHT_STEER_FILE")
+
+        def broken_publish(_event: dict) -> None:
+            raise RuntimeError("controller carrier unavailable")
+
+        try:
+            goalflight_steer_mailbox.publish_worker_wait_question = broken_publish
+            os.environ["GOALFLIGHT_DISPATCH_ID"] = dispatch_id
+            os.environ["GOALFLIGHT_STEER_FILE"] = str(_mailbox(tmp, dispatch_id))
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            started = time.monotonic()
+            with _state_dir(tmp), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = goalflight_dispatch.main(
+                    [
+                        "steer",
+                        dispatch_id,
+                        "--wait",
+                        "--question-kind",
+                        "USER-NEED",
+                        "must be visible",
+                        "--timeout-secs",
+                        "2",
+                    ]
+                )
+        finally:
+            goalflight_steer_mailbox.publish_worker_wait_question = old_publish
+            if old_dispatch_id is None:
+                os.environ.pop("GOALFLIGHT_DISPATCH_ID", None)
+            else:
+                os.environ["GOALFLIGHT_DISPATCH_ID"] = old_dispatch_id
+            if old_steer_file is None:
+                os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+            else:
+                os.environ["GOALFLIGHT_STEER_FILE"] = old_steer_file
+
+        assert rc == 64, stdout.getvalue() + stderr.getvalue()
+        assert time.monotonic() - started < 0.5, stderr.getvalue()
+        assert "question publication failed" in stderr.getvalue(), stderr.getvalue()
+        entries = _read_mailbox(tmp, dispatch_id)
+        assert [entry.get("kind") for entry in entries] == [
+            goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND,
+            goalflight_steer_mailbox.WORKER_WAIT_ENDED_KIND,
+        ], entries
+        assert entries[-1]["decision"] == "failed", entries
 
 
 def case_worker_wait_requires_an_atomic_question() -> None:
@@ -957,6 +1259,7 @@ def case_preamble_routing_matrix() -> None:
 def main() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
+    case_steer_sender_identity_and_cross_project_guard()
     case_acp_list_reads_status_ack_dict()
     case_prefixed_ack_is_parsed_by_both_call_sites()
     case_dead_worker_records_but_does_not_claim_delivery()
@@ -964,6 +1267,9 @@ def main() -> None:
     case_worker_wait_reports_existing_backlog_without_arming()
     case_worker_confirm_does_not_accept_decision_free_backlog()
     case_worker_wait_atomic_question_has_own_deadline()
+    case_worker_wait_question_is_published_before_waiting()
+    case_controller_reply_reaches_waiter_and_late_reply_is_retained()
+    case_worker_wait_publication_failure_fails_fast_and_settles()
     case_worker_wait_requires_an_atomic_question()
     case_worker_wait_carrier_error_is_reported()
     case_controller_reply_is_typed_and_wait_id_correlated()
