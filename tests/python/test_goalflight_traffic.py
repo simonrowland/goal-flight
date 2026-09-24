@@ -251,6 +251,31 @@ def test_unreadable_ledger_marks_status_worker_unverified(
     assert "total unverified: 1" in traffic.render(summary)
 
 
+def test_unreadable_ledger_and_status_dir_report_unknown(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    dispatch_dir = tmp_path / "missing-dispatch"
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable; status directory unavailable: {dispatch_dir}"
+    ]
+    assert "UNKNOWN:" in traffic.render(summary)
+    assert "UNKNOWN:" in traffic.live_mix_pointer(summary)
+
+
 def test_terminal_ledger_state_wins_over_live_sidecar(
     tmp_path: Path, monkeypatch
 ) -> None:

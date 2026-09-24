@@ -38,11 +38,13 @@ def _dispatch_status_payloads(
     dispatch_dir: Path,
     *,
     limit: int = STATUS_SCAN_LIMIT,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str | None]:
     try:
+        if not dispatch_dir.is_dir():
+            return [], f"status directory unavailable: {dispatch_dir}"
         paths = list(dispatch_dir.glob("*.status.json"))
-    except OSError:
-        return []
+    except OSError as exc:
+        return [], f"status directory unreadable: {type(exc).__name__}: {exc}"
     if limit > 0 and len(paths) > limit:
         def _mtime(path: Path) -> float:
             try:
@@ -60,7 +62,7 @@ def _dispatch_status_payloads(
             continue
         payload.setdefault("status_path", str(path))
         payloads.append(payload)
-    return payloads
+    return payloads, None
 
 
 def _timestamp(value: object) -> float | None:
@@ -128,7 +130,7 @@ def _dispatch_records(
     # Status directories retain terminal history on some installations. A
     # bounded recent scan keeps status-only launches visible without reopening
     # every historical sidecar on each /usage invocation.
-    status_payloads = _dispatch_status_payloads(status_dir)
+    status_payloads, status_error = _dispatch_status_payloads(status_dir)
     status_ids = {str(payload["dispatch_id"]) for payload in status_payloads}
     now = time.time()
     for record in list(records.values()):
@@ -194,6 +196,14 @@ def _dispatch_records(
             if isinstance(expected, Mapping):
                 record["worker_identity"] = dict(expected)
 
+    if ledger_unreadable and status_error:
+        return [
+            {
+                "_source_unverified_reason": (
+                    "ledger unreadable; " + status_error
+                )
+            }
+        ]
     return list(records.values())
 
 
@@ -372,12 +382,18 @@ def live_workers_by_model(
     buckets: dict[str, dict[str, object]] = {}
     total = 0
     unverified_total = 0
+    unknown_reasons: list[str] = []
     candidates: list[dict[str, object]] = []
     now = time.time()
     for record in _dispatch_records(
         ledger_records=ledger_records,
         dispatch_dir=dispatch_dir,
     ):
+        if record.get("_source_unverified_reason"):
+            unknown_reasons.append(str(record["_source_unverified_reason"]))
+            _record_bucket(buckets, "UNKNOWN", "UNKNOWN", "unverified")
+            unverified_total += 1
+            continue
         if not isinstance(record.get("worker_pid"), int) or record["worker_pid"] <= 0:
             continue
         if any(
@@ -446,11 +462,14 @@ def live_workers_by_model(
                 )
             },
         }
-    return {
+    summary = {
         "total": total,
         "unverified_total": unverified_total,
         "models": models,
     }
+    if unknown_reasons:
+        summary["unknown_reasons"] = unknown_reasons
+    return summary
 
 
 def _model_flag(model: str) -> str | None:
@@ -496,6 +515,9 @@ def render(summary: Mapping[str, object]) -> str:
                 f"  {int(details.get('unverified', 0)):10d}  "
                 f"{controller_text}{warning_text}"
             )
+    reasons = summary.get("unknown_reasons")
+    if isinstance(reasons, Sequence) and reasons:
+        lines.append("  UNKNOWN: " + "; ".join(str(reason) for reason in reasons))
     lines.append(f"  total live: {int(summary.get('total', 0))}")
     lines.append(f"  total unverified: {int(summary.get('unverified_total', 0))}")
     return "\n".join(lines)
@@ -513,7 +535,13 @@ def live_mix_pointer(summary: Mapping[str, object]) -> str:
                 if family in model_text:
                     counts[family] += int(details.get("count", 0))
     joined = ", ".join(f"{family} {counts[family]}" for family in POINTER_FAMILIES)
-    return f"live mix: {joined}; see /goal-flight traffic"
+    reasons = summary.get("unknown_reasons")
+    unknown = (
+        "; UNKNOWN: " + "; ".join(str(reason) for reason in reasons)
+        if isinstance(reasons, Sequence) and reasons
+        else ""
+    )
+    return f"live mix: {joined}{unknown}; see /goal-flight traffic"
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -3466,44 +3466,47 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
     )
 
 
-def _held_liveness(dispatch_id: str) -> tuple[str, dict]:
-    record = _find_dispatch_record(dispatch_id)
-    if not isinstance(record, dict):
-        return "indeterminate", {}
-    if record.get("worker_still_alive") is True:
-        return "live", record
-    try:
-        index = _build_queue_carrier_index(_queue_entry_path(dispatch_id).parent)
-        if index.listing_error is not None:
-            return "indeterminate", record
-        carrier_statuses = index.carriers_by_id.get(dispatch_id, [])
-        if any(status.kind == ClaimCarrierKind.LIVE for status in carrier_statuses):
-            return "live", record
-        if any(status.kind == ClaimCarrierKind.UNKNOWN for status in carrier_statuses):
-            return "indeterminate", record
-    except Exception:
-        return "indeterminate", record
-    pid = record.get("worker_pid") or record.get("queue_worker_pid")
-    if pid:
-        status, _reason = _queue_claim_identity_status(
-            pid, record.get("worker_identity") or record.get("queue_worker_identity")
-        )
-        if status in {"live", "indeterminate"}:
-            return status, record
-        return "dead", record
-    return ("dead" if record.get("worker_still_alive") is False else "indeterminate"), record
+def _withdraw_recovery_plan(
+    dispatch_id: str, project_root: str,
+) -> tuple[Path, dict | None, dict, dict[Path, dict], str | None]:
+    """Run the withdrawal liveness preflight and return its actor details.
+
+    ``operator`` is used only for this read-only probe so an unowned dead row
+    can be classified. The mutating command still uses the recorded owner, or
+    the explicit operator override when the row has no owner.
+    """
+    probe = argparse.Namespace(
+        dispatch_id=dispatch_id,
+        project_root=project_root,
+        operator=True,
+        controller_label=None,
+        dry_run=True,
+    )
+    root, _authority, attempt, record, carriers, _outcome, _withdrawn = (
+        _withdraw_preflight(probe)
+    )
+    owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
+    owner = str(owner).strip() if owner else None
+    return root, record, attempt, carriers, owner
 
 
 def _retry_recovery_command(
-    held_id: str, replacement_id: str, project_root: str, label: str | None,
+    held_id: str,
+    replacement_id: str,
+    project_root: str,
+    *,
+    owner: str | None = None,
+    operator: bool = False,
 ) -> str:
     command = [
         sys.executable, str(Path(__file__).resolve()), "withdraw", held_id,
         "--superseded-by", replacement_id, "--reason",
         "retry same task after held dispatch ended", "--project-root", project_root,
     ]
-    if label:
-        command.extend(("--controller-label", label))
+    if owner:
+        command.extend(("--controller-label", owner))
+    elif operator:
+        command.append("--operator")
     return shlex.join(command)
 
 
@@ -3517,19 +3520,28 @@ def _completion_refusal_guidance(
     task_ids = list(getattr(args, "task_ids", []) or [])
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
     replacement = str(getattr(args, "dispatch_id", "") or "<new-dispatch-id>")
-    label = str(getattr(args, "controller_label", None) or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip() or None
     if held and not live:
         lines = []
         for dispatch_id, state in held:
-            liveness, record = _held_liveness(dispatch_id)
-            if liveness == "live":
-                lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
-            elif liveness == "indeterminate":
-                lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
-            else:
-                owner = str(record.get("controller_label") or label or "").strip() or None
-                command = _retry_recovery_command(dispatch_id, replacement, project_root, owner)
-                lines.append(f"{task_text} is held by {dispatch_id} (state {state}). To retry the same task: {command}, then re-run this dispatch. Or re-run it with --retry-of {dispatch_id}.")
+            try:
+                root, _record, _attempt, _carriers, owner = _withdraw_recovery_plan(
+                    dispatch_id, project_root
+                )
+            except Exception as exc:
+                liveness = getattr(exc, "liveness", None)
+                if liveness == "live":
+                    lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
+                else:
+                    lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
+                continue
+            command = _retry_recovery_command(
+                dispatch_id,
+                replacement,
+                str(root),
+                owner=owner,
+                operator=owner is None,
+            )
+            lines.append(f"{task_text} is held by {dispatch_id} (state {state}). To retry the same task: {command}, then re-run this dispatch. Or re-run it with --retry-of {dispatch_id}.")
         text = "\n".join(lines)
         return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     if held and live:
@@ -3598,43 +3610,72 @@ def _prepare_retry_of(args) -> None:
 
     replacement_id = str(getattr(args, "dispatch_id", "") or "").strip()
     if not replacement_id:
-        replacement_id = _default_dispatch_id(getattr(args, "agent", "worker"))
-        args.dispatch_id = replacement_id
+        raise DispatchUsageError("--retry-of requires a resolved replacement dispatch id")
     if replacement_id == held_id:
         raise DispatchUsageError("--retry-of and --dispatch-id must name different dispatches")
 
     try:
         project_root = _project_root(args)
+        root, record, attempt, carriers, owner = _withdraw_recovery_plan(
+            held_id, str(project_root)
+        )
+        requested_label = str(
+            getattr(args, "controller_label", None)
+            or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL")
+            or ""
+        ).strip() or None
+        if owner is not None and requested_label != owner:
+            raise ValueError(
+                f"dispatch belongs to {owner!r}; use its --controller-label, "
+                "or the human owner may pass --operator"
+            )
         withdraw_args = argparse.Namespace(
             dispatch_id=held_id,
-            project_root=str(project_root),
-            operator=False,
-            controller_label=getattr(args, "controller_label", None) or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL"),
+            project_root=str(root),
+            operator=owner is None,
+            controller_label=owner if owner is not None else None,
         )
-        root, _authority, attempt, record, carriers, _outcome, _withdrawn = _withdraw_preflight(withdraw_args)
+        entry = next(iter(carriers.values()), {})
+        missing = sorted(task_ids - set(_entry_task_ids(entry, record)))
+        if missing:
+            raise ValueError(
+                f"holder does not hold task ids {', '.join(missing)}"
+            )
+        held_state = str((record or {}).get("state") or (record or {}).get("terminal_state") or attempt.get("terminal_state") or "")
+        if held_state not in _SELF_HELD_LEDGER_STATES:
+            raise ValueError(
+                f"holder state {held_state or 'unknown'} is not stale"
+            )
+
+        command = [held_id, "--reason", "retry same task after held dispatch ended", "--superseded-by", replacement_id, "--project-root", str(root)]
+        if withdraw_args.operator:
+            command.append("--operator")
+        else:
+            command.extend(("--controller-label", str(withdraw_args.controller_label)))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = _cmd_withdraw(command)
+        if code != 0:
+            detail = output.getvalue().strip()
+            raise ValueError(detail or "withdraw failed")
     except Exception as exc:
+        if getattr(args, "_auto_dispatch_id_reserved", False):
+            _release_auto_dispatch_id_reservation(
+                replacement_id, _dispatch_base_dir()
+            )
         raise DispatchUsageError(f"--retry-of {held_id} refused: {exc}") from exc
 
-    missing = sorted(task_ids - set(_entry_task_ids(next(iter(carriers.values()), {}), record)))
-    if missing:
-        raise DispatchUsageError(
-            f"--retry-of {held_id} refused: holder does not hold task ids {', '.join(missing)}"
-        )
-    held_state = str((record or {}).get("state") or (record or {}).get("terminal_state") or attempt.get("terminal_state") or "")
-    if held_state not in _SELF_HELD_LEDGER_STATES:
-        raise DispatchUsageError(
-            f"--retry-of {held_id} refused: holder state {held_state or 'unknown'} is not stale"
-        )
 
-    command = [held_id, "--reason", "retry same task after held dispatch ended", "--superseded-by", replacement_id, "--project-root", str(root)]
-    if withdraw_args.controller_label:
-        command.extend(("--controller-label", str(withdraw_args.controller_label)))
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        code = _cmd_withdraw(command)
-    if code != 0:
-        detail = output.getvalue().strip()
-        raise DispatchUsageError(f"--retry-of {held_id} refused: {detail or 'withdraw failed'}")
+def _emit_launch_wake_notice() -> None:
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
 
 
 def _refuse_reused_nonterminal_dispatch_id(
@@ -5889,6 +5930,26 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
             fh.write("\n")
         return dispatch_id
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
+
+
+def _release_auto_dispatch_id_reservation(dispatch_id: str, base: Path) -> None:
+    path = base / ".dispatch-ids" / f"{dispatch_id}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("dispatch_id") != dispatch_id
+            or payload.get("pid") != os.getpid()
+        ):
+            return
+        path.unlink()
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _release_retry_dispatch_id_reservation(args, base: Path) -> None:
+    if getattr(args, "retry_of", None) and getattr(args, "_auto_dispatch_id_reserved", False):
+        _release_auto_dispatch_id_reservation(args.dispatch_id, base)
 
 
 @dataclass(frozen=True)
@@ -10713,6 +10774,12 @@ def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
         }
 
 
+class _WithdrawPreflightRefusal(ValueError):
+    def __init__(self, message: str, *, liveness: str | None = None) -> None:
+        super().__init__(message)
+        self.liveness = liveness
+
+
 def _withdraw_preflight(args, queue_dir: Path | None = None):
     """Read authority and identity evidence without creating any state."""
     record = goalflight_ledger.read_record(args.dispatch_id)
@@ -10722,10 +10789,11 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     statuses = index.carriers_by_id.get(args.dispatch_id, [])
     for active in ([index.listing_error] if index.listing_error is not None else statuses):
         if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
-            raise ValueError(
+            raise _WithdrawPreflightRefusal(
                 f"carrier launch ownership is {active.kind.value} ({active.reason}); "
                 "withdraw never kills a live worker. Wait for launch to settle and verify "
-                "the launcher identity before retrying."
+                "the launcher identity before retrying.",
+                liveness=("live" if active.kind is ClaimCarrierKind.LIVE else "indeterminate"),
             )
     carriers = {Path(active.path): json.loads(Path(active.path).read_text()) for active in statuses}
     entry = next(iter(carriers.values()), {})
@@ -10763,9 +10831,10 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
             continue
         status, reason = _queue_claim_identity_status(pid, identity)
         if status != "dead":
-            raise ValueError(
+            raise _WithdrawPreflightRefusal(
                 f"{source} worker {pid} is {status} ({reason}); withdraw never kills a live worker. "
-                "Steer the worker to stop, wait for exit, and verify its identity before retrying."
+                "Steer the worker to stop, wait for exit, and verify its identity before retrying.",
+                liveness=("live" if status == "live" else "indeterminate"),
             )
     for evidence in (record or {}, *carriers.values()):
         if _queue_claim_worker_spawn_intent(evidence) and not (
@@ -10773,9 +10842,10 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         ):
             stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
             if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
-                raise ValueError(
+                raise _WithdrawPreflightRefusal(
                     "spawn intent has no worker pid and is not older than the claim-stale window "
-                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry"
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
+                    liveness="indeterminate",
                 )
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
     withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
@@ -20103,23 +20173,6 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     args._original_argv = list(argv)
     _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
-    try:
-        _prepare_retry_of(args)
-    except DispatchUsageError as e:
-        print(f"goalflight_dispatch: {e}", file=sys.stderr)
-        return 64
-    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
-    # _persist_acp_watcher_prompt), never before retry preflight: a refused
-    # --retry-of must leave zero launch-side artifacts.
-    try:
-        import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
     if args.stats is not None:
         try:
             payload = goalflight_ledger.stats_payload(args.stats)
@@ -20219,16 +20272,24 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
+            args._auto_dispatch_id_reserved = False
             if not args.dispatch_id:
                 args.dispatch_id = (
                     _default_dispatch_id(args.agent)
                     if goalflight_compat.is_windows()
                     else _reserve_auto_dispatch_id(args.agent, base)
                 )
-            _refuse_reused_dispatch_id_for_launch(
-                args.dispatch_id,
-                allow_queued=args.from_queue,
-            )
+                args._auto_dispatch_id_reserved = not goalflight_compat.is_windows()
+            try:
+                _refuse_reused_dispatch_id_for_launch(
+                    args.dispatch_id,
+                    allow_queued=args.from_queue,
+                )
+                _prepare_retry_of(args)
+            except DispatchUsageError:
+                _release_retry_dispatch_id_reservation(args, base)
+                raise
+            _emit_launch_wake_notice()
             # Direct resume launches must validate before exempting lineage or
             # binding a seat; claim-boundary validation remains under its lock.
             if args.parent_dispatch_id:
@@ -20278,6 +20339,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
         except DispatchUsageError as e:
+            _release_retry_dispatch_id_reservation(args, base)
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
 
@@ -20305,9 +20367,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Auto-derive id + paths so the common call is one line.
     base = _dispatch_base_dir()
+    args._auto_dispatch_id_reserved = False
     if not args.dispatch_id:
         try:
             args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
+            args._auto_dispatch_id_reserved = True
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
@@ -20316,6 +20380,8 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue,
         )
+        _prepare_retry_of(args)
+        _emit_launch_wake_notice()
         # Validate direct resumes before lineage exemption and seat mutation.
         if args.parent_dispatch_id:
             _validate_resume_source(
@@ -20339,6 +20405,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
         return 1
     except DispatchUsageError as e:
+        _release_retry_dispatch_id_reservation(args, base)
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     # Occupancy is the filesystem-corruption gate; it must refuse a second

@@ -141,6 +141,13 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
     records.append(_dead_record(args, "stopped-earlier", controller_label="owner", worker_still_alive=False))
     args.controller_label = "owner"
     monkeypatch.setattr(D, "_find_dispatch_record", _find_in(records))
+    monkeypatch.setattr(
+        D,
+        "_withdraw_recovery_plan",
+        lambda _dispatch_id, project_root: (
+            Path(project_root), records[0], {"owner_controller_label": "owner"}, {}, "owner"
+        ),
+    )
 
     with pytest.raises(D.DispatchUsageError):
         D._refuse_launch_blocked_by_completion_authority(args)
@@ -393,6 +400,7 @@ def test_dead_hold_refusal_names_resume_not_reconcile(launch_authority, capsys, 
     assert f'state="{state}"' in output.err
     assert "worker_cwd=" in output.err
     assert "reconcile-outbox" not in output.err
+    assert "holder liveness is indeterminate" in output.err
     assert "resume" in output.err.lower()
     assert "interim" in output.err
 

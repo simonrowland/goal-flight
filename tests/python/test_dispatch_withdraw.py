@@ -5,6 +5,7 @@ import contextlib
 import datetime as dt
 import io
 import json
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -617,13 +618,13 @@ def test_queued_rows_never_own_worktree_and_withdraw_releases_task(prepared, rep
 
 
 def _retry_args(project: Path, held_id: str = "withdraw-test") -> SimpleNamespace:
-    return SimpleNamespace(retry_of=held_id, dispatch_id="replacement-dispatch", agent="codex", task_ids=["t-retry"], cwd=str(project), controller_label="owner")
+    return SimpleNamespace(retry_of=held_id, dispatch_id="replacement-dispatch", agent="codex", task_ids=["t-123"], cwd=str(project), controller_label="owner")
 
 
 def _make_retry_holder(prepared):
     project, authority, attempt, carrier = prepared
     record = ledger.read_record("withdraw-test")
-    record.update(task_ids=["t-retry"], state="worker_dead", terminal_state="worker_dead", controller_label="owner")
+    record.update(task_ids=["t-123"], state="worker_dead", terminal_state="worker_dead", controller_label="owner")
     ledger.write_record(record)
     carrier.write_text(json.dumps(record))
     assert authority.commit_terminal(
@@ -660,6 +661,142 @@ def test_retry_of_live_holder_refuses_without_artifacts(prepared, monkeypatch, t
         dispatch._prepare_retry_of(_retry_args(project))
 
     assert snapshot(tmp_path) == before
+
+
+def _stub_main_admission(monkeypatch):
+    monkeypatch.setattr(dispatch, "_validate_before_side_effects", lambda *_args: None)
+    monkeypatch.setattr(dispatch, "_stamp_controller_session", lambda *_args: {})
+    monkeypatch.setattr(dispatch, "_ensure_assigned_engine_session", lambda *_args: None)
+    monkeypatch.setattr(dispatch, "_dispatch_warnings", lambda *_args: [])
+    monkeypatch.setattr(dispatch, "_resolve_launch_account_env", lambda *_args: {})
+    monkeypatch.setattr(dispatch, "_validate_claude_auth_before_attempt", lambda *_args: None)
+
+
+def test_main_validates_replacement_id_before_retry_withdraw(
+    prepared, monkeypatch, capsys
+):
+    project = _make_retry_holder(prepared)
+    ledger.write_record(
+        {
+            "dispatch_id": "replacement-dispatch",
+            "project_root": str(project),
+            "state": "running",
+            "terminal_state": "unknown",
+        }
+    )
+    _stub_main_admission(monkeypatch)
+
+    code = dispatch.main([
+        "--agent", "codex", "--shape", "bash", "--dispatch-id", "replacement-dispatch",
+        "--retry-of", "withdraw-test", "--task", "t-123", "--prompt", "retry",
+        "--cwd", str(project), "--controller-label", "owner",
+    ])
+
+    assert code == 64
+    assert "replacement-dispatch" in capsys.readouterr().err
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "worker_dead"
+    assert attempt_row(prepared[1])["terminal_state"] == "worker_dead"
+
+
+def test_main_releases_auto_id_when_retry_preflight_refuses(
+    prepared, monkeypatch, capsys
+):
+    project = _make_retry_holder(prepared)
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", "replacement-auto")
+    _stub_main_admission(monkeypatch)
+
+    def refuse(*_args):
+        raise ValueError("worker is live")
+
+    monkeypatch.setattr(dispatch, "_withdraw_recovery_plan", refuse)
+    code = dispatch.main([
+        "--agent", "codex", "--shape", "bash", "--retry-of", "withdraw-test",
+        "--task", "t-123", "--prompt", "retry", "--cwd", str(project),
+        "--controller-label", "owner",
+    ])
+
+    assert code == 64
+    assert "worker is live" in capsys.readouterr().err
+    assert not list((dispatch._dispatch_base_dir() / ".dispatch-ids").glob("*.json"))
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "worker_dead"
+
+
+def test_unowned_guidance_command_runs_with_operator(tmp_path, monkeypatch):
+    project = tmp_path / "unowned-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    authority = journal.Journal.create(project)
+    prepared_attempt = authority.prepare_attempt("unowned-holder")
+    assert prepared_attempt.committed
+    record = {
+        "dispatch_id": "unowned-holder",
+        "project_root": str(project),
+        "state": "worker_dead",
+        "terminal_state": "worker_dead",
+        "task_ids": ["t-unowned"],
+        "worker_still_alive": False,
+    }
+    ledger.write_record(record)
+    carrier = dispatch._queue_entry_path("unowned-holder")
+    carrier.parent.mkdir(parents=True, exist_ok=True)
+    carrier.write_text(json.dumps(record))
+    assert authority.commit_terminal(
+        prepared_attempt.value.attempt_id,
+        terminal_state="worker_dead",
+        observation={"state": "worker_dead", "reason": "stale worker"},
+    ).committed
+
+    guidance = dispatch._completion_refusal_guidance(
+        ['dispatch_id="unowned-holder" state="worker_dead"'],
+        str(project),
+        args=SimpleNamespace(task_ids=["t-unowned"], dispatch_id="replacement"),
+    )
+    line = next(line for line in guidance.splitlines() if "To retry the same task:" in line)
+    command = line.split("To retry the same task: ", 1)[1].split(", then re-run", 1)[0]
+    assert "--operator" in command
+
+    result = subprocess.run(
+        shlex.split(command), cwd=project, text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ledger.read_record("unowned-holder")["terminal_state"] == "superseded"
+
+
+def test_main_guidance_uses_journal_worker_identity_for_liveness(
+    prepared, monkeypatch, capsys
+):
+    project, authority, attempt, _carrier = prepared
+    started = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert started.committed
+    running = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=started.value.launch_epoch,
+        worker_instance={"pid": 12345, "start_token": "live"},
+    )
+    assert running.committed
+    monkeypatch.setattr(
+        dispatch,
+        "_queue_claim_identity_status",
+        lambda _pid, _identity: ("live", "test-live"),
+    )
+    _stub_main_admission(monkeypatch)
+
+    def block(_entry, *, diagnostics=None):
+        diagnostics.append('dispatch_id="withdraw-test" state="worker_dead"')
+        return {"state": "worker_dead", "reason": "partial_task_supersession"}
+
+    monkeypatch.setattr(dispatch, "_entry_completion_authority", block)
+
+    code = dispatch.main([
+        "--agent", "codex", "--shape", "bash", "--dispatch-id", "replacement-live",
+        "--task", "t-123", "--prompt", "retry", "--cwd", str(project),
+        "--controller-label", "owner",
+    ])
+    assert code == 64
+    guidance = capsys.readouterr().err
+    assert "holder is LIVE" in guidance
+    assert "To retry the same task:" not in guidance
 
 
 @pytest.mark.parametrize("terminal_state", ["blocked", "abandoned"])
