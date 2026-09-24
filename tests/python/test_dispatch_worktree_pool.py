@@ -525,11 +525,13 @@ def test_occupancy_refusal_releases_bound_seat(
     )
     replacement.release()
 @pytest.mark.parametrize("legacy", [False, True], ids=["recorded", "legacy"])
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read-only"])
 def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     legacy: bool,
+    read_only: bool,
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
@@ -568,6 +570,8 @@ def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
             str(seat),
         ],
     }
+    if read_only:
+        record["dispatch_argv"].append("--read-only")
     if legacy:
         record.pop("worktree_branch")
         record.pop("worktree_head")

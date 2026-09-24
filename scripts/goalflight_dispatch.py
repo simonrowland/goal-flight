@@ -2410,7 +2410,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         and _occupancy_exempt_read_only(args)
     ):
         # A read-only resume reuses its recorded cwd. It has no writer seat to
-        # reacquire, reset, or validate against the pool's branch lineage.
+        # reacquire, reset, or occupy; source lineage is checked before launch.
         return None
     project_root = _project_root(args)
     label = _controller_ring_label(args, project_root)
@@ -6370,14 +6370,13 @@ def _preflight_resume_dispatch(
         account_env = _validate_before_side_effects(args, raw)
     finally:
         del args._defer_sandbox_boundary
-    if not _occupancy_exempt_read_only(args):
-        _validate_resume_worktree_source(
-            parent_dispatch_id,
-            source["record"],
-            _resume_worker_cwd(
-                source["record"], override=getattr(args, "cwd", None)
-            ),
-        )
+    _validate_resume_worktree_source(
+        parent_dispatch_id,
+        source["record"],
+        _resume_worker_cwd(
+            source["record"], override=getattr(args, "cwd", None)
+        ),
+    )
     _refuse_launch_blocked_by_completion_authority(args)
     engine = _account_engine(args.agent)
     preflight_home = None
@@ -20988,15 +20987,14 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             resume_source = _validate_resume_source(
                 args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
             )
-            if not _occupancy_exempt_read_only(args):
-                _validate_resume_worktree_source(
-                    args.parent_dispatch_id,
+            _validate_resume_worktree_source(
+                args.parent_dispatch_id,
+                resume_source["record"],
+                _resume_worker_cwd(
                     resume_source["record"],
-                    _resume_worker_cwd(
-                        resume_source["record"],
-                        override=getattr(args, "cwd", None),
-                    ),
-                )
+                    override=getattr(args, "cwd", None),
+                ),
+            )
         except DispatchUsageError as exc:
             print(f"goalflight_dispatch: {exc}", file=sys.stderr)
             return 64
