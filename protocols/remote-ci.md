@@ -26,7 +26,8 @@ review verdict exists:
    are zero.
 
 The configured remote command performs checkout, overlay construction, test
-execution, receipt creation, and transport. It receives the arm, SHA values,
+execution, and receipt creation on the node. The single configured
+`remote_exec` primitive supplies transport. It receives the arm, SHA values,
 test files, selection, and configured test command through argv placeholders and
 `GOALFLIGHT_REMOTE_CI_*` environment variables.
 
@@ -88,85 +89,39 @@ python3 scripts/goalflight_remote_ci.py \
   --box <box-id> --request-id <request-id>
 ```
 
-`reattach` verifies the recorded remote `pid`, `start_token`, and `run_dir`,
-then runs only the configured watch and collect commands. It never invokes the
-run command. A local reattach timeout cancels by that exact identity before
-returning a timeout result.
+The node's launch log contains its PID, node-issued start token, run directory,
+and lease token. Active reattach must prove that exact identity and inherit
+the original holder's live admission token. Queued or dead holders cannot
+bypass admission. Reattach observes the original run without executing a
+second test command.
 
-## Managed run leases
+## Node admission and recovery
 
-Each box names one durable `managed_run_directory`. The runner mints a unique
-child for every run or export and passes that child as `{run_dir}`. `/tmp` and
-other per-invocation scratch roots are invalid managed directories. The lease
-record contains:
+Every project sharing a physical box uses the same node managed root and
+P-core/token defaults. Under `<managed-root>/admission/`, one numbered ticket
+queue orders all projects. One node flock token is held for each active run.
+Admission requires a free token and measured `load1 <= p_cores`; it precedes
+command expansion, checkout, object movement, and rendering.
 
-- `owner_identity` and `owner_pid`, identifying the local controller that owns
-  the run;
-- `lease_token`, an opaque fencing value returned in the arm result and passed
-  to the remote kit; and
-- `managed_run_directory` and `run_directory`, proving the path namespace.
+The node writes durable PID + incarnation token + run directory before it
+accepts the command. Its detached holder owns the token for the entire
+workload, including controller crashes. SIGKILL releases the holder's kernel
+locks. Local daemon records are convenience mirrors; reaping and lease listing
+read authoritative node state through the same `remote_exec` primitive.
 
-The lease lock is a flock. Normal completion, timeout, cancellation, and
-successful re-attach mark the record released; a killed owner drops the kernel
-lock automatically. The reaper may mark an active record released only after a
-process-identity check proves its recorded owner is dead. An unknown liveness
-result is retained for manual review. `list` shows active and released
-records, so a controller can inspect lease state without probing a live remote
-host.
+Cancellation compares all identity fields and asks the proven holder to kill
+its own group. It never signals a guessed PID. Reaping also requires proof
+that the owning controller is dead; liveness from another controller host or
+an unavailable probe is unknown and cannot authorize cancellation. A dead node
+holder without completion evidence remains unknown/manual.
 
-The configured transport is responsible for preserving the supplied run
-directory and lease record in its remote kit. A launch log should include the
-remote PID, start token, run directory, and, when available, the lease id,
-lease token, and owner identity. Re-attach validates that the recorded run
-directory remains below the configured managed root and uses the token only for
-that exact run.
+Receipts must contain the answering node's measured hostname. Health returns
+node-measured load, hostname, and actual token locks. Shared live caps reside
+at `<managed-root>/admission/caps.json`.
 
-## Shared admission contract
-
-Every project configuration for the same physical box must use the same
-`admission.token_directory` and `boxes.<box>.token_key`. Each token is one
-worker's P-core budget. Token files are persistent sentinel files whose locks,
-not their contents or deletion, represent ownership. `flock` releases a token
-when the holder exits, including SIGKILL.
-
-Admission is granted only after both checks succeed:
-
-- a token is held; and
-- the measured remote `load1` is no greater than the configured P-core cap.
-
-When either check fails, the runner sleeps for `queue_wait_seconds` and tries
-again. It does not re-probe every token in a tight loop. The token is acquired
-before command expansion, rendering, object pushing, or remote run creation.
-
-An optional live cap file is re-read on every admission/census cycle:
-
-```json
-{
-  "boxes": {
-    "<box-id>": {"p_cores": 20, "token_pool_size": 4, "self_cap": 4}
-  }
-}
-```
-
-The optional `self_cap` at the top level or under a box is also re-read before
-each arm. The remote load probe must return the answering hostname, not merely the
-configured alias:
-
-```json
-{"hostname": "<answering-hostname>", "load1": 3.2, "p_cores": 20}
-```
-
-## Timeout, reaping, and health
-
-The local timeout is a containment event. If the remote command emitted
-`REMOTE_RUN_LAUNCHED pid=<pid> start_token=<token> run_dir=<dir>`, the runner
-executes the configured cancel command before releasing its token. Cancellation
-uses all three identity fields so a reused remote PID cannot be mistaken for
-the original run.
-
-The `reap` command scans durable running records. It cancels only records whose
-local owner is gone and whose exact remote identity is available; incomplete
-identity is reported for manual inspection. The `health` command records one
-measured hostname/load sample and token census per configured box. These facts
-make overloaded or orphaned boxes visible without treating a configured alias
-as evidence.
+Config v2 replaces local token/lease registries and operation-specific
+watch/collect/cancel commands with one transport primitive and node supervision.
+The disconnected automatic chunking helper and its unused settings were
+removed. Bounded selections and explicit `-v` remain project policy.
+See [the runbook](../docs/remote-ci-runbook.md) for the complete schema,
+migration, identity fencing, and recovery commands.
