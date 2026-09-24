@@ -5297,7 +5297,6 @@ def _validate_codex_resume_source(
 
 _CODEX_RESUME_CLAIM_VALIDATED_HOOK = None
 _CODEX_RESUME_DURABLE_CLAIM_HOOK = None
-_CODEX_RESUME_BEFORE_REPLACE_HOOK = None
 
 
 def _codex_resume_lock_path(home: Path, session_id: str) -> Path:
@@ -5398,102 +5397,6 @@ def _revalidate_codex_resume_claim(
         )
 
 
-def _restore_codex_resume_home(
-    original_home: Path,
-    saved_home: Path,
-    *,
-    failed_home_id: str,
-) -> None:
-    failed_home = saved_home.parent / failed_home_id
-    if original_home.exists():
-        original_home.replace(failed_home)
-    saved_home.replace(original_home)
-    cleanup_codex_dispatch_home(failed_home_id)
-
-
-def _rebuild_codex_resume_home(
-    project_root: Path,
-    parent_dispatch_id: str,
-    expected_home: Path,
-    session_id: str,
-    *,
-    home_owner_dispatch_id: str | None = None,
-    explicit_account: str | None = None,
-    model: str | None = None,
-    pre_resolved: dict | None = None,
-) -> tuple[str, str]:
-    """Refresh auth/config in the original home while preserving its rollout."""
-    if not expected_home.is_dir():
-        raise DispatchUsageError(
-            f"dispatch home missing for {parent_dispatch_id}: {expected_home}"
-        )
-    if goalflight_codex_sessions.rollout_path(expected_home, session_id) is None:
-        raise DispatchUsageError(
-            f"rollout missing for dispatch {parent_dispatch_id}: session "
-            f"{session_id} under {expected_home / 'sessions'}"
-        )
-
-    root = expected_home.parent
-    saved_home_id = f"resume-save-{uuid.uuid4().hex}"
-    failed_home_id = f"resume-failed-{uuid.uuid4().hex}"
-    saved_home = root / saved_home_id
-    if _CODEX_RESUME_BEFORE_REPLACE_HOOK is not None:
-        _CODEX_RESUME_BEFORE_REPLACE_HOOK(
-            expected_home,
-            session_id,
-            parent_dispatch_id,
-        )
-    expected_home.replace(saved_home)
-    try:
-        if pre_resolved is not None:
-            rebuilt_home = pre_resolved.get("home")
-            effective_account = pre_resolved.get("account")
-        else:
-            resolve_args = (
-                project_root,
-                explicit_account,
-                home_owner_dispatch_id or parent_dispatch_id,
-            )
-            if model is None:
-                rebuilt_home, effective_account = resolve_codex_home(*resolve_args)
-            else:
-                rebuilt_home, effective_account = resolve_codex_home(
-                    *resolve_args, model=model
-                )
-        if (
-            rebuilt_home is None
-            or effective_account is None
-            or Path(rebuilt_home).resolve(strict=False) != expected_home
-        ):
-            account_detail = (
-                f"with codex account {explicit_account}"
-                if explicit_account
-                else "with a healthy codex account"
-            )
-            raise DispatchUsageError(
-                f"could not rebuild dispatch home for {parent_dispatch_id} "
-                f"{account_detail}"
-            )
-        expected_home.mkdir(parents=True, exist_ok=True)
-        saved_sessions = saved_home / "sessions"
-        rebuilt_sessions = expected_home / "sessions"
-        if not saved_sessions.is_dir() or rebuilt_sessions.exists():
-            raise DispatchUsageError(
-                f"could not preserve rollout while rebuilding dispatch home "
-                f"for {parent_dispatch_id}"
-            )
-        saved_sessions.replace(rebuilt_sessions)
-    except BaseException:
-        _restore_codex_resume_home(
-            expected_home,
-            saved_home,
-            failed_home_id=failed_home_id,
-        )
-        raise
-    cleanup_codex_dispatch_home(saved_home_id)
-    return str(expected_home), effective_account
-
-
 def _seed_codex_resume_home_from_canonical(
     project_root: Path,
     parent_dispatch_id: str,
@@ -5507,15 +5410,13 @@ def _seed_codex_resume_home_from_canonical(
 ) -> tuple[str, str]:
     """Resume a recorded session from a read-only source-home rollout copy.
 
-    _rebuild_codex_resume_home is only safe for a per-dispatch home: it renames
-    the home aside, rebuilds it in place, moves sessions/ across and deletes
-    the original. A recorded home is shared state during resume, so it must
-    never take that path. Instead the resumed worker gets a fresh per-dispatch
-    home for the target account, built by the ordinary account path and keyed
-    by THIS dispatch, and a byte copy of the one rollout it resumes at the same
-    path relative to the home, which is where `codex exec resume <session>`
-    looks. The source home is only read. The prompt-token cache does not carry
-    over; after a quota wall it is stale anyway.
+    A recorded home is shared state during resume, so it is never rebuilt in
+    place. The resumed worker gets a fresh per-dispatch home for the target
+    account, built by the ordinary account path and keyed by THIS dispatch, and
+    a byte copy of the one rollout it resumes at the same path relative to the
+    home, which is where `codex exec resume <session>` looks. The source home is
+    only read. The prompt-token cache does not carry over; after a quota wall it
+    is stale anyway.
     """
     rollout = goalflight_codex_sessions.rollout_path(source_home, session_id)
     if rollout is None:
@@ -21032,7 +20933,9 @@ def main(argv: list[str] | None = None) -> int:
                     parent_record = (
                         _find_dispatch_record(args.parent_dispatch_id) or {}
                     )
-                    parent_account = parent_record.get("effective_account")
+                    parent_account = parent_record.get("effective_account") or parent_record.get(
+                        "account"
+                    )
                     canonical_home = goalflight_codex_sessions.canonical_account_home(
                         parent_account
                     )
@@ -21073,9 +20976,26 @@ def main(argv: list[str] | None = None) -> int:
                         codex_dispatch_home = str(resume_home)
                         effective_account = parent_account
                     else:
-                        if getattr(args, "account", None) or getattr(
+                        pre_resolved = getattr(
                             args, "_codex_resume_pre_resolved", None
-                        ) is not None:
+                        )
+                        if pre_resolved is None and getattr(
+                            args, "_codex_account_pre_resolved", False
+                        ):
+                            pre_resolved = {
+                                "home": getattr(args, "_codex_pre_resolved_home", None),
+                                "account": getattr(
+                                    args, "_codex_pre_resolved_account", None
+                                ),
+                            }
+                        target_account = getattr(
+                            args, "_codex_selected_account", None
+                        ) or getattr(args, "account", None)
+                        if target_account or pre_resolved:
+                            target_account = target_account or pre_resolved.get(
+                                "account"
+                            )
+                        if target_account and target_account != "host":
                             codex_dispatch_home, effective_account = (
                                 _seed_codex_resume_home_from_canonical(
                                     project_root,
@@ -21084,13 +21004,10 @@ def main(argv: list[str] | None = None) -> int:
                                     args.codex_session_id,
                                     dispatch_id=args.dispatch_id,
                                     account=(
-                                        getattr(args, "_codex_selected_account", None)
-                                        or args.account
+                                        target_account
                                     ),
                                     model=getattr(args, "model", None),
-                                    pre_resolved=getattr(
-                                        args, "_codex_resume_pre_resolved", None
-                                    ),
+                                    pre_resolved=pre_resolved,
                                 )
                             )
                             codex_home_owner_dispatch_id = args.dispatch_id
@@ -21100,23 +21017,8 @@ def main(argv: list[str] | None = None) -> int:
                                 args.dispatch_id
                             )
                         else:
-                            codex_dispatch_home, effective_account = (
-                                _rebuild_codex_resume_home(
-                                    project_root,
-                                    args.parent_dispatch_id,
-                                    resume_home,
-                                    args.codex_session_id,
-                                    home_owner_dispatch_id=codex_home_owner_dispatch_id,
-                                    explicit_account=(
-                                        getattr(args, "_codex_selected_account", None)
-                                        or getattr(args, "account", None)
-                                    ),
-                                    model=getattr(args, "model", None),
-                                    pre_resolved=getattr(
-                                        args, "_codex_resume_pre_resolved", None
-                                    ),
-                                )
-                            )
+                            codex_dispatch_home = str(resume_home)
+                            effective_account = parent_account
             else:
                 if getattr(args, "_codex_account_pre_resolved", False):
                     codex_dispatch_home = getattr(

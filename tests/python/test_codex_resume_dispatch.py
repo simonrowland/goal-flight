@@ -148,14 +148,15 @@ def _stub_detached_runtime(
         lambda *_args, **_kwargs: leases.append("lease-resume") or "lease-resume",
     )
     monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda _root, _parent, expected_home, _session, **_kwargs: (
-            str(expected_home),
-            "new-seat",
-        ),
-    )
+    original_seed = D._seed_codex_resume_home_from_canonical
+
+    def seed_resume_home(*args, **kwargs):
+        source_home = Path(args[2])
+        if "dispatch-homes" in source_home.parts and kwargs.get("pre_resolved") is None:
+            return str(source_home), "new-seat"
+        return original_seed(*args, **kwargs)
+
+    monkeypatch.setattr(D, "_seed_codex_resume_home_from_canonical", seed_resume_home)
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
     monkeypatch.setattr(
         D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None
@@ -220,10 +221,11 @@ def _stub_forked_runtime(
         (markers / f"{os.getpid()}-capacity").write_text("acquired")
         return f"lease-{os.getpid()}"
 
-    def resolve(*_args, **_kwargs) -> tuple[str, str]:
-        home.mkdir(parents=True, exist_ok=True)
-        (home / "auth.json").write_text("new-seat", encoding="utf-8")
-        return str(home), "new-seat"
+    def resolve(_project_root: Path, _account: str | None, dispatch_id: str) -> tuple[str, str]:
+        target = _dispatch_home(tmp_path, dispatch_id)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "auth.json").write_text("new-seat", encoding="utf-8")
+        return str(target), "new-seat"
 
     def spawn(argv: list[str], **kwargs) -> int:
         label = kwargs["label"]
@@ -538,14 +540,6 @@ def test_canonical_home_resume_uses_shared_source_without_rebuilding_it(
     prompt = tmp_path / "resume-canonical-home.md"
     prompt.write_text("Continue this exact session.\n", encoding="utf-8")
     spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda *_args, **_kwargs: pytest.fail(
-            "a shared canonical home must not be renamed or rebuilt"
-        ),
-    )
-
     rc = D.main(
         [
             "--agent",
@@ -708,14 +702,6 @@ def test_cross_account_resume_copies_rollout_out_of_canonical_home(
         return str(target), str(explicit_account)
 
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda *_a, **_k: pytest.fail(
-            "a canonical home must never be renamed, rebuilt, or deleted"
-        ),
-    )
-
     rc = D.main(
         _canonical_resume_argv(
             tmp_path,
@@ -772,12 +758,6 @@ def test_same_account_canonical_resume_is_unchanged(
         "resolve_codex_home",
         lambda *_a, **_k: pytest.fail("same-account resume must not build a home"),
     )
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda *_a, **_k: pytest.fail("a canonical home must not be rebuilt"),
-    )
-
     rc = D.main(
         _canonical_resume_argv(
             tmp_path,
@@ -1311,82 +1291,6 @@ def test_resume_argv_places_flags_before_subcommand_and_feeds_prompt_via_stdin(
     assert stdin_path == str(prompt)
 
 
-def test_resume_rebuild_allows_cross_seat_and_preserves_rollout(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    dispatch_id = "cross-seat-parent"
-    home = _dispatch_home(tmp_path, dispatch_id)
-    rollout = _write_rollout(home)
-    (home / "auth.json").write_text("old-seat", encoding="utf-8")
-    calls: list[tuple[Path, str | None, str]] = []
-
-    def resolve(
-        project_root: Path,
-        explicit_account: str | None,
-        resolved_dispatch_id: str,
-    ) -> tuple[str, str]:
-        calls.append((project_root, explicit_account, resolved_dispatch_id))
-        home.mkdir(parents=True)
-        (home / "auth.json").write_text("new-seat", encoding="utf-8")
-        return str(home), "new-seat"
-
-    monkeypatch.setattr(D, "resolve_codex_home", resolve)
-    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
-
-    rebuilt, effective_account = D._rebuild_codex_resume_home(
-        tmp_path,
-        dispatch_id,
-        home,
-        SESSION_ID,
-    )
-
-    assert calls == [(tmp_path, None, dispatch_id)]
-    assert rebuilt == str(home)
-    assert effective_account == "new-seat"
-    assert (home / "auth.json").read_text(encoding="utf-8") == "new-seat"
-    assert S.rollout_path(home, SESSION_ID) == rollout
-
-
-def test_failed_seat_rebuild_restores_original_home(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    dispatch_id = "restore-parent"
-    home = _dispatch_home(tmp_path, dispatch_id)
-    _write_rollout(home)
-    (home / "auth.json").write_text("old-seat", encoding="utf-8")
-
-    def fail_resolve(
-        _project_root: Path,
-        explicit_account: str | None,
-        _dispatch_id: str,
-    ) -> tuple[None, None]:
-        assert explicit_account is None
-        return None, None
-
-    monkeypatch.setattr(D, "resolve_codex_home", fail_resolve)
-    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
-
-    with pytest.raises(D.DispatchUsageError) as exc_info:
-        D._rebuild_codex_resume_home(
-            tmp_path,
-            dispatch_id,
-            home,
-            SESSION_ID,
-        )
-
-    # "account", not "seat": an account is a billing identity that runs many
-    # concurrent sessions, so calling it a seat implies a capacity of one and
-    # has repeatedly misled operators about real headroom. "seat" is reserved
-    # for a worktree slot.
-    assert str(exc_info.value) == (
-        "could not rebuild dispatch home for restore-parent with a healthy codex account"
-    )
-    assert (home / "auth.json").read_text(encoding="utf-8") == "old-seat"
-    assert S.rollout_path(home, SESSION_ID) is not None
-
-
 def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1796,7 +1700,7 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
     assert ledger["codex_session_id"] == SESSION_ID
     assert ledger["codex_home"] == str(home)
     assert ledger["codex_home_owner_dispatch_id"] == parent_id
-    assert ledger["effective_account"] == "new-seat"
+    assert ledger["effective_account"] == "old-seat"
     assert ledger["model"] == "gpt-5.6"
     assert ledger["reasoning_effort"] == "xhigh"
     assert status["state"] == "starting"
@@ -1837,8 +1741,6 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     first_claim_validation = ctx.Event()
     second_claim_validation = ctx.Event()
     release_first_claim = ctx.Event()
-    before_replace = ctx.Event()
-    release_replace = ctx.Event()
     validation_calls = 0
 
     def synchronized_validate(*args, **kwargs):
@@ -1859,13 +1761,8 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
         else:
             second_claim_validation.set()
 
-    def replace_boundary(*_args) -> None:
-        before_replace.set()
-        assert release_replace.wait(timeout=5)
-
     monkeypatch.setattr(D, "_validate_codex_resume_source", synchronized_validate)
     monkeypatch.setattr(D, "_CODEX_RESUME_CLAIM_VALIDATED_HOOK", claim_validated)
-    monkeypatch.setattr(D, "_CODEX_RESUME_BEFORE_REPLACE_HOOK", replace_boundary)
     monkeypatch.setattr(
         D,
         "_reserve_auto_dispatch_id",
@@ -1897,11 +1794,6 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
         process.start()
     assert first_claim_validation.wait(timeout=5)
     claim_is_interprocess = not second_claim_validation.wait(timeout=0.5)
-    release_first_claim.set()
-    assert before_replace.wait(timeout=5)
-
-    loser_pid, loser_rc = results.get(timeout=5)
-    assert loser_rc == 64
 
     probe_results = ctx.Queue()
 
@@ -1913,15 +1805,16 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     probe.start()
     try:
         probe_results.get(timeout=0.5)
-        replace_was_locked = False
+        claim_was_locked = False
     except queue.Empty:
-        replace_was_locked = True
+        claim_was_locked = True
 
-    release_replace.set()
-    if replace_was_locked:
-        assert probe_results.get(timeout=5) == "acquired"
+    release_first_claim.set()
+    loser_pid, loser_rc = results.get(timeout=5)
+    assert loser_rc == 64
     winner_pid, winner_rc = results.get(timeout=5)
     assert winner_rc == 0
+    assert probe_results.get(timeout=5) == "acquired"
     for process in [*processes, probe]:
         process.join(timeout=5)
         assert not process.is_alive()
@@ -1930,7 +1823,7 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     assert claim_is_interprocess, (
         "owner-home/session claim validation must use an inter-process lock"
     )
-    assert replace_was_locked, "the owner-home/session lock must cover replace"
+    assert claim_was_locked, "the owner-home/session lock must cover the claim"
     assert winner_pid != loser_pid
     assert len(list(markers.glob("*-capacity"))) == 1
     assert len(list(markers.glob("*-worker"))) == 1
@@ -2626,59 +2519,6 @@ def test_main_reports_resume_build_usage_error_without_traceback(
     )
 
 
-def test_main_reports_resume_rebuild_usage_error_without_traceback(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    parent_id = "rebuild-parent"
-    child_id = "rebuild-child"
-    home = _dispatch_home(tmp_path, parent_id)
-    _write_rollout(home)
-    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
-    prompt = tmp_path / "revisions.md"
-    prompt.write_text("Apply revisions.", encoding="utf-8")
-    _stub_detached_runtime(monkeypatch)
-
-    def fail_rebuild(*_args, **_kwargs):
-        raise D.DispatchUsageError("resume home rebuild refused")
-
-    monkeypatch.setattr(D, "_rebuild_codex_resume_home", fail_rebuild)
-
-    rc = D.main(
-        [
-            "--agent",
-            "codex",
-            "--unregistered-forced",
-            "--shape",
-            "bash",
-            "--dispatch-id",
-            child_id,
-            "--cwd",
-            str(tmp_path),
-            "--prompt-file",
-            str(prompt),
-            "--parent-dispatch-id",
-            parent_id,
-            "--codex-session-id",
-            SESSION_ID,
-            "--codex-resume-home",
-            str(home),
-            "--codex-home-owner-dispatch-id",
-            parent_id,
-            "--launch-detached",
-        ]
-    )
-
-    assert rc == 64
-    error = capsys.readouterr().err
-    assert "controller not connected; reconnect as:" in error
-    assert "--session-label" in error
-    assert "--takeover" not in error
-    assert "goalflight_dispatch: resume home rebuild refused" in error
-    assert "Traceback" not in error
-
-
 def test_blocked_capacity_resume_status_preserves_full_lineage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3005,44 +2845,6 @@ def test_resume_occupancy_skips_parent_plan_approval_row(
     assert occupied is None
     assert unknown is None
     assert occupied_state is None
-
-
-def test_resume_rebuild_honors_explicit_account(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    dispatch_id = "explicit-seat-parent"
-    home = _dispatch_home(tmp_path, dispatch_id)
-    rollout = _write_rollout(home)
-    (home / "auth.json").write_text("old-seat", encoding="utf-8")
-    calls: list[tuple[Path, str | None, str]] = []
-
-    def resolve(
-        project_root: Path,
-        explicit_account: str | None,
-        resolved_dispatch_id: str,
-    ) -> tuple[str, str]:
-        calls.append((project_root, explicit_account, resolved_dispatch_id))
-        home.mkdir(parents=True)
-        (home / "auth.json").write_text(str(explicit_account), encoding="utf-8")
-        return str(home), str(explicit_account)
-
-    monkeypatch.setattr(D, "resolve_codex_home", resolve)
-    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
-
-    rebuilt, effective_account = D._rebuild_codex_resume_home(
-        tmp_path,
-        dispatch_id,
-        home,
-        SESSION_ID,
-        explicit_account="25ca6b",
-    )
-
-    assert calls == [(tmp_path, "25ca6b", dispatch_id)]
-    assert rebuilt == str(home)
-    assert effective_account == "25ca6b"
-    assert (home / "auth.json").read_text(encoding="utf-8") == "25ca6b"
-    assert S.rollout_path(home, SESSION_ID) == rollout
 
 
 def test_unpinned_codex_selection_skips_recently_exhausted_seat(

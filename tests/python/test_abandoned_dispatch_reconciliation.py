@@ -196,14 +196,6 @@ def _stub_resume_runtime(
     # The fake lease is never written to capacity state, so the launcher's
     # "lease still held before spawn" check must be faked alongside it.
     monkeypatch.setattr(D.goalflight_capacity, "mark_lease_spawning", lambda _lease_id: True)
-    monkeypatch.setattr(
-        D,
-        "_rebuild_codex_resume_home",
-        lambda _root, _parent, expected_home, _session, **_kwargs: (
-            str(expected_home),
-            "fixture-seat",
-        ),
-    )
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
     monkeypatch.setattr(D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None)
     monkeypatch.setattr(D, "_mark_queue_claim_worker_spawned", lambda _args, _pid: None)
