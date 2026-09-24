@@ -435,6 +435,34 @@ def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
     return candidate
 
 
+def _reject_casefold_stream_collision(messages_dir: Path, dispatch_id: str) -> None:
+    """Reject a case-only carrier name collision before any post write."""
+    token = validate_stream_id(dispatch_id)
+    directory = _lexical_absolute(Path(messages_dir))
+    try:
+        entries = list(directory.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise MessageError(f"cannot inspect message directory {directory}: {exc}") from exc
+    requested = token.casefold()
+    for entry in sorted(entries, key=lambda candidate: candidate.name):
+        name = entry.name
+        if not name.endswith(".jsonl") or name.endswith(".quarantine.jsonl"):
+            continue
+        existing = name[: -len(".jsonl")]
+        if (
+            existing != token
+            and existing.casefold() == requested
+            and STREAM_TOKEN_RE.fullmatch(existing)
+        ):
+            raise MessageError(
+                "dispatch_id case collision: requested "
+                f"{token!r} conflicts with existing carrier id {existing!r} "
+                f"at {entry}; dispatch ids are case-sensitive"
+            )
+
+
 def mail_lock_path(path: Path) -> Path:
     lexical = _lexical_absolute(Path(path))
     resolved = lexical.parent.resolve(strict=False) / lexical.name
@@ -1011,6 +1039,21 @@ def controller_addressee(label: str, *, project_root: Path | str) -> dict[str, s
 
 def controller_address_project_root(project_root: Path | str) -> str:
     return _canonical_project_root_text(str(project_root))
+
+
+def _normalize_controller_addressee(addressee: object) -> object:
+    """Store controller roots in their canonical spelling at post time."""
+    if not isinstance(addressee, dict):
+        return addressee
+    root = addressee.get("project_root")
+    if not isinstance(root, str) or not root.strip():
+        return addressee
+    normalized = dict(addressee)
+    try:
+        normalized["project_root"] = controller_address_project_root(root)
+    except Exception as exc:
+        raise MessageError(f"addressee.project_root: {exc}") from exc
+    return normalized
 
 
 def controller_addressee_label(envelope: dict) -> str | None:
@@ -1611,6 +1654,7 @@ def _read_envelope_records(
             (error,),
         )
     envelopes: list[dict] = []
+    seen_sequences: set[int] = set()
     errors: list[dict[str, object]] = []
     offset = 0
     for line_no, chunk in enumerate(data.splitlines(keepends=True), start=1):
@@ -1639,6 +1683,10 @@ def _read_envelope_records(
                 )
             except (MessageError, ValueError, RecursionError) as exc:
                 reason = str(exc)
+        if reason is None:
+            sequence = int(envelope["seq"])  # validate_envelope checked the shape
+            if sequence in seen_sequences:
+                reason = f"duplicate sequence number: {sequence}"
         if reason is not None:
             error = _carrier_error(
                 path,
@@ -1655,6 +1703,7 @@ def _read_envelope_records(
             if not tolerate_errors:
                 break
             continue
+        seen_sequences.add(int(envelope["seq"]))
         envelopes.append(envelope)  # type: ignore[arg-type]
     status = (
         CarrierReadStatus.CORRUPT_RECORDS_QUARANTINED
@@ -1668,7 +1717,30 @@ def read_envelopes_result(
     path: Path, *, tolerate_errors: bool = True
 ) -> CarrierReadResult:
     """Return the explicit ok/quarantined/unreadable carrier read state."""
-    return _read_envelope_records(path, tolerate_errors=tolerate_errors)
+    try:
+        return _read_envelope_records(path, tolerate_errors=tolerate_errors)
+    except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        display_path = str(path)
+        try:
+            display_path = str(_lexical_absolute(Path(path)))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+        reason = str(exc) or f"{type(exc).__name__}: carrier read failed"
+        return CarrierReadResult(
+            CarrierReadStatus.CARRIER_UNREADABLE,
+            (),
+            (
+                {
+                    "path": display_path,
+                    "line": None,
+                    "offset": None,
+                    "error": f"{display_path}: {reason}",
+                    "reason": reason,
+                    "validated_envelopes": 0,
+                    "validated_through_seq": 0,
+                },
+            ),
+        )
 
 
 def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | None]:
@@ -1924,6 +1996,7 @@ def post_message(
     project_journal_delivery: bool = True,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
+    addressee = _normalize_controller_addressee(addressee)
     _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
     _reject_unaddressed_controller_mail(
         msg_type=msg_type,
@@ -1943,6 +2016,7 @@ def post_message(
     except Exception:
         payload = {"text": "[redacted]"}
     path = inbox_path(messages_dir, dispatch_id)
+    _reject_casefold_stream_collision(messages_dir, dispatch_id)
     _require_carrier_path(path)
     provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
     base_source = {
@@ -1995,6 +2069,10 @@ def post_message(
     # and serialized again under the transaction lock.
     validate_envelope(envelope, expected_dispatch_id=dispatch_id)
     with carrier_transaction(path) as transaction:
+        # Recheck while holding the carrier lock so a concurrent creator cannot
+        # win the case-insensitive name race between the preflight scan and
+        # this append.
+        _reject_casefold_stream_collision(messages_dir, dispatch_id)
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
             (
@@ -3006,10 +3084,28 @@ def logical_envelopes_for_paths(
             else path.stem
         )
         if tolerate_errors:
-            envelopes = read_envelopes_tolerant(
-                path,
-                carrier_errors=carrier_errors,
-            )
+            try:
+                envelopes = read_envelopes_tolerant(
+                    path,
+                    carrier_errors=carrier_errors,
+                )
+            except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                error = {
+                    "path": str(path),
+                    "carrier_path": str(path),
+                    "error": str(exc),
+                    "reason": str(exc),
+                }
+                if carrier_errors is not None:
+                    if not any(
+                        item.get("carrier_path") == error["carrier_path"]
+                        and item.get("error") == error["error"]
+                        for item in carrier_errors
+                    ):
+                        carrier_errors.append(error)
+                else:
+                    _emit_carrier_error(error)
+                continue
         else:
             envelopes = read_envelopes(path)
         for envelope in envelopes:
@@ -3753,10 +3849,19 @@ def _controller_scope_kind(
     addressee_label = controller_addressee_label(envelope)
     if addressee_label is not None:
         addressee_root = controller_addressee_project_root(envelope)
+        if addressee_root is None:
+            return None
+        try:
+            canonical_addressee_root = _canonical_project_root_text(addressee_root)
+            canonical_controller_root = _canonical_project_root_text(
+                controller_project_root
+            )
+        except Exception:
+            return None
         if (
             controller_label is not None
             and addressee_label == controller_label
-            and addressee_root == controller_project_root
+            and canonical_addressee_root == canonical_controller_root
         ):
             return "controller"
         return None
@@ -3900,7 +4005,31 @@ def _listener_envelope(
     path = Path(carrier_path)
     result = read_envelopes_result(path)
     if result.status is not CarrierReadStatus.OK:
-        raise MessageError(f"carrier is corrupt or unreadable: {path}")
+        details = "; ".join(
+            str(error.get("error") or error.get("reason") or result.status.value)
+            for error in result.errors
+        )
+        recipient = str(row.get("recipient_label") or "").strip()
+        if (
+            controller_label is not None
+            and recipient
+            and recipient not in {"*", controller_label}
+        ):
+            return None
+        withdrawal_error = _withdraw_carrier_delivery(
+            authority,
+            row,
+            controller_label=controller_label,
+        )
+        raise MessageError(
+            f"carrier is corrupt or unreadable: {path}"
+            + (f": {details}" if details else f": {result.status.value}")
+            + (
+                f"; delivery withdrawal failed: {withdrawal_error}"
+                if withdrawal_error
+                else "; delivery assignment withdrawn"
+            )
+        )
     origin_node = str(row.get("origin_node") or "")
     event_uuid = str(row.get("event_uuid") or "")
     stream_seq = int(row.get("stream_seq") or 0)
@@ -3942,12 +4071,22 @@ def _listener_envelope(
                 for item in live_assignments
             ):
                 return None
+        withdrawal_error = _withdraw_carrier_delivery(
+            authority,
+            row,
+            controller_label=controller_label,
+        )
         raise MessageError(
             "journal delivery assignment has no projected carrier row: "
             f"event_uuid={event_uuid} origin_node={origin_node} "
             f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
             f"carrier row absent from {path}; projection/withdrawal evidence incomplete; "
             f"inspect delivery_events in {authority.path}"
+            + (
+                f"; delivery withdrawal failed: {withdrawal_error}"
+                if withdrawal_error
+                else "; delivery assignment withdrawn"
+            )
         )
     return envelope
 
@@ -4389,7 +4528,13 @@ def controller_mail_summary(
         try:
             envelope = _listener_envelope(authority, row, controller_label=label)
         except MessageError as exc:
-            carrier_errors.append({"error": str(exc), "carrier_path": row.get("carrier_path")})
+            error = {"error": str(exc), "carrier_path": row.get("carrier_path")}
+            if not any(
+                item.get("carrier_path") == error["carrier_path"]
+                and item.get("error") == error["error"]
+                for item in carrier_errors
+            ):
+                carrier_errors.append(error)
             continue
         if envelope is None:
             continue
@@ -5435,23 +5580,84 @@ def _attention_items_for_rows(
     }
 
 
+def _withdraw_carrier_delivery(
+    authority,
+    row: dict[str, object],
+    *,
+    controller_label: str | None = None,
+) -> str | None:
+    """Withdraw a skipped physical-carrier assignment from the journal."""
+    carrier_path = str(row.get("carrier_path") or "")
+    if not carrier_path or carrier_path.startswith("journal:"):
+        return None
+    recipient = str(row.get("recipient_label") or controller_label or "*").strip()
+    origin = str(row.get("origin_node") or "").strip()
+    event_uuid = str(row.get("event_uuid") or "").strip()
+    if not recipient or not origin or not event_uuid:
+        return "delivery assignment identity is incomplete"
+    try:
+        import goalflight_journal  # type: ignore
+
+        writer = authority
+        if bool(getattr(authority, "_read_only_client", False)):
+            writer = goalflight_journal.Journal(
+                getattr(authority, "project_root"),
+                retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
+                open_retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
+            )
+        result = writer.withdraw_delivery_event(
+            recipient_label=recipient,
+            origin_node=origin,
+            event_uuid=event_uuid,
+        )
+        if not result.committed:
+            return str(result.reason or "delivery assignment withdrawal was not committed")
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def _envelopes_with_rows(
     authority,
     rows: list[dict] | tuple[dict, ...],
     *,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> list[tuple[dict, dict]]:
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
     items = []
+    reported: set[tuple[str, str]] = set()
     for row in rows:
-        envelope = _listener_envelope(
-            authority,
-            row,
-            controller_label=controller_label,
-            attention_by_id=attention_by_id,
-        )
+        try:
+            envelope = _listener_envelope(
+                authority,
+                row,
+                controller_label=controller_label,
+                attention_by_id=attention_by_id,
+            )
+        except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            carrier_path = str(row.get("carrier_path") or "")
+            detail = str(exc)
+            identity = (carrier_path, detail)
+            if identity not in reported:
+                reported.add(identity)
+                error = {
+                    "carrier_path": carrier_path,
+                    "error": detail,
+                    "reason": detail,
+                }
+                if carrier_errors is not None:
+                    if not any(
+                        item.get("carrier_path") == carrier_path
+                        and item.get("error") == detail
+                        for item in carrier_errors
+                    ):
+                        carrier_errors.append(error)
+                else:
+                    _emit_carrier_error(error)
+            continue
         if envelope is not None:
             items.append((row, envelope))
     return items
@@ -5731,7 +5937,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             raise MessageError("active controller lease is unavailable")
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
-        items_with_rows = _envelopes_with_rows(authority, rows, controller_label=controller_label)
+        carrier_errors: list[dict[str, object]] = []
+        items_with_rows = _envelopes_with_rows(
+            authority,
+            rows,
+            controller_label=controller_label,
+            carrier_errors=carrier_errors,
+        )
         if since is not None:
             items_with_rows = [
                 (row, envelope)
@@ -5756,6 +5968,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
     ) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
+    for error in carrier_errors:
+        _emit_carrier_error(error)
     positions = _cursor_positions(rows)
     # --summary-only/--since are diagnostic: they must not look like a drain
     # recipe for a filtered subset, which would skip unshown mail.
@@ -5781,6 +5995,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             "drained": 0,
                             "items": [],
                             "status": "no_mail",
+                            **({"carrier_errors": carrier_errors} if carrier_errors else {}),
                         },
                         sort_keys=True,
                     )
@@ -5867,19 +6082,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
         if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    {
-                        "controller_label": controller_label,
-                        "cursor_version": cursor_version,
-                        "drained": len(envelopes),
-                        "items": envelopes,
-                        "previous_cursor_version": previous_version,
-                        "status": "drained",
-                    },
-                    sort_keys=True,
-                )
-            )
+            payload = {
+                "controller_label": controller_label,
+                "cursor_version": cursor_version,
+                "drained": len(envelopes),
+                "items": envelopes,
+                "previous_cursor_version": previous_version,
+                "status": "drained",
+            }
+            if carrier_errors:
+                payload["carrier_errors"] = carrier_errors
+            print(json.dumps(payload, sort_keys=True))
         else:
             print(
                 f"drained {len(envelopes)} · cursor "
@@ -5902,6 +6115,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
             "stream_snapshots": peek.stream_snapshots,
             "advance_command": advance_command,
         }
+        if carrier_errors:
+            payload["carrier_errors"] = carrier_errors
         if summary_only:
             payload["counts"] = counts
             seen: dict[str, dict[str, object]] = {}
@@ -7646,6 +7861,7 @@ def cmd_follow(args) -> int:
     # advance the journal: a replacement must replay unacknowledged mail.
     delivered: set[tuple[str, int, str]] = set()
     seen_rewinds: dict[str, int] = {}
+    reported_carrier_errors: set[tuple[str, str]] = set()
     reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
@@ -7754,11 +7970,32 @@ def cmd_follow(args) -> int:
                     and int(item.get("stream_seq") or 0)
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 ]
+                carrier_errors: list[dict[str, object]] = []
                 visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
-                    _envelopes_with_rows(authority, candidate_rows, controller_label=label),
+                    _envelopes_with_rows(
+                        authority,
+                        candidate_rows,
+                        controller_label=label,
+                        carrier_errors=carrier_errors,
+                    ),
                     controller_label=label,
                     lease_nonce=nonce,
                 )
+                for error in carrier_errors:
+                    identity = (
+                        str(error.get("carrier_path") or ""),
+                        str(error.get("error") or error.get("reason") or ""),
+                    )
+                    if identity in reported_carrier_errors:
+                        continue
+                    reported_carrier_errors.add(identity)
+                    if not emit(
+                        _follow_fault_record(
+                            "carrier-corrupt",
+                            f"{identity[0]}: {identity[1]}",
+                        )
+                    ):
+                        return 0
                 try:
                     if reset_owner_ring:
                         # The exclusive monitor slot proves the prior follow
@@ -8496,6 +8733,32 @@ def cmd_listen(args) -> int:
     report_claim = None
     pending_report_settled = True
     prearmed_visible_items: list[tuple[dict, dict]] | None = None
+    reported_carrier_errors: set[tuple[str, str]] = set()
+
+    def listener_envelopes(
+        source,
+        rows: list[dict] | tuple[dict, ...],
+        *,
+        attention_by_id: dict[str, dict[str, object]] | None = None,
+    ) -> list[tuple[dict, dict]]:
+        errors: list[dict[str, object]] = []
+        items = _envelopes_with_rows(
+            source,
+            rows,
+            controller_label=label,
+            attention_by_id=attention_by_id,
+            carrier_errors=errors,
+        )
+        for error in errors:
+            identity = (
+                str(error.get("carrier_path") or ""),
+                str(error.get("error") or error.get("reason") or ""),
+            )
+            if identity in reported_carrier_errors:
+                continue
+            reported_carrier_errors.add(identity)
+            _emit_carrier_error(error)
+        return items
 
     def arm_once():
         result = authority.arm_listener(
@@ -8555,10 +8818,9 @@ def cmd_listen(args) -> int:
                     # no arm actually reported.
                     prearmed_visible_items = _retry_listener_journal_busy(
                         lambda: _foreign_controller_items(
-                            _envelopes_with_rows(
+                            listener_envelopes(
                                 authority,
                                 list(arm_snapshot.items),
-                                controller_label=label,
                             ),
                             controller_label=label,
                             lease_nonce=nonce,
@@ -9077,7 +9339,7 @@ def cmd_listen(args) -> int:
             if visible_arm_items is None:
                 visible_arm_items = _retry_listener_journal_busy(
                     lambda: _foreign_controller_items(
-                        _envelopes_with_rows(authority, list(report_items), controller_label=label),
+                        listener_envelopes(authority, list(report_items)),
                         controller_label=label,
                         lease_nonce=nonce,
                     ),
@@ -9314,10 +9576,9 @@ def cmd_listen(args) -> int:
                     read_authority,
                     candidate_rows,
                 )
-                candidate_items = _envelopes_with_rows(
+                candidate_items = listener_envelopes(
                     read_authority,
                     candidate_rows,
-                    controller_label=label,
                     attention_by_id=candidate_attention,
                 )
                 wakeable_items = bool(
@@ -9337,10 +9598,9 @@ def cmd_listen(args) -> int:
                     # complete snapshot is rendered. When the candidate is a normal
                     # carrier, a quiet synthetic backlog is loaded once here.
                     visible_ring_items = _foreign_controller_items(
-                        _envelopes_with_rows(
+                        listener_envelopes(
                             read_authority,
                             list(peek.items),
-                            controller_label=label,
                             attention_by_id=candidate_attention,
                         ),
                         controller_label=label,

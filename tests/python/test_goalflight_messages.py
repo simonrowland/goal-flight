@@ -990,6 +990,171 @@ def test_inbox_corrupt_line_fails_closed() -> None:
             pass
 
 
+def test_corrupt_carrier_is_reported_once_while_relay_delivers_healthy_mail() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "carrier-isolation-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+            clear=False,
+        ), mock.patch.object(_carrier_messages, "_current_project_root", return_value=project):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "carrier-isolation-test"},
+            )
+            assert_true("carrier isolation lease claimed", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="healthy-carrier",
+            )
+            bad = _carrier_messages.post_message(
+                dispatch_id="corrupt-carrier",
+                msg_type="controller-notice",
+                payload={"text": "must be skipped"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+            with Path(bad["path"]).open("ab") as handle:
+                handle.write(b"{corrupt carrier row\n")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "--fleet-dir",
+                        env["GOALFLIGHT_FLEET_DIR"],
+                        "relay",
+                        "--new",
+                        "--json",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+            assert_true("relay survives corrupt carrier", rc == 0)
+            assert_true(
+                "healthy mail remains visible",
+                any(item.get("dispatch_id") == "healthy-carrier" for item in payload["items"]),
+            )
+            assert_true(
+                "corrupt carrier is reported once",
+                len(payload.get("carrier_errors") or []) == 1
+                and payload["carrier_errors"][0]["carrier_path"].endswith(
+                    "corrupt-carrier.jsonl"
+                ),
+            )
+            assignments = authority.read_all(
+                "SELECT withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+                (bad["envelope"]["id"],),
+            )
+            assert_true(
+                "corrupt carrier assignment is withdrawn",
+                assignments and assignments[0]["withdrawn_at"] is not None,
+            )
+            assert_true(
+                "corruption warning is one line",
+                stderr.getvalue().count("WARNING: carrier corruption:") == 1,
+            )
+
+
+def test_duplicate_carrier_sequence_is_quarantined_without_hiding_valid_rows() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        posted = _carrier_messages.post_message(
+            dispatch_id="duplicate-seq-carrier",
+            msg_type="status",
+            payload={"text": "valid"},
+            messages_dir=messages_dir,
+            project_journal_delivery=False,
+        )
+        path = Path(posted["path"])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(posted["line"])
+        errors: list[dict[str, object]] = []
+        loaded = _carrier_messages.read_envelopes_tolerant(path, carrier_errors=errors)
+        assert_true("duplicate leaves the first row", len(loaded) == 1)
+        assert_true(
+            "duplicate sequence is named",
+            len(errors) == 1 and "duplicate sequence number" in str(errors[0]["reason"]),
+        )
+
+
+def test_post_refuses_case_variant_dispatch_id_before_writing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        _carrier_messages.post_message(
+            dispatch_id="Case-Variant-Carrier",
+            msg_type="status",
+            payload={"text": "existing"},
+            messages_dir=messages_dir,
+            project_journal_delivery=False,
+        )
+        before = {
+            entry.name: entry.read_bytes()
+            for entry in messages_dir.iterdir()
+            if entry.is_file()
+        }
+        try:
+            _carrier_messages.post_message(
+                dispatch_id="case-variant-carrier",
+                msg_type="status",
+                payload={"text": "must refuse"},
+                messages_dir=messages_dir,
+                project_journal_delivery=False,
+            )
+            assert_true("case collision is refused", False)
+        except _carrier_messages.MessageError as exc:
+            detail = str(exc)
+            assert_true("requested id is named", "case-variant-carrier" in detail)
+            assert_true("existing id is named", "Case-Variant-Carrier" in detail)
+        after = {
+            entry.name: entry.read_bytes()
+            for entry in messages_dir.iterdir()
+            if entry.is_file()
+        }
+        assert_true("case collision writes nothing", after == before)
+
+
+def test_post_normalizes_controller_project_root_alias() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project-root"
+        root.mkdir()
+        alias = base / "project-alias"
+        alias.symlink_to(root, target_is_directory=True)
+        result = _carrier_messages.post_message(
+            dispatch_id="canonical-root-post",
+            msg_type="controller-notice",
+            payload={"text": "canonical"},
+            messages_dir=base / "messages",
+            addressee={
+                "kind": "controller",
+                "label": "main",
+                "project_root": str(alias),
+            },
+            project_journal_delivery=False,
+        )
+        assert_true(
+            "post stores canonical project root",
+            result["envelope"]["addressee"]["project_root"] == str(root.resolve()),
+        )
+
+
 def test_aggregate_open_user_need() -> None:
     import tempfile
     from goalflight_messages import build_aggregate, inbox_path, refresh_aggregate
