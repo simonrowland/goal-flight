@@ -1,0 +1,13 @@
+{
+  "schema": "goalflight.remote-ci.receipt.v1",
+  "hostname": "ci-worker.example.invalid",
+  "status": "pass",
+  "returncode": 0,
+  "passed": 12,
+  "failed": 0,
+  "errors": 0,
+  "failing_node_ids": [],
+  "collection_import_errors": [],
+  "first_error_lines": [],
+  "duration_seconds": 18.4
+}
