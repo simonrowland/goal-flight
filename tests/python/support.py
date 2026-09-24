@@ -102,9 +102,10 @@ def registered_child_environment(
     """Run an ACP/dispatch child with a live checkout-local controller."""
     import goalflight_journal
     import goalflight_ledger
+    import goalflight_task
     import goalflight_wake
 
-    project = Path(project_root)
+    project = goalflight_task.resolve_project_root(str(project_root))
     child_env = dict(os.environ if env is None else env)
     child_env.update(
         {

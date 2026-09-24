@@ -987,7 +987,11 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert not leases[-1].get("released_at"), leases[-1]
         assert leases[-1].get("worker_pid") == worker_pid, leases[-1]
         assert leases[-1].get("controller_pid") == worker_pid, leases[-1]
-        assert leases[-1].get("detached_controller_pid") is None, leases[-1]
+        # d213e78e preserves the registered controller when the live worker
+        # becomes the lease's new liveness authority.
+        assert (
+            leases[-1].get("detached_controller_pid") == status["controller_pid"]
+        ), leases[-1]
     finally:
         _force_kill(worker_pid)
 
