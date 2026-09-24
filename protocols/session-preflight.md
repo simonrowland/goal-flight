@@ -2,6 +2,20 @@
 
 Run before non-trivial goal-flight commands. Keep output compact.
 
+## Friction log
+
+When something bites, immediately append one line to
+`~/.goal-flight/friction/<controller-label>.md`:
+`<UTC timestamp> | <what happened> | <evidence: command/output/path> | <cost>`.
+Keep it append-only. This preserves evidence compaction drops, so the weekly
+poll can summarize the file instead of reconstructing from memory.
+
+## Weekly feedback poll
+
+Once a week, the goal-flight controller mails each active controller for a
+summary of its friction log since the last poll. Answer from the log file, not
+from memory.
+
 0. Auto-claim this controller's journal lease before status, listening, or dispatch.
 Goal Flight entry points and compaction resume perform the same role-aware claim; an
 explicit preflight is useful when you need the returned capability:

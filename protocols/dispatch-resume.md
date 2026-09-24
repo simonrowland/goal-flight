@@ -6,6 +6,19 @@ Withdrawal never kills a live worker. It requires no live worker, preserves a
 carrier audit copy, and prevents drain from restoring the retired dispatch.
 See `protocols/dispatch-danger.md` for ownership, moved roots, and dry-run flags.
 
+## Pin before resume or redispatch
+
+Before resuming or redispatching a worker that died or stopped, the controller
+pins its committed tip and dirty tree. For a dirty tree, run controller-side:
+
+```bash
+git -C <worktree> stash create "<id> uncommitted"   # capture the returned <sha>
+git update-ref refs/keep/<dispatch-id>-dirty-<date> <sha>
+```
+
+Workers cannot update refs. Only after this pin may the controller resume,
+redispatch, or let the seat be reused.
+
 ## ★ The most expensive miss: a worker that stopped to ASK YOU something
 
 **If the worker ended because it needs something from you, RESUME it with the
@@ -93,8 +106,10 @@ you want to keep, not by what killed the worker.
   not. Resume reattaches to the existing worktree, branch, and partial
   artifacts — it does not acquire a sibling pooled worktree. Quota-exhausted,
   dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
-  continuable. `--account <account>` pins a surviving account; default selection
-  skips recently quota-exhausted accounts until their reset.
+  continuable. Account selection prefers the original healthy account; an
+  explicit `--account <account>` selects the account for a supported
+  cross-account resume. Default selection skips recently quota-exhausted
+  accounts until their reset.
 - Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
   (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume

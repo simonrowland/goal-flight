@@ -113,8 +113,9 @@ Default terse output has no full-coverage readiness record after the
 probe. Supervisor process presence alone is insufficient. Resolve any
 subsequent startup `stop` or child failure before proceeding.
 Do not grep that feed; default is terse.
-If `--list-controllers` still reports `supervisor: absent` after arming, treat
-that as a blocker and resolve it — do not proceed to STEP 2 deaf.
+If `python3 <skill-root>/scripts/goalflight_session_status.py
+--list-controllers` still reports `supervisor: absent` after arming, treat that
+as a blocker and resolve it — do not proceed to STEP 2 deaf.
 
 Stop any pre-existing direct listeners first; a supervisor plus loose listeners
 double-deliver.

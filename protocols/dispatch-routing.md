@@ -258,6 +258,9 @@ queue, or a deploy. A timer that asks whether a worker finished is polling an
 available channel. Background every controller tool call expected to run longer
 than about 10 seconds so typed steers remain visible and ESC/Ctrl-C interrupts
 only the observer surface, not the detached worker.
+Never wrap `goalflight_dispatch.py` in `timeout` or a backgrounded subshell
+(`( ... & )`); use the host's background mechanism so watcher attachment and
+status remain owned.
 
 Blocking waits are for short scripted synchronous needs. Prefer default detached
 dispatch plus the background listener; use `goalflight_status.py --dispatch <id>`
@@ -270,8 +273,13 @@ the controller terminal and queues typed steers behind the wait.
 Direct detached dispatch:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --at <ref>
 ```
+
+For pooled worktrees, omit `--cwd` for normal dispatch. Never pass `--cwd
+<seat>` without `--at <ref>` or `--worktree <ref>`: it reseats the worktree at
+the default base. Controllers do not ferry, rebase, or keep files in pool
+seats; use a worktree outside the pool for controller-held files.
 
 This launches immediately and waits for the lane's capacity window. If capacity
 remains unavailable, it writes `blocked_capacity`, prints `DISPATCH-BLOCKED`,
