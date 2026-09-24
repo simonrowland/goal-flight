@@ -25,8 +25,8 @@ incremented when meaningful skill behaviour changes.
 
 - Account validation runs before any dispatch side effect on every launch path.
 - Unknown liveness evidence from a failed process probe is reported as unknown (never live or dead), so pending sidecars are not settled on it.
-- Resume account selection uses the normal Codex resolver before creating the child ledger, so an explicit host login follows the same resolver path as a fresh dispatch and an unresolved account leaves no child claim.
-- A resumed dispatch whose recorded pool seat was recycled now validates its own `worktree/<dispatch-id>` (or legacy `seat/<dispatch-id>`) branch and reacquires a free seat at the recorded head. Missing or divergent branches are refused without touching another dispatch's seat; recovery keep/quarantine refs are reported.
+- Resume account selection uses the normal Codex resolver before creating the child ledger, so an explicit host login follows the same resolver path as a fresh dispatch and an unresolved account leaves no child claim. Explicit-account resumes build a child-owned Codex home and copy the parent's rollout while the source-home lock is held; capacity is charged to the resolver's effective account and a refusal rolls back the auto child reservation before controller stamping.
+- A resumed dispatch whose recorded pool seat was recycled now validates its own `worktree/<dispatch-id>` (or legacy `seat/<dispatch-id>`) branch and reacquires a free seat at the recorded head or a descendant committed on that branch. Missing checkouts, foreign or divergent branches, and uninspected recovery refs are refused without touching another dispatch's seat; recovery keep/quarantine refs are named so the operator can recover them.
 
 ## [1.7.1] - 2026-09-23
 

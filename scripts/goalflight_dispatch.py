@@ -1877,6 +1877,74 @@ def _resume_worktree_ref_commit(project_root: Path, ref: str) -> str | None:
     return value or None
 
 
+def _resume_worktree_is_descendant(
+    project_root: Path, ancestor: str, descendant: str
+) -> bool:
+    """Accept progress committed on the dispatch's own durable branch."""
+    proc = goalflight_worktree_pool._git_proc(
+        project_root,
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+    )
+    return proc is not None and proc.returncode == 0
+
+
+def _resume_recovery_refs_for_parent(
+    parent_dispatch_id: str,
+    record: dict,
+    *,
+    recorded_cwd: str | None = None,
+) -> list[str]:
+    """Find recovery refs left on a recycled seat by another dispatch.
+
+    Reclamation stores its keep/quarantine refs on the new lease, not on the
+    abandoned dispatch. Refusing when that lease is still discoverable is safer
+    than starting a resume that silently drops the preserved work.
+    """
+    parent_path = record.get("worker_cwd") or record.get("worktree_path") or recorded_cwd
+    if not parent_path:
+        return []
+    try:
+        parent_resolved = Path(str(parent_path)).expanduser().resolve(strict=False)
+    except OSError as exc:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: could not inspect recovery refs for "
+            f"{parent_dispatch_id}: {exc}"
+        ) from exc
+    refs: list[str] = []
+    try:
+        candidates = goalflight_ledger.read_records()
+    except OSError as exc:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: could not inspect recovery refs for "
+            f"{parent_dispatch_id}: {exc}"
+        ) from exc
+    for candidate in candidates:
+        if str(candidate.get("dispatch_id") or "") == parent_dispatch_id:
+            continue
+        candidate_path = candidate.get("worktree_path") or candidate.get("worker_cwd")
+        if not candidate_path:
+            continue
+        try:
+            if Path(str(candidate_path)).expanduser().resolve(strict=False) != parent_resolved:
+                continue
+        except OSError:
+            continue
+        for key in (
+            "worktree_keep_ref",
+            "keep_ref",
+            "worktree_quarantine_ref",
+            "quarantine_ref",
+            "quarantine_branch",
+        ):
+            value = candidate.get(key)
+            if value and str(value) not in refs:
+                refs.append(str(value))
+    return refs
+
+
 def _resume_worktree_branch_spec(
     project_root: Path,
     parent_dispatch_id: str,
@@ -1910,7 +1978,18 @@ def _resume_worktree_branch_spec(
     )
     recorded_branch = record.get("worktree_branch")
     if recorded_branch:
-        candidates = [str(recorded_branch).strip()]
+        recorded_branch = str(recorded_branch).strip()
+        suffix = recorded_branch.split("/", 1)[1] if "/" in recorded_branch else ""
+        if (
+            not goalflight_worktree_pool.is_worktree_branch(recorded_branch)
+            or suffix != str(parent_dispatch_id)
+        ):
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: recorded branch {recorded_branch} does not "
+                f"belong to dispatch {parent_dispatch_id}"
+                + _resume_worktree_ref_context(keep_ref, quarantine_ref)
+            )
+        candidates = [recorded_branch]
     else:
         candidates = [
             goalflight_worktree_pool.worktree_branch_name(parent_dispatch_id),
@@ -1923,6 +2002,7 @@ def _resume_worktree_branch_spec(
         if (
             not goalflight_worktree_pool.is_worktree_branch(candidate)
             or not suffix
+            or suffix != str(parent_dispatch_id)
             or not re.fullmatch(r"[A-Za-z0-9._-]+", suffix)
         ):
             continue
@@ -1943,6 +2023,7 @@ def _resume_worktree_branch_spec(
             + _resume_worktree_ref_context(keep_ref, quarantine_ref)
         )
     expected_heads: list[str] = []
+    recorded_head_matches = False
     recorded_head = record.get("worktree_head") or record.get("worktree_base")
     if recorded_head:
         resolved_head = _resume_worktree_ref_commit(project_root, str(recorded_head))
@@ -1953,6 +2034,9 @@ def _resume_worktree_branch_spec(
                 + _resume_worktree_ref_context(keep_ref, quarantine_ref)
             )
         expected_heads.append(resolved_head)
+        recorded_head_matches = branch_tip == resolved_head or _resume_worktree_is_descendant(
+            project_root, resolved_head, branch_tip
+        )
     if keep_ref:
         keep_tip = _resume_worktree_ref_commit(project_root, keep_ref)
         if keep_tip is None:
@@ -1960,12 +2044,20 @@ def _resume_worktree_branch_spec(
                 f"resume refused: branch {branch} has missing keep ref {keep_ref}"
                 + _resume_worktree_ref_context(None, quarantine_ref)
             )
+        if branch_tip == keep_tip:
+            recorded_head_matches = True
         expected_heads.append(keep_tip)
+    if quarantine_ref:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: preserved work for branch {branch} is in recovery ref "
+            f"{quarantine_ref}; restore or inspect it before resuming"
+        )
     if not expected_heads:
         # Pre-1.7.2 records did not persist a head. The branch itself is the
         # only durable evidence available for those records.
         expected_heads.append(branch_tip)
-    if branch_tip not in expected_heads:
+        recorded_head_matches = True
+    if not recorded_head_matches:
         recorded_text = str(recorded_head or "unknown")
         raise goalflight_worktree_pool.WorktreeCwdRefused(
             f"resume refused: branch {branch} diverged; recorded head "
@@ -1977,6 +2069,18 @@ def _resume_worktree_branch_spec(
 
 def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id: str):
     record = _find_dispatch_record(parent_dispatch_id) or {}
+    recovery_refs = _resume_recovery_refs_for_parent(
+        parent_dispatch_id,
+        record,
+        recorded_cwd=getattr(args, "cwd", None),
+    )
+    if recovery_refs:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: recycled worktree for {parent_dispatch_id} has "
+            "preserved state in recovery ref(s) "
+            + ", ".join(recovery_refs)
+            + "; restore or inspect them before resuming"
+        )
     branch, branch_tip, _keep_ref, _quarantine_ref = _resume_worktree_branch_spec(
         project_root,
         parent_dispatch_id,
@@ -2245,6 +2349,22 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 if (
                     (" is held:" in message or "oldest holders:" in message)
                     and str(parent_dispatch_id) in holder_tokens
+                ):
+                    raise
+                lease = _resume_replacement_worktree(
+                    args,
+                    project_root=project_root,
+                    parent_dispatch_id=str(parent_dispatch_id),
+                )
+            except goalflight_worktree_pool.WorktreeCwdRefused:
+                # A deleted recorded seat still has managed-pool identity from
+                # its path. The exact-seat acquire cannot attach a missing
+                # checkout, so use the same safe replacement path as a
+                # recycled holder. Other cwd refusals remain refusals.
+                if not (
+                    skip_reset
+                    and parent_dispatch_id
+                    and not cwd.exists()
                 ):
                     raise
                 lease = _resume_replacement_worktree(
@@ -5363,18 +5483,17 @@ def _seed_codex_resume_home_from_canonical(
     model: str | None = None,
     pre_resolved: dict | None = None,
 ) -> tuple[str, str]:
-    """Resume a canonical-home session on another account from a rollout COPY.
+    """Resume a recorded session from a read-only source-home rollout copy.
 
     _rebuild_codex_resume_home is only safe for a per-dispatch home: it renames
     the home aside, rebuilds it in place, moves sessions/ across and deletes
-    the original. A canonical account home is shared state -- that account's
-    login and every session it has run -- so it must never take that path.
-    Instead the resumed worker gets a fresh per-dispatch home for the target
-    account, built by the ordinary account path and keyed by THIS dispatch, and a
-    byte copy of the one rollout it resumes at the same path relative to the
-    home, which is where `codex exec resume <session>` looks. The source home
-    is only read. The prompt-token cache does not carry over; after a quota
-    wall it is stale anyway.
+    the original. A recorded home is shared state during resume, so it must
+    never take that path. Instead the resumed worker gets a fresh per-dispatch
+    home for the target account, built by the ordinary account path and keyed
+    by THIS dispatch, and a byte copy of the one rollout it resumes at the same
+    path relative to the home, which is where `codex exec resume <session>`
+    looks. The source home is only read. The prompt-token cache does not carry
+    over; after a quota wall it is stale anyway.
     """
     rollout = goalflight_codex_sessions.rollout_path(source_home, session_id)
     if rollout is None:
@@ -5550,15 +5669,34 @@ def _cmd_resume(argv: list[str]) -> int:
         _resume_worker_cwd(
             source["record"], override=getattr(args, "cwd", None)
         )
+        dispatch_base = _dispatch_base_dir()
         child_dispatch_id = _reserve_auto_dispatch_id(
-            f"{source['engine']}-resume", _dispatch_base_dir()
+            f"{source['engine']}-resume", dispatch_base
         )
-        launch_argv = _resume_launch_argv(
-            source,
-            child_dispatch_id=child_dispatch_id,
-            prompt_path=prompt_path,
-            resume_args=args,
-        )
+        try:
+            launch_argv = _resume_launch_argv(
+                source,
+                child_dispatch_id=child_dispatch_id,
+                prompt_path=prompt_path,
+                resume_args=args,
+            )
+            # Account resolution is the only resume preparation that may build
+            # a child home. Do it before main can stamp controller ownership;
+            # if it refuses, remove both the auto-id reservation and any
+            # child snapshot it may have created.
+            preflight_args = _build_launch_parser().parse_args(launch_argv)
+            _preflight_resume_codex_account(preflight_args)
+        except DispatchUsageError:
+            reservation = dispatch_base / ".dispatch-ids" / f"{child_dispatch_id}.json"
+            try:
+                payload = json.loads(reservation.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("dispatch_id") == child_dispatch_id:
+                with contextlib.suppress(OSError):
+                    reservation.unlink()
+            cleanup_codex_dispatch_home(child_dispatch_id)
+            raise
     except DispatchUsageError as exc:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
@@ -5604,7 +5742,16 @@ def _resume_cwd_from_record(record: dict) -> Path | None:
 
 def _resume_recorded_controller_label(record: dict) -> str | None:
     value = record.get("controller_label")
-    return str(value).strip() if value and str(value).strip() else None
+    if value and str(value).strip():
+        return str(value).strip()
+    recorded = _dispatch_argv_from_record(record)
+    return (
+        _option_value_before_worker_remainder(
+            recorded, "--controller-label", last=True
+        )
+        if recorded
+        else None
+    )
 
 
 def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
@@ -5679,7 +5826,7 @@ def _resume_launch_argv(
         "--cwd": str(cwd),
     }
     recorded_model = record.get("model") or _option_value_before_worker_remainder(
-        recorded, "--model"
+        recorded, "--model", last=True
     )
     requested_model = getattr(resume_args, "model", None)
     if requested_model is not None:
@@ -5687,7 +5834,9 @@ def _resume_launch_argv(
     elif recorded_model:
         replace["--model"] = str(recorded_model)
     recorded_reasoning_effort = record.get("reasoning_effort") or (
-        _option_value_before_worker_remainder(recorded, "--reasoning-effort")
+        _option_value_before_worker_remainder(
+            recorded, "--reasoning-effort", last=True
+        )
     )
     requested_reasoning_effort = getattr(resume_args, "reasoning_effort", None)
     if requested_reasoning_effort is not None:
@@ -5700,7 +5849,9 @@ def _resume_launch_argv(
     recorded_label = _resume_recorded_controller_label(record)
     if (
         resume_args.controller_label is None
-        and _option_value_before_worker_remainder(base, "--controller-label") is None
+        and _option_value_before_worker_remainder(
+            base, "--controller-label", last=True
+        ) is None
         and recorded_label
     ):
         replace["--controller-label"] = str(recorded_label)
@@ -7373,19 +7524,16 @@ def _preflight_resume_codex_account(args) -> None:
         # Same-account canonical resumes read the source home directly; invoking
         # the resolver would unnecessarily rebuild a shared login home.
         return
-    if source_is_canonical:
-        resolve_dispatch_id = str(args.dispatch_id)
-        expected_home = (_codex_dispatch_homes_dir() / resolve_dispatch_id).resolve(
-            strict=False
-        )
-    else:
-        resolve_dispatch_id = str(
-            getattr(args, "codex_home_owner_dispatch_id", None)
-            or parent_dispatch_id
-        )
-        expected_home = Path(str(args.codex_resume_home)).expanduser().resolve(
-            strict=False
-        )
+    source_home = Path(str(recorded_home or args.codex_resume_home)).expanduser().resolve(
+        strict=False
+    )
+    source_home_owner_dispatch_id = str(
+        record.get("codex_home_owner_dispatch_id") or parent_dispatch_id
+    )
+    resolve_dispatch_id = str(args.dispatch_id)
+    expected_home = (_codex_dispatch_homes_dir() / resolve_dispatch_id).resolve(
+        strict=False
+    )
     try:
         if getattr(args, "model", None) is None:
             resolved_home, effective_account = resolve_codex_home(
@@ -7420,6 +7568,17 @@ def _preflight_resume_codex_account(args) -> None:
         "account": str(effective_account),
         "source_is_canonical": source_is_canonical,
     }
+    args._capacity_account = str(effective_account)
+    args.effective_account = str(effective_account)
+    args._codex_resume_source_home = str(source_home)
+    args._codex_resume_source_home_owner_dispatch_id = (
+        source_home_owner_dispatch_id
+    )
+    # The source remains available for claim validation through the private
+    # source fields above; all child status/ledger rows and the worker use the
+    # new home built for this resume dispatch.
+    args.codex_resume_home = str(resolved_home)
+    args.codex_home_owner_dispatch_id = str(args.dispatch_id)
 
 
 _CODEX_SEAT_API_UNSET = object()
@@ -8675,20 +8834,30 @@ def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) 
     return _insert_before_worker_remainder(argv, [flag, str(value)])
 
 
-def _option_value_before_worker_remainder(argv: list[str], flag: str) -> str | None:
+def _option_value_before_worker_remainder(
+    argv: list[str], flag: str, *, last: bool = False
+) -> str | None:
     head, _tail = _argv_split_worker_remainder(argv)
     prefix = flag + "="
+    value = None
     index = 0
     while index < len(head):
         token = head[index]
         if token == flag:
             if index + 1 < len(head):
-                return head[index + 1]
-            return None
+                value = head[index + 1]
+            elif not last:
+                return None
+            if not last:
+                return value
+            index += 2
+            continue
         if token.startswith(prefix):
-            return token[len(prefix) :]
+            value = token[len(prefix) :]
+            if not last:
+                return value
         index += 1
-    return None
+    return value
 
 
 # Classification of every launch-parser option string. Preserve-class flags are
@@ -20300,6 +20469,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 64
+    # Validate a direct resume before controller stamping. The resume verb has
+    # already reserved its child id so it rolls that reservation back on an
+    # account refusal; direct launch/requeue callers have no reservation to
+    # clean up here.
+    if getattr(args, "parent_dispatch_id", None):
+        try:
+            _validate_resume_source(
+                args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+            )
+            _preflight_resume_codex_account(args)
+        except DispatchUsageError as exc:
+            print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+            return 64
     if not goalflight_compat.is_windows():
         controller_claim = _stamp_controller_session(args, _project_root(args))
         if controller_claim.get("reason") == "label_in_use":
@@ -20353,11 +20535,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             # Direct resume launches must validate before exempting lineage or
             # binding a seat; claim-boundary validation remains under its lock.
-            if args.parent_dispatch_id:
-                _validate_resume_source(
-                    args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
-                )
-                _preflight_resume_codex_account(args)
             # Before any worktree bind. This gate reads the ledger and the task
             # store, not the worktree, and a refusal must not become the occupant.
             _refuse_launch_blocked_by_completion_authority(args)
@@ -20440,11 +20617,6 @@ def main(argv: list[str] | None = None) -> int:
             allow_queued=args.from_queue,
         )
         # Validate direct resumes before lineage exemption and seat mutation.
-        if args.parent_dispatch_id:
-            _validate_resume_source(
-                args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
-            )
-            _preflight_resume_codex_account(args)
         # Occupancy-forced is a worktree hatch and does not bypass this:
         # a same-task sibling still refuses before admission.
         _refuse_launch_blocked_by_completion_authority(args)
@@ -20611,6 +20783,11 @@ def main(argv: list[str] | None = None) -> int:
     if codex_session_id is not None:
         summary_head["codex_session_id"] = codex_session_id
     codex_home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
+    codex_resume_claim_home_owner_dispatch_id = getattr(
+        args,
+        "_codex_resume_source_home_owner_dispatch_id",
+        codex_home_owner_dispatch_id,
+    )
     if codex_home_owner_dispatch_id is not None:
         summary_head["codex_home_owner_dispatch_id"] = (
             codex_home_owner_dispatch_id
@@ -20626,15 +20803,17 @@ def main(argv: list[str] | None = None) -> int:
         # dispatch; the existing running row is still written after capacity
         # is acquired and the worker is spawned.
         if getattr(args, "parent_dispatch_id", None) and resume_engine == "codex":
-            resume_home = Path(args.codex_resume_home).expanduser().resolve(
-                strict=False
-            )
+            resume_home = Path(
+                getattr(args, "_codex_resume_source_home", args.codex_resume_home)
+            ).expanduser().resolve(strict=False)
             with _codex_resume_lock(resume_home, args.codex_session_id):
                 _revalidate_codex_resume_claim(
                     parent_dispatch_id=args.parent_dispatch_id,
                     expected_home=resume_home,
                     expected_session_id=args.codex_session_id,
-                    expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                    expected_home_owner_dispatch_id=(
+                        codex_resume_claim_home_owner_dispatch_id
+                    ),
                     exclude_dispatch_id=args.dispatch_id,
                 )
                 if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
@@ -20770,15 +20949,17 @@ def main(argv: list[str] | None = None) -> int:
             and not goalflight_compat.is_windows()
         ):
             if getattr(args, "parent_dispatch_id", None):
-                resume_home = Path(args.codex_resume_home).expanduser().resolve(
-                    strict=False
-                )
+                resume_home = Path(
+                    getattr(args, "_codex_resume_source_home", args.codex_resume_home)
+                ).expanduser().resolve(strict=False)
                 with _codex_resume_lock(resume_home, args.codex_session_id):
                     _revalidate_codex_resume_claim(
                         parent_dispatch_id=args.parent_dispatch_id,
                         expected_home=resume_home,
                         expected_session_id=args.codex_session_id,
-                        expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                        expected_home_owner_dispatch_id=(
+                            codex_resume_claim_home_owner_dispatch_id
+                        ),
                         exclude_dispatch_id=args.dispatch_id,
                     )
                     parent_record = (
@@ -20819,28 +21000,56 @@ def main(argv: list[str] | None = None) -> int:
                         # make the resumed dispatch itself unresumable.
                         codex_home_owner_dispatch_id = args.dispatch_id
                         args.codex_home_owner_dispatch_id = args.dispatch_id
+                        args.codex_resume_home = codex_dispatch_home
                         summary_head["codex_home_owner_dispatch_id"] = args.dispatch_id
                     elif source_is_canonical:
                         codex_dispatch_home = str(resume_home)
                         effective_account = parent_account
                     else:
-                        codex_dispatch_home, effective_account = (
-                            _rebuild_codex_resume_home(
-                                project_root,
-                                args.parent_dispatch_id,
-                                resume_home,
-                                args.codex_session_id,
-                                home_owner_dispatch_id=codex_home_owner_dispatch_id,
-                                explicit_account=(
-                                    getattr(args, "_codex_selected_account", None)
-                                    or getattr(args, "account", None)
-                                ),
-                                model=getattr(args, "model", None),
-                                pre_resolved=getattr(
-                                    args, "_codex_resume_pre_resolved", None
-                                ),
+                        if getattr(args, "account", None) or getattr(
+                            args, "_codex_resume_pre_resolved", None
+                        ) is not None:
+                            codex_dispatch_home, effective_account = (
+                                _seed_codex_resume_home_from_canonical(
+                                    project_root,
+                                    args.parent_dispatch_id,
+                                    resume_home,
+                                    args.codex_session_id,
+                                    dispatch_id=args.dispatch_id,
+                                    account=(
+                                        getattr(args, "_codex_selected_account", None)
+                                        or args.account
+                                    ),
+                                    model=getattr(args, "model", None),
+                                    pre_resolved=getattr(
+                                        args, "_codex_resume_pre_resolved", None
+                                    ),
+                                )
                             )
-                        )
+                            codex_home_owner_dispatch_id = args.dispatch_id
+                            args.codex_home_owner_dispatch_id = args.dispatch_id
+                            args.codex_resume_home = codex_dispatch_home
+                            summary_head["codex_home_owner_dispatch_id"] = (
+                                args.dispatch_id
+                            )
+                        else:
+                            codex_dispatch_home, effective_account = (
+                                _rebuild_codex_resume_home(
+                                    project_root,
+                                    args.parent_dispatch_id,
+                                    resume_home,
+                                    args.codex_session_id,
+                                    home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                                    explicit_account=(
+                                        getattr(args, "_codex_selected_account", None)
+                                        or getattr(args, "account", None)
+                                    ),
+                                    model=getattr(args, "model", None),
+                                    pre_resolved=getattr(
+                                        args, "_codex_resume_pre_resolved", None
+                                    ),
+                                )
+                            )
             else:
                 if getattr(args, "_codex_account_pre_resolved", False):
                     codex_dispatch_home = getattr(

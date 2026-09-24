@@ -94,6 +94,10 @@ you want to keep, not by what killed the worker.
   still valid. If the pool recycled that path, it validates the parent's own
   `worktree/<dispatch-id>` branch (or legacy `seat/<dispatch-id>`) against the
   recorded head or keep ref, then acquires a free pooled seat on that branch.
+  A branch tip descended from the recorded head is accepted as worker progress
+  on that dispatch's own branch; an unrelated or foreign-dispatch tip is still
+  refused. If the recorded checkout was deleted, the same normal replacement
+  allocation path is used after the branch and recovery checks.
   It never resets a seat held by another dispatch. Quota-exhausted, dead-pid,
   stale_dead, and plan-approval pauses (USER-NEED / !READY) are continuable.
   `--account <account>` pins a surviving account; default selection skips
@@ -134,10 +138,18 @@ you want to keep, not by what killed the worker.
   removes them. A fresh writable Grok dispatch simply omits `--read-only`.
 - An explicit Codex account is resolved through the same account resolver used
   by a fresh dispatch before the resume child ledger or worktree claim is
-  created. If that resolver cannot produce the requested account home, resume
-  refuses without changing the seat lock or ledger.
+  created, but the resolver is always keyed to the new resume dispatch. Capacity
+  admission uses the effective account returned by that resolver. An account
+  refusal rolls back the auto child reservation before controller ownership is
+  stamped. The
+  parent's rollout is copied into that child-owned home while the recorded
+  source-home lock is held, so the parent home remains resumable. If that
+  resolver cannot produce the requested account home, resume refuses without
+  changing the seat lock or ledger.
 - Ownership is recorded at dispatch time; a resumed dispatch keeps its
   original owner, so wakes still route to the controller that started it.
+  Legacy records without a controller-label field still enforce the last
+  controller label encoded in their replay argv.
 - Never resume a source that is still live or whose liveness is
   indeterminate. A row labeled `worker_dead` whose pid is still live is
   this case, not a successful resume.
@@ -159,9 +171,10 @@ you want to keep, not by what killed the worker.
   to carry a session when it has actually started a reconstructed one.
 - If a recycled worktree's branch is missing or its tip diverges from the
   recorded head, resume names the branch and refuses. When reclaiming dirty
-  state produced a `refs/goalflight/keep/*` or quarantine ref, the ref is
-  printed so the operator can recover it. If no pooled seat is free, the
-  existing exhaustion message remains authoritative.
+  state produced a `refs/goalflight/keep/*` or quarantine ref, resume refuses
+  to continue silently and names the recovery ref so the operator can recover
+  it. If no pooled seat is free, the existing exhaustion message remains
+  authoritative.
 
 ## Capture
 

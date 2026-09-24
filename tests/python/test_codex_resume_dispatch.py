@@ -853,6 +853,7 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
     parent_id = "host-login-parent"
     child_id = "host-login-child"
     home = _dispatch_home(tmp_path, parent_id)
+    target = _dispatch_home(tmp_path, child_id)
     _write_rollout(home)
     record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
     record["effective_account"] = "source-account"
@@ -864,7 +865,8 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
 
     def resolve_seat(_project_root: str, account: str | None, dispatch_id: str):
         calls.append((account, dispatch_id))
-        return str(home), "host-login"
+        assert dispatch_id == child_id
+        return str(target), "host-login"
 
     monkeypatch.setattr(
         D,
@@ -872,22 +874,6 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
         lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
     )
     spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
-
-    def rebuild(
-        _project_root: Path,
-        _parent_id: str,
-        expected_home: Path,
-        _session_id: str,
-        **kwargs,
-    ) -> tuple[str, str]:
-        assert kwargs["pre_resolved"] == {
-            "home": str(home),
-            "account": "host-login",
-            "source_is_canonical": False,
-        }
-        return str(expected_home), "host-login"
-
-    monkeypatch.setattr(D, "_rebuild_codex_resume_home", rebuild)
 
     rc = D.main(
         _canonical_resume_argv(
@@ -902,11 +888,180 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
     )
 
     assert rc == 0
-    assert calls == [("host-login", parent_id)]
+    assert calls == [("host-login", child_id)]
     worker = next(call for call in spawn_calls if call["label"] == "worker")
-    assert worker["env"]["CODEX_HOME"] == str(home)
+    assert worker["env"]["CODEX_HOME"] == str(target)
+    assert S.rollout_path(home, SESSION_ID) is not None
+    assert S.rollout_path(target, SESSION_ID) is not None
     child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
     assert child["effective_account"] == "host-login"
+    assert child["codex_home"] == str(target)
+    assert child["codex_home_owner_dispatch_id"] == child_id
+
+
+def test_resume_capacity_uses_resolver_effective_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "capacity-effective-parent"
+    child_id = "capacity-effective-child"
+    source = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
+    record["effective_account"] = "source-account"
+    L.write_record(record)
+    target = _dispatch_home(tmp_path, child_id)
+
+    def resolve_seat(_project_root: str, account: str | None, dispatch_id: str):
+        assert account == "alias"
+        assert dispatch_id == child_id
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target), "effective-seat"
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+    args = SimpleNamespace(
+        parent_dispatch_id=parent_id,
+        dispatch_id=child_id,
+        agent="codex",
+        account="alias",
+        model=None,
+        cwd=str(tmp_path),
+        codex_resume_home=str(source),
+        shape="bash",
+        priority="normal",
+        max_idle_secs=300,
+        capacity_wait_s=0,
+        foreground=False,
+        from_queue=False,
+    )
+    D._preflight_resume_codex_account(args)
+    seen: dict[str, str | None] = {}
+
+    def acquire(capacity_args, **_kwargs):
+        seen["account"] = capacity_args.account
+        return {"decision": "allow", "lease": {"lease_id": "effective-lease"}}
+
+    monkeypatch.setattr(D, "_capacity_wait_seconds", lambda _args: 0.0)
+    monkeypatch.setattr(D, "write_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(D.goalflight_capacity, "acquire_with_wait", acquire)
+
+    assert (
+        D._acquire_capacity(
+            args,
+            project_root=tmp_path,
+            status_json=tmp_path / "capacity.status.json",
+        )
+        == "effective-lease"
+    )
+    assert seen["account"] == "effective-seat"
+
+
+def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "rollback-account-parent"
+    child_id = "rollback-account-child"
+    source = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
+    record["effective_account"] = "source-account"
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--cwd",
+        str(tmp_path),
+    ]
+    L.write_record(record)
+    prompt = tmp_path / "rollback-account.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+
+    def resolve_seat(_project_root: str, _account: str | None, _dispatch_id: str):
+        return None, None
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(
+        D,
+        "_stamp_controller_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "account refusal must precede controller stamping"
+        ),
+    )
+
+    rc = D._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "missing-seat",
+        ]
+    )
+
+    assert rc == 64
+    assert "missing-seat" in capsys.readouterr().err
+    reservations = D._dispatch_base_dir() / ".dispatch-ids"
+    assert not (reservations / f"{child_id}.json").exists()
+    assert not L.record_path(child_id).exists()
+    assert not _dispatch_home(tmp_path, child_id).exists()
+
+
+def test_resume_legacy_controller_label_is_enforced_from_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "legacy-label-parent"
+    source = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--cwd",
+        str(tmp_path),
+        "--controller-label",
+        "old-label",
+        "--controller-label=newer-label",
+    ]
+    L.write_record(record)
+    prompt = tmp_path / "legacy-label.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy controller-label mismatch must refuse before reservation"
+        ),
+    )
+
+    rc = D._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--controller-label",
+            "new-label",
+        ]
+    )
+
+    assert rc == 64
+    assert capsys.readouterr().err == (
+        "goalflight_dispatch: resume refused: --controller-label 'new-label' "
+        "does not match the recorded controller label 'newer-label'\n"
+    )
 
 
 def test_resume_account_resolution_refuses_before_ledger_or_seat_mutation(
@@ -1231,6 +1386,54 @@ def test_resume_reconnects_through_current_controller_after_restart(
         assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
     finally:
         holder.close()
+
+
+def test_resume_legacy_duplicate_model_flags_keep_last_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "legacy-duplicate-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.pop("model", None)
+    record.pop("reasoning_effort", None)
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--model",
+        "old-model",
+        "--model=new-model",
+        "--reasoning-effort",
+        "low",
+        "--reasoning-effort=max",
+        "--cwd",
+        str(tmp_path),
+    ]
+    L.write_record(record)
+    prompt = tmp_path / "legacy-duplicate.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "legacy-duplicate-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
+
+    launch = captured[0]
+    assert launch.count("--model") == 1
+    assert launch[launch.index("--model") + 1] == "new-model"
+    assert launch.count("--reasoning-effort") == 1
+    assert launch[launch.index("--reasoning-effort") + 1] == "max"
 
 
 def test_resume_explicit_controller_beacon_replaces_recorded_identity(
