@@ -2043,12 +2043,40 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
                 with contextlib.suppress(RuntimeError):
                     _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
 
-            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(project)
-            retry = _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
-            assert retry["recorded"] is False, retry
-            assert retry["delivery"]["worker_view_written"] is True, retry
             messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
-            canonical = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+            first = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+            assert len(first) == 1, first
+            first_id = first[0]["id"]
+            first_identity = first[0]["source"].get("project_identity")
+            assert isinstance(first_identity, list), first
+            subprocess.run(
+                ["git", "-C", str(project), "worktree", "remove", "--force", str(linked)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(project)
+
+            retry_source = dict(first[0]["source"])
+            retry_source["project_root"] = str(project)
+            retry_payload = dict(first[0]["payload"])
+            retry_sender = dict(retry_payload["sender"])
+            retry_sender["project_root"] = str(project)
+            retry_payload["sender"] = retry_sender
+            replay = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type=first[0]["type"],
+                payload=retry_payload,
+                messages_dir=messages_dir,
+                source=retry_source,
+                priority=first[0]["priority"],
+                event_id=first_id,
+                deliver_to_worker=True,
+                retain_terminal_worker_view=True,
+                project_journal_delivery=False,
+            )
+            assert replay["recorded"] is False, replay
 
             for _ in range(2):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -2061,7 +2089,30 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
                 steer.read_steer_entries(steer.steer_file(dispatch_id))
             )
             assert len(entries) == 1, entries
-            assert entries[0]["context"]["message_envelope"]["id"] == canonical[0]["id"]
+            assert entries[0]["context"]["message_envelope"]["id"] == first_id
+
+            second = _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
+            assert second["recorded"] is True, second
+            assert second["envelope"]["id"] != first_id, second
+            canonical = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
+            assert len(canonical) == 2, canonical
+            assert [item["id"] for item in canonical] == [first_id, second["envelope"]["id"]]
+            assert canonical[1]["source"]["project_identity"] == first_identity
+
+            for _ in range(2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert _carrier_messages.cmd_read(mock.Mock(
+                        dispatch_id=dispatch_id, messages_dir=messages_dir,
+                        fleet_dir=base / "fleet", last=None, json=True,
+                    )) == 0
+            entries = steer.worker_entries(
+                steer.read_steer_entries(steer.steer_file(dispatch_id))
+            )
+            assert len(entries) == 2, entries
+            assert {entry["context"]["message_envelope"]["id"] for entry in entries} == {
+                first_id,
+                second["envelope"]["id"],
+            }
 
 
 def test_live_controller_post_delivery_failure_is_nonzero_and_recorded() -> None:

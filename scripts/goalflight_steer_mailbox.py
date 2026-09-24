@@ -164,7 +164,7 @@ def _append_worker_wait_reply_receipt(
     path: Path,
     reply: dict,
     *,
-    lock_timeout_secs: float | None,
+    lock_timeout_secs: float,
 ) -> None:
     """Append and fsync one exact receipt, raising on any incomplete write."""
     payload = json.dumps(
@@ -201,7 +201,7 @@ def record_worker_wait_reply_receipt(
         _append_worker_wait_reply_receipt(
             path,
             reply,
-            lock_timeout_secs=None,
+            lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
         )
     except (OSError, RuntimeError, TimeoutError, ValueError):
         # Mirrors the independent end row: receipt persistence must never
@@ -515,7 +515,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
                         else "question_publication_failed"
                     )
                 },
-                lock_timeout_secs=None,
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
             )
             return 0
         if reply_seq is None:
@@ -531,7 +531,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
             _append_worker_wait_reply_receipt(
                 path,
                 reply,
-                lock_timeout_secs=None,
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
             )
         else:
             append_worker_wait_ended(
@@ -539,7 +539,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
                 arm,
                 decision="reply",
                 reply_seq=reply_seq,
-                lock_timeout_secs=None,
+                lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
             )
     except (OSError, RuntimeError, TimeoutError, ValueError):
         return 1
@@ -708,7 +708,7 @@ def _parse_steer_carrier(
 def read_steer_entries(
     path: Path,
     *,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
     quarantine_errors: bool = True,
 ) -> list[dict]:
     messages = _carrier_module()
@@ -738,7 +738,7 @@ def append_steer_entry(
     sender: dict | None = None,
     cross_project: bool = False,
     awake_mono_ns: int | None = None,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
     validate_existing: Callable[[list[dict]], dict | None] | None = None,
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
@@ -758,9 +758,7 @@ def append_steer_entry(
         existing = _parse_steer_carrier(
             carrier.path,
             carrier.read_bytes(),
-            # A deadline-bounded caller must not enter a second, unbounded
-            # quarantine-sidecar lock while it owns the mailbox carrier.
-            quarantine_errors=lock_timeout_secs is None,
+            quarantine_errors=True,
         )
         if validate_existing is not None:
             existing_entry = validate_existing(existing)
@@ -1135,7 +1133,7 @@ def append_worker_wait_reply(
     sender: dict | None = None,
     cross_project: bool = False,
     message_id: str | None = None,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
 ) -> dict:
     """Durably admit one typed, exactly-correlated reply to one active wait.
 
@@ -1234,7 +1232,7 @@ def append_worker_wait_started(
     question_kind: str,
     question_text: str,
     deadline_mono: float | None = None,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
     consumed_reply_receipts: set[tuple[str, int]] | None = None,
 ) -> dict:
     """Durably arm one bounded, lease-free worker wait in its steer mailbox."""
@@ -1472,7 +1470,7 @@ def append_worker_wait_ended(
     decision: str,
     reply_seq: int | None = None,
     context: dict | None = None,
-    lock_timeout_secs: float | None = None,
+    lock_timeout_secs: float = CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
 ) -> dict:
     lock_timeout_secs = CONTROLLER_STEER_LOCK_TIMEOUT_SECS if lock_timeout_secs is None else lock_timeout_secs
     wait_id = str(arm.get("question_id") or "").strip()
@@ -1737,7 +1735,6 @@ def wait_for_worker_entries(
         return result
 
     def deadline_result(arm: dict | None = None) -> dict:
-        settled = True
         if arm is not None:
             try:
                 append_worker_wait_ended(
@@ -1752,9 +1749,10 @@ def wait_for_worker_entries(
                             else None
                         ),
                     },
-                    # The deadline also bounds the final settlement lock. If
-                    # another writer is fsyncing, a detached cleanup helper
-                    # finishes the same durable end row after this return.
+                    # The deadline also bounds the final settlement lock. A
+                    # contended lock is a retryable outcome, not a deadline:
+                    # the mailbox lock must decide the reply-versus-timeout
+                    # race before this waiter reports a settled deadline.
                     lock_timeout_secs=remaining_secs(),
                 )
             except WorkerWaitReplyPending as pending_reply:
@@ -1767,15 +1765,24 @@ def wait_for_worker_entries(
                 if "already settled" not in str(exc):
                     raise
             except TimeoutError:
-                settled = False
                 schedule_worker_wait_timeout_cleanup(
                     path,
                     arm,
                 )
+                result = {
+                    "state": "retry",
+                    "entries": [],
+                    "timed_out": False,
+                    "settled": False,
+                    "reason": "worker wait settlement lock deadline reached",
+                }
+                result["wait_id"] = arm["question_id"]
+                report(result)
+                return result
         result = {"state": "deadline", "entries": [], "timed_out": True}
         if arm is not None:
             result["wait_id"] = arm["question_id"]
-            result["settled"] = settled
+            result["settled"] = True
         report(result)
         return result
 

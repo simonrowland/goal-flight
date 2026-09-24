@@ -516,7 +516,7 @@ def _next_ingestion_order(messages_dir: Path) -> int:
     """Allocate a controller-local causal order that survives restarts and clock rollback."""
     path = messages_dir / INGESTION_ORDER_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(path):
+    with mail_lock(path, timeout_secs=5.0):
         try:
             previous = max(0, int(path.read_text(encoding="utf-8").strip()))
         except (OSError, TypeError, ValueError, UnicodeDecodeError):
@@ -1537,7 +1537,11 @@ def _record_quarantine(row: dict) -> None:
     canonical_row = {**row, "path": str(carrier)}
     sidecar = quarantine_path(carrier)
     identity = (canonical_row["path"], canonical_row["offset"], canonical_row["hash"])
-    with carrier_transaction(sidecar, quarantine_sidecar=True) as transaction:
+    with carrier_transaction(
+        sidecar,
+        quarantine_sidecar=True,
+        lock_timeout_secs=5.0,
+    ) as transaction:
         existing = transaction.read_bytes()
         for raw in existing.splitlines():
             try:
@@ -2031,24 +2035,26 @@ def post_message(
                 fields = {key: item.get(key) for key in comparable_fields}
                 if steer_retry:
                     fields.pop("ts", None)
+                    source = fields.get("source")
+                    has_project_identity = (
+                        isinstance(source, dict) and "project_identity" in source
+                    )
                     for key in ("source", "payload"):
                         value = fields.get(key)
-                        if isinstance(value, dict):
-                            value = dict(value)
-                            value.pop("controller_pid", None)
-                            value.pop("controller_session_id", None)
-                            if "project_root" in value:
-                                value["project_root"] = _canonical_steer_project_identity(
-                                    value["project_root"]
-                                )
-                            if isinstance(value.get("sender"), dict):
-                                value["sender"] = dict(value["sender"])
-                                value["sender"].pop("controller_pid", None)
-                                if "project_root" in value["sender"]:
-                                    value["sender"]["project_root"] = _canonical_steer_project_identity(
-                                        value["sender"]["project_root"]
-                                    )
-                            fields[key] = value
+                        if not isinstance(value, dict):
+                            continue
+                        value = dict(value)
+                        value.pop("controller_pid", None)
+                        value.pop("controller_session_id", None)
+                        if has_project_identity:
+                            value.pop("project_root", None)
+                            sender = value.get("sender")
+                            if isinstance(sender, dict):
+                                sender = dict(sender)
+                                sender.pop("controller_pid", None)
+                                sender.pop("project_root", None)
+                                value["sender"] = sender
+                        fields[key] = value
                 return fields
 
             same_content = retry_fields(same_identity) == retry_fields(envelope)
@@ -2801,18 +2807,12 @@ def _steer_project_identity(root: Path) -> tuple[object, ...] | None:
     return ("path", path_stat.st_dev, path_stat.st_ino)
 
 
-def _canonical_steer_project_identity(value: object) -> tuple[object, ...]:
-    root = _canonical_steer_project_root(value)
-    identity = _steer_project_identity(root) if root is not None else None
-    return identity if identity is not None else ("unknown",)
-
-
 def _validate_steer_sender_project(
     dispatch_id: str,
     sender: dict[str, object],
     *,
     cross_project: bool,
-) -> None:
+) -> tuple[object, ...]:
     """Refuse a foreign-project steer before writing carrier or worker bytes."""
     record, lookup_error = _dispatch_record(dispatch_id)
     if lookup_error is not None:
@@ -2831,15 +2831,15 @@ def _validate_steer_sender_project(
     )
     if target_identity is None or sender_identity is None:
         if cross_project:
-            return
+            return sender_identity or ("unknown",)
         raise MessageError(
             "steer refused: project_root identity is unknown for the sender or "
             f"target dispatch {dispatch_id}; pass --cross-project to override"
         )
     if target_identity == sender_identity:
-        return
+        return sender_identity
     if cross_project:
-        return
+        return sender_identity
     raise MessageError(
         "steer refused: sender project_root "
         f"{sender_root} differs from target dispatch {dispatch_id} project_root "
@@ -2879,7 +2879,7 @@ def post_controller_steer(
 ) -> dict:
     """Record a legacy steer command, then materialize its worker-visible view."""
     sender = _steer_sender_identity()
-    _validate_steer_sender_project(
+    project_identity = _validate_steer_sender_project(
         dispatch_id,
         sender,
         cross_project=cross_project,
@@ -2890,6 +2890,7 @@ def post_controller_steer(
         "transport": "steer",
         **sender,
         "cross_project": bool(cross_project),
+        "project_identity": list(project_identity),
     }
     sender_session_id = _controller_sender_session_id(dispatch_id)
     if sender_session_id is not None:
@@ -2909,12 +2910,6 @@ def post_controller_steer(
         messages_dir=default_messages_dir(),
         source=source,
         author_capability=_presented_ambient_controller_capability(),
-        event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, repr((
-            dispatch_id, text, reply_to, decision,
-            sender.get("controller_label"),
-            _canonical_steer_project_identity(sender.get("project_root")),
-            cross_project,
-        )))),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
         # A steer is controller-to-worker mail. Its carrier record and worker

@@ -606,7 +606,9 @@ def case_worker_confirm_does_not_accept_decision_free_backlog() -> None:
         assert [entry.get("kind") for entry in entries] == [
             goalflight_steer_mailbox.STEERING_KIND,
             goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND,
+            goalflight_steer_mailbox.WORKER_WAIT_ENDED_KIND,
         ], entries
+        assert entries[-1].get("decision") == "timeout", entries
 
 
 def case_worker_wait_atomic_question_has_own_deadline() -> None:

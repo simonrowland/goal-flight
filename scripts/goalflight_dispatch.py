@@ -4298,6 +4298,11 @@ def _worker_liveness_warning(record: dict, *, in_process: bool = False) -> str |
     dispatch_id = record.get("dispatch_id") or "unknown"
     pid = record.get("worker_pid")
     if not pid:
+        if record.get("state") in {"queued", "waiting_capacity"}:
+            return (
+                f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+                "and queued in the worker-visible steer mailbox; no worker is running yet"
+            )
         return (
             f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
             "but worker delivery was not attempted"
