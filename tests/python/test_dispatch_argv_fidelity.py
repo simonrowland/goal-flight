@@ -285,13 +285,13 @@ def _capture_resume(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: child_id,
+        "_default_dispatch_id",
+        lambda _agent: child_id,
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
     return captured
 

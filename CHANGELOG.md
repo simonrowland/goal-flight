@@ -22,6 +22,11 @@ incremented when meaningful skill behaviour changes.
 - `resume` reattaches to the live controller for the dispatch's recorded label after a controller restart or reboot, instead of refusing on the original launch's controller process; a different label's controller is refused.
 - Grok resume prefers the recorded account and falls back to another healthy account by carrying the local session over, instead of refusing.
 
+### Added
+
+- `resume` accepts `--model` and `--reasoning-effort` overrides. The selected values replace the recorded launch values and are retained in the child ledger and status projections.
+- Doctor warns when a readable Codex seat-state snapshot has seats but its newest per-seat probe is more than 30 minutes old, including the daemon log path.
+
 ### Fixed
 
 - Account validation runs before any dispatch side effect on every launch path.
@@ -31,6 +36,8 @@ incremented when meaningful skill behaviour changes.
   while Seatbelt denies project writes; non-macOS retains the `--deny Bash`
   fallback, and read-only review dispatches continue to consume no pooled
   writer worktree.
+- Resume account selection uses the normal Codex resolver before creating the child ledger, so an explicit host login follows the same resolver path as a fresh dispatch and an unresolved account leaves no child claim. Explicit-account resumes build a child-owned Codex home and copy the parent's rollout while the source-home lock is held; capacity is charged to the resolver's effective account and the resolved preflight is reused by the launch handoff.
+- A resumed dispatch whose recorded pool seat was recycled now validates its resume-lineage `worktree/<dispatch-id>` (or legacy `seat/<dispatch-id>`) branch and reacquires a free seat at the recorded head or a descendant committed on that branch. Missing checkouts, foreign or divergent branches, and recovery refs recorded for that dispatch at reclaim time are refused without touching another dispatch's seat; hot and archived reclaimer rows are inspected, and the recovery ref plus one restore command are named so the operator can recover it. Deleted checkout registrations are pruned only after the path is proven absent.
 
 ## [1.7.1] - 2026-09-23
 

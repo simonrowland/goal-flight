@@ -350,6 +350,31 @@ def test_doctor_is_quiet_while_the_daemon_is_writing() -> None:
     assert "warning" not in got, got
 
 
+def test_doctor_warns_when_seat_states_exist_but_probes_are_stale() -> None:
+    state = Path(__import__("os").environ["GOALFLIGHT_CODEX_STATE_DIR"])
+    payload = {
+        "version": 1,
+        "updated_at": time.time(),
+        "seats": {
+            SEAT: {
+                "probed_at": time.time() - 31 * 60,
+                "healthy": True,
+                "worst_used": 19.0,
+            }
+        },
+    }
+    (state / "codex-seat-states.json").write_text(json.dumps(payload))
+
+    got = DOC.check_seat_state_freshness()
+
+    assert got["fresh"] is False
+    warning = got["warning"]
+    assert "probed_at" in warning
+    assert "daemon" in warning
+    assert "crashed" in warning and "publish" in warning
+    assert str(state / "codex-accountd.log") in warning
+
+
 def test_doctor_names_a_stopped_daemon_and_its_known_cause() -> None:
     """The 31.7h case. A warning nobody can act on is not much better."""
     _write_snapshot(age_s=31.7 * 3600)

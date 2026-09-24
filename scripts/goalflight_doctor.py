@@ -633,6 +633,33 @@ def check_seat_state_freshness() -> dict:
     without the wedge -- silently degraded to whatever the ledger alone can
     infer, for as long as nobody happens to look.
     """
+    state_root = Path(
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR") or (Path.home() / ".goal-flight")
+    ).expanduser()
+    daemon_log = state_root / "codex-accountd.log"
+    path = state_root / "codex-seat-states.json"
+
+    def stale_probe_warning(age_s: float) -> str:
+        return (
+            "codex seat states exist, but the newest probed_at is "
+            f"{age_s / 60:.1f}m old; the seat daemon may have version "
+            "drifted, crashed, or failed to publish. Check its log at "
+            f"{daemon_log}."
+        )
+
+    def probe_ages(payload: object) -> list[float]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("seats"), dict):
+            return []
+        return [
+            parsed
+            for entry in payload["seats"].values()
+            if isinstance(entry, dict)
+            for parsed in [
+                goalflight_dispatch._parse_timestamp_s(entry.get("probed_at"))
+            ]
+            if parsed is not None
+        ]
+
     try:
         payload = goalflight_dispatch._codex_seat_state_payload()
     except Exception as exc:  # a doctor check never takes the process down
@@ -640,20 +667,44 @@ def check_seat_state_freshness() -> dict:
 
     if payload is not None:
         seats = payload.get("seats") or {}
-        return {
+        detail = {
             "ok": True,
             "fresh": True,
             "seats": len(seats),
             "accounts": len(seats),
             "updated_at": payload.get("updated_at"),
         }
+        probed = probe_ages(payload)
+        if probed:
+            newest = max(probed)
+            age_s = time.time() - newest
+            if age_s > goalflight_dispatch.CODEX_SEAT_STATE_MAX_AGE_S:
+                detail["fresh"] = False
+                detail["newest_probed_at"] = newest
+                detail["probe_age_s"] = round(age_s, 1)
+                detail["warning"] = stale_probe_warning(age_s)
+        return detail
 
     # Stale or unreadable. Separate the two, because they need different
     # actions, and report the age when we can measure it.
-    state_root = Path(
-        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR") or (Path.home() / ".goal-flight")
-    ).expanduser()
-    path = state_root / "codex-seat-states.json"
+    try:
+        raw_payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        raw_payload = None
+    probed = probe_ages(raw_payload)
+    if probed:
+        newest = max(probed)
+        age_s = time.time() - newest
+        if age_s > goalflight_dispatch.CODEX_SEAT_STATE_MAX_AGE_S:
+            return {
+                "ok": True,
+                "fresh": False,
+                "path": str(path),
+                "max_age_s": goalflight_dispatch.CODEX_SEAT_STATE_MAX_AGE_S,
+                "newest_probed_at": newest,
+                "probe_age_s": round(age_s, 1),
+                "warning": stale_probe_warning(age_s),
+            }
     detail: dict = {
         "ok": True,
         "fresh": False,
@@ -662,8 +713,9 @@ def check_seat_state_freshness() -> dict:
     }
     if not path.exists():
         detail["warning"] = (
-            "no account-health snapshot: per-account headroom is unmanaged and "
-            "selection is running on ledger inference alone"
+            "no seat-health snapshot (account-health snapshot): per-account "
+            "headroom is unmanaged and selection is running on ledger inference "
+            "alone"
         )
         return detail
     # Age it by the SAME field the freshness decision uses. The file's mtime is
@@ -682,15 +734,17 @@ def check_seat_state_freshness() -> dict:
     if age_s is None:
         detail["warning"] = (
             "account-health snapshot cannot say when it was taken, so it cannot "
-            "say it is current; per-account headroom is unmanaged"
+            "say it is current; per-account headroom is unmanaged. Check the "
+            f"daemon log at {daemon_log}."
         )
         return detail
     detail["age_s"] = round(age_s, 1)
     detail["warning"] = (
         f"account-health snapshot is {age_s / 3600:.1f}h stale, so the writing "
-        "daemon has stopped; per-account headroom is unmanaged. Check its log "
-        "for a refusal (a worker-CLI version past the daemon's supported "
-        "pin is the known cause)."
+        "daemon has stopped; per-account headroom is unmanaged. Check the "
+        f"daemon log at {daemon_log}; possible causes include worker-CLI "
+        "version drift past the supported pin, a daemon crash, or publication "
+        "failure."
     )
     return detail
 
