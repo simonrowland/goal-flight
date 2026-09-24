@@ -1550,10 +1550,14 @@ def carrier_transaction(
     """Lock one canonical carrier, then re-resolve and validate its identity."""
     canonical = _canonical_jsonl_path(Path(path), allow_quarantine=quarantine_sidecar)
     canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Case variants are distinct names on case-sensitive filesystems but one
+    # carrier on case-insensitive filesystems. Serialize both through one
+    # folded lock so the under-lock collision check is authoritative.
+    lock_path = canonical.with_name(canonical.name.casefold())
     lock_context = (
-        mail_lock(canonical)
+        mail_lock(lock_path)
         if lock_timeout_secs is None
-        else mail_lock(canonical, timeout_secs=lock_timeout_secs)
+        else mail_lock(lock_path, timeout_secs=lock_timeout_secs)
     )
     with lock_context:
         locked_canonical = _canonical_jsonl_path(
@@ -8893,8 +8897,12 @@ def cmd_listen(args) -> int:
             if persisted_state is not None:
                 # The claim never raises its water. Covered streams may drop
                 # off so a replacement re-reports only the unconsumed remainder.
-                arm_high = dict(persisted_state.positions)
                 pending_report_settled = persisted_state.phase == "acknowledged"
+                arm_high = (
+                    dict(persisted_state.positions)
+                    if pending_report_settled
+                    else {}
+                )
                 if not pending_report_settled:
                     settled = _settle_pending_report_if_consumed(
                         authority,
@@ -8968,8 +8976,12 @@ def cmd_listen(args) -> int:
                     )
                     if winner_state is None:
                         raise MessageError("pending-report claim was not published")
-                    arm_high = dict(winner_state.positions)
                     pending_report_settled = winner_state.phase == "acknowledged"
+                    arm_high = (
+                        dict(winner_state.positions)
+                        if pending_report_settled
+                        else {}
+                    )
 
         armed = _retry_listener_journal_busy(
             arm_once,
@@ -9348,6 +9360,7 @@ def cmd_listen(args) -> int:
         visible_items: list[tuple[dict, dict]] | None = None,
     ) -> bool:
         """Flush one claimed boundary. True when handled; False means retry."""
+        nonlocal arm_high
         settled = _settle_pending_report_if_consumed(
             authority,
             project_root,
@@ -9434,6 +9447,7 @@ def cmd_listen(args) -> int:
         ):
             quarantine_claim_unit()
             return True
+        claimed_positions = dict(report_positions)
         settled_rows: list[dict] = []
         if visible_items is None:
             materialized_items = _retry_listener_journal_busy(
@@ -9463,6 +9477,10 @@ def cmd_listen(args) -> int:
             shown_items,
             settled_rows,
         )
+        # Never retain a durable claim's water for a row that this attempt did
+        # not show or successfully quarantine. A partial report remains
+        # pending, while safe siblings can still be delivered below.
+        report_complete = report_positions == claimed_positions
         report_snapshots = {
             stream_id: stream_snapshot
             for stream_id, stream_snapshot in claim.stream_snapshots.items()
@@ -9470,6 +9488,9 @@ def cmd_listen(args) -> int:
         }
         if report_snapshots.keys() != report_positions.keys():
             quarantine_claim_unit()
+            return True
+        arm_high = dict(report_positions)
+        if not report_positions:
             return True
         arm_advance = _cursor_advance_command(
             project_root=project_root,
@@ -9505,6 +9526,8 @@ def cmd_listen(args) -> int:
             for row, envelope in visible_arm_items:
                 print(format_receipt_headline(row, envelope), flush=True)
             print(f"advance: {arm_advance}", flush=True)
+        if not report_complete:
+            return True
         if claim.claim_token is None or not goalflight_wake.mark_pending_report_reported(
             project_root,
             controller_label=label,

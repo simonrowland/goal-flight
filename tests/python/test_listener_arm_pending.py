@@ -80,6 +80,36 @@ raise SystemExit(goalflight_messages.main(sys.argv[1:]))
 """
 
 
+_UNREPORTABLE_CARRIER = r"""
+import os
+import sys
+
+sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
+import goalflight_messages
+
+real_read = goalflight_messages.read_envelopes_result
+read_state = {"failed": False}
+
+def unreadable_once(path, *args, **kwargs):
+    if not read_state["failed"]:
+        read_state["failed"] = True
+        return goalflight_messages.CarrierReadResult(
+            goalflight_messages.CarrierReadStatus.CARRIER_UNREADABLE,
+            (),
+            ({"error": f"{path}: injected unreadable", "reason": "injected unreadable"},),
+        )
+    return real_read(path, *args, **kwargs)
+
+goalflight_messages.read_envelopes_result = unreadable_once
+
+def fail_withdraw(*args, **kwargs):
+    return "injected carrier withdrawal failure"
+
+goalflight_messages._withdraw_carrier_delivery = fail_withdraw
+raise SystemExit(goalflight_messages.main(sys.argv[1:]))
+"""
+
+
 _UNREADABLE_CURSOR_STATUS = r"""
 import os
 import sys
@@ -1323,6 +1353,117 @@ def test_replacement_takes_over_claim_when_first_arm_dies_before_report(
     )
     assert reported is not None
     assert reported.phase == "reported"
+
+
+def test_rearm_does_not_raise_unreportable_carrier_water(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-unreportable-carrier-test"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
+    }
+    dispatch_id = "unreportable-carrier"
+    carrier = messages.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id)
+
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "backlog before carrier failure", dispatch_id=dispatch_id)
+        failed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _FAIL_ARM_AFTER_PENDING_CLAIM,
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert failed.returncode == 2, failed.stderr
+        assert carrier.exists()
+        os.chmod(carrier, 0o000)
+        replacement = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _UNREPORTABLE_CARRIER,
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "5",
+            ],
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            wait_until(
+                lambda: (
+                    coverage
+                    if (coverage := authority.active_coverage("armtest"))
+                    and int(coverage["pid"]) == replacement.pid
+                    else None
+                ),
+                timeout_s=5,
+                message="replacement listener never armed",
+            )
+            pending = wait_until(
+                lambda: (
+                    state
+                    if (state := wake.pending_report_state(
+                        project,
+                        controller_label="armtest",
+                        lease_nonce=lease.nonce,
+                    ))
+                    and state.phase == "claimed"
+                    else None
+                ),
+                timeout_s=5,
+                message="unreportable claim was marked reported",
+            )
+            assert pending.positions == {dispatch_id: 1}
+            healthy_dispatch_id = "healthy-after-carrier-failure"
+            _post(env, project, "healthy after carrier failure", dispatch_id=healthy_dispatch_id)
+            stdout, stderr = replacement.communicate(timeout=10)
+        finally:
+            os.chmod(carrier, 0o600)
+            if replacement.poll() is None:
+                replacement.kill()
+                replacement.wait(timeout=5)
+
+    payloads = [
+        json.loads(line) for line in stdout.splitlines() if line.strip()
+    ]
+    assert replacement.returncode == 0, (stderr, payloads)
+    assert payloads[-1]["kind"] == "ring", payloads
+    assert f"{healthy_dispatch_id}=1" in payloads[-1]["advance_command"]
+    assert f"{dispatch_id}=" not in payloads[-1]["advance_command"]
+    assert "WARNING: carrier corruption" in stderr
+    assert str(carrier) in stderr
 
 
 def test_dead_claim_takeover_reports_once_without_spending_listener_pool(

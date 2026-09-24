@@ -1134,6 +1134,61 @@ def test_post_refuses_case_variant_dispatch_id_before_writing() -> None:
         assert_true("case collision writes nothing", after == before)
 
 
+def test_concurrent_case_variant_posts_have_one_winner() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        original_admit_stream_seq = _carrier_messages._admit_stream_seq
+        admit_barrier = threading.Barrier(2)
+        successes: list[dict] = []
+        failures: list[BaseException] = []
+
+        def synchronized_admit(*, provided_seq: int | None, envelopes: list[dict]) -> int:
+            try:
+                admit_barrier.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+            return original_admit_stream_seq(
+                provided_seq=provided_seq,
+                envelopes=envelopes,
+            )
+
+        def post(dispatch_id: str) -> None:
+            try:
+                successes.append(
+                    _carrier_messages.post_message(
+                        dispatch_id=dispatch_id,
+                        msg_type="status",
+                        payload={"text": dispatch_id},
+                        messages_dir=messages_dir,
+                        project_journal_delivery=False,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                failures.append(exc)
+
+        _carrier_messages._admit_stream_seq = synchronized_admit  # type: ignore[assignment]
+        first = threading.Thread(target=post, args=("CaseId",))
+        second = threading.Thread(target=post, args=("caseid",))
+        try:
+            first.start()
+            second.start()
+            first.join(timeout=3)
+            second.join(timeout=3)
+        finally:
+            _carrier_messages._admit_stream_seq = original_admit_stream_seq  # type: ignore[assignment]
+            assert_true("case-variant post threads finish", not first.is_alive() and not second.is_alive())
+
+        assert_true("exactly one case-variant post succeeds", len(successes) == 1)
+        assert_true("exactly one case-variant post is refused", len(failures) == 1)
+        assert_true("collision failure names both ids", "case" in str(failures[0]).lower())
+        carriers = sorted(
+            entry.name
+            for entry in messages_dir.iterdir()
+            if entry.name.endswith(".jsonl") and not entry.name.endswith(".quarantine.jsonl")
+        )
+        assert_true("case-variant race leaves one carrier", len(carriers) == 1)
+
+
 def test_post_normalizes_controller_project_root_alias() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
