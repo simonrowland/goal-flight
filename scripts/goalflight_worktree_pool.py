@@ -1467,6 +1467,92 @@ def _tree_paths(cwd: Path, treeish: str) -> set[str]:
     )
 
 
+def _tree_blob_ids(cwd: Path, treeish: str) -> dict[str, str]:
+    blobs: dict[str, str] = {}
+    for entry in _git_nul(cwd, "ls-tree", "-r", "-z", treeish).split("\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[1] != "blob":
+            raise WorktreeSeatResetRefused(
+                f"malformed tree entry for {treeish}; refusing reset"
+            )
+        blobs[path] = fields[2]
+    return blobs
+
+
+def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
+    tree_blobs = _tree_blob_ids(worktree_path, "HEAD")
+    blob_ids: list[str] = []
+    for path in paths:
+        blob_id = tree_blobs.get(path)
+        if blob_id is None:
+            raise WorktreeSeatResetRefused(
+                f"LFS path {path!r} is not present in HEAD; refusing reset"
+            )
+        blob_ids.append(blob_id)
+    requested = tuple(dict.fromkeys(blob_ids))
+    batch = _git_proc(
+        worktree_path,
+        "cat-file",
+        "--batch",
+        input_text="\n".join(requested) + "\n",
+    )
+    if batch is None or batch.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            "cannot read LFS pointer blobs; refusing reset"
+        )
+    contents: dict[str, str] = {}
+    offset = 0
+    for blob_id in requested:
+        header_end = batch.stdout.find("\n", offset)
+        if header_end < 0:
+            raise WorktreeSeatResetRefused(
+                "malformed LFS pointer batch; refusing reset"
+            )
+        header = batch.stdout[offset:header_end].split()
+        if len(header) != 3 or header[0] != blob_id or header[1] != "blob":
+            raise WorktreeSeatResetRefused(
+                "missing or invalid LFS pointer blob; refusing reset"
+            )
+        try:
+            size = int(header[2])
+        except ValueError as exc:
+            raise WorktreeSeatResetRefused(
+                "invalid LFS pointer blob size; refusing reset"
+            ) from exc
+        content_start = header_end + 1
+        content_end = content_start + size
+        content = batch.stdout[content_start:content_end]
+        if len(content) != size or batch.stdout[content_end : content_end + 1] != "\n":
+            raise WorktreeSeatResetRefused(
+                "truncated LFS pointer blob; refusing reset"
+            )
+        contents[blob_id] = content
+        offset = content_end + 1
+
+    common_lfs = _git_common_dir(worktree_path) / "lfs" / "objects"
+    for path, blob_id in zip(paths, blob_ids):
+        pointer = contents.get(blob_id, "")
+        match = re.search(r"(?m)^oid sha256:([0-9a-f]{64})$", pointer)
+        if match is None:
+            raise WorktreeSeatResetRefused(
+                f"LFS pointer for {path!r} is unparseable; refusing reset"
+            )
+        digest = match.group(1)
+        object_path = common_lfs / digest[:2] / digest[2:4] / digest
+        try:
+            if not object_path.is_file():
+                raise OSError("object is missing")
+            with object_path.open("rb") as object_file:
+                object_file.read(1)
+        except OSError as exc:
+            raise WorktreeSeatResetRefused(
+                f"LFS object for {path!r} is missing or unreadable; refusing reset"
+            ) from exc
+
+
 def _refuse_ignored_tree_collisions(
     worktree_path: Path, *, head: str, target: str
 ) -> None:
@@ -1509,12 +1595,6 @@ def _prepare_seat_checkout(
     needs_checkout = (
         current_branch != branch or current_head != base_commit or tracked_status
     )
-    if needs_checkout:
-        # The collision check makes a forced checkout safe for ignored bytes;
-        # no preceding reset is needed once the dirty state is quarantined.
-        _refuse_ignored_tree_collisions(
-            worktree_path, head=current_head, target=base_commit
-        )
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
     # when a temp repo has not gitignored ``.goal-flight/``. Clean before the
     # forced checkout so quarantined untracked files cannot block it.
@@ -1563,12 +1643,11 @@ def _update_ref_and_verify(
         )
 
 
-def _quarantine_dirty_worktree(
+def _precheck_quarantine_worktree(
     worktree_path: Path,
     *,
     seat_name: str,
-    abandoned_dispatch_id: str,
-) -> str | None:
+) -> tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]]:
     hidden_entries = _nul_paths(_git_nul(worktree_path, "ls-files", "-v", "-z"))
     for entry in hidden_entries:
         if len(entry) < 3 or entry[1] != " ":
@@ -1656,6 +1735,7 @@ def _quarantine_dirty_worktree(
                 f"malformed Git attributes in dirty worktree {seat_name}; refusing reset"
             )
         dirty_set = set(dirty_paths)
+        lfs_paths: list[str] = []
         for index in range(0, len(fields), 3):
             path, attribute, value = fields[index : index + 3]
             active_filter = attribute == "filter" and value not in {
@@ -1668,6 +1748,8 @@ def _quarantine_dirty_worktree(
                     f"dirty worktree {seat_name} path {path!r} uses active "
                     f"filter {value!r}; refusing reset"
                 )
+            if active_filter and value == "lfs":
+                lfs_paths.append(path)
             if path not in dirty_set:
                 continue
             reencodes = False
@@ -1697,6 +1779,24 @@ def _quarantine_dirty_worktree(
                 f"dirty worktree {seat_name} path {path!r} uses active "
                 f"{attribute} {value!r}; refusing reset"
             )
+        if lfs_paths:
+            _prove_lfs_objects(worktree_path, lfs_paths)
+    return reserved_untracked, product, dirty_paths
+
+
+def _quarantine_dirty_worktree(
+    worktree_path: Path,
+    *,
+    seat_name: str,
+    abandoned_dispatch_id: str,
+    precheck: tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]] | None = None,
+) -> str | None:
+    if precheck is None:
+        precheck = _precheck_quarantine_worktree(
+            worktree_path,
+            seat_name=seat_name,
+        )
+    reserved_untracked, product, dirty_paths = precheck
     if not product:
         return None
 
@@ -1858,6 +1958,25 @@ def _prepare_claimed_seat_locked(
             branch=actual,
             controller_label=controller_label,
         )
+    precheck = None
+    head = None
+    if existing and reset:
+        try:
+            head = _git(worktree_path, "rev-parse", "HEAD")
+            _refuse_ignored_tree_collisions(
+                worktree_path, head=head, target=base_commit
+            )
+            precheck = _precheck_quarantine_worktree(
+                worktree_path,
+                seat_name=seat_name,
+            )
+        except WorktreeSeatResetRefused:
+            raise
+        except (WorktreeSeatError, OSError) as exc:
+            raise WorktreeSeatResetRefused(
+                f"cannot inspect dirty worktree {seat_name}: {exc}; refusing reset"
+            ) from exc
+
     keep_ref = None
     if safety is not None and safety["conditions"]["commits_preserved"]["verdict"] == NO:
         pinned = pin_unique_commits(
@@ -1873,7 +1992,7 @@ def _prepare_claimed_seat_locked(
         keep_ref = str(pinned.get("keep_ref") or "") or None
     if existing and reset:
         keep_ref = f"refs/{KEEP_REF_PREFIX}/{prior_dispatch_id}/head"
-        head = _git(worktree_path, "rev-parse", "HEAD")
+        assert head is not None
         previous = _git_proc(worktree_path, "rev-parse", "--verify", "--quiet", keep_ref)
         if previous is None or previous.returncode not in (0, 1):
             raise WorktreeSeatResetRefused(f"cannot inspect saved head {keep_ref}")
@@ -1894,6 +2013,7 @@ def _prepare_claimed_seat_locked(
             worktree_path,
             seat_name=seat_name,
             abandoned_dispatch_id=prior_dispatch_id,
+            precheck=precheck,
         )
     except WorktreeSeatResetRefused:
         raise

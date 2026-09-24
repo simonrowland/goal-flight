@@ -3,6 +3,7 @@
 import json
 import asyncio
 import fcntl
+import hashlib
 import os
 import subprocess
 import sys
@@ -151,7 +152,7 @@ def test_ignored_collision_retains_seat(holder):
     collision.mkdir()
     (collision / "out.bin").write_text("must survive\n")
 
-    with pytest.raises(pool.WorktreeSeatResetRefused, match="cannot reset worktree"):
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
         pool.acquire_worktree_seat(repo, "next")
     assert (collision / "out.bin").read_text() == "must survive\n"
     assert _git(path, "branch", "--show-current") == "worktree/old"
@@ -175,6 +176,13 @@ def test_ignored_head_collision_retains_seat(holder):
         pool.acquire_worktree_seat(repo, "next")
     assert artifact.read_text() == "must survive reset\n"
     assert _git(path, "branch", "--show-current") == "worktree/old"
+    assert _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/goalflight/keep/old",
+        "refs/heads/goalflight/quarantine",
+    ) == ""
 
 
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
@@ -279,28 +287,32 @@ def test_quarantine_refuses_clean_filter_bytes(holder):
     repo, path, row = holder
     payload = path / "note.dat"
     payload.write_text("secret-bytes\n")
-    _git(path, "add", "note.dat")
-    _git(path, "commit", "-m", "track raw note")
     (path / ".gitattributes").write_text("*.dat filter=pointer\n")
     _git(path, "config", "filter.pointer.clean", "printf POINTER")
     _git(path, "config", "filter.pointer.smudge", "cat")
     _git(path, "config", "filter.pointer.required", "true")
-    _git(path, "add", ".gitattributes")
-    _git(path, "commit", "-m", "activate pointer filter")
+    _git(path, "add", ".gitattributes", "note.dat")
+    _git(path, "commit", "-m", "track filtered note")
+    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
     with pytest.raises(pool.WorktreeSeatResetRefused, match="active filter"):
         pool.acquire_worktree_seat(repo, "next")
     assert payload.read_text() == "secret-bytes\n"
     assert _git(path, "branch", "--show-current") == "worktree/old"
 
 
-def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path):
+@pytest.mark.parametrize("object_present", [True, False])
+def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present):
     repo, path, row = holder
     payload = path / "valuable.dat"
+    payload_bytes = b"smudged bytes\n"
+    payload_oid = hashlib.sha256(payload_bytes).hexdigest()
     clean_filter = tmp_path / "lfs-clean.py"
     clean_filter.write_text(
-        "import sys\n"
-        "sys.stdin.buffer.read()\n"
-        "sys.stdout.buffer.write(b'pointer\\n')\n",
+        "import hashlib, sys\n"
+        "data = sys.stdin.buffer.read()\n"
+        "oid = hashlib.sha256(data).hexdigest()\n"
+        "sys.stdout.write(f'version https://git-lfs.github.com/spec/v1\\n"
+        "oid sha256:{oid}\\nsize {len(data)}\\n')\n",
         encoding="utf-8",
     )
     smudge_filter = tmp_path / "lfs-smudge.py"
@@ -314,20 +326,31 @@ def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path):
     _git(path, "config", "filter.lfs.clean", f"{sys.executable} {clean_filter}")
     _git(path, "config", "filter.lfs.smudge", f"{sys.executable} {smudge_filter}")
     _git(path, "config", "filter.lfs.required", "true")
-    payload.write_text("smudged bytes\n")
+    payload.write_bytes(payload_bytes)
     _git(path, "add", ".gitattributes", "valuable.dat")
     _git(path, "commit", "-m", "track filtered file")
     assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
     common = Path(_git(path, "rev-parse", "--git-common-dir"))
     if not common.is_absolute():
         common = (path / common).resolve()
-    lfs_object = common / "lfs" / "objects" / "aa" / "bb" / "object"
-    lfs_object.parent.mkdir(parents=True)
-    lfs_object.write_bytes(b"lfs object\n")
-
-    with pool.acquire_worktree_seat(repo, "next") as lease:
-        assert lease.path == path
-        assert lfs_object.read_bytes() == b"lfs object\n"
+    lfs_object = common / "lfs" / "objects" / payload_oid[:2] / payload_oid[2:4] / payload_oid
+    if object_present:
+        lfs_object.parent.mkdir(parents=True)
+        lfs_object.write_bytes(payload_bytes)
+        with pool.acquire_worktree_seat(repo, "next") as lease:
+            assert lease.path == path
+            assert lfs_object.read_bytes() == payload_bytes
+    else:
+        with pytest.raises(pool.WorktreeSeatResetRefused, match="LFS object"):
+            pool.acquire_worktree_seat(repo, "next")
+        assert _git(path, "branch", "--show-current") == "worktree/old"
+        assert _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/old",
+            "refs/heads/goalflight/quarantine",
+        ) == ""
 
 
 def test_quarantine_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatch):

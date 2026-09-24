@@ -57,7 +57,10 @@ Rules:
   the dirty ref; dirty paths with active filters retain the worktree. Ignored
   untracked notes there are intentionally left in the reused seat and are not
   in the keep ref because the reserved namespace is preserved by `git clean
-  -fd -e .goal-flight` (a documented cross-dispatch leak).
+  -fd -e .goal-flight` (a documented cross-dispatch leak). A clean
+  `filter=lfs` path is the sole filter exception: acquisition parses its HEAD
+  pointer and proves the matching object is readable in the shared
+  `.git/lfs/objects` store before reuse; other filters retain the seat.
 - Allocation lock ownership covers only the short candidate-claim critical
   section. The per-seat lock then excludes writers while quarantine and reset
   run, so slow quarantine does not serialize reclaimers; there is no FIFO
