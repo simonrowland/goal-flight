@@ -2093,6 +2093,7 @@ def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id
         branch=branch,
         controller_label=label,
         reset=True,
+        before_reset=_worktree_occupancy_before_reset(args),
         managed_root=(
             Path(str(args.worktree_root)).expanduser()
             if getattr(args, "worktree_root", None)
@@ -2101,6 +2102,18 @@ def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id
     )
     args._resume_relocated_worktree = True
     return lease
+
+
+def _worktree_occupancy_before_reset(args):
+    """Check a selected existing seat before the pool mutates it."""
+    def check(path: Path) -> None:
+        args.cwd = str(path)
+        args._worktree_occupancy_warning = _prepare_attempt_worktree_occupancy(
+            args
+        )
+        args._worktree_occupancy_checked = True
+
+    return check
 
 
 def _validate_resume_worktree_source(
@@ -2271,9 +2284,8 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     spawn, then ``release()`` this process's copy so the worker's lifetime is
     the lease lifetime.
 
-    Occupancy must bind AFTER this so the kernel lock is on the worktree path,
-    not the project root. Caching the lease lets the launch path call this
-    once before occupancy and again when wiring env/summary.
+    Existing seats run the occupancy check while this helper's pool lock
+    protects them from reset; new seats are checked after creation.
     """
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
@@ -2368,13 +2380,9 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                         if getattr(args, "worktree_root", None)
                         else None
                     ),
+                    before_reset=_worktree_occupancy_before_reset(args),
                 )
             except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
-                # A resume may land on a seat that the pool recycled. Never
-                # touch that occupied path; validate the parent's own branch
-                # and acquire a different free seat through the normal pool.
-                # A live original holder remains the exact-seat path's owner
-                # and keeps the historical refusal unchanged.
                 if not skip_reset or not parent_dispatch_id:
                     raise
                 message = str(exc)
@@ -2392,10 +2400,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     parent_dispatch_id=str(parent_dispatch_id),
                 )
             except goalflight_worktree_pool.WorktreeCwdRefused:
-                # A deleted recorded seat still has managed-pool identity from
-                # its path. The exact-seat acquire cannot attach a missing
-                # checkout, so use the same safe replacement path as a
-                # recycled holder. Other cwd refusals remain refusals.
                 if not (
                     skip_reset
                     and parent_dispatch_id
@@ -2447,6 +2451,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             if getattr(args, "worktree_root", None)
             else None
         ),
+        before_reset=_worktree_occupancy_before_reset(args),
     )
     _record_dispatch_worktree(args, lease)
     _emit_resume_worktree_recovery_refs(args, lease)
@@ -2454,15 +2459,13 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
 
 
 def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
-    """Bind the worktree only after the caller has admitted capacity.
-
-    Every local launch shape uses this single post-admission hook. Account
-    resolution and capacity acquisition happen before it; a refusal or wait
-    therefore cannot create, reset, or hold a worktree seat.
-    """
+    """Bind a seat after account/capacity admission and before launch writes."""
     lease = _bind_dispatch_worktree(args)
-    warning = _prepare_attempt_worktree_occupancy(args)
-    args._worktree_occupancy_warning = warning
+    warning = getattr(args, "_worktree_occupancy_warning", None)
+    if not getattr(args, "_worktree_occupancy_checked", False):
+        warning = _prepare_attempt_worktree_occupancy(args)
+        args._worktree_occupancy_warning = warning
+        args._worktree_occupancy_checked = True
     if warning is not None:
         args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
     return lease
@@ -3945,9 +3948,14 @@ def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: boo
         _refuse_reused_nonterminal_dispatch_id(dispatch_id)
 
 
-def _refuse_existing_dispatch_id_for_resume(dispatch_id: str) -> None:
+def _refuse_existing_dispatch_id_for_resume(
+    dispatch_id: str, *, project_root: str | Path | None = None
+) -> None:
     record = _find_dispatch_record(dispatch_id)
     if record is None:
+        _refuse_existing_journal_attempt_for_resume(
+            dispatch_id, project_root=project_root
+        )
         return
     if goalflight_ledger.record_is_unreadable(record):
         raise DispatchUsageError(
@@ -3966,6 +3974,31 @@ def _refuse_existing_dispatch_id_for_resume(dispatch_id: str) -> None:
         f"resume refused: dispatch id {dispatch_id!r} already has {description}; "
         "a resume child must use a new id"
     )
+
+
+def _refuse_existing_journal_attempt_for_resume(
+    dispatch_id: str, *, project_root: str | Path | None
+) -> None:
+    """Reject a child id fenced by the journal without a ledger row."""
+    if project_root is None:
+        return
+    try:
+        attempt = goalflight_journal.Journal.open_reader(
+            project_root,
+            retry_budget_s=goalflight_journal.JOURNAL_LAUNCH_READER_RETRY_BUDGET_S,
+        ).attempt_for_dispatch(dispatch_id)
+    except goalflight_journal.JournalDisappeared:
+        return
+    except goalflight_journal.JournalError as exc:
+        raise DispatchUsageError(
+            f"resume refused: could not inspect the journal for child dispatch {dispatch_id!r} "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    if attempt is not None:
+        raise DispatchUsageError(
+            f"resume refused: dispatch id {dispatch_id!r} already has a journal attempt "
+            f"({attempt.lifecycle_state}); a resume child must use a new id"
+        )
 
 
 def _record_declared_read_only(record: dict) -> bool:
@@ -4244,36 +4277,11 @@ def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
 
 
 def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None]:
-    """(occupied_reason, unknown_reason, occupied_state) for this write tree.
+    """Return (occupied, unknown, state) from non-terminal local ledger rows.
 
-    Occupancy is judged from the ledger's non-terminal set -- the lifecycle
-    authority -- never from a process scan: a queued/starting dispatch owns its
-    tree before any worker process exists for pgrep to see, and pid liveness
-    cannot tell a searcher from a worker. ``occupied_state`` is the ledger
-    state of a named occupant so a freshly acquired kernel lock can tell a
-    queued owner (ledger-only claim) from a stale running row after SIGKILL.
-
-    The predicate selects records that can be tied to THIS path. Cwd is
-    taken from ``worker_cwd``, ``dispatch_argv --cwd`` (including after
-    ``--``), and ``request.cwd``; a relative result is resolved against
-    ``project_root``. A row is nameless only when all three are absent or
-    unusable. Disagreeing sources that both resolve occupy every named
-    path (refuse on a superset).
-
-    A nameless non-terminal row is not occupancy of a specific tree, but
-    this is a write-capable admission site: unknown must not be rendered
-    as "does not occupy this path". Split on identity liveness (pid +
-    start_token; never pgrep): proven-dead / no live identity skip+warn
-    (reconcile already closes those); live identity on this host whose
-    ``project_root`` matches the target tree's repo is occupancy UNKNOWN
-    of this project (refuse; ``--occupied-worktree-forced`` is the hatch);
-    missing ``project_root`` on a live nameless row is also UNKNOWN (cannot
-    tell "other repo" from "this repo, unlabeled"); a *different* readable
-    ``project_root`` skip+warn (cannot be this repo).
-    ``project_root`` is never itself a path claim -- a matching
-    ``worker_cwd`` still occupies when the root differs. Unreadable or
-    unlistable records remain occupancy UNKNOWN: they might name this
-    path, so the gate still refuses rather than reading as free.
+    Match every recorded cwd source; unreadable records and live nameless rows
+    fail closed. Dead, remote, terminal, and enforced read-only rows vacate the
+    path, while a different readable project root is only diagnostic.
     """
     target = _worker_cwd(args)
     try:
@@ -4526,17 +4534,7 @@ def _finish_worktree_occupancy(args, *, refusal: str, forced_warning: str) -> st
 
 
 def _prepare_attempt_worktree_occupancy(args) -> str | None:
-    """Refuse a second writer into an occupied worktree, or return the forced-path warning.
-
-    Enforcement is an exclusive non-blocking kernel lock on the target
-    worktree, inherited by the worker so the claim outlives this dispatcher
-    and is released by the kernel on crash. The ledger is diagnostic: it
-    names the incumbent and fail-closes on unlistable/unreadable records.
-    A launch that actually cannot write (enforced read-only) is never
-    refused here. --read-only on a write-capable ``--`` worker is not
-    enough. --occupied-worktree-forced converts either refusal into a
-    visible warning, matching the --unregistered-forced hatch.
-    """
+    """Take the worker-path lock, or refuse/ warn from ledger occupancy evidence."""
     if _occupancy_exempt_read_only(args):
         return None
     occupied, unknown, occupied_state = _worktree_incumbent_reason(args)
@@ -5652,7 +5650,10 @@ def _cmd_resume(argv: list[str]) -> int:
                 f"controller label {recorded_label!r}"
             )
         candidate_dispatch_id = _default_dispatch_id(f"{source['engine']}-resume")
-        _refuse_existing_dispatch_id_for_resume(candidate_dispatch_id)
+        _refuse_existing_dispatch_id_for_resume(
+            candidate_dispatch_id,
+            project_root=source["record"].get("project_root"),
+        )
         candidate_argv = _resume_launch_argv(
             source,
             child_dispatch_id=candidate_dispatch_id,

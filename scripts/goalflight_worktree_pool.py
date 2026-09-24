@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import TextIO
+from typing import Callable, TextIO
 
 import goalflight_compat
 
@@ -1228,12 +1228,10 @@ def _prepare_claimed_seat(
     base_commit: str,
     reset: bool,
     controller_label: str | None = None,
+    before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
     existing = worktree_path.exists() or worktree_path.is_symlink()
     safety: dict | None = None
-    # The kernel lock is the transaction guard. Remove stale diagnostic data
-    # before any bind step so a later failure cannot strand the prior holder.
-    _clear_occupant(lock_file)
     if existing:
         _verify_existing_seat(project_root, worktree_path)
         if reset:
@@ -1244,11 +1242,16 @@ def _prepare_claimed_seat(
             )
             if safety["decision"] != "reset":
                 raise WorktreeSeatResetRefused(safety["reason"])
+        if before_reset is not None:
+            before_reset(worktree_path)
     elif not reset:
         raise WorktreeCwdRefused(
             f"refusing to create missing --cwd {worktree_path}; "
             "resume and occupy only attach an existing tree"
         )
+    # The kernel lock is the transaction guard. Remove stale diagnostic data
+    # only after all pre-reset checks have accepted the seat.
+    _clear_occupant(lock_file)
     if not existing:
         _create_seat_worktree(
             project_root,
@@ -1360,8 +1363,7 @@ def _legacy_ring_candidates(project_root: Path) -> list[tuple[Path, Path]]:
             lock_path = _seat_lock_root(project_root, controller_label=label_root.name) / (
                 f"{path.name}.lock"
             )
-            if lock_path.is_file():
-                found.append((path, lock_path))
+            found.append((path, lock_path))
     return found
 
 
@@ -1425,6 +1427,7 @@ def acquire_worktree_seat(
     reset: bool = True,
     occupy_path: Path | None = None,
     expected_prior_dispatch_id: str | None = None,
+    before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -1486,14 +1489,8 @@ def acquire_worktree_seat(
         ) from exc
     allocation_file = os.fdopen(allocation_fd, "r+", encoding="utf-8")
     try:
-        # Serialize the short acquire/reset transaction. This is not seat
-        # ownership; it only ensures a contender never reads an occupant's old
-        # diagnostic metadata between that occupant's flock and metadata write.
         fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
 
-        # Count every held global or legacy-ring lock before any checkout/reset
-        # or directory creation. Legacy rings are migration input, not extra
-        # capacity, so a full set of old holders must refuse immediately.
         global_candidates = [
             (
                 managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
@@ -1613,6 +1610,7 @@ def acquire_worktree_seat(
                     base_commit=base_commit,
                     reset=reset,
                     controller_label=label,
+                    before_reset=before_reset,
                 )
             except BaseException:
                 lock_file.close()
@@ -1685,6 +1683,7 @@ def acquire_worktree_seat(
                     base_commit=base_commit,
                     reset=reset,
                     controller_label=label,
+                    before_reset=before_reset,
                 )
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")

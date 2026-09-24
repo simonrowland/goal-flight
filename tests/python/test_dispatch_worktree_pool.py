@@ -181,6 +181,62 @@ def test_existing_checkout_without_lock_counts_against_pool_capacity(
     assert "none recorded" not in message
 
 
+def test_legacy_label_checkout_without_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    legacy = repo / "worktrees" / "old-label" / "s-1"
+    legacy.parent.mkdir(parents=True)
+    _git(repo, "worktree", "add", "--detach", str(legacy), "HEAD")
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert "s-1=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
+def test_occupancy_refuses_before_existing_seat_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "old-holder")
+    seat = holder.path
+    holder.release()
+    branch_before = _git(seat, "rev-parse", "--abbrev-ref", "HEAD")
+    seen_branches: list[str] = []
+
+    def refuse(args) -> None:
+        seen_branches.append(_git(seat, "rev-parse", "--abbrev-ref", "HEAD"))
+        raise goalflight_dispatch.DispatchUsageError("occupancy refused")
+
+    monkeypatch.setattr(
+        goalflight_dispatch, "_prepare_attempt_worktree_occupancy", refuse
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=None,
+        dispatch_id="new-dispatch",
+        cwd=str(seat),
+        skip_seat_reset=False,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+        dispatch_warnings=[],
+    )
+
+    with pytest.raises(goalflight_dispatch.DispatchUsageError, match="occupancy refused"):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert seen_branches == [branch_before]
+    assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == branch_before
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

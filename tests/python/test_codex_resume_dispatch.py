@@ -1593,6 +1593,48 @@ def test_resume_legacy_duplicate_model_flags_keep_last_occurrence(
     assert launch[launch.index("--reasoning-effort") + 1] == "max"
 
 
+def test_resume_refuses_child_id_reserved_in_journal_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "journal-parent"
+    child_id = "journal-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    authority = J.open_or_create_journal(tmp_path)
+    prepared = authority.prepare_attempt(child_id)
+    assert prepared.committed and prepared.value is not None
+    prompt = tmp_path / "journal-resume.md"
+    prompt.write_text("Continue after the journal check.\n", encoding="utf-8")
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(
+            resolve_codex_seat=lambda _root, account, dispatch_id: (
+                str(_dispatch_home(tmp_path, dispatch_id)),
+                account,
+            )
+        ),
+    )
+    monkeypatch.setattr(D, "_default_dispatch_id", lambda _agent: child_id)
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None, **_kwargs: launched.append(list(argv or [])) or 0,
+    )
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+
+    assert launched == []
+    assert not L.record_path(child_id).exists()
+    assert "already has a journal attempt" in capsys.readouterr().err
+
+
 def test_resume_explicit_controller_beacon_replaces_recorded_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
