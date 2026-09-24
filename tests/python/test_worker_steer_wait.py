@@ -457,6 +457,79 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
         holder.wait(timeout=5)
 
 
+def test_timeout_settlement_does_not_wait_on_mailbox_lock(tmp_path: Path) -> None:
+    mailbox = tmp_path / "timeout-lock.steer.jsonl"
+    ready = tmp_path / "timeout-lock.ready"
+    holder_code = r'''
+import os
+import time
+from pathlib import Path
+import goalflight_messages as messages
+
+with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
+    Path(os.environ["TEST_READY_FILE"]).write_text("ready", encoding="utf-8")
+    time.sleep(0.8)
+'''
+    env = _env(tmp_path)
+    env.update(
+        {
+            "TEST_STEER_FILE": str(mailbox),
+            "TEST_READY_FILE": str(ready),
+        }
+    )
+    holder: subprocess.Popen | None = None
+
+    def hold_mailbox_after_arm(event: dict) -> None:
+        nonlocal holder
+        if event["state"] != "armed":
+            return
+        holder = subprocess.Popen([sys.executable, "-c", holder_code], env=env)
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "timeout lock holder did not become ready"
+
+    started = time.monotonic()
+    result = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id="timeout-lock",
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="deadline must remain bounded",
+        timeout_secs=0.2,
+        poll_secs=0.05,
+        notify=hold_mailbox_after_arm,
+        publish_question=lambda _event: None,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        assert result["state"] == "deadline", result
+        assert result["settled"] is False, result
+        assert elapsed < 0.6, f"timeout settlement waited on mailbox lock: {elapsed:.3f}s"
+        assert holder is not None
+        holder.wait(timeout=3)
+        deadline = time.monotonic() + 2
+        entries: list[dict] = []
+        while time.monotonic() < deadline:
+            entries = steer.read_steer_entries(mailbox)
+            if any(
+                entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+                and entry.get("decision") == "timeout"
+                for entry in entries
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+            and entry.get("decision") == "timeout"
+            for entry in entries
+        ), entries
+    finally:
+        if holder is not None and holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+
 def test_carrier_validation_error_fails_closed(
     tmp_path: Path,
     monkeypatch,
@@ -514,7 +587,21 @@ time.sleep(5)
         waiter.terminate()
         waiter.wait(timeout=5)
 
+    renewed = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id="dead-waiter",
+        timeout_secs=1,
+        question_kind="USER-NEED",
+        question_text="the replacement question",
+    )
+    steer.append_worker_wait_ended(mailbox, renewed, decision="timeout")
     entries = steer.read_steer_entries(mailbox)
+    assert any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+        and entry.get("reply_to") == entries[0].get("question_id")
+        and entry.get("decision") == "timeout"
+        for entry in entries
+    ), entries
     assert steer.active_worker_wait(entries, dispatch_id="dead-waiter") is None
 
 
@@ -618,14 +705,21 @@ def test_expired_wait_cannot_renew_suspension_indefinitely(tmp_path: Path) -> No
         dispatch_id="nonrenewable",
     ) is None
 
-    with pytest.raises(ValueError, match="renewal refused"):
-        steer.append_worker_wait_started(
-            mailbox,
-            dispatch_id="nonrenewable",
-            timeout_secs=1,
-            question_kind="USER-NEED",
-            question_text="renewed question",
-        )
+    renewed = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id="nonrenewable",
+        timeout_secs=1,
+        question_kind="USER-NEED",
+        question_text="renewed question",
+    )
+    entries = steer.read_steer_entries(mailbox)
+    assert any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+        and entry.get("reply_to") == entries[0].get("question_id")
+        and entry.get("decision") == "timeout"
+        for entry in entries
+    ), entries
+    steer.append_worker_wait_ended(mailbox, renewed, decision="timeout")
 
 
 def test_two_concurrent_waiters_create_exactly_one_arm(tmp_path: Path) -> None:

@@ -2654,15 +2654,12 @@ def _controller_sender_session_id(dispatch_id: str) -> str | None:
 
 
 def _steer_sender_project_root() -> Path:
-    """Resolve the controller command's project identity for steer attribution."""
-    requested = os.environ.get("GOALFLIGHT_PROJECT_ROOT") or str(Path.cwd())
+    """Resolve the controller command's project identity without acquiring."""
+    requested = os.environ.get("GOALFLIGHT_PROJECT_ROOT")
     try:
-        import goalflight_task  # type: ignore
-
-        return goalflight_task.resolve_project_root(requested)
-    except _EXPECTED_OPTIONAL_ERRORS:
+        requested = requested or str(Path.cwd())
         return Path(requested).expanduser().resolve(strict=False)
-    except Exception as exc:
+    except (OSError, RuntimeError) as exc:
         raise MessageError(
             f"cannot resolve steer sender project_root {requested!r}: {exc}"
         ) from exc
@@ -2689,15 +2686,8 @@ def _canonical_steer_project_root(value: object) -> Path | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        import goalflight_task  # type: ignore
-
-        resolved = goalflight_task.resolve_project_root_for_read(value)
-        if resolved is not None:
-            return resolved
-    except _EXPECTED_OPTIONAL_ERRORS:
-        pass
-    try:
-        return Path(value).expanduser().resolve(strict=False)
+        root = Path(value).expanduser().resolve(strict=False)
+        return root if root.is_dir() else None
     except OSError:
         return None
 
@@ -2718,7 +2708,14 @@ def _validate_steer_sender_project(
         record.get("project_root") if isinstance(record, dict) else None
     )
     sender_root = _canonical_steer_project_root(sender.get("project_root"))
-    if target_root is None or sender_root is None or target_root == sender_root:
+    if target_root is None or sender_root is None:
+        if cross_project:
+            return
+        raise MessageError(
+            "steer refused: project_root identity is unknown for the sender or "
+            f"target dispatch {dispatch_id}; pass --cross-project to override"
+        )
+    if target_root == sender_root:
         return
     if cross_project:
         return

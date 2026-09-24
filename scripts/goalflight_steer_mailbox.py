@@ -40,6 +40,7 @@ DEFAULT_WORKER_WAIT_POLL_SECS = 0.25
 WORKER_WAIT_CLEANUP_MODE = "--worker-wait-cleanup"
 WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
 WORKER_WAIT_CLEANUP_END = "end"
+WORKER_WAIT_CLEANUP_TIMEOUT = "timeout"
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -133,12 +134,12 @@ def worker_wait_cleanup_slot_path(
     wait_id: str,
     reply_seq: int,
 ) -> Path:
-    """Return the flock file that bounds one in-flight cleanup helper.
-
-    The bound is one live process per ``(wait_id, reply_seq, operation)``, so
-    at most two live cleanup helpers for one exact typed reply.
-    """
-    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+    """Return the flock file that bounds one in-flight cleanup helper."""
+    if operation not in {
+        WORKER_WAIT_CLEANUP_RECEIPT,
+        WORKER_WAIT_CLEANUP_END,
+        WORKER_WAIT_CLEANUP_TIMEOUT,
+    }:
         raise ValueError("worker wait cleanup slot requires a known operation")
     token = str(wait_id or "").strip()
     if (
@@ -279,17 +280,9 @@ def _cleanup_arm_and_reply_from_mailbox(
     dispatch_id: str,
     wait_id: str,
     arm_seq: int,
-    reply_seq: int,
-) -> tuple[dict, dict]:
-    """Confirm argv names the mailbox's exact typed reply without taking its lock.
-
-    End-row re-validates under the mailbox write lock because it appends there.
-    Receipt writes a different carrier; waiting on the mailbox lock would let a
-    wedged end-row fsync stall the sidecar and recouple the two evidence paths.
-    An unlocked read is enough to refuse a forged receipt: renewal still needs
-    the real typed reply, and this check keeps the sidecar from recording one
-    that the mailbox does not contain.
-    """
+    reply_seq: int | None,
+) -> tuple[dict, dict | None]:
+    """Confirm argv names one durable arm and, when requested, its reply."""
     try:
         data = Path(path).read_bytes()
     except OSError as exc:
@@ -308,6 +301,8 @@ def _cleanup_arm_and_reply_from_mailbox(
     )
     if arm is None:
         raise ValueError("worker wait cleanup does not match one durable arm")
+    if reply_seq is None:
+        return arm, None
     replies = _worker_wait_replies(
         entries,
         dispatch_id=dispatch_id,
@@ -323,29 +318,22 @@ def _worker_wait_cleanup_command(
     operation: str,
     path: Path,
     arm: dict,
-    reply: dict,
+    reply: dict | None,
 ) -> list[str]:
     """Build one self-contained cleanup helper command from validated rows."""
     wait_id = str(arm.get("question_id") or "").strip()
     dispatch_id = str(arm.get("dispatch_id") or "").strip()
     try:
         arm_seq = int(arm["seq"])
-        reply_seq = int(reply["seq"])
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError("worker wait cleanup requires valid row sequences") from exc
-    if (
-        operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}
-        or not wait_id
-        or not wait_id.isalnum()
-        or not dispatch_id
-        or arm_seq <= 0
-        or reply_seq <= 0
-        or reply.get("kind") != WORKER_WAIT_REPLY_KIND
-        or reply.get("reply_to") != wait_id
-        or reply.get("dispatch_id") != dispatch_id
-    ):
+    if operation not in {
+        WORKER_WAIT_CLEANUP_RECEIPT,
+        WORKER_WAIT_CLEANUP_END,
+        WORKER_WAIT_CLEANUP_TIMEOUT,
+    } or not wait_id or not wait_id.isalnum() or not dispatch_id or arm_seq <= 0:
         raise ValueError("worker wait cleanup requires one exact correlated reply")
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         WORKER_WAIT_CLEANUP_MODE,
@@ -354,8 +342,23 @@ def _worker_wait_cleanup_command(
         dispatch_id,
         wait_id,
         str(arm_seq),
-        str(reply_seq),
     ]
+    if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+        if reply is not None:
+            raise ValueError("timeout cleanup cannot carry a reply")
+        return command
+    if (
+        reply is None
+        or not isinstance(reply.get("seq"), int)
+        or isinstance(reply.get("seq"), bool)
+        or reply["seq"] <= 0
+        or reply.get("kind") != WORKER_WAIT_REPLY_KIND
+        or reply.get("reply_to") != wait_id
+        or reply.get("dispatch_id") != dispatch_id
+    ):
+        raise ValueError("worker wait cleanup requires one exact correlated reply")
+    command.append(str(reply["seq"]))
+    return command
 
 
 def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> None:
@@ -396,25 +399,78 @@ def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> No
             pass
 
 
+def schedule_worker_wait_timeout_cleanup(
+    path: Path,
+    arm: dict,
+) -> None:
+    """Finish a deadline settlement after a bounded waiter return.
+
+    The helper is used only when the deadline collides with a mailbox lock. It
+    owns the same durable end-row operation as the waiter, but can wait for a
+    slow fsync after the worker has returned its deadline result.
+    """
+    try:
+        command = _worker_wait_cleanup_command(
+            WORKER_WAIT_CLEANUP_TIMEOUT,
+            path,
+            arm,
+            None,
+        )
+        wait_id = str(arm.get("question_id") or "").strip()
+        arm_seq = int(arm["seq"])
+        if _worker_wait_cleanup_slot_held(
+            path,
+            WORKER_WAIT_CLEANUP_TIMEOUT,
+            wait_id,
+            arm_seq,
+        ):
+            return
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError):
+        # A later wait can settle the expired arm or recover a reply that won
+        # the race. The durable arm must not turn a bounded deadline into a
+        # process failure merely because cleanup launch was unavailable.
+        pass
+
+
 def _run_worker_wait_cleanup(argv: list[str]) -> int:
     """Run one detached cleanup operation to completion."""
-    if len(argv) != 7 or argv[0] != WORKER_WAIT_CLEANUP_MODE:
+    if len(argv) not in {6, 7} or argv[0] != WORKER_WAIT_CLEANUP_MODE:
         return 64
-    _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq, raw_reply_seq = argv
+    _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq = argv[:6]
+    raw_reply_seq = argv[6] if len(argv) == 7 else None
+    if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+        if raw_reply_seq is not None:
+            return 64
+    elif operation in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+        if raw_reply_seq is None:
+            return 64
+    else:
+        return 64
     try:
         arm_seq = int(raw_arm_seq)
-        reply_seq = int(raw_reply_seq)
     except (TypeError, ValueError, OverflowError):
         return 64
-    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
-        return 64
+    reply_seq = None
+    if raw_reply_seq is not None:
+        try:
+            reply_seq = int(raw_reply_seq)
+        except (TypeError, ValueError, OverflowError):
+            return 64
     path = Path(raw_path)
     try:
         slot = _try_acquire_worker_wait_cleanup_slot(
             path,
             operation,
             wait_id,
-            reply_seq,
+            reply_seq if reply_seq is not None else arm_seq,
         )
     except ValueError:
         return 64
@@ -423,6 +479,24 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
     if slot is None:
         return 0
     try:
+        if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+            arm, _reply = _cleanup_arm_and_reply_from_mailbox(
+                path,
+                dispatch_id=dispatch_id,
+                wait_id=wait_id,
+                arm_seq=arm_seq,
+                reply_seq=None,
+            )
+            append_worker_wait_ended(
+                path,
+                arm,
+                decision="timeout",
+                context={"reason": "deadline_lock_timeout"},
+                lock_timeout_secs=None,
+            )
+            return 0
+        if reply_seq is None:
+            return 64
         arm, reply = _cleanup_arm_and_reply_from_mailbox(
             path,
             dispatch_id=dispatch_id,
@@ -1153,6 +1227,60 @@ def append_worker_wait_started(
     if waiter_pgid is not None:
         context["waiter_pgid"] = waiter_pgid
 
+    lock_deadline = (
+        float(deadline_mono)
+        if deadline_mono is not None
+        else (
+            active_monotonic() + float(lock_timeout_secs)
+            if lock_timeout_secs is not None
+            else None
+        )
+    )
+
+    def lock_budget() -> float | None:
+        if lock_deadline is None:
+            return None
+        return max(0.0, lock_deadline - active_monotonic())
+
+    def settle_stale_prior_wait() -> None:
+        """Close a prior arm that can no longer suspend its worker."""
+        entries = read_steer_entries(
+            path,
+            lock_timeout_secs=lock_budget(),
+            quarantine_errors=False,
+        )
+        prior = _latest_worker_wait_arm(entries, dispatch_id)
+        if prior is None:
+            return
+        wait_id = str(prior.get("question_id") or "")
+        if not wait_id:
+            return
+        try:
+            prior_seq = int(prior["seq"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("prior worker wait arm has invalid seq") from exc
+        if _worker_wait_settlement(
+            entries,
+            wait_id=wait_id,
+            after_seq=prior_seq,
+        ) is not None:
+            return
+        if active_worker_wait(entries, dispatch_id=dispatch_id) is not None:
+            return
+        try:
+            append_worker_wait_ended(
+                path,
+                prior,
+                decision="timeout",
+                context={"reason": "prior_wait_not_active"},
+                lock_timeout_secs=lock_budget(),
+            )
+        except ValueError as exc:
+            if "already settled" not in str(exc):
+                raise
+
+    settle_stale_prior_wait()
+
     def reject_unsettled_prior_wait(entries: list[dict]) -> None:
         prior = _latest_worker_wait_arm(entries, dispatch_id)
         if prior is None:
@@ -1209,7 +1337,7 @@ def append_worker_wait_started(
         question_id=wait_id,
         context=context,
         awake_mono_ns=started_mono_ns,
-        lock_timeout_secs=lock_timeout_secs,
+        lock_timeout_secs=lock_budget(),
         validate_existing=reject_unsettled_prior_wait,
     )
 
@@ -1511,6 +1639,7 @@ def wait_for_worker_entries(
         return result
 
     def deadline_result(arm: dict | None = None) -> dict:
+        settled = True
         if arm is not None:
             try:
                 append_worker_wait_ended(
@@ -1525,10 +1654,10 @@ def wait_for_worker_entries(
                             else None
                         ),
                     },
-                    # A timeout must be durable before the worker can issue
-                    # another question. Wait for the mailbox writer rather
-                    # than returning an unsettled arm.
-                    lock_timeout_secs=None,
+                    # The deadline also bounds the final settlement lock. If
+                    # another writer is fsyncing, a detached cleanup helper
+                    # finishes the same durable end row after this return.
+                    lock_timeout_secs=remaining_secs(),
                 )
             except WorkerWaitReplyPending as pending_reply:
                 return deliver_reply(
@@ -1539,10 +1668,16 @@ def wait_for_worker_entries(
             except ValueError as exc:
                 if "already settled" not in str(exc):
                     raise
+            except TimeoutError:
+                settled = False
+                schedule_worker_wait_timeout_cleanup(
+                    path,
+                    arm,
+                )
         result = {"state": "deadline", "entries": [], "timed_out": True}
         if arm is not None:
             result["wait_id"] = arm["question_id"]
-            result["settled"] = True
+            result["settled"] = settled
         report(result)
         return result
 

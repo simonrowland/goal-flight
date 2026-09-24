@@ -4298,13 +4298,19 @@ def _worker_liveness_warning(record: dict) -> str | None:
     dispatch_id = record.get("dispatch_id") or "unknown"
     pid = record.get("worker_pid")
     if not pid:
-        return f"WARN: dispatch {dispatch_id} has no worker pid; message appended but may not be observed"
+        return (
+            f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+            "but worker delivery was not attempted"
+        )
     try:
         current = goalflight_ledger.process_identity(int(pid))
     except (TypeError, ValueError, OSError) as exc:
         return f"WARN: dispatch {dispatch_id} worker identity check failed: {exc}"
     if current is None:
-        return f"WARN: dispatch {dispatch_id} worker pid {pid} is not alive; message appended but may not be observed"
+        return (
+            f"WARN: dispatch {dispatch_id} worker pid {pid} is not alive; "
+            "message recorded but worker delivery was not attempted"
+        )
     prior = record.get("worker_identity") or {}
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
         return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"

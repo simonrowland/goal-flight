@@ -26,12 +26,15 @@ import goalflight_dispatch  # noqa: E402
 import goalflight_journal  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_messages  # noqa: E402
+import goalflight_task  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_terminal  # noqa: E402
 
+PROJECT_ROOT = goalflight_task.resolve_project_root(str(ROOT))
+
 
 @contextlib.contextmanager
-def _state_dir(tmp: Path, *, project_root: Path | None = ROOT):
+def _state_dir(tmp: Path, *, project_root: Path | None = PROJECT_ROOT):
     isolated = {
         "GOALFLIGHT_STATE_DIR": str(tmp),
         "GOALFLIGHT_DISPATCH_DIR": str(tmp / "dispatch"),
@@ -60,7 +63,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_STATE_DIR"] = str(tmp)
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
-    env["GOALFLIGHT_PROJECT_ROOT"] = str(ROOT)
+    env["GOALFLIGHT_PROJECT_ROOT"] = str(PROJECT_ROOT)
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
@@ -241,7 +244,7 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
         try:
             os.environ["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-alpha"
             os.environ["GOALFLIGHT_CONTROLLER_PID"] = "4242"
-            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(ROOT)
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(PROJECT_ROOT)
             goalflight_messages._deliver_message_to_worker = pretend_delivery
             with _state_dir(tmp):
                 first = goalflight_messages.post_controller_steer(
@@ -313,6 +316,23 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
                     os.environ[key] = value
 
 
+def case_steer_unknown_project_root_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "steer-unknown-project"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        with _state_dir(tmp):
+            record_path = goalflight_ledger.record_path(dispatch_id, create=False)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record.pop("project_root", None)
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        proc = _run_steer(tmp, dispatch_id, "halt")
+        assert proc.returncode == 64, proc.stdout + proc.stderr
+        assert "project_root identity is unknown" in proc.stderr, proc.stderr
+        assert _read_messages(tmp, dispatch_id) == []
+
+
 def case_acp_list_reads_status_ack_dict() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -364,6 +384,7 @@ def case_dead_worker_records_but_does_not_claim_delivery() -> None:
         assert proc.returncode != 0, proc.stdout + proc.stderr
         assert "WARN:" in proc.stderr, proc.stderr
         assert "no worker pid" in proc.stderr, proc.stderr
+        assert "message appended" not in proc.stderr, proc.stderr
         entries = _read_mailbox(tmp, "dead-worker")
         assert entries == [], entries
         envelopes = [
@@ -401,6 +422,7 @@ def case_steer_is_no_worker_early_exit() -> None:
 
         assert rc != 0, proc_err.getvalue()
         assert "no worker pid" in proc_err.getvalue(), proc_err.getvalue()
+        assert "message appended" not in proc_err.getvalue(), proc_err.getvalue()
         assert "steer appended:" not in proc_out.getvalue(), proc_out.getvalue()
         entries = _read_mailbox(tmp, dispatch_id)
         assert entries == [], entries
@@ -1263,6 +1285,7 @@ def main() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
     case_steer_sender_identity_and_cross_project_guard()
+    case_steer_unknown_project_root_fails_closed()
     case_acp_list_reads_status_ack_dict()
     case_prefixed_ack_is_parsed_by_both_call_sites()
     case_dead_worker_records_but_does_not_claim_delivery()
