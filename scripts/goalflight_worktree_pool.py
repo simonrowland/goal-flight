@@ -6,15 +6,20 @@ from __future__ import annotations
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
+import tempfile
+import time
 from typing import TextIO
 
 import goalflight_compat
+import goalflight_ledger
 
 
 WORKTREES_PER_REPO_ENV = "GOALFLIGHT_WORKTREES_PER_REPO"
@@ -197,6 +202,35 @@ class WorktreeSeatLease:
 
 
 def configured_worktree_seats() -> int:
+    raw_conf_path = os.environ.get("GOALFLIGHT_CAPACITY_CONF", "").strip()
+    conf_path = (
+        Path(raw_conf_path).expanduser()
+        if raw_conf_path
+        else Path.home() / ".goal-flight" / "capacity.local.json"
+    )
+    if conf_path == Path(os.devnull):
+        local_overrides = {}
+    else:
+        try:
+            local_overrides = json.loads(conf_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            local_overrides = {}
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise WorktreeSeatError(
+                f"capacity override {conf_path} is unreadable or invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(local_overrides, dict):
+            raise WorktreeSeatError(
+                f"capacity override {conf_path} must contain a JSON object"
+            )
+    if "worktrees_per_repo" in local_overrides:
+        configured = local_overrides["worktrees_per_repo"]
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+            return configured
+        raise WorktreeSeatError(
+            f"{conf_path}: worktrees_per_repo must be a positive integer, "
+            f"got {configured!r}"
+        )
     raw = os.environ.get(WORKTREES_PER_REPO_ENV)
     env_name = WORKTREES_PER_REPO_ENV
     if raw is None or not raw.strip():
@@ -520,6 +554,22 @@ def _git(
     return result.stdout.strip()
 
 
+def _git_nul(
+    cwd: Path,
+    *args: str,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run a Git command whose NUL-delimited output must keep path bytes."""
+    result = _git_proc(cwd, *args, input_text=input_text, env=env)
+    if result is None:
+        raise WorktreeSeatError(f"git {' '.join(args)} could not run in {cwd}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise WorktreeSeatError(f"git {' '.join(args)} failed in {cwd}: {detail}")
+    return result.stdout
+
+
 def _git_identity(cwd: Path) -> tuple[str, str, str] | None:
     """Return realpath git-dir, common-dir, and worktree top-level."""
     try:
@@ -779,21 +829,66 @@ def _write_ring_hwm(lock_root: Path, hwm: int) -> None:
     tmp.replace(path)
 
 
-def _porcelain_relpaths(line: str) -> list[str]:
-    text = line.rstrip("\n")
-    if len(text) < 4:
-        return []
-    rest = text[3:]
-    if " -> " in rest:
-        return [part.replace("\\", "/").strip() for part in rest.split(" -> ", 1)]
-    return [rest.replace("\\", "/").strip()]
+def _parse_porcelain_z(output: str) -> list[tuple[str, tuple[str, ...]]]:
+    fields = output.split("\0")
+    records: list[tuple[str, tuple[str, ...]]] = []
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            raise WorktreeSeatResetRefused(
+                "malformed NUL-delimited Git status; refusing reset"
+            )
+        status = record[:2]
+        paths = [record[3:]]
+        if any(code in {"R", "C"} for code in status):
+            if index >= len(fields) or not fields[index]:
+                raise WorktreeSeatResetRefused(
+                    "malformed NUL-delimited rename status; refusing reset"
+                )
+            paths.append(fields[index])
+            index += 1
+        records.append((status, tuple(paths)))
+    return records
 
 
-def _porcelain_is_product(line: str) -> bool:
-    paths = _porcelain_relpaths(line)
+def _status_records(
+    worktree_path: Path, *, untracked: str = "all"
+) -> list[tuple[str, tuple[str, ...]]]:
+    output = _git_nul(
+        worktree_path,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        f"--untracked-files={untracked}",
+        "--ignore-submodules=none",
+    )
+    return _parse_porcelain_z(output)
+
+
+def _status_tree_paths(record: tuple[str, tuple[str, ...]]) -> tuple[str, ...]:
+    status, paths = record
+    if "D" in status:
+        return ()
+    if "R" in status:
+        return paths[:1]
+    return paths
+
+
+def _status_is_product(record: tuple[str, tuple[str, ...]]) -> bool:
+    status, paths = record
     if not paths:
-        return bool(line.strip())
+        return bool(status.strip())
+    if status != "??":
+        return True
     return any(not is_reserved_seat_notes_path(path) for path in paths)
+
+
+def _nul_paths(output: str) -> tuple[str, ...]:
+    return tuple(path for path in output.split("\0") if path)
 
 
 def classify_dispatch_cwd(
@@ -915,10 +1010,110 @@ def _lock_metadata(lock_file: TextIO) -> dict:
 
 def _occupant_description(lock_file: TextIO, seat_name: str) -> str:
     payload = _lock_metadata(lock_file)
-    dispatch_id = str(payload.get("dispatch_id") or "unknown-dispatch")
-    pid = payload.get("pid")
-    suffix = f" pid={pid}" if isinstance(pid, int) else ""
-    return f"{seat_name}={dispatch_id}{suffix}"
+    return _holder_description(seat_name, payload)
+
+
+def _holder_record(dispatch_id: str) -> tuple[dict, bool | None]:
+    """Read worker evidence, never the allocator PID from lock metadata."""
+    record = goalflight_ledger.read_record(dispatch_id)
+    if not record or goalflight_ledger.record_is_unreadable(record):
+        return {}, None
+    record = dict(record)
+    status_path = record.get("status_path")
+    if status_path:
+        try:
+            status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return record, None
+        if not isinstance(status, dict) or status.get("dispatch_id") != dispatch_id:
+            return record, None
+        for key in ("state", "worker_pid", "wrapper_pid"):
+            if status.get(key) is not None:
+                if key == "state" and status[key] != "cancelled" and goalflight_ledger.terminal_state_for(status[key]) == "unknown":
+                    continue
+                record[key] = status[key]
+        # Watchers publish the current process snapshot (empty after exit, or
+        # a reused PID). Only the launch generation can prove this worker dead.
+        expected = status.get("expected_worker_identity") or record.get("worker_identity")
+        if expected:
+            record["worker_identity"] = expected
+        elif status.get("worker_identity"):
+            record["worker_identity"] = status["worker_identity"]
+    identity = record.get("worker_identity") or {}
+    if not isinstance(identity, dict):
+        return record, None
+    pid = record.get("worker_pid")
+    token = identity.get("start_token")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or not token:
+        return record, None
+    if identity.get("pid", pid) != pid:
+        return record, None
+    return record, goalflight_compat.process_identity_matches(pid, token)
+
+
+def _holder_description(name: str, metadata: dict) -> str:
+    dispatch_id = str(metadata.get("dispatch_id") or "unknown-dispatch")
+    if Path(name).is_absolute() and Path(name).is_dir():
+        branch = _git_proc(Path(name), "rev-parse", "--abbrev-ref", "HEAD")
+        if branch is not None and branch.returncode == 0:
+            for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
+                if branch.stdout.strip().startswith(prefix + "/"):
+                    branch_id = branch.stdout.strip()[len(prefix) + 1:]
+                    if branch_id != dispatch_id:
+                        return (
+                            _holder_description(Path(name).name, {"dispatch_id": branch_id})
+                            + " / lock holder: "
+                            + _holder_description(Path(name).name, metadata)
+                        )
+                    break
+    record, live = _holder_record(dispatch_id)
+    detail = (
+        f"{Path(name).name}={dispatch_id} "
+        f"controller={record.get('controller_label') or 'unknown'} "
+        f"state={record.get('state') or 'unknown'}"
+    )
+    if live is True:
+        detail += f" worker_pid={record['worker_pid']}"
+    elif live is False:
+        detail += " worker exited"
+    elif record.get("prelaunch_failure") is True:
+        detail += " worker never launched"
+    else:
+        detail += " worker identity unknown"
+    if record.get("wrapper_pid"):
+        detail += f" wrapper_pid={record['wrapper_pid']}"
+    return detail
+
+
+def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
+    """Existing branch names identify holders; directory labels never do."""
+    metadata_dispatch_id = prior_dispatch_id
+    branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
+        if branch.startswith(prefix + "/"):
+            prior_dispatch_id = branch[len(prefix) + 1:]
+            break
+    holders = {prior_dispatch_id, metadata_dispatch_id} - {"unknown-dispatch"}
+    if not holders:
+        raise WorktreeSeatUnavailable(f"worktree {worktree_path} has unknown ownership")
+    for holder in holders:
+        # Resumes keep the original branch but update lock ownership. Both
+        # identities must be settled before a later dispatch may reset it.
+        record, live = _holder_record(holder)
+        state = str(record.get("state") or "")
+        terminal = goalflight_ledger.terminal_state_for(state, record.get("reason"))
+        if state != "cancelled" and terminal in {"", "unknown", "watcher_stopped"}:
+            raise WorktreeSeatUnavailable(
+                _holder_description(worktree_path.name, {"dispatch_id": holder})
+            )
+        # A terminal dispatch with an explicit pre-worker launch failure has
+        # no process identity to probe. That is proven non-launch, unlike a
+        # started worker whose identity is unreadable (UNKNOWN, retain).
+        if live is True or (live is None and record.get("prelaunch_failure") is not True):
+            raise WorktreeSeatUnavailable(
+                _holder_description(worktree_path.name, {"dispatch_id": holder})
+            )
+    return prior_dispatch_id
 
 
 def _refnames(cwd: Path) -> tuple[list[str] | None, str]:
@@ -980,7 +1175,12 @@ def check_reset_preserves_commits(
 def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
     """YES clean / NO dirty / UNKNOWN. Same three-state as worktree GC check_clean."""
     proc = _git_proc(
-        worktree_path, "status", "--porcelain=v1", "--untracked-files=all"
+        worktree_path,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
     )
     if proc is None:
         return _condition(
@@ -991,11 +1191,10 @@ def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
         return _condition(
             UNKNOWN, f"git status failed ({detail}), so cleanliness is unknown"
         )
-    dirty = [
-        line
-        for line in proc.stdout.splitlines()
-        if line.strip() and _porcelain_is_product(line)
-    ]
+    try:
+        dirty = [record for record in _parse_porcelain_z(proc.stdout) if _status_is_product(record)]
+    except WorktreeSeatResetRefused as exc:
+        return _condition(UNKNOWN, str(exc))
     if dirty:
         return _condition(
             NO,
@@ -1056,6 +1255,83 @@ def pin_unique_commits(
         "reason": f"unique commits pinned at {keep_ref}",
         "keep_ref": keep_ref,
     }
+
+
+def _pin_existing_target_branch(
+    cwd: Path,
+    *,
+    branch: str,
+    base_commit: str,
+    keep_id: str,
+) -> str | None:
+    """Pin an existing target branch before a forced checkout can move it."""
+    target_ref = f"refs/heads/{branch}"
+    target = _git_proc(
+        cwd, "rev-parse", "--verify", "--quiet", f"{target_ref}^{{commit}}"
+    )
+    if target is None or target.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect target branch {branch}; refusing reset"
+        )
+    if target.returncode == 1:
+        return None
+    target_tip = target.stdout.strip()
+    if not target_tip:
+        raise WorktreeSeatResetRefused(
+            f"target branch {branch} has no readable tip; refusing reset"
+        )
+
+    from_base = _git_proc(
+        cwd, "merge-base", "--is-ancestor", target_tip, base_commit
+    )
+    if from_base is None or from_base.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot compare target branch {branch} with reset base; refusing reset"
+        )
+    if from_base.returncode == 0:
+        return None
+
+    kept = _git_proc(
+        cwd,
+        "for-each-ref",
+        "--contains",
+        target_tip,
+        "--format=%(refname)",
+        f"refs/{KEEP_REF_PREFIX}/",
+    )
+    if kept is None or kept.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect keep refs for target branch {branch}; refusing reset"
+        )
+    if any(line.strip() for line in kept.stdout.splitlines()):
+        return None
+
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(keep_id)).strip(".-") or "worktree"
+    keep_ref = f"refs/{KEEP_REF_PREFIX}/{safe_id}/prior-target-{target_tip[:12]}"
+    existing = _git_proc(
+        cwd, "rev-parse", "--verify", "--quiet", f"{keep_ref}^{{commit}}"
+    )
+    if existing is None or existing.returncode not in (0, 1):
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect saved target branch {branch}; refusing reset"
+        )
+    if existing.returncode == 0:
+        if existing.stdout.strip() != target_tip:
+            raise WorktreeSeatResetRefused(
+                f"saved target branch {branch} pin points elsewhere; refusing reset"
+            )
+        return keep_ref
+    updated = _git_proc(cwd, "update-ref", keep_ref, target_tip, "")
+    if updated is None or updated.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            f"cannot pin target branch {branch}; refusing reset"
+        )
+    verified = _git_proc(cwd, "rev-parse", "--verify", f"{keep_ref}^{{commit}}")
+    if verified is None or verified.returncode != 0 or verified.stdout.strip() != target_tip:
+        raise WorktreeSeatResetRefused(
+            f"target branch {branch} pin did not verify; refusing reset"
+        )
+    return keep_ref
 
 
 def evaluate_seat_reset_safety(
@@ -1150,6 +1426,7 @@ def _create_seat_worktree(
     *,
     branch: str,
     base_commit: str,
+    keep_id: str,
 ) -> None:
     ref = f"refs/heads/{branch}"
     exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
@@ -1163,16 +1440,12 @@ def _create_seat_worktree(
             f"cannot determine whether worktree branch {branch} exists ({detail})"
         )
     if exists.returncode == 0:
-        commits = check_reset_preserves_commits(
+        _pin_existing_target_branch(
             project_root,
-            start=ref,
+            branch=branch,
             base_commit=base_commit,
-            moving_ref=ref,
+            keep_id=keep_id,
         )
-        if commits["verdict"] != YES:
-            raise WorktreeSeatResetRefused(
-                f"refusing to reset {branch}: {commits['reason']}"
-            )
         _git(
             project_root,
             "worktree",
@@ -1263,19 +1536,184 @@ def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
     return 0 if head == str(base_commit).strip() else 1
 
 
+def _tree_paths(cwd: Path, treeish: str) -> set[str]:
+    return set(
+        _nul_paths(_git_nul(cwd, "ls-tree", "-r", "-z", "--name-only", treeish))
+    )
+
+
+def _tree_blob_ids(cwd: Path, treeish: str) -> dict[str, str]:
+    blobs: dict[str, str] = {}
+    for entry in _git_nul(cwd, "ls-tree", "-r", "-z", treeish).split("\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise WorktreeSeatResetRefused(
+                f"malformed tree entry for {treeish}; refusing reset"
+            )
+        mode, entry_type, blob_id = fields
+        if entry_type == "commit":
+            if mode != "160000":
+                raise WorktreeSeatResetRefused(
+                    f"malformed gitlink entry for {treeish}; refusing reset"
+                )
+            continue
+        if entry_type != "blob" or mode == "160000":
+            raise WorktreeSeatResetRefused(
+                f"malformed tree entry for {treeish}; refusing reset"
+            )
+        blobs[path] = blob_id
+    return blobs
+
+
+def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
+    tree_blobs = _tree_blob_ids(worktree_path, "HEAD")
+    blob_ids: list[str] = []
+    for path in paths:
+        blob_id = tree_blobs.get(path)
+        if blob_id is None:
+            raise WorktreeSeatResetRefused(
+                f"LFS path {path!r} is not present in HEAD; refusing reset"
+            )
+        blob_ids.append(blob_id)
+    requested = tuple(dict.fromkeys(blob_ids))
+    batch = _git_proc(
+        worktree_path,
+        "cat-file",
+        "--batch",
+        input_text="\n".join(requested) + "\n",
+    )
+    if batch is None or batch.returncode != 0:
+        raise WorktreeSeatResetRefused(
+            "cannot read LFS pointer blobs; refusing reset"
+        )
+    contents: dict[str, str] = {}
+    offset = 0
+    for blob_id in requested:
+        header_end = batch.stdout.find("\n", offset)
+        if header_end < 0:
+            raise WorktreeSeatResetRefused(
+                "malformed LFS pointer batch; refusing reset"
+            )
+        header = batch.stdout[offset:header_end].split()
+        if len(header) != 3 or header[0] != blob_id or header[1] != "blob":
+            raise WorktreeSeatResetRefused(
+                "missing or invalid LFS pointer blob; refusing reset"
+            )
+        try:
+            size = int(header[2])
+        except ValueError as exc:
+            raise WorktreeSeatResetRefused(
+                "invalid LFS pointer blob size; refusing reset"
+            ) from exc
+        content_start = header_end + 1
+        content_end = content_start + size
+        content = batch.stdout[content_start:content_end]
+        if len(content) != size or batch.stdout[content_end : content_end + 1] != "\n":
+            raise WorktreeSeatResetRefused(
+                "truncated LFS pointer blob; refusing reset"
+            )
+        contents[blob_id] = content
+        offset = content_end + 1
+
+    common_lfs = _git_common_dir(worktree_path) / "lfs" / "objects"
+    for path, blob_id in zip(paths, blob_ids):
+        pointer = contents.get(blob_id, "")
+        oid_match = re.search(r"(?m)^oid sha256:([0-9a-f]{64})$", pointer)
+        size_match = re.search(r"(?m)^size ([0-9]+)$", pointer)
+        if oid_match is None or size_match is None:
+            raise WorktreeSeatResetRefused(
+                f"LFS pointer for {path!r} is unparseable; refusing reset"
+            )
+        digest = oid_match.group(1)
+        expected_size = int(size_match.group(1))
+        object_path = common_lfs / digest[:2] / digest[2:4] / digest
+        try:
+            if not object_path.is_file():
+                raise OSError("object is missing")
+            if object_path.stat().st_size != expected_size:
+                raise OSError("object size does not match pointer")
+            actual = hashlib.sha256()
+            actual_size = 0
+            with object_path.open("rb") as object_file:
+                for chunk in iter(lambda: object_file.read(1024 * 1024), b""):
+                    actual.update(chunk)
+                    actual_size += len(chunk)
+            if actual_size != expected_size or actual.hexdigest() != digest:
+                raise OSError("object hash does not match pointer")
+        except OSError as exc:
+            raise WorktreeSeatResetRefused(
+                f"LFS object for {path!r} is missing or unreadable; refusing reset"
+            ) from exc
+
+
+def _refuse_ignored_tree_collisions(
+    worktree_path: Path, *, head: str, target: str
+) -> None:
+    ignored = _nul_paths(
+        _git_nul(
+            worktree_path,
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        )
+    )
+    if not ignored:
+        return
+    tree_paths = _tree_paths(worktree_path, head) | _tree_paths(worktree_path, target)
+    for raw_path in ignored:
+        path = raw_path.rstrip("/")
+        if not path:
+            continue
+        components = path.split("/")
+        for end in range(1, len(components) + 1):
+            prefix = "/".join(components[:end])
+            if prefix in tree_paths or any(
+                tree_path.startswith(prefix + "/") for tree_path in tree_paths
+            ):
+                raise WorktreeSeatResetRefused(
+                    f"ignored path {raw_path!r} collides with HEAD or target tree; "
+                    "refusing reset"
+                )
+
+
 def _prepare_seat_checkout(
-    worktree_path: Path, *, branch: str, base_commit: str
+    worktree_path: Path, *, branch: str, base_commit: str, keep_id: str
 ) -> None:
     current_branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
     current_head = _git(worktree_path, "rev-parse", "HEAD")
-    tracked_status = _git(
-        worktree_path, "status", "--porcelain", "--untracked-files=no"
+    tracked_status = _status_records(worktree_path, untracked="no")
+    needs_checkout = (
+        current_branch != branch or current_head != base_commit or tracked_status
     )
-    if current_branch != branch or current_head != base_commit or tracked_status:
-        _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
-    # when a temp repo has not gitignored ``.goal-flight/``.
+    # when a temp repo has not gitignored ``.goal-flight/``. Clean before the
+    # forced checkout so quarantined untracked files cannot block it.
+    if needs_checkout:
+        _pin_existing_target_branch(
+            worktree_path,
+            branch=branch,
+            base_commit=base_commit,
+            keep_id=keep_id,
+        )
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
+    if needs_checkout:
+        _git(
+            worktree_path,
+            "-c",
+            "submodule.recurse=false",
+            "checkout",
+            "--no-overwrite-ignore",
+            "-f",
+            "-B",
+            branch,
+            base_commit,
+        )
 
 
 def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
@@ -1292,26 +1730,205 @@ def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch:
     return actual
 
 
+def _update_ref_and_verify(
+    cwd: Path,
+    ref: str,
+    commit: str,
+    *,
+    old: str = "",
+) -> None:
+    """Create one keep/quarantine ref and verify it before any reset."""
+    _git(cwd, "update-ref", ref, commit, old)
+    verified = _git_proc(cwd, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if verified is None or verified.returncode != 0 or verified.stdout.strip() != commit:
+        raise WorktreeSeatResetRefused(
+            f"ref {ref} did not verify after creation; refusing reset"
+        )
+
+
+def _precheck_quarantine_worktree(
+    worktree_path: Path,
+    *,
+    seat_name: str,
+) -> tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]]:
+    hidden_entries = _nul_paths(_git_nul(worktree_path, "ls-files", "-v", "-z"))
+    for entry in hidden_entries:
+        if len(entry) < 3 or entry[1] != " ":
+            raise WorktreeSeatResetRefused(
+                f"malformed hidden index entry in dirty worktree {seat_name}; "
+                "refusing reset"
+            )
+        tag, path = entry[0], entry[2:]
+        if tag.islower() or tag == "S":
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} has hidden index entry {path!r}; "
+                "refusing reset"
+            )
+
+    records = _status_records(worktree_path)
+    submodule_paths = set()
+    for entry in _nul_paths(_git_nul(worktree_path, "ls-files", "--stage", "-z")):
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise WorktreeSeatResetRefused(
+                f"malformed index entry in dirty worktree {seat_name}; refusing reset"
+            )
+        if fields[0] == "160000":
+            submodule_paths.add(path)
+    for record in records:
+        _status, paths = record
+        if any(
+            path == submodule or path.startswith(submodule + "/")
+            for path in paths
+            for submodule in submodule_paths
+        ):
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} has dirty submodule; refusing reset"
+            )
+
+    reserved_untracked = list(
+        dict.fromkeys(
+            path
+            for status, paths in records
+            if status == "??"
+            for path in paths
+            if is_reserved_seat_notes_path(path)
+        )
+    )
+    product = [record for record in records if _status_is_product(record)]
+    staged_and_worktree = [
+        record
+        for record in product
+        if record[0][0] not in {" ", "?"}
+        and record[0][1] not in {" ", "?"}
+    ]
+    if staged_and_worktree:
+        raise WorktreeSeatResetRefused(
+            f"dirty worktree {seat_name} has separate staged and working versions "
+            "that cannot be represented by one quarantine commit; refusing reset"
+        )
+
+    dirty_paths = list(
+        dict.fromkeys(path for record in product for path in _status_tree_paths(record))
+    )
+    tracked_paths = _nul_paths(_git_nul(worktree_path, "ls-files", "-z"))
+    attribute_paths = tuple(dict.fromkeys((*tracked_paths, *dirty_paths)))
+    if attribute_paths:
+        # A clean lfs-filtered file is safe: status confirms that its worktree
+        # bytes are the smudge of the pinned pointer, and the LFS object lives
+        # in the common .git/lfs/objects shared by all worktrees. Other clean
+        # filters may be lossy, so they retain the seat.
+        attributes = _git_nul(
+            worktree_path,
+            "check-attr",
+            "-z",
+            "--stdin",
+            "filter",
+            "working-tree-encoding",
+            "eol",
+            "text",
+            input_text="\0".join(attribute_paths) + "\0",
+        )
+        fields = attributes.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 3:
+            raise WorktreeSeatResetRefused(
+                f"malformed Git attributes in dirty worktree {seat_name}; refusing reset"
+            )
+        dirty_set = set(dirty_paths)
+        lfs_paths: list[str] = []
+        for index in range(0, len(fields), 3):
+            path, attribute, value = fields[index : index + 3]
+            active_filter = attribute == "filter" and value not in {
+                "",
+                "unspecified",
+                "unset",
+            }
+            if active_filter and (value != "lfs" or path in dirty_set):
+                raise WorktreeSeatResetRefused(
+                    f"dirty worktree {seat_name} path {path!r} uses active "
+                    f"filter {value!r}; refusing reset"
+                )
+            if active_filter and value == "lfs":
+                lfs_paths.append(path)
+            if path not in dirty_set:
+                continue
+            reencodes = False
+            if attribute == "working-tree-encoding":
+                reencodes = value not in {"", "unspecified", "unset"}
+            elif (
+                attribute == "eol" and value in {"lf", "crlf"}
+            ) or (attribute == "text" and value in {"set", "auto"}):
+                try:
+                    data = (worktree_path / path).read_bytes()
+                except OSError:
+                    reencodes = True
+                else:
+                    if attribute == "eol":
+                        reencodes = (
+                            b"\r\n" in data
+                            if value == "lf"
+                            else b"\n" in data.replace(b"\r\n", b"")
+                        )
+                    else:
+                        reencodes = b"\r\n" in data and (
+                            value == "set" or b"\x00" not in data
+                        )
+            if not reencodes:
+                continue
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} path {path!r} uses active "
+                f"{attribute} {value!r}; refusing reset"
+            )
+        if lfs_paths:
+            _prove_lfs_objects(worktree_path, lfs_paths)
+    return reserved_untracked, product, dirty_paths
+
+
 def _quarantine_dirty_worktree(
     worktree_path: Path,
     *,
     seat_name: str,
     abandoned_dispatch_id: str,
+    precheck: tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]] | None = None,
 ) -> str | None:
-    dirty = _git(worktree_path, "status", "--porcelain=v1", "--untracked-files=all")
-    product = [
-        line for line in dirty.splitlines() if line.strip() and _porcelain_is_product(line)
-    ]
+    if precheck is None:
+        precheck = _precheck_quarantine_worktree(
+            worktree_path,
+            seat_name=seat_name,
+        )
+    reserved_untracked, product, dirty_paths = precheck
     if not product:
         return None
 
-    # `:(exclude)` of an ignored path makes `git add` exit 1, so a worktree that
-    # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
-    # `.goal-flight`: ignored contents were never staged, and a tracked tree is
-    # put back to HEAD so it is not part of the quarantine commit.
-    _git(worktree_path, "add", "-A", "--", ".")
-    _git(worktree_path, "reset", "-q", "--", ".goal-flight")
-    tree = _git(worktree_path, "write-tree")
+    # Seed the temporary index from the real index so staged content, including
+    # force-added ignored files, is preserved. `git add -A` adds other dirty
+    # paths; ignored untracked notes are intentionally left out of the tree.
+    with tempfile.TemporaryDirectory(prefix="goalflight-quarantine-") as temporary:
+        temporary_index = Path(temporary) / "index"
+        real_index = Path(_git(worktree_path, "rev-parse", "--git-path", "index"))
+        if not real_index.is_absolute():
+            real_index = (worktree_path / real_index).resolve()
+        try:
+            shutil.copyfile(real_index, temporary_index)
+        except OSError as exc:
+            raise WorktreeSeatResetRefused(
+                f"cannot copy real index for quarantine: {exc}; refusing reset"
+            ) from exc
+        index_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
+        _git(worktree_path, "add", "-A", "--", ".", env=index_env)
+        if reserved_untracked:
+            _git(
+                worktree_path,
+                "reset",
+                "-q",
+                "--",
+                *reserved_untracked,
+                env=index_env,
+            )
+        tree = _git(worktree_path, "write-tree", env=index_env)
     parent = _git(worktree_path, "rev-parse", "HEAD")
     parent_tree = _git(worktree_path, "rev-parse", "HEAD^{tree}")
     if tree == parent_tree:
@@ -1356,11 +1973,35 @@ def _quarantine_dirty_worktree(
         raise WorktreeSeatError(
             f"quarantine commit for dirty worktree {seat_name} is empty; refusing reset"
         )
-    _git(worktree_path, "update-ref", f"refs/heads/{branch}", commit, "")
+    _update_ref_and_verify(
+        worktree_path, f"refs/heads/{branch}", commit, old=""
+    )
+    dirty_ref = f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}"
+    _update_ref_and_verify(worktree_path, dirty_ref, commit, old="")
+    tree_paths = _tree_paths(worktree_path, dirty_ref)
+    missing_paths = sorted(set(dirty_paths) - tree_paths)
+    if missing_paths:
+        raise WorktreeSeatResetRefused(
+            f"dirty ref {dirty_ref} is missing status paths {missing_paths!r}; "
+            "refusing reset"
+        )
     return branch
 
 
-def _prepare_claimed_seat(
+def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
+    """Exclude writers using the path lock before any checkout or reset."""
+    path = kwargs["worktree_path"]
+    if path.exists() and kwargs["reset"]:
+        try:
+            occupancy = try_acquire_worktree_path_lock(path, kwargs["dispatch_id"])
+        except (WorktreePathLockBusy, WorktreePathLockUnknown) as exc:
+            raise WorktreeSeatUnavailable(str(exc)) from exc
+        with occupancy:
+            return _prepare_claimed_seat_locked(**kwargs)
+    return _prepare_claimed_seat_locked(**kwargs)
+
+
+def _prepare_claimed_seat_locked(
     *,
     project_root: Path,
     worktree_path: Path,
@@ -1375,12 +2016,10 @@ def _prepare_claimed_seat(
 ) -> WorktreeSeatLease:
     existing = worktree_path.exists() or worktree_path.is_symlink()
     safety: dict | None = None
-    # The kernel lock is the transaction guard. Remove stale diagnostic data
-    # before any bind step so a later failure cannot strand the prior holder.
-    _clear_occupant(lock_file)
     if existing:
         _verify_existing_seat(project_root, worktree_path)
         if reset:
+            prior_dispatch_id = _validate_holder(worktree_path, prior_dispatch_id)
             safety = evaluate_seat_reset_safety(
                 worktree_path,
                 base_commit=base_commit,
@@ -1399,6 +2038,7 @@ def _prepare_claimed_seat(
             worktree_path,
             branch=branch,
             base_commit=base_commit,
+            keep_id=dispatch_id,
         )
         _verify_existing_seat(project_root, worktree_path)
     if not reset:
@@ -1422,6 +2062,25 @@ def _prepare_claimed_seat(
             branch=actual,
             controller_label=controller_label,
         )
+    precheck = None
+    head = None
+    if existing and reset:
+        try:
+            head = _git(worktree_path, "rev-parse", "HEAD")
+            _refuse_ignored_tree_collisions(
+                worktree_path, head=head, target=base_commit
+            )
+            precheck = _precheck_quarantine_worktree(
+                worktree_path,
+                seat_name=seat_name,
+            )
+        except WorktreeSeatResetRefused:
+            raise
+        except (WorktreeSeatError, OSError) as exc:
+            raise WorktreeSeatResetRefused(
+                f"cannot inspect dirty worktree {seat_name}: {exc}; refusing reset"
+            ) from exc
+
     keep_ref = None
     if safety is not None and safety["conditions"]["commits_preserved"]["verdict"] == NO:
         pinned = pin_unique_commits(
@@ -1435,30 +2094,56 @@ def _prepare_claimed_seat(
                 f"refusing to reset worktree {seat_name}: {pinned['reason']}"
             )
         keep_ref = str(pinned.get("keep_ref") or "") or None
-    quarantine_branch = _quarantine_dirty_worktree(
-        worktree_path,
-        seat_name=seat_name,
-        abandoned_dispatch_id=prior_dispatch_id,
-    )
-    _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
-    remaining = _git(
-        worktree_path,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    )
-    leftover = [
-        line
-        for line in remaining.splitlines()
-        if line.strip() and _porcelain_is_product(line)
-    ]
-    if leftover:
-        raise WorktreeSeatError(
-            f"worktree {seat_name} is not clean after acquire-time reset"
+    if existing and reset:
+        keep_ref = f"refs/{KEEP_REF_PREFIX}/{prior_dispatch_id}/head"
+        assert head is not None
+        previous = _git_proc(worktree_path, "rev-parse", "--verify", "--quiet", keep_ref)
+        if previous is None or previous.returncode not in (0, 1):
+            raise WorktreeSeatResetRefused(f"cannot inspect saved head {keep_ref}")
+        if previous.returncode == 0 and previous.stdout.strip() != head:
+            raise WorktreeSeatResetRefused(f"refusing to overwrite saved head {keep_ref}")
+        if previous.returncode != 0:
+            _update_ref_and_verify(worktree_path, keep_ref, head, old="")
+        else:
+            verified = _git_proc(
+                worktree_path, "rev-parse", "--verify", f"{keep_ref}^{{commit}}"
+            )
+            if verified is None or verified.returncode != 0 or verified.stdout.strip() != head:
+                raise WorktreeSeatResetRefused(
+                    f"saved head {keep_ref} did not verify; refusing reset"
+                )
+    try:
+        quarantine_branch = _quarantine_dirty_worktree(
+            worktree_path,
+            seat_name=seat_name,
+            abandoned_dispatch_id=prior_dispatch_id,
+            precheck=precheck,
         )
-    actual_branch = _assert_seat_on_named_branch(
-        worktree_path, seat_name=seat_name, branch=branch
-    )
+    except WorktreeSeatResetRefused:
+        raise
+    except (WorktreeSeatError, OSError) as exc:
+        raise WorktreeSeatResetRefused(
+            f"cannot quarantine dirty worktree {seat_name}: {exc}"
+        ) from exc
+    try:
+        _prepare_seat_checkout(
+            worktree_path,
+            branch=branch,
+            base_commit=base_commit,
+            keep_id=dispatch_id,
+        )
+        leftover = [record for record in _status_records(worktree_path) if _status_is_product(record)]
+        if leftover:
+            raise WorktreeSeatError(
+                f"worktree {seat_name} is not clean after acquire-time reset"
+            )
+        actual_branch = _assert_seat_on_named_branch(
+            worktree_path, seat_name=seat_name, branch=branch
+        )
+    except (WorktreeSeatError, OSError) as exc:
+        raise WorktreeSeatResetRefused(
+            f"cannot reset worktree {seat_name}: {exc}"
+        ) from exc
     try:
         _write_occupant(
             lock_file,
@@ -1546,14 +2231,44 @@ def _busy_worktree_message(
         key=lambda item: str(item[1].get("acquired_at") or "9999"),
     )
     oldest = ", ".join(
-        f"{Path(name).name}={payload.get('dispatch_id') or 'unknown-dispatch'}"
-        + (f" pid={payload['pid']}" if isinstance(payload.get("pid"), int) else "")
-        for name, payload in ordered[:5]
+        _holder_description(name, payload)
+        for name, payload in ordered
     ) or "none recorded"
     return (
         f"{len(occupants)}/{limit} worktrees busy in {project_root.name}; "
         f"oldest holders: {oldest}"
     )
+
+
+def _acquire_allocation_lock(
+    allocation_file: TextIO,
+    allocation_lock_path: Path,
+    *,
+    deadline: float | None,
+) -> None:
+    """Acquire the pool transaction lock without overrunning a wait budget."""
+    if deadline is None:
+        fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as exc:
+            if deadline <= 0 or time.monotonic() >= deadline:
+                raise WorktreeSeatUnavailable(
+                    f"seat wait expired while waiting for worktree allocation lock "
+                    f"{allocation_lock_path}"
+                ) from exc
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    # Do not begin seat inspection or launch preparation after a positive
+    # capacity deadline. Once this check passes, worktree setup may finish
+    # after the deadline; the caller already owns the admitted seat.
+    if deadline > 0 and time.monotonic() >= deadline:
+        raise WorktreeSeatUnavailable(
+            f"seat wait expired before worktree admission after acquiring "
+            f"{allocation_lock_path}"
+        )
 
 
 def acquire_worktree_seat(
@@ -1566,6 +2281,7 @@ def acquire_worktree_seat(
     reset: bool = True,
     occupy_path: Path | None = None,
     expected_prior_dispatch_id: str | None = None,
+    capacity_deadline: float | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -1618,10 +2334,31 @@ def acquire_worktree_seat(
         ) from exc
     allocation_file = os.fdopen(allocation_fd, "r+", encoding="utf-8")
     try:
-        # Serialize the short acquire/reset transaction. This is not seat
-        # ownership; it only ensures a contender never reads an occupant's old
-        # diagnostic metadata between that occupant's flock and metadata write.
-        fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
+        # Serialize candidate claims and occupant metadata only. This is not
+        # seat ownership; quarantine and checkout run under the seat lock after
+        # the allocation lock is released.
+        _acquire_allocation_lock(
+            allocation_file,
+            allocation_lock_path,
+            deadline=capacity_deadline,
+        )
+        allocation_locked = True
+
+        def release_allocation_lock() -> None:
+            nonlocal allocation_locked
+            if allocation_locked:
+                fcntl.flock(allocation_file.fileno(), fcntl.LOCK_UN)
+                allocation_locked = False
+
+        def reacquire_allocation_lock() -> None:
+            nonlocal allocation_locked
+            if not allocation_locked:
+                _acquire_allocation_lock(
+                    allocation_file,
+                    allocation_lock_path,
+                    deadline=capacity_deadline,
+                )
+                allocation_locked = True
 
         # Count every held global or legacy-ring lock before any checkout/reset
         # or directory creation. Legacy rings are migration input, not extra
@@ -1718,6 +2455,7 @@ def acquire_worktree_seat(
                         f"{prior_dispatch_id}; expected recorded holder "
                         f"{expected_prior_dispatch_id}; refusing to reset or recreate it"
                     )
+                release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,
@@ -1781,6 +2519,7 @@ def acquire_worktree_seat(
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
                 )
+                release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,
@@ -1796,6 +2535,15 @@ def acquire_worktree_seat(
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
                 lock_file.close()
+                reacquire_allocation_lock()
+                return None
+            except WorktreeSeatUnavailable:
+                resolved_path = worktree_path.resolve(strict=False)
+                if resolved_path not in occupied_paths:
+                    occupied_paths.add(resolved_path)
+                    occupants.append((str(worktree_path), _lock_metadata(lock_file)))
+                lock_file.close()
+                reacquire_allocation_lock()
                 return None
             except BaseException:
                 lock_file.close()

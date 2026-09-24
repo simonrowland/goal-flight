@@ -1987,6 +1987,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     cwd_raw = getattr(args, "cwd", None)
     base = _requested_worktree_base(args)
     force_captive = getattr(args, "worktree", None) == "create"
+    capacity_deadline = getattr(args, "_worktree_capacity_deadline", None)
 
     if getattr(args, "worktree", None) == "shared-read-only":
         shared_path, base_commit = goalflight_worktree_pool.shared_read_only_worktree(
@@ -2059,6 +2060,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     if getattr(args, "worktree_root", None)
                     else None
                 ),
+                capacity_deadline=capacity_deadline,
             )
             _record_dispatch_worktree(args, lease)
             return lease
@@ -2099,6 +2101,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             if getattr(args, "worktree_root", None)
             else None
         ),
+        capacity_deadline=capacity_deadline,
     )
     _record_dispatch_worktree(args, lease)
     return lease
@@ -2111,12 +2114,52 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     resolution and capacity acquisition happen before it; a refusal or wait
     therefore cannot create, reset, or hold a worktree seat.
     """
-    lease = _bind_dispatch_worktree(args)
-    warning = _prepare_attempt_worktree_occupancy(args)
-    args._worktree_occupancy_warning = warning
-    if warning is not None:
-        args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
-    return lease
+    requested_wait = getattr(args, "capacity_wait_s", None)
+    wait_s = max(0.0, float(requested_wait or 0.0))
+    deadline = time.monotonic() + wait_s
+    previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
+    # Zero is an immediate non-blocking lock budget; positive deadlines poll.
+    args._worktree_capacity_deadline = deadline if wait_s else 0.0
+    last_wait_error = None
+    lease = None
+    try:
+        while True:
+            try:
+                lease = _bind_dispatch_worktree(args)
+                break
+            except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    args._worktree_seat_refused = True
+                    if wait_s:
+                        raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                            f"seat wait expired after {wait_s:g}s: "
+                            f"{last_wait_error or exc}"
+                        ) from exc
+                    raise
+                last_wait_error = exc
+                time.sleep(min(1.0, remaining))
+    finally:
+        if previous_deadline is None:
+            try:
+                del args._worktree_capacity_deadline
+            except AttributeError:
+                pass
+        else:
+            args._worktree_capacity_deadline = previous_deadline
+    try:
+        warning = _prepare_attempt_worktree_occupancy(args)
+        args._worktree_occupancy_warning = warning
+        if warning is not None:
+            args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
+        return lease
+    except BaseException:
+        if lease is not None:
+            with contextlib.suppress(Exception):
+                lease.release()
+            if getattr(args, "_worktree_seat", None) is lease:
+                args._worktree_seat = None
+        raise
 
 
 def _parse_task_ids(values: list[str] | None) -> list[str]:
@@ -9808,6 +9851,7 @@ def _finish_ledger(
     *,
     elapsed_s: float | None = None,
     worker_still_alive: bool | None = None,
+    prelaunch_failure: bool | None = None,
 ) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         code = goalflight_ledger.cmd_finish(
@@ -9818,6 +9862,7 @@ def _finish_ledger(
                 terminal_state=None,
                 elapsed_s=elapsed_s,
                 worker_still_alive=worker_still_alive,
+                prelaunch_failure=prelaunch_failure,
             )
         )
     if code != 0:
@@ -18593,7 +18638,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         # ACP and bash use the same inline-wait policy, including lane defaults
         # for detached launchers. Only a claimed backlog entry has a durable
         # carrier that owns retry after a capacity refusal.
-        capacity_wait_s=_capacity_wait_seconds(args),
+        capacity_wait_s=getattr(args, "capacity_wait_s", None),
         preserve_capacity_refusal_attempt=_capacity_refusal_attempt_stays_prepared(args),
         prompt_id=None,
         prompt=None,
@@ -18949,6 +18994,13 @@ def _run_acp_detached_launcher(
                 last_state = status_payload.get("state")
                 if (
                     last_state == "failed_worktree"
+                    and str(status_payload.get("error", "")).startswith("WorktreeSeatUnavailable:")
+                ):
+                    print(f"goalflight_dispatch: {status_payload['error']}", file=sys.stderr)
+                    status_json.unlink(missing_ok=True)
+                    return 2
+                if (
+                    last_state == "failed_worktree"
                     and status_payload.get("reason") == "worktree_occupied"
                 ):
                     print(f"goalflight_dispatch: {status_payload['error']}", file=sys.stderr)
@@ -19031,7 +19083,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             tail_path=tail_path,
             account_env=account_env,
             env_remove=env_remove,
-            capacity_wait_s=float(cfg.capacity_wait_s or 0.0),
+            capacity_wait_s=_capacity_wait_seconds(args) + float(cfg.capacity_wait_s or 0.0),
         )
     test_rc = _run_test_acp_shape_if_requested(args, base=base, status_json=status_json, tail_path=tail_path)
     if test_rc is not None:
@@ -19086,6 +19138,10 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         if worktree_seat is not None:
             worktree_seat.release()
             args._worktree_seat = None
+    if getattr(cfg, "_worktree_seat_refused", False):
+        print(f"goalflight_dispatch: {payload.get('error')}", file=sys.stderr)
+        status_json.unlink(missing_ok=True)
+        return 2
     if (
         payload.get("state") == "blocked_capacity"
         and not cfg.preserve_capacity_refusal_attempt
@@ -21073,12 +21129,7 @@ def main(argv: list[str] | None = None) -> int:
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         final_state = "failed_worktree"
         final_reason = str(e)
-        print(f"goalflight_dispatch: {e}", file=sys.stderr)
-        print(
-            "goalflight_dispatch: refusing to git worktree add; "
-            "wait for a worktree or raise GOALFLIGHT_WORKTREES_PER_REPO",
-            file=sys.stderr,
-        )
+        print(f"goalflight_dispatch: {e}; refusing to git worktree add", file=sys.stderr)
         return 2
     except goalflight_worktree_pool.WorktreeSeatError as e:
         final_state = "failed_worktree"
@@ -21100,7 +21151,10 @@ def main(argv: list[str] | None = None) -> int:
             worktree_seat.release()
             worktree_seat = None
         if (
-            getattr(args, "_worktree_occupancy_refused", False)
+            (
+                getattr(args, "_worktree_occupancy_refused", False)
+                or getattr(args, "_worktree_seat_refused", False)
+            )
             and not worker_spawn_attempted
         ):
             _discard_preworker_ledger(args)
@@ -21165,6 +21219,7 @@ def main(argv: list[str] | None = None) -> int:
                     capacity_reason,
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
+                    prelaunch_failure=not worker_spawn_attempted,
                 )
             except Exception as exc:
                 # Finalization must not mask the launch/watch outcome, but a

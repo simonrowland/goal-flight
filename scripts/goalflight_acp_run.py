@@ -4306,6 +4306,8 @@ async def _run_acp_dispatch_impl(
             record_ledger_state(worker_pid=None, state="starting")
             ledger_recorded = True
         except Exception as e:
+            if getattr(cfg, "_worktree_seat_refused", False):
+                goalflight_dispatch._discard_preworker_ledger(cfg)
             if getattr(cfg, "_worktree_occupancy_refused", False):
                 goalflight_dispatch._discard_preworker_ledger(cfg)
                 payload["reason"] = "worktree_occupied"

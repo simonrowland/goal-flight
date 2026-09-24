@@ -19,10 +19,19 @@ Rules:
 - `resume <id>` skips acquire-reset so partial work is not wiped. Occupancy
   refuses a second writer; the deprecated forced override is rejected for
   ordinary dispatches.
-- `GOALFLIGHT_WORKTREES_PER_REPO` is a repository fuse (default 15), with
+- `worktrees_per_repo` in `~/.goal-flight/capacity.local.json` (or
+  `$GOALFLIGHT_CAPACITY_CONF`) sets the per-machine repository fuse. It falls
+  back to `GOALFLIGHT_WORKTREES_PER_REPO`, then default 15, with
   deprecated alias `GOALFLIGHT_WORKTREE_SEATS`. It is not an account/session
   capacity or a fan-out knob. Exhaustion reports `<N>/15 worktrees busy in
-  <repo>; oldest holders: …` and never mints an unmanaged checkout.
+  <repo>; oldest holders: …` and never mints an unmanaged checkout. Holders
+  show dispatch id, ledger controller label, state, and worker identity;
+  directory labels and allocator PIDs are not ownership evidence.
+  A malformed file or non-positive/non-integer `worktrees_per_repo` fails
+  loudly; fallback applies only when the file is absent or omits that key.
+  Explicit `--capacity-wait-s` also bounds seat polling. Without it, exhaustion
+  refuses immediately. A refused seat admission leaves no dispatch ledger row
+  or terminal notification and does not consume the task id.
 - Read-only dispatches share a detached checkout keyed by commit and do not
   consume an exclusive writer worktree. Writable dispatches remain exclusive
   by default.
@@ -35,11 +44,30 @@ Rules:
   accept legacy `seat/<dispatch-id>` branches during mixed-version upgrades.
   `DISPATCH-START` / `DISPATCH-LAUNCHED` and status/ledger JSON dual-write
   `worktree_id` and legacy `worktree_seat`.
-- Acquire quarantines abandoned dirty product files to
-  `goalflight/quarantine/s-<N>-<UTC-time>`, pins known unique commits under
-  `refs/goalflight/keep/*`, then checks out the new branch at `<base>` and
-  runs `git clean -fd -e .goal-flight`. Unknown status, refs, or identity
-  evidence retains the worktree.
+- Acquire reclaims only terminal holders whose worker PID and start identity
+  are proven dead, or whose terminal record explicitly proves no worker
+  launched, after acquiring both pool and path locks. It pins HEAD at
+  `refs/goalflight/keep/<dispatch-id>/head`, and quarantines abandoned dirty
+  product files, including untracked files, using a temporary index at
+  `refs/goalflight/keep/<dispatch-id>/dirty-<UTC-time>` (also exposed through
+  the legacy `goalflight/quarantine/s-<N>-<UTC-time>` branch), then checks out the new branch at `<base>` and
+  runs `git clean -fd -e .goal-flight`. A seat resets only when every byte reset
+  would discard is already in a ref; otherwise it is retained. Tracked
+  `.goal-flight/` edits are included in
+  the dirty ref; dirty paths with active filters retain the worktree. Ignored
+  untracked notes there are intentionally left in the reused seat and are not
+  in the keep ref because the reserved namespace is preserved by `git clean
+  -fd -e .goal-flight` (a documented cross-dispatch leak). A clean
+  `filter=lfs` path is the sole filter exception: acquisition parses its HEAD
+  pointer and proves the matching object is readable in the shared
+  `.git/lfs/objects` store before reuse; other filters retain the seat.
+- Allocation lock ownership covers only the short candidate-claim critical
+  section. The per-seat lock then excludes writers while quarantine and reset
+  run, so slow quarantine does not serialize reclaimers; there is no FIFO
+  queue, and an explicit capacity wait bounds contenders.
+- A reclaimed `BLOCKED` worker is not automatically re-seated yet. Resume
+  validates the recorded seat and refuses safely; automatic resume re-seating
+  is a separate fix.
 - The pool holds `LOCK_EX|LOCK_NB`, inherited by the spawned worker; process
   death releases the kernel lease. The dispatch id and controller label in the
   lock file are diagnostic metadata, not allocator namespaces.
