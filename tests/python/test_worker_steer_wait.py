@@ -1185,6 +1185,11 @@ print(f"!COMPLETE: {dispatch_id} — resumed after controller reply", flush=True
             for entry in mailbox_entries
             if entry.get("kind") == steer.WORKER_WAIT_REPLY_KIND
         )
+        mailbox_entries, _receipts = _wait_for_cleanup_evidence(
+            mailbox,
+            wait_id=str(armed["worker_wait"]["wait_id"]),
+            reply_seq=int(typed_reply["seq"]),
+        )
         ended = next(
             entry
             for entry in mailbox_entries
@@ -1357,6 +1362,8 @@ def test_reply_before_watcher_first_scan_remains_pending_until_consumed(
     mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "reply-before-scan.tail"
     status = tmp_path / "reply-before-scan.status.json"
+    reply_seen = tmp_path / "reply-before-scan.seen"
+    release_reply = tmp_path / "reply-before-scan.release"
     worker_code = r'''
 import json
 import os
@@ -1370,7 +1377,9 @@ def report(event):
     if event["state"] == "armed":
         print(f"!{event['question_kind']}: {event['question_marker_text']}", flush=True)
     elif event["state"] == "messages":
-        time.sleep(1.5)
+        Path(os.environ["TEST_REPLY_SEEN"]).write_text("seen", encoding="utf-8")
+        while not Path(os.environ["TEST_RELEASE_REPLY"]).exists():
+            time.sleep(0.01)
         for entry in event["entries"]:
             for line in steer.worker_wait_reply_output_lines(entry):
                 print(line, flush=True)
@@ -1389,7 +1398,14 @@ if result["state"] != "messages":
     raise SystemExit(1)
 print(f"!COMPLETE: {dispatch_id} — pending reply consumed", flush=True)
 '''
-    env.update({"TEST_DISPATCH_ID": dispatch_id, "TEST_STEER_FILE": str(mailbox)})
+    env.update(
+        {
+            "TEST_DISPATCH_ID": dispatch_id,
+            "TEST_STEER_FILE": str(mailbox),
+            "TEST_REPLY_SEEN": str(reply_seen),
+            "TEST_RELEASE_REPLY": str(release_reply),
+        }
+    )
     with tail.open("w", encoding="utf-8") as worker_stdout:
         worker = subprocess.Popen(
             [sys.executable, "-c", worker_code],
@@ -1421,6 +1437,10 @@ print(f"!COMPLETE: {dispatch_id} — pending reply consumed", flush=True)
         wait_id=str(arm["question_id"]),
         text="continue",
     )
+    deadline = time.monotonic() + 2
+    while not reply_seen.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert reply_seen.exists(), tail.read_text(encoding="utf-8")
     watcher = subprocess.Popen(
         _watcher_command(
             dispatch_id=dispatch_id,
@@ -1444,6 +1464,7 @@ print(f"!COMPLETE: {dispatch_id} — pending reply consumed", flush=True)
         time.sleep(0.55)
         assert watcher.poll() is None, json.loads(status.read_text(encoding="utf-8"))
         assert worker.poll() is None
+        release_reply.write_text("release", encoding="utf-8")
 
         worker_rc = worker.wait(timeout=5)
         watcher_out, watcher_err = watcher.communicate(timeout=5)

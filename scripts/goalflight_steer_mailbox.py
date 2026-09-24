@@ -1032,7 +1032,9 @@ def append_worker_wait_reply(
     if not text or "\n" in text or "\r" in text:
         raise ValueError("worker wait reply text must be one non-empty line")
     normalized_decision = None if decision is None else str(decision).strip().lower()
-    reply_context: dict[str, object] = {}
+    # Keep the classification explicit on every admitted row; a timeout race
+    # must never turn a late reply into an absent context field.
+    reply_context: dict[str, object] = {"late": False}
 
     def validate(entries: list[dict]) -> None:
         arm = next(

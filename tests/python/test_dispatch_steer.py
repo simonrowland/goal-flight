@@ -31,7 +31,7 @@ import goalflight_terminal  # noqa: E402
 
 
 @contextlib.contextmanager
-def _state_dir(tmp: Path):
+def _state_dir(tmp: Path, *, project_root: Path | None = ROOT):
     isolated = {
         "GOALFLIGHT_STATE_DIR": str(tmp),
         "GOALFLIGHT_DISPATCH_DIR": str(tmp / "dispatch"),
@@ -41,6 +41,8 @@ def _state_dir(tmp: Path):
         "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp / "wake-ledger"),
     }
+    if project_root is not None:
+        isolated["GOALFLIGHT_PROJECT_ROOT"] = str(project_root)
     old = {key: os.environ.get(key) for key in isolated}
     os.environ.update(isolated)
     try:
@@ -58,6 +60,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_STATE_DIR"] = str(tmp)
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_PROJECT_ROOT"] = str(ROOT)
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
@@ -266,7 +269,7 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
             assert expected_sender_root in entry["text"], entry
 
             os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(foreign)
-            with _state_dir(tmp):
+            with _state_dir(tmp, project_root=foreign):
                 try:
                     goalflight_messages.post_controller_steer(
                         dispatch_id,
@@ -282,7 +285,7 @@ def case_steer_sender_identity_and_cross_project_guard() -> None:
             assert len(_read_messages(tmp, dispatch_id)) == 1
             assert len(_read_mailbox(tmp, dispatch_id)) == 1
 
-            with _state_dir(tmp), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with _state_dir(tmp, project_root=foreign), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = goalflight_dispatch.main(
                     [
                         "steer",
@@ -360,7 +363,7 @@ def case_dead_worker_records_but_does_not_claim_delivery() -> None:
         proc = _run_steer(tmp, "dead-worker", "halt")
         assert proc.returncode != 0, proc.stdout + proc.stderr
         assert "WARN:" in proc.stderr, proc.stderr
-        assert "unknown_no_pid" in proc.stderr, proc.stderr
+        assert "no worker pid" in proc.stderr, proc.stderr
         entries = _read_mailbox(tmp, "dead-worker")
         assert entries == [], entries
         envelopes = [
@@ -397,7 +400,7 @@ def case_steer_is_no_worker_early_exit() -> None:
             goalflight_dispatch.subprocess.Popen = old_popen
 
         assert rc != 0, proc_err.getvalue()
-        assert "unknown_no_pid" in proc_err.getvalue(), proc_err.getvalue()
+        assert "no worker pid" in proc_err.getvalue(), proc_err.getvalue()
         assert "steer appended:" not in proc_out.getvalue(), proc_out.getvalue()
         entries = _read_mailbox(tmp, dispatch_id)
         assert entries == [], entries
