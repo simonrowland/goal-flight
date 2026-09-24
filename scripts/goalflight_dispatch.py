@@ -2118,12 +2118,8 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     wait_s = max(0.0, float(requested_wait or 0.0))
     deadline = time.monotonic() + wait_s
     previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
-    # Zero is an immediate non-blocking lock budget. A positive monotonic
-    # deadline is used for polling; None retains the direct-call blocking
-    # behavior for callers that do not go through admission.
-    args._worktree_capacity_deadline = (
-        deadline if wait_s else (0.0 if requested_wait is not None else None)
-    )
+    # Zero is an immediate non-blocking lock budget; positive deadlines poll.
+    args._worktree_capacity_deadline = deadline if wait_s else 0.0
     last_wait_error = None
     try:
         while True:

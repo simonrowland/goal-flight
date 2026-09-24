@@ -51,12 +51,13 @@ Rules:
   product files, including untracked files, using a temporary index at
   `refs/goalflight/keep/<dispatch-id>/dirty-<UTC-time>` (also exposed through
   the legacy `goalflight/quarantine/s-<N>-<UTC-time>` branch), then checks out the new branch at `<base>` and
-  runs `git clean -fd -e .goal-flight`. Unknown status, refs, or identity
-  evidence retains the worktree. Staged entries under `.goal-flight/` also
-  retain the worktree; ignored untracked notes there are intentionally left in
-  the reused seat and are not in the keep ref because the reserved namespace
-  is preserved by `git clean -fd -e .goal-flight` (a documented cross-dispatch
-  leak).
+  runs `git clean -fd -e .goal-flight`. A seat resets only when every byte reset
+  would discard is already in a ref; otherwise it is retained. Tracked
+  `.goal-flight/` edits are included in
+  the dirty ref; dirty paths with active filters retain the worktree. Ignored
+  untracked notes there are intentionally left in the reused seat and are not
+  in the keep ref because the reserved namespace is preserved by `git clean
+  -fd -e .goal-flight` (a documented cross-dispatch leak).
 - Allocation lock ownership covers candidate selection, quarantine, and reset
   so ref pinning and checkout remain one transaction. Slow quarantine can
   serialize reclaimers; there is no FIFO queue, and an explicit capacity wait

@@ -817,6 +817,8 @@ def _porcelain_relpaths(line: str) -> list[str]:
     if len(text) < 4:
         return []
     rest = text[3:]
+    if text[0] not in {" ", "?"} and text[1] == " ":
+        rest = text[2:]
     if " -> " in rest:
         return [part.replace("\\", "/").strip() for part in rest.split(" -> ", 1)]
     return [rest.replace("\\", "/").strip()]
@@ -826,6 +828,8 @@ def _porcelain_is_product(line: str) -> bool:
     paths = _porcelain_relpaths(line)
     if not paths:
         return bool(line.strip())
+    if line[:2] != "??":
+        return True
     return any(not is_reserved_seat_notes_path(path) for path in paths)
 
 
@@ -1447,19 +1451,6 @@ def _quarantine_dirty_worktree(
     seat_name: str,
     abandoned_dispatch_id: str,
 ) -> str | None:
-    staged_reserved = _git(
-        worktree_path,
-        "diff",
-        "--cached",
-        "--name-only",
-        "--",
-        ".goal-flight",
-    )
-    if staged_reserved:
-        raise WorktreeSeatResetRefused(
-            f"dirty worktree {seat_name} has staged .goal-flight content "
-            "that cannot be safely reset; refusing reclaim"
-        )
     dirty = _git(worktree_path, "status", "--porcelain=v1", "--untracked-files=all")
     product = [
         line for line in dirty.splitlines() if line.strip() and _porcelain_is_product(line)
@@ -1477,49 +1468,34 @@ def _quarantine_dirty_worktree(
             "that cannot be represented by one quarantine commit; refusing reset"
         )
 
-    filter_paths: list[str] = []
-    for line in product:
-        for path in _porcelain_relpaths(line):
-            if path not in filter_paths and (worktree_path / path).is_file():
-                filter_paths.append(path)
-    tracked_paths = [
-        path for path in _git(worktree_path, "ls-files", "-z").split("\0") if path
-    ]
-    for path in tracked_paths:
-        if path not in filter_paths:
-            filter_paths.append(path)
-    for path in filter_paths:
-        worktree_file = worktree_path / path
-        if not worktree_file.is_file():
-            continue
-        attribute = _git(worktree_path, "check-attr", "filter", "--", path)
-        marker = ": filter: "
-        if marker not in attribute:
-            continue
-        filter_name = attribute.rsplit(marker, 1)[1].strip()
-        if filter_name in {"", "unspecified", "unset"}:
-            continue
-        stored_entry = _git(worktree_path, "ls-files", "--stage", "--", path)
-        if not stored_entry:
+    dirty_paths = list(
+        dict.fromkeys(path for line in product for path in _porcelain_relpaths(line))
+    )
+    if dirty_paths:
+        attributes = _git(
+            worktree_path,
+            "check-attr",
+            "--stdin",
+            "filter",
+            input_text="\n".join(dirty_paths) + "\n",
+        )
+        for line in attributes.splitlines():
+            fields = line.rsplit(": ", 2)
+            if len(fields) != 3 or fields[1] != "filter":
+                continue
+            filter_name = fields[2].strip()
+            if filter_name in {"", "unspecified", "unset"}:
+                continue
             raise WorktreeSeatResetRefused(
-                f"worktree {seat_name} path {path} uses active clean/process "
-                f"filter {filter_name!r} but has no stored bytes; refusing reset"
-            )
-        raw_oid = _git(worktree_path, "hash-object", "--", path)
-        stored_oid = stored_entry.splitlines()[0].split()[1]
-        if raw_oid != stored_oid:
-            raise WorktreeSeatResetRefused(
-                f"worktree {seat_name} path {path} uses active clean/process "
-                f"filter {filter_name!r} and would lose raw bytes; refusing reset"
+                f"dirty worktree {seat_name} path {fields[0]} uses active filter "
+                f"{filter_name!r}; refusing reset"
             )
     if not product:
         return None
 
-    # `:(exclude)` of an ignored path makes `git add` exit 1, so a worktree that
-    # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
-    # `.goal-flight`: ignored contents were never staged, and a tracked tree is
-    # put back to HEAD so it is not part of the quarantine commit.
-    # A failed quarantine must leave both the working tree and real index intact.
+    # Seed the temporary index from the real index so staged content, including
+    # force-added ignored files, is preserved. `git add -A` adds other dirty
+    # paths; ignored untracked notes are intentionally left out of the tree.
     with tempfile.TemporaryDirectory(prefix="goalflight-quarantine-") as temporary:
         temporary_index = Path(temporary) / "index"
         real_index = Path(_git(worktree_path, "rev-parse", "--git-path", "index"))
@@ -1533,7 +1509,6 @@ def _quarantine_dirty_worktree(
             ) from exc
         index_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
         _git(worktree_path, "add", "-A", "--", ".", env=index_env)
-        _git(worktree_path, "reset", "-q", "--", ".goal-flight", env=index_env)
         tree = _git(worktree_path, "write-tree", env=index_env)
     parent = _git(worktree_path, "rev-parse", "HEAD")
     parent_tree = _git(worktree_path, "rev-parse", "HEAD^{tree}")
@@ -1582,12 +1557,17 @@ def _quarantine_dirty_worktree(
     _update_ref_and_verify(
         worktree_path, f"refs/heads/{branch}", commit, old=""
     )
-    _update_ref_and_verify(
-        worktree_path,
-        f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}",
-        commit,
-        old="",
+    dirty_ref = f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}"
+    _update_ref_and_verify(worktree_path, dirty_ref, commit, old="")
+    tree_paths = set(
+        _git(worktree_path, "ls-tree", "-r", "--name-only", dirty_ref).splitlines()
     )
+    missing_paths = sorted(set(dirty_paths) - tree_paths)
+    if missing_paths:
+        raise WorktreeSeatResetRefused(
+            f"dirty ref {dirty_ref} is missing status paths {missing_paths!r}; "
+            "refusing reset"
+        )
     return branch
 
 

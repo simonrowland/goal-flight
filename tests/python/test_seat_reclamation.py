@@ -113,51 +113,72 @@ def test_quarantine_preserves_force_staged_ignored_file(holder):
         assert _git(repo, "show", refs[0] + ":valuable.bin") == "keep this"
 
 
-def test_quarantine_refuses_staged_goalflight_entry(holder):
+def test_quarantine_preserves_tracked_goalflight_edits(holder):
     repo, path, row = holder
-    (path / ".gitignore").write_text(".goal-flight/\n")
-    _git(path, "add", ".gitignore")
-    _git(path, "commit", "-m", "ignore goal-flight")
     notes = path / ".goal-flight" / "seat" / "memory.md"
     notes.parent.mkdir(parents=True)
-    notes.write_text("keep this\n")
+    notes.write_text("committed\n")
     _git(path, "add", "-f", ".goal-flight/seat/memory.md")
+    _git(path, "commit", "-m", "track seat note")
+    notes.write_text("unique unstaged\n")
+    staged = path / ".goal-flight" / "seat" / "staged.md"
+    staged.write_text("keep staged\n")
+    _git(path, "add", "-f", ".goal-flight/seat/staged.md")
 
-    with pytest.raises(pool.WorktreeSeatResetRefused, match="staged .goal-flight"):
-        pool.acquire_worktree_seat(repo, "next")
-    assert notes.read_text() == "keep this\n"
-    assert _git(path, "branch", "--show-current") == "worktree/old"
+    with pool.acquire_worktree_seat(repo, "next"):
+        refs = _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/old/dirty-*",
+        ).splitlines()
+        assert len(refs) == 1
+        assert _git(repo, "show", refs[0] + ":.goal-flight/seat/memory.md") == "unique unstaged"
+        assert _git(repo, "show", refs[0] + ":.goal-flight/seat/staged.md") == "keep staged"
 
 
 def test_quarantine_refuses_clean_filter_bytes(holder, monkeypatch):
     repo, path, row = holder
-    payload = path / "valuable.dat"
-    payload.write_text("base worktree bytes\n")
-    _git(path, "add", "valuable.dat")
-    _git(path, "commit", "-m", "track filter candidate")
+    payload = path / "note.dat"
+    payload.write_text("secret-bytes\n")
+    _git(path, "add", "note.dat")
     (path / ".gitattributes").write_text("*.dat filter=pointer\n")
-    _git(path, "add", ".gitattributes")
-    _git(path, "commit", "-m", "configure pointer filter")
-    clean_filter = path / "clean-filter.sh"
-    clean_filter.write_text("#!/bin/sh\nprintf 'LFS_POINTER\\n'\n")
-    clean_filter.chmod(0o755)
-    _git(path, "config", "filter.pointer.clean", str(clean_filter))
+    _git(path, "config", "filter.pointer.clean", "printf POINTER")
     _git(path, "config", "filter.pointer.smudge", "cat")
     _git(path, "config", "filter.pointer.required", "true")
-    payload.write_text("raw worktree bytes\n")
-    assert _git(path, "check-attr", "filter", "--", "valuable.dat").endswith(
-        "filter: pointer"
-    )
+    real_git = pool._git
+    def dirty_status(cwd, *args, **kwargs):
+        if args[:2] == ("status", "--porcelain=v1"):
+            return " M note.dat\n"
+        return real_git(cwd, *args, **kwargs)
+    monkeypatch.setattr(pool, "_git", dirty_status)
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="active filter"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert payload.read_text() == "secret-bytes\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+def test_smudged_clean_filter_seat_is_reusable(holder, monkeypatch):
+    repo, path, row = holder
+    payload = path / "valuable.dat"
+    payload.write_text("pointer\n")
+    _git(path, "add", "valuable.dat")
+    (path / ".gitattributes").write_text("*.dat filter=pointer\n")
+    _git(path, "add", ".gitattributes")
+    _git(path, "commit", "-m", "track filtered file")
+    _git(path, "config", "filter.pointer.clean", "printf POINTER")
+    _git(path, "config", "filter.pointer.smudge", "cat")
+    _git(path, "config", "filter.pointer.required", "true")
+    payload.write_text("smudged bytes\n")
     real_git = pool._git
     def clean_status(cwd, *args, **kwargs):
-        if args[:2] == ("status", "--porcelain=v1"):
+        if args and args[0] == "status":
             return ""
         return real_git(cwd, *args, **kwargs)
     monkeypatch.setattr(pool, "_git", clean_status)
-    with pytest.raises(pool.WorktreeSeatResetRefused, match="active clean"):
-        pool.acquire_worktree_seat(repo, "next")
-    assert payload.read_text() == "raw worktree bytes\n"
-    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == path
 
 
 def test_quarantine_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatch):
@@ -224,7 +245,8 @@ def test_terminal_missing_identity_without_prelaunch_proof_is_retained(holder):
         pool.acquire_worktree_seat(repo, "next")
 
 
-def test_allocation_lock_wait_honors_deadline(holder):
+@pytest.mark.parametrize("wait", [0.05, 0])
+def test_allocation_lock_wait_honors_deadline(holder, wait):
     repo, path, row = holder
     lock_path = pool._seat_lock_root(repo) / "allocation.lock"
     lock_file = open(lock_path, "a+")
@@ -235,13 +257,11 @@ def test_allocation_lock_wait_honors_deadline(holder):
             pool.acquire_worktree_seat(
                 repo,
                 "next",
-                capacity_deadline=started + 0.05,
+                capacity_deadline=started + wait if wait else 0,
             )
         assert time.monotonic() - started < 1.0
     finally:
         lock_file.close()
-
-
 def test_message_uses_worker_and_ledger_owner(holder, monkeypatch):
     repo, path, row = holder
     monkeypatch.setattr(pool.goalflight_compat, "process_identity_matches", lambda pid, token: True)
@@ -298,9 +318,11 @@ def test_seat_wait_retries_without_terminal_record(monkeypatch):
 
 
 def test_seat_wait_expiry_is_admission_refusal(monkeypatch):
-    args = SimpleNamespace(capacity_wait_s=0)
-    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", Mock(side_effect=pool.WorktreeSeatUnavailable("full")))
-    with pytest.raises(pool.WorktreeSeatUnavailable):
+    args = SimpleNamespace(capacity_wait_s=None)
+    def refuse(bind_args):
+        raise pool.WorktreeSeatUnavailable(str(bind_args._worktree_capacity_deadline))
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", refuse)
+    with pytest.raises(pool.WorktreeSeatUnavailable, match="0.0"):
         dispatch._admit_dispatch_worktree(args)
     assert args._worktree_seat_refused
 
