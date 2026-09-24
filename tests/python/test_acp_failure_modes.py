@@ -1023,6 +1023,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
     # same process (it false-failed case_handshake_wedge_kills_before_respawn).
     old_pidfile_dir = ac._PIDFILE_DIR
     old_ps_meta = ac._ps_meta
+    old_process_start_identity = ac.goalflight_compat.process_start_identity
     tmp = Path(tempfile.mkdtemp(prefix="gf-detach-ghost-"))
     ac._PIDFILE_DIR = tmp
     worker = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -1041,10 +1042,21 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
             return old_ps_meta(pid)
 
         ac._ps_meta = fake_ps_meta
+        ac.goalflight_compat.process_start_identity = (
+            lambda pid, **kwargs: (
+                {"pid": pid, "start_token": "controller-current"}
+                if pid == dead_controller_pid
+                else old_process_start_identity(pid, **kwargs)
+            )
+        )
         pidfile = tmp / f"{dead_controller_pid}.jsonl"
         base = {
             "pid": worker.pid, "pgid": worker.pid, "started_at": lstart,
             "cmd": comm, "agent": "codex-acp", "session_id": "s",
+            "controller_identity": {
+                "pid": dead_controller_pid,
+                "start_token": "controller-recorded",
+            },
             "worker_identity": ac._identity_token(worker_identity),
         }
         # detached worker -> NOT killed, survives.
@@ -1059,6 +1071,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
             worker.kill()
         ac._PIDFILE_DIR = old_pidfile_dir
         ac._ps_meta = old_ps_meta
+        ac.goalflight_compat.process_start_identity = old_process_start_identity
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")

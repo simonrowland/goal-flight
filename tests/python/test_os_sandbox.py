@@ -1058,9 +1058,13 @@ async def _run_sandbox_probe(profile: str) -> dict:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "sandbox_write_probe"
     goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
-    workspace = ROOT / f".goalflight-os-sandbox-run-{profile}-{os.getpid()}"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir()
+    # Dispatches may run in the project root in-place or in a managed pooled
+    # seat; an arbitrary child directory is no longer a valid --cwd.  Keep
+    # this direct runner probe in-place so it exercises the sandbox itself.
+    workspace = ROOT
+    probe_file = workspace / "goalflight-sandbox-inside.txt"
+    prior_probe = probe_file.read_bytes() if probe_file.exists() else None
+    probe_file.unlink(missing_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-adapters-") as tmp:
             tmp_path = Path(tmp)
@@ -1074,6 +1078,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
                     agent="fake-sandbox",
                     unregistered_forced=True,
                     cwd=str(workspace),
+                    in_place=True,
                     session_id=f"{dispatch_id}-session",
                     dispatch_id=dispatch_id,
                     prompt_id=None,
@@ -1111,7 +1116,10 @@ async def _run_sandbox_probe(profile: str) -> dict:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
-        shutil.rmtree(workspace, ignore_errors=True)
+        if prior_probe is None:
+            probe_file.unlink(missing_ok=True)
+        else:
+            probe_file.write_bytes(prior_probe)
 
 
 def case_runner_workspace_write_blocks_home_write() -> None:
