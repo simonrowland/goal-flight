@@ -337,6 +337,7 @@ class CarrierReadStatus(str, Enum):
     OK = "ok"
     CORRUPT_RECORDS_QUARANTINED = "corrupt-records-quarantined"
     CARRIER_UNREADABLE = "CARRIER-UNREADABLE"
+    CARRIER_MISSING = "CARRIER-MISSING"
 
 
 @dataclass(frozen=True)
@@ -1415,13 +1416,15 @@ def _require_carrier_path(path: Path) -> str:
     return validate_stream_id(canonical.stem, path=f"{canonical}.stream")
 
 
-def _read_nofollow_bytes(path: Path) -> bytes:
+def _read_nofollow_bytes(path: Path, *, missing_ok: bool = True) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
+        if not missing_ok:
+            raise
         return b""
     except OSError as exc:
         raise MessageError(f"{path}: unreadable carrier: {type(exc).__name__}: {exc}") from exc
@@ -1641,7 +1644,26 @@ def _read_envelope_records(
     path = _canonical_jsonl_path(Path(path))
     expected_dispatch_id = _require_carrier_path(path)
     try:
-        data = _read_nofollow_bytes(path) if locked_data is None else locked_data
+        data = (
+            _read_nofollow_bytes(path, missing_ok=False)
+            if locked_data is None
+            else locked_data
+        )
+    except FileNotFoundError:
+        error = _carrier_error(
+            path,
+            line_no=None,
+            offset=None,
+            reason="carrier is missing",
+            raw_line=None,
+            envelopes=[],
+        )
+        error["carrier_status"] = CarrierReadStatus.CARRIER_MISSING.value
+        return CarrierReadResult(
+            CarrierReadStatus.CARRIER_MISSING,
+            (),
+            (error,),
+        )
     except MessageError as exc:
         error = _carrier_error(
             path,
@@ -1720,7 +1742,7 @@ def _read_envelope_records(
 def read_envelopes_result(
     path: Path, *, tolerate_errors: bool = True
 ) -> CarrierReadResult:
-    """Return the explicit ok/quarantined/unreadable carrier read state."""
+    """Return the explicit ok/quarantined/missing/unreadable carrier state."""
     try:
         return _read_envelope_records(path, tolerate_errors=tolerate_errors)
     except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -4012,7 +4034,10 @@ def _listener_envelope(
             str(error.get("error") or error.get("reason") or result.status.value)
             for error in result.errors
         )
-        if result.status is not CarrierReadStatus.OK:
+        if result.status not in {
+            CarrierReadStatus.OK,
+            CarrierReadStatus.CARRIER_MISSING,
+        }:
             recipient = str(row.get("recipient_label") or "").strip()
             if (
                 controller_label is not None
@@ -4062,6 +4087,15 @@ def _listener_envelope(
                 for item in live_assignments
             ):
                 return None
+        if result.status is CarrierReadStatus.CARRIER_MISSING:
+            raise MessageError(
+                "journal delivery assignment has no projected carrier row: "
+                f"event_uuid={event_uuid} origin_node={origin_node} "
+                f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
+                f"carrier row absent from {path}; carrier is missing; "
+                "delivery remains pending; projection/withdrawal evidence incomplete; "
+                f"inspect delivery_events in {authority.path}"
+            )
         withdrawal_error = _withdraw_carrier_delivery(
             authority,
             row,
@@ -8887,7 +8921,10 @@ def cmd_listen(args) -> int:
             )
             if state is None or state.phase == "acknowledged":
                 return {}
-            if goalflight_wake._pending_report_owner_liveness(state) is not True:
+            if (
+                goalflight_wake._pending_report_owner_liveness(state) is not True
+                or goalflight_compat.pid_is_zombie(state.owner_pid) is not False
+            ):
                 return {}
             return dict(state.positions)
         except (
@@ -9751,24 +9788,26 @@ def cmd_listen(args) -> int:
                 # Self-authored rows can sort before foreign mail indefinitely, so
                 # a limit-1 peek cannot implement skip-without-wedging semantics.
                 peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
-                candidate_rows = [
+                visible_rows = [
                     item
                     for item in peek.items
-                    if str(item.get("wake_class") or "") == "waking"
-                    and (
-                        not suppression
-                        or int(item.get("stream_seq") or 0)
-                        > suppression.get(str(item.get("stream_id") or ""), 0)
-                    )
+                    if not suppression
+                    or int(item.get("stream_seq") or 0)
+                    > suppression.get(str(item.get("stream_id") or ""), 0)
                 ]
-                candidate_attention = _attention_items_for_rows(
+                candidate_rows = [
+                    item
+                    for item in visible_rows
+                    if str(item.get("wake_class") or "") == "waking"
+                ]
+                visible_attention = _attention_items_for_rows(
                     read_authority,
-                    candidate_rows,
+                    visible_rows,
                 )
                 candidate_items = listener_envelopes(
                     read_authority,
                     candidate_rows,
-                    attention_by_id=candidate_attention,
+                    attention_by_id=visible_attention,
                 )
                 wakeable_items = bool(
                     _foreign_controller_items(
@@ -9791,8 +9830,8 @@ def cmd_listen(args) -> int:
                     visible_ring_settled_rows: list[dict] = []
                     ring_materialized_items = listener_envelopes(
                         read_authority,
-                        list(peek.items),
-                        attention_by_id=candidate_attention,
+                        visible_rows,
+                        attention_by_id=visible_attention,
                         settled_rows=visible_ring_settled_rows,
                     )
                     visible_ring_items = _foreign_controller_items(
@@ -9888,7 +9927,7 @@ def cmd_listen(args) -> int:
                     return retry_result
                 continue
             positions = _cursor_positions_for_shown_rows(
-                snapshot.items,
+                visible_rows,
                 ring_materialized_items,
                 visible_ring_settled_rows,
             )
