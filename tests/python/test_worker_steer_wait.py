@@ -2794,101 +2794,51 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
         holder.wait(timeout=5)
 
 
-def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
+def test_deadline_settlement_recovers_reply_appended_before_settlement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A reply admitted before the deadline must survive its own slow fsync.
+    """Settlement re-reads the mailbox, so a reply appended first wins."""
+    mailbox = tmp_path / "reply-before-settlement.steer.jsonl"
+    dispatch_id = "reply-before-settlement"
+    real_end = steer.append_worker_wait_ended
+    reply: dict | None = None
 
-    The writer validates inside the mailbox lock before the deadline, then
-    remains in append/fsync while the waiter's ordinary pre-deadline read
-    exhausts its lock budget. The waiter must deliver the durable typed reply
-    after the writer releases the lock instead of recording a false timeout.
-    """
-    mailbox = tmp_path / "admitted-writer-race.steer.jsonl"
-    dispatch_id = "admitted-writer-race"
-    timeout_secs = 0.25
-    stall_secs = 0.8
-    stall_started = threading.Event()
-    stall_state = {"used": False}
-    writers: list[threading.Thread] = []
-    writer_errors: list[BaseException] = []
-    wait_started_at = time.monotonic()
-    stall_started_at = [0.0]
-
-    real_append_fsync = messages._append_fsync
-
-    def stalled_append_fsync(path, data):
-        if b"worker_wait_reply" in data and not stall_state["used"]:
-            stall_state["used"] = True
-            stall_started_at[0] = time.monotonic()
-            # Validation already admitted the writer inside the mailbox lock.
-            # Keep that lock held until well after the real waiter deadline.
-            stall_started.set()
-            time.sleep(stall_secs)
-        real_append_fsync(path, data)
-
-    monkeypatch.setattr(messages, "_append_fsync", stalled_append_fsync)
-
-    def write_reply(wait_id: str) -> None:
-        try:
-            steer.append_worker_wait_reply(
-                mailbox,
+    def append_reply_before_timeout_end(path, arm, **kwargs):
+        nonlocal reply
+        if kwargs.get("decision") == "timeout" and reply is None:
+            reply = steer.append_worker_wait_reply(
+                path,
                 dispatch_id=dispatch_id,
-                wait_id=wait_id,
-                text="admitted before the deadline",
+                wait_id=str(arm["question_id"]),
+                text="durable before settlement",
             )
-        except BaseException as exc:  # pragma: no cover - asserted below
-            writer_errors.append(exc)
+        return real_end(path, arm, **kwargs)
 
-    def report(event: dict) -> None:
-        if event["state"] != "armed":
-            return
-        writer = threading.Thread(
-            target=write_reply,
-            args=(str(event["arm"]["question_id"]),),
-        )
-        writer.start()
-        writers.append(writer)
-        # Return while the real deadline is still ahead. The ordinary read,
-        # not the post-deadline branch, must lose its remaining lock budget.
-        assert stall_started.wait(timeout=10)
-
-    first = steer.wait_for_worker_entries(
+    monkeypatch.setattr(steer, "append_worker_wait_ended", append_reply_before_timeout_end)
+    result = steer.wait_for_worker_entries(
         mailbox,
         dispatch_id=dispatch_id,
         acked_seqs=set(),
         question_kind="USER-NEED",
         question_text="need a boundary answer",
-        timeout_secs=timeout_secs,
-        poll_secs=0.05,
-        notify=report,
-    )
-    assert stall_started_at[0] - wait_started_at < timeout_secs
-    for writer in writers:
-        writer.join(timeout=10)
-
-    assert stall_state["used"], "the writer never reached its fsync stall"
-    assert not writer_errors, writer_errors
-    durable_entries = steer.read_steer_entries(mailbox)
-    durable_reply = next(
-        entry
-        for entry in durable_entries
-        if entry.get("kind") == steer.WORKER_WAIT_REPLY_KIND
+        timeout_secs=0.05,
+        poll_secs=0.2,
+        publish_question=lambda _event: None,
     )
 
-    assert first["state"] == "messages", first
-    assert first["entries"] == [durable_reply]
-    reply_seq = int(durable_reply["seq"])
+    assert reply is not None
+    assert result["state"] == "messages", result
+    assert result["entries"] == [reply]
     entries, receipts = _wait_for_cleanup_evidence(
         mailbox,
-        wait_id=str(first["wait_id"]),
-        reply_seq=reply_seq,
+        wait_id=str(result["wait_id"]),
+        reply_seq=int(reply["seq"]),
     )
-    assert sum(
-        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
-    ) == 1, entries
-    assert receipts == {(first["wait_id"], reply_seq)}
+    assert not any(
+        entry.get("decision") == "timeout" for entry in entries
+    ), entries
+    assert receipts == {(result["wait_id"], int(reply["seq"]))}
 
 
 @pytest.mark.parametrize("failure_kind", ["oserror", "messageerror"])

@@ -2004,11 +2004,33 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
         base = Path(td)
         project = base / "project"
         init_git_project(project)
+        (project / "README.md").write_text("fixture\n", encoding="utf-8")
+        for args in (
+            ("config", "user.email", "test@example.test"),
+            ("config", "user.name", "Test"),
+            ("add", "README.md"),
+            ("commit", "-m", "fixture"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(project), *args],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        linked = base / "linked"
+        subprocess.run(
+            ["git", "-C", str(project), "worktree", "add", "--detach", str(linked), "HEAD"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         dispatch_id = "d-controller-replay"
         write_ledger_record(base, dispatch_id, project, worker_pid=os.getpid())
         env = {
             **_journal_test_env(base),
-            "GOALFLIGHT_PROJECT_ROOT": str(project),
+            "GOALFLIGHT_PROJECT_ROOT": str(linked),
             "GOALFLIGHT_CONTROLLER_LABEL": "replay-controller",
             "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
         }
@@ -2021,6 +2043,10 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
                 with contextlib.suppress(RuntimeError):
                     _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
 
+            os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(project)
+            retry = _carrier_messages.post_controller_steer(dispatch_id, "replay this steer")
+            assert retry["recorded"] is False, retry
+            assert retry["delivery"]["worker_view_written"] is True, retry
             messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
             canonical = _carrier_messages.read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
 

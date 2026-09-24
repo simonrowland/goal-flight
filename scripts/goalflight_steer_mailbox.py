@@ -1978,7 +1978,10 @@ def acked_steer_seqs(record: dict) -> set[int]:
 
 def list_steer_messages(dispatch_id: str, record: dict) -> int:
     mailbox = steer_file(dispatch_id)
-    entries = read_steer_entries(mailbox)
+    entries = read_steer_entries(
+        mailbox,
+        lock_timeout_secs=CONTROLLER_STEER_LOCK_TIMEOUT_SECS,
+    )
     acked = acked_steer_seqs(record)
     print(f"steer mailbox: {mailbox}")
     if not entries:

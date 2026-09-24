@@ -4294,13 +4294,28 @@ def _find_dispatch_record(dispatch_id: str) -> dict | None:
         _pass_time("ledger_lookup_s", time.monotonic() - t0, count_key="ledger_lookup_n")
 
 
-def _worker_liveness_warning(record: dict) -> str | None:
+def _worker_liveness_warning(record: dict, *, in_process: bool = False) -> str | None:
     dispatch_id = record.get("dispatch_id") or "unknown"
     pid = record.get("worker_pid")
     if not pid:
         return (
             f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
             "but worker delivery was not attempted"
+        )
+    if in_process:
+        import goalflight_messages
+
+        classification = goalflight_messages._steer_worker_classification(record)
+        if classification in {"expected_live", "queued_capacity"}:
+            return None
+        if classification == "unknown_no_pid":
+            return (
+                f"WARN: dispatch {dispatch_id} has no worker pid; message recorded "
+                "but worker delivery was not attempted"
+            )
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
         )
     try:
         current = goalflight_ledger.process_identity(int(pid))
@@ -4576,7 +4591,7 @@ def _cmd_steer(argv: list[str]) -> int:
 
     shape = goalflight_ledger.infer_shape(record)
     if shape == "acp":
-        warning = _worker_liveness_warning(record)
+        warning = _worker_liveness_warning(record, in_process=True)
         if warning:
             print(warning, file=sys.stderr)
         return append_controller_steer()
@@ -4584,7 +4599,7 @@ def _cmd_steer(argv: list[str]) -> int:
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
         return 64
 
-    warning = _worker_liveness_warning(record)
+    warning = _worker_liveness_warning(record, in_process=True)
     if warning:
         print(warning, file=sys.stderr)
     return append_controller_steer()

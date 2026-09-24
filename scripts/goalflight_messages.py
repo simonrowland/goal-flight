@@ -1994,9 +1994,12 @@ def post_message(
     # carrier/ingestion state is touched. The final seq-bearing form is validated
     # and serialized again under the transaction lock.
     validate_envelope(envelope, expected_dispatch_id=dispatch_id)
-    steer_lock_timeout = (goalflight_steer_mailbox.CONTROLLER_STEER_LOCK_TIMEOUT_SECS
-                          if deliver_to_worker or base_source.get("transport") in {"steer", "steer-wait"}
-                          else None)
+    steer_retry = deliver_to_worker or base_source.get("transport") in {"steer", "steer-wait"}
+    steer_lock_timeout = (
+        goalflight_steer_mailbox.CONTROLLER_STEER_LOCK_TIMEOUT_SECS
+        if steer_retry
+        else None
+    )
     with carrier_transaction(path, lock_timeout_secs=steer_lock_timeout) as transaction:
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
@@ -2034,9 +2037,17 @@ def post_message(
                             value = dict(value)
                             value.pop("controller_pid", None)
                             value.pop("controller_session_id", None)
+                            if "project_root" in value:
+                                value["project_root"] = _canonical_steer_project_identity(
+                                    value["project_root"]
+                                )
                             if isinstance(value.get("sender"), dict):
                                 value["sender"] = dict(value["sender"])
                                 value["sender"].pop("controller_pid", None)
+                                if "project_root" in value["sender"]:
+                                    value["sender"]["project_root"] = _canonical_steer_project_identity(
+                                        value["sender"]["project_root"]
+                                    )
                             fields[key] = value
                 return fields
 
@@ -2447,6 +2458,33 @@ def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
             )
 
 
+def _steer_worker_classification(record: dict) -> str:
+    state = str(record.get("state") or "running")
+    detached_live = bool(record.get("detached")) and (
+        state == "controller_dead"
+        or (state == "orphaned" and (record.get("reason") or record.get("error")) == "controller_dead")
+    )
+    if _record_is_terminal(record) and not detached_live:
+        return str(record.get("terminal_state") or state)
+    if state in {"queued", "waiting_capacity"}:
+        return "queued_capacity"
+    pid = record.get("worker_pid") or record.get("claimant_pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "unknown_no_pid"
+    prior = record.get("worker_identity") or record.get("claimant_identity") or {}
+    start_token = prior.get("start_token") if isinstance(prior, dict) else None
+    if not isinstance(start_token, str) or not start_token:
+        return "identity_indeterminate"
+    try:
+        return (
+            "expected_live"
+            if goalflight_compat.process_identity_matches(pid, start_token) is True
+            else "identity_indeterminate"
+        )
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return "identity_indeterminate"
+
+
 def _deliver_message_to_worker(
     dispatch_id: str,
     envelope: dict,
@@ -2471,9 +2509,12 @@ def _deliver_message_to_worker(
             "detail": "message recorded; no matching dispatch record, so no worker delivery was attempted",
         }
     try:
-        import goalflight_ledger  # type: ignore
+        if envelope.get("source", {}).get("transport") == "steer":
+            classification = _steer_worker_classification(record)
+        else:
+            import goalflight_ledger  # type: ignore
 
-        classification = goalflight_ledger.classify(record)
+            classification = goalflight_ledger.classify(record)
     except _EXPECTED_OPTIONAL_ERRORS as exc:
         return {
             "requested": True,
@@ -2760,6 +2801,12 @@ def _steer_project_identity(root: Path) -> tuple[object, ...] | None:
     return ("path", path_stat.st_dev, path_stat.st_ino)
 
 
+def _canonical_steer_project_identity(value: object) -> tuple[object, ...]:
+    root = _canonical_steer_project_root(value)
+    identity = _steer_project_identity(root) if root is not None else None
+    return identity if identity is not None else ("unknown",)
+
+
 def _validate_steer_sender_project(
     dispatch_id: str,
     sender: dict[str, object],
@@ -2864,7 +2911,9 @@ def post_controller_steer(
         author_capability=_presented_ambient_controller_capability(),
         event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, repr((
             dispatch_id, text, reply_to, decision,
-            sender.get("controller_label"), sender.get("project_root"), cross_project,
+            sender.get("controller_label"),
+            _canonical_steer_project_identity(sender.get("project_root")),
+            cross_project,
         )))),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
