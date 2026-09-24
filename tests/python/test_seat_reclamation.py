@@ -588,6 +588,41 @@ def test_seat_wait_expiry_is_admission_refusal(monkeypatch):
     assert args._worktree_seat_refused
 
 
+def test_resume_replacement_preserves_seat_wait_deadline(tmp_path, monkeypatch):
+    deadline = time.monotonic() + 10
+    args = SimpleNamespace(
+        dispatch_id="replacement-child",
+        _worktree_capacity_deadline=deadline,
+    )
+    lease = object()
+    observed = {}
+    monkeypatch.setattr(
+        dispatch,
+        "_find_dispatch_record",
+        lambda _dispatch_id: {"dispatch_id": "replacement-parent"},
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_resume_worktree_branch_spec",
+        lambda *_args: ("worktree/replacement-parent", "base-sha", None, None),
+    )
+    monkeypatch.setattr(
+        dispatch, "_controller_ring_label", lambda *_args: "unlabeled"
+    )
+
+    def acquire(_project_root, _dispatch_id, **kwargs):
+        observed.update(kwargs)
+        return lease
+
+    monkeypatch.setattr(pool, "acquire_worktree_seat", acquire)
+    assert dispatch._resume_replacement_worktree(
+        args,
+        project_root=tmp_path,
+        parent_dispatch_id="replacement-parent",
+    ) is lease
+    assert observed["capacity_deadline"] == deadline
+
+
 @pytest.mark.parametrize("state", ["failed", "error", "cancelled", "worker_dead", "blocked_capacity", "blocked_task_breadcrumb"])
 def test_terminal_dead_states_reuse(holder, state):
     repo, path, row = holder

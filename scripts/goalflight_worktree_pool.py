@@ -170,6 +170,7 @@ class WorktreeSeatLease:
         keep_ref: str | None = None,
         reclaimed_dispatch_id: str | None = None,
         controller_label: str | None = None,
+        created: bool = False,
     ) -> None:
         self.path = path
         self.seat_name = seat_name
@@ -179,6 +180,7 @@ class WorktreeSeatLease:
         self.keep_ref = keep_ref
         self.reclaimed_dispatch_id = reclaimed_dispatch_id
         self.controller_label = controller_label
+        self.created = created
         self._lock_file: TextIO | None = lock_file
 
     def fileno(self) -> int:
@@ -2086,6 +2088,7 @@ def _prepare_claimed_seat_locked(
             branch=actual,
             reclaimed_dispatch_id=None,
             controller_label=controller_label,
+            created=not existing,
         )
     precheck = None
     head = None
@@ -2189,6 +2192,7 @@ def _prepare_claimed_seat_locked(
         keep_ref=keep_ref,
         reclaimed_dispatch_id=prior_dispatch_id,
         controller_label=controller_label,
+        created=not existing,
     )
 
 

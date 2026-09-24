@@ -22,8 +22,6 @@ incremented when meaningful skill behaviour changes.
 - `resume` reattaches to the live controller for the dispatch's recorded label after a controller restart or reboot, instead of refusing on the original launch's controller process; a different label's controller is refused.
 - Grok resume prefers the recorded account and falls back to another healthy account by carrying the local session over, instead of refusing.
 
-### Added
-
 - `resume` accepts `--model` and `--reasoning-effort` overrides. The selected values replace the recorded launch values and are retained in the child ledger and status projections.
 - Doctor warns when a readable Codex seat-state snapshot has seats but its newest per-seat probe is more than 30 minutes old, including the daemon log path.
 

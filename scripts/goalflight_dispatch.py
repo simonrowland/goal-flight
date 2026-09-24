@@ -1842,6 +1842,15 @@ def _record_dispatch_worktree(args, lease) -> None:
         if not base_commit:
             raise goalflight_worktree_pool.WorktreeSeatError("resolved base SHA is null")
     except goalflight_worktree_pool.WorktreeSeatError as exc:
+        if getattr(lease, "created", False):
+            with contextlib.suppress(Exception):
+                goalflight_worktree_pool._git(
+                    _project_root(args),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(lease.path),
+                )
         lease.release()
         requested = _requested_worktree_base(args)
         request = f"--at {requested!r}" if requested else "--at omitted (project default)"
@@ -2138,6 +2147,7 @@ def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id
         branch=branch,
         controller_label=label,
         reset=True,
+        capacity_deadline=getattr(args, "_worktree_capacity_deadline", None),
         before_reset=_worktree_occupancy_before_reset(args),
         managed_root=(
             Path(str(args.worktree_root)).expanduser()
@@ -2395,6 +2405,13 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         # not request a post-capacity pool bind. Reclassifying that cwd here
         # would turn an explicit no-worktree mode into an allocation.
         return None
+    if (
+        getattr(args, "parent_dispatch_id", None)
+        and _occupancy_exempt_read_only(args)
+    ):
+        # A read-only resume reuses its recorded cwd. It has no writer seat to
+        # reacquire, reset, or validate against the pool's branch lineage.
+        return None
     project_root = _project_root(args)
     label = _controller_ring_label(args, project_root)
     skip_reset = bool(getattr(args, "skip_seat_reset", False))
@@ -2586,6 +2603,11 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                             f"{last_wait_error or exc}"
                         ) from exc
                     raise
+                if not getattr(args, "_worktree_wait_notified", False):
+                    callback = getattr(args, "_worktree_wait_callback", None)
+                    if callback is not None:
+                        callback()
+                        args._worktree_wait_notified = True
                 last_wait_error = exc
                 time.sleep(min(1.0, remaining))
     finally:
@@ -3836,7 +3858,8 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
     # inert profile launch as if the flag were honoured.
     _validate_os_sandbox_conflict(args)
     _validate_agent_os_sandbox(args)
-    _validate_os_sandbox_boundary(args)
+    if not getattr(args, "_defer_sandbox_boundary", False):
+        _validate_os_sandbox_boundary(args)
     # Billing refusal is a pre-write guard. Id reservation, prompt
     # materialization, occupancy bind, and capacity leases must not land first.
     return _resolve_launch_account_env(args)
@@ -6342,12 +6365,19 @@ def _preflight_resume_dispatch(
     if args.shape == "acp":
         _normalize_acp_agent(args)
     parent_dispatch_id = str(args.parent_dispatch_id)
-    account_env = _validate_before_side_effects(args, raw)
-    _validate_resume_worktree_source(
-        parent_dispatch_id,
-        source["record"],
-        _resume_worker_cwd(source["record"], override=getattr(args, "cwd", None)),
-    )
+    args._defer_sandbox_boundary = True
+    try:
+        account_env = _validate_before_side_effects(args, raw)
+    finally:
+        del args._defer_sandbox_boundary
+    if not _occupancy_exempt_read_only(args):
+        _validate_resume_worktree_source(
+            parent_dispatch_id,
+            source["record"],
+            _resume_worker_cwd(
+                source["record"], override=getattr(args, "cwd", None)
+            ),
+        )
     _refuse_launch_blocked_by_completion_authority(args)
     engine = _account_engine(args.agent)
     preflight_home = None
@@ -20958,13 +20988,15 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             resume_source = _validate_resume_source(
                 args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
             )
-            _validate_resume_worktree_source(
-                args.parent_dispatch_id,
-                resume_source["record"],
-                _resume_worker_cwd(
-                    resume_source["record"], override=getattr(args, "cwd", None)
-                ),
-            )
+            if not _occupancy_exempt_read_only(args):
+                _validate_resume_worktree_source(
+                    args.parent_dispatch_id,
+                    resume_source["record"],
+                    _resume_worker_cwd(
+                        resume_source["record"],
+                        override=getattr(args, "cwd", None),
+                    ),
+                )
         except DispatchUsageError as exc:
             print(f"goalflight_dispatch: {exc}", file=sys.stderr)
             return 64
@@ -21078,6 +21110,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         if resume_plan is None:
             account_env = _validate_before_side_effects(args, raw)
         else:
+            _validate_os_sandbox_boundary(args)
             account_env = dict(resume_plan.get("account_env") or {})
         dispatch_warnings = _dispatch_warnings(args, raw)
         args.dispatch_warnings = dispatch_warnings
@@ -21341,7 +21374,28 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         if registration_warning is not None:
             dispatch_warnings = [*dispatch_warnings, registration_warning]
             worker_stdout_mode = "ab"
-        worktree_seat = _admit_dispatch_worktree(args)
+        def record_worktree_wait() -> None:
+            nonlocal ledger_recorded
+            if ledger_recorded:
+                return
+            _record_ledger(
+                args,
+                project_root=project_root,
+                prompt_path=None,
+                status_json=status_json,
+                tail=tail,
+                lease_id=lease_id,
+                worker_pid=None,
+                state="waiting_capacity",
+            )
+            ledger_recorded = True
+
+        args._worktree_wait_callback = record_worktree_wait
+        try:
+            worktree_seat = _admit_dispatch_worktree(args)
+        finally:
+            with contextlib.suppress(AttributeError):
+                del args._worktree_wait_callback
         occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
         if occupancy_warning is not None:
             dispatch_warnings = [*dispatch_warnings, occupancy_warning]
