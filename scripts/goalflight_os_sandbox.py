@@ -212,13 +212,16 @@ def _scheme_string(value: str) -> str:
 def _grok_read_only_cleanup_lock_filters(steer_file: str) -> list[str]:
     """Return regex grants for this dispatch's dynamically named cleanup locks."""
     steer_path = Path(steer_file).expanduser()
-    parent = re.escape(str(steer_path.parent.resolve(strict=False)))
     stem = re.escape(steer_path.stem)
-    prefix = f"{parent}/\\.{stem}"
-    return [
-        f'(regex #"^{prefix}\\.cleanup\\.(?:receipt|end)'
-        f'\\.[A-Za-z0-9]{{1,128}}\\.[1-9][0-9]*\\.lock$")'
-    ]
+    suffix = r"\.[A-Za-z0-9]{1,128}\.[1-9][0-9]*\.lock$"
+    filters: list[str] = []
+    for parent in _unique_real_paths([str(steer_path.parent)]):
+        prefix = f"{re.escape(parent)}/\\.{stem}"
+        filters.extend((
+            f'(regex #"^{prefix}\\.cleanup\\.receipt{suffix}")',
+            f'(regex #"^{prefix}\\.cleanup\\.end{suffix}")',
+        ))
+    return filters
 
 
 def goalflight_worker_channel_roots() -> list[str]:

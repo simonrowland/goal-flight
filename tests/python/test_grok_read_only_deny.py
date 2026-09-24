@@ -231,7 +231,11 @@ def test_grok_read_only_profile_fences_project_and_allows_account_state() -> Non
             assert f'(subpath "{root.resolve()}")' in profile, root
         assert "(regex #\"^" in profile
         escaped_stem = steer_file.stem.replace(".", r"\.")
-        assert f"\\.{escaped_stem}\\.cleanup\\.(?:receipt|end)" in profile
+        for operation in ("receipt", "end"):
+            assert (
+                f"\\.{escaped_stem}\\.cleanup\\.{operation}"
+                in profile
+            )
 
 
 def test_read_only_profile_rejects_state_symlink_outside_selected_account() -> None:
