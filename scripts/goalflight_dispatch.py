@@ -3465,47 +3465,6 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
     )
 
 
-def _withdraw_recovery_plan(
-    dispatch_id: str, project_root: str,
-) -> tuple[Path, dict, str | None]:
-    """Run withdrawal admission and settlement dry-runs before printing a command.
-
-    The first probe discovers the recorded owner without changing state. The
-    second probe uses the same owner/operator arguments that the printed
-    command will use, so guidance is emitted only when both stages of that
-    command are safe.
-    """
-    probe = argparse.Namespace(
-        dispatch_id=dispatch_id,
-        project_root=project_root,
-        operator=True,
-        controller_label=None,
-        dry_run=True,
-    )
-    root, _, attempt, record, carriers, _, _ = (
-        _withdraw_preflight(probe)
-    )
-    carrier_reason = _plain_withdrawal_carrier_reason(dispatch_id, carriers)
-    if carrier_reason:
-        raise ValueError(carrier_reason)
-    owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
-    owner = str(owner).strip() if owner else None
-    settlement_args = argparse.Namespace(
-        dispatch_id=dispatch_id,
-        project_root=str(root),
-        operator=owner is None,
-        controller_label=owner,
-        dry_run=True,
-        reason="retry same task after held dispatch ended",
-        superseded_by=None,
-    )
-    _withdraw_preflight(settlement_args)
-    _settle_final_dispatch(
-        settlement_args, _queue_entry_path(dispatch_id).parent,
-    )
-    return root, attempt, owner
-
-
 def _withdraw_recovery_command(
     held_id: str,
     project_root: str,
@@ -3527,84 +3486,36 @@ def _withdraw_recovery_command(
     return shlex.join(command)
 
 
-def _plain_withdrawal_carrier_reason(dispatch_id: str, carriers: dict[Path, dict]) -> str | None:
-    expected = _queue_entry_path(dispatch_id)
-    candidates = set(carriers)
-    try:
-        candidates.update(path for path in _queue_dir_listing(expected.parent)
-                          if not path.name.endswith(".failed") and (path == expected or
-                          path.name.split(".json.claimed-", 1)[0].removesuffix(".json").casefold() == dispatch_id.casefold()))
-    except OSError as exc:
-        return f"queue carrier listing failed ({exc})"
-    if not candidates: return None
-    if len(candidates) == 1:
-        path, payload = next((path, carriers.get(path)) for path in candidates)
-        filename_id = path.name.split(".json.claimed-", 1)[0].removesuffix(".json")
-        if (filename_id == dispatch_id and isinstance(payload, dict)
-                and payload.get("dispatch_id") == dispatch_id):
-            return None
-    return (f"{len(candidates)} queue carriers are present" if len(candidates) != 1
-            else "carrier filename, payload, and holder IDs are not byte-identical")
-
-
 def _completion_refusal_guidance(
     diagnostics: list[str], project_root: str, *, args=None,
 ) -> str:
-    """Explain how to release a confirmed-dead task holder safely."""
+    """Explain how to release a task holder; withdrawal enforces safety."""
     rows, publication_failed = _blocking_rows_from_diagnostics(diagnostics)
-    held = [(did, state) for did, state in rows if state in _SELF_HELD_LEDGER_STATES]
     task_ids = list(getattr(args, "task_ids", []) or [])
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
-    if held:
+    if rows:
         lines = []
-        blockers = []
         for dispatch_id, state in rows:
             if state not in _SELF_HELD_LEDGER_STATES:
-                blockers.append(
-                    f"{dispatch_id} state={state}: holder is live or liveness is indeterminate"
-                )
-                continue
-            try:
-                root, attempt, owner = _withdraw_recovery_plan(
-                    dispatch_id, project_root
-                )
-            except Exception as exc:
-                liveness = getattr(exc, "liveness", None)
-                if liveness == "live":
-                    reason = "holder is LIVE; do not withdraw it"
-                elif liveness == "indeterminate":
-                    reason = "liveness is indeterminate; do not withdraw it yet"
-                else:
-                    reason = (
-                        f"withdraw dry-run refused ({exc}); resume it or wait for "
-                        "verification; opening a new task row is interim"
+                if not goalflight_dispatch_states.is_terminal_state(state):
+                    lines.append(
+                        f"{task_text} is held by a worker that may still be running "
+                        f"({state}): wait for it, or steer it to stop before withdrawing. "
+                        f"Holder: {dispatch_id}."
                     )
-                blockers.append(f"{dispatch_id} state={state}: {reason}")
                 continue
-            withdrawal_state = str(attempt.get("terminal_state") or state)
-            if withdrawal_state not in _SELF_HELD_LEDGER_STATES:
-                blockers.append(
-                    f"{dispatch_id} state={state}: withdrawal state is "
-                    f"{withdrawal_state or 'unknown'}; no withdrawal command is safe"
-                )
-                continue
-            if len(rows) != 1:
-                blockers.append(f"{dispatch_id} state={state}: multiple task holders")
-                continue
+            record = _find_dispatch_record(dispatch_id) or {}
+            owner = str(record.get("controller_label") or "").strip() or None
             lines.append(
-                f"{task_text} is held by {dispatch_id} (state {state}). Run:\n"
-                f"  {_withdraw_recovery_command(dispatch_id, str(root), owner=owner, operator=owner is None)}"
+                f"{task_text} is held by {dispatch_id} (state {state}). "
+                "If you've confirmed that worker is gone, release it with:\n"
+                f"  {_withdraw_recovery_command(dispatch_id, project_root, owner=owner, operator=owner is None)}\n"
+                "(withdraw refuses if it can't prove the worker is dead; see "
+                "protocols/dispatch-danger.md). Then re-run this dispatch."
             )
-        if not blockers:
-            lines.append("then re-run your dispatch command")
-        elif blockers:
-            lines.append(
-                "Do not re-run your dispatch command; needs manual review: blockers: "
-                + "; ".join(blockers)
-                + "."
-            )
-        text = "\n".join(lines)
-        return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
+        if lines:
+            text = "\n".join(lines)
+            return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     return _reconcile_outbox_guidance(project_root)
 
 

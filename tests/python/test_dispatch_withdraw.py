@@ -510,8 +510,9 @@ def test_active_missing_identity_evidence_refused_in_guidance_and_withdraw(prepa
         args=SimpleNamespace(task_ids=["t-missing-evidence"]),
     )
 
-    assert "goalflight_dispatch.py" not in guidance
-    assert "liveness is indeterminate" in guidance
+    assert "task t-missing-evidence is held by withdraw-test (state worker_dead)" in guidance
+    assert "goalflight_dispatch.py withdraw withdraw-test" in guidance
+    assert "withdraw refuses if it can't prove the worker is dead" in guidance
 
     code, result = withdraw()
 
@@ -809,68 +810,6 @@ def _stub_main_admission(monkeypatch):
     monkeypatch.setattr(dispatch, "_validate_claude_auth_before_attempt", lambda *_args: None)
 
 
-def terminal_guidance_holder(project, authority, dispatch_id, task_id):
-    journal_dispatch_id = "sanitized-holder" if "/" in dispatch_id else dispatch_id
-    prepared = authority.prepare_attempt(
-        journal_dispatch_id,
-        owner_controller_label="owner", owner_session_nonce="test-session",
-    )
-    assert prepared.committed and prepared.value is not None
-    if journal_dispatch_id != dispatch_id:
-        with sqlite3.connect(authority.path) as connection:
-            connection.execute(
-                "UPDATE dispatch_attempts SET dispatch_id = ? WHERE attempt_id = ?",
-                (dispatch_id, prepared.value.attempt_id),
-            )
-    record = {
-        "dispatch_id": dispatch_id, "controller_label": "owner",
-        "project_root": str(project), "state": "worker_dead",
-        "terminal_state": "worker_dead", "task_ids": [task_id],
-        "worker_still_alive": False,
-    }
-    ledger.write_record(record)
-    carrier = dispatch._queue_entry_path(dispatch_id)
-    carrier.parent.mkdir(parents=True, exist_ok=True)
-    carrier.write_text(json.dumps(record))
-    assert authority.commit_terminal(
-        prepared.value.attempt_id,
-        terminal_state="worker_dead",
-        observation={"state": "worker_dead", "reason": "stale worker"},
-    ).committed
-    return carrier, record
-
-
-@pytest.mark.parametrize("shape", ["sanitized", "case", "mismatch"])
-def test_guidance_rejects_non_plain_carrier_identity(prepared, shape):
-    project, authority, _, _ = prepared
-    dispatch_id = {
-        "sanitized": "a/b",
-        "case": "Foo",
-        "mismatch": "mismatch-holder",
-    }[shape]
-    carrier, record = terminal_guidance_holder(
-        project, authority, dispatch_id, f"task-{shape}",
-    )
-    if shape == "case":
-        carrier.unlink()
-        carrier = carrier.with_name("foo.json")
-        carrier.write_text(json.dumps({**record, "dispatch_id": "foo"}))
-    elif shape == "mismatch":
-        record["dispatch_id"] = "other"
-        carrier.write_text(json.dumps(record))
-
-    guidance = dispatch._completion_refusal_guidance(
-        [f'dispatch_id="{dispatch_id}" state="worker_dead"'],
-        str(project),
-        args=SimpleNamespace(task_ids=[f"task-{shape}"]),
-    )
-
-    assert "goalflight_dispatch.py" not in guidance
-    assert "then re-run your dispatch command" not in guidance
-    assert "needs manual review" in guidance
-    assert "carrier filename, payload, and holder IDs are not byte-identical" in guidance
-
-
 def test_unowned_guidance_command_runs_with_operator(tmp_path, monkeypatch):
     project = tmp_path / "unowned-project"
     project.mkdir()
@@ -958,6 +897,8 @@ def test_guidance_withdraw_step_runs_for_each_holder_state(
         for line in guidance.splitlines()
         if "goalflight_dispatch.py" in line and " withdraw " in line
     )
+    assert "task t-guidance is held by withdraw-test (state " + terminal_state + ")" in guidance
+    assert "withdraw refuses if it can't prove the worker is dead" in guidance
     assert "--superseded-by" not in command
     result = subprocess.run(
         shlex.split(command), cwd=project, text=True, capture_output=True,
@@ -1022,7 +963,7 @@ def test_guidance_withdraw_repairs_final_without_outbox(prepared, terminal_state
     )
 
 
-def test_guidance_does_not_offer_rerun_with_mixed_holders(prepared):
+def test_guidance_informs_mixed_holders(prepared):
     project, authority, attempt, carrier = prepared
     holder = ledger.read_record("withdraw-test")
     holder.update(
@@ -1051,28 +992,26 @@ def test_guidance_does_not_offer_rerun_with_mixed_holders(prepared):
     ).committed
     ledger.write_record({
         "dispatch_id": "live-holder", "controller_label": "owner",
-        "project_root": str(project), "state": "worker_dead",
-        "terminal_state": "worker_dead", "task_ids": ["t-mixed"],
-        "worker_still_alive": False,
+        "project_root": str(project), "state": "running",
+        "terminal_state": "unknown", "task_ids": ["t-mixed"],
     })
 
     guidance = dispatch._completion_refusal_guidance(
         [
             'dispatch_id="withdraw-test" state="worker_dead"',
-            'dispatch_id="live-holder" state="worker_dead"',
+            'dispatch_id="live-holder" state="running"',
         ],
         str(project),
         args=SimpleNamespace(task_ids=["t-mixed"]),
     )
 
-    assert "goalflight_dispatch.py" not in guidance
-    assert "then re-run your dispatch command" not in guidance
-    assert "needs manual review: blockers:" in guidance
-    assert "live-holder state=worker_dead" in guidance
-    assert "live-holder state=worker_dead: liveness is indeterminate" in guidance
+    assert guidance.count("goalflight_dispatch.py withdraw") == 1
+    assert "task t-mixed is held by a worker that may still be running (running)" in guidance
+    assert "Holder: live-holder" in guidance
+    assert "wait for it, or steer it to stop before withdrawing" in guidance
 
 
-def test_guidance_refuses_superseded_without_withdrawn_by(prepared):
+def test_guidance_informs_superseded_without_withdrawn_by(prepared):
     project, authority, attempt, carrier = prepared
     holder = ledger.read_record("withdraw-test")
     holder.update(
@@ -1093,12 +1032,12 @@ def test_guidance_refuses_superseded_without_withdrawn_by(prepared):
         args=SimpleNamespace(task_ids=["t-superseded"]),
     )
 
-    assert "goalflight_dispatch.py" not in guidance
-    assert "task-release effect is unproven" in guidance
-    assert "then re-run your dispatch command" not in guidance
+    assert "task t-superseded is held by withdraw-test (state superseded)" in guidance
+    assert "goalflight_dispatch.py withdraw withdraw-test" in guidance
+    assert "withdraw refuses if it can't prove the worker is dead" in guidance
 
 
-def test_guidance_refuses_multiple_holders_without_command(prepared):
+def test_guidance_prints_each_holder_command(prepared):
     project, authority, attempt, carrier = prepared
     holder = ledger.read_record("withdraw-test")
     holder.update(
@@ -1144,15 +1083,15 @@ def test_guidance_refuses_multiple_holders_without_command(prepared):
         for line in guidance.splitlines()
         if "goalflight_dispatch.py" in line and " withdraw " in line
     ]
-    assert commands == []
-    assert "withdraw-test state=worker_dead: multiple task holders" in guidance
-    assert "withdraw-other state=worker_dead: multiple task holders" in guidance
-    assert guidance.count("then re-run your dispatch command") == 0
+    assert len(commands) == 2
+    assert "withdraw-test (state worker_dead)" in guidance
+    assert "withdraw-other (state worker_dead)" in guidance
+    assert guidance.count("Then re-run this dispatch.") == 2
     assert ledger.read_record("withdraw-test")["terminal_state"] == "worker_dead"
     assert ledger.read_record("withdraw-other")["terminal_state"] == "worker_dead"
 
 
-def test_main_guidance_uses_journal_worker_identity_for_liveness(
+def test_main_guidance_reports_ledger_holder_without_liveness_probe(
     prepared, monkeypatch, capsys
 ):
     project, authority, attempt, _carrier = prepared
@@ -1185,8 +1124,9 @@ def test_main_guidance_uses_journal_worker_identity_for_liveness(
     ])
     assert code == 64
     guidance = capsys.readouterr().err
-    assert "holder is LIVE" in guidance
-    assert "To retry the same task:" not in guidance
+    assert "task t-123 is held by withdraw-test (state worker_dead)" in guidance
+    assert "withdraw refuses if it can't prove the worker is dead" in guidance
+    assert "holder is LIVE" not in guidance
 
 
 @pytest.mark.parametrize("terminal_state", ["blocked", "abandoned"])
