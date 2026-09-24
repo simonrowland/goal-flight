@@ -40,6 +40,7 @@ import goalflight_os_sandbox as S  # noqa: E402
 
 
 def _args(**over):
+    account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
     base = dict(
         agent="grok-code",
         shape="bash",
@@ -47,7 +48,14 @@ def _args(**over):
         cwd=None,
         read_only=False,
         os_sandbox=None,
-        account=None,
+        account="probe",
+        _account_env={
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(account_home / ".config"),
+            "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+            "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+        },
+        _grok_selected_account=None,
         billing="sub",
         dispatch_id="t",
         parent_dispatch_id=None,
@@ -62,10 +70,15 @@ def _args(**over):
 
 
 def _grok_argv(args) -> list[str]:
-    with tempfile.TemporaryDirectory() as td:
-        prompt = Path(td) / "prompt.md"
-        prompt.write_text("Review the change.\n", encoding="utf-8")
-        argv, _stdin = D.build_worker(args, prompt, [])
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            prompt = Path(td) / "prompt.md"
+            prompt.write_text("Review the change.\n", encoding="utf-8")
+            argv, _stdin = D.build_worker(args, prompt, [])
+    finally:
+        private_tmp = getattr(args, "_grok_read_only_tmpdir", None)
+        if private_tmp:
+            shutil.rmtree(private_tmp, ignore_errors=True)
     return argv
 
 
@@ -113,6 +126,26 @@ def test_macos_read_only_grok_wraps_profile_without_bash_deny() -> None:
     assert f'(subpath "{ROOT}")' not in profile
 
 
+def test_macos_read_only_grok_refuses_unresolved_host_seat() -> None:
+    args = _args(
+        account=None,
+        _account_env={},
+        _grok_selected_account=None,
+        read_only=True,
+    )
+    with (
+        mock.patch.object(D.goalflight_compat, "is_macos", return_value=True),
+        mock.patch.object(S, "preflight_os_sandbox", return_value="read-only"),
+        mock.patch.object(S.shutil, "which", return_value="/usr/bin/sandbox-exec"),
+    ):
+        try:
+            _grok_argv(args)
+        except D.DispatchUsageError as exc:
+            assert "resolved account-scoped HOME" in str(exc), exc
+        else:
+            raise AssertionError("host-seat read-only Grok launch must refuse")
+
+
 def test_writable_grok_carries_no_deny_rules() -> None:
     """The default write dispatch must be untouched.
 
@@ -146,33 +179,77 @@ def test_read_only_git_disables_optional_index_locks() -> None:
 
 def test_grok_read_only_profile_fences_project_and_allows_account_state() -> None:
     account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
-    environment = {
-        "HOME": str(account_home),
-        "XDG_CONFIG_HOME": str(account_home / ".config"),
-        "XDG_STATE_HOME": str(account_home / ".local" / "state"),
-        "XDG_DATA_HOME": str(account_home / ".local" / "share"),
-    }
-    profile, roots = S.macos_sandbox_profile(
-        str(ROOT),
-        S.OS_SANDBOX_READ_ONLY,
-        agent="grok-code",
-        command="grok",
-        environment=environment,
+    with (
+        tempfile.TemporaryDirectory(prefix="gf-grok-read-only-tmp-") as tmp,
+        tempfile.TemporaryDirectory(prefix="gf-grok-read-only-dispatch-") as dispatch,
+    ):
+        steer_file = Path(dispatch) / "current.steer.jsonl"
+        steer_file.touch()
+        steer_lock = steer_file.with_name(f".{steer_file.name}.lock")
+        steer_receipts = steer_file.with_name(f"{steer_file.stem}.receipts.jsonl")
+        environment = {
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(account_home / ".config"),
+            "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+            "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+            "TMPDIR": tmp,
+            "GOALFLIGHT_STEER_FILE": str(steer_file),
+        }
+        profile, roots = S.macos_sandbox_profile(
+            str(ROOT),
+            S.OS_SANDBOX_READ_ONLY,
+            agent="grok-code",
+            command="grok",
+            environment=environment,
+        )
+        expected = {
+            account_home / ".grok",
+            account_home / ".goal-flight",
+            account_home / ".config" / "grok",
+            account_home / ".local" / "state" / "goal-flight",
+            account_home / ".local" / "share" / "grok",
+            account_home / ".cache" / "grok",
+            Path(tmp),
+            steer_file,
+            steer_lock,
+            steer_receipts,
+        }
+        root_paths = {Path(root).resolve() for root in roots}
+        assert {path.resolve() for path in expected} <= root_paths, roots
+        assert Path(tempfile.gettempdir()).resolve() not in root_paths
+        assert Path("/tmp").resolve() not in root_paths
+        assert Path("/private/tmp").resolve() not in root_paths
+        assert Path.home() / ".goal-flight" / "messages" not in root_paths
+        assert f'(subpath "{ROOT}")' not in profile
+        scripts_dir = ROOT / "scripts"
+        assert f'(subpath "{scripts_dir}")' not in profile
+        for root in expected:
+            assert f'(subpath "{root.resolve()}")' in profile, root
+
+
+def test_read_only_profile_rejects_any_repository_or_git_overlap() -> None:
+    cases = (
+        {"TMPDIR": str(ROOT / "scratch")},
+        {"HOME": str(ROOT / ".git" / "linked-home")},
     )
-    expected = {
-        account_home / ".grok",
-        account_home / ".goal-flight",
-        account_home / ".config" / "grok",
-        account_home / ".local" / "state" / "goal-flight",
-        account_home / ".local" / "share" / "grok",
-        account_home / ".cache" / "grok",
-    }
-    assert expected <= {Path(root) for root in roots}, roots
-    assert f'(subpath "{ROOT}")' not in profile
-    scripts_dir = ROOT / "scripts"
-    assert f'(subpath "{scripts_dir}")' not in profile
-    for root in expected:
-        assert f'(subpath "{root}")' in profile, root
+    for extra in cases:
+        environment = {
+            "HOME": str(Path.home() / ".cursor"),
+            "TMPDIR": tempfile.gettempdir(),
+            **extra,
+        }
+        try:
+            S.macos_write_roots(
+                str(ROOT),
+                S.OS_SANDBOX_READ_ONLY,
+                agent="cursor",
+                command="cursor-agent",
+                environment=environment,
+            )
+        except S.OsSandboxError as exc:
+            assert "intersects protected" in str(exc), exc
+        else:
+            raise AssertionError(f"overlapping read-only grant was accepted: {extra}")
 
 
 def _sandbox_exec_available() -> bool:
@@ -203,6 +280,22 @@ def test_grok_read_only_profile_blocks_shell_writes_but_allows_git_show() -> Non
     probe_dir = ROOT / f".goalflight-grok-read-only-probe-{os.getpid()}"
     shutil.rmtree(probe_dir, ignore_errors=True)
     probe_dir.mkdir()
+    private_tmp = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-probe-"))
+    dispatch_dir = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-dispatch-"))
+    steer_file = dispatch_dir / "current.steer.jsonl"
+    steer_file.touch()
+    account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
+    environment = {
+        "HOME": str(account_home),
+        "XDG_CONFIG_HOME": str(account_home / ".config"),
+        "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+        "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+        "TMPDIR": str(private_tmp),
+        "GOALFLIGHT_STEER_FILE": str(steer_file),
+    }
+    sibling_dispatch_file = dispatch_dir / "sibling.status.json"
+    repo_file = ROOT / f".goalflight-grok-read-only-repo-{os.getpid()}"
+    repo_file.unlink(missing_ok=True)
 
     def run(command: str, args: list[str]) -> subprocess.CompletedProcess[str]:
         prepared = S.prepare_os_sandbox_command(
@@ -211,11 +304,12 @@ def test_grok_read_only_profile_blocks_shell_writes_but_allows_git_show() -> Non
             cwd=str(probe_dir),
             os_sandbox=S.OS_SANDBOX_READ_ONLY,
             agent="grok-code",
+            environment=environment,
         )
         return subprocess.run(
             [prepared.command, *prepared.args],
             cwd=str(probe_dir),
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env={**os.environ, **environment, "GIT_OPTIONAL_LOCKS": "0"},
             text=True,
             capture_output=True,
             timeout=10,
@@ -223,6 +317,10 @@ def test_grok_read_only_profile_blocks_shell_writes_but_allows_git_show() -> Non
         )
 
     try:
+        tmp_write = run("/bin/sh", ["-c", 'echo x > "$TMPDIR/allowed"'])
+        assert tmp_write.returncode == 0, tmp_write
+        assert (private_tmp / "allowed").exists(), tmp_write
+
         shell_write = run("/bin/sh", ["-c", "echo x > f"])
         assert shell_write.returncode != 0, shell_write
         assert not (probe_dir / "f").exists(), shell_write
@@ -234,7 +332,24 @@ def test_grok_read_only_profile_blocks_shell_writes_but_allows_git_show() -> Non
         assert python_write.returncode != 0, python_write
         assert not (probe_dir / "f").exists(), python_write
 
+        sibling_write = run(
+            sys.executable,
+            ["-c", f"open({str(sibling_dispatch_file)!r}, 'w').write('x')"],
+        )
+        assert sibling_write.returncode != 0, sibling_write
+        assert not sibling_dispatch_file.exists(), sibling_write
+
+        repo_write = run(
+            sys.executable,
+            ["-c", f"open({str(repo_file)!r}, 'w').write('x')"],
+        )
+        assert repo_write.returncode != 0, repo_write
+        assert not repo_file.exists(), repo_write
+
         git_show = run("git", ["show", "HEAD", "--stat"])
         assert git_show.returncode == 0, git_show
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
+        shutil.rmtree(private_tmp, ignore_errors=True)
+        shutil.rmtree(dispatch_dir, ignore_errors=True)
+        repo_file.unlink(missing_ok=True)

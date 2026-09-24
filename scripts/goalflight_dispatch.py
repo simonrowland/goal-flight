@@ -70,6 +70,7 @@ import urllib.parse
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -687,6 +688,17 @@ def _validate_os_sandbox_boundary(args) -> None:
         return
     cwd = getattr(args, "cwd", None)
     if not cwd:
+        return
+    if (
+        profile == "read-only"
+        and str(getattr(args, "agent", "") or "")
+        in {"grok-code", "grok-research"}
+        and goalflight_compat.is_macos()
+    ):
+        # The bash Grok wrapper creates the per-dispatch TMPDIR and resolves
+        # the account-scoped HOME immediately before profile construction.
+        # Let that single path perform the fail-closed validation; this
+        # pre-side-effect check has neither value available yet.
         return
     # Function-local import, matching this module's convention for the readiness
     # helpers: dispatch must not fail to load if the sandbox module is absent.
@@ -19273,13 +19285,50 @@ def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
         return [*argv, "--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
     from goalflight_os_sandbox import prepare_os_sandbox_command
 
+    account = getattr(args, "account", None) or grok_selected_account(args)
+    account_env = getattr(args, "_account_env", None)
+    if not account or not isinstance(account_env, dict):
+        raise DispatchUsageError(
+            "--read-only Grok on macOS requires a resolved account-scoped HOME; "
+            "refusing the host-seat launch"
+        )
+    expected_home = _account_home(str(account), "grok").expanduser().resolve(
+        strict=False
+    )
+    actual_home_raw = str(account_env.get("HOME") or "").strip()
+    actual_home = (
+        Path(actual_home_raw).expanduser().resolve(strict=False)
+        if actual_home_raw
+        else None
+    )
+    if actual_home != expected_home:
+        raise DispatchUsageError(
+            f"--read-only Grok account {account!r} did not resolve to its "
+            f"account HOME {expected_home}; refusing the launch"
+        )
+    private_tmp = getattr(args, "_grok_read_only_tmpdir", None)
+    if not private_tmp:
+        try:
+            private_tmp = tempfile.mkdtemp(
+                prefix="goalflight-grok-read-only-",
+                dir=tempfile.gettempdir(),
+            )
+        except OSError as exc:
+            raise DispatchUsageError(
+                f"--read-only Grok could not create its private TMPDIR: {exc}"
+            ) from exc
+        args._grok_read_only_tmpdir = private_tmp
+    account_env["TMPDIR"] = str(private_tmp)
+    account_env["GOALFLIGHT_STEER_FILE"] = str(
+        goalflight_dispatch_paths.steer_file(str(args.dispatch_id))
+    )
     prepared = prepare_os_sandbox_command(
         argv[0],
         list(argv[1:]),
         cwd=str(_worker_cwd(args)),
         os_sandbox="read-only",
         agent=str(getattr(args, "agent", "") or "grok"),
-        environment=getattr(args, "_account_env", None),
+        environment=account_env,
     )
     return [prepared.command, *prepared.args]
 

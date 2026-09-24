@@ -11,7 +11,11 @@ import platform
 import shutil
 import tempfile
 
-from goalflight_codex_sandbox import linked_worktree_writable_roots, worker_task_store_root
+from goalflight_codex_sandbox import (
+    _git_path,
+    linked_worktree_writable_roots,
+    worker_task_store_root,
+)
 from typing import Any
 
 import goalflight_compat
@@ -137,11 +141,67 @@ def _unique_real_paths(paths: list[str]) -> list[str]:
 
 def _path_contains(root: str, child: str) -> bool:
     try:
-        root_path = Path(root).expanduser().resolve()
-        child_path = Path(child).expanduser().resolve()
+        root_path = Path(root).expanduser().resolve(strict=False)
+        child_path = Path(child).expanduser().resolve(strict=False)
         return root_path == child_path or root_path in child_path.parents
     except OSError:
         return False
+
+
+def _path_intersects(left: str | Path, right: str | Path) -> bool:
+    """Return whether two canonical paths overlap in either direction."""
+    try:
+        left_path = Path(left).expanduser().resolve(strict=False)
+        right_path = Path(right).expanduser().resolve(strict=False)
+    except OSError as exc:
+        raise OsSandboxError(
+            f"cannot canonicalize sandbox path {left!r} or {right!r}: {exc}"
+        ) from exc
+    return (
+        left_path == right_path
+        or left_path in right_path.parents
+        or right_path in left_path.parents
+    )
+
+
+def _protected_worktree_paths(cwd: str) -> list[str]:
+    """Return the repository, worktree, and linked-worktree Git boundaries."""
+    cwd_path = Path(cwd).expanduser().resolve(strict=False)
+    protected: list[Path] = [cwd_path]
+    repository_root = _git_path(cwd_path, "--show-toplevel")
+    git_dir = _git_path(cwd_path, "--git-dir")
+    common_dir = _git_path(cwd_path, "--git-common-dir")
+    for path in (repository_root, git_dir, common_dir):
+        if path is not None:
+            protected.append(path)
+    if common_dir is not None and common_dir.name == ".git":
+        # A linked worktree's common .git directory owns every sibling
+        # worktree plus shared objects and refs; protect the repository root
+        # and worktrees subtree in addition to the metadata directories.
+        protected.extend((common_dir.parent, common_dir.parent / "worktrees"))
+    return _unique_real_paths([str(path) for path in protected])
+
+
+def _is_bash_grok(agent: str | None, command: str) -> bool:
+    label = (agent or "").lower()
+    binary = Path(command).name.lower()
+    if label in {"grok-code", "grok-research"}:
+        return True
+    return binary == "grok" and not label.endswith("-acp")
+
+
+def _resolved_grok_account_home(environment: Mapping[str, str]) -> Path | None:
+    raw_home = str(environment.get("HOME") or "").strip()
+    if not raw_home:
+        return None
+    try:
+        home = Path(raw_home).expanduser().resolve(strict=False)
+        accounts_root = (Path.home() / ".goal-flight" / "accounts").resolve(strict=False)
+    except OSError:
+        return None
+    if home.name != "grok" or accounts_root not in home.parents:
+        return None
+    return home
 
 
 def _scheme_string(value: str) -> str:
@@ -267,22 +327,48 @@ def macos_write_roots(
     environment: Mapping[str, str] | None = None,
 ) -> list[str]:
     roots: list[str] = []
+    env = os.environ if environment is None else environment
+    grok_bash_read_only = (
+        profile == OS_SANDBOX_READ_ONLY and _is_bash_grok(agent, command)
+    )
     if profile == OS_SANDBOX_WORKSPACE_WRITE:
         roots.append(cwd)
         label = (agent or "").lower()
         if label in {"codex", "codex-acp"}:
             roots.extend(linked_worktree_writable_roots(cwd))
-    # Grok can use the worker's private temp directory for transient files;
-    # the dispatch launcher owns status/tail files and redirects Grok's
-    # stdout/stderr before exec, so the dispatch directory is not a Grok write
-    # root unless that ownership changes.
-    tmpdir = tempfile.gettempdir()
-    temp_roots = _unique_real_paths([
-        tmpdir,
-        os.environ.get("TMPDIR", ""),
-        "/tmp",
-        "/private/tmp",
-    ])
+    if grok_bash_read_only:
+        if _resolved_grok_account_home(env) is None:
+            raise OsSandboxError(
+                "read-only Grok requires a resolved account-scoped HOME; "
+                "refusing the host-seat launch"
+            )
+        private_tmp = str(env.get("TMPDIR") or "").strip()
+        if not private_tmp:
+            raise OsSandboxError(
+                "read-only Grok requires a private per-dispatch TMPDIR"
+            )
+        private_tmp_path = Path(private_tmp).expanduser().resolve(strict=False)
+        temp_root = Path(tempfile.gettempdir()).expanduser().resolve(strict=False)
+        if (
+            private_tmp_path == temp_root
+            or private_tmp_path.parent != temp_root
+            or not private_tmp_path.is_dir()
+        ):
+            raise OsSandboxError(
+                "read-only Grok TMPDIR must be an existing private child of "
+                f"{temp_root}"
+            )
+        # The dispatcher creates this 0700 directory for this dispatch. Never
+        # add the shared system temp root, which contains sibling dispatches.
+        temp_roots = _unique_real_paths([str(private_tmp_path)])
+    else:
+        tmpdir = tempfile.gettempdir()
+        temp_roots = _unique_real_paths([
+            tmpdir,
+            env.get("TMPDIR", ""),
+            "/tmp",
+            "/private/tmp",
+        ])
     for root in temp_roots:
         if _path_contains(root, cwd):
             raise OsSandboxError(
@@ -290,9 +376,33 @@ def macos_write_roots(
                 f"inside allowed temp root {root!r}; move the worktree or use off"
             )
     roots.extend(temp_roots)
+    if grok_bash_read_only:
+        # _cmd_steer --wait calls append_worker_wait_started through
+        # goalflight_steer_mailbox.py, so Grok writes only its own steer
+        # carrier. carrier_transaction() also creates the exact mailbox lock
+        # from goalflight_messages.mail_lock_path(), and
+        # worker_wait_receipts_path() owns the same dispatch's reply receipt.
+        # The dispatcher creates status/tail and redirects stdout to the
+        # already-open tail descriptor; the Grok adapter and
+        # configs/grok/skills/goal-flight/SKILL.md do not write the global
+        # messages or task-store trees, so no sibling channel is granted.
+        steer_file = str(env.get("GOALFLIGHT_STEER_FILE") or "").strip()
+        if steer_file:
+            steer_path = Path(steer_file).expanduser()
+            worker_channel_roots = [
+                str(steer_path),
+                str(steer_path.with_name(f".{steer_path.name}.lock")),
+                str(steer_path.with_name(
+                    f"{steer_path.stem}.receipts.jsonl"
+                )),
+            ]
+        else:
+            worker_channel_roots = []
+    else:
+        worker_channel_roots = goalflight_worker_channel_roots()
     extra_roots = _unique_real_paths(
         _agent_state_roots(agent, command, environment=environment)
-        + goalflight_worker_channel_roots()
+        + worker_channel_roots
     )
     for root in extra_roots:
         if _path_contains(root, cwd):
@@ -301,6 +411,16 @@ def macos_write_roots(
                 f"inside allowed agent state root {root!r}; move the worktree or use off"
             )
     roots.extend(extra_roots)
+    if profile == OS_SANDBOX_READ_ONLY:
+        protected = _protected_worktree_paths(cwd)
+        for grant in _unique_real_paths(roots):
+            for boundary in protected:
+                if _path_intersects(grant, boundary):
+                    raise OsSandboxError(
+                        "read-only sandbox grant "
+                        f"{grant!r} intersects protected repository/worktree/Git "
+                        f"path {boundary!r}; refusing the launch"
+                    )
     return _unique_real_paths(roots)
 
 

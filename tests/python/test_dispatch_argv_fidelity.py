@@ -32,6 +32,17 @@ import goalflight_ledger as L  # noqa: E402
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
 
+
+def _grok_read_only_account_env() -> dict[str, str]:
+    account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
+    return {
+        "HOME": str(account_home),
+        "XDG_CONFIG_HOME": str(account_home / ".config"),
+        "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+        "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+    }
+
+
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="worktree cwd and worker-CLI resume are local POSIX-only",
@@ -545,6 +556,8 @@ def test_synthesized_grok_resume_preserves_legacy_read_only_record(
         # root is itself writable in the profile. The argv contract under test
         # is independent of the temporary fixture path.
         parsed.cwd = str(ROOT)
+        parsed.account = "probe"
+        parsed._account_env = _grok_read_only_account_env()
     worker_argv, _stdin = D.build_worker(parsed, prompt, [])
     if D.goalflight_compat.is_macos():
         assert Path(worker_argv[0]).name == "sandbox-exec", worker_argv
