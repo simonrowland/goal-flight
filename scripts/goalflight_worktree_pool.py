@@ -1643,6 +1643,17 @@ def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
                     actual_size += len(chunk)
             if actual_size != expected_size or actual.hexdigest() != digest:
                 raise OSError("object hash does not match pointer")
+            worktree_actual = hashlib.sha256()
+            worktree_size = 0
+            with (worktree_path / path).open("rb") as worktree_file:
+                for chunk in iter(lambda: worktree_file.read(1024 * 1024), b""):
+                    worktree_actual.update(chunk)
+                    worktree_size += len(chunk)
+            if (
+                worktree_size != expected_size
+                or worktree_actual.hexdigest() != digest
+            ):
+                raise OSError("worktree bytes do not match pointer")
         except OSError as exc:
             raise WorktreeSeatResetRefused(
                 f"LFS object for {path!r} is missing or unreadable; refusing reset"
@@ -1666,13 +1677,22 @@ def _refuse_ignored_tree_collisions(
     if not ignored:
         return
     tree_paths = _tree_paths(worktree_path, head) | _tree_paths(worktree_path, target)
+    ignorecase = _git_proc(worktree_path, "config", "--bool", "core.ignorecase")
+    case_insensitive = bool(
+        ignorecase is not None
+        and ignorecase.returncode == 0
+        and ignorecase.stdout.strip().lower() == "true"
+    )
+    if case_insensitive:
+        tree_paths = {tree_path.casefold() for tree_path in tree_paths}
     for raw_path in ignored:
         path = raw_path.rstrip("/")
         if not path:
             continue
-        components = path.split("/")
-        if path in tree_paths or any(
-            tree_path.startswith(path + "/") for tree_path in tree_paths
+        compare_path = path.casefold() if case_insensitive else path
+        components = compare_path.split("/")
+        if compare_path in tree_paths or any(
+            tree_path.startswith(compare_path + "/") for tree_path in tree_paths
         ) or any(
             "/".join(components[:end]) in tree_paths
             for end in range(1, len(components))
@@ -2535,6 +2555,10 @@ def acquire_worktree_seat(
                 )
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
+                resolved_path = worktree_path.resolve(strict=False)
+                if resolved_path not in occupied_paths:
+                    occupied_paths.add(resolved_path)
+                    occupants.append((str(worktree_path), _lock_metadata(lock_file)))
                 lock_file.close()
                 reacquire_allocation_lock()
                 return None
@@ -2595,7 +2619,7 @@ def acquire_worktree_seat(
                 return lease
 
         busy = len(occupants)
-        if busy >= seat_limit:
+        if busy >= seat_limit and not refused:
             detail = _busy_worktree_message(project_root, seat_limit, occupants)
             raise WorktreeSeatUnavailable(
                 f"{detail}; refusing to create a new unmanaged worktree"
