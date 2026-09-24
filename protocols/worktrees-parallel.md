@@ -38,13 +38,17 @@ Rules:
   `DISPATCH-START` / `DISPATCH-LAUNCHED` and status/ledger JSON dual-write
   `worktree_id` and legacy `worktree_seat`.
 - Acquire reclaims only terminal holders whose worker PID and start identity
-  are proven dead, after acquiring both pool and path locks. It pins HEAD at
+  are proven dead, or whose terminal record explicitly proves no worker
+  launched, after acquiring both pool and path locks. It pins HEAD at
   `refs/goalflight/keep/<dispatch-id>/head`, and quarantines abandoned dirty
   product files, including untracked files, using a temporary index at
   `refs/goalflight/keep/<dispatch-id>/dirty-<UTC-time>` (also exposed through
   the legacy `goalflight/quarantine/s-<N>-<UTC-time>` branch), then checks out the new branch at `<base>` and
   runs `git clean -fd -e .goal-flight`. Unknown status, refs, or identity
   evidence retains the worktree.
+- A reclaimed `BLOCKED` worker is not automatically re-seated yet. Resume
+  validates the recorded seat and refuses safely; automatic resume re-seating
+  is a separate fix.
 - The pool holds `LOCK_EX|LOCK_NB`, inherited by the spawned worker; process
   death releases the kernel lease. The dispatch id and controller label in the
   lock file are diagnostic metadata, not allocator namespaces.

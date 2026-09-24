@@ -2,6 +2,7 @@
 
 import json
 import asyncio
+import fcntl
 import os
 import subprocess
 import sys
@@ -73,8 +74,11 @@ def test_nonterminal_holder_retained(holder, state):
 
 def test_quarantine_failure_preserves_real_index(holder, monkeypatch):
     repo, path, row = holder
-    (path / "tracked.txt").write_text("staged\n")
-    _git(path, "add", "tracked.txt")
+    (path / ".gitignore").write_text("*.bin\n")
+    _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore binary files")
+    (path / "valuable.bin").write_text("staged ignored\n")
+    _git(path, "add", "-f", "valuable.bin")
     (path / "tracked.txt").write_text("unstaged\n")
     original = _git(path, "diff", "--cached")
     real_git = pool._git
@@ -87,6 +91,73 @@ def test_quarantine_failure_preserves_real_index(holder, monkeypatch):
         pool.acquire_worktree_seat(repo, "next")
     assert _git(path, "diff", "--cached") == original
     assert (path / "tracked.txt").read_text() == "unstaged\n"
+
+
+def test_quarantine_preserves_force_staged_ignored_file(holder):
+    repo, path, row = holder
+    (path / ".gitignore").write_text("*.bin\n")
+    _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore binary files")
+    (path / "valuable.bin").write_text("keep this\n")
+    _git(path, "add", "-f", "valuable.bin")
+    (path / "tracked.txt").write_text("ordinary edit\n")
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        refs = _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/old/dirty-*",
+        ).splitlines()
+        assert len(refs) == 1
+        assert _git(repo, "show", refs[0] + ":valuable.bin") == "keep this"
+
+
+def test_quarantine_refuses_separate_staged_and_working_versions(holder):
+    repo, path, row = holder
+    (path / "tracked.txt").write_text("staged\n")
+    _git(path, "add", "tracked.txt")
+    (path / "tracked.txt").write_text("working\n")
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="separate staged"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+    assert _git(path, "diff", "--cached")
+    assert (path / "tracked.txt").read_text() == "working\n"
+
+
+def test_terminal_explicit_prelaunch_failure_reclaims_without_identity(holder):
+    repo, path, row = holder
+    row.pop("worker_pid")
+    row.pop("worker_identity")
+    row["prelaunch_failure"] = True
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == path
+
+
+def test_terminal_missing_identity_without_prelaunch_proof_is_retained(holder):
+    repo, path, row = holder
+    row.pop("worker_pid")
+    row.pop("worker_identity")
+    with pytest.raises(pool.WorktreeSeatUnavailable):
+        pool.acquire_worktree_seat(repo, "next")
+
+
+def test_allocation_lock_wait_honors_deadline(holder):
+    repo, path, row = holder
+    lock_path = pool._seat_lock_root(repo) / "allocation.lock"
+    lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(pool.WorktreeSeatUnavailable, match="allocation lock"):
+            pool.acquire_worktree_seat(
+                repo,
+                "next",
+                capacity_deadline=started + 0.05,
+            )
+        assert time.monotonic() - started < 1.0
+    finally:
+        lock_file.close()
 
 
 def test_message_uses_worker_and_ledger_owner(holder, monkeypatch):

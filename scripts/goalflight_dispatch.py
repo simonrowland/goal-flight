@@ -1973,6 +1973,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     cwd_raw = getattr(args, "cwd", None)
     base = _requested_worktree_base(args)
     force_captive = getattr(args, "worktree", None) == "create"
+    capacity_deadline = getattr(args, "_worktree_capacity_deadline", None)
 
     if getattr(args, "worktree", None) == "shared-read-only":
         shared_path, base_commit = goalflight_worktree_pool.shared_read_only_worktree(
@@ -2045,6 +2046,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     if getattr(args, "worktree_root", None)
                     else None
                 ),
+                capacity_deadline=capacity_deadline,
             )
             _record_dispatch_worktree(args, lease)
             return lease
@@ -2085,6 +2087,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             if getattr(args, "worktree_root", None)
             else None
         ),
+        capacity_deadline=capacity_deadline,
     )
     _record_dispatch_worktree(args, lease)
     return lease
@@ -2099,20 +2102,37 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     """
     wait_s = max(0.0, float(getattr(args, "capacity_wait_s", None) or 0.0))
     deadline = time.monotonic() + wait_s
-    while True:
-        try:
-            lease = _bind_dispatch_worktree(args)
-            break
-        except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                args._worktree_seat_refused = True
-                if wait_s:
-                    raise goalflight_worktree_pool.WorktreeSeatUnavailable(
-                        f"seat wait expired after {wait_s:g}s: {exc}"
-                    ) from exc
-                raise
-            time.sleep(min(1.0, remaining))
+    previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
+    # Zero is an immediate non-blocking lock budget. A positive monotonic
+    # deadline is used for polling; None retains the direct-call blocking
+    # behavior for callers that do not go through admission.
+    args._worktree_capacity_deadline = deadline if wait_s else 0.0
+    last_wait_error = None
+    try:
+        while True:
+            try:
+                lease = _bind_dispatch_worktree(args)
+                break
+            except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    args._worktree_seat_refused = True
+                    if wait_s:
+                        raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                            f"seat wait expired after {wait_s:g}s: "
+                            f"{last_wait_error or exc}"
+                        ) from exc
+                    raise
+                last_wait_error = exc
+                time.sleep(min(1.0, remaining))
+    finally:
+        if previous_deadline is None:
+            try:
+                del args._worktree_capacity_deadline
+            except AttributeError:
+                pass
+        else:
+            args._worktree_capacity_deadline = previous_deadline
     warning = _prepare_attempt_worktree_occupancy(args)
     args._worktree_occupancy_warning = warning
     if warning is not None:
@@ -9770,6 +9790,7 @@ def _finish_ledger(
     *,
     elapsed_s: float | None = None,
     worker_still_alive: bool | None = None,
+    prelaunch_failure: bool | None = None,
 ) -> None:
     with contextlib.redirect_stdout(io.StringIO()):
         code = goalflight_ledger.cmd_finish(
@@ -9780,6 +9801,7 @@ def _finish_ledger(
                 terminal_state=None,
                 elapsed_s=elapsed_s,
                 worker_still_alive=worker_still_alive,
+                prelaunch_failure=prelaunch_failure,
             )
         )
     if code != 0:
@@ -21068,6 +21090,7 @@ def main(argv: list[str] | None = None) -> int:
                     capacity_reason,
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
+                    prelaunch_failure=not worker_spawn_attempted,
                 )
             except Exception as exc:
                 # Finalization must not mask the launch/watch outcome, but a

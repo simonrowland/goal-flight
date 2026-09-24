@@ -722,7 +722,7 @@ raise SystemExit(dispatch.main(sys.argv[1:]))
     assert not marker.exists(), combined
     # A refused launch must release its seat, including on a failed SHA probe.
     lease = goalflight_worktree_pool.acquire_worktree_seat(
-        repo, "after-refusal", reset=False
+        repo, "after-refusal"
     )
     lease.release()
 

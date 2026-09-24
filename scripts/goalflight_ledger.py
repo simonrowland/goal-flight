@@ -1082,6 +1082,7 @@ def commit_terminal_authority(
     terminal_state: str | None = None,
     worker_still_alive: bool | None = None,
     headline: str | None = None,
+    prelaunch_failure: bool | None = None,
 ) -> goalflight_journal.WriteResult[goalflight_journal.TerminalCommit]:
     """Sole journal emitter used by every terminal classifier."""
     dispatch_id = str(record.get("dispatch_id") or "")
@@ -1122,6 +1123,8 @@ def commit_terminal_authority(
     }
     if isinstance(headline, str) and headline.strip():
         observation["headline"] = headline.strip()
+    if prelaunch_failure is not None:
+        observation["prelaunch_failure"] = bool(prelaunch_failure)
     observation = goalflight_output_redact.redact_data(observation)
     return authority.commit_terminal(
         attempt.attempt_id,
@@ -1730,6 +1733,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         terminal_state=terminal_state,
         worker_still_alive=getattr(args, "worker_still_alive", None),
         headline=getattr(args, "headline", None),
+        prelaunch_failure=getattr(args, "prelaunch_failure", None),
     )
     if not committed.committed or committed.value is None:
         print(json.dumps({
@@ -1787,6 +1791,9 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if envelope:
             record.update(envelope)
             record["outcome"].update(envelope)
+        if "prelaunch_failure" in winner.observation:
+            record["prelaunch_failure"] = bool(winner.observation["prelaunch_failure"])
+            record["outcome"]["prelaunch_failure"] = record["prelaunch_failure"]
         headline = winner.observation.get("headline")
         if isinstance(headline, str) and headline.strip():
             record["headline"] = headline.strip()

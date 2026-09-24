@@ -10,9 +10,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from typing import TextIO
 
 import goalflight_compat
@@ -830,6 +832,8 @@ def _holder_description(name: str, metadata: dict) -> str:
         detail += f" worker_pid={record['worker_pid']}"
     elif live is False:
         detail += " worker exited"
+    elif record.get("prelaunch_failure") is True:
+        detail += " worker never launched"
     else:
         detail += " worker identity unknown"
     if record.get("wrapper_pid"):
@@ -854,7 +858,14 @@ def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
         record, live = _holder_record(holder)
         state = str(record.get("state") or "")
         terminal = goalflight_ledger.terminal_state_for(state, record.get("reason"))
-        if live is not False or (state != "cancelled" and terminal in {"", "unknown", "watcher_stopped"}):
+        if state != "cancelled" and terminal in {"", "unknown", "watcher_stopped"}:
+            raise WorktreeSeatUnavailable(
+                _holder_description(worktree_path.name, {"dispatch_id": holder})
+            )
+        # A terminal dispatch with an explicit pre-worker launch failure has
+        # no process identity to probe. That is proven non-launch, unlike a
+        # started worker whose identity is unreadable (UNKNOWN, retain).
+        if live is True or (live is None and record.get("prelaunch_failure") is not True):
             raise WorktreeSeatUnavailable(
                 _holder_description(worktree_path.name, {"dispatch_id": holder})
             )
@@ -1232,6 +1243,22 @@ def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch:
     return actual
 
 
+def _update_ref_and_verify(
+    cwd: Path,
+    ref: str,
+    commit: str,
+    *,
+    old: str = "",
+) -> None:
+    """Create one keep/quarantine ref and verify it before any reset."""
+    _git(cwd, "update-ref", ref, commit, old)
+    verified = _git_proc(cwd, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if verified is None or verified.returncode != 0 or verified.stdout.strip() != commit:
+        raise WorktreeSeatResetRefused(
+            f"ref {ref} did not verify after creation; refusing reset"
+        )
+
+
 def _quarantine_dirty_worktree(
     worktree_path: Path,
     *,
@@ -1244,6 +1271,18 @@ def _quarantine_dirty_worktree(
     ]
     if not product:
         return None
+    staged_and_worktree = [
+        line
+        for line in product
+        if len(line) >= 2
+        and line[0] not in {" ", "?"}
+        and line[1] not in {" ", "?"}
+    ]
+    if staged_and_worktree:
+        raise WorktreeSeatResetRefused(
+            f"dirty worktree {seat_name} has separate staged and working versions "
+            "that cannot be represented by one quarantine commit; refusing reset"
+        )
 
     # `:(exclude)` of an ignored path makes `git add` exit 1, so a worktree that
     # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
@@ -1251,8 +1290,17 @@ def _quarantine_dirty_worktree(
     # put back to HEAD so it is not part of the quarantine commit.
     # A failed quarantine must leave both the working tree and real index intact.
     with tempfile.TemporaryDirectory(prefix="goalflight-quarantine-") as temporary:
-        index_env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
-        _git(worktree_path, "read-tree", "HEAD", env=index_env)
+        temporary_index = Path(temporary) / "index"
+        real_index = Path(_git(worktree_path, "rev-parse", "--git-path", "index"))
+        if not real_index.is_absolute():
+            real_index = (worktree_path / real_index).resolve()
+        try:
+            shutil.copyfile(real_index, temporary_index)
+        except OSError as exc:
+            raise WorktreeSeatResetRefused(
+                f"cannot copy real index for quarantine: {exc}; refusing reset"
+            ) from exc
+        index_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
         _git(worktree_path, "add", "-A", "--", ".", env=index_env)
         _git(worktree_path, "reset", "-q", "--", ".goal-flight", env=index_env)
         tree = _git(worktree_path, "write-tree", env=index_env)
@@ -1300,8 +1348,15 @@ def _quarantine_dirty_worktree(
         raise WorktreeSeatError(
             f"quarantine commit for dirty worktree {seat_name} is empty; refusing reset"
         )
-    _git(worktree_path, "update-ref", f"refs/heads/{branch}", commit, "")
-    _git(worktree_path, "update-ref", f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}", commit, "")
+    _update_ref_and_verify(
+        worktree_path, f"refs/heads/{branch}", commit, old=""
+    )
+    _update_ref_and_verify(
+        worktree_path,
+        f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}",
+        commit,
+        old="",
+    )
     return branch
 
 
@@ -1400,7 +1455,15 @@ def _prepare_claimed_seat_locked(
         if previous.returncode == 0 and previous.stdout.strip() != head:
             raise WorktreeSeatResetRefused(f"refusing to overwrite saved head {keep_ref}")
         if previous.returncode != 0:
-            _git(worktree_path, "update-ref", keep_ref, head, "")
+            _update_ref_and_verify(worktree_path, keep_ref, head, old="")
+        else:
+            verified = _git_proc(
+                worktree_path, "rev-parse", "--verify", f"{keep_ref}^{{commit}}"
+            )
+            if verified is None or verified.returncode != 0 or verified.stdout.strip() != head:
+                raise WorktreeSeatResetRefused(
+                    f"saved head {keep_ref} did not verify; refusing reset"
+                )
     quarantine_branch = _quarantine_dirty_worktree(
         worktree_path,
         seat_name=seat_name,
@@ -1521,6 +1584,37 @@ def _busy_worktree_message(
     )
 
 
+def _acquire_allocation_lock(
+    allocation_file: TextIO,
+    allocation_lock_path: Path,
+    *,
+    deadline: float | None,
+) -> None:
+    """Acquire the pool transaction lock without overrunning a wait budget."""
+    if deadline is None:
+        fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as exc:
+            if deadline <= 0 or time.monotonic() >= deadline:
+                raise WorktreeSeatUnavailable(
+                    f"seat wait expired while waiting for worktree allocation lock "
+                    f"{allocation_lock_path}"
+                ) from exc
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    # Do not begin seat inspection or launch preparation after a positive
+    # capacity deadline. Once this check passes, worktree setup may finish
+    # after the deadline; the caller already owns the admitted seat.
+    if deadline > 0 and time.monotonic() >= deadline:
+        raise WorktreeSeatUnavailable(
+            f"seat wait expired before worktree admission after acquiring "
+            f"{allocation_lock_path}"
+        )
+
+
 def acquire_worktree_seat(
     project_root: Path,
     dispatch_id: str,
@@ -1531,6 +1625,7 @@ def acquire_worktree_seat(
     reset: bool = True,
     occupy_path: Path | None = None,
     expected_prior_dispatch_id: str | None = None,
+    capacity_deadline: float | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -1586,7 +1681,11 @@ def acquire_worktree_seat(
         # Serialize the short acquire/reset transaction. This is not seat
         # ownership; it only ensures a contender never reads an occupant's old
         # diagnostic metadata between that occupant's flock and metadata write.
-        fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
+        _acquire_allocation_lock(
+            allocation_file,
+            allocation_lock_path,
+            deadline=capacity_deadline,
+        )
 
         # Count every held global or legacy-ring lock before any checkout/reset
         # or directory creation. Legacy rings are migration input, not extra
