@@ -3875,10 +3875,9 @@ def _nonterminal_dispatch_reuse_reason(
     if record is None:
         return None
     if goalflight_ledger.record_is_unreadable(record):
-        # Unlistable runs.d makes every id look present-but-unreadable.
-        # That is not proof the id is taken; occupancy fail-closes on the
-        # directory itself. Inventing a duplicate here stalls every launch.
-        return None
+        return (
+            f"ledger record unreadable path={record.get('path') or '-'}"
+        )
     if (
         allow_queued
         and record.get("state") == "queued"
@@ -3974,7 +3973,7 @@ def _launch_authority_entry(args) -> dict:
     return entry
 
 
-_SELF_HELD_LEDGER_STATES = frozenset({"worker_dead", "superseded", "abandoned"})
+_SELF_HELD_LEDGER_STATES = frozenset({"stale_dead", "worker_dead", "superseded", "abandoned"})
 _DIAGNOSTIC_ROW_RE = re.compile(
     r'dispatch_id=("(?:\\.|[^"\\])*") state=("(?:\\.|[^"\\])*"|null)'
 )
@@ -4020,39 +4019,57 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
     )
 
 
-def _completion_refusal_guidance(diagnostics: list[str], project_root: str) -> str:
-    """Remedy text keyed on the blocking rows, not the synthetic decision state.
+def _withdraw_recovery_command(
+    held_id: str,
+    project_root: str,
+    *,
+    owner: str | None = None,
+    operator: bool = False,
+) -> str:
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "withdraw", held_id,
+    ]
+    command.extend((
+        "--reason", "retry same task after held dispatch ended",
+        "--project-root", project_root,
+    ))
+    if owner:
+        command.extend(("--controller-label", owner))
+    elif operator:
+        command.append("--operator")
+    return shlex.join(command)
 
-    A ``worker_dead`` / ``superseded`` / ``abandoned`` row is the hold. Resume
-    of that dispatch is the recovery; reconcile-outbox does not clear it.
-    A live sibling keeps the wait guidance. Reconcile stays only where a
-    terminal publication actually failed, or where the blocker is not one of
-    those self-held rows.
-    """
+
+def _completion_refusal_guidance(
+    diagnostics: list[str], project_root: str, *, args=None,
+) -> str:
+    """Explain how to release a task holder; withdrawal enforces safety."""
     rows, publication_failed = _blocking_rows_from_diagnostics(diagnostics)
-    held = [(did, state) for did, state in rows if state in _SELF_HELD_LEDGER_STATES]
-    live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
-    if held and not live:
-        named = ", ".join(f"{did} state={state}" for did, state in held)
-        text = (
-            "The hold is the ledger row "
-            f"({named}). Resume that dispatch; a later resume in the same "
-            "chain is the same attempt. A fresh dispatch on this task stays "
-            "refused. Opening a new task row is interim and leaves the old id held."
-        )
-        if publication_failed:
-            text += "\n" + _reconcile_outbox_guidance(project_root)
-        return text
-    if held and live:
-        named = ", ".join(f"{did} state={state}" for did, state in held)
-        text = (
-            f"Dead rows ({named}) do not block their own resume, but a live "
-            "sibling still holds this task. Wait for active siblings, or "
-            "dispatch only remaining task IDs."
-        )
-        if publication_failed:
-            text += "\n" + _reconcile_outbox_guidance(project_root)
-        return text
+    task_ids = list(getattr(args, "task_ids", []) or [])
+    task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
+    if rows:
+        lines = []
+        for dispatch_id, state in rows:
+            if state not in _SELF_HELD_LEDGER_STATES:
+                if not goalflight_dispatch_states.is_terminal_state(state):
+                    lines.append(
+                        f"{task_text} is held by a worker that may still be running "
+                        f"({state}): wait for it, or steer it to stop before withdrawing. "
+                        f"Holder: {dispatch_id}."
+                    )
+                continue
+            record = _find_dispatch_record(dispatch_id) or {}
+            owner = str(record.get("controller_label") or "").strip() or None
+            lines.append(
+                f"{task_text} is held by {dispatch_id} (state {state}). "
+                "If you've confirmed that worker is gone, release it with:\n"
+                f"  {_withdraw_recovery_command(dispatch_id, project_root, owner=owner, operator=owner is None)}\n"
+                "(withdraw refuses if it can't prove the worker is dead; see "
+                "protocols/dispatch-danger.md). Then re-run this dispatch."
+            )
+        if lines:
+            text = "\n".join(lines)
+            return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     return _reconcile_outbox_guidance(project_root)
 
 
@@ -4082,7 +4099,9 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
             f"entry.created_at={json.dumps(entry.get('created_at'))}\n"
             + "\n".join(diagnostics)
             + "\n"
-            + _completion_refusal_guidance(diagnostics, str(entry["project_root"])),
+            + _completion_refusal_guidance(
+                diagnostics, str(entry["project_root"]), args=args,
+            ),
             file=sys.stderr,
         )
     print(
@@ -4099,6 +4118,18 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
         flush=True,
     )
     raise DispatchUsageError(message)
+
+
+def _emit_launch_wake_notice() -> None:
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
 
 
 def _refuse_reused_nonterminal_dispatch_id(
@@ -11597,6 +11628,156 @@ def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
         }
 
 
+class _WithdrawPreflightRefusal(ValueError):
+    def __init__(self, message: str, *, liveness: str | None = None) -> None:
+        super().__init__(message)
+        self.liveness = liveness
+
+
+def _withdraw_liveness_preflight(
+    *,
+    dispatch_id: str,
+    attempt: dict,
+    record: dict | None,
+    worker: dict,
+    carriers: dict[Path, dict],
+    status_paths: list[object],
+) -> None:
+    """Require every recorded worker source to prove the same dead holder."""
+    lifecycle = attempt.get("lifecycle_state")
+    active = lifecycle in {
+        goalflight_journal.ATTEMPT_STARTING,
+        goalflight_journal.ATTEMPT_RUNNING,
+    }
+
+    def check(source: str, pid: object, identity: object) -> bool:
+        if pid in (None, ""):
+            if identity not in (None, {}):
+                raise _WithdrawPreflightRefusal(
+                    f"{source} worker identity has no pid; worker liveness is indeterminate. "
+                    "Wait for the worker identity to be recorded before retrying.",
+                    liveness="indeterminate",
+                )
+            return False
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            raise _WithdrawPreflightRefusal(
+                f"{source} worker {pid} has no start identity; worker liveness is indeterminate. "
+                "Wait for the worker identity to be recorded before retrying.",
+                liveness="indeterminate",
+            )
+        state, reason = _queue_claim_identity_status(pid, identity)
+        if state != "dead":
+            raise _WithdrawPreflightRefusal(
+                f"{source} worker {pid} is {state} ({reason}); withdraw never kills a live worker. "
+                "Steer the worker to stop, wait for exit, and verify its identity before retrying.",
+                liveness=("live" if state == "live" else "indeterminate"),
+            )
+        return True
+
+    ledger = record or {}
+    ledger_pid = ledger.get("worker_pid")
+    ledger_identity = ledger.get("worker_identity")
+    ledger_dead = check("ledger", ledger_pid, ledger_identity)
+    journal_pid = worker.get("pid")
+    journal_dead = check("journal", journal_pid, worker)
+    for path, carrier in carriers.items():
+        check(
+            str(path), carrier.get("queue_worker_pid"),
+            carrier.get("queue_worker_identity"),
+        )
+        check(
+            f"{path} claimer", carrier.get("queue_claimer_pid"),
+            carrier.get("queue_claimer_identity"),
+        )
+        check(
+            f"{path} launcher", carrier.get("queue_launcher_pid"),
+            carrier.get("queue_launcher_identity"),
+        )
+
+    status_dead = not status_paths
+    for status_path in status_paths:
+        status, status_reason = _abandoned_status_payload(
+            {"dispatch_id": dispatch_id, "status_path": status_path}
+        )
+        if status is None:
+            raise _WithdrawPreflightRefusal(
+                f"status sidecar is {status_reason}; worker liveness is indeterminate. "
+                "Wait for the status evidence to become readable before retrying.",
+                liveness="indeterminate",
+            )
+        status_identity = status.get("expected_worker_identity") or status.get("worker_identity")
+        status_pid = status.get("worker_pid")
+        if status_pid not in (None, "") or status_identity not in (None, {}):
+            status_dead = check("status", status_pid, status_identity)
+        elif status.get("worker_alive") is True:
+            raise _WithdrawPreflightRefusal(
+                "status sidecar reports a live worker; withdraw never kills a live worker. "
+                "Wait for exit and verify its identity before retrying.",
+                liveness="live",
+            )
+        elif status.get("worker_alive") is False:
+            status_dead = True
+        else:
+            state = status.get("terminal_pending_state") or status.get("state")
+            if not goalflight_dispatch_states.is_terminal_state(state):
+                raise _WithdrawPreflightRefusal(
+                    "status sidecar has no worker identity; worker liveness is indeterminate. "
+                    "Wait for the status evidence to become complete before retrying.",
+                    liveness="indeterminate",
+                )
+
+    stale_spawn_intent = False
+    for evidence in (ledger, *carriers.values()):
+        if _queue_claim_worker_spawn_intent(evidence) and not (
+            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
+        ):
+            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
+            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
+                raise _WithdrawPreflightRefusal(
+                    "spawn intent has no worker pid and is not older than the claim-stale window "
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
+                    liveness="indeterminate",
+                )
+            stale_spawn_intent = True
+
+    if active and not stale_spawn_intent:
+        if not status_dead:
+            raise _WithdrawPreflightRefusal(
+                f"{lifecycle} attempt has no dead status sidecar evidence; "
+                "worker liveness is indeterminate. "
+                "Wait for the status evidence to become complete before retrying.",
+                liveness="indeterminate",
+            )
+        if not ledger_dead:
+            raise _WithdrawPreflightRefusal(
+                f"{lifecycle} attempt has no dead ledger worker identity; "
+                "worker liveness is indeterminate. "
+                "Wait for the worker identity to be recorded before retrying.",
+                liveness="indeterminate",
+            )
+        if not journal_dead:
+            raise _WithdrawPreflightRefusal(
+                f"{lifecycle} attempt has no dead journal worker identity; worker liveness is indeterminate. "
+                "Wait for the worker identity to be recorded before retrying.",
+                liveness="indeterminate",
+            )
+        try:
+            identities_match = (
+                int(ledger_pid) == int(journal_pid)
+                and isinstance(ledger_identity, dict)
+                and ledger_identity.get("start_token") == worker.get("start_token")
+            )
+        except (TypeError, ValueError):
+            identities_match = False
+        if not identities_match:
+            raise _WithdrawPreflightRefusal(
+                f"{lifecycle} attempt ledger and journal worker identities do not match; "
+                "worker liveness is indeterminate. "
+                "Wait for launch to settle before retrying.",
+                liveness="indeterminate",
+            )
+
+
 def _withdraw_preflight(args, queue_dir: Path | None = None):
     """Read authority and identity evidence without creating any state."""
     record = goalflight_ledger.read_record(args.dispatch_id)
@@ -11606,10 +11787,11 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     statuses = index.carriers_by_id.get(args.dispatch_id, [])
     for active in ([index.listing_error] if index.listing_error is not None else statuses):
         if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
-            raise ValueError(
+            raise _WithdrawPreflightRefusal(
                 f"carrier launch ownership is {active.kind.value} ({active.reason}); "
                 "withdraw never kills a live worker. Wait for launch to settle and verify "
-                "the launcher identity before retrying."
+                "the launcher identity before retrying.",
+                liveness=("live" if active.kind is ClaimCarrierKind.LIVE else "indeterminate"),
             )
     carriers = {Path(active.path): json.loads(Path(active.path).read_text()) for active in statuses}
     entry = next(iter(carriers.values()), {})
@@ -11637,31 +11819,24 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     if not args.operator and (not args.controller_label or args.controller_label != owner):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
-    for source, pid, identity in (
-        ("ledger", (record or {}).get("worker_pid"), (record or {}).get("worker_identity")),
-        ("journal", worker.get("pid"), worker),
-        *((str(path), evidence.get("queue_worker_pid"), evidence.get("queue_worker_identity"))
-          for path, evidence in carriers.items()),
-    ):
-        if not pid:
-            continue
-        status, reason = _queue_claim_identity_status(pid, identity)
-        if status != "dead":
-            raise ValueError(
-                f"{source} worker {pid} is {status} ({reason}); withdraw never kills a live worker. "
-                "Steer the worker to stop, wait for exit, and verify its identity before retrying."
-            )
-    for evidence in (record or {}, *carriers.values()):
-        if _queue_claim_worker_spawn_intent(evidence) and not (
-            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
-        ):
-            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
-            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
-                raise ValueError(
-                    "spawn intent has no worker pid and is not older than the claim-stale window "
-                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry"
-                )
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
+    status_paths = []
+    for source in (record or {}, *carriers.values()):
+        path = source.get("status_path")
+        if path not in (None, "") and path not in status_paths:
+            status_paths.append(path)
+    _withdraw_liveness_preflight(
+        dispatch_id=args.dispatch_id,
+        attempt=attempt,
+        record=record,
+        worker=worker,
+        carriers=carriers,
+        status_paths=status_paths,
+    )
+    if attempt.get("terminal_state") == "superseded" and not outcome.get("withdrawn_by"):
+        raise ValueError(
+            "superseded attempt has no withdrawn_by; its task-release effect is unproven"
+        )
     withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
     return root, authority, attempt, record, carriers, outcome, withdrawn
 
@@ -11688,22 +11863,78 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
         if attempt["lifecycle_state"] not in goalflight_journal.ATTEMPT_FINAL_STATES:
             raise ValueError("attempt is no longer final; settlement refused")
         journal_state = attempt["terminal_state"]
-        state = "withdrawn" if journal_state == "abandoned" else journal_state
-        if goalflight_ledger.terminal_state_for(state) == "unknown":
-            raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
-        events = authority.read_all(
-            "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
-            (attempt["attempt_id"], attempt["terminal_transition_id"]),
+        replacement_id = getattr(args, "superseded_by", None)
+        events = None
+        if journal_state in {"worker_dead", "stale_dead", "abandoned"}:
+            events = authority.read_all(
+                "SELECT event_uuid, event_type FROM terminal_outbox "
+                "WHERE attempt_id = ? AND transition_id = ?",
+                (attempt["attempt_id"], attempt["terminal_transition_id"]),
+            )
+        missing_final_outbox = not events if events is not None else False
+        final_retirement = bool(
+            (
+                journal_state in {"worker_dead", "stale_dead"}
+                or (journal_state == "abandoned" and missing_final_outbox)
+            )
+            and not args.dry_run
         )
-        if not events:
-            raise ValueError("terminal attempt has no matching outbox event")
-        terminal = goalflight_journal.TerminalCommit(
-            attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
-            transition_id=attempt["terminal_transition_id"],
-            event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
-            terminal_state=journal_state, observation={**outcome, "state": journal_state},
-            terminal_at=attempt["terminal_at"], idempotent=True,
+        final_retirement_preview = bool(
+            args.dry_run
+            and (
+                journal_state in {"worker_dead", "stale_dead"}
+                or (journal_state == "abandoned" and missing_final_outbox)
+            )
         )
+        if final_retirement or final_retirement_preview:
+            actor = "operator" if getattr(args, "operator", False) else args.controller_label
+            terminal_state = "superseded" if replacement_id else "withdrawn"
+            observation = {
+                "reason": getattr(args, "reason", "terminal dispatch cleanup"),
+                "withdrawn_by": actor,
+                "state": terminal_state,
+            }
+            if replacement_id:
+                observation["superseded_by"] = replacement_id
+            if final_retirement_preview:
+                terminal = goalflight_journal.TerminalCommit(
+                    attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+                    transition_id="<new transition>", event_uuid="<new event>",
+                    event_type="blocked", terminal_state=terminal_state,
+                    observation=observation,
+                    terminal_at=attempt.get("terminal_at") or goalflight_journal.utc_now(),
+                    idempotent=False,
+                )
+            else:
+                committed = goalflight_journal.Journal(root).commit_terminal(
+                    attempt["attempt_id"], terminal_state=terminal_state,
+                    event_type="blocked", observation=observation,
+                    _allow_final_supersession=True,
+                )
+                if not committed.committed or committed.value is None:
+                    raise ValueError(f"journal supersession failed: {committed}")
+                terminal = committed.value
+            journal_state = terminal.terminal_state
+            state = journal_state
+            outcome = terminal.observation
+        else:
+            state = "withdrawn" if journal_state == "abandoned" else journal_state
+            if goalflight_ledger.terminal_state_for(state) == "unknown":
+                raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
+            if events is None:
+                events = authority.read_all(
+                    "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
+                    (attempt["attempt_id"], attempt["terminal_transition_id"]),
+                )
+            if not events:
+                raise ValueError("terminal attempt has no matching outbox event")
+            terminal = goalflight_journal.TerminalCommit(
+                attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+                transition_id=attempt["terminal_transition_id"],
+                event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
+                terminal_state=journal_state, observation={**outcome, "state": journal_state},
+                terminal_at=attempt["terminal_at"], idempotent=True,
+            )
         projected = goalflight_ledger.terminal_record_projection(
             record or {"dispatch_id": args.dispatch_id,
                        "controller_label": attempt.get("owner_controller_label")},
@@ -11736,6 +11967,8 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+            if final_retirement:
+                _release_withdrawn_worktree(projected, args.dispatch_id)
             archived = _archive_withdraw_carriers(carriers)
             payload.update(archived_carriers=archived,
                            archived_carrier=archived[0] if archived else None)
@@ -20908,18 +21141,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     if argv and argv[0] == "withdraw":
         return _cmd_withdraw(argv[1:])
     option_argv = argv[: argv.index("--")] if "--" in argv else argv
-    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
-    # _persist_acp_watcher_prompt and the launch path), never here: a refused
-    # dispatch must leave zero side effects before its guards run.
-    try:
-        import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "resume":
@@ -21145,6 +21366,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+            _emit_launch_wake_notice()
             # Direct resume launches must validate before exempting lineage or
             # binding a seat; claim-boundary validation remains under its lock.
             # Before any worktree bind. This gate reads the ledger and the task
@@ -21233,6 +21455,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+        _emit_launch_wake_notice()
         # Validate direct resumes before lineage exemption and seat mutation.
         # Occupancy-forced is a worktree hatch and does not bypass this:
         # a same-task sibling still refuses before admission.

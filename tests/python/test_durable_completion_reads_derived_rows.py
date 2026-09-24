@@ -134,13 +134,13 @@ def test_durably_complete_row_refuses_with_store_evidence(launch_authority, stam
     assert "dispatch_id=unbound" in output.err
 
 
-def test_partial_supersession_names_advanced_record(launch_authority, capsys):
+def test_partial_supersession_names_advanced_record(launch_authority, monkeypatch, capsys):
     args, store, row, records = launch_authority
     row.update(done=False, done_at=None, closed_at=None)
     store.tasks_path.write_text(json.dumps(row) + "\n")
-    records.append({"dispatch_id": "stopped-earlier", "project_root": args.project_root,
-                    "task_ids": args.task_ids, "state": "worker_dead", "ended_at": None})
-
+    records.append(_dead_record(args, "stopped-earlier", controller_label="owner", worker_still_alive=False))
+    args.controller_label = "owner"
+    monkeypatch.setattr(D, "_find_dispatch_record", _find_in(records))
     with pytest.raises(D.DispatchUsageError):
         D._refuse_launch_blocked_by_completion_authority(args)
     output = capsys.readouterr()
@@ -151,9 +151,16 @@ def test_partial_supersession_names_advanced_record(launch_authority, capsys):
     assert 'state="worker_dead"' in output.err
     assert "ended_at=null" in output.err
     assert row["id"] in output.err
-    assert "resume" in output.err.lower()
+    assert "goalflight_dispatch.py withdraw stopped-earlier" in output.err
+    assert "--superseded-by" not in output.err
+    assert "--reason 'retry same task after held dispatch ended'" in output.err
+    assert "--controller-label owner" in output.err
+    assert "Then re-run this dispatch." in output.err
+    assert "  1. " not in output.err
+    assert "  2. " not in output.err
+    assert "--dispatch-id followup" not in output.err
+    assert "--retry-of" not in output.err
     assert "reconcile-outbox" not in output.err
-    assert "interim" in output.err
 
 
 @pytest.mark.parametrize("status_kind", ["failed", "healthy", "foreign", "unreadable"])
@@ -390,8 +397,11 @@ def test_dead_hold_refusal_names_resume_not_reconcile(launch_authority, capsys, 
     assert f'state="{state}"' in output.err
     assert "worker_cwd=" in output.err
     assert "reconcile-outbox" not in output.err
-    assert "resume" in output.err.lower()
-    assert "interim" in output.err
+    assert "task t-b212 is held by stopped-earlier (state " + state + ")" in output.err
+    assert "goalflight_dispatch.py withdraw stopped-earlier" in output.err
+    assert "withdraw refuses if it can't prove the worker is dead" in output.err
+    assert "--superseded-by" not in output.err
+    assert "Then re-run this dispatch." in output.err
 
 
 def test_live_sibling_refusal_keeps_wait_guidance(launch_authority, capsys):
@@ -416,7 +426,9 @@ def test_live_sibling_refusal_keeps_wait_guidance(launch_authority, capsys):
     assert refusal["state"] == "worker_dead"
     assert refusal["reason"] == "partial_task_supersession"
     assert 'state="running"' in output.err
-    assert "remaining task IDs" in output.err
+    assert "task t-b212 is held by a worker that may still be running (running)" in output.err
+    assert "Holder: live-sibling" in output.err
+    assert "wait for it, or steer it to stop before withdrawing" in output.err
     assert "interim" not in output.err
 
 

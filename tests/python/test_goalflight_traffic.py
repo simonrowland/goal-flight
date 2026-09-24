@@ -247,8 +247,335 @@ def test_unreadable_ledger_marks_status_worker_unverified(
                 "unverified_controllers": {"unknown-ledger": 1},
             }
         },
+        "unknown_reasons": ["ledger unreadable rows=1: OSError: ledger denied"],
     }
     assert "total unverified: 1" in traffic.render(summary)
+    assert "lower bound; unverified" in traffic.render(summary)
+
+
+def test_unreadable_ledger_with_only_terminal_sidecars_stays_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    for dispatch_id in ("terminal-one", "terminal-two"):
+        (dispatch_dir / f"{dispatch_id}.status.json").write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "agent": "codex",
+                    "model": "gpt-5.6-sol",
+                    "worker_pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 2
+    assert summary["models"]["UNKNOWN"]["unverified"] == 2
+    assert summary["unknown_reasons"] == [
+        "ledger unreadable rows=1: OSError: ledger denied"
+    ]
+    assert "total live (lower bound; unverified): 0" in traffic.render(summary)
+
+
+def test_unreadable_ledger_and_status_dir_report_unknown(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    dispatch_dir = tmp_path / "missing-dispatch"
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: OSError: ledger denied; status directory unavailable: {dispatch_dir}"
+    ]
+    assert "UNKNOWN:" in traffic.render(summary)
+    assert "UNKNOWN:" in traffic.live_mix_pointer(summary)
+
+
+def test_readable_empty_ledger_with_unreadable_status_dir_reports_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "missing-dispatch"
+    monkeypatch.setattr(traffic.goalflight_ledger, "read_records", lambda **_kwargs: [])
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"status directory unavailable: {dispatch_dir}"
+    ]
+    assert "total live (lower bound; unverified): 0" in traffic.render(summary)
+
+
+def test_malformed_status_sidecar_reports_unknown_lower_bound(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    malformed = dispatch_dir / "malformed.status.json"
+    malformed.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(traffic.goalflight_ledger, "read_records", lambda **_kwargs: [])
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"status files unreadable or malformed: {malformed}"
+    ]
+
+
+def test_unreadable_ledger_with_empty_status_dir_reports_unknown(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    state_dir = tmp_path / "state"
+    dispatch_dir = state_dir / "dispatch"
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "ledger unreadable rows=1: OSError: ledger denied"
+    ]
+
+
+def test_corrupt_ledger_row_without_sidecar_is_unverified(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs.d"
+    dispatch_dir = state_dir / "dispatch"
+    runs_dir.mkdir(parents=True)
+    dispatch_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    corrupt = runs_dir / "corrupt-row.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {corrupt}"
+    ]
+
+
+def test_unreadable_ledger_row_with_terminal_sidecar_is_unverified(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    unreadable_path = tmp_path / "runs.d" / "terminal-corrupt.json"
+    (dispatch_dir / "terminal-corrupt.status.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "terminal-corrupt",
+                "state": "complete",
+                "terminal_state": "complete",
+                "agent": "codex",
+                "model": "gpt-5.6-sol",
+                "worker_pid": os.getpid(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[
+            {
+                "dispatch_id": "terminal-corrupt",
+                "state": "unreadable",
+                "path": str(unreadable_path),
+            }
+        ],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {unreadable_path}"
+    ]
+
+
+def test_unreadable_ledger_row_with_running_sidecar_is_counted_once(
+    tmp_path: Path,
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    unreadable_path = tmp_path / "runs.d" / "running-corrupt.json"
+    (dispatch_dir / "running-corrupt.status.json").write_text(
+        json.dumps({
+            "dispatch_id": "running-corrupt",
+            "state": "running",
+            "worker_pid": os.getpid(),
+            "worker_identity": {"pid": os.getpid(), "start_token": "sidecar"},
+        }),
+        encoding="utf-8",
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[{
+            "dispatch_id": "running-corrupt",
+            "state": "unreadable",
+            "path": str(unreadable_path),
+        }],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {unreadable_path}"
+    ]
+
+
+def test_referenced_status_read_failure_is_unknown_once(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    status_path = tmp_path / "missing.status.json"
+    (dispatch_dir / "status-missing.status.json").write_text(
+        json.dumps({"dispatch_id": "status-missing", "state": "running"}),
+        encoding="utf-8",
+    )
+    pid = os.getpid()
+    summary = traffic.live_workers_by_model(
+        ledger_records=[{
+            "dispatch_id": "status-missing",
+            "state": "running",
+            "worker_pid": pid,
+            "worker_identity": {"pid": pid, "start_token": "ledger"},
+            "model": "gpt-5.6-sol",
+            "controller_label": "controller",
+            "status_path": str(status_path),
+        }],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"status file unreadable or malformed: {status_path}"
+    ]
+
+
+def test_status_only_ledger_read_failure_is_unknown_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    status_path = dispatch_dir / "status-only.status.json"
+    status_path.write_text(
+        json.dumps({
+            "dispatch_id": "status-only",
+            "state": "running",
+            "worker_pid": os.getpid(),
+            "worker_identity": {"pid": os.getpid(), "start_token": "status"},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_record",
+        lambda _dispatch_id: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[], dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "ledger read failed: OSError: ledger denied"
+    ]
+
+
+def test_ledger_identity_fields_are_authoritative_over_status(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    pid = os.getpid()
+    ledger_identity = {"pid": pid, "start_token": "ledger"}
+    status_identity = {"pid": pid, "start_token": "status"}
+    (dispatch_dir / "authority.status.json").write_text(
+        json.dumps({
+            "dispatch_id": "authority",
+            "state": "running",
+            "worker_pid": pid,
+            "worker_identity": status_identity,
+            "model": "status-model",
+            "controller_label": "status-controller",
+        }),
+        encoding="utf-8",
+    )
+    ledger_record = {
+        "dispatch_id": "authority",
+        "state": "running",
+        "worker_pid": pid,
+        "worker_identity": ledger_identity,
+        "model": "ledger-model",
+        "controller_label": "ledger-controller",
+    }
+
+    merged = traffic._dispatch_records(
+        ledger_records=[ledger_record], dispatch_dir=dispatch_dir,
+    )
+    record = next(record for record in merged if record.get("dispatch_id") == "authority")
+    assert record["worker_pid"] == pid
+    assert record["worker_identity"] == ledger_identity
+    assert record["model"] == "ledger-model"
+    assert record["controller_label"] == "ledger-controller"
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[ledger_record], dispatch_dir=dispatch_dir,
+    )
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "status model disagrees with ledger"
+    ]
 
 
 def test_terminal_ledger_state_wins_over_live_sidecar(

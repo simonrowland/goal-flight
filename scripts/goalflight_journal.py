@@ -5976,6 +5976,7 @@ class Journal:
         observation: Mapping[str, object] | None = None,
         event_type: str | None = None,
         _deadline_at_or_before: str | None = None,
+        _allow_final_supersession: bool = False,
     ) -> WriteResult[TerminalCommit]:
         """CAS one terminal winner and its outbox event in the same transaction."""
         attempt = self._canonical_uuid(attempt_id, label="attempt_id")
@@ -6004,7 +6005,13 @@ class Journal:
             ).fetchone()
             if existing is None:
                 raise CASMismatch("terminal commit lost: attempt does not exist")
-            if str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES:
+            superseding_final = (
+                str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES
+                and _allow_final_supersession
+                and terminal in {"superseded", "withdrawn"}
+                and str(existing["terminal_state"]) in {"worker_dead", "stale_dead", "abandoned"}
+            )
+            if str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES and not superseding_final:
                 if not existing["terminal_transition_id"] or not existing["event_uuid"]:
                     raise JournalIntegrityError(
                         "terminal attempt exists without its transition/outbox row"
@@ -6020,11 +6027,13 @@ class Journal:
                     terminal_at=journal_terminal_at(existing["terminal_at"]),
                     idempotent=True,
                 )
-            if str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
+            # Withdrawal is the repair path for a dead final attempt whose
+            # terminal outbox publication was lost before the process stopped.
+            if not superseding_final and str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
                 raise CASMismatch(
                     f"terminal commit lost: attempt state is {existing['lifecycle_state']}"
                 )
-            if _deadline_at_or_before is not None:
+            if not superseding_final and _deadline_at_or_before is not None:
                 if str(existing["lifecycle_state"]) not in {
                     ATTEMPT_PREPARED,
                     ATTEMPT_STARTING,
@@ -6062,7 +6071,7 @@ class Journal:
                         terminal_state = ?, terminal_outcome_json = ?, terminal_at = ?,
                         state_updated_at = ?
                     WHERE attempt_id = ?
-                      AND lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING')
+                      AND lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING', 'TERMINAL', 'ABANDONED')
                     """,
                     (
                         final_lifecycle,
