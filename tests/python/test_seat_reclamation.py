@@ -185,6 +185,176 @@ def test_ignored_head_collision_retains_seat(holder):
     ) == ""
 
 
+@pytest.mark.parametrize(
+    ("ignore_pattern", "tracked_path", "ignored_path", "ignored_is_file", "reuses"),
+    [
+        (
+            "__pycache__/",
+            "rf/coupling/tracked.py",
+            "rf/coupling/__pycache__",
+            False,
+            True,
+        ),
+        ("build/", "build/x", "build", False, False),
+        ("out", "out/x", "out", True, False),
+    ],
+)
+def test_ignored_paths_match_tree_collisions_exactly(
+    holder, ignore_pattern, tracked_path, ignored_path, ignored_is_file, reuses
+):
+    repo, path, row = holder
+    (path / ".gitignore").write_text(ignore_pattern + "\n")
+    if ignored_path == "rf/coupling/__pycache__":
+        anchor = path / "rf/coupling/existing.py"
+        anchor.parent.mkdir(parents=True)
+        anchor.write_text("existing\n")
+        _git(path, "add", ".gitignore", "rf/coupling/existing.py")
+    else:
+        _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore reset fixture")
+
+    target = repo / tracked_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("target\n")
+    if reuses:
+        (repo / ".gitignore").write_text(ignore_pattern + "\n")
+        _git(repo, "add", ".gitignore", tracked_path)
+    else:
+        _git(repo, "add", tracked_path)
+    _git(repo, "commit", "-m", "add reset fixture target")
+
+    ignored = path / ignored_path
+    if ignored_is_file:
+        ignored.write_text("must survive reset\n")
+    else:
+        ignored.mkdir(parents=True)
+        (ignored / "payload").write_text("must survive reset\n")
+
+    if reuses:
+        with pool.acquire_worktree_seat(repo, "next") as lease:
+            assert lease.path == path
+            assert ignored.exists()
+    else:
+        with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
+            pool.acquire_worktree_seat(repo, "next")
+        assert ignored.exists()
+        assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+def test_ignored_tracked_file_parent_type_clash_is_collision(tmp_path, monkeypatch):
+    def fake_git_nul(_cwd, *args):
+        return "parent/child\0" if args[0] == "ls-files" else "parent\0"
+
+    monkeypatch.setattr(pool, "_git_nul", fake_git_nul)
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
+        pool._refuse_ignored_tree_collisions(
+            tmp_path, head="HEAD", target="target"
+        )
+
+
+def test_casefolded_ignored_collision_retains_seat(holder):
+    repo, path, row = holder
+    _git(repo, "config", "core.ignorecase", "true")
+    (path / ".gitignore").write_text("foo\n")
+    _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore case collision")
+    (repo / "Foo").write_text("target\n")
+    _git(repo, "add", "Foo")
+    _git(repo, "commit", "-m", "add case collision target")
+    ignored = path / "foo"
+    ignored.write_text("must survive\n")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert ignored.read_text() == "must survive\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+def test_retained_legacy_ring_seat_counts_toward_cap(holder):
+    repo, path, row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+    global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
+    if global_ring.exists():
+        global_ring.unlink()
+
+    (legacy_path / ".gitignore").write_text("build/\n")
+    _git(legacy_path, "add", ".gitignore")
+    _git(legacy_path, "commit", "-m", "ignore retained legacy fixture")
+    target = repo / "build" / "x"
+    target.parent.mkdir()
+    target.write_text("target\n")
+    _git(repo, "add", "build/x")
+    _git(repo, "commit", "-m", "add retained legacy target")
+    collision = legacy_path / "build"
+    collision.mkdir()
+    (collision / "payload").write_text("must survive\n")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="all available worktrees"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert not (repo / "worktrees" / "s-1").exists()
+    assert (collision / "payload").read_text() == "must survive\n"
+
+
+def test_ignored_listing_is_scoped_to_each_candidate_seat(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo = _make_repo(tmp_path)
+    bad = pool.acquire_worktree_seat(repo, "bad")
+    good = pool.acquire_worktree_seat(repo, "good")
+    bad_path = bad.path
+    good_path = good.path
+    bad.release()
+    good.release()
+
+    (bad_path / ".gitignore").write_text("build/\n")
+    _git(bad_path, "add", ".gitignore")
+    _git(bad_path, "commit", "-m", "add ignored seat fixture")
+    _git(repo, "merge", "--ff-only", "worktree/bad")
+    target = repo / "build" / "x"
+    target.parent.mkdir()
+    target.write_text("target\n")
+    _git(repo, "add", "-f", "build/x")
+    _git(repo, "commit", "-m", "add ignored seat target")
+    collision = bad_path / "build"
+    collision.mkdir()
+    (collision / "payload").write_text("must survive\n")
+
+    ignored_listing_cwds = []
+    real_git_nul = pool._git_nul
+
+    def record_ignored_listing(cwd, *args, **kwargs):
+        if args[:1] == ("ls-files",) and "--ignored" in args:
+            ignored_listing_cwds.append(Path(cwd).resolve())
+        return real_git_nul(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(pool, "_git_nul", record_ignored_listing)
+    records = {
+        ident: {
+            "dispatch_id": ident,
+            "state": "complete",
+            "worker_pid": 34567,
+            "worker_identity": {"pid": 34567, "start_token": f"{ident}-token"},
+        }
+        for ident in ("bad", "good")
+    }
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: False,
+    )
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == good_path
+    assert ignored_listing_cwds[:2] == [bad_path.resolve(), good_path.resolve()]
+    assert (collision / "payload").read_text() == "must survive\n"
+
+
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 @pytest.mark.parametrize("missing", [False, True])
 def test_hidden_index_edit_retains_seat(holder, flag, missing):
@@ -365,6 +535,29 @@ def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_state):
             "refs/goalflight/keep/old",
             "refs/heads/goalflight/quarantine",
         ) == ""
+
+
+def test_lfs_worktree_bytes_must_match_pointer(holder, tmp_path):
+    repo, path, row = holder
+    payload = b"pointer bytes\n"
+    payload_oid = hashlib.sha256(payload).hexdigest()
+    _add_clean_lfs_file(path, tmp_path, "valuable.dat", payload)
+    clean_filter = tmp_path / "lfs-clean.py"
+    clean_filter.write_text(
+        "import sys\n"
+        "sys.stdin.buffer.read()\n"
+        "sys.stdout.write('version https://git-lfs.github.com/spec/v1\\n"
+        f"oid sha256:{payload_oid}\\nsize {len(payload)}\\n')\n",
+        encoding="utf-8",
+    )
+    (path / "valuable.dat").write_bytes(b"wrong bytes!!\n")
+    _git(path, "add", "valuable.dat")
+    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="LFS object"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert (path / "valuable.dat").read_bytes() == b"wrong bytes!!\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
 
 
 def test_clean_submodule_with_lfs_reuses_seat(holder, tmp_path):
@@ -578,6 +771,22 @@ def test_seat_wait_retries_without_terminal_record(monkeypatch):
     assert bind.call_count == 2
 
 
+def test_retained_seat_wait_retries_without_terminal_record(monkeypatch):
+    args = SimpleNamespace(capacity_wait_s=10)
+    lease = object()
+    bind = Mock(
+        side_effect=[
+            pool.WorktreeSeatResetRefused("all available worktrees would lose work"),
+            lease,
+        ]
+    )
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", bind)
+    monkeypatch.setattr(dispatch.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dispatch, "_prepare_attempt_worktree_occupancy", lambda args: None)
+    assert dispatch._admit_dispatch_worktree(args) is lease
+    assert bind.call_count == 2
+
+
 def test_seat_wait_expiry_is_admission_refusal(monkeypatch):
     args = SimpleNamespace(capacity_wait_s=None)
     def refuse(bind_args):
@@ -621,6 +830,20 @@ def test_resume_replacement_preserves_seat_wait_deadline(tmp_path, monkeypatch):
         parent_dispatch_id="replacement-parent",
     ) is lease
     assert observed["capacity_deadline"] == deadline
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-inf"])
+def test_capacity_wait_parser_rejects_nonfinite(value, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        dispatch._build_launch_parser().parse_args([f"--capacity-wait-s={value}"])
+    assert exc_info.value.code == 2
+    assert "--capacity-wait-s must be finite" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_admission_rejects_nonfinite_capacity_wait(value):
+    with pytest.raises(dispatch.DispatchUsageError, match="must be finite"):
+        dispatch._admit_dispatch_worktree(SimpleNamespace(capacity_wait_s=value))
 
 
 @pytest.mark.parametrize("state", ["failed", "error", "cancelled", "worker_dead", "blocked_capacity", "blocked_task_breadcrumb"])
@@ -765,6 +988,84 @@ def test_full_pool_waits_then_launches_same_id(tmp_path, monkeypatch):
         assert marker.exists()
     finally:
         holder.release()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.communicate(timeout=5)
+
+
+# HOST-ONLY: launches a detached dispatcher; do not run in a worker worktree.
+def test_retained_seat_waits_then_launches_same_id(tmp_path, monkeypatch):
+    env = _env(tmp_path, seats=1)
+    for key, value in env.items():
+        if key.startswith("GOALFLIGHT_"):
+            monkeypatch.setenv(key, value)
+    repo = _make_repo(tmp_path)
+    holder = pool.acquire_worktree_seat(repo, "held")
+    seat = holder.path
+    holder.release()
+    ledger.record_path("held").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "held",
+                "state": "complete",
+                "worker_pid": os.getpid(),
+                "worker_identity": {
+                    "pid": os.getpid(),
+                    "start_token": "previous-generation",
+                },
+            }
+        )
+    )
+
+    (seat / ".gitignore").write_text("build/\n")
+    _git(seat, "add", ".gitignore")
+    _git(seat, "commit", "-m", "ignore retained-seat fixture")
+    target = repo / "build" / "x"
+    target.parent.mkdir()
+    target.write_text("target\n")
+    _git(repo, "add", "build/x")
+    _git(repo, "commit", "-m", "add retained-seat target")
+    collision = seat / "build"
+    collision.mkdir()
+    (collision / "payload").write_text("must survive until release\n")
+
+    marker = tmp_path / "launched"
+    command = _dispatch_cmd(
+        tmp_path,
+        repo,
+        "waiting",
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('launched')",
+    )
+    command[command.index("--") : command.index("--")] = ["--capacity-wait-s", "5"]
+    wait_started = time.monotonic()
+
+    def release_collision() -> None:
+        (collision / "payload").unlink()
+        collision.rmdir()
+
+    proc = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    timer = threading.Timer(1.2, release_collision)
+    timer.start()
+    try:
+        stdout, stderr = proc.communicate(timeout=20)
+        waited = time.monotonic() - wait_started
+        assert proc.returncode == 0, stdout + stderr
+        assert waited >= 1.0
+        assert stdout.count("DISPATCH-LAUNCHED") == 1
+        assert "DISPATCH-BLOCKED" not in stdout
+        assert marker.exists()
+    finally:
+        timer.cancel()
+        timer.join()
         if proc.poll() is None:
             proc.terminate()
             proc.communicate(timeout=5)

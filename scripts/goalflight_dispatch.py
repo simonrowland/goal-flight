@@ -560,6 +560,20 @@ def _parse_os_sandbox_arg(value: str) -> str:
             f"invalid choice: {value!r} (choose from {', '.join(OS_SANDBOX_PROFILES)})"
         )
     return mapped
+
+
+def _parse_finite_capacity_wait(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "--capacity-wait-s must be a finite number"
+        ) from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("--capacity-wait-s must be finite")
+    return parsed
+
+
 _CODEX_SANDBOX_VALUE = {
     "workspace-write": "workspace-write",
     "read-only": "read-only",
@@ -2654,7 +2668,18 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     therefore cannot create, reset, or hold a worktree seat.
     """
     requested_wait = getattr(args, "capacity_wait_s", None)
-    wait_s = max(0.0, float(requested_wait or 0.0))
+    if requested_wait is None:
+        wait_s = 0.0
+    else:
+        try:
+            requested_wait = float(requested_wait)
+        except (TypeError, ValueError) as exc:
+            raise DispatchUsageError(
+                "--capacity-wait-s must be a finite number"
+            ) from exc
+        if not math.isfinite(requested_wait):
+            raise DispatchUsageError("--capacity-wait-s must be finite")
+        wait_s = max(0.0, requested_wait)
     deadline = time.monotonic() + wait_s
     previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
     # Zero is an immediate non-blocking lock budget; positive deadlines poll.
@@ -2666,7 +2691,10 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
             try:
                 lease = _bind_dispatch_worktree(args)
                 break
-            except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+            except (
+                goalflight_worktree_pool.WorktreeSeatUnavailable,
+                goalflight_worktree_pool.WorktreeSeatResetRefused,
+            ) as exc:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     args._worktree_seat_refused = True
@@ -19534,7 +19562,7 @@ def _cmd_drain(argv: list[str]) -> int:
         "--controller-label",
         help="Invoking controller label (default: $GOALFLIGHT_CONTROLLER_LABEL).",
     )
-    parser.add_argument("--capacity-wait-s", type=float, default=0.0)
+    parser.add_argument("--capacity-wait-s", type=_parse_finite_capacity_wait, default=0.0)
     parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
     parser.add_argument("--limit", type=int, default=0, help="maximum queue entries to inspect; 0 = all")
     parser.add_argument("--remote-node", help="Launch claimed queue entries on this fleet node instead of locally.")
@@ -21044,7 +21072,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                         help="Suppress advisory git-base-pin warnings for git-repo cwd prompts.")
     parser.add_argument("--no-orientation", action="store_true",
                         help="Do not auto-add the docs-private/rag/ORIENTATION.md pointer preamble.")
-    parser.add_argument("--capacity-wait-s", type=float, default=None,
+    parser.add_argument("--capacity-wait-s", type=_parse_finite_capacity_wait, default=None,
                         help="How long to poll inline for a capacity slot "
                              "(re-attempts acquire every ~15s; sleep-excluding clock). Defaults "
                              "by lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
