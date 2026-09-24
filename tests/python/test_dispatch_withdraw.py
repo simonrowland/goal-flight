@@ -616,6 +616,52 @@ def test_queued_rows_never_own_worktree_and_withdraw_releases_task(prepared, rep
     assert withdraw(*args)[1]["status"] == "already withdrawn"
 
 
+def _retry_args(project: Path, held_id: str = "withdraw-test") -> SimpleNamespace:
+    return SimpleNamespace(retry_of=held_id, dispatch_id="replacement-dispatch", agent="codex", task_ids=["t-retry"], cwd=str(project), controller_label="owner")
+
+
+def _make_retry_holder(prepared):
+    project, authority, attempt, carrier = prepared
+    record = ledger.read_record("withdraw-test")
+    record.update(task_ids=["t-retry"], state="worker_dead", terminal_state="worker_dead", controller_label="owner")
+    ledger.write_record(record)
+    carrier.write_text(json.dumps(record))
+    assert authority.commit_terminal(
+        attempt.attempt_id, terminal_state="worker_dead",
+        observation={"state": "worker_dead", "reason": "stale worker"},
+    ).committed
+    return project
+
+
+def test_retry_of_supersedes_stale_holder_and_is_idempotent(prepared):
+    project = _make_retry_holder(prepared)
+    args = _retry_args(project)
+
+    dispatch._prepare_retry_of(args)
+    record = ledger.read_record("withdraw-test")
+    assert record["state"] == record["terminal_state"] == "superseded"
+    assert record["superseded_by"] == "replacement-dispatch"
+    assert attempt_row(prepared[1])["terminal_state"] == "superseded"
+
+    # A crash after withdrawal but before launch leaves a safe, repeatable row.
+    dispatch._prepare_retry_of(args)
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "superseded"
+
+
+def test_retry_of_live_holder_refuses_without_artifacts(prepared, monkeypatch, tmp_path):
+    project = _make_retry_holder(prepared)
+    record = ledger.read_record("withdraw-test")
+    record.update(worker_pid=12345, worker_identity={})
+    ledger.write_record(record)
+    monkeypatch.setattr(dispatch, "_queue_claim_identity_status", lambda _pid, _identity: ("live", "test-live"))
+    before = snapshot(tmp_path)
+
+    with pytest.raises(dispatch.DispatchUsageError, match="is live"):
+        dispatch._prepare_retry_of(_retry_args(project))
+
+    assert snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize("terminal_state", ["blocked", "abandoned"])
 def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_state):
     _, authority, attempt, carrier = prepared

@@ -3420,7 +3420,7 @@ def _launch_authority_entry(args) -> dict:
     return entry
 
 
-_SELF_HELD_LEDGER_STATES = frozenset({"worker_dead", "superseded", "abandoned"})
+_SELF_HELD_LEDGER_STATES = frozenset({"stale_dead", "worker_dead", "superseded", "abandoned"})
 _DIAGNOSTIC_ROW_RE = re.compile(
     r'dispatch_id=("(?:\\.|[^"\\])*") state=("(?:\\.|[^"\\])*"|null)'
 )
@@ -3466,39 +3466,77 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
     )
 
 
-def _completion_refusal_guidance(diagnostics: list[str], project_root: str) -> str:
-    """Remedy text keyed on the blocking rows, not the synthetic decision state.
+def _held_liveness(dispatch_id: str) -> tuple[str, dict]:
+    record = _find_dispatch_record(dispatch_id)
+    if not isinstance(record, dict):
+        return "indeterminate", {}
+    if record.get("worker_still_alive") is True:
+        return "live", record
+    try:
+        index = _build_queue_carrier_index(_queue_entry_path(dispatch_id).parent)
+        if index.listing_error is not None:
+            return "indeterminate", record
+        carrier_statuses = index.carriers_by_id.get(dispatch_id, [])
+        if any(status.kind == ClaimCarrierKind.LIVE for status in carrier_statuses):
+            return "live", record
+        if any(status.kind == ClaimCarrierKind.UNKNOWN for status in carrier_statuses):
+            return "indeterminate", record
+    except Exception:
+        return "indeterminate", record
+    pid = record.get("worker_pid") or record.get("queue_worker_pid")
+    if pid:
+        status, _reason = _queue_claim_identity_status(
+            pid, record.get("worker_identity") or record.get("queue_worker_identity")
+        )
+        if status in {"live", "indeterminate"}:
+            return status, record
+        return "dead", record
+    return ("dead" if record.get("worker_still_alive") is False else "indeterminate"), record
 
-    A ``worker_dead`` / ``superseded`` / ``abandoned`` row is the hold. Resume
-    of that dispatch is the recovery; reconcile-outbox does not clear it.
-    A live sibling keeps the wait guidance. Reconcile stays only where a
-    terminal publication actually failed, or where the blocker is not one of
-    those self-held rows.
-    """
+
+def _retry_recovery_command(
+    held_id: str, replacement_id: str, project_root: str, label: str | None,
+) -> str:
+    command = [
+        sys.executable, str(Path(__file__).resolve()), "withdraw", held_id,
+        "--superseded-by", replacement_id, "--reason",
+        "retry same task after held dispatch ended", "--project-root", project_root,
+    ]
+    if label:
+        command.extend(("--controller-label", label))
+    return shlex.join(command)
+
+
+def _completion_refusal_guidance(
+    diagnostics: list[str], project_root: str, *, args=None,
+) -> str:
+    """Explain how to release a confirmed-dead task holder safely."""
     rows, publication_failed = _blocking_rows_from_diagnostics(diagnostics)
     held = [(did, state) for did, state in rows if state in _SELF_HELD_LEDGER_STATES]
     live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
+    task_ids = list(getattr(args, "task_ids", []) or [])
+    task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
+    replacement = str(getattr(args, "dispatch_id", "") or "<new-dispatch-id>")
+    label = str(getattr(args, "controller_label", None) or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip() or None
     if held and not live:
-        named = ", ".join(f"{did} state={state}" for did, state in held)
-        text = (
-            "The hold is the ledger row "
-            f"({named}). Resume that dispatch; a later resume in the same "
-            "chain is the same attempt. A fresh dispatch on this task stays "
-            "refused. Opening a new task row is interim and leaves the old id held."
-        )
-        if publication_failed:
-            text += "\n" + _reconcile_outbox_guidance(project_root)
-        return text
+        lines = []
+        for dispatch_id, state in held:
+            liveness, record = _held_liveness(dispatch_id)
+            if liveness == "live":
+                lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
+            elif liveness == "indeterminate":
+                lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
+            else:
+                owner = str(record.get("controller_label") or label or "").strip() or None
+                command = _retry_recovery_command(dispatch_id, replacement, project_root, owner)
+                lines.append(f"{task_text} is held by {dispatch_id} (state {state}). To retry the same task: {command}, then re-run this dispatch. Or re-run it with --retry-of {dispatch_id}.")
+        text = "\n".join(lines)
+        return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     if held and live:
         named = ", ".join(f"{did} state={state}" for did, state in held)
-        text = (
-            f"Dead rows ({named}) do not block their own resume, but a live "
-            "sibling still holds this task. Wait for active siblings, or "
-            "dispatch only remaining task IDs."
-        )
-        if publication_failed:
-            text += "\n" + _reconcile_outbox_guidance(project_root)
-        return text
+        active = ", ".join(f"{did} state={state}" for did, state in live)
+        text = f"Rows ({named}) are held, but {active} still holds {task_text}. Wait for the active holder; do not withdraw a live or liveness-indeterminate row."
+        return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     return _reconcile_outbox_guidance(project_root)
 
 
@@ -3528,7 +3566,9 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
             f"entry.created_at={json.dumps(entry.get('created_at'))}\n"
             + "\n".join(diagnostics)
             + "\n"
-            + _completion_refusal_guidance(diagnostics, str(entry["project_root"])),
+            + _completion_refusal_guidance(
+                diagnostics, str(entry["project_root"]), args=args,
+            ),
             file=sys.stderr,
         )
     print(
@@ -3545,6 +3585,56 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
         flush=True,
     )
     raise DispatchUsageError(message)
+
+
+def _prepare_retry_of(args) -> None:
+    """Withdraw one confirmed stale holder before ordinary launch admission."""
+    held_id = str(getattr(args, "retry_of", "") or "").strip()
+    if not held_id:
+        return
+    task_ids = set(getattr(args, "task_ids", []) or [])
+    if not task_ids:
+        raise DispatchUsageError("--retry-of requires at least one --task held by that dispatch")
+
+    replacement_id = str(getattr(args, "dispatch_id", "") or "").strip()
+    if not replacement_id:
+        replacement_id = _default_dispatch_id(getattr(args, "agent", "worker"))
+        args.dispatch_id = replacement_id
+    if replacement_id == held_id:
+        raise DispatchUsageError("--retry-of and --dispatch-id must name different dispatches")
+
+    try:
+        project_root = _project_root(args)
+        withdraw_args = argparse.Namespace(
+            dispatch_id=held_id,
+            project_root=str(project_root),
+            operator=False,
+            controller_label=getattr(args, "controller_label", None) or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL"),
+        )
+        root, _authority, attempt, record, carriers, _outcome, _withdrawn = _withdraw_preflight(withdraw_args)
+    except Exception as exc:
+        raise DispatchUsageError(f"--retry-of {held_id} refused: {exc}") from exc
+
+    missing = sorted(task_ids - set(_entry_task_ids(next(iter(carriers.values()), {}), record)))
+    if missing:
+        raise DispatchUsageError(
+            f"--retry-of {held_id} refused: holder does not hold task ids {', '.join(missing)}"
+        )
+    held_state = str((record or {}).get("state") or (record or {}).get("terminal_state") or attempt.get("terminal_state") or "")
+    if held_state not in _SELF_HELD_LEDGER_STATES:
+        raise DispatchUsageError(
+            f"--retry-of {held_id} refused: holder state {held_state or 'unknown'} is not stale"
+        )
+
+    command = [held_id, "--reason", "retry same task after held dispatch ended", "--superseded-by", replacement_id, "--project-root", str(root)]
+    if withdraw_args.controller_label:
+        command.extend(("--controller-label", str(withdraw_args.controller_label)))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = _cmd_withdraw(command)
+    if code != 0:
+        detail = output.getvalue().strip()
+        raise DispatchUsageError(f"--retry-of {held_id} refused: {detail or 'withdraw failed'}")
 
 
 def _refuse_reused_nonterminal_dispatch_id(
@@ -8434,6 +8524,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--codex-resume-home": "preserve",
     "--codex-home-owner-dispatch-id": "preserve",
     "--dispatch-id": "replace",
+    "--retry-of": "strip",
     "--tail": "replace",
     "--status-json": "replace",
     "--foreground": "strip",
@@ -8488,6 +8579,7 @@ _REPLAY_VALUE_OPTIONS = {
     "--codex-resume-home",
     "--codex-home-owner-dispatch-id",
     "--dispatch-id",
+    "--retry-of",
     "--tail",
     "--status-json",
     "--queue-launch-token",
@@ -10712,22 +10804,45 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
         if attempt["lifecycle_state"] not in goalflight_journal.ATTEMPT_FINAL_STATES:
             raise ValueError("attempt is no longer final; settlement refused")
         journal_state = attempt["terminal_state"]
-        state = "withdrawn" if journal_state == "abandoned" else journal_state
-        if goalflight_ledger.terminal_state_for(state) == "unknown":
-            raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
-        events = authority.read_all(
-            "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
-            (attempt["attempt_id"], attempt["terminal_transition_id"]),
+        final_supersession = bool(
+            getattr(args, "superseded_by", None)
+            and journal_state in {"worker_dead", "stale_dead"}
+            and not args.dry_run
         )
-        if not events:
-            raise ValueError("terminal attempt has no matching outbox event")
-        terminal = goalflight_journal.TerminalCommit(
-            attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
-            transition_id=attempt["terminal_transition_id"],
-            event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
-            terminal_state=journal_state, observation={**outcome, "state": journal_state},
-            terminal_at=attempt["terminal_at"], idempotent=True,
-        )
+        if final_supersession:
+            actor = "operator" if getattr(args, "operator", False) else args.controller_label
+            observation = {
+                "reason": args.reason, "withdrawn_by": actor,
+                "superseded_by": args.superseded_by, "state": "superseded",
+            }
+            committed = goalflight_journal.Journal(root).commit_terminal(
+                attempt["attempt_id"], terminal_state="superseded",
+                event_type="blocked", observation=observation,
+                _allow_final_supersession=True,
+            )
+            if not committed.committed or committed.value is None:
+                raise ValueError(f"journal supersession failed: {committed}")
+            terminal = committed.value
+            journal_state = terminal.terminal_state
+            state = journal_state
+            outcome = terminal.observation
+        else:
+            state = "withdrawn" if journal_state == "abandoned" else journal_state
+            if goalflight_ledger.terminal_state_for(state) == "unknown":
+                raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
+            events = authority.read_all(
+                "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
+                (attempt["attempt_id"], attempt["terminal_transition_id"]),
+            )
+            if not events:
+                raise ValueError("terminal attempt has no matching outbox event")
+            terminal = goalflight_journal.TerminalCommit(
+                attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+                transition_id=attempt["terminal_transition_id"],
+                event_uuid=events[0]["event_uuid"], event_type=events[0]["event_type"],
+                terminal_state=journal_state, observation={**outcome, "state": journal_state},
+                terminal_at=attempt["terminal_at"], idempotent=True,
+            )
         projected = goalflight_ledger.terminal_record_projection(
             record or {"dispatch_id": args.dispatch_id,
                        "controller_label": attempt.get("owner_controller_label")},
@@ -10760,6 +10875,8 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
                     f"{type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
+            if final_supersession:
+                _release_withdrawn_worktree(projected, args.dispatch_id)
             archived = _archive_withdraw_carriers(carriers)
             payload.update(archived_carriers=archived,
                            archived_carrier=archived[0] if archived else None)
@@ -19804,6 +19921,10 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail", help="Worker output sink (auto: <state>/dispatch/<id>.tail)")
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")
+    parser.add_argument(
+        "--retry-of",
+        help="Withdraw a confirmed stale holder before retrying its linked task(s)",
+    )
     parser.add_argument("--poll-secs", type=float, default=2.0)
     parser.add_argument(
         "--max-idle-secs",
@@ -19914,18 +20035,6 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "withdraw":
         return _cmd_withdraw(argv[1:])
     option_argv = argv[: argv.index("--")] if "--" in argv else argv
-    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
-    # _persist_acp_watcher_prompt and the launch path), never here: a refused
-    # dispatch must leave zero side effects before its guards run.
-    try:
-        import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "resume":
@@ -19994,6 +20103,23 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     args._original_argv = list(argv)
     _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
+    try:
+        _prepare_retry_of(args)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
+    # _persist_acp_watcher_prompt), never before retry preflight: a refused
+    # --retry-of must leave zero launch-side artifacts.
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
     if args.stats is not None:
         try:
             payload = goalflight_ledger.stats_payload(args.stats)

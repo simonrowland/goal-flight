@@ -134,12 +134,13 @@ def test_durably_complete_row_refuses_with_store_evidence(launch_authority, stam
     assert "dispatch_id=unbound" in output.err
 
 
-def test_partial_supersession_names_advanced_record(launch_authority, capsys):
+def test_partial_supersession_names_advanced_record(launch_authority, monkeypatch, capsys):
     args, store, row, records = launch_authority
     row.update(done=False, done_at=None, closed_at=None)
     store.tasks_path.write_text(json.dumps(row) + "\n")
-    records.append({"dispatch_id": "stopped-earlier", "project_root": args.project_root,
-                    "task_ids": args.task_ids, "state": "worker_dead", "ended_at": None})
+    records.append(_dead_record(args, "stopped-earlier", controller_label="owner", worker_still_alive=False))
+    args.controller_label = "owner"
+    monkeypatch.setattr(D, "_find_dispatch_record", _find_in(records))
 
     with pytest.raises(D.DispatchUsageError):
         D._refuse_launch_blocked_by_completion_authority(args)
@@ -151,9 +152,11 @@ def test_partial_supersession_names_advanced_record(launch_authority, capsys):
     assert 'state="worker_dead"' in output.err
     assert "ended_at=null" in output.err
     assert row["id"] in output.err
-    assert "resume" in output.err.lower()
+    assert "goalflight_dispatch.py withdraw stopped-earlier --superseded-by followup" in output.err
+    assert "--reason 'retry same task after held dispatch ended'" in output.err
+    assert "--controller-label owner" in output.err
+    assert "Or re-run it with --retry-of stopped-earlier" in output.err
     assert "reconcile-outbox" not in output.err
-    assert "interim" in output.err
 
 
 @pytest.mark.parametrize("status_kind", ["failed", "healthy", "foreign", "unreadable"])
