@@ -212,11 +212,12 @@ def _scheme_string(value: str) -> str:
 def _grok_read_only_cleanup_lock_filters(steer_file: str) -> list[str]:
     """Return regex grants for this dispatch's dynamically named cleanup locks."""
     steer_path = Path(steer_file).expanduser()
-    stem = re.escape(steer_path.stem)
+    stem = re.escape(steer_path.stem).replace(r"\-", "-")
     suffix = r"\.[A-Za-z0-9]{1,128}\.[1-9][0-9]*\.lock$"
     filters: list[str] = []
     for parent in _unique_real_paths([str(steer_path.parent)]):
-        prefix = f"{re.escape(parent)}/\\.{stem}"
+        escaped_parent = re.escape(parent).replace(r"\-", "-")
+        prefix = f"{escaped_parent}/\\.{stem}"
         filters.extend((
             f'(regex #"^{prefix}\\.cleanup\\.receipt{suffix}")',
             f'(regex #"^{prefix}\\.cleanup\\.end{suffix}")',
