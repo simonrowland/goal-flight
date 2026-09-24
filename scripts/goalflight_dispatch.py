@@ -10381,45 +10381,75 @@ def _commit_abandoned_dispatch(
         )
     winner = committed.value
     terminal_state = winner.terminal_state
+    winner_observation = (
+        winner.observation if isinstance(winner.observation, dict) else {}
+    )
+    winner_outcome = winner_observation.get("outcome")
+    winner_envelope = dict(winner_outcome) if isinstance(winner_outcome, dict) else {}
+    winner_state = str(winner_observation.get("state") or terminal_state)
+    state = winner_state
     ended_at = goalflight_ledger.preserve_first_terminal_time(
         record,
         winner.terminal_at,
     )
-    basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
-    reconciliation = {
-        "source": "goalflight_dispatch.drain",
-        "basis": basis,
-        "reason": evaluation.get("reason"),
-        "process_evidence": evaluation.get("process_evidence"),
-        "status_evidence": evaluation.get("status_evidence"),
-        "output_evidence": evaluation.get("output_evidence"),
-        "lease_evidence": evaluation.get("lease_evidence"),
-        "controller_evidence": evaluation.get("controller_evidence"),
-        "progress_age_s": evaluation.get("progress_age_s"),
-        "checked_output": True,
-        "observed_outcome": marker is not None,
-    }
-    if marker is not None:
-        reconciliation["terminal_marker_kind"] = marker.get("kind")
-        record["terminal_marker"] = marker
-    record.update(
-        {
-            "state": state,
-            "terminal_state": terminal_state,
-            "liveness_state": goalflight_terminal.terminal_liveness_state(state),
-            "worker_still_alive": False,
-            "reason": reason,
-            "outcome": {
+    if winner.idempotent:
+        # The journal winner is authoritative when a watcher committed before
+        # dying. Do not merge this reconciler's marker or inferred outcome into
+        # the winner's terminal state, event, or failure envelope.
+        record.pop("reason", None)
+        record.pop("error", None)
+        record.pop("terminal_marker", None)
+        record.update(
+            {
+                "state": state,
                 "terminal_state": terminal_state,
-                "reason": reason,
-                "reconciliation": reconciliation,
-            },
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+                "worker_still_alive": winner_observation.get("worker_still_alive"),
+                "outcome": {"terminal_state": terminal_state, **winner_envelope},
+            }
+        )
+        record.update(winner_envelope)
+        headline = winner_observation.get("headline")
+        if isinstance(headline, str) and headline.strip():
+            record["headline"] = headline.strip()
+        else:
+            record.pop("headline", None)
+    else:
+        record.pop("error", None)
+        basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
+        reconciliation = {
+            "source": "goalflight_dispatch.drain",
+            "basis": basis,
+            "reason": evaluation.get("reason"),
+            "process_evidence": evaluation.get("process_evidence"),
+            "status_evidence": evaluation.get("status_evidence"),
+            "output_evidence": evaluation.get("output_evidence"),
+            "lease_evidence": evaluation.get("lease_evidence"),
+            "controller_evidence": evaluation.get("controller_evidence"),
+            "progress_age_s": evaluation.get("progress_age_s"),
+            "checked_output": True,
+            "observed_outcome": marker is not None,
         }
-    )
+        if marker is not None:
+            reconciliation["terminal_marker_kind"] = marker.get("kind")
+            record["terminal_marker"] = marker
+        record.update(
+            {
+                "state": state,
+                "terminal_state": terminal_state,
+                "liveness_state": goalflight_terminal.terminal_liveness_state(state),
+                "worker_still_alive": False,
+                "reason": reason,
+                "outcome": {
+                    "terminal_state": terminal_state,
+                    "reason": reason,
+                    "reconciliation": reconciliation,
+                },
+            }
+        )
     record["attempt_id"] = winner.attempt_id
     record["transition_id"] = winner.transition_id
     record["terminal_event_uuid"] = winner.event_uuid
-    record.pop("error", None)
     elapsed_s = goalflight_ledger.elapsed_seconds(record, ended_at)
     if elapsed_s is not None:
         record["elapsed_s"] = elapsed_s
@@ -10594,6 +10624,9 @@ def reconcile_abandoned_dispatches(
                             marker=marker,
                         )
                         committed_record = fresh
+                        state = str(committed_record.get("state") or state)
+                        committed_marker = committed_record.get("terminal_marker")
+                        marker = committed_marker if isinstance(committed_marker, dict) else None
                 finally:
                     ledger_lock.release()
         finally:
@@ -12962,7 +12995,14 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
     status_json = Path(str(request.get("status_json") or record.get("status_path") or _dispatch_base_dir() / f"{dispatch_id}.status.json"))
     tail = Path(str(request.get("tail") or record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
     state = str(record.get("state") or record.get("terminal_state") or "worker_dead")
-    reason = record.get("reason") or record.get("error") or "claim_reconciliation"
+    outcome = record.get("outcome") if isinstance(record.get("outcome"), dict) else {}
+    reason = (
+        record.get("reason")
+        or record.get("error")
+        or outcome.get("reason")
+        or outcome.get("error")
+        or "claim_reconciliation"
+    )
     # Derived post-commit mirror only: losing it gives up status freshness, not
     # the durable terminal journal row or its outbox event. Reconciliation will
     # rebuild it, so this must not unwind the already-committed queue cleanup.

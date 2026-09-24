@@ -770,6 +770,53 @@ def test_dead_worker_terminal_markers_reconcile_without_status_and_publish_once(
         assert M.read_envelopes(M.inbox_path(messages_dir, dispatch_id)) == delivered[dispatch_id]
 
 
+def test_reconciliation_adopts_existing_terminal_authority(tmp_path: Path) -> None:
+    dispatch_id = "watcher-authority-wins"
+    worker_pid, worker_identity = _dead_worker_identity()
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text=f"review output\nCOMPLETE: {dispatch_id} — late marker\n",
+        worker_pid=worker_pid,
+        worker_identity=worker_identity,
+        **_gone_controller(),
+    )
+    winner = L.commit_terminal_authority(
+        record,
+        state="inconclusive_timeout",
+        reason={"reason": "watcher_post_terminal_timeout"},
+        terminal_state="inconclusive_timeout",
+        worker_still_alive=True,
+    )
+    assert winner.committed and winner.value is not None
+    Path(str(record["status_path"])).unlink()
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert closed["state"] == "inconclusive_timeout"
+    assert closed["terminal_state"] == "inconclusive_timeout"
+    assert closed["terminal_event_uuid"] == winner.value.event_uuid
+    assert closed["worker_still_alive"] is True
+    assert closed["error"] == {"reason": "watcher_post_terminal_timeout"}
+    assert closed["outcome"] == {
+        "terminal_state": "inconclusive_timeout",
+        "error": {"reason": "watcher_post_terminal_timeout"},
+    }
+    assert "terminal_marker" not in closed
+    status = json.loads(Path(str(record["status_path"])).read_text(encoding="utf-8"))
+    assert status["state"] == "inconclusive_timeout"
+    assert status["terminal_state"] == "inconclusive_timeout"
+    assert status["reason"] == {"reason": "watcher_post_terminal_timeout"}
+    assert status["terminal_marker"] is None
+    delivered = M.read_envelopes(
+        M.inbox_path(Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id)
+    )
+    assert len(delivered) == 1
+    assert delivered[0]["type"] == "blocked"
+
+
 def test_terminal_marker_without_worker_identity_stays_open(tmp_path: Path) -> None:
     dispatch_id = "marker-without-worker-identity"
     record = _record(

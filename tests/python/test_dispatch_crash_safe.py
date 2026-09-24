@@ -37,9 +37,12 @@ WATCH = ROOT / "scripts" / "goalflight_watch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client  # noqa: E402
+import goalflight_journal  # noqa: E402
+import goalflight_ledger  # noqa: E402
 import goalflight_messages  # noqa: E402
 import goalflight_rate_pressure  # noqa: E402
 import goalflight_watch  # noqa: E402
+import goalflight_wake  # noqa: E402
 
 
 _SLOW_INTERRUPT_EXIT_SECS = 6.0
@@ -1253,7 +1256,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
 
 
 def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> None:
-    """HOST-ONLY: temp-repo regression for kill-after-DISPATCH-LAUNCHED."""
+    """HOST-ONLY: registered-controller regression for launcher-group death."""
     with tempfile.TemporaryDirectory(dir=ROOT, prefix=".goalflight-host-") as tmp:
         tmp_path = Path(tmp)
         repo = tmp_path / "repo"
@@ -1289,32 +1292,31 @@ def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> Non
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        tail = tmp_path / "dispatch.tail"
-        status = tmp_path / "dispatch.status.json"
-        started = tmp_path / "started"
-        done = tmp_path / "done"
-        dispatch_id = "background-group-kill"
-        env = os.environ.copy()
-        _isolate_state_env(env, tmp_path)
-        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
-        env["GOALFLIGHT_TEST_MODE"] = "1"
-        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
-        worker_code = (
-            "import pathlib, time\n"
-            f"pathlib.Path({str(started)!r}).write_text('started')\n"
-            f"print('!COMPLETE: {dispatch_id} — code done', flush=True)\n"
-            "time.sleep(0.5)\n"
-            f"pathlib.Path({str(done)!r}).write_text('done')\n"
-        )
-        proc = subprocess.Popen(
-            [
+        for shape, read_only in (("read-only", True), ("seat", False)):
+            tail = tmp_path / f"{shape}.dispatch.tail"
+            status = tmp_path / f"{shape}.dispatch.status.json"
+            started = tmp_path / f"{shape}.started"
+            done = tmp_path / f"{shape}.done"
+            dispatch_id = f"background-group-kill-{shape}"
+            label = f"host-regression-{shape}"
+            env = os.environ.copy()
+            _isolate_state_env(env, tmp_path)
+            env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids" / shape)
+            env["GOALFLIGHT_TEST_MODE"] = "1"
+            env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(ROOT / "scripts"), env.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep)
+            worker_code = (
+                "import pathlib, time\n"
+                f"pathlib.Path({str(started)!r}).write_text('started')\n"
+                f"print('!COMPLETE: {dispatch_id} — code done', flush=True)\n"
+                "time.sleep(2.0)\n"
+                f"pathlib.Path({str(done)!r}).write_text('done')\n"
+            )
+            dispatch_argv = [
                 sys.executable,
                 str(DISPATCH),
-                "--unregistered-forced",
-                "--cwd",
-                str(repo),
-                "--in-place",
-                "--read-only",
                 "--agent",
                 "test",
                 "--tail",
@@ -1327,89 +1329,120 @@ def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> Non
                 "0.1",
                 "--max-idle-secs",
                 "10",
-                "--",
-                sys.executable,
-                "-c",
-                worker_code,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            start_new_session=True,
-        )
-        try:
-            launch_line = ""
-            observed_lines: list[str] = []
-            deadline = time.monotonic() + _EVENT_HANG_CEILING_SECS
-            while time.monotonic() < deadline:
-                ready, _, _ = select.select(
-                    [proc.stdout], [], [], min(_EVENT_POLL_SECS, deadline - time.monotonic())
+            ]
+            if read_only:
+                dispatch_argv.extend(
+                    ["--cwd", str(repo), "--in-place", "--read-only"]
                 )
-                if not ready:
-                    continue
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                observed_lines.append(line.rstrip())
-                if line.startswith("DISPATCH-LAUNCHED "):
-                    launch_line = line
-                    break
-            if not launch_line:
-                stderr = ""
-                if proc.poll() is not None:
-                    _out, stderr = proc.communicate()
-                raise AssertionError(
-                    "dispatcher did not publish DISPATCH-LAUNCHED; "
-                    f"stdout={observed_lines!r}; stderr={stderr!r}; rc={proc.poll()!r}"
+            else:
+                dispatch_argv.extend(["--worktree-root", str(tmp_path / "worktrees")])
+            dispatch_argv.extend(["--", sys.executable, "-c", worker_code])
+            controller_code = (
+                "import os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "import goalflight_journal, goalflight_ledger, goalflight_wake\n"
+                f"project = Path({str(repo)!r})\n"
+                f"label = {label!r}\n"
+                "authority = goalflight_journal.open_or_create_journal(project)\n"
+                "principal = goalflight_ledger.process_identity(os.getpid())\n"
+                "if principal is None: raise SystemExit('missing controller identity')\n"
+                "claimed = authority.claim_or_renew_lease(label, principal=principal)\n"
+                "if not claimed.committed or claimed.value is None: raise SystemExit('controller registration failed')\n"
+                "holder = goalflight_wake.register_lease_holder(project, controller_label=label, lease_nonce=claimed.value.nonce)\n"
+                "os.environ.update({\n"
+                "    'GOALFLIGHT_CONTROLLER_LABEL': label,\n"
+                "    'GOALFLIGHT_CONTROLLER_PID': str(os.getpid()),\n"
+                "    'GOALFLIGHT_CONTROLLER_LEASE_NONCE': claimed.value.nonce,\n"
+                "})\n"
+                f"child = subprocess.Popen({dispatch_argv!r}, stdout=subprocess.PIPE, text=True)\n"
+                "for line in child.stdout:\n"
+                "    sys.stdout.write(line)\n"
+                "    sys.stdout.flush()\n"
+                "child.wait()\n"
+                "while True: time.sleep(1)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", controller_code],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                launch_line = ""
+                observed_lines: list[str] = []
+                deadline = time.monotonic() + _EVENT_HANG_CEILING_SECS
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select(
+                        [proc.stdout], [], [], min(_EVENT_POLL_SECS, deadline - time.monotonic())
+                    )
+                    if not ready:
+                        continue
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    observed_lines.append(line.rstrip())
+                    if line.startswith("DISPATCH-LAUNCHED "):
+                        launch_line = line
+                        break
+                if not launch_line:
+                    stderr = ""
+                    if proc.poll() is not None:
+                        _out, stderr = proc.communicate()
+                    raise AssertionError(
+                        f"{shape} dispatcher did not publish DISPATCH-LAUNCHED; "
+                        f"stdout={observed_lines!r}; stderr={stderr!r}; rc={proc.poll()!r}"
+                    )
+                launched = json.loads(launch_line.split(" ", 1)[1])
+                watcher_pid = int(launched["watcher_pid"])
+                assert proc.poll() is None, f"{shape} controller exited before the kill"
+                os.killpg(proc.pid, signal.SIGTERM)
+                _observe_process_exit(proc, expected_returncode=-signal.SIGTERM)
+                assert _process_exists(watcher_pid), (
+                    f"{shape} watcher died with the registered controller group"
                 )
-            assert proc.poll() is None, "dispatcher exited before the kill"
-            os.killpg(proc.pid, signal.SIGTERM)
-            _observe_process_exit(proc, expected_returncode=-signal.SIGTERM)
 
-            assert _wait_for(done.exists), "worker died with launcher process group"
+                assert _wait_for(done.exists), f"{shape} worker died with launcher group"
 
-            def _terminal_state() -> str | None:
-                try:
-                    return json.loads(status.read_text(encoding="utf-8")).get("state")
-                except (OSError, ValueError, json.JSONDecodeError):
-                    return None
+                def _terminal_state() -> str | None:
+                    try:
+                        return json.loads(status.read_text(encoding="utf-8")).get("state")
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        return None
 
-            assert _wait_for(lambda: _terminal_state() == "complete"), (
-                status.read_text(encoding="utf-8") if status.exists() else "missing status"
-            )
-            payload = json.loads(status.read_text(encoding="utf-8"))
-            assert payload.get("detached") is True, payload
-            ledger_path = (
-                Path(env["GOALFLIGHT_STATE_DIR"])
-                / "runs.d"
-                / f"{dispatch_id}.json"
-            )
-            assert _wait_for(
-                lambda: ledger_path.exists()
-                and json.loads(ledger_path.read_text(encoding="utf-8")).get("state")
-                == "complete"
-            ), "watcher did not settle the ledger"
-            inbox = goalflight_messages.inbox_path(
-                Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id
-            )
+                assert _wait_for(lambda: _terminal_state() == "complete"), (
+                    status.read_text(encoding="utf-8") if status.exists() else f"{shape} missing status"
+                )
+                payload = json.loads(status.read_text(encoding="utf-8"))
+                assert payload.get("detached") is True, payload
+                ledger_path = Path(env["GOALFLIGHT_STATE_DIR"]) / "runs.d" / f"{dispatch_id}.json"
+                assert _wait_for(
+                    lambda: ledger_path.exists()
+                    and json.loads(ledger_path.read_text(encoding="utf-8")).get("state")
+                    == "complete"
+                ), f"{shape} watcher did not settle the ledger"
+                inbox = goalflight_messages.inbox_path(
+                    Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id
+                )
 
-            def _result_count() -> int:
-                try:
-                    return len(goalflight_messages.read_envelopes(inbox))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    return 0
+                def _result_count() -> int:
+                    try:
+                        return len(goalflight_messages.read_envelopes(inbox))
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        return 0
 
-            assert _wait_for(
-                lambda: _result_count() == 1
-            ), "watcher did not publish exactly one result event"
-        finally:
-            if proc.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGTERM)
-                _observe_process_exit(proc)
+                assert _wait_for(lambda: _result_count() == 1), (
+                    f"{shape} watcher did not publish exactly one result event"
+                )
+            finally:
+                if proc.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    _observe_process_exit(proc)
 
 
 def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> None:
