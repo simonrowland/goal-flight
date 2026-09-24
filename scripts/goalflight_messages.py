@@ -8898,11 +8898,7 @@ def cmd_listen(args) -> int:
                 # The claim never raises its water. Covered streams may drop
                 # off so a replacement re-reports only the unconsumed remainder.
                 pending_report_settled = persisted_state.phase == "acknowledged"
-                arm_high = (
-                    dict(persisted_state.positions)
-                    if pending_report_settled
-                    else {}
-                )
+                arm_high = dict(persisted_state.positions)
                 if not pending_report_settled:
                     settled = _settle_pending_report_if_consumed(
                         authority,
@@ -9594,6 +9590,7 @@ def cmd_listen(args) -> int:
                 if observed_report is None or observed_report.phase == "acknowledged":
                     pending_report_settled = True
                 else:
+                    arm_high = dict(observed_report.positions)
                     settled = _settle_pending_report_if_consumed(
                         authority,
                         project_root,
