@@ -47,7 +47,7 @@ def _raw_config(tmp_path: Path, *, token_pool_size: int = 2) -> dict:
                 "token_pool_size": token_pool_size,
                 "remote_exec": ["scripted-remote", "{host}", "{script}"],
                 "env": {},
-                "managed_run_directory": "/var/lib/example-ci",
+                "managed_run_directory": str(tmp_path / "fake-node"),
             }
         },
         "admission": {
@@ -100,11 +100,15 @@ class ScriptedExecutor:
         self.calls.append(payload["operation"])
         if self.before:
             self.before(payload)
-        payload["managed_root"] = str(self.root)
+        # Honour the managed root in the payload. Rewriting it hid two projects
+        # on one box creating two token pools.
         shell[-1] = base64.b64encode(json.dumps(payload).encode()).decode()
         shell[0] = sys.executable
+        authority = str(self.root / "authority.json")
         shell[2] = (
-            "import os,socket;os.getloadavg=lambda:(" + repr(self.load1) + ",0,0);"
+            "import builtins,os,socket;"
+            "builtins._GOALFLIGHT_REMOTE_CI_AUTHORITY = " + repr(authority) + ";"
+            "os.getloadavg=lambda:(" + repr(self.load1) + ",0,0);"
             "socket.gethostname=lambda:'measured-node';" + shell[2]
         )
         return run_command(shell, timeout=timeout)
@@ -113,10 +117,11 @@ class ScriptedExecutor:
         node = RemoteRunner(config, executor=self).nodes["box-a"]
         for record in node.call("list"):
             key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
+            owner = {name: record.get(name) for name in ("owner_host", "owner_pid", "owner_identity")}
             if record.get("remote_run"):
-                node.call("cancel", **key, identity=record["remote_run"])
+                node.call("cancel", **key, identity=record["remote_run"], expected_owner=owner)
             elif record["state"] != "released":
-                node.call("release", **key)
+                node.call("release", **key, expected_owner=owner)
 
 
 @pytest.fixture
@@ -280,7 +285,7 @@ def test_node_admission_never_creates_controller_paths(node_env, monkeypatch):
     monkeypatch.setattr(Path, "mkdir", guarded)
     held = wait_state(node, enqueue(node), {"admitted"})
     assert held["sample"]["hostname"] == "measured-node"
-    assert Path(held["run_directory"]).parent == executor.root / "admission" / "runs"
+    assert Path(held["run_directory"]).parent == executor.root / "runs"
     assert health_census(config, executor=executor)["boxes"][0]["tokens"]["in_use"] == 1
     assert list_remote_leases(config, executor=executor)[0]["lease_id"] == held["lease_id"]
 
@@ -416,8 +421,9 @@ def test_receipt_with_alias_instead_of_measured_hostname_is_red(node_env):
 
 def test_health_counts_distinct_token_locks(node_env):
     config, executor, _, _ = node_env
-    other_executor = ScriptedExecutor(executor.root.parent / "two-token-node")
-    box = replace(config.boxes["box-a"], token_pool_size=2)
+    other_root = executor.root.parent / "two-token-node"
+    other_executor = ScriptedExecutor(other_root)
+    box = replace(config.boxes["box-a"], token_pool_size=2, managed_run_directory=other_root)
     config = replace(config, boxes={"box-a": box})
     node = RemoteRunner(config, executor=other_executor).nodes["box-a"]
     try:
@@ -671,11 +677,7 @@ def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp
           "import os,time\n"
           f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
           "time.sleep(30)\n")
-    deadline = time.monotonic() + 5
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile.exists()
-    child = int(pidfile.read_text())
+    child = _child_pid(pidfile)
     waiting = None
     try:
         os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
@@ -689,7 +691,9 @@ def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp
         time.sleep(0.25)
         assert node.call("status", **key(waiting))["state"] == "queued"
         assert node.call("health")["tokens"]["in_use"] == 1
-        result = node.call("cancel", **key(held), identity=held["remote_run"])
+        result = node.call("cancel", **key(held), identity=held["remote_run"],
+                           expected_owner={name: held[name] for name in
+                                           ("owner_host", "owner_pid", "owner_identity")})
         assert result["status"] == "unknown"
         os.kill(child, 0)
         assert node.call("health")["tokens"]["in_use"] == 1
@@ -746,3 +750,279 @@ def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
         assert time.monotonic() - clock["t0"] < 3
     finally:
         executor.close(config)
+
+
+def _child_pid(pidfile):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        text = pidfile.read_text() if pidfile.exists() else ""
+        if text.strip():
+            return int(text.strip())
+        time.sleep(0.01)
+    raise AssertionError("workload pid was not written")
+
+
+def test_two_managed_roots_do_not_create_two_pools(tmp_path):
+    root_a = tmp_path / "node-a"
+    root_b = tmp_path / "node-b"
+    raw = _raw_config(tmp_path, token_pool_size=1)
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(root_a)
+    path_a = tmp_path / "a.json"
+    path_a.write_text(json.dumps(raw), encoding="utf-8")
+    config_a = load_config(path_a)
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(root_b)
+    path_b = tmp_path / "b.json"
+    path_b.write_text(json.dumps(raw), encoding="utf-8")
+    config_b = load_config(path_b)
+    executor = ScriptedExecutor(tmp_path / "box-authority")
+    node_a = RemoteRunner(config_a, executor=executor).nodes["box-a"]
+    node_b = RemoteRunner(config_b, executor=executor).nodes["box-a"]
+    try:
+        held = wait_state(node_a, enqueue(node_a), {"admitted"})
+        with pytest.raises(ci.RemoteCIError, match="admission authority"):
+            enqueue(node_b)
+        assert node_a.call("health")["tokens"]["in_use"] == 1
+        assert not (root_b / "admission").exists()
+        assert str(root_a) in held["run_directory"]
+    finally:
+        executor.close(config_a)
+
+
+def test_cancel_requires_expected_owner(node_env):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    with pytest.raises(ci.RemoteCIError, match="expected_owner"):
+        node.call("cancel", **key(held), identity=held["remote_run"])
+    assert node.call("health")["tokens"]["in_use"] == 1
+
+
+def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
+    config, executor, _, node = node_env
+    pidfile = tmp_path / "stale.pid"
+    config = replace(config, runner=replace(config.runner, command=(
+        sys.executable, "-c",
+        "import os,time\n"
+        f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+    )))
+    owner_b = dict(RemoteRunner._owner(), owner_pid=os.getpid() + 1, owner_identity="other-controller")
+    seen = {}
+    phase = {"watch": False}
+
+    def transport(argv, env, timeout):
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        operation = payload["operation"]
+        if operation == "start":
+            result = executor(argv, env, timeout)
+            phase["watch"] = True
+            return result
+        if operation == "status" and phase["watch"]:
+            result = executor(argv, env, timeout)
+            if result.returncode == 0 and result.stdout.strip():
+                record = json.loads(result.stdout)
+                if record.get("state") == "running":
+                    phase["watch"] = False
+                    node.call("attach", **key(record), identity=record["remote_run"], owner=owner_b)
+                    seen["run_dir"] = record["run_directory"]
+                    return CommandResult(255, stderr="lost status")
+            return result
+        result = executor(argv, env, timeout)
+        if operation == "cancel" and result.returncode == 0 and result.stdout.strip():
+            seen["cancel_owner"] = payload.get("expected_owner")
+            seen["cancel_status"] = json.loads(result.stdout).get("status")
+        return result
+
+    runner = RemoteRunner(config, executor=transport)
+    with pytest.raises(ci.RemoteCIError, match="lost status"):
+        runner.run_arm(spec())
+    assert seen["cancel_status"] == "owned"
+    assert seen["cancel_owner"]["owner_pid"] == os.getpid()
+    child = _child_pid(pidfile)
+    os.kill(child, 0)
+    assert not (Path(seen["run_dir"]) / "cancel.json").exists()
+    assert node.call("health")["tokens"]["in_use"] == 1
+    os.kill(child, signal.SIGKILL)
+
+
+def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
+    _, _, runner, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "orphan.pid"
+    node.call("start", **key(held), command={
+        "argv": [sys.executable, "-c",
+                 "import os,time\n"
+                 f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
+                 "time.sleep(30)\n"],
+        "env": {},
+        "timeout": 0.4,
+    })
+    child = _child_pid(pidfile)
+    try:
+        os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
+        time.sleep(0.7)
+        assert runner.reap()[0]["status"] == "cancelled"
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        _free_tokens(node)
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_operator_clear_audits_a_dead_holder(node_env, tmp_path):
+    _, executor, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    with pytest.raises(ci.RemoteCIError, match="holder is alive"):
+        node.call("clear", **key(held), identity=held["remote_run"], operator=RemoteRunner._owner())
+    pidfile = tmp_path / "clear.pid"
+    start(node, held,
+          "import os,time\n"
+          f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
+          "time.sleep(30)\n")
+    child = _child_pid(pidfile)
+    try:
+        os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
+        deadline = time.monotonic() + 5
+        while node.call("status", **key(held))["holder_alive"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        result = node.call("clear", **key(held), identity=held["remote_run"],
+                           operator=RemoteRunner._owner())
+        assert result["status"] == "cleared"
+        audit = (executor.root / "admission" / "audit.log").read_text(encoding="utf-8")
+        assert held["lease_id"] in audit and "operator-clear" in audit
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        _free_tokens(node)
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_released_run_bodies_are_pruned(node_env):
+    _, executor, _, node = node_env
+    finished = wait_state(node, enqueue(node, "done"), {"admitted"})
+    start(node, finished, "import sys; sys.exit(0)")
+    wait_state(node, finished, {"released"})
+    dry = node.call("gc", apply=False, retain_max_count=0, retain_max_age_seconds=0,
+                    retain_failure_count=0, retain_failure_age_seconds=0)
+    assert any(row["class"] == "ELIGIBLE" and row["path"] == finished["run_directory"] for row in dry)
+    assert Path(finished["run_directory"]).exists()
+    tokens = executor.root / "admission" / "tokens"
+    (tokens / "sentinel").write_text("keep", encoding="utf-8")
+    unknown = wait_state(node, enqueue(node, "unknown"), {"admitted"})
+    pidfile_holder = int(unknown["remote_run"]["pid"])
+    start(node, unknown, "import time; time.sleep(30)")
+    wait_state(node, unknown, {"running"})
+    os.kill(pidfile_holder, signal.SIGKILL)
+    try:
+        node.call("enqueue", request_id="prune", arm="candidate", owner=RemoteRunner._owner(),
+                  retain_max_count=0, retain_max_age_seconds=0)
+        assert not Path(finished["run_directory"]).exists()
+        assert Path(unknown["run_directory"]).exists()
+        assert (tokens / "sentinel").read_text(encoding="utf-8") == "keep"
+        assert finished["lease_id"] in (executor.root / "results" / "index.jsonl").read_text(encoding="utf-8")
+    finally:
+        # The orphan still holds the token; clearing it is the supported path.
+        try:
+            node.call("clear", **key(unknown), identity=unknown["remote_run"],
+                      operator=RemoteRunner._owner())
+        except ci.RemoteCIError:
+            pass
+
+
+def test_checkout_directory_stays_inside_the_managed_root(node_env):
+    config, executor, _, _ = node_env
+    seen = {}
+
+    def before(payload):
+        if payload["operation"] == "start":
+            seen["checkout"] = payload["command"]["env"]["GOALFLIGHT_REMOTE_CI_CHECKOUT_DIR"]
+            seen["run_dir"] = payload["run_dir"]
+
+    executor.before = before
+    RemoteRunner(_green_config(config), executor=executor).run_arm(spec())
+    slot = seen["checkout"]
+    assert Path(slot).is_dir()
+    assert slot == str(Path(executor.root) / "repos" / "default" / "slots" / "s-01")
+    assert str(executor.root) in slot
+    assert not slot.startswith(str(Path.home()))
+
+
+def test_poll_once_does_not_write_a_request_mirror(tmp_path):
+    config = _config(tmp_path, token_pool_size=1)
+    executor = ScriptedExecutor(tmp_path / "fake-node")
+    request = {
+        "schema": "goalflight.remote-ci.request.v1",
+        "request_id": "request-1",
+        "kind": "targeted",
+        "tip_sha": "a" * 40,
+        "candidate_sha": "b" * 40,
+        "test_files": ["tests/test_one.py"],
+        "selection": ["tests/test_one.py", "-q"],
+    }
+    config.queue_dir.mkdir(parents=True, exist_ok=True)
+    (config.queue_dir / "request-1.json").write_text(json.dumps(request), encoding="utf-8")
+    try:
+        result = ci.GateDaemon(config, runner=RemoteRunner(config, executor=executor)).poll_once()
+        assert result is not None
+        assert (config.result_dir / "request-1.json").exists()
+        assert not (config.state_dir / "runs" / "request-1.json").exists()
+    finally:
+        executor.close(config)
+
+
+def _cancel(node, record):
+    return node.call("cancel", **key(record), identity=record["remote_run"],
+                     expected_owner={name: record[name] for name in
+                                     ("owner_host", "owner_pid", "owner_identity")})
+
+
+def test_cancel_kills_background_grandchildren_before_releasing_the_token(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "bg.pids"
+    start(node, held,
+          "import pathlib, subprocess, time\n"
+          f"out = pathlib.Path({str(pidfile)!r})\n"
+          "procs = [subprocess.Popen(['sleep', '30']) for _ in range(2)]\n"
+          "out.write_text('\\n'.join(str(p.pid) for p in procs))\n"
+          "time.sleep(30)\n")
+    text = ""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and text.count("\n") < 1:
+        text = pidfile.read_text() if pidfile.exists() else ""
+        time.sleep(0.01)
+    pids = [int(line) for line in text.split() if line.strip()]
+    assert len(pids) == 2
+    for pid in pids:
+        os.kill(pid, 0)
+    assert _cancel(node, held)["status"] == "cancelled"
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    _free_tokens(node)
+
+
+def test_cancel_kills_a_setsid_descendant_before_releasing_the_token(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "escaped.pid"
+    start(node, held,
+          "import os, time\n"
+          "pid = os.fork()\n"
+          "if pid == 0:\n"
+          "    os.setsid()\n"
+          f"    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+          "    time.sleep(60)\n"
+          "    os._exit(0)\n"
+          "time.sleep(60)\n")
+    child = _child_pid(pidfile)
+    os.kill(child, 0)
+    assert _cancel(node, held)["status"] == "cancelled"
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    _free_tokens(node)

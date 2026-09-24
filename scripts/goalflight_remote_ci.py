@@ -866,8 +866,11 @@ class RemoteRunner:
         node = self.nodes[spec.box]
         key: dict[str, str] | None = None
         started = False
+        # Captured here, not re-read later. A reattach replaces owner.json;
+        # this controller must still present the owner it admitted under.
+        expected_owner = self._owner()
         try:
-            record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm, owner=self._owner())
+            record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm, owner=expected_owner)
             key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
             self._inflight.add((key["run_dir"], key["lease_token"]))
             while True:
@@ -889,6 +892,8 @@ class RemoteRunner:
                 "owner_identity": record["owner_identity"], "run_dir": key["run_dir"],
                 "managed_run_directory": str(node.box.managed_run_directory),
                 "token_index": str(record["token_index"]), "overlay": "1" if spec.overlay else "0",
+                "slot_dir": str(record.get("slot") or ""),
+                "checkout_dir": str(record.get("slot") or ""),
             }
             command = expand_command(self.config.runner.command, values,
                                      selection=spec.selection, test_files=spec.test_files,
@@ -907,13 +912,14 @@ class RemoteRunner:
             started = True
             node.call("start", **key, command={"argv": command, "env": env,
                                               "timeout": self.config.runner.timeout_seconds})
-            return self._watch(spec, node, key)
+            return self._watch(spec, node, key, expected_owner)
         except BaseException:
             if started and key is not None:
                 # A lost response can follow a successful launch. Cancel the
                 # fenced node identity; never just drop its admission token.
                 with contextlib.suppress(RemoteCIError):
-                    node.call("cancel", **key, identity=record["remote_run"])
+                    node.call("cancel", **key, identity=record["remote_run"],
+                              expected_owner=expected_owner)
             raise
         finally:
             if key is not None:
@@ -922,11 +928,12 @@ class RemoteRunner:
                         # The holder is already forked. A release that never
                         # reaches the node is recovered by reap / the next arm.
                         with contextlib.suppress(RemoteCIError):
-                            node.call("release", **key)
+                            node.call("release", **key, expected_owner=expected_owner)
                 finally:
                     self._inflight.discard((key["run_dir"], key["lease_token"]))
 
-    def _watch(self, spec: ArmSpec, node: RemoteNode, key: dict[str, str]) -> ArmOutcome:
+    def _watch(self, spec: ArmSpec, node: RemoteNode, key: dict[str, str],
+               expected_owner: Mapping[str, Any]) -> ArmOutcome:
         deadline = time.monotonic() + self.config.runner.timeout_seconds
         while True:
             record = node.call("status", **key)
@@ -948,7 +955,8 @@ class RemoteRunner:
             if not record["holder_alive"]:
                 raise RemoteCIError("node holder died without a result; remote identity is unknown")
             if time.monotonic() >= deadline:
-                result = node.call("cancel", **key, identity=identity.to_dict())
+                result = node.call("cancel", **key, identity=identity.to_dict(),
+                                   expected_owner=dict(expected_owner))
                 cancelled = result["status"] in {"cancelled", "finished"}
                 return ArmOutcome(spec.arm, "timeout", 124, None, identity,
                                   timed_out=True, cancelled=cancelled, lease=record,
@@ -964,10 +972,11 @@ class RemoteRunner:
     def reattach(self, spec: ArmSpec, identity: RemoteRunIdentity) -> ArmOutcome:
         node = self.nodes[spec.box]
         key = {"run_dir": identity.run_dir, "lease_token": identity.lease_token}
-        node.call("attach", **key, identity=identity.to_dict(), owner=self._owner())
+        owner = self._owner()
+        node.call("attach", **key, identity=identity.to_dict(), owner=owner)
         self._inflight.add((key["run_dir"], key["lease_token"]))
         try:
-            return self._watch(spec, node, key)
+            return self._watch(spec, node, key, owner)
         finally:
             self._inflight.discard((key["run_dir"], key["lease_token"]))
 
@@ -1196,17 +1205,6 @@ class GateDaemon:
                 request_id = request_path.stem
             else:
                 request_id = str(request["request_id"])
-                run_state = self.config.state_dir / "runs" / f"{request_id}.json"
-                _atomic_write_json(
-                    run_state,
-                    {
-                        "schema": RESULT_SCHEMA,
-                        "request_id": request_id,
-                        "state": "running",
-                        "owner_pid": os.getpid(),
-                        "started_at": _utc_now(),
-                    },
-                )
                 try:
                     if request["kind"] == "gate":
                         result = run_matched_pair(request, self.runner)
@@ -1222,17 +1220,6 @@ class GateDaemon:
                         "error": str(exc),
                         "finished_at": _utc_now(),
                     }
-                _atomic_write_json(
-                    run_state,
-                    {
-                        "schema": RESULT_SCHEMA,
-                        "request_id": request_id,
-                        "state": "finished",
-                        "owner_pid": os.getpid(),
-                        "finished_at": _utc_now(),
-                        "result": result,
-                    },
-                )
             _atomic_write_json(self.config.result_dir / f"{request_id}.json", result)
             request_path.unlink(missing_ok=True)
             return result
@@ -1307,6 +1294,14 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("health")
     subparsers.add_parser("list", help="list durable remote leases")
     subparsers.add_parser("reap")
+    clear = subparsers.add_parser("clear", help="audit and release a dead holder")
+    clear.add_argument("--box", required=True)
+    clear.add_argument("--run-dir", required=True)
+    clear.add_argument("--lease-token", required=True)
+    clear.add_argument("--pid", required=True)
+    clear.add_argument("--start-token", required=True)
+    gc = subparsers.add_parser("gc", help="show or delete retained run bodies")
+    gc.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -1344,6 +1339,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(list_remote_leases(config), indent=2, sort_keys=True))
         elif args.command == "reap":
             print(json.dumps(RemoteRunner(config).reap(), indent=2, sort_keys=True))
+        elif args.command == "clear":
+            runner = RemoteRunner(config)
+            print(json.dumps(runner.nodes[args.box].call(
+                "clear",
+                run_dir=args.run_dir,
+                lease_token=args.lease_token,
+                identity={"pid": args.pid, "start_token": args.start_token, "run_dir": args.run_dir},
+                operator=RemoteRunner._owner(),
+            ), sort_keys=True))
+        elif args.command == "gc":
+            runner = RemoteRunner(config)
+            print(json.dumps([
+                {"box": name, "rows": node.call("gc", apply=bool(args.apply))}
+                for name, node in runner.nodes.items()
+            ], indent=2, sort_keys=True))
         return 0
     except (RemoteCIError, OSError) as exc:
         print(f"goalflight-remote-ci: {exc}", file=sys.stderr)
