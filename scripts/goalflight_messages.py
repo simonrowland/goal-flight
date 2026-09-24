@@ -8825,11 +8825,10 @@ def cmd_listen(args) -> int:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
 
-    # Fix the report-pending threshold before publishing journal coverage.
+    # Fix the report-pending snapshot before publishing journal coverage.
     # Producers and controllers treat an ARMED coverage row as the listener's
     # readiness boundary; taking this snapshot afterwards lets an event posted
-    # beyond that boundary leak into arm_high and become silent backlog.
-    arm_high: dict[str, int] = {}
+    # beyond that boundary leak into the pending report.
     arm_snapshot = None
     report_claim = None
     pending_report_settled = True
@@ -8879,6 +8878,26 @@ def cmd_listen(args) -> int:
             )
         return result
 
+    def pending_report_suppression() -> dict[str, int]:
+        try:
+            state = goalflight_wake.recover_pending_report_state(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            if state is None or state.phase == "acknowledged":
+                return {}
+            if goalflight_wake._pending_report_owner_liveness(state) is not True:
+                return {}
+            return dict(state.positions)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            goalflight_wake.PendingReportStateError,
+        ):
+            return {}
+
     try:
         if getattr(args, "report_pending", False):
             arm_snapshot = _retry_listener_journal_busy(
@@ -8898,7 +8917,6 @@ def cmd_listen(args) -> int:
                 # The claim never raises its water. Covered streams may drop
                 # off so a replacement re-reports only the unconsumed remainder.
                 pending_report_settled = persisted_state.phase == "acknowledged"
-                arm_high = dict(persisted_state.positions)
                 if not pending_report_settled:
                     settled = _settle_pending_report_if_consumed(
                         authority,
@@ -8973,11 +8991,6 @@ def cmd_listen(args) -> int:
                     if winner_state is None:
                         raise MessageError("pending-report claim was not published")
                     pending_report_settled = winner_state.phase == "acknowledged"
-                    arm_high = (
-                        dict(winner_state.positions)
-                        if pending_report_settled
-                        else {}
-                    )
 
         armed = _retry_listener_journal_busy(
             arm_once,
@@ -9356,7 +9369,6 @@ def cmd_listen(args) -> int:
         visible_items: list[tuple[dict, dict]] | None = None,
     ) -> bool:
         """Flush one claimed boundary. True when handled; False means retry."""
-        nonlocal arm_high
         settled = _settle_pending_report_if_consumed(
             authority,
             project_root,
@@ -9485,7 +9497,6 @@ def cmd_listen(args) -> int:
         if report_snapshots.keys() != report_positions.keys():
             quarantine_claim_unit()
             return True
-        arm_high = dict(report_positions)
         if not report_positions:
             return True
         arm_advance = _cursor_advance_command(
@@ -9590,7 +9601,6 @@ def cmd_listen(args) -> int:
                 if observed_report is None or observed_report.phase == "acknowledged":
                     pending_report_settled = True
                 else:
-                    arm_high = dict(observed_report.positions)
                     settled = _settle_pending_report_if_consumed(
                         authority,
                         project_root,
@@ -9598,6 +9608,11 @@ def cmd_listen(args) -> int:
                         lease_nonce=nonce,
                         claim_positions=observed_report.positions,
                     )
+                    if settled is None:
+                        poll_result = wait_for_next_poll()
+                        if poll_result is not None:
+                            return poll_result
+                        continue
                     if settled is True:
                         pending_report_settled = True
                     elif settled is False:
@@ -9685,6 +9700,7 @@ def cmd_listen(args) -> int:
                 controller_label=label,
                 lease_nonce=nonce,
             )
+            suppression = pending_report_suppression()
             watchdog_status = witness_status.get("watchdog")
             watchdog_state = (
                 str(watchdog_status.get("state") or "")
@@ -9729,9 +9745,9 @@ def cmd_listen(args) -> int:
                     return finish_watchdog_dead(claim_state=claim_state)
             wakeable_items = False
             if journal_changed or peek_needed:
-                # With an arm-time backlog the cheap limit-1 peek would forever
-                # see the oldest (already-reported) item; peek wide and ring only
-                # for events beyond the arm-time high-water.
+                # With a pending report the cheap limit-1 peek would forever see
+                # the oldest already-reported item; peek wide and ring only for
+                # events beyond the live claim's durable high-water.
                 # Self-authored rows can sort before foreign mail indefinitely, so
                 # a limit-1 peek cannot implement skip-without-wedging semantics.
                 peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
@@ -9740,9 +9756,9 @@ def cmd_listen(args) -> int:
                     for item in peek.items
                     if str(item.get("wake_class") or "") == "waking"
                     and (
-                        not arm_high
+                        not suppression
                         or int(item.get("stream_seq") or 0)
-                        > arm_high.get(str(item.get("stream_id") or ""), 0)
+                        > suppression.get(str(item.get("stream_id") or ""), 0)
                     )
                 ]
                 candidate_attention = _attention_items_for_rows(
