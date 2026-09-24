@@ -10744,7 +10744,7 @@ def _withdraw_liveness_preflight(
     record: dict | None,
     worker: dict,
     carriers: dict[Path, dict],
-    status_path: object,
+    status_paths: list[object],
 ) -> None:
     """Require every recorded worker source to prove the same dead holder."""
     lifecycle = attempt.get("lifecycle_state")
@@ -10797,9 +10797,8 @@ def _withdraw_liveness_preflight(
             carrier.get("queue_launcher_identity"),
         )
 
-    status_required = status_path not in (None, "")
-    status_dead = not status_required
-    if status_path not in (None, ""):
+    status_dead = not status_paths
+    for status_path in status_paths:
         status, status_reason = _abandoned_status_payload(
             {"dispatch_id": dispatch_id, "status_path": status_path}
         )
@@ -10924,14 +10923,18 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
-    status_path = (record or {}).get("status_path") or entry.get("status_path")
+    status_paths = []
+    for source in (record or {}, *carriers.values()):
+        path = source.get("status_path")
+        if path not in (None, "") and path not in status_paths:
+            status_paths.append(path)
     _withdraw_liveness_preflight(
         dispatch_id=args.dispatch_id,
         attempt=attempt,
         record=record,
         worker=worker,
         carriers=carriers,
-        status_path=status_path,
+        status_paths=status_paths,
     )
     if attempt.get("terminal_state") == "superseded" and not outcome.get("withdrawn_by"):
         raise ValueError(

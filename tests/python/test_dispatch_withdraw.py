@@ -543,6 +543,29 @@ def test_active_carrier_worker_identity_cannot_bypass_worker_evidence(
     assert claimed.exists()
 
 
+def test_all_carrier_status_paths_veto_live_worker(prepared, claimed, tmp_path):
+    project, authority, attempt, _carrier = prepared
+    record_dead_worker_evidence(project, authority, attempt)
+    status_path = tmp_path / "live.status.json"
+    status_path.write_text(json.dumps({
+        "dispatch_id": "withdraw-test",
+        "state": "running",
+        "worker_alive": True,
+    }))
+    entry = json.loads(claimed.read_text())
+    entry["status_path"] = str(status_path)
+    second = claimed.with_name(claimed.name + "-second")
+    second.write_text(json.dumps(entry))
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "status sidecar reports a live worker" in result["reason"]
+    assert claimed.exists() and second.exists()
+    assert attempt_row(authority)["terminal_state"] is None
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
+
+
 def test_status_sidecar_live_vetoes_dead_ledger_worker(prepared, tmp_path):
     project, authority, attempt, carrier = prepared
     status_path = tmp_path / "live.status.json"
