@@ -160,7 +160,7 @@ def _sweep_managed_jobs(managed: Path) -> None:
             for pid, start in members:
                 if pid <= 1 or pid == os.getpid():
                     continue
-                if not node._signal_incarnation(pid, start, cid):
+                if not node._signal_incarnation(lease, pid, start, cid):
                     _sweep_unsignalled.append((cid, pid, start))
 
 
@@ -1650,9 +1650,10 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
 
     monkeypatch.setattr(node, "_same_process", same)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 100)
+    monkeypatch.setattr(node, "_private_tree_proof", lambda state, cid, members=None: True)
     monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
     monkeypatch.setattr(node.os, "kill", fake_kill)
-    assert node._signal_incarnation(4321, (10, 20), 100) is True
+    assert node._signal_incarnation({}, 4321, (10, 20), 100) is True
     assert signals == [signal.SIGTERM]
     assert signal.SIGKILL not in signals
 
@@ -1668,9 +1669,10 @@ def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
 
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "_private_tree_proof", lambda state, cid, members=None: True)
     monkeypatch.setattr(node, "TREE_GRACE_SECONDS", 0)
     monkeypatch.setattr(node.os, "kill", lambda pid, sig: signals.append(sig))
-    assert node._signal_incarnation(20, (99, 99), 100) is False
+    assert node._signal_incarnation({}, 20, (99, 99), 100) is False
     assert signals == [signal.SIGTERM]
     assert signal.SIGKILL not in signals
 
@@ -2359,6 +2361,79 @@ def test_absent_submit_without_a_wrapper_identity_is_not_released(tmp_path, monk
     assert lease.get("identity_status") == "unproven"
 
 
+def test_ambiguous_launch_failure_is_not_an_empty_tree(tmp_path, monkeypatch):
+    """launch-failed plus an absent listing and no identity is not empty."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time() - 120,
+        "release_reason": "launch-failed",
+        "slot": str(run),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    assert node.clear_tree(tmp_path, state, run) is False
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease.get("identity_status") == "unproven"
+    assert lease.get("state") != "released"
+
+
+def test_not_loaded_submit_can_release_when_the_label_was_never_present(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {"lease_id": "abc", "state": "running"}
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def submit(argv, **kwargs):
+        del kwargs
+        if argv[:2] == ["launchctl", "list"]:
+            return type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
+        return type("R", (), {
+            "returncode": 1, "stderr": "service is not loaded\n", "stdout": ""})()
+
+    monkeypatch.setattr(node.subprocess, "run", submit)
+    assert "not loaded" in node._submit_workload(run, state, ["/bin/true"], {}, "")
+    assert state.get("launch_rejected") is True
+    assert node.clear_tree(tmp_path, state, run) is True
+
+
+def test_missing_holder_coalition_does_not_signal_outside_the_wrapper(tmp_path, monkeypatch):
+    """A live wrapper coalition with no holder proof is never signalled."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time(),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+    killed = []
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 100)
+    monkeypatch.setattr(node, "_coalition_members",
+                        lambda cid: [(4242, (1, 2)), (99991, (3, 4))])
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    monkeypatch.setattr(node.os, "kill", lambda pid, sig: killed.append(pid))
+    assert node.clear_tree(tmp_path, state, run) is False
+    assert killed == []
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease.get("identity_status") == "holder-coalition-unknown"
+
+
 def test_dead_wrapper_with_an_empty_coalition_can_release(tmp_path, monkeypatch):
     import goalflight_remote_ci_node as node
 
@@ -2552,7 +2627,8 @@ def test_sweep_rechecks_incarnation_before_kill(tmp_path, monkeypatch):
     calls = []
     killed = []
 
-    def signal_incarnation(pid, started_at, cid):
+    def signal_incarnation(state, pid, started_at, cid):
+        del state
         calls.append((pid, started_at, cid))
         return False
 

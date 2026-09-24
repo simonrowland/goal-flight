@@ -421,6 +421,20 @@ def _start_time(pid):
     return (int(info.pbi_start_tvsec), int(info.pbi_start_tvusec))
 
 
+def _parent_pid(pid):
+    """Parent pid, or None when the process record cannot be read."""
+    try:
+        lib = _libproc()
+        info = _ProcBsdInfo()
+        size = lib.proc_pidinfo(int(pid), PROC_PIDTBSDINFO, 0,
+                                ctypes.byref(info), ctypes.sizeof(info))
+    except OSError:
+        return None
+    if size != ctypes.sizeof(info) or int(info.pbi_pid) != int(pid):
+        return None
+    return int(info.pbi_ppid)
+
+
 def _pid_exists(pid):
     """False for exited processes and zombies. None if liveness is unreadable.
 
@@ -633,14 +647,100 @@ def _incarnation_in_coalition(pid, started, cid):
     return True
 
 
-def _signal_incarnation(pid, started, cid):
-    """TERM, then KILL only while pid, start time, and coalition still agree.
+def _wrapper_ref(state):
+    """(pid, start) for the wrapper incarnation recorded on this lease."""
+    if not isinstance(state, dict):
+        return None
+    try:
+        pid = int(state.get("workload_pid"))
+    except (TypeError, ValueError):
+        return None
+    started = _as_start(state.get("workload_start"))
+    if pid <= 1 or started is None:
+        return None
+    return pid, started
+
+
+def _under_wrapper(wrapper_pid, pid, wrapper_start=None):
+    """True when ``pid`` is the wrapper or a current descendant of it."""
+    if pid == wrapper_pid:
+        return True
+    seen = set()
+    current = int(pid)
+    for _ in range(32):
+        if current in seen or current <= 1:
+            return False
+        seen.add(current)
+        parent = _parent_pid(current)
+        if parent is None:
+            return False
+        if parent == wrapper_pid:
+            return (wrapper_start is None
+                    or _verify_incarnation(wrapper_pid, wrapper_start) is True)
+        current = parent
+    return False
+
+
+def _marked_descendant(state, pid, started):
+    """True when an earlier scan proved this reparented member's ancestry."""
+    for member in state.get("members") or []:
+        if not isinstance(member, dict) or member.get("descendant") is not True:
+            continue
+        if member.get("pid") == pid and _as_start(member.get("start")) == started:
+            return True
+    return False
+
+
+def _private_tree_proof(state, cid, members=None):
+    """True only when ``cid`` is private and every member is wrapper-owned.
+
+    A missing holder coalition, the holder's own coalition, this process's
+    coalition, an unreadable wrapper reference, or an unproven parent chain
+    is not a positive proof. ``members`` is the latest coalition scan; the
+    durable descendant marker covers children reparented after the wrapper
+    exited.
+    """
+    if not isinstance(state, dict) or not _positive_cid(cid):
+        return False
+    holder = state.get("holder_coalition_id")
+    if not _positive_cid(holder) or cid == holder:
+        return False
+    mine = _coalition_id(os.getpid())
+    if not _positive_cid(mine) or cid == mine:
+        return False
+    ref = _wrapper_ref(state)
+    if ref is None:
+        return False
+    wrapper_pid, wrapper_start = ref
+    if members is None:
+        members = list(_member_map(state).items())
+    for pid, started in members:
+        if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1
+                or _as_start(started) is None):
+            return False
+        started = _as_start(started)
+        if pid == wrapper_pid:
+            if started != wrapper_start:
+                return False
+            continue
+        if _under_wrapper(wrapper_pid, pid, wrapper_start):
+            continue
+        if _marked_descendant(state, pid, started):
+            continue
+        return False
+    return True
+
+
+def _signal_incarnation(state, pid, started, cid):
+    """TERM, then KILL only after a positive private-tree proof.
 
     Returns True when that incarnation is gone. A reused pid is not signalled.
+    This is the only helper that sends a signal to a workload process.
     """
     pid = int(pid)
     if (pid <= 1 or pid == os.getpid() or started is None
-            or isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0):
+            or not _private_tree_proof(
+                state, cid, [*list(_member_map(state).items()), (pid, started)])):
         return False
 
     def gone():
@@ -705,8 +805,22 @@ def _member_map(state):
 
 
 def _store_members(run, state, members):
-    state["members"] = [{"pid": pid, "start": [start[0], start[1]]}
-                        for pid, start in sorted(members.items())]
+    previous = {}
+    for member in state.get("members") or []:
+        if isinstance(member, dict) and member.get("descendant") is True:
+            previous[(member.get("pid"), _as_start(member.get("start")))] = True
+    ref = _wrapper_ref(state)
+    rows = []
+    for pid, start in sorted(members.items()):
+        start = _as_start(start)
+        if start is None:
+            continue
+        descended = previous.get((pid, start), False)
+        if ref is not None and _under_wrapper(ref[0], pid, ref[1]):
+            descended = True
+        rows.append({"pid": pid, "start": [start[0], start[1]],
+                     "descendant": descended})
+    state["members"] = rows
     if run is None:
         return
     try:
@@ -727,7 +841,7 @@ _LEASE_KEYS = (
     "launch_label", "coalition_id", "holder_coalition_id", "workload_pid",
     "workload_start", "exit_code", "exit_known", "members", "job_remove_pending",
     "pending_result", "launch_submitted", "launch_seen", "launch_intent_at",
-    "identity_status",
+    "identity_status", "launch_rejected",
 )
 
 # How long a recorded submit may lack a wrapper identity before recovery
@@ -750,12 +864,18 @@ def _remember_identity(run, state):
     write_json(run / "lease.json", lease)
 
 
+def _positive_cid(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _private_coalition(state):
+    """A coalition id proven different from the holder and this process."""
     cid = state.get("coalition_id")
     holder = state.get("holder_coalition_id")
-    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
+    if not _positive_cid(cid) or not _positive_cid(holder) or cid == holder:
         return None
-    if cid == holder:
+    mine = _coalition_id(os.getpid())
+    if not _positive_cid(mine) or cid == mine:
         return None
     return cid
 
@@ -871,7 +991,10 @@ def _recover_absent(run, state):
     Release only when the wrapper's incarnation is dead and its coalition
     has no members. A missing identity is unknown, during the wait and after.
     """
-    if state.get("release_reason") == "launch-failed":
+    # Only the explicit launchd rejection proof can bypass the recorded-intent
+    # path. An ambiguous submit failure may have accepted the job already.
+    if (state.get("launch_rejected") is True
+            and _job_view(state.get("launch_label") or "") == "absent"):
         ident = _read_wrapper_identity(run)
         if not isinstance(ident, dict):
             state["job_remove_pending"] = False
@@ -891,6 +1014,10 @@ def _recover_absent(run, state):
         state["coalition_id"] = ident["coalition_id"]
     if verdict is True or not _identity_allows_release(run, state):
         state["job_remove_pending"] = True
+        if verdict is True and not _positive_cid(state.get("holder_coalition_id")):
+            state["identity_status"] = "holder-coalition-unknown"
+            _remember_identity(run, state)
+            return "unknown"
         _remember_identity(run, state)
         if verdict is True and _private_coalition(state):
             return "ready"
@@ -917,6 +1044,11 @@ def _adopt_launch(run, state):
     if view == "absent":
         return _recover_absent(run, state)
     kind, pid, code = view
+    if not _positive_cid(state.get("holder_coalition_id")):
+        state["identity_status"] = "holder-coalition-unknown"
+        state["job_remove_pending"] = True
+        _remember_identity(run, state)
+        return "unknown"
     if kind == "exited":
         if isinstance(code, int) and not isinstance(code, bool):
             state["exit_code"] = code
@@ -947,25 +1079,18 @@ def _adopt_launch(run, state):
         return "unknown"
     start, cid = identity
     holder = state.get("holder_coalition_id")
-    if isinstance(holder, bool) or not isinstance(holder, int) or holder <= 0:
-        holder = _coalition_id(os.getpid())
     state["workload_pid"] = str(pid)
     state["workload_start"] = [start[0], start[1]]
-    if holder is None or cid == holder or cid <= 0:
+    if not _positive_cid(holder):
+        state["identity_status"] = "holder-coalition-unknown"
+        state["job_remove_pending"] = True
         _remember_identity(run, state)
-        if _workload_released(run, state):
-            return "unknown"
-        if not _remove_job(label):
-            state["job_remove_pending"] = True
-            _remember_identity(run, state)
-            return "unknown"
-        if _same_process(pid, start) is not False:
-            state["job_remove_pending"] = True
-            _remember_identity(run, state)
-            return "unknown"
-        state["job_remove_pending"] = False
+        return "unknown"
+    if cid == holder or not _positive_cid(cid):
+        state["identity_status"] = "coalition-not-private"
+        state["job_remove_pending"] = True
         _remember_identity(run, state)
-        return "empty"
+        return "unknown"
     state["coalition_id"] = cid
     state["holder_coalition_id"] = holder
     _remember_identity(run, state)
@@ -998,6 +1123,16 @@ def _kill_members(run, state, cid, label):
                 return False
             living[pid] = start
         _store_members(run, state, living)
+        if living and not _positive_cid(state.get("holder_coalition_id")):
+            state["identity_status"] = "holder-coalition-unknown"
+            state["job_remove_pending"] = bool(label)
+            _remember_identity(run, state)
+            return False
+        if living and not _private_tree_proof(state, cid):
+            state["identity_status"] = "coalition-not-private"
+            state["job_remove_pending"] = bool(label)
+            _remember_identity(run, state)
+            return False
         if not living:
             if not _remove_job(label):
                 state["job_remove_pending"] = True
@@ -1021,7 +1156,7 @@ def _kill_members(run, state, cid, label):
             _remember_identity(run, state)
             return True
         for pid, start in living.items():
-            _signal_incarnation(pid, start, cid)
+            _signal_incarnation(state, pid, start, cid)
         persisted = living
     state["job_remove_pending"] = bool(label)
     _store_members(run, state, persisted)
@@ -1286,6 +1421,7 @@ def _submit_workload(run, state, argv, env, cwd):
         return None
     if recorded.get("launch_submitted") is not True or recorded.get("launch_label") != label:
         return None
+    before_submit = _job_view(label)
     try:
         submitted = subprocess.run(
             ["launchctl", "submit", "-l", label, "-o", str(stdout), "-e", str(stderr),
@@ -1296,6 +1432,15 @@ def _submit_workload(run, state, argv, env, cwd):
     except OSError as exc:
         return str(exc)
     if submitted.returncode != 0:
+        output = (f"{getattr(submitted, 'stderr', '') or ''}\n"
+                  f"{getattr(submitted, 'stdout', '') or ''}").lower()
+        # A failed submit is empty only when launchd explicitly rejected it as
+        # not loaded and the label was absent both before and after submit.
+        # Every other failure follows the durable recorded-intent path.
+        if ("not loaded" in output and before_submit == "absent"
+                and _job_view(label) == "absent"):
+            state["launch_rejected"] = True
+            _remember_identity(run, state)
         return submitted.stderr.strip() or "launchctl submit failed"
     _remember_identity(run, state)
     # A slow launchd must not become "the job never existed". Expiry keeps
@@ -1324,11 +1469,10 @@ def _submit_workload(run, state, argv, env, cwd):
             time.sleep(0.02)
             continue
         start, cid = identity
-        holder_cid = _coalition_id(os.getpid())
         state["workload_pid"] = str(pid)
         state["workload_start"] = [start[0], start[1]]
-        state["holder_coalition_id"] = holder_cid
-        if holder_cid is None or cid == holder_cid:
+        holder_cid = state.get("holder_coalition_id")
+        if not _positive_cid(holder_cid) or cid == holder_cid:
             # Not a private coalition. Do not record it as a kill target.
             _remember_identity(run, state)
             return "coalition was not private"
@@ -2029,7 +2173,18 @@ def dispatch(request):
                 'state': 'queued', 'acquired_at': time.time(), 'ticket': sequence,
                 'request_id': request['request_id'], 'arm': request['arm'],
             }
+            holder_cid = _coalition_id(os.getpid())
+            if _positive_cid(holder_cid):
+                # The forked holder remains in this coalition. Record it
+                # before any submit so recovery cannot mistake the session
+                # coalition for a private workload coalition.
+                state['holder_coalition_id'] = holder_cid
             write_json(run / 'lease.json', state)
+            if not _fsync_file(run / 'lease.json'):
+                # Without a durability proof, absence of this field must
+                # fail closed in every later recovery path.
+                state.pop('holder_coalition_id', None)
+                write_json(run / 'lease.json', state)
             write_json(run / 'owner.json', request['owner'])
             pid = os.fork()
             if pid == 0:
