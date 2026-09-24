@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 import os
 from pathlib import Path
 import platform
@@ -174,10 +175,16 @@ def goalflight_worker_channel_roots() -> list[str]:
     ]
 
 
-def _agent_state_roots(agent: str | None, command: str) -> list[str]:
+def _agent_state_roots(
+    agent: str | None,
+    command: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> list[str]:
     label = (agent or "").lower()
     binary = Path(command).name.lower()
-    home = Path.home()
+    env = os.environ if environment is None else environment
+    home = Path(env.get("HOME") or Path.home())
     roots: list[Path] = []
     if "codex" in label or "codex" in binary:
         roots.extend([
@@ -204,11 +211,28 @@ def _agent_state_roots(agent: str | None, command: str) -> list[str]:
             roots.append(Path(configured_home))
         roots.append(home / ".goal-flight" / "dispatch-homes")
     if "grok" in label or "grok" in binary:
+        xdg_config_home = Path(env.get("XDG_CONFIG_HOME") or home / ".config")
+        xdg_state_home = Path(env.get("XDG_STATE_HOME") or home / ".local" / "state")
+        xdg_data_home = Path(env.get("XDG_DATA_HOME") or home / ".local" / "share")
+        xdg_cache_home = Path(env.get("XDG_CACHE_HOME") or home / ".cache")
         roots.extend([
+            # Grok's account HOME state: the adapter installs its skill below
+            # ~/.grok, and grok_seats.ensure_project_trusted() writes
+            # ~/.grok/trusted_folders.toml before launch.
             home / ".grok",
-            home / ".config" / "grok",
-            home / ".local" / "share" / "grok",
-            home / ".cache" / "grok",
+            # grok_seats.STATE_PATH is HOME/.goal-flight/grok-seat-states.json
+            # when the account helper is invoked from this worker home.
+            home / ".goal-flight",
+            # XDG_CONFIG_HOME is the account-scoped config root selected by
+            # _apply_home_env(); Grok's XDG config lives below its "grok" key.
+            xdg_config_home / "grok",
+            # The adapter records readiness below XDG_STATE_HOME/goal-flight.
+            xdg_state_home / "goal-flight",
+            # Grok's account-scoped runtime data uses XDG_DATA_HOME/grok.
+            xdg_data_home / "grok",
+            # Grok's account-scoped cache uses XDG_CACHE_HOME/grok (or the
+            # standard HOME/.cache fallback when no XDG cache variable exists).
+            xdg_cache_home / "grok",
         ])
     if "cursor" in label or "cursor" in binary:
         roots.extend([
@@ -234,13 +258,24 @@ def _agent_state_roots(agent: str | None, command: str) -> list[str]:
     return [str(path) for path in roots]
 
 
-def macos_write_roots(cwd: str, profile: str, *, agent: str | None = None, command: str = "") -> list[str]:
+def macos_write_roots(
+    cwd: str,
+    profile: str,
+    *,
+    agent: str | None = None,
+    command: str = "",
+    environment: Mapping[str, str] | None = None,
+) -> list[str]:
     roots: list[str] = []
     if profile == OS_SANDBOX_WORKSPACE_WRITE:
         roots.append(cwd)
         label = (agent or "").lower()
         if label in {"codex", "codex-acp"}:
             roots.extend(linked_worktree_writable_roots(cwd))
+    # Grok can use the worker's private temp directory for transient files;
+    # the dispatch launcher owns status/tail files and redirects Grok's
+    # stdout/stderr before exec, so the dispatch directory is not a Grok write
+    # root unless that ownership changes.
     tmpdir = tempfile.gettempdir()
     temp_roots = _unique_real_paths([
         tmpdir,
@@ -256,7 +291,7 @@ def macos_write_roots(cwd: str, profile: str, *, agent: str | None = None, comma
             )
     roots.extend(temp_roots)
     extra_roots = _unique_real_paths(
-        _agent_state_roots(agent, command)
+        _agent_state_roots(agent, command, environment=environment)
         + goalflight_worker_channel_roots()
     )
     for root in extra_roots:
@@ -275,10 +310,17 @@ def macos_sandbox_profile(
     *,
     agent: str | None = None,
     command: str = "",
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     if profile not in {OS_SANDBOX_READ_ONLY, OS_SANDBOX_WORKSPACE_WRITE}:
         raise OsSandboxError(f"unsupported macOS sandbox profile: {profile!r}")
-    write_roots = macos_write_roots(cwd, profile, agent=agent, command=command)
+    write_roots = macos_write_roots(
+        cwd,
+        profile,
+        agent=agent,
+        command=command,
+        environment=environment,
+    )
     write_filters = "\n".join(f"  (subpath {_scheme_string(path)})" for path in write_roots)
     # /dev/null and /dev/zero are safe write targets (a data sink and a zero
     # source — writing to them mutates no real filesystem state). git and many
@@ -313,6 +355,7 @@ def prepare_os_sandbox_command(
     cwd: str,
     os_sandbox: str | None = OS_SANDBOX_OFF,
     agent: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> PreparedOsSandboxCommand:
     requested = os_sandbox or OS_SANDBOX_OFF
     profile = preflight_os_sandbox(requested)
@@ -326,7 +369,13 @@ def prepare_os_sandbox_command(
             implementation=None,
             write_roots=[],
         )
-    profile_text, write_roots = macos_sandbox_profile(cwd, profile, agent=agent, command=command)
+    profile_text, write_roots = macos_sandbox_profile(
+        cwd,
+        profile,
+        agent=agent,
+        command=command,
+        environment=environment,
+    )
     sandbox_exec = shutil.which("sandbox-exec")
     if sandbox_exec is None:
         raise OsSandboxError("os sandbox requested but sandbox-exec is not installed")

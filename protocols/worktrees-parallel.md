@@ -26,6 +26,11 @@ Rules:
 - Read-only dispatches share a detached checkout keyed by commit and do not
   consume an exclusive writer worktree. Writable dispatches remain exclusive
   by default.
+- Reviews and analysis should use `--read-only`: the shared detached checkout
+  takes no pooled writer seat. On macOS, read-only bash-shape Grok keeps its
+  shell for `git show`/diff/log inspection while the Seatbelt profile denies
+  project writes; Write/Edit remain denied. Non-macOS keeps Grok's `--deny
+  Bash` fallback.
 - Acquire prepares writable worktrees on `worktree/<dispatch-id>`; readers
   accept legacy `seat/<dispatch-id>` branches during mixed-version upgrades.
   `DISPATCH-START` / `DISPATCH-LAUNCHED` and status/ledger JSON dual-write

@@ -764,7 +764,8 @@ def _validate_agent_os_sandbox(args) -> None:
                 f"--os-sandbox {explicit} is ignored for agent={agent} "
                 f"shape={shape} ({gate.get('reason')}); refusing to launch "
                 "with an inert safety flag. "
-                "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
+                "Use --read-only instead (grok: Write/Edit denies plus macOS "
+                "sandbox-exec shell fencing or non-macOS Bash denial; "
                 "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
                 "honoured by bash-shape codex, bash-shape cursor (macOS "
                 "sandbox-exec wrap), and by ACP shapes whose adapter "
@@ -775,7 +776,8 @@ def _validate_agent_os_sandbox(args) -> None:
         raise UnsupportedAgentSandboxRequest(
             f"--os-sandbox {explicit} is ignored for agent={agent} "
             f"shape={shape}; refusing to launch with an inert safety flag. "
-            "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
+            "Use --read-only instead (grok: Write/Edit denies plus macOS "
+            "sandbox-exec shell fencing or non-macOS Bash denial; "
             "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
             "honoured by bash-shape codex, bash-shape cursor (macOS "
             "sandbox-exec wrap), and by ACP shapes whose adapter "
@@ -19019,6 +19021,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     )
     web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
     acp_env = {**account_env, **web_qa_updates}
+    _apply_read_only_env(acp_env, args)
     acp_remove = list(env_remove) + list(web_qa_remove)
     worktree_seat = getattr(args, "_worktree_seat", None)
     if worktree_seat is not None:
@@ -19260,6 +19263,33 @@ def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
     return [prepared.command, *prepared.args]
 
 
+def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
+    """Keep Grok's shell on macOS while fencing project writes with Seatbelt."""
+    if not argv or not _effective_read_only(args):
+        return argv
+    if not goalflight_compat.is_macos():
+        # Linux/other hosts have no runner:sandbox-exec profile. Preserve the
+        # existing fail-closed Grok posture there by denying the shell itself.
+        return [*argv, "--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
+    from goalflight_os_sandbox import prepare_os_sandbox_command
+
+    prepared = prepare_os_sandbox_command(
+        argv[0],
+        list(argv[1:]),
+        cwd=str(_worker_cwd(args)),
+        os_sandbox="read-only",
+        agent=str(getattr(args, "agent", "") or "grok"),
+        environment=getattr(args, "_account_env", None),
+    )
+    return [prepared.command, *prepared.args]
+
+
+def _apply_read_only_env(env: dict[str, str], args) -> None:
+    """Prevent read-only Git inspection from creating an index lock."""
+    if _effective_read_only(args):
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+
+
 def build_worker(args, prompt_path, raw_argv: list[str]):
     """Return (argv, stdin_path). Explicit `-- <cmd>` overrides any preset.
     Presets encode the canonical SAFE, non-interactive invocation per worker.
@@ -19361,21 +19391,15 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
-        if _effective_read_only(args):
-            # Grok has no OS sandbox here (--os-sandbox is a codex-bash knob,
-            # and is now REFUSED at dispatch rather than accepted and ignored)
-            # and its ACP adapter bypasses the permission gate for writes, so
-            # until 2026-08-25 a "read-only" grok review was enforced by nothing
-            # but brief discipline. --deny rules are the mechanism the CLI
-            # actually honours, and they hold against the model's own bypass
-            # attempts: probed on grok 1.0.0 and re-validated on 1.0.5 (write
-            # prompt, seat `info`) the worker tried the write tool, then a shell
-            # command, then a subagent, and reported honestly that writes were
-            # blocked. The broken --permission-mode flag documented above stays
-            # omitted — deny rules are a different, measured surface. If a new
-            # write-capable tool ships, the deny list must grow with it; the
-            # probe in tests/python/test_grok_read_only_deny.py is the tripwire.
-            argv += ["--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
+        grok_read_only = _effective_read_only(args)
+        if grok_read_only:
+            # Write/Edit stay denied at Grok's tool boundary on every host.
+            argv += ["--deny", "Write", "--deny", "Edit"]
+        if grok_read_only and not goalflight_compat.is_macos():
+            # Non-macOS has no runner:sandbox-exec profile. Bash is denied
+            # there because no OS profile can fence shell writes; on macOS the
+            # wrapper below leaves Bash available while Seatbelt fences them.
+            argv += ["--deny", "Bash"]
         # Only pin a model when one is EXPLICITLY requested; otherwise omit the
         # flag entirely and let grok's CLI default (grok-4.5) apply.
         selected_model = str(model) if model else default_model
@@ -19394,6 +19418,8 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
                     and not getattr(args, "resume_reconstruction", False)
                 ),
             )
+        if grok_read_only and goalflight_compat.is_macos():
+            return _wrap_grok_read_only_os_sandbox(argv, args), None
         return argv, None
     if args.agent == "moonshot":
         # kimi has no --cwd, is off-PATH, takes the prompt as an argv value, and -p auto-runs
@@ -19581,11 +19607,13 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         "--readonly",
         action="store_true",
         help=(
-            "Read-only worker posture for review/analysis. Grok denies "
-            "Bash/Write/Edit; OS-sandboxed workers cannot modify the worktree, "
-            "so they cannot commit or write a review artifact and must return "
-            "findings inline. On OS-sandbox-capable workers this selects "
-            "--os-sandbox read-only; Grok bash uses deny rules instead."
+            "Read-only worker posture for review/analysis; use it for reviews "
+            "and analysis because it takes no pooled writer worktree. On macOS "
+            "Grok keeps a shell under the read-only OS profile while Write/Edit "
+            "remain denied and project writes fail at the OS boundary. On "
+            "non-macOS Grok keeps --deny Bash/Write/Edit. OS-sandboxed workers "
+            "cannot modify the worktree, so they cannot commit or write a review "
+            "artifact and must return findings inline."
         ),
     )
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
@@ -19595,7 +19623,8 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "cursor-cli has no read-only flag), and by ACP shapes whose "
                              "adapter and platform can wrap the worker (macOS sandbox-exec). "
                              "Unset = workspace-write for bash-shape codex. An accepted-but-inert "
-                             "request is refused; grok bash should pass --read-only instead. "
+                             "request is refused; grok bash should pass --read-only instead "
+                             "(--sandbox-exec write fencing on macOS, --deny Bash elsewhere). "
                              "The read-only profile denies worktree writes, so the worker cannot "
                              "commit or write its review artifact. "
                              "'off' disables codex's Seatbelt sandbox (codex --sandbox "
@@ -20107,6 +20136,9 @@ def main(argv: list[str] | None = None) -> int:
     # operator. Same order as the ACP branch.
     try:
         account_env = _resolve_launch_account_env(args)
+        # build_worker() needs the same account-scoped HOME/XDG roots that the
+        # spawned Grok process receives when it prepares its macOS profile.
+        args._account_env = account_env
         _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:
         try:
@@ -20569,6 +20601,7 @@ def main(argv: list[str] | None = None) -> int:
         # envelope with goalflight_messages.py while still writing prose to its
         # log for the human reading the tail.
         env["GOALFLIGHT_DISPATCH_ID"] = str(args.dispatch_id)
+        _apply_read_only_env(env, args)
         if worktree_seat is not None:
             env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
                 worktree_seat.fileno()

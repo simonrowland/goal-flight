@@ -540,9 +540,20 @@ def test_synthesized_grok_resume_preserves_legacy_read_only_record(
     assert "--read-only" in launch
     parsed = D._build_launch_parser().parse_args(launch)
     D._validate_agent_os_sandbox(parsed)
+    if D.goalflight_compat.is_macos():
+        # sandbox-exec refuses a cwd below the system temp root because that
+        # root is itself writable in the profile. The argv contract under test
+        # is independent of the temporary fixture path.
+        parsed.cwd = str(ROOT)
     worker_argv, _stdin = D.build_worker(parsed, prompt, [])
-    assert worker_argv.count("--deny") == 3
-    assert all(tool in worker_argv for tool in ("Write", "Edit", "Bash"))
+    if D.goalflight_compat.is_macos():
+        assert Path(worker_argv[0]).name == "sandbox-exec", worker_argv
+        assert worker_argv.count("--deny") == 2
+        assert all(tool in worker_argv for tool in ("Write", "Edit"))
+        assert "Bash" not in worker_argv
+    else:
+        assert worker_argv.count("--deny") == 3
+        assert all(tool in worker_argv for tool in ("Write", "Edit", "Bash"))
 
 
 def test_resume_refuses_old_record_without_cwd_evidence(
