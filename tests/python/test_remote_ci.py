@@ -1807,9 +1807,12 @@ def test_gate_opens_only_after_the_coalition_is_recorded(tmp_path, monkeypatch):
             raise AssertionError("gate opened before the coalition was durable")
         original(target, current)
 
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 42, "start": [10, 20], "coalition_id": 100}), encoding="utf-8")
     monkeypatch.setattr(node.subprocess, "run", fake_run)
     monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
     monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     monkeypatch.setattr(node, "_remember_identity", remember)
     launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
@@ -1834,10 +1837,13 @@ def test_gate_stays_closed_without_a_durable_coalition_id(tmp_path, monkeypatch)
             return
         original(target, current)
 
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 42, "start": [10, 20], "coalition_id": 100}), encoding="utf-8")
     monkeypatch.setattr(node.subprocess, "run", lambda argv, **kwargs: type("R", (), {
         "returncode": 0, "stderr": "", "stdout": ""})())
     monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
     monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
     monkeypatch.setattr(node, "_remember_identity", remember)
     launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
@@ -2308,7 +2314,8 @@ def test_absent_launch_with_a_live_cwd_is_not_empty(tmp_path, monkeypatch):
         proc.wait(timeout=5)
 
 
-def test_absent_launch_releases_when_cwd_is_empty(tmp_path, monkeypatch):
+def test_live_wrapper_outside_an_empty_cwd_keeps_the_slot(tmp_path, monkeypatch):
+    """launch_submitted, absent listing, empty cwd, wrapper alive elsewhere."""
     import goalflight_remote_ci_node as node
 
     run = tmp_path / "run"
@@ -2316,12 +2323,110 @@ def test_absent_launch_releases_when_cwd_is_empty(tmp_path, monkeypatch):
     state = {
         "lease_id": "abc", "state": "draining",
         "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time(),
+        "slot": str(run),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    assert node.clear_tree(tmp_path, state, run) is False
+
+
+def test_absent_submit_without_a_wrapper_identity_is_not_released(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time() - 120,
         "slot": str(run),
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
     monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    assert node.clear_tree(tmp_path, state, run) is False
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["state"] != "released"
+    assert lease.get("identity_status") == "unproven"
+
+
+def test_dead_wrapper_with_an_empty_coalition_can_release(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time() - 120,
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     assert node.clear_tree(tmp_path, state, run) is True
+
+
+def test_dead_wrapper_with_an_unreadable_coalition_is_not_empty(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time(),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: None)
+    assert node.clear_tree(tmp_path, state, run) is False
+
+
+def test_stale_listing_does_not_adopt_a_reused_pid(tmp_path, monkeypatch):
+    """Same pid, new start token, launchd still listing the old pid."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "launch_submitted": True,
+        "launch_intent_at": time.time(),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps(
+        {"pid": 50, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
+    killed = []
+    monkeypatch.setattr(node, "_job_view", lambda label: ("running", 50, None))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((9, 9), 777))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: tuple(started) == (9, 9))
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [(50, (9, 9))])
+    monkeypatch.setattr(node, "_remove_job", lambda label: False)
+    monkeypatch.setattr(node.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert node.clear_tree(tmp_path, state, run) is False
+    assert state.get("coalition_id") != 777
+    assert killed == []
 
 
 def test_reused_job_pid_is_not_adopted(tmp_path, monkeypatch):

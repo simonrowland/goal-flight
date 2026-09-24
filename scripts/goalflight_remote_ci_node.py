@@ -449,6 +449,15 @@ def _same_process(pid, started):
     return now == started
 
 
+def _verify_incarnation(pid, started):
+    """True only when ``pid`` still has the persisted start token.
+
+    False is ESRCH or a different process. None means the check cannot be
+    read. A mismatch is not adopted and not signalled.
+    """
+    return _same_process(pid, started)
+
+
 def _as_start(value):
     if isinstance(value, (list, tuple)) and len(value) == 2:
         try:
@@ -610,13 +619,13 @@ def _incarnation_in_coalition(pid, started, cid):
     Membership and start time are re-read together. A pid reused into another
     coalition is not this incarnation and is not signalled.
     """
-    same = _same_process(pid, started)
+    same = _verify_incarnation(pid, started)
     if same is not True:
         return False if same is False else None
     found = _coalition_id(pid)
     if found is None:
         return None
-    after = _same_process(pid, started)
+    after = _verify_incarnation(pid, started)
     if after is not True:
         return False if after is False else None
     if found != cid:
@@ -717,8 +726,14 @@ def _store_members(run, state, members):
 _LEASE_KEYS = (
     "launch_label", "coalition_id", "holder_coalition_id", "workload_pid",
     "workload_start", "exit_code", "exit_known", "members", "job_remove_pending",
-    "pending_result", "launch_submitted", "launch_seen",
+    "pending_result", "launch_submitted", "launch_seen", "launch_intent_at",
+    "identity_status",
 )
+
+# How long a recorded submit may lack a wrapper identity before recovery
+# says the tree is unproven. Absence after that still keeps the slot.
+_INTENT_HOLD_SECONDS = 60
+_WRAPPER_IDENTITY = "wrapper-identity.json"
 
 
 def _remember_identity(run, state):
@@ -789,6 +804,103 @@ def clear_tree(managed, state, run):
     return _kill_members(run, state, cid, label)
 
 
+def _read_wrapper_identity(run):
+    """The wrapper's own pid, start token, and coalition.
+
+    None if the file is not there yet. 'unreadable' if it is not a usable
+    identity. A dict is the record.
+    """
+    if run is None:
+        return None
+    path = run / _WRAPPER_IDENTITY
+    if not path.is_file():
+        return None
+    try:
+        body = read_json(path)
+    except (OSError, ValueError):
+        return "unreadable"
+    if not isinstance(body, dict):
+        return "unreadable"
+    pid = body.get("pid")
+    start = _as_start(body.get("start"))
+    cid = body.get("coalition_id")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or start is None:
+        return "unreadable"
+    if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
+        cid = None
+    return {"pid": pid, "start": start, "coalition_id": cid}
+
+
+def _identity_allows_release(run, state):
+    """True only when a recorded launch is positively gone.
+
+    No wrapper record and no submit intent: the coalition scan is the proof.
+    A recorded submit with no identity, or an identity that is still alive
+    or whose coalition cannot be listed, is not proof.
+    """
+    ident = _read_wrapper_identity(run)
+    if ident is None and not state.get("launch_submitted"):
+        return True
+    if not isinstance(ident, dict):
+        return False
+    if _verify_incarnation(ident["pid"], ident["start"]) is not False:
+        return False
+    cid = ident.get("coalition_id")
+    if not cid:
+        return False
+    members = _coalition_members(cid)
+    if members is None or members:
+        return False
+    return True
+
+
+def _hold_unproven(run, state):
+    """Keep the slot. After the intent window, say the wrapper was not proved."""
+    started = state.get("launch_intent_at")
+    if (isinstance(started, bool) or not isinstance(started, (int, float))
+            or time.time() >= started + _INTENT_HOLD_SECONDS):
+        state["identity_status"] = "unproven"
+    state["job_remove_pending"] = True
+    _remember_identity(run, state)
+    return "unknown"
+
+
+def _recover_absent(run, state):
+    """Absent from launchd is not an empty tree.
+
+    Release only when the wrapper's incarnation is dead and its coalition
+    has no members. A missing identity is unknown, during the wait and after.
+    """
+    if state.get("release_reason") == "launch-failed":
+        ident = _read_wrapper_identity(run)
+        if not isinstance(ident, dict):
+            state["job_remove_pending"] = False
+            _remember_identity(run, state)
+            return "empty"
+    ident = _read_wrapper_identity(run)
+    if ident == "unreadable":
+        return _hold_unproven(run, state)
+    if not isinstance(ident, dict):
+        return _hold_unproven(run, state)
+    verdict = _verify_incarnation(ident["pid"], ident["start"])
+    if verdict is None:
+        return _hold_unproven(run, state)
+    state["workload_pid"] = str(ident["pid"])
+    state["workload_start"] = [ident["start"][0], ident["start"][1]]
+    if ident.get("coalition_id"):
+        state["coalition_id"] = ident["coalition_id"]
+    if verdict is True or not _identity_allows_release(run, state):
+        state["job_remove_pending"] = True
+        _remember_identity(run, state)
+        if verdict is True and _private_coalition(state):
+            return "ready"
+        return "unknown"
+    state["job_remove_pending"] = False
+    state["identity_status"] = "dead"
+    _remember_identity(run, state)
+    return "empty"
+
+
 def _adopt_launch(run, state):
     """Name a job whose coalition was not recorded yet.
 
@@ -803,18 +915,7 @@ def _adopt_launch(run, state):
         _remember_identity(run, state)
         return "unknown"
     if view == "absent":
-        # The label is durable before submit. Absence can mean the job has
-        # not been listed yet, or that it already ran and left the list.
-        # Neither is an empty tree unless the run directory and slot are.
-        paths = [p for p in (run, state.get("slot")) if p]
-        intruders = cwd_intruders(paths) if paths else []
-        if intruders is None or intruders:
-            state["job_remove_pending"] = True
-            _remember_identity(run, state)
-            return "unknown"
-        state["job_remove_pending"] = False
-        _remember_identity(run, state)
-        return "empty"
+        return _recover_absent(run, state)
     kind, pid, code = view
     if kind == "exited":
         if isinstance(code, int) and not isinstance(code, bool):
@@ -830,7 +931,16 @@ def _adopt_launch(run, state):
         state["job_remove_pending"] = False
         _remember_identity(run, state)
         return "empty"
-    identity = _identity_for_job(label, pid)
+    ident = _read_wrapper_identity(run)
+    started = ident["start"] if isinstance(ident, dict) else _as_start(state.get("workload_start"))
+    persisted_cid = ident.get("coalition_id") if isinstance(ident, dict) else state.get("coalition_id")
+    if isinstance(ident, dict) and ident["pid"] != pid:
+        started = None
+    if started is None:
+        state["job_remove_pending"] = True
+        _remember_identity(run, state)
+        return "unknown"
+    identity = _identity_for_job(label, pid, started, persisted_cid)
     if identity is None:
         state["job_remove_pending"] = True
         _remember_identity(run, state)
@@ -903,6 +1013,10 @@ def _kill_members(run, state, cid, label):
             if leftovers:
                 persisted = dict(leftovers)
                 continue
+            if not _identity_allows_release(run, state):
+                state["job_remove_pending"] = bool(label)
+                _remember_identity(run, state)
+                return False
             state["job_remove_pending"] = False
             _remember_identity(run, state)
             return True
@@ -1031,28 +1145,75 @@ def _stable_identity(pid):
     return start, first
 
 
-def _identity_for_job(label, pid):
-    """(start, coalition) while ``pid`` is still this job, else None.
+def _identity_for_job(label, pid, started, coalition):
+    """(start, coalition) only when the live start token is the persisted one.
 
-    The pid from a listing and the start time are one identity. A pid
-    reused before the coalition read belongs to someone else: do not adopt
-    it, and do not signal it. The caller re-reads the job.
+    ``started`` is the first observation (the wrapper's own record). The
+    same pid with a different start is a different process: do not adopt it.
     """
-    identity = _stable_identity(pid)
-    if identity is None:
+    if _verify_incarnation(pid, started) is not True:
         return None
-    start, cid = identity
+    identity = _stable_identity(pid)
+    if identity is None or identity[0] != started:
+        return None
+    if coalition and identity[1] != coalition:
+        return None
     view = _job_view(label)
     if not (isinstance(view, tuple) and view[0] == "running" and view[1] == pid):
         return None
-    if _stable_identity(pid) != (start, cid):
+    if _verify_incarnation(pid, started) is not True:
         return None
-    return start, cid
+    return started, (coalition or identity[1])
 
 
+# Field layout matches _ProcBsdInfo and _CoalInfo. The wrapper is a separate
+# process and cannot import this module when the node is exec'd from a string.
 _WORKLOAD_WRAPPER = (
-    "import json, os, sys, time\n"
-    "spec = json.loads(open(sys.argv[1], encoding='utf-8').read())\n"
+    "import ctypes, json, os, sys, time\n"
+    "from pathlib import Path\n"
+    "def identity():\n"
+    "    pid = os.getpid()\n"
+    "    start = None\n"
+    "    coalition = None\n"
+    "    try:\n"
+    "        lib = ctypes.CDLL('/usr/lib/libproc.dylib')\n"
+    "        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]\n"
+    "        lib.proc_pidinfo.restype = ctypes.c_int\n"
+    "        class BSD(ctypes.Structure):\n"
+    "            _fields_ = [\n"
+    "                ('pbi_flags', ctypes.c_uint32), ('pbi_status', ctypes.c_uint32),\n"
+    "                ('pbi_xstatus', ctypes.c_uint32), ('pbi_pid', ctypes.c_uint32),\n"
+    "                ('pbi_ppid', ctypes.c_uint32), ('pbi_uid', ctypes.c_uint32),\n"
+    "                ('pbi_gid', ctypes.c_uint32), ('pbi_ruid', ctypes.c_uint32),\n"
+    "                ('pbi_rgid', ctypes.c_uint32), ('pbi_svuid', ctypes.c_uint32),\n"
+    "                ('pbi_svgid', ctypes.c_uint32), ('rfu_1', ctypes.c_uint32),\n"
+    "                ('pbi_comm', ctypes.c_char * 16), ('pbi_name', ctypes.c_char * 32),\n"
+    "                ('pbi_nfiles', ctypes.c_uint32), ('pbi_pgid', ctypes.c_uint32),\n"
+    "                ('pbi_pjobc', ctypes.c_uint32), ('e_tdev', ctypes.c_uint32),\n"
+    "                ('e_tpgid', ctypes.c_uint32), ('pbi_nice', ctypes.c_int32),\n"
+    "                ('pbi_start_tvsec', ctypes.c_uint64), ('pbi_start_tvusec', ctypes.c_uint64)]\n"
+    "        class Coal(ctypes.Structure):\n"
+    "            _fields_ = [('ids', ctypes.c_uint64 * 2), ('reserved', ctypes.c_uint64 * 3)]\n"
+    "        info = BSD()\n"
+    "        size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))\n"
+    "        if size == ctypes.sizeof(info) and int(info.pbi_pid) == pid:\n"
+    "            start = [int(info.pbi_start_tvsec), int(info.pbi_start_tvusec)]\n"
+    "        coal = Coal()\n"
+    "        size = lib.proc_pidinfo(pid, 20, 0, ctypes.byref(coal), ctypes.sizeof(coal))\n"
+    "        if size == ctypes.sizeof(coal):\n"
+    "            coalition = int(coal.ids[0])\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "    return {'pid': pid, 'start': start, 'coalition_id': coalition}\n"
+    "spec = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+    "run = Path(sys.argv[1]).resolve().parent\n"
+    "raw = json.dumps(identity()).encode()\n"
+    "tmp = run / ('wrapper-identity.json.' + str(os.getpid()))\n"
+    "fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\n"
+    "os.write(fd, raw)\n"
+    "os.fsync(fd)\n"
+    "os.close(fd)\n"
+    "os.replace(tmp, run / 'wrapper-identity.json')\n"
     "gate = sys.argv[2]\n"
     "while not os.path.exists(gate):\n"
     "    time.sleep(0.02)\n"
@@ -1114,6 +1275,7 @@ def _submit_workload(run, state, argv, env, cwd):
     # Intent is durable before the syscall. A holder killed during submit
     # must not recover as "the job never existed".
     state["launch_submitted"] = True
+    state["launch_intent_at"] = time.time()
     state["job_remove_pending"] = True
     write_json(run / "lease.json", state)
     if not _fsync_file(run / "lease.json"):
@@ -1152,7 +1314,12 @@ def _submit_workload(run, state, argv, env, cwd):
                 state["exit_known"] = True
             _remember_identity(run, state)
             return None
-        identity = _identity_for_job(label, pid)
+        ident = _read_wrapper_identity(run)
+        if not isinstance(ident, dict) or ident["pid"] != pid:
+            time.sleep(0.02)
+            continue
+        identity = _identity_for_job(
+            label, pid, ident["start"], ident.get("coalition_id"))
         if identity is None:
             time.sleep(0.02)
             continue
