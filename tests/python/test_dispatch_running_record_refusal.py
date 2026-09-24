@@ -806,17 +806,31 @@ def test_review_no_worker_spawned_refusal_still_raises(
     assert "goalflight_review_job: WARN:" not in capsys.readouterr().err
 
 
-def test_importing_this_module_does_not_mutate_acp_python_env(
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "test_dispatch_running_record_refusal",
+        "test_codex_dispatch_seams",
+        "test_acp_reexec",
+        "test_acp_model_passthrough",
+    ],
+)
+@pytest.mark.parametrize("configured_python", [None, "/configured/acp/python"])
+def test_importing_module_does_not_mutate_acp_python_env(
     tmp_path: Path,
+    module_name: str,
+    configured_python: str | None,
 ) -> None:
     """Collection must not pin GOALFLIGHT_ACP_PYTHON on the process.
 
     An import-time os.environ write leaks into every later module in the same
-    pytest process via env.copy() child launches. Keep the pin inside the
-    autouse fixture so teardown restores it.
+    pytest process via env.copy() child launches. Scope overrides to a fixture
+    or patch context so teardown restores them.
     """
     env = os.environ.copy()
     env.pop("GOALFLIGHT_ACP_PYTHON", None)
+    if configured_python is not None:
+        env["GOALFLIGHT_ACP_PYTHON"] = configured_python
     env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp_path / "dispatch")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp_path / "journals")
@@ -831,8 +845,8 @@ def test_importing_this_module_does_not_mutate_acp_python_env(
     probe = (
         "import os, sys\n"
         f"sys.path.insert(0, {str(ROOT / 'tests' / 'python')!r})\n"
-        "assert os.environ.get('GOALFLIGHT_ACP_PYTHON') is None\n"
-        "import test_dispatch_running_record_refusal as m\n"
+        f"assert os.environ.get('GOALFLIGHT_ACP_PYTHON') == {configured_python!r}\n"
+        f"import {module_name} as m\n"
         "print('after=' + repr(os.environ.get('GOALFLIGHT_ACP_PYTHON')))\n"
         "print('module=' + m.__name__)\n"
     )
@@ -846,4 +860,4 @@ def test_importing_this_module_does_not_mutate_acp_python_env(
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    assert "after=None" in proc.stdout
+    assert f"after={configured_python!r}" in proc.stdout

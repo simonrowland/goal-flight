@@ -5,13 +5,18 @@ from __future__ import annotations
 
 REQUIRES_ACP_SDK = True
 
-from support import skip_posix_on_native_windows
+from support import (
+    ensure_acp_test_interpreter,
+    registered_child_environment,
+    skip_posix_on_native_windows,
+)
 
 skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and signals")
 
 import asyncio
 import argparse
 import contextlib
+from functools import wraps
 import io
 import json
 import os
@@ -23,12 +28,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 FAKE_AGENT = ROOT / "tests/fixtures/acp_fake_agent.py"
+ensure_acp_test_interpreter("test_acp_failure_modes")
 
 from goalflight_acp_client import (  # noqa: E402
     ACP_IMPORT_ERROR,
@@ -43,6 +50,7 @@ from goalflight_acp_client import (  # noqa: E402
     RequestPermissionResponse,
     _classify_oversized_json_rpc_head,
 )
+
 from goalflight_acp_run import (  # noqa: E402
     _apply_user_confirm_reply_batch,
     _finalize_provisional_user_confirm_yes,
@@ -88,6 +96,7 @@ def env_override_fields(text: str, env_name: str) -> dict[str, str]:
 
 def skipif(condition: bool, reason: str):
     def _decorator(func):
+        @wraps(func)
         def _wrapped(*args, **kwargs):
             if condition:
                 print(f"SKIP: {func.__name__}: {reason}")
@@ -503,15 +512,12 @@ def _run_fake_runner(
                 "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": scenario,
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
                 "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
                 "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
         )
         if extra_env:
             env.update(extra_env)
-        with patch.dict(os.environ, env, clear=False):
-            goalflight_journal.Journal.create(ROOT)
         args = [
             sys.executable,
             "scripts/goalflight_acp_run.py",
@@ -547,41 +553,42 @@ def _run_fake_runner(
             args.extend(["--user-confirm-timeout-s", str(user_confirm_timeout_s)])
         if stall_kill:
             args.append("--stall-kill")
-        proc = subprocess.Popen(
-            args,
-            cwd=ROOT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _kill_from_status(status)
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            stdout, stderr = proc.communicate()
-            raise AssertionError(f"{scenario} runner timed out\nstdout={stdout}\nstderr={stderr}")
-        if not status.exists():
-            raise AssertionError(f"{scenario} wrote no status\nstdout={stdout}\nstderr={stderr}")
-        status_payload = json.loads(status.read_text())
-        if state_snapshot is not None:
-            capacity_path = state_dir / "capacity.json"
-            state_snapshot["capacity"] = (
-                json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
+        with registered_child_environment(ROOT, env=env) as child_env:
+            proc = subprocess.Popen(
+                args,
+                cwd=ROOT,
+                env=child_env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-            runs_dir = state_dir / "runs.d"
-            state_snapshot["records"] = [
-                json.loads(path.read_text())
-                for path in sorted(runs_dir.glob("*.json"))
-            ] if runs_dir.exists() else []
-        return proc.returncode, status_payload, stdout, stderr
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                _kill_from_status(status)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                stdout, stderr = proc.communicate()
+                raise AssertionError(f"{scenario} runner timed out\nstdout={stdout}\nstderr={stderr}")
+            if not status.exists():
+                raise AssertionError(f"{scenario} wrote no status\nstdout={stdout}\nstderr={stderr}")
+            status_payload = json.loads(status.read_text())
+            if state_snapshot is not None:
+                capacity_path = state_dir / "capacity.json"
+                state_snapshot["capacity"] = (
+                    json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
+                )
+                runs_dir = state_dir / "runs.d"
+                state_snapshot["records"] = [
+                    json.loads(path.read_text())
+                    for path in sorted(runs_dir.glob("*.json"))
+                ] if runs_dir.exists() else []
+            return proc.returncode, status_payload, stdout, stderr
 
 
 @skipif(os.name == "nt", reason="matrix timeout reap is POSIX process-group behavior")
@@ -893,7 +900,6 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
             "GOALFLIGHT_STATE_DIR": str(state_dir),
             "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
             "GOALFLIGHT_FAKE_ACP_SCENARIO": "echo",
-            "GOALFLIGHT_ACP_PYTHON": sys.executable,
             "GOALFLIGHT_CAPACITY_CONF": os.devnull,
             "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
         }
@@ -964,8 +970,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert status["killed_by_heartbeat"] is False, status
         assert status["wedged_by_heartbeat"] is False, status
         assert status["markers"]["STALLED"], status
-        assert status.get("controller_session_id") is None, status
-        assert status.get("controller_pid") is None, status
+        assert status.get("controller_session_id"), status
+        assert status.get("controller_pid") == os.getpid(), status
         assert _pid_alive(worker_pid), (status, stderr)
 
         dispatch_id = status["dispatch_id"]
@@ -973,8 +979,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert records and records[-1].get("state") == "stalled", records
         assert records[-1].get("terminal_state") == "stalled", records[-1]
         assert records[-1].get("worker_still_alive") is True, records[-1]
-        assert records[-1].get("controller_session_id") is None, records[-1]
-        assert records[-1].get("controller_pid") is None, records[-1]
+        assert records[-1].get("controller_session_id"), records[-1]
+        assert records[-1].get("controller_pid") == os.getpid(), records[-1]
         leases = [
             lease
             for lease in (state_snapshot.get("capacity", {}).get("leases") or {}).values()
@@ -984,7 +990,11 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert not leases[-1].get("released_at"), leases[-1]
         assert leases[-1].get("worker_pid") == worker_pid, leases[-1]
         assert leases[-1].get("controller_pid") == worker_pid, leases[-1]
-        assert leases[-1].get("detached_controller_pid") is None, leases[-1]
+        # d213e78e preserves the registered controller when the live worker
+        # becomes the lease's new liveness authority.
+        assert (
+            leases[-1].get("detached_controller_pid") == status["controller_pid"]
+        ), leases[-1]
     finally:
         _force_kill(worker_pid)
 
@@ -1004,6 +1014,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
     # same process (it false-failed case_handshake_wedge_kills_before_respawn).
     old_pidfile_dir = ac._PIDFILE_DIR
     old_ps_meta = ac._ps_meta
+    old_process_start_identity = ac.goalflight_compat.process_start_identity
     tmp = Path(tempfile.mkdtemp(prefix="gf-detach-ghost-"))
     ac._PIDFILE_DIR = tmp
     worker = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -1022,10 +1033,21 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
             return old_ps_meta(pid)
 
         ac._ps_meta = fake_ps_meta
+        ac.goalflight_compat.process_start_identity = (
+            lambda pid, **kwargs: (
+                {"pid": pid, "start_token": "controller-current"}
+                if pid == dead_controller_pid
+                else old_process_start_identity(pid, **kwargs)
+            )
+        )
         pidfile = tmp / f"{dead_controller_pid}.jsonl"
         base = {
             "pid": worker.pid, "pgid": worker.pid, "started_at": lstart,
             "cmd": comm, "agent": "codex-acp", "session_id": "s",
+            "controller_identity": {
+                "pid": dead_controller_pid,
+                "start_token": "controller-recorded",
+            },
             "worker_identity": ac._identity_token(worker_identity),
         }
         # detached worker -> NOT killed, survives.
@@ -1040,6 +1062,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
             worker.kill()
         ac._PIDFILE_DIR = old_pidfile_dir
         ac._ps_meta = old_ps_meta
+        ac.goalflight_compat.process_start_identity = old_process_start_identity
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -1105,33 +1128,25 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
     """Acceptance: production bounds preserve 55 minutes of buffered work."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        args = argparse.Namespace(
-            dispatch_id="read-only-buffered-acceptance",
-            agent="codex",
-            account=None,
-            read_only=True,
-            os_sandbox=None,
-            controller_pid=None,
-            controller_session_id=None,
-            controller_label=None,
-            task_ids=[],
-            launch_detached=False,
-            queue_launch_token=None,
-            cwd=str(ROOT),
-            prompt="buffered acceptance",
-            prompt_file=None,
-            no_orientation=True,
-            model=None,
-            priority="normal",
-            capacity_wait_s=0,
-            max_idle_secs=None,
-            poll_secs=0.05,
-            permission_mode="auto",
-            permission_dir=None,
-            permission_inline_timeout_s=None,
-            permission_user_timeout_s=None,
-            interactive=False,
-            context_mode=None,
+        args = goalflight_dispatch._build_launch_parser().parse_args(
+            [
+                "--dispatch-id",
+                "read-only-buffered-acceptance",
+                "--agent",
+                "codex",
+                "--read-only",
+                "--cwd",
+                str(ROOT),
+                "--prompt",
+                "buffered acceptance",
+                "--no-orientation",
+                "--capacity-wait-s",
+                "0",
+                "--poll-secs",
+                "0.05",
+                "--permission-mode",
+                "auto",
+            ]
         )
         goalflight_dispatch._apply_max_idle_default(args)
         cfg = goalflight_dispatch._build_acp_cfg(
@@ -1250,7 +1265,7 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_pause",
+        "progress_then_silent",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
@@ -1258,7 +1273,6 @@ def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
         max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
-            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
             "GOALFLIGHT_TEST_MODE": "1",
             "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
         },
@@ -1267,6 +1281,12 @@ def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
 
     worker_pid = status.get("worker_pid")
     try:
+        worker_identity = goalflight_compat.process_start_identity(worker_pid)
+        assert (
+            worker_identity
+            and worker_identity.get("pid") == worker_pid
+            and worker_identity.get("start_token")
+        ), (status, worker_identity, stderr)
         assert returncode != 0, (stdout, stderr, status)
         assert status["state"] == "liveness_indeterminate", status
         assert status["error"]["reason"] == "event_silence_outer_bound", status
@@ -1284,8 +1304,10 @@ def case_runner_outer_bound_classifies_measured_idle() -> None:
         tmp = Path(td)
         process_table_file = tmp / "process-table.txt"
         bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        # Keep the worker alive until the measured-idle verdict; sibling
+        # modules in the isolated wrapper can delay a finite fake past 0.6s.
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.05,
             wedge_samples=99,
@@ -1293,7 +1315,6 @@ def case_runner_outer_bound_classifies_measured_idle() -> None:
             max_quiet_s=0.15,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
                 "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
@@ -1321,7 +1342,7 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
         process_table_file = tmp / "process-table.txt"
         bindir = _descendant_ps_table_bindir(tmp, process_table_file)
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=30.0,
             wedge_samples=99,
@@ -1332,7 +1353,6 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
             max_quiet_s=2.0,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "30",
                 "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
@@ -1354,8 +1374,10 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
+    # The CPU percentage is supplied by the test hook; use a blocking worker
+    # so wrapper concurrency cannot let a finite fake exit before the probes.
     returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_busy",
+        "progress_then_silent",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
@@ -1363,7 +1385,6 @@ def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
         max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
-            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
             "GOALFLIGHT_TEST_MODE": "1",
             "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
         },
@@ -1443,8 +1464,11 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             process_table_file,
             delay_s=0.2,
         )
+        # The outer-bound verdict is intentionally indeterminate and the
+        # worker must still exist while the delayed probes finish. Reuse the
+        # blocking fixture so host load cannot make a finite fake exit first.
         returncode, status, stdout, stderr = _run_fake_runner(
-            "thought_stream_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.02,
             wedge_samples=99,
@@ -1452,8 +1476,7 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             max_quiet_s=0.05,
             max_tool_s=30.0,
             extra_env={
-                "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.1",
-                "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
                 "GOALFLIGHT_TEST_MODE": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
                 "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
@@ -1461,13 +1484,25 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             timeout_s=30.0,
         )
 
+    # 8cd581d4 changed unmeasurable positive-CPU silence from a kill to a
+    # bounded indeterminate result with the worker detached for the operator.
     assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "failed", status
-    assert status["error"]["reason"] == "empty_session", status
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["reason"] == "event_silence_outer_bound", status
+    assert (
+        status["error"]["observed_state"]
+        == "positive_cpu_without_observable_progress"
+    ), status
+    assert status["error"]["recent_forward_progress_observed"] is False, status
+    assert status["liveness_indeterminate_probes"] == 3, status
     assert status["killed_by_heartbeat"] is False, status
-    assert status["wedge_progress_seen"] >= 5, status
-    assert status["worker_alive"] is False, status
-    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+    assert status["worker_alive"] is True, status
+    worker_pid = status.get("worker_pid")
+    try:
+        assert status["wedge_progress_seen"] >= 1, status
+        assert _pid_alive(worker_pid), (status, stderr)
+    finally:
+        _force_kill(worker_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2161,10 +2196,13 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": "user_confirm_hang_after_marker",
                 "GOALFLIGHT_FAKE_ACP_HANG_S": "30",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
                 "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
                 "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
+        )
+        child_stack = contextlib.ExitStack()
+        child_env = child_stack.enter_context(
+            registered_child_environment(ROOT, env=env)
         )
         proc = subprocess.Popen(
             [
@@ -2200,7 +2238,7 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 "--json",
             ],
             cwd=ROOT,
-            env=env,
+            env=child_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2233,6 +2271,7 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
             proc.communicate(timeout=10)
+            child_stack.close()
 
 
 def case_user_confirm_midturn_deadline_reenables_remote_silence_terminal() -> None:
@@ -2374,6 +2413,7 @@ def case_runner_unknown_descendants_cannot_override_hard_wall() -> None:
             extra_env={
                 "PATH": env["PATH"],
                 "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
             },
             timeout_s=20.0,
@@ -2418,7 +2458,7 @@ def case_runner_indeterminate_liveness_does_not_kill() -> None:
         assert probe.returncode != 0, "precondition failed: descendant ps probe succeeded"
         state_snapshot: dict = {}
         returncode, status, stdout, stderr = _run_fake_runner(
-            "long_reasoning_pause",
+            "progress_then_silent",
             progress_stall_s=30.0,
             heartbeat_interval=0.05,
             wedge_samples=99,
@@ -2427,8 +2467,8 @@ def case_runner_indeterminate_liveness_does_not_kill() -> None:
             max_tool_s=30.0,
             extra_env={
                 "PATH": env["PATH"],
-                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "8",
                 "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
             },
             state_snapshot=state_snapshot,
@@ -2672,7 +2712,8 @@ def case_handshake_wedge_kills_before_respawn() -> None:
                 for pid in spawned:
                     _force_kill(pid)
 
-    asyncio.run(_run())
+    with registered_child_environment(ROOT):
+        asyncio.run(_run())
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2711,7 +2752,8 @@ def case_pool_exhaustion_then_drain() -> None:
                 for pid in spawned:
                     _force_kill(pid)
 
-    asyncio.run(_run())
+    with registered_child_environment(ROOT):
+        asyncio.run(_run())
 
 
 def case_env_ipc_paths_are_constrained() -> None:
@@ -2726,11 +2768,12 @@ def case_env_ipc_paths_are_constrained() -> None:
     try:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            state = tmp / "state"
+            # The isolated wrapper owns this state root; do not replace it
+            # with a test-local root while validating the path guard.
+            state = goalflight_compat.resolve_state_dir()
             dispatch = state / "dispatch"
-            dispatch.mkdir(parents=True)
+            dispatch.mkdir(parents=True, exist_ok=True)
 
-            os.environ["GOALFLIGHT_STATE_DIR"] = str(state)
             os.environ["GOALFLIGHT_STEER_FILE"] = str(dispatch / "worker.steer.jsonl")
             os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
             steer, steer_source = _resolve_steer_file(argparse.Namespace(steer_file=None), "worker")
@@ -2861,8 +2904,6 @@ def case_test_mode_hooks_require_gate() -> None:
 def case_acp_missing_prompt_commits_terminal_outbox() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        sandbox = tmp / "sandbox"
-        sandbox.mkdir()
         status = tmp / "missing-prompt.status.json"
         missing_prompt = tmp / "missing.prompt.md"
         wrapper = _make_fake_agent_wrapper(tmp)
@@ -2878,7 +2919,6 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
                 "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
                 "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
                 "GOALFLIGHT_TEST_MODE": "1",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
             }
         )
         proc = subprocess.run(
@@ -2891,14 +2931,14 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
                 "--dispatch-id",
                 "acp-missing-prompt",
                 "--cwd",
-                str(sandbox),
+                str(ROOT),
                 "--prompt",
                 str(missing_prompt),
                 "--status-json",
                 str(status),
                 "--json",
             ],
-            cwd=sandbox,
+            cwd=ROOT,
             env=env,
             text=True,
             encoding="utf-8",
@@ -2927,73 +2967,86 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
         ], rows
 
 
+def _run_case(case) -> None:
+    try:
+        case()
+    except BaseException:
+        print(f"FAIL: {case.__name__}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        raise
+
+
 def main() -> None:
-    case_unimportable_sdk_permission_path_names_acp_import_error()
-    case_vendor_flood_idle_waits_for_quiet_backstop()
-    case_dropped_frame_records_are_bounded()
-    case_empty_oversized_head_assumes_request_for_reply()
-    case_vendor_flood_cpu_busy_is_alive()
-    case_standard_progress_resets_wedge_streak()
-    case_permission_timeout_unblocks_wedge()
-    case_progress_stall_wall_ignores_raw_vendor_noise()
-    case_adapter_manifest_liveness_defaults()
-    case_manifest_acp_command_defaults()
-    case_json_rpc_stdout_filter()
-    case_matrix_timeout_reaps_runner_process_group()
-    case_permission_router_audit_bounded_and_truncated()
-    case_normal_dispatch_hides_matrix_audit_surface()
-    case_matrix_env_surfaces_bounded_audit()
-    case_matrix_claude_defer_skips_remaining_cases()
-    case_runner_raw_vendor_flood_hits_progress_stall_and_reaps()
-    case_runner_preserves_live_controller_beacon_pair()
-    case_runner_progress_stall_detaches_by_default()
-    case_detached_pidfile_entry_survives_ghost_cleanup()
-    case_runner_progress_then_silent_wedges_and_reaps()
-    case_runner_remote_long_reasoning_pause_survives_old_walls()
-    case_read_only_acp_buffered_work_survives_incident_duration()
-    case_runner_remote_dead_silent_turn_hits_remote_wall()
-    case_runner_outer_bound_with_unknown_cpu_and_idle_disabled()
-    case_runner_outer_bound_classifies_measured_idle()
-    case_runner_idle_callback_uses_same_outer_classifier()
-    case_runner_outer_bound_with_busy_cpu_and_idle_disabled()
-    case_runner_outer_bound_kills_zero_cpu_without_progress()
-    case_runner_outer_bound_rechecks_progress_after_probe()
-    case_runner_thought_stream_survives_progress_stall_wall()
-    case_runner_auth_failure_output_records_blocked_terminal()
-    case_runner_trivial_probe_working_engine_writes_file()
-    case_terminal_state_endturn_beats_tail_race_wedge()
-    case_runner_blocked_none_completes()
-    case_runner_blocked_substantive_cancels()
-    case_runner_user_confirm_then_blocked_preserves_denial_and_partial()
-    case_user_confirm_denial_arbitration_is_order_independent_and_sticky()
-    case_user_confirm_scope_requires_every_member_yes()
-    case_user_confirm_generation_key_is_hashable_and_fail_closed()
-    case_steer_prompt_sanitizes_quoted_authorize_grammar()
-    case_post_user_confirm_denial_keeps_continuation_read_only()
-    case_user_confirm_clocks_are_independent_without_sleeping()
-    case_user_confirm_arrival_stamp_is_strict_and_round_trips()
-    case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no()
-    case_later_denial_preserves_finalized_question_history_and_closes_future()
-    case_user_confirm_wait_is_not_remote_silence_reaped()
-    case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()
-    case_runner_user_need_none_completes()
-    case_runner_idle_silent_idle_timeout_reaps()
-    case_runner_idle_descendant_cannot_override_hard_wall()
-    case_runner_unknown_descendants_cannot_override_hard_wall()
-    case_runner_indeterminate_liveness_does_not_kill()
-    case_runner_oversized_frame_dropped_then_completes()
-    case_runner_oversized_request_gets_safe_reply()
-    case_runner_oversized_request_late_id_gets_safe_reply()
-    case_runner_oversized_no_newline_kills_worker()
-    case_runner_goal_mode_progress_stall_backstop()
-    case_runner_goal_mode_heartbeat_backstop()
-    case_runner_tool_timeout_reaps()
-    case_handshake_wedge_kills_before_respawn()
-    case_pool_exhaustion_then_drain()
-    case_env_ipc_paths_are_constrained()
-    case_env_override_warning_shell_tokens_round_trip()
-    case_test_mode_hooks_require_gate()
-    case_acp_missing_prompt_commits_terminal_outbox()
+    cases = (
+        case_unimportable_sdk_permission_path_names_acp_import_error,
+        case_vendor_flood_idle_waits_for_quiet_backstop,
+        case_dropped_frame_records_are_bounded,
+        case_empty_oversized_head_assumes_request_for_reply,
+        case_vendor_flood_cpu_busy_is_alive,
+        case_standard_progress_resets_wedge_streak,
+        case_permission_timeout_unblocks_wedge,
+        case_progress_stall_wall_ignores_raw_vendor_noise,
+        case_adapter_manifest_liveness_defaults,
+        case_manifest_acp_command_defaults,
+        case_json_rpc_stdout_filter,
+        case_matrix_timeout_reaps_runner_process_group,
+        case_permission_router_audit_bounded_and_truncated,
+        case_normal_dispatch_hides_matrix_audit_surface,
+        case_matrix_env_surfaces_bounded_audit,
+        case_matrix_claude_defer_skips_remaining_cases,
+        case_runner_raw_vendor_flood_hits_progress_stall_and_reaps,
+        case_runner_preserves_live_controller_beacon_pair,
+        case_runner_progress_stall_detaches_by_default,
+        case_detached_pidfile_entry_survives_ghost_cleanup,
+        case_runner_progress_then_silent_wedges_and_reaps,
+        case_runner_remote_long_reasoning_pause_survives_old_walls,
+        case_read_only_acp_buffered_work_survives_incident_duration,
+        case_runner_remote_dead_silent_turn_hits_remote_wall,
+        case_runner_outer_bound_with_unknown_cpu_and_idle_disabled,
+        case_runner_outer_bound_classifies_measured_idle,
+        case_runner_idle_callback_uses_same_outer_classifier,
+        case_runner_outer_bound_with_busy_cpu_and_idle_disabled,
+        case_runner_outer_bound_kills_zero_cpu_without_progress,
+        case_runner_outer_bound_rechecks_progress_after_probe,
+        case_runner_thought_stream_survives_progress_stall_wall,
+        case_runner_auth_failure_output_records_blocked_terminal,
+        case_runner_trivial_probe_working_engine_writes_file,
+        case_terminal_state_endturn_beats_tail_race_wedge,
+        case_runner_blocked_none_completes,
+        case_runner_blocked_substantive_cancels,
+        case_runner_user_confirm_then_blocked_preserves_denial_and_partial,
+        case_user_confirm_denial_arbitration_is_order_independent_and_sticky,
+        case_user_confirm_scope_requires_every_member_yes,
+        case_user_confirm_generation_key_is_hashable_and_fail_closed,
+        case_steer_prompt_sanitizes_quoted_authorize_grammar,
+        case_post_user_confirm_denial_keeps_continuation_read_only,
+        case_user_confirm_clocks_are_independent_without_sleeping,
+        case_user_confirm_arrival_stamp_is_strict_and_round_trips,
+        case_closed_user_confirm_yes_stays_non_authorizing_and_rejects_late_no,
+        case_later_denial_preserves_finalized_question_history_and_closes_future,
+        case_user_confirm_wait_is_not_remote_silence_reaped,
+        case_user_confirm_midturn_deadline_reenables_remote_silence_terminal,
+        case_runner_user_need_none_completes,
+        case_runner_idle_silent_idle_timeout_reaps,
+        case_runner_idle_descendant_cannot_override_hard_wall,
+        case_runner_unknown_descendants_cannot_override_hard_wall,
+        case_runner_indeterminate_liveness_does_not_kill,
+        case_runner_oversized_frame_dropped_then_completes,
+        case_runner_oversized_request_gets_safe_reply,
+        case_runner_oversized_request_late_id_gets_safe_reply,
+        case_runner_oversized_no_newline_kills_worker,
+        case_runner_goal_mode_progress_stall_backstop,
+        case_runner_goal_mode_heartbeat_backstop,
+        case_runner_tool_timeout_reaps,
+        case_handshake_wedge_kills_before_respawn,
+        case_pool_exhaustion_then_drain,
+        case_env_ipc_paths_are_constrained,
+        case_env_override_warning_shell_tokens_round_trip,
+        case_test_mode_hooks_require_gate,
+        case_acp_missing_prompt_commits_terminal_outbox,
+    )
+    for case in cases:
+        _run_case(case)
     print("OK: ACP SDK failure-mode tests pass")
 
 

@@ -3086,8 +3086,11 @@ def _steer_file(dispatch_id: str) -> Path:
     return goalflight_dispatch_paths.steer_file(dispatch_id)
 
 
-def _raw_worker_args(args) -> list[str]:
-    return args.worker[1:] if args.worker and args.worker[0] == "--" else args.worker
+def _raw_worker_args(args) -> list[str] | None:
+    worker = getattr(args, "worker", None)
+    if not isinstance(worker, list):
+        return None
+    return worker[1:] if worker and worker[0] == "--" else worker
 
 
 def _prompt_requested(args) -> bool:
@@ -3608,7 +3611,8 @@ def _occupancy_exempt_read_only(args) -> bool:
     """
     if not _effective_read_only(args):
         return False
-    if _raw_worker_args(args):
+    raw_worker = _raw_worker_args(args)
+    if raw_worker is None or raw_worker:
         return False
     agent = str(getattr(args, "agent", "") or "")
     shape = getattr(args, "shape", "bash")

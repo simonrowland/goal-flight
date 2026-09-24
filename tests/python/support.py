@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from functools import lru_cache
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +92,60 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
     return mapping
 
 
+@contextmanager
+def registered_child_environment(
+    project_root: Path | str,
+    *,
+    env: Mapping[str, str] | None = None,
+    controller_label: str | None = None,
+) -> Iterator[dict[str, str]]:
+    """Run an ACP/dispatch child with a live checkout-local controller."""
+    import goalflight_journal
+    import goalflight_ledger
+    import goalflight_task
+    import goalflight_wake
+
+    project = goalflight_task.resolve_project_root(str(project_root))
+    child_env = dict(os.environ if env is None else env)
+    child_env.update(
+        {
+            "GOALFLIGHT_ROOT": str(ROOT),
+            "GOALFLIGHT_DISPATCH_SCRIPT": str(SCRIPTS / "goalflight_dispatch.py"),
+            "GOALFLIGHT_PROJECT_ROOT": str(project),
+        }
+    )
+    child_env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
+    label = controller_label or f"isolated-test-{os.getpid()}"
+
+    with patch.dict(os.environ, child_env, clear=True):
+        authority = goalflight_journal.open_or_create_journal(project)
+        principal = goalflight_ledger.process_identity(os.getpid())
+        if principal is None:
+            raise RuntimeError("isolated child controller has no process identity")
+        claimed = authority.claim_or_renew_lease(label, principal=principal)
+        if not claimed.committed or claimed.value is None:
+            raise AssertionError(
+                f"isolated child controller lease failed: {claimed.reason}"
+            )
+        holder = goalflight_wake.register_lease_holder(
+            project,
+            controller_label=label,
+            lease_nonce=claimed.value.nonce,
+        )
+        child_env.update(
+            {
+                "GOALFLIGHT_CONTROLLER_LABEL": label,
+                "GOALFLIGHT_CONTROLLER_PID": str(os.getpid()),
+                "GOALFLIGHT_CONTROLLER_LEASE_NONCE": claimed.value.nonce,
+            }
+        )
+        os.environ.update(child_env)
+        try:
+            yield child_env
+        finally:
+            holder.close()
+
+
 @lru_cache(maxsize=None)
 def _module_tree(test: Path) -> ast.Module:
     return ast.parse(test.read_text(encoding="utf-8"), filename=str(test))
@@ -168,6 +225,25 @@ def acp_sdk_unavailable_reason(interpreter: str) -> str | None:
         f"exit {probe.returncode}",
     )
     return f"interpreter {path} cannot import acp and pydantic: {detail}"
+
+
+def ensure_acp_test_interpreter(test_name: str) -> None:
+    """Run an ACP SDK test with the configured interpreter when needed."""
+    import goalflight_acp_client
+
+    resolution = goalflight_acp_client.acp_sdk_resolution()
+    if resolution.state == goalflight_acp_client.ACP_SDK_IMPORTABLE:
+        return
+    if (
+        resolution.state == goalflight_acp_client.ACP_SDK_REEXEC
+        and resolution.target_python
+    ):
+        os.execv(resolution.target_python, [resolution.target_python, *sys.argv])
+    print(
+        f"SKIP: {test_name}: ACP SDK requirement unsatisfied: "
+        f"{resolution.reason}"
+    )
+    raise SystemExit(0)
 
 
 def _current_test_name() -> str:

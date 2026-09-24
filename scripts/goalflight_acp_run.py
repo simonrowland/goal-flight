@@ -2545,6 +2545,37 @@ async def _run_acp_dispatch_impl(
             write_status(status_path, payload)
 
     write_status(status_path, payload)
+    allow_patterns_raw = getattr(cfg, "permission_allow_tool_title_pattern", None) or []
+    _compiled_patterns: list[Any] = []
+    _allow_pattern_error: _re.error | None = None
+    if allow_patterns_raw:
+        try:
+            _compiled_patterns = [_re.compile(p) for p in allow_patterns_raw]
+        except _re.error as exc:
+            _allow_pattern_error = exc
+        else:
+            # Warn before any adapter, sandbox, capacity, or ledger path can
+            # return early. This is an operator-facing startup warning, not a
+            # post-launch permission-policy detail.
+            sentinel_titles = (
+                "read foo.txt", "edit bar.py", "search docs", "run ls",
+            )
+            broad = [
+                raw
+                for raw, compiled in zip(allow_patterns_raw, _compiled_patterns)
+                if all(compiled.search(title) for title in sentinel_titles)
+            ]
+            if broad and requested_os_sandbox in ("off", "none", "host-default"):
+                sys.stderr.write(
+                    "goalflight_acp_run: WARNING — broad title-allow pattern(s) "
+                    f"{broad!r} with --os-sandbox=off. Execute/fetch tool calls "
+                    "will still escalate (hard gate). Either pair with "
+                    "--os-sandbox=read-only (workers get auto-allow on "
+                    "execute/fetch via sandbox backstop) or scope patterns more "
+                    "precisely. See scripts/goalflight_acp_run.py "
+                    "make_title_allow_policy docstring.\n"
+                )
+                sys.stderr.flush()
     if registration_error is not None:
         payload.update(
             state="blocked_controller_registration",
@@ -4324,10 +4355,10 @@ async def _run_acp_dispatch_impl(
         # scope-aware policy. Otherwise leave permission_policy=None (the worker
         # uses default_permission_policy via the client).
         spawn_os_sandbox_profile = os_sandbox_profile
-        allow_patterns_raw = getattr(cfg, "permission_allow_tool_title_pattern", None) or []
         if allow_patterns_raw:
             try:
-                _compiled_patterns = [_re.compile(p) for p in allow_patterns_raw]
+                if _allow_pattern_error is not None:
+                    raise _allow_pattern_error
                 # Sweep B P1 follow-up: wire the sandbox-aware base into the
                 # title-allow policy. The client's spawn path only installs
                 # permission_policy_for_dispatch when permission_policy is
@@ -4353,35 +4384,6 @@ async def _run_acp_dispatch_impl(
                 _err = {"code": -1, "message": f"invalid --permission-allow-tool-title-pattern: {exc}"}
                 await update_status(state="failed", error=_err)
                 return {"state": "failed", "error": _err}
-            # Broad-pattern + sandbox-off audit warning: even with the
-            # post-fix layering (sweep B P1), execute/fetch escalate when
-            # sandbox is off. A `.*` pattern paired with sandbox-off means
-            # workers needing execute/fetch will block on every tool call.
-            # Warn the operator at startup so they know to add --os-sandbox
-            # read-only (or scope patterns more precisely).
-            # Reuse policy_os_sandbox_profile from base-policy wiring above.
-            # Broaden the "broad pattern" detection beyond exact strings:
-            # any pattern that matches an arbitrary string of safe-titles
-            # qualifies. Probe by compiling and searching against representative
-            # benign titles; if ALL match, treat as broad.
-            sentinel_titles = (
-                "read foo.txt", "edit bar.py", "search docs", "run ls",
-            )
-            broad: list[str] = []
-            for raw, compiled in zip(allow_patterns_raw, _compiled_patterns):
-                if all(compiled.search(t) for t in sentinel_titles):
-                    broad.append(raw)
-            if broad and policy_os_sandbox_profile in ("off", "none", "host-default"):
-                import sys as _sys
-                _sys.stderr.write(
-                    "goalflight_acp_run: WARNING — broad title-allow pattern(s) "
-                    f"{broad!r} with --os-sandbox=off. Execute/fetch tool calls "
-                    "will still escalate (hard gate). Either pair with "
-                    "--os-sandbox=read-only (workers get auto-allow on "
-                    "execute/fetch via sandbox backstop) or scope patterns more "
-                    "precisely. See scripts/goalflight_acp_run.py "
-                    "make_title_allow_policy docstring.\n"
-                )
         else:
             permission_policy = None
         if sandbox_fallback is not None:

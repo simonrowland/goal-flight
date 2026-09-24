@@ -154,7 +154,6 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
     tmp_path: Path,
 ) -> None:
     project, _authority = _quiesced_journal(monkeypatch, tmp_path)
-
     def unavailable_connect(
         database: str | Path,
         *,
