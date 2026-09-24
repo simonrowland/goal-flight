@@ -815,8 +815,11 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
 
             snapshot_ready = threading.Event()
             release_snapshot = threading.Event()
+            cas_ready = threading.Event()
+            release_cas = threading.Event()
             captured: dict[str, object] = {}
             original_peek = goalflight_journal.Journal.cursor_peek
+            original_advance = goalflight_journal.Journal.advance_cursor
 
             def blocked_peek(self, *args, **kwargs):
                 snapshot = original_peek(self, *args, **kwargs)
@@ -826,6 +829,12 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                     assert release_snapshot.wait(5), "drain race snapshot was not released"
                 return snapshot
 
+            def blocked_advance(self, *args, **kwargs):
+                if threading.current_thread().name == "drain-race-cli":
+                    cas_ready.set()
+                    assert release_cas.wait(5), "drain race CAS was not released"
+                return original_advance(self, *args, **kwargs)
+
             stdout = io.StringIO()
             stderr = io.StringIO()
             outcome: dict[str, int] = {}
@@ -834,7 +843,14 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     outcome["rc"] = _carrier_messages.main(argv)
 
-            with mock.patch.object(goalflight_journal.Journal, "cursor_peek", blocked_peek):
+            with (
+                mock.patch.object(goalflight_journal.Journal, "cursor_peek", blocked_peek),
+                mock.patch.object(
+                    goalflight_journal.Journal,
+                    "advance_cursor",
+                    blocked_advance,
+                ),
+            ):
                 worker = threading.Thread(target=drain, name="drain-race-cli")
                 worker.start()
                 assert_true("drain captured its snapshot", snapshot_ready.wait(5))
@@ -850,6 +866,8 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 )
                 assert_true("concurrent cursor advance committed", advanced.committed)
                 release_snapshot.set()
+                assert_true("drain reached its CAS", cas_ready.wait(5))
+                release_cas.set()
                 worker.join(timeout=5)
                 assert_true("drain race thread exited", not worker.is_alive())
 
