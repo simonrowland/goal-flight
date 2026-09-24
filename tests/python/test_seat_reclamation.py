@@ -300,11 +300,9 @@ def test_quarantine_refuses_clean_filter_bytes(holder):
     assert _git(path, "branch", "--show-current") == "worktree/old"
 
 
-@pytest.mark.parametrize("object_present", [True, False])
-def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present):
-    repo, path, row = holder
-    payload = path / "valuable.dat"
-    payload_bytes = b"smudged bytes\n"
+def _add_clean_lfs_file(
+    path: Path, tmp_path: Path, filename: str, payload_bytes: bytes
+) -> Path:
     payload_oid = hashlib.sha256(payload_bytes).hexdigest()
     clean_filter = tmp_path / "lfs-clean.py"
     clean_filter.write_text(
@@ -326,21 +324,31 @@ def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present)
     _git(path, "config", "filter.lfs.clean", f"{sys.executable} {clean_filter}")
     _git(path, "config", "filter.lfs.smudge", f"{sys.executable} {smudge_filter}")
     _git(path, "config", "filter.lfs.required", "true")
-    payload.write_bytes(payload_bytes)
-    _git(path, "add", ".gitattributes", "valuable.dat")
+    (path / filename).write_bytes(payload_bytes)
+    _git(path, "add", ".gitattributes", filename)
     _git(path, "commit", "-m", "track filtered file")
-    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
     common = Path(_git(path, "rev-parse", "--git-common-dir"))
     if not common.is_absolute():
         common = (path / common).resolve()
     lfs_object = common / "lfs" / "objects" / payload_oid[:2] / payload_oid[2:4] / payload_oid
+    lfs_object.parent.mkdir(parents=True)
+    lfs_object.write_bytes(payload_bytes)
+    return lfs_object
+
+
+@pytest.mark.parametrize("object_present", [True, False])
+def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present):
+    repo, path, row = holder
+    lfs_object = _add_clean_lfs_file(
+        path, tmp_path, "valuable.dat", b"smudged bytes\n"
+    )
+    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
     if object_present:
-        lfs_object.parent.mkdir(parents=True)
-        lfs_object.write_bytes(payload_bytes)
         with pool.acquire_worktree_seat(repo, "next") as lease:
             assert lease.path == path
-            assert lfs_object.read_bytes() == payload_bytes
+            assert lfs_object.read_bytes() == b"smudged bytes\n"
     else:
+        lfs_object.unlink()
         with pytest.raises(pool.WorktreeSeatResetRefused, match="LFS object"):
             pool.acquire_worktree_seat(repo, "next")
         assert _git(path, "branch", "--show-current") == "worktree/old"
@@ -351,6 +359,45 @@ def test_smudged_clean_filter_seat_is_reusable(holder, tmp_path, object_present)
             "refs/goalflight/keep/old",
             "refs/heads/goalflight/quarantine",
         ) == ""
+
+
+def test_clean_submodule_with_lfs_reuses_seat(holder, tmp_path):
+    repo, path, row = holder
+    subrepo = tmp_path / "subrepo"
+    _git(tmp_path, "init", str(subrepo))
+    _git(subrepo, "config", "user.email", "goalflight-test@example.invalid")
+    _git(subrepo, "config", "user.name", "Goal Flight Test")
+    (subrepo / "tracked.txt").write_text("submodule\n")
+    _git(subrepo, "add", "tracked.txt")
+    _git(subrepo, "commit", "-m", "submodule base")
+    _git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(subrepo),
+        "modules/sub",
+    )
+    _git(repo, "commit", "-m", "add target submodule")
+    _git(
+        path,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(subrepo),
+        "modules/sub",
+    )
+    _git(path, "commit", "-m", "add clean submodule")
+    lfs_object = _add_clean_lfs_file(
+        path, tmp_path, "valuable.dat", b"submodule lfs\n"
+    )
+    assert _git(path, "status", "--porcelain=v1", "--untracked-files=all") == ""
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == path
+        assert lfs_object.read_bytes() == b"submodule lfs\n"
 
 
 def test_quarantine_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatch):

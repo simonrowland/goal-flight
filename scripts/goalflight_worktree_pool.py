@@ -1474,11 +1474,22 @@ def _tree_blob_ids(cwd: Path, treeish: str) -> dict[str, str]:
             continue
         metadata, separator, path = entry.partition("\t")
         fields = metadata.split()
-        if not separator or len(fields) != 3 or fields[1] != "blob":
+        if not separator or len(fields) != 3:
             raise WorktreeSeatResetRefused(
                 f"malformed tree entry for {treeish}; refusing reset"
             )
-        blobs[path] = fields[2]
+        mode, entry_type, blob_id = fields
+        if entry_type == "commit":
+            if mode != "160000":
+                raise WorktreeSeatResetRefused(
+                    f"malformed gitlink entry for {treeish}; refusing reset"
+                )
+            continue
+        if entry_type != "blob" or mode == "160000":
+            raise WorktreeSeatResetRefused(
+                f"malformed tree entry for {treeish}; refusing reset"
+            )
+        blobs[path] = blob_id
     return blobs
 
 
