@@ -4395,11 +4395,11 @@ async def _run_acp_dispatch_impl(
 
         try:
             async with StartupGate(cfg.agent):
+                goalflight_dispatch._revalidate_read_only_resume_worktree(cfg)
                 if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
                     raise RuntimeError(
                         f"capacity lease {lease_id} lost before worker spawn"
                     )
-                goalflight_dispatch._revalidate_read_only_resume_worktree(cfg)
                 proc, conn = await spawn_and_handshake_with_retry(
                     command,
                     acp_args,

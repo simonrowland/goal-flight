@@ -2323,9 +2323,10 @@ def _revalidate_read_only_resume_worktree(
     args, *, resume_plan: dict | None = None
 ) -> None:
     """Recheck a read-only resume after capacity admission and before spawn."""
+    read_only = bool(getattr(args, "read_only", False)) or _effective_read_only(args)
     if not (
         getattr(args, "parent_dispatch_id", None)
-        and _occupancy_exempt_read_only(args)
+        and read_only
     ):
         return
     if resume_plan is not None:
@@ -22286,10 +22287,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             str(args.dispatch_id),
             worker_argv,
         )
+        _revalidate_read_only_resume_worktree(args, resume_plan=resume_plan)
         _mark_queue_claim_worker_spawn_intent(args)
         if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
             raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
-        _revalidate_read_only_resume_worktree(args, resume_plan=resume_plan)
         worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,
