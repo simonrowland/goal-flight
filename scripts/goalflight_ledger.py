@@ -1496,10 +1496,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         record["detached"] = True
     if getattr(args, "queue_launch_token", None):
         record["queue_launch_token"] = args.queue_launch_token
-    if (
-        args.state in {"waiting_capacity", "starting", "running"}
-        and not getattr(args, "skip_attempt_prepare", False)
-    ):
+    if args.state in {"waiting_capacity", "starting", "running"}:
         authority = goalflight_journal.open_or_create_journal(args.project_root)
         prepared = authority.prepare_attempt(
             dispatch_id,

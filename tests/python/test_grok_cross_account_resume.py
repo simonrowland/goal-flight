@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 import goalflight_dispatch as D
+import goalflight_journal as J
 import goalflight_ledger as L
+import goalflight_wake as wake
 
 
 SESSION = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -172,6 +175,74 @@ def test_invalid_grok_target_refuses_before_resume_side_effects(
     assert not (
         D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
     ).exists()
+
+
+def test_resume_foreign_controller_beacon_moves_nothing_or_writes_waiting_row(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _accounts(tmp_path, "old", "new")
+    for account in ("old", "new"):
+        home = Path.home() / ".goal-flight" / "accounts" / account / "grok"
+        (home / ".grok").mkdir(parents=True, exist_ok=True)
+        (home / ".grok" / "auth.json").write_text("token", encoding="utf-8")
+        (home / ".grok" / "config.toml").write_text(
+            '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+        )
+    record = _record(tmp_path, account="old")
+    record.update(
+        {
+            "schema": L.SCHEMA,
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(tmp_path),
+            "controller_label": "recorded-controller",
+            "engine_session_id": SESSION,
+        }
+    )
+    L.write_record(record)
+    source = _session("old", Path(record["worker_cwd"]))
+    prompt = tmp_path / "foreign-beacon.md"
+    prompt.write_text("Continue after the controller restart.\n", encoding="utf-8")
+    child_id = "grok-foreign-beacon-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **_kwargs: account == "old")
+    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **_kwargs: "new")
+    monkeypatch.setattr(D, "_acquire_capacity", lambda *_args, **_kwargs: "lease-foreign")
+    monkeypatch.setattr(D, "_release_capacity", lambda *_args, **_kwargs: None)
+
+    authority = J.open_or_create_journal(tmp_path)
+    principal = L.process_identity(os.getpid())
+    assert principal is not None
+    claimed = authority.claim_or_renew_lease("foreign-controller", principal=principal)
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        tmp_path,
+        controller_label="foreign-controller",
+        lease_nonce=claimed.value.nonce,
+    )
+    try:
+        rc = D._cmd_resume(
+            [
+                record["dispatch_id"],
+                "--prompt-file",
+                str(prompt),
+                "--controller-beacon-pid",
+                str(os.getpid()),
+            ]
+        )
+    finally:
+        holder.close()
+
+    assert rc == 73
+    assert "foreign-controller" in capsys.readouterr().err
+    assert source.is_dir()
+    target = D._seat_session_dir("new", "grok", record["worker_cwd"], SESSION)
+    assert target is None or not target.exists()
+    assert not L.record_path(child_id).exists()
+    assert not (D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json").exists()
 
 
 def test_walled_account_carries_session_to_healthy_account(

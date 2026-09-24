@@ -1627,6 +1627,7 @@ def acquire_worktree_seat(
             *,
             require_ancestor: bool = False,
         ):
+            lock_existed = lock_path.is_file()
             try:
                 lock_fd = os.open(lock_path, flags, 0o600)
             except OSError as exc:
@@ -1653,6 +1654,16 @@ def acquire_worktree_seat(
                     return None
                 seat_name = worktree_path.name
                 prior_dispatch_id = _known_lock_dispatch_id(lock_file)
+                # A present checkout with no readable occupant is not a free
+                # seat. A resume cannot prove whether resetting it would erase
+                # another dispatch's uncommitted work; leave it untouched.
+                # Brand-new slots remain allocatable because they have no
+                # checkout to protect yet.
+                if prior_dispatch_id is None and (
+                    lock_existed or worktree_path.exists()
+                ):
+                    lock_file.close()
+                    return None
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,

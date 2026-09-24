@@ -152,7 +152,11 @@ def _stub_detached_runtime(
 
     def seed_resume_home(*args, **kwargs):
         source_home = Path(args[2])
-        if "dispatch-homes" in source_home.parts and kwargs.get("pre_resolved") is None:
+        if (
+            "dispatch-homes" in source_home.parts
+            and kwargs.get("pre_resolved") is None
+            and not kwargs.get("account")
+        ):
             return str(source_home), "new-seat"
         return original_seed(*args, **kwargs)
 
@@ -739,6 +743,58 @@ def test_cross_account_resume_copies_rollout_out_of_canonical_home(
     assert _tree_snapshot(target_account_home) == target_account_before
 
 
+def test_failed_cross_account_resume_removes_only_its_new_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "codex-failed-home-parent"
+    child_id = "codex-failed-home-child"
+    source, rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="old-seat"
+    )
+    assert rollout is not None
+    _configure_account(tmp_path, "new-seat")
+    target = _dispatch_home(tmp_path, child_id)
+    prompt = tmp_path / "failed-home.md"
+    prompt.write_text("Continue on the new account.\n", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+
+    def resolve(
+        _project_root: Path,
+        explicit_account: str | None,
+        dispatch_id: str,
+    ) -> tuple[str, str]:
+        assert explicit_account == "new-seat"
+        assert dispatch_id == child_id
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "auth.json").write_text("new-seat-login", encoding="utf-8")
+        return str(target), "new-seat"
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(
+        D,
+        "_admit_dispatch_worktree",
+        lambda _args: (_ for _ in ()).throw(
+            WP.WorktreeSeatUnavailable("pre-spawn seat refusal")
+        ),
+    )
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=source,
+            prompt=prompt,
+            session_id=OTHER_CANONICAL_SESSION_ID,
+            account="new-seat",
+        )
+    )
+
+    assert rc == 2
+    assert not target.exists()
+    assert S.rollout_path(source, OTHER_CANONICAL_SESSION_ID) == rollout
+
+
 def test_same_account_canonical_resume_is_unchanged(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -917,11 +973,23 @@ def test_resume_command_reuses_one_effective_account_preflight(
     monkeypatch.setattr(
         D,
         "_codex_seat_api",
-        lambda: SimpleNamespace(resolve_codex_seat=resolve),
+        lambda: SimpleNamespace(
+            resolve_codex_seat=resolve,
+            resolve_codex_account=lambda *_args: "effective-seat",
+        ),
     )
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
     _stub_detached_runtime(monkeypatch)
     monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    capacity_accounts: list[str | None] = []
+    monkeypatch.setattr(
+        D,
+        "_acquire_capacity",
+        lambda args, **_kwargs: capacity_accounts.append(
+            getattr(args, "_capacity_account", None)
+        )
+        or "lease-resume",
+    )
 
     assert D._cmd_resume(
         [
@@ -935,71 +1003,11 @@ def test_resume_command_reuses_one_effective_account_preflight(
     ) == 0
 
     assert calls == [("alias", child_id)]
+    assert capacity_accounts == ["effective-seat"]
     child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
     assert child["effective_account"] == "effective-seat"
     assert child["codex_home"] == str(target)
     assert S.rollout_path(target, SESSION_ID) is not None
-
-
-def test_resume_capacity_uses_resolver_effective_account(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    parent_id = "capacity-effective-parent"
-    child_id = "capacity-effective-child"
-    source = _dispatch_home(tmp_path, parent_id)
-    _write_rollout(source)
-    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
-    record["effective_account"] = "source-account"
-    L.write_record(record)
-    target = _dispatch_home(tmp_path, child_id)
-
-    def resolve_seat(_project_root: str, account: str | None, dispatch_id: str):
-        assert account == "alias"
-        assert dispatch_id == child_id
-        target.mkdir(parents=True, exist_ok=True)
-        return str(target), "effective-seat"
-
-    monkeypatch.setattr(
-        D,
-        "_codex_seat_api",
-        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
-    )
-    args = SimpleNamespace(
-        parent_dispatch_id=parent_id,
-        dispatch_id=child_id,
-        agent="codex",
-        account="alias",
-        model=None,
-        cwd=str(tmp_path),
-        codex_resume_home=str(source),
-        shape="bash",
-        priority="normal",
-        max_idle_secs=300,
-        capacity_wait_s=0,
-        foreground=False,
-        from_queue=False,
-    )
-    D._preflight_resume_codex_account(args)
-    seen: dict[str, str | None] = {}
-
-    def acquire(capacity_args, **_kwargs):
-        seen["account"] = capacity_args.account
-        return {"decision": "allow", "lease": {"lease_id": "effective-lease"}}
-
-    monkeypatch.setattr(D, "_capacity_wait_seconds", lambda _args: 0.0)
-    monkeypatch.setattr(D, "write_status", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(D.goalflight_capacity, "acquire_with_wait", acquire)
-
-    assert (
-        D._acquire_capacity(
-            args,
-            project_root=tmp_path,
-            status_json=tmp_path / "capacity.status.json",
-        )
-        == "effective-lease"
-    )
-    assert seen["account"] == "effective-seat"
 
 
 def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
@@ -1329,13 +1337,13 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "codex-resume-child",
+        "_default_dispatch_id",
+        lambda _agent: "codex-resume-child",
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert D._cmd_resume(
@@ -1462,13 +1470,13 @@ def test_resume_legacy_duplicate_model_flags_keep_last_occurrence(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "legacy-duplicate-child",
+        "_default_dispatch_id",
+        lambda _agent: "legacy-duplicate-child",
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert D._cmd_resume(
@@ -1506,11 +1514,11 @@ def test_resume_explicit_controller_beacon_replaces_recorded_identity(
     prompt = tmp_path / "explicit-controller.md"
     prompt.write_text("Continue.\n", encoding="utf-8")
     captured: list[list[str]] = []
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: "explicit-child")
+    monkeypatch.setattr(D, "_default_dispatch_id", lambda _agent: "explicit-child")
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert D._cmd_resume(
@@ -2668,13 +2676,13 @@ def test_resume_reuses_worktree_and_does_not_mint_a_new_seat(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "wt-resume-child",
+        "_default_dispatch_id",
+        lambda _agent: "wt-resume-child",
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert (
@@ -2759,13 +2767,13 @@ def test_resume_of_quota_exhausted_dispatch_honors_account(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "quota-resume-child",
+        "_default_dispatch_id",
+        lambda _agent: "quota-resume-child",
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert (
@@ -2823,13 +2831,13 @@ def test_resume_of_plan_approval_pause_reuses_worktree(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "plan-resume-child",
+        "_default_dispatch_id",
+        lambda _agent: "plan-resume-child",
     )
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
 
     assert (

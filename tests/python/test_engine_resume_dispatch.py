@@ -242,13 +242,15 @@ def test_resume_verb_passes_grok_lineage(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda agent, _base: f"{agent}-child",
+        "_default_dispatch_id",
+        lambda agent: f"{agent}-child",
     )
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **_kwargs: None)
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
     assert D._cmd_resume(
         [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
@@ -301,13 +303,14 @@ def test_resume_honors_explicit_grok_account(
     captured: list[list[str]] = []
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda agent, _base: f"{agent}-child",
+        "_default_dispatch_id",
+        lambda agent: f"{agent}-child",
     )
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
     monkeypatch.setattr(
         D,
         "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
+        lambda argv=None, **_kwargs: captured.append(list(argv or [])) or 0,
     )
     assert (
         D._cmd_resume(

@@ -345,29 +345,90 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         resumed.release()
 
 
-def test_resume_empty_lock_metadata_is_unknown_and_not_reclaimed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_resume_unknown_lock_refuses_before_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
     repo = _make_repo(tmp_path)
     monkeypatch.chdir(repo)
-    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    parent_id = "resume-unknown-parent"
+    child_id = "resume-unknown-child"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
     seat = parent.path
+    head = _git(repo, "rev-parse", "worktree/resume-unknown-parent")
     parent.release()
     goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).write_text(
         "\n", encoding="utf-8"
     )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "account": "old-seat",
+            "effective_account": "old-seat",
+            "engine_session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": "worktree/resume-unknown-parent",
+            "worktree_head": head,
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+                "--account",
+                "old-seat",
+            ],
+        }
+    )
+    prompt = tmp_path / "resume-unknown.md"
+    prompt.write_text("Continue without resetting the seat.\n", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "_resolve_launch_account_env", lambda _args: {})
+    monkeypatch.setattr(goalflight_dispatch, "_acquire_capacity", lambda *_a, **_k: "lease-unknown")
+    monkeypatch.setattr(goalflight_dispatch, "_release_capacity", lambda *_a, **_k: None)
+    monkeypatch.setattr(goalflight_dispatch, "_stamp_controller_session", lambda *_a, **_k: {})
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_controller_registration",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_reap_quota_stuck_before_bash_launch", lambda: None)
+    monkeypatch.setattr(goalflight_dispatch, "_mark_queue_claim_launch_started", lambda _args: None)
+    monkeypatch.setattr(goalflight_dispatch, "_terminal_worktree_gc", lambda *_a, **_k: None)
 
-    with pytest.raises(
-        goalflight_worktree_pool.WorktreeSeatUnavailable,
-        match="unknown ownership",
-    ):
-        goalflight_worktree_pool.acquire_worktree_seat(
-            repo,
-            "resume-child",
-            occupy_path=seat,
-            expected_prior_dispatch_id="resume-parent",
-        )
+    rc = goalflight_dispatch._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "old-seat",
+            "--unregistered-forced",
+        ]
+    )
+
+    assert rc == 2
+    assert "unknown ownership" in capsys.readouterr().err
+    assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == (
+        "worktree/resume-unknown-parent"
+    )
+    assert (seat / "tracked.txt").read_text(encoding="utf-8") == "base\n"
 
 
 def test_resume_reseats_a_recycled_worktree_on_the_parent_branch(
@@ -573,8 +634,7 @@ def test_resume_recycled_branch_accepts_root_resume_lineage(
     [
         ("cycle", "lineage cycle"),
         ("missing", "missing or unreadable lineage ancestor"),
-        ("different-root", "different project root"),
-        ("wrong-root-branch", "root lineage branch"),
+        ("missing-project-root", "missing a project root"),
     ],
 )
 def test_resume_rejects_inconsistent_lineage(
@@ -585,9 +645,6 @@ def test_resume_rejects_inconsistent_lineage(
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     repo = _make_repo(tmp_path)
-    other_root = tmp_path / "other"
-    other_root.mkdir()
-    other_repo = _make_repo(other_root)
 
     def record(dispatch_id: str, *, parent: str | None = None, root: Path = repo, branch: str | None = None) -> dict:
         value = {
@@ -610,9 +667,11 @@ def test_resume_rejects_inconsistent_lineage(
         goalflight_ledger.write_record(record("lineage-root", parent="lineage-child"))
     elif case == "missing":
         goalflight_ledger.write_record(record("lineage-child", parent="missing"))
-    elif case == "different-root":
+    elif case == "missing-project-root":
         goalflight_ledger.write_record(record("lineage-child", parent="lineage-root"))
-        goalflight_ledger.write_record(record("lineage-root", root=other_repo))
+        root_record = record("lineage-root")
+        root_record.pop("project_root")
+        goalflight_ledger.write_record(root_record)
     else:
         goalflight_ledger.write_record(
             record("lineage-child", parent="lineage-root")
