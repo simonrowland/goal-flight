@@ -1658,6 +1658,14 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
     assert signal.SIGKILL not in signals
 
 
+def test_private_tree_proof_uses_the_recorded_coalition_without_parentage(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 7)
+    state = {"coalition_id": 100, "holder_coalition_id": 5}
+    assert node._private_tree_proof(state, 100, [(99991, (1, 2))]) is True
+
+
 def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
     import goalflight_remote_ci_node as node
 
@@ -1763,6 +1771,13 @@ def test_job_label_is_durable_before_launchctl_submit(tmp_path, monkeypatch):
 
     def fake_run(argv, **kwargs):
         del kwargs
+        if argv[:2] == ["launchctl", "list"]:
+            class Result:
+                returncode = 0
+                stderr = ""
+                stdout = ""
+
+            return Result()
         if argv[:2] == ["launchctl", "submit"]:
             lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
             seen["label"] = lease.get("launch_label")
@@ -1823,6 +1838,23 @@ def test_gate_opens_only_after_the_coalition_is_recorded(tmp_path, monkeypatch):
     assert lease["coalition_id"] == 100
     assert lease["launch_label"] == "com.goalflight.remote-ci.abc"
     assert (run / "workload-go").is_file()
+
+
+def test_exited_job_without_holder_proof_can_release_an_empty_tree(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: ("exited", None, 19))
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    assert node.clear_tree(tmp_path, state, run) is True
+    assert state["exit_code"] == 19
+    assert state["exit_known"] is True
 
 
 def test_gate_stays_closed_without_a_durable_coalition_id(tmp_path, monkeypatch):

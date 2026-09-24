@@ -541,6 +541,28 @@ class CommandResult:
     timed_out: bool = False
 
 
+def _signal_process_group(
+    process: subprocess.Popen[Any], pgid: int, sig: signal.Signals
+) -> None:
+    """Signal the process's original group, never a reused numeric group id."""
+    if process.poll() is None:
+        try:
+            if os.getpgid(process.pid) != pgid:
+                return
+        except OSError:
+            return
+    else:
+        # A timed-out communicate means a descendant can still hold a pipe
+        # after the leader exits. The group must still exist in that case;
+        # while it has a member, its id cannot be reused by another session.
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+    with contextlib.suppress(OSError):
+        os.killpg(pgid, sig)
+
+
 def run_command(
     argv: Sequence[str],
     *,
@@ -565,15 +587,17 @@ def run_command(
     except OSError as exc:
         raise RemoteCIError(f"configured command could not start: {argv[0] if argv else '<empty>'}: {exc}") from exc
     try:
+        process_group = os.getpgid(process.pid)
+    except OSError:
+        process_group = process.pid
+    try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+        _signal_process_group(process, process_group, signal.SIGTERM)
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
+            _signal_process_group(process, process_group, signal.SIGKILL)
             stdout, stderr = process.communicate()
         return CommandResult(
             124,
