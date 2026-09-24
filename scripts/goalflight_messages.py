@@ -7813,11 +7813,12 @@ def cmd_follow(args) -> int:
                 # would spin forever against a deleted journal.
                 return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalIOError as exc:
-                # Fatal on purpose. JournalIOError has two origins: an immediate
-                # path.stat() OSError that prevents identity/disappearance
-                # verification, or exhausted 75s present-path open retries.
-                # Neither is SQLite contention, so only JournalBusy enters the
-                # listener tolerance below.
+                # Fatal on purpose. JournalIOError has three relevant origins:
+                # an immediate path.stat() OSError that prevents
+                # identity/disappearance verification, an immediate verified
+                # permission denial during journal open, or exhausted 75s
+                # present-path open retries. Neither is SQLite contention, so
+                # only JournalBusy enters the listener tolerance below.
                 return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalBusy as exc:
                 first = not journal_tolerance.degraded
@@ -8113,7 +8114,8 @@ def _cmd_watch_follow(
             ):
                 # Fatal via the outer handler: verified absence never recovers
                 # in place. JournalIOError is either an immediate identity/stat
-                # I/O failure or exhausted present-path open retries; neither
+                # I/O failure, an immediate verified permission denial during
+                # journal open, or exhausted present-path open retries; neither
                 # is SQLite contention.
                 raise
             except goalflight_journal.JournalBusy as exc:
@@ -9362,7 +9364,8 @@ def cmd_listen(args) -> int:
             )
         except goalflight_journal.JournalIOError as exc:
             # Fatal on purpose. This is either immediate path identity/stat I/O
-            # failure or exhausted present-path open retries; neither is busy.
+            # failure, an immediate verified permission denial during journal
+            # open, or exhausted present-path open retries; neither is busy.
             return finish(
                 _journal_failure_reason(exc),
                 code=2,
