@@ -85,6 +85,7 @@ import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_fleet_billing
 import goalflight_fs
+import goalflight_messages
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -9879,11 +9880,11 @@ def _read_capacity_state_for_reconciliation() -> dict:
 def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
     """Read status evidence, treating every unreadable case as indeterminate.
 
-    Returns ``(payload, evidence)``. **Every failure returns ``None``, and
-    ``None`` vetoes reconciliation** at the caller (``status_indeterminate``).
-    That includes a recorded ``status_path`` whose file is missing:
-    never-created, write-failed and unlinked are indistinguishable from here,
-    so absence is "could not tell", never proof the dispatch is closable.
+    Returns ``(payload, evidence)``. Every failure returns ``None``. The
+    caller normally treats that as ``status_indeterminate``; a dispatch-bound
+    terminal marker may override it only after the worker identity is proven
+    dead. That includes a recorded ``status_path`` whose file is missing:
+    absence alone is "could not tell", never proof the dispatch is closable.
 
     Only a payload that reads, parses, and names this same ``dispatch_id`` is
     returned as evidence.
@@ -10111,6 +10112,14 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
     return True, ",".join(evidence)
 
 
+def _abandoned_worker_pid_present(record: dict, status: dict) -> bool:
+    """Require a recorded worker pid before trusting a terminal tail marker."""
+    return any(
+        value not in (None, "") and not isinstance(value, bool)
+        for value in (record.get("worker_pid"), status.get("worker_pid"))
+    )
+
+
 def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool, str]:
     leases = capacity_state.get("leases")
     if not isinstance(leases, dict):
@@ -10235,7 +10244,14 @@ def _evaluate_abandoned_dispatch(
         }
 
     status, status_evidence = _abandoned_status_payload(record)
+    terminal_marker = None
     if status is None:
+        # A dead worker's dispatch-bound terminal marker is stronger than a
+        # missing or stale status mirror. The ledger row and tail are the
+        # durable evidence left when the foreground launcher dies before the
+        # watcher can publish its sidecar.
+        _marker_state, _marker_reason, terminal_marker = _abandoned_terminal_outcome(record)
+    if status is None and terminal_marker is None:
         return {
             **result,
             "eligible": False,
@@ -10250,13 +10266,20 @@ def _evaluate_abandoned_dispatch(
             "reason": "output_indeterminate",
             "output_evidence": output_evidence,
         }
-    process_inactive, process_evidence = _abandoned_process_evidence(record, status)
+    process_inactive, process_evidence = _abandoned_process_evidence(record, status or {})
     if not process_inactive:
         return {
             **result,
             "eligible": False,
             "reason": "worker_live_or_indeterminate",
             "process_evidence": process_evidence,
+        }
+    if terminal_marker is not None and not _abandoned_worker_pid_present(record, status or {}):
+        return {
+            **result,
+            "eligible": False,
+            "reason": "worker_identity_indeterminate",
+            "process_evidence": "worker_identity_absent",
         }
     lease_inactive, lease_evidence = _abandoned_lease_evidence(record, capacity_state)
     if not lease_inactive:
@@ -10268,6 +10291,9 @@ def _evaluate_abandoned_dispatch(
         }
     controller_inactive, controller_evidence = _abandoned_controller_evidence(record)
     if not controller_inactive:
+        if terminal_marker is None:
+            _marker_state, _marker_reason, terminal_marker = _abandoned_terminal_outcome(record)
+    if not controller_inactive and terminal_marker is None:
         held = {
             **result,
             "eligible": False,
@@ -10282,7 +10308,7 @@ def _evaluate_abandoned_dispatch(
         if controller_evidence == "controller_indeterminate":
             held["detail"] = _abandoned_controller_indeterminate_unlock(record)
         return held
-    latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status)
+    latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status or {})
     if latest_progress_s is None:
         return {**result, "eligible": False, "reason": "progress_time_indeterminate"}
     progress_age_s = now_s - latest_progress_s
@@ -10307,6 +10333,9 @@ def _evaluate_abandoned_dispatch(
         "output_evidence": output_evidence,
         "lease_evidence": lease_evidence,
         "controller_evidence": controller_evidence,
+        "terminal_marker_evidence": (
+            terminal_marker.get("kind") if isinstance(terminal_marker, dict) else None
+        ),
         "progress_age_s": round(progress_age_s, 3),
         "progress_fingerprint": progress_fingerprint,
     }
@@ -10495,7 +10524,19 @@ def reconcile_abandoned_dispatches(
                         continue
                     state, reason, marker = _abandoned_terminal_outcome(fresh)
                     post_status, post_status_evidence = _abandoned_status_payload(fresh)
-                    if post_status is None:
+                    if marker is not None and not _abandoned_worker_pid_present(
+                        fresh, post_status or {}
+                    ):
+                        entries.append(
+                            {
+                                **final_evaluation,
+                                "eligible": False,
+                                "reason": "worker_identity_indeterminate",
+                                "process_evidence": "worker_identity_absent",
+                            }
+                        )
+                        continue
+                    if post_status is None and marker is None:
                         entries.append(
                             {
                                 **final_evaluation,
@@ -10505,6 +10546,7 @@ def reconcile_abandoned_dispatches(
                             }
                         )
                         continue
+                    post_status = post_status or {}
                     _post_progress_s, post_fingerprint = _abandoned_progress_snapshot(
                         fresh, post_status
                     )
@@ -10581,6 +10623,17 @@ def reconcile_abandoned_dispatches(
     for project_root in changed_projects:
         _export_dashboard_status_for_project(project_root)
     if not dry_run:
+        # Terminal authority and its result event are one durable journal
+        # transition, but the inbox is a derived projection. Reuse the
+        # existing journal outbox projector so a launcher-death recovery
+        # publishes the event exactly once even when the watcher never got
+        # that far.
+        for project_root in changed_projects:
+            with contextlib.suppress(Exception):
+                authority = goalflight_journal.open_or_create_journal(project_root)
+                authority.project_terminal_outbox(
+                    messages_dir=goalflight_messages.default_messages_dir()
+                )
         goalflight_cursor.cleanup_dispatch_data()
     closed = [entry for entry in entries if entry.get("action") == "closed"]
     would_close = [entry for entry in entries if entry.get("action") == "would_close"]
@@ -20929,7 +20982,10 @@ def main(argv: list[str] | None = None) -> int:
             worker_cwd=_worker_cwd(args),
             task_ids=getattr(args, "task_ids", None),
             worker_identity=worker_identity_token,
-            launch_detached=bool(args.launch_detached),
+            # Implicit background mode is detached too. Keep the watcher's
+            # controller-death policy aligned with the launcher's actual
+            # lifetime, for both seat and read-only dispatches.
+            launch_detached=background_launch,
             codex_dispatch_home=codex_dispatch_home,
             codex_session_id=codex_session_id,
             engine_session_id=engine_session_id,
@@ -20953,7 +21009,7 @@ def main(argv: list[str] | None = None) -> int:
                     codex_session_id=codex_session_id,
                 ),
                 "worker_pid": worker_pid,
-                "detached": bool(args.launch_detached),
+                "detached": background_launch,
                 "pgid": pgid,
                 "worker_alive": True,
                 "worker_identity": worker_identity_token,

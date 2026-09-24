@@ -21,6 +21,7 @@ import json
 import contextlib
 import io
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -36,6 +37,7 @@ WATCH = ROOT / "scripts" / "goalflight_watch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client  # noqa: E402
+import goalflight_messages  # noqa: E402
 import goalflight_rate_pressure  # noqa: E402
 import goalflight_watch  # noqa: E402
 
@@ -59,6 +61,8 @@ def _isolate_state_env(env: dict[str, str], base: Path) -> None:
         "GOALFLIGHT_CONTROLLER_SESSION_ID",
         "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
         "GOALFLIGHT_CONTROLLER_PID",
+        "GOALFLIGHT_WORKTREE_LOCK_FD",
+        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
     ):
         env.pop(key, None)
     env["GOALFLIGHT_STATE_DIR"] = str(base / "state")
@@ -1248,6 +1252,166 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
                 _observe_process_exit(proc)
 
 
+def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> None:
+    """HOST-ONLY: temp-repo regression for kill-after-DISPATCH-LAUNCHED."""
+    with tempfile.TemporaryDirectory(dir=ROOT, prefix=".goalflight-host-") as tmp:
+        tmp_path = Path(tmp)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Goal Flight Test"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        (repo / "README").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "README"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        tail = tmp_path / "dispatch.tail"
+        status = tmp_path / "dispatch.status.json"
+        started = tmp_path / "started"
+        done = tmp_path / "done"
+        dispatch_id = "background-group-kill"
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+        env["GOALFLIGHT_TEST_MODE"] = "1"
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        worker_code = (
+            "import pathlib, time\n"
+            f"pathlib.Path({str(started)!r}).write_text('started')\n"
+            f"print('!COMPLETE: {dispatch_id} — code done', flush=True)\n"
+            "time.sleep(0.5)\n"
+            f"pathlib.Path({str(done)!r}).write_text('done')\n"
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--unregistered-forced",
+                "--cwd",
+                str(repo),
+                "--in-place",
+                "--read-only",
+                "--agent",
+                "test",
+                "--tail",
+                str(tail),
+                "--status-json",
+                str(status),
+                "--dispatch-id",
+                dispatch_id,
+                "--poll-secs",
+                "0.1",
+                "--max-idle-secs",
+                "10",
+                "--",
+                sys.executable,
+                "-c",
+                worker_code,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            launch_line = ""
+            observed_lines: list[str] = []
+            deadline = time.monotonic() + _EVENT_HANG_CEILING_SECS
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], min(_EVENT_POLL_SECS, deadline - time.monotonic())
+                )
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                observed_lines.append(line.rstrip())
+                if line.startswith("DISPATCH-LAUNCHED "):
+                    launch_line = line
+                    break
+            if not launch_line:
+                stderr = ""
+                if proc.poll() is not None:
+                    _out, stderr = proc.communicate()
+                raise AssertionError(
+                    "dispatcher did not publish DISPATCH-LAUNCHED; "
+                    f"stdout={observed_lines!r}; stderr={stderr!r}; rc={proc.poll()!r}"
+                )
+            assert proc.poll() is None, "dispatcher exited before the kill"
+            os.killpg(proc.pid, signal.SIGTERM)
+            _observe_process_exit(proc, expected_returncode=-signal.SIGTERM)
+
+            assert _wait_for(done.exists), "worker died with launcher process group"
+
+            def _terminal_state() -> str | None:
+                try:
+                    return json.loads(status.read_text(encoding="utf-8")).get("state")
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return None
+
+            assert _wait_for(lambda: _terminal_state() == "complete"), (
+                status.read_text(encoding="utf-8") if status.exists() else "missing status"
+            )
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("detached") is True, payload
+            ledger_path = (
+                Path(env["GOALFLIGHT_STATE_DIR"])
+                / "runs.d"
+                / f"{dispatch_id}.json"
+            )
+            assert _wait_for(
+                lambda: ledger_path.exists()
+                and json.loads(ledger_path.read_text(encoding="utf-8")).get("state")
+                == "complete"
+            ), "watcher did not settle the ledger"
+            inbox = goalflight_messages.inbox_path(
+                Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id
+            )
+
+            def _result_count() -> int:
+                try:
+                    return len(goalflight_messages.read_envelopes(inbox))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return 0
+
+            assert _wait_for(
+                lambda: _result_count() == 1
+            ), "watcher did not publish exactly one result event"
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                _observe_process_exit(proc)
+
+
 def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -1535,6 +1699,7 @@ def main() -> None:
     case_shared_cwd_complete_then_hang_is_inconclusive()
     case_dispatch_post_terminal_idle_returns_inconclusive()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()
+    case_host_only_background_dispatch_survives_launcher_pgroup_sigterm()
     case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running()
     case_watcher_sigterm_flushes_non_running_status()
     case_detached_watcher_ignores_dead_controller_pid()
