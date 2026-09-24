@@ -747,6 +747,8 @@ def test_json_cli_shape_and_unavailable_exit_zero(
     tmp_path: Path, capsys, monkeypatch
 ):
     monkeypatch.setattr(usage, "PACKAGE_READERS_DIR", tmp_path / "empty-package")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
     _write_reader(
         tmp_path,
         "codex_usage.py",
@@ -757,7 +759,8 @@ def test_json_cli_shape_and_unavailable_exit_zero(
     )
 
     assert usage.main(["--json", "--readers-dir", str(tmp_path)]) == 0
-    rows = json.loads(capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
+    rows = payload["rows"]
 
     # One row per registered reader; derived, so adding a provider does not
     # fail this test for the wrong reason.
@@ -771,6 +774,11 @@ def test_json_cli_shape_and_unavailable_exit_zero(
     # Every reader but the one written above is absent, so each degrades to a
     # single unavailable row rather than vanishing from the table.
     assert all(row["flags"] == ["unavailable"] for row in rows[1:])
+    assert set(payload["live_workers_by_model"]) == {
+        "total",
+        "unverified_total",
+        "models",
+    }
 
 
 def test_table_renders_health_flags():

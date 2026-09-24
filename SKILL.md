@@ -149,6 +149,7 @@ Mail is journal-assigned, not a private file: `relay --new` peeks without acknow
 | `/goal-flight resume` | `commands/resume.md` | `session-preflight`, `state-handoff` |
 | `/goal-flight goal <SLUG>` | `commands/goal.md` | none |
 | `/goal-flight usage` | `commands/usage.md` | none |
+| `/goal-flight traffic` | `commands/traffic.md` | none |
 | `/goal-flight register-codex [<path>]` | `commands/register-codex.md` | `tool-readiness` |
 | `/goal-flight update` | `commands/update.md` | `tool-readiness` |
 | `/goal-flight validate-dispatch [<slug>]` | `commands/validate-dispatch.md` | `dispatch-routing`, `worker-markers` |

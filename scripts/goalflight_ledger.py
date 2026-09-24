@@ -371,7 +371,14 @@ def compare_fine_process_identities(
     return compare_process_identities(pid, expected_identity, current_identity)
 
 
-def identity_matches(record: dict) -> tuple[bool, str]:
+_IDENTITY_UNSET = object()
+
+
+def identity_matches(
+    record: dict,
+    *,
+    current_identity: object = _IDENTITY_UNSET,
+) -> tuple[bool, str]:
     pid = (
         record.get("worker_pid")
         or record.get("claimant_pid")
@@ -379,7 +386,11 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     )
     if not pid:
         return False, "no_pid"
-    current = process_identity(int(pid))
+    current = (
+        process_identity(int(pid))
+        if current_identity is _IDENTITY_UNSET
+        else current_identity
+    )
     if current is None:
         return False, "dead"
     prior = (
@@ -419,7 +430,11 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     return False, reason
 
 
-def worker_identity_liveness(record: dict) -> tuple[str, str]:
+def worker_identity_liveness(
+    record: dict,
+    *,
+    current_identity: object = _IDENTITY_UNSET,
+) -> tuple[str, str]:
     """Three-state worker liveness: ``live`` / ``dead`` / ``unknown``, plus reason.
 
     A missing fine-grained start token is genuinely indeterminate and maps to
@@ -427,7 +442,7 @@ def worker_identity_liveness(record: dict) -> tuple[str, str]:
     different process (``pid_reused_*``) is ``dead``: the recorded worker is
     gone even though the PID number survives.
     """
-    matched, reason = identity_matches(record)
+    matched, reason = identity_matches(record, current_identity=current_identity)
     if reason in {"no_pid", "identity_indeterminate"}:
         return "unknown", reason
     if matched:
@@ -1441,6 +1456,9 @@ def cmd_record(args: argparse.Namespace) -> int:
         "started_at": utc_now(),
         "hostname": socket.gethostname(),
     }
+    model = getattr(args, "model", None)
+    if isinstance(model, str) and model.strip():
+        record["model"] = model.strip()
     effective_account = getattr(args, "effective_account", None)
     if effective_account:
         record["effective_account"] = effective_account

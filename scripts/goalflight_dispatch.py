@@ -4254,6 +4254,8 @@ def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
         "status_path": str(status_path),
         "updated_at": int(time.time()),
     }
+    if getattr(args, "model", None):
+        payload["model"] = str(args.model)
     write_status(status_path, payload)
     return payload, status_path
 
@@ -5346,6 +5348,15 @@ def _dispatch_argv_from_record(record: dict) -> list[str]:
     return []
 
 
+def _resume_model_from_record(record: dict) -> str | None:
+    recorded = record.get("model")
+    if isinstance(recorded, str) and recorded.strip():
+        return recorded.strip()
+    return _option_value_before_worker_remainder(
+        _dispatch_argv_from_record(record), "--model"
+    )
+
+
 def _resume_cwd_from_record(record: dict) -> Path | None:
     envelope = (
         record.get("request_envelope")
@@ -5402,7 +5413,9 @@ def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
     )
 
 
-def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
+def _synthesize_resume_base_argv(
+    source: dict, *, cwd: Path, model: str | None = None
+) -> list[str]:
     """Fallback when an older record never stored dispatch_argv."""
     record = source["record"]
     shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
@@ -5414,6 +5427,10 @@ def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
         "--cwd",
         str(cwd),
     ]
+    if model is None:
+        model = _resume_model_from_record(record)
+    if model:
+        argv += ["--model", model]
     posture = record.get("os_sandbox")
     requested = None
     if isinstance(posture, dict):
@@ -5447,11 +5464,14 @@ def _resume_launch_argv(
     resume_args,
 ) -> list[str]:
     record = source["record"]
+    resume_model = _resume_model_from_record(record)
     recorded = _dispatch_argv_from_record(record)
     cwd = _resume_worker_cwd(
         record, override=getattr(resume_args, "cwd", None)
     )
-    base = recorded or _synthesize_resume_base_argv(source, cwd=cwd)
+    base = recorded or _synthesize_resume_base_argv(
+        source, cwd=cwd, model=resume_model
+    )
     replace = {
         "--dispatch-id": child_dispatch_id,
         "--prompt-file": str(prompt_path),
@@ -5506,7 +5526,6 @@ def _resume_launch_argv(
         # registry and fail 404, losing the whole context. So: choose a seat
         # that can actually run, then MOVE the session to it.
         configured = set(_configured_account_names(engine))
-        resume_model = record.get("model")
         target = requested or owner_account
         if not requested and owner_account:
             owner_healthy = (
@@ -7594,6 +7613,9 @@ def _prelaunch_status_metadata(
         "controller_pid": _controller_pid(args),
         "controller_label": _controller_label(args),
     }
+    model = getattr(args, "model", None)
+    if model:
+        metadata["model"] = str(model)
     worktree_id = getattr(args, "_worktree_id", None)
     worktree_path = getattr(args, "_worktree_path", None)
     if worktree_id:
@@ -7832,6 +7854,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     prompt_path=prompt_path,
                     task_ids=getattr(args, "task_ids", []),
                     agent=args.agent,
+                    model=getattr(args, "model", None),
                     engine=_account_engine(args.agent) or args.agent,
                     shape=args.shape,
                     account=args.account or "default",

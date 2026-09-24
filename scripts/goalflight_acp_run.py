@@ -666,6 +666,7 @@ def _record_acp_ledger_state(
                     prompt_path=cfg.prompt or getattr(cfg, "original_prompt_file", None),
                     task_ids=getattr(cfg, "task_ids", []),
                     agent=cfg.agent,
+                    model=getattr(cfg, "model", None),
                     engine=goalflight_ledger.infer_engine(cfg.agent),
                     shape="acp",
                     account=getattr(cfg, "account", None) or "default",
@@ -2466,6 +2467,7 @@ async def _run_acp_dispatch_impl(
         "steer_mid_turn_delivery": "deferred",
         "lease_id": None,
         "agent": cfg.agent,
+        "model": getattr(cfg, "model", None),
         "priority": getattr(cfg, "priority", "normal"),
         "session_id": cfg.session_id,
         "resume_mode": getattr(cfg, "resume_mode", None),
@@ -5208,6 +5210,7 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
         "worker_still_alive": False,
         "status_path": str(status_path),
         "updated_at": _now(),
+        "model": getattr(args, "model", None),
     }
     _commit_prelaunch_terminal(payload, project_root=project_root)
     write_status(status_path, payload)

@@ -255,6 +255,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
     args = SimpleNamespace(
         dispatch_id="grok-child",
         agent="grok-code",
+        model="gpt-5.6-sol",
         shape="bash",
         controller_session_id=None,
         controller_pid=None,
@@ -270,6 +271,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
         codex_home_owner_dispatch_id=None,
     )
     metadata = D._prelaunch_status_metadata(args)
+    assert metadata["model"] == "gpt-5.6-sol"
     assert metadata["resume_mode"] == "reconstructed"
     watcher = D._watcher_spawn_argv(
         worker_pid=123,
