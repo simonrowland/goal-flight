@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -37,6 +38,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_os_sandbox as S  # noqa: E402
+import goalflight_steer_mailbox as steer  # noqa: E402
 
 
 def _args(**over):
@@ -187,6 +189,7 @@ def test_grok_read_only_profile_fences_project_and_allows_account_state() -> Non
         steer_file.touch()
         steer_lock = steer_file.with_name(f".{steer_file.name}.lock")
         steer_receipts = steer_file.with_name(f"{steer_file.stem}.receipts.jsonl")
+        steer_receipts_lock = steer_receipts.with_name(f".{steer_receipts.name}.lock")
         environment = {
             "HOME": str(account_home),
             "XDG_CONFIG_HOME": str(account_home / ".config"),
@@ -213,6 +216,7 @@ def test_grok_read_only_profile_fences_project_and_allows_account_state() -> Non
             steer_file,
             steer_lock,
             steer_receipts,
+            steer_receipts_lock,
         }
         root_paths = {Path(root).resolve() for root in roots}
         assert {path.resolve() for path in expected} <= root_paths, roots
@@ -225,6 +229,183 @@ def test_grok_read_only_profile_fences_project_and_allows_account_state() -> Non
         assert f'(subpath "{scripts_dir}")' not in profile
         for root in expected:
             assert f'(subpath "{root.resolve()}")' in profile, root
+        assert "(regex #\"^" in profile
+        escaped_stem = steer_file.stem.replace(".", r"\.")
+        assert f"\\.{escaped_stem}\\.cleanup\\.(?:receipt|end)" in profile
+
+
+def test_read_only_profile_rejects_state_symlink_outside_selected_account() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-grok-read-only-state-") as base:
+        base_path = Path(base)
+        account_home = base_path / "account" / "grok"
+        outside = base_path / "sibling-dispatch"
+        (account_home / ".config").mkdir(parents=True)
+        outside.mkdir()
+        (account_home / ".config" / "grok").symlink_to(
+            outside, target_is_directory=True
+        )
+        private_tmp = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-private-"))
+        dispatch_dir = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-dispatch-"))
+        steer_file = dispatch_dir / "current.steer.jsonl"
+        steer_file.touch()
+        environment = {
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(account_home / ".config"),
+            "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+            "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+            "TMPDIR": str(private_tmp),
+            "GOALFLIGHT_STEER_FILE": str(steer_file),
+        }
+        try:
+            with mock.patch.object(
+                S,
+                "_resolved_grok_account_home",
+                return_value=account_home.resolve(),
+            ):
+                try:
+                    S.macos_write_roots(
+                        str(ROOT),
+                        S.OS_SANDBOX_READ_ONLY,
+                        agent="grok-code",
+                        command="grok",
+                        environment=environment,
+                    )
+                except S.OsSandboxError as exc:
+                    assert "resolves outside selected account" in str(exc), exc
+                else:
+                    raise AssertionError("state symlink outside account was accepted")
+        finally:
+            shutil.rmtree(private_tmp, ignore_errors=True)
+            shutil.rmtree(dispatch_dir, ignore_errors=True)
+
+
+def test_grok_read_only_profile_consumes_reply_and_persists_cleanup() -> None:
+    """The sandbox must permit the full wait reply and detached cleanup flow."""
+    if not _sandbox_exec_available():
+        import pytest
+
+        pytest.skip("sandbox-exec unavailable or blocked in this worker sandbox")
+
+    probe_dir = ROOT / f".goalflight-grok-read-only-wait-{os.getpid()}"
+    private_tmp = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-wait-tmp-"))
+    dispatch_dir = Path(tempfile.mkdtemp(prefix="gf-grok-read-only-wait-dispatch-"))
+    steer_file = dispatch_dir / "current.steer.jsonl"
+    steer_file.touch()
+    dispatch_id = "grok-wait-profile"
+    account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
+    environment = {
+        "HOME": str(account_home),
+        "XDG_CONFIG_HOME": str(account_home / ".config"),
+        "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+        "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+        "TMPDIR": str(private_tmp),
+        "GOALFLIGHT_STEER_FILE": str(steer_file),
+        "PYTHONPATH": str(ROOT / "scripts"),
+    }
+    child_code = f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT / 'scripts')!r})
+import goalflight_steer_mailbox as steer
+
+def notify(event):
+    if event.get('state') == 'armed':
+        print('ARMED', flush=True)
+    elif event.get('state') == 'messages':
+        print('DELIVERED', flush=True)
+
+result = steer.wait_for_worker_entries(
+    Path({str(steer_file)!r}),
+    dispatch_id={dispatch_id!r},
+    acked_seqs=set(),
+    question_kind='USER-NEED',
+    question_text='need a reply',
+    timeout_secs=5.0,
+    poll_secs=0.05,
+    notify=notify,
+)
+print('RESULT', result['state'], flush=True)
+"""
+    shutil.rmtree(probe_dir, ignore_errors=True)
+    probe_dir.mkdir()
+    process = None
+    try:
+        prepared = S.prepare_os_sandbox_command(
+            sys.executable,
+            ["-c", child_code],
+            cwd=str(probe_dir),
+            os_sandbox=S.OS_SANDBOX_READ_ONLY,
+            agent="grok-code",
+            environment=environment,
+        )
+        process = subprocess.Popen(
+            [prepared.command, *prepared.args],
+            cwd=str(probe_dir),
+            env={**os.environ, **environment},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ARMED"
+        arm = next(
+            entry
+            for entry in steer.read_steer_entries(steer_file)
+            if entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND
+        )
+        reply = steer.append_worker_wait_reply(
+            steer_file,
+            dispatch_id=dispatch_id,
+            wait_id=str(arm["question_id"]),
+            text="reply persisted",
+        )
+        output, error = process.communicate(timeout=10)
+        assert process.returncode == 0, (output, error)
+        assert "DELIVERED" in output, output
+        assert "RESULT messages" in output, output
+
+        deadline = time.monotonic() + 5
+        entries = []
+        receipts = set()
+        identity = (str(arm["question_id"]), int(reply["seq"]))
+        while time.monotonic() < deadline:
+            entries = steer.read_steer_entries(steer_file)
+            receipts = steer.consumed_worker_wait_receipts(
+                {},
+                marker_entries=[],
+                mailbox_path=steer_file,
+            )
+            if any(
+                entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+                for entry in entries
+            ) and identity in receipts:
+                break
+            time.sleep(0.05)
+        assert identity in receipts, (entries, receipts)
+        assert any(
+            entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+            and entry.get("decision") == "reply"
+            for entry in entries
+        ), entries
+        assert steer.worker_wait_cleanup_slot_path(
+            steer_file,
+            steer.WORKER_WAIT_CLEANUP_RECEIPT,
+            str(arm["question_id"]),
+            int(reply["seq"]),
+        ).exists()
+        assert steer.worker_wait_cleanup_slot_path(
+            steer_file,
+            steer.WORKER_WAIT_CLEANUP_END,
+            str(arm["question_id"]),
+            int(reply["seq"]),
+        ).exists()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        shutil.rmtree(private_tmp, ignore_errors=True)
+        shutil.rmtree(dispatch_dir, ignore_errors=True)
 
 
 def test_read_only_profile_rejects_any_repository_or_git_overlap() -> None:

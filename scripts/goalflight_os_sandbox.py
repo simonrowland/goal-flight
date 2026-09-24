@@ -8,6 +8,7 @@ from collections.abc import Mapping
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import tempfile
 
@@ -208,6 +209,18 @@ def _scheme_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _grok_read_only_cleanup_lock_filters(steer_file: str) -> list[str]:
+    """Return regex grants for this dispatch's dynamically named cleanup locks."""
+    steer_path = Path(steer_file).expanduser()
+    parent = re.escape(str(steer_path.parent.resolve(strict=False)))
+    stem = re.escape(steer_path.stem)
+    prefix = f"{parent}/\\.{stem}"
+    return [
+        f'(regex #"^{prefix}\\.cleanup\\.(?:receipt|end)'
+        f'\\.[A-Za-z0-9]{{1,128}}\\.[1-9][0-9]*\\.lock$")'
+    ]
+
+
 def goalflight_worker_channel_roots() -> list[str]:
     """Paths a sandboxed worker needs in order to SEND mail.
 
@@ -331,17 +344,20 @@ def macos_write_roots(
     grok_bash_read_only = (
         profile == OS_SANDBOX_READ_ONLY and _is_bash_grok(agent, command)
     )
+    account_home: Path | None = None
+    if grok_bash_read_only:
+        account_home = _resolved_grok_account_home(env)
+        if account_home is None:
+            raise OsSandboxError(
+                "read-only Grok requires a resolved account-scoped HOME; "
+                "refusing the host-seat launch"
+            )
     if profile == OS_SANDBOX_WORKSPACE_WRITE:
         roots.append(cwd)
         label = (agent or "").lower()
         if label in {"codex", "codex-acp"}:
             roots.extend(linked_worktree_writable_roots(cwd))
     if grok_bash_read_only:
-        if _resolved_grok_account_home(env) is None:
-            raise OsSandboxError(
-                "read-only Grok requires a resolved account-scoped HOME; "
-                "refusing the host-seat launch"
-            )
         private_tmp = str(env.get("TMPDIR") or "").strip()
         if not private_tmp:
             raise OsSandboxError(
@@ -389,21 +405,32 @@ def macos_write_roots(
         steer_file = str(env.get("GOALFLIGHT_STEER_FILE") or "").strip()
         if steer_file:
             steer_path = Path(steer_file).expanduser()
+            steer_receipts = steer_path.with_name(
+                f"{steer_path.stem}.receipts.jsonl"
+            )
             worker_channel_roots = [
                 str(steer_path),
                 str(steer_path.with_name(f".{steer_path.name}.lock")),
-                str(steer_path.with_name(
-                    f"{steer_path.stem}.receipts.jsonl"
-                )),
+                str(steer_receipts),
+                str(steer_receipts.with_name(f".{steer_receipts.name}.lock")),
             ]
         else:
             worker_channel_roots = []
     else:
         worker_channel_roots = goalflight_worker_channel_roots()
-    extra_roots = _unique_real_paths(
+    state_roots = _unique_real_paths(
         _agent_state_roots(agent, command, environment=environment)
-        + worker_channel_roots
     )
+    if grok_bash_read_only:
+        assert account_home is not None
+        for grant in state_roots:
+            if not _path_contains(str(account_home), grant):
+                raise OsSandboxError(
+                    "read-only Grok agent state grant "
+                    f"{grant!r} resolves outside selected account "
+                    f"{str(account_home)!r}; refusing the launch"
+                )
+    extra_roots = _unique_real_paths(state_roots + worker_channel_roots)
     for root in extra_roots:
         if _path_contains(root, cwd):
             raise OsSandboxError(
@@ -442,6 +469,13 @@ def macos_sandbox_profile(
         environment=environment,
     )
     write_filters = "\n".join(f"  (subpath {_scheme_string(path)})" for path in write_roots)
+    regex_filters = ""
+    if profile == OS_SANDBOX_READ_ONLY and _is_bash_grok(agent, command):
+        steer_file = str((environment or os.environ).get("GOALFLIGHT_STEER_FILE") or "").strip()
+        if steer_file:
+            regex_filters = "\n".join(
+                f"  {entry}" for entry in _grok_read_only_cleanup_lock_filters(steer_file)
+            )
     # /dev/null and /dev/zero are safe write targets (a data sink and a zero
     # source — writing to them mutates no real filesystem state). git and many
     # tools redirect stderr/stdin to /dev/null; without an explicit allow rule
@@ -463,6 +497,7 @@ def macos_sandbox_profile(
 (allow file-read*)
 (allow file-write*
 {write_filters}
+{regex_filters}
 {device_filters})
 """
     return profile_text, write_roots
