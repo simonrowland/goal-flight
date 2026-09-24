@@ -148,10 +148,6 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
             Path(project_root), records[0], "owner"
         ),
     )
-    monkeypatch.setattr(
-        D, "_reserve_unused_recovery_dispatch_id", lambda *_args: "followup"
-    )
-
     with pytest.raises(D.DispatchUsageError):
         D._refuse_launch_blocked_by_completion_authority(args)
     output = capsys.readouterr()
@@ -162,12 +158,14 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
     assert 'state="worker_dead"' in output.err
     assert "ended_at=null" in output.err
     assert row["id"] in output.err
-    assert "goalflight_dispatch.py withdraw stopped-earlier --superseded-by followup" in output.err
+    assert "goalflight_dispatch.py withdraw stopped-earlier" in output.err
+    assert "--superseded-by" not in output.err
     assert "--reason 'retry same task after held dispatch ended'" in output.err
     assert "--controller-label owner" in output.err
-    assert "  1. " in output.err
-    assert "  2. " in output.err
-    assert "--dispatch-id followup" in output.err
+    assert "then re-run your dispatch command" in output.err
+    assert "  1. " not in output.err
+    assert "  2. " not in output.err
+    assert "--dispatch-id followup" not in output.err
     assert "--retry-of" not in output.err
     assert "reconcile-outbox" not in output.err
 

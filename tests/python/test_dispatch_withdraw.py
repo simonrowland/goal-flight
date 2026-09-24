@@ -418,6 +418,26 @@ def test_live_worker_refused(prepared, source):
         child.wait(timeout=10)
 
 
+def test_running_worker_without_identity_refused(prepared):
+    _, authority, attempt, carrier = prepared
+    started = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert started.committed and started.value is not None
+    running = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=started.value.launch_epoch,
+        worker_instance={},
+    )
+    assert running.committed
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "liveness is indeterminate" in result["reason"]
+    assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_RUNNING
+    assert carrier.exists()
+
+
 def test_foreign_controller_refused_and_operator_allowed(prepared):
     _, authority, _, _ = prepared
     code, result = withdraw("--controller-label", "foreign")
@@ -723,21 +743,22 @@ def test_guidance_withdraw_step_runs_for_each_holder_state(
     ) == (0, 0, "conclusive")
 
 
-def test_guidance_withdraw_repairs_dead_final_without_outbox(prepared):
+@pytest.mark.parametrize("terminal_state", ["worker_dead", "abandoned"])
+def test_guidance_withdraw_repairs_final_without_outbox(prepared, terminal_state):
     project, authority, attempt, carrier = prepared
     holder = ledger.read_record("withdraw-test")
     holder.update(
         task_ids=["t-missing-outbox"],
-        state="worker_dead",
-        terminal_state="worker_dead",
+        state=terminal_state,
+        terminal_state=terminal_state,
         worker_still_alive=False,
     )
     ledger.write_record(holder)
     carrier.write_text(json.dumps(holder))
     assert authority.commit_terminal(
         attempt.attempt_id,
-        terminal_state="worker_dead",
-        observation={"state": "worker_dead", "reason": "stale worker"},
+        terminal_state=terminal_state,
+        observation={"state": terminal_state, "reason": "stale worker"},
     ).committed
     with sqlite3.connect(authority.path) as connection:
         connection.execute(
@@ -745,7 +766,7 @@ def test_guidance_withdraw_repairs_dead_final_without_outbox(prepared):
         )
 
     guidance = dispatch._completion_refusal_guidance(
-        ['dispatch_id="withdraw-test" state="worker_dead"'],
+        [f'dispatch_id="withdraw-test" state="{terminal_state}"'],
         str(project),
         args=SimpleNamespace(
             task_ids=["t-missing-outbox"],
@@ -769,6 +790,33 @@ def test_guidance_withdraw_repairs_dead_final_without_outbox(prepared):
     assert authority.read_all(
         "SELECT * FROM terminal_outbox WHERE attempt_id = ?", (attempt.attempt_id,)
     )
+
+
+def test_guidance_does_not_offer_rerun_with_mixed_holders(
+    prepared, monkeypatch
+):
+    project, _authority, _attempt, _carrier = prepared
+    monkeypatch.setattr(
+        dispatch,
+        "_withdraw_recovery_plan",
+        lambda _dispatch_id, project_root: (
+            Path(project_root), {"terminal_state": "worker_dead"}, "owner"
+        ),
+    )
+
+    guidance = dispatch._completion_refusal_guidance(
+        [
+            'dispatch_id="dead-holder" state="worker_dead"',
+            'dispatch_id="live-holder" state="running"',
+        ],
+        str(project),
+        args=SimpleNamespace(task_ids=["t-mixed"]),
+    )
+
+    assert "goalflight_dispatch.py withdraw dead-holder" in guidance
+    assert "then re-run your dispatch command" not in guidance
+    assert "live-holder state=running" in guidance
+    assert "live or liveness is indeterminate" in guidance
 
 
 def test_guidance_withdraws_multiple_holders_then_reruns_original_command(prepared):

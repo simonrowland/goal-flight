@@ -273,19 +273,12 @@ def _dispatch_records(
         )
     if unreadable_rows:
         paths = ", ".join(path for _dispatch_id, path in unreadable_rows)
-        unresolved = sum(
-            1
-            for dispatch_id, _path in unreadable_rows
-            if not dispatch_id
-            or not isinstance(records.get(dispatch_id, {}).get("worker_pid"), int)
-            or records.get(dispatch_id, {}).get("worker_pid", 0) <= 0
-        )
         source_records.append(
             {
                 "_source_unverified_reason": (
                     f"ledger unreadable rows={len(unreadable_rows)}: {paths}"
                 ),
-                "_source_unverified_count": unresolved,
+                "_source_unverified_count": len(unreadable_rows),
             }
         )
     return source_records + list(records.values())

@@ -3468,11 +3468,12 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
 def _withdraw_recovery_plan(
     dispatch_id: str, project_root: str,
 ) -> tuple[Path, dict, str | None]:
-    """Run the exact withdrawal dry-run preflight and return its actor details.
+    """Run withdrawal admission and settlement dry-runs before printing a command.
 
     The first probe discovers the recorded owner without changing state. The
     second probe uses the same owner/operator arguments that the printed
-    command will use, so guidance is emitted only when that command is safe.
+    command will use, so guidance is emitted only when both stages of that
+    command are safe.
     """
     probe = argparse.Namespace(
         dispatch_id=dispatch_id,
@@ -3486,14 +3487,18 @@ def _withdraw_recovery_plan(
     )
     owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
     owner = str(owner).strip() if owner else None
-    _withdraw_preflight(
-        argparse.Namespace(
-            dispatch_id=dispatch_id,
-            project_root=str(root),
-            operator=owner is None,
-            controller_label=owner,
-            dry_run=True,
-        )
+    settlement_args = argparse.Namespace(
+        dispatch_id=dispatch_id,
+        project_root=str(root),
+        operator=owner is None,
+        controller_label=owner,
+        dry_run=True,
+        reason="retry same task after held dispatch ended",
+        superseded_by=None,
+    )
+    _withdraw_preflight(settlement_args)
+    _settle_final_dispatch(
+        settlement_args, _queue_entry_path(dispatch_id).parent,
     )
     return root, attempt, owner
 
@@ -3525,13 +3530,18 @@ def _completion_refusal_guidance(
     """Explain how to release a confirmed-dead task holder safely."""
     rows, publication_failed = _blocking_rows_from_diagnostics(diagnostics)
     held = [(did, state) for did, state in rows if state in _SELF_HELD_LEDGER_STATES]
-    live = [(did, state) for did, state in rows if state not in _SELF_HELD_LEDGER_STATES]
     task_ids = list(getattr(args, "task_ids", []) or [])
     task_text = f"task {task_ids[0]}" if len(task_ids) == 1 else "these tasks"
-    if held and not live:
+    if held:
         lines = []
-        withdrawable = False
-        for dispatch_id, state in held:
+        withdrawable = 0
+        blockers = []
+        for dispatch_id, state in rows:
+            if state not in _SELF_HELD_LEDGER_STATES:
+                blockers.append(
+                    f"{dispatch_id} state={state}: holder is live or liveness is indeterminate"
+                )
+                continue
             try:
                 root, attempt, owner = _withdraw_recovery_plan(
                     dispatch_id, project_root
@@ -3540,8 +3550,10 @@ def _completion_refusal_guidance(
                 liveness = getattr(exc, "liveness", None)
                 if liveness == "live":
                     lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
+                    blockers.append(f"{dispatch_id} state={state}: holder is live")
                 elif liveness == "indeterminate":
                     lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
+                    blockers.append(f"{dispatch_id} state={state}: liveness is indeterminate")
                 else:
                     lines.append(
                         f"{task_text} is held by {dispatch_id} (state {state}); "
@@ -3549,6 +3561,7 @@ def _completion_refusal_guidance(
                         "resume it or wait for verification; opening a new task "
                         "row is interim."
                     )
+                    blockers.append(f"{dispatch_id} state={state}: withdrawal refused")
                 continue
             withdrawal_state = str(attempt.get("terminal_state") or state)
             if withdrawal_state not in _SELF_HELD_LEDGER_STATES:
@@ -3556,6 +3569,9 @@ def _completion_refusal_guidance(
                     f"{task_text} is held by {dispatch_id} (state {state}); "
                     f"withdrawal state is {withdrawal_state or 'unknown'}. "
                     "No withdrawal command is safe; inspect the holder before retrying."
+                )
+                blockers.append(
+                    f"{dispatch_id} state={state}: withdrawal state is {withdrawal_state or 'unknown'}"
                 )
                 continue
             command = _withdraw_recovery_command(
@@ -3568,15 +3584,16 @@ def _completion_refusal_guidance(
                 f"{task_text} is held by {dispatch_id} (state {state}). Run:\n"
                 f"  {command}"
             )
-            withdrawable = True
-        if withdrawable:
+            withdrawable += 1
+        if withdrawable and not blockers:
             lines.append("then re-run your dispatch command")
+        elif blockers:
+            lines.append(
+                "Do not re-run your dispatch command; blockers: "
+                + "; ".join(blockers)
+                + "."
+            )
         text = "\n".join(lines)
-        return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
-    if held and live:
-        named = ", ".join(f"{did} state={state}" for did, state in held)
-        active = ", ".join(f"{did} state={state}" for did, state in live)
-        text = f"Rows ({named}) are held, but {active} still holds {task_text}. Wait for the active holder; do not withdraw a live or liveness-indeterminate row."
         return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     return _reconcile_outbox_guidance(project_root)
 
@@ -10761,6 +10778,7 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     if not args.operator and (not args.controller_label or args.controller_label != owner):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
+    liveness_evidence = []
     for source, pid, identity in (
         ("ledger", (record or {}).get("worker_pid"), (record or {}).get("worker_identity")),
         ("journal", worker.get("pid"), worker),
@@ -10769,6 +10787,7 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     ):
         if not pid:
             continue
+        liveness_evidence.append((source, pid))
         status, reason = _queue_claim_identity_status(pid, identity)
         if status != "dead":
             raise _WithdrawPreflightRefusal(
@@ -10776,6 +10795,12 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
                 "Steer the worker to stop, wait for exit, and verify its identity before retrying.",
                 liveness=("live" if status == "live" else "indeterminate"),
             )
+    if attempt.get("lifecycle_state") == goalflight_journal.ATTEMPT_RUNNING and not liveness_evidence:
+        raise _WithdrawPreflightRefusal(
+            "RUNNING attempt has no worker identity; worker liveness is indeterminate. "
+            "Wait for the worker identity to be recorded before retrying.",
+            liveness="indeterminate",
+        )
     for evidence in (record or {}, *carriers.values()):
         if _queue_claim_worker_spawn_intent(evidence) and not (
             evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
@@ -10815,11 +10840,29 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             raise ValueError("attempt is no longer final; settlement refused")
         journal_state = attempt["terminal_state"]
         replacement_id = getattr(args, "superseded_by", None)
+        events = None
+        if journal_state in {"worker_dead", "stale_dead", "abandoned"}:
+            events = authority.read_all(
+                "SELECT event_uuid, event_type FROM terminal_outbox "
+                "WHERE attempt_id = ? AND transition_id = ?",
+                (attempt["attempt_id"], attempt["terminal_transition_id"]),
+            )
+        missing_final_outbox = not events if events is not None else False
         final_retirement = bool(
-            journal_state in {"worker_dead", "stale_dead"}
+            (
+                journal_state in {"worker_dead", "stale_dead"}
+                or (journal_state == "abandoned" and missing_final_outbox)
+            )
             and not args.dry_run
         )
-        if final_retirement:
+        final_retirement_preview = bool(
+            args.dry_run
+            and (
+                journal_state in {"worker_dead", "stale_dead"}
+                or (journal_state == "abandoned" and missing_final_outbox)
+            )
+        )
+        if final_retirement or final_retirement_preview:
             actor = "operator" if getattr(args, "operator", False) else args.controller_label
             terminal_state = "superseded" if replacement_id else "withdrawn"
             observation = {
@@ -10829,14 +10872,24 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             }
             if replacement_id:
                 observation["superseded_by"] = replacement_id
-            committed = goalflight_journal.Journal(root).commit_terminal(
-                attempt["attempt_id"], terminal_state=terminal_state,
-                event_type="blocked", observation=observation,
-                _allow_final_supersession=True,
-            )
-            if not committed.committed or committed.value is None:
-                raise ValueError(f"journal supersession failed: {committed}")
-            terminal = committed.value
+            if final_retirement_preview:
+                terminal = goalflight_journal.TerminalCommit(
+                    attempt_id=attempt["attempt_id"], dispatch_id=args.dispatch_id,
+                    transition_id="<new transition>", event_uuid="<new event>",
+                    event_type="blocked", terminal_state=terminal_state,
+                    observation=observation,
+                    terminal_at=attempt.get("terminal_at") or goalflight_journal.utc_now(),
+                    idempotent=False,
+                )
+            else:
+                committed = goalflight_journal.Journal(root).commit_terminal(
+                    attempt["attempt_id"], terminal_state=terminal_state,
+                    event_type="blocked", observation=observation,
+                    _allow_final_supersession=True,
+                )
+                if not committed.committed or committed.value is None:
+                    raise ValueError(f"journal supersession failed: {committed}")
+                terminal = committed.value
             journal_state = terminal.terminal_state
             state = journal_state
             outcome = terminal.observation
@@ -10844,10 +10897,11 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             state = "withdrawn" if journal_state == "abandoned" else journal_state
             if goalflight_ledger.terminal_state_for(state) == "unknown":
                 raise ValueError(f"unrecognised journal terminal state: {journal_state!r}")
-            events = authority.read_all(
-                "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
-                (attempt["attempt_id"], attempt["terminal_transition_id"]),
-            )
+            if events is None:
+                events = authority.read_all(
+                    "SELECT event_uuid, event_type FROM terminal_outbox WHERE attempt_id = ? AND transition_id = ?",
+                    (attempt["attempt_id"], attempt["terminal_transition_id"]),
+                )
             if not events:
                 raise ValueError("terminal attempt has no matching outbox event")
             terminal = goalflight_journal.TerminalCommit(

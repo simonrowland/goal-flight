@@ -399,6 +399,43 @@ def test_corrupt_ledger_row_without_sidecar_is_unverified(
     ]
 
 
+def test_unreadable_ledger_row_with_terminal_sidecar_is_unverified(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    unreadable_path = tmp_path / "runs.d" / "terminal-corrupt.json"
+    (dispatch_dir / "terminal-corrupt.status.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "terminal-corrupt",
+                "state": "complete",
+                "terminal_state": "complete",
+                "agent": "codex",
+                "model": "gpt-5.6-sol",
+                "worker_pid": os.getpid(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[
+            {
+                "dispatch_id": "terminal-corrupt",
+                "state": "unreadable",
+                "path": str(unreadable_path),
+            }
+        ],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {unreadable_path}"
+    ]
+
+
 def test_terminal_ledger_state_wins_over_live_sidecar(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -5895,7 +5895,7 @@ class Journal:
                 str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES
                 and _allow_final_supersession
                 and terminal in {"superseded", "withdrawn"}
-                and str(existing["terminal_state"]) in {"worker_dead", "stale_dead"}
+                and str(existing["terminal_state"]) in {"worker_dead", "stale_dead", "abandoned"}
             )
             if str(existing["lifecycle_state"]) in ATTEMPT_FINAL_STATES and not superseding_final:
                 if not existing["terminal_transition_id"] or not existing["event_uuid"]:
