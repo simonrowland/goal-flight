@@ -481,19 +481,24 @@ def _scan_coalition_once(cid):
     living = []
     for pid, start in found.items():
         verdict = _incarnation_in_coalition(pid, start, cid)
-        if verdict is None:
+        # False is not proof this pid left no child. It can exit after the
+        # last snapshot and the child is absent from this pass. Unknown is
+        # the same: this pass cannot prove the coalition is empty. Only a
+        # later pass that finds nobody does.
+        if verdict is not True:
             return None
-        if verdict is True:
-            living.append((pid, start))
+        living.append((pid, start))
     return living
 
 
 def _coalition_members(cid):
     """(pid, start) for every process in this resource coalition.
 
-    None means UNKNOWN. An empty list is one finished pass that saw nobody.
+    None means UNKNOWN. An empty list is one finished pass that saw nobody
+    from its first snapshot through the confirming check. A member that
+    vanishes during that check is not an empty tree: the pass restarts.
     A live pid that cannot be classified, or a birth that never settles,
-    is not that proof. A later clean pass may still show the coalition empty.
+    is not proof either.
     """
     if isinstance(cid, bool) or not isinstance(cid, int) or cid <= 0:
         return None
@@ -1025,6 +1030,26 @@ def _submit_workload(run, state, argv, env, cwd):
             return "coalition was not private"
         state["coalition_id"] = cid
         _remember_identity(run, state)
+        # The wrapper execs only after the id is on disk and readable again.
+        # A failed lease write must not open the gate: recovery cannot kill
+        # a tree it cannot name.
+        try:
+            lease_path = run / "lease.json"
+            fd = os.open(str(lease_path), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            dirfd = os.open(str(run), os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+            recorded = read_json(lease_path)
+        except (OSError, ValueError):
+            return "coalition id was not durable"
+        if recorded.get("coalition_id") != cid:
+            return "coalition id was not durable"
         gate_path.write_text("1")
         return pid, start, cid
     return "launchctl job did not appear"
@@ -1134,13 +1159,17 @@ def _token_index(lease):
 
 
 def reserved_token_indexes(managed):
-    """Indexes a non-released lease still owns, whether or not its flock is held."""
+    """Indexes a non-released lease still owns, whether or not its flock is held.
+
+    None means UNKNOWN. An unreadable lease does not name its index, so the
+    caller holds the whole pool. Skipping the lease would free that capacity.
+    """
     found = set()
     for run in iter_run_dirs(managed):
         try:
             lease = read_json(run / "lease.json")
         except (OSError, ValueError):
-            continue
+            return None
         if lease.get("state") == "released":
             continue
         index = _token_index(lease)
@@ -1236,10 +1265,24 @@ def finish_dead_workload(root, run, state, action):
             audit(managed / "admission", {"action": action, "result": "kept",
                                           "lease_id": current.get("lease_id"), "at": time.time()})
             return {"status": "unknown"}
+        if action == "deadline" and not (run / "result.json").exists():
+            pending = current.get("pending_result")
+            # A captured exit, including 0, is not this outcome. No captured
+            # exit must not leave the watcher with no result at all.
+            if not isinstance(pending, dict) or not pending.get("status"):
+                current["pending_result"] = {
+                    "returncode": EXIT_DEADLINE, "timed_out": True, "status": "deadline",
+                }
         _publish_pending(run, current)
-        reason = "deadline" if action == "deadline" else "operator-clear"
-        if isinstance(current.get("pending_result"), dict):
-            reason = current["pending_result"].get("status") or reason
+        pending = current.get("pending_result")
+        if isinstance(pending, dict) and pending.get("status"):
+            reason = pending["status"]
+        elif action == "deadline":
+            reason = "deadline"
+        elif action == "operator-clear":
+            reason = "operator-clear"
+        else:
+            reason = current.get("release_reason") or "completed"
         _mark_released(managed, run, current, reason)
         audit(managed / "admission", {"action": action, "result": "cleared",
                                       "lease_id": current.get("lease_id"),
@@ -1395,6 +1438,11 @@ def _release_holder(root, run, state, token):
         paths = [p for p in (run, lease.get("slot")) if p]
         intruders = cwd_intruders(paths)
         ok = intruders is not None and not intruders
+    label = lease.get("launch_label") or state.get("launch_label") or ""
+    # Capacity is published only after the job is gone. clear_tree may already
+    # have removed it; a failed proof here keeps the lease draining.
+    if ok and label and not _remove_job(label):
+        ok = False
     guard = _with_queue_lock(root)
     try:
         current = read_json(run / "lease.json")
@@ -1402,11 +1450,16 @@ def _release_holder(root, run, state, token):
             pass
         elif not ok:
             current["state"] = "draining"
+            if label:
+                current["launch_label"] = label
+                current["job_remove_pending"] = True
             if state.get("release_reason"):
                 current["release_reason"] = state["release_reason"]
             write_json(run / "lease.json", current)
             return
         else:
+            if label:
+                current["job_remove_pending"] = False
             _publish_pending(run, current)
             reason = state.get("release_reason") or current.get("release_reason") or "completed"
             _mark_released(managed, run, current, reason)
@@ -1462,23 +1515,26 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
                         measured = sample(root)
                         if measured['load1'] <= measured['p_cores']:
                             reserved = reserved_token_indexes(root.parent)
-                            for index in range(measured['token_pool_size']):
-                                if index in reserved:
-                                    continue
-                                token = try_lock(root / 'tokens' / str(index))
-                                if token is not None:
-                                    repo = safe_repo(request.get('repo'))
-                                    slot, slot_lock = lease_slot(
-                                        root.parent, repo, measured['token_pool_size'], state)
-                                    if slot is None:
-                                        token.close()
-                                        token = None
+                            # None holds every index. An unreadable lease has
+                            # no token number to reserve on its own.
+                            if reserved is not None:
+                                for index in range(measured['token_pool_size']):
+                                    if index in reserved:
+                                        continue
+                                    token = try_lock(root / 'tokens' / str(index))
+                                    if token is not None:
+                                        repo = safe_repo(request.get('repo'))
+                                        slot, slot_lock = lease_slot(
+                                            root.parent, repo, measured['token_pool_size'], state)
+                                        if slot is None:
+                                            token.close()
+                                            token = None
+                                            break
+                                        state.update(state='admitted', token_index=index,
+                                                     sample=measured, slot=str(slot), repo=repo)
+                                        write_json(run / 'lease.json', state)
+                                        ticket.unlink()
                                         break
-                                    state.update(state='admitted', token_index=index,
-                                                 sample=measured, slot=str(slot), repo=repo)
-                                    write_json(run / 'lease.json', state)
-                                    ticket.unlink()
-                                    break
                     except (OSError, ValueError):
                         pass  # Unknown load/caps must not grant admission.
             if token is None:
@@ -1579,7 +1635,12 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
                     write_json(run / 'result.json', pending)
                     state['release_reason'] = 'cancelled' if cancelled else 'node-timeout'
                     break
-                if same is not True:
+                if same is None:
+                    # Unreadable is not an exit. Treating it as one starts
+                    # cleanup while the leader may still be alive.
+                    time.sleep(0.05)
+                    continue
+                if same is False:
                     _capture_exit_status(run, state, wait=True)
                     state['pending_result'] = _terminal_result(state)
                     _remember_identity(run, state)
@@ -1607,17 +1668,24 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         try:
             _release_holder(root, run, state, token)
         finally:
-            if not _remove_job(state.get('launch_label')):
-                state['job_remove_pending'] = True
-                try:
-                    lease = read_json(run / 'lease.json')
-                    lease['launch_label'] = state.get('launch_label')
+            # Removal is proved before release. Do not take a published
+            # release back: that window lets a second run share the token.
+            # A holder that is leaving with the job still present stays
+            # draining so the next reap retries the removal.
+            label = state.get('launch_label')
+            try:
+                lease = read_json(run / 'lease.json')
+            except (OSError, ValueError):
+                lease = None
+            if label and (lease is None or lease.get('state') != 'released') and not _remove_job(label):
+                if lease is not None:
+                    lease['launch_label'] = label
                     lease['job_remove_pending'] = True
-                    if lease.get('state') == 'released':
-                        lease['state'] = 'draining'
-                    write_json(run / 'lease.json', lease)
-                except (OSError, ValueError):
-                    pass
+                    lease['state'] = 'draining'
+                    try:
+                        write_json(run / 'lease.json', lease)
+                    except OSError:
+                        pass
             if slot_lock is not None:
                 slot_lock.close()
             ticket_lock.close()
@@ -1701,7 +1769,10 @@ def dispatch(request):
         finally:
             guard.close()
         used = {index for index in range(total) if locked(root / 'tokens' / str(index))}
-        used.update(index for index in reserved if index < total)
+        if reserved is None:
+            used.update(range(total))
+        else:
+            used.update(index for index in reserved if index < total)
         return {'load': measured, 'tokens': {'total': total, 'free': total - len(used),
                                              'in_use': len(used)}}
     run = Path(request['run_dir'])
@@ -1770,6 +1841,11 @@ def dispatch(request):
                 fresh.update(read_json(run / 'owner.json'))
                 if past_deadline(fresh):
                     return finish_dead_workload(root, run, fresh, 'deadline')
+                # Cleanup already started. Retry job removal on every reap,
+                # not only after the deadline. A running lease stays unknown
+                # so a live workload is not killed early.
+                if fresh.get('state') == 'draining':
+                    return finish_dead_workload(root, run, fresh, 'reap')
                 return {'status': 'unknown'}
             write_json(run / 'cancel.json', request['identity'])
             # An admitted holder may not have received its command yet.

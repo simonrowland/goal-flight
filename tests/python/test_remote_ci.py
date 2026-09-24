@@ -1619,6 +1619,34 @@ def test_gate_opens_only_after_the_coalition_is_recorded(tmp_path, monkeypatch):
     assert (run / "workload-go").is_file()
 
 
+def test_gate_stays_closed_without_a_durable_coalition_id(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {"lease_id": "abc", "state": "running"}
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    original = node._remember_identity
+
+    def remember(target, current):
+        if current.get("coalition_id"):
+            return
+        original(target, current)
+
+    monkeypatch.setattr(node.subprocess, "run", lambda argv, **kwargs: type("R", (), {
+        "returncode": 0, "stderr": "", "stdout": ""})())
+    monkeypatch.setattr(node, "_job_view", lambda label: ("running", 42, None))
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((10, 20), 100))
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_remember_identity", remember)
+    launched = node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "")
+    assert isinstance(launched, str)
+    assert not (run / "workload-go").exists()
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert "coalition_id" not in lease
+    assert state.get("coalition_id") == 100
+
+
 def test_unrecorded_coalition_does_not_count_as_an_empty_tree(tmp_path, monkeypatch):
     node, run, state = _lease_run(
         tmp_path, launch_label="com.goalflight.remote-ci.abc")
@@ -1643,6 +1671,46 @@ def test_failed_coalition_query_of_a_live_pid_is_unknown(monkeypatch):
 
     monkeypatch.setattr(node, "_coalition_id", coalition)
     assert node._coalition_members(100) is None
+
+
+def test_member_dying_during_the_final_check_is_not_an_empty_tree(monkeypatch):
+    """A death during the confirming check is not an empty coalition.
+
+    The child born as that member exits is invisible to the raced pass.
+    The next complete pass must see it. Returning [] here is the bug.
+    """
+    import goalflight_remote_ci_node as node
+
+    snapshots = iter([[10], [10], [11], [11]])
+
+    def all_pids():
+        return list(next(snapshots))
+
+    monkeypatch.setattr(node, "_all_pids", all_pids)
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 100)
+    monkeypatch.setattr(node, "_start_time", lambda pid: (5, pid))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: pid != 10)
+    assert node._coalition_members(100) == [(11, (5, 11))]
+
+
+def test_complete_rescan_after_a_mid_check_death_proves_empty(monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    snapshots = iter([[10], [10], [99], [99]])
+
+    def all_pids():
+        return list(next(snapshots))
+
+    def coalition(pid):
+        return 100 if pid == 10 else 7
+
+    monkeypatch.setattr(node, "_all_pids", all_pids)
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "_start_time", lambda pid: (5, pid))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
+    assert node._coalition_members(100) == []
 
 
 def test_child_born_during_the_scan_is_not_an_empty_tree(monkeypatch):
@@ -1757,6 +1825,174 @@ def test_failed_job_removal_stays_tracked_for_reap(tmp_path, monkeypatch):
     assert json.loads((run / "lease.json").read_text(encoding="utf-8"))["state"] == "released"
 
 
+def test_capacity_is_not_released_before_the_job_is_gone(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    managed = tmp_path / "managed"
+    root = managed / "admission"
+    run = managed / "runs" / "abc"
+    root.mkdir(parents=True)
+    run.mkdir(parents=True)
+    (root / "queue.lock").write_text("", encoding="utf-8")
+    state = {
+        "lease_id": "abc", "lease_token": "tok", "state": "running",
+        "token_index": 0, "launch_label": "com.goalflight.remote-ci.abc",
+        "coalition_id": 100, "holder_coalition_id": 5,
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "clear_tree", lambda *args, **kwargs: True)
+    monkeypatch.setattr(node, "_remove_job", lambda label: False)
+    token = (run / "token-standin").open("a+")
+    try:
+        node._release_holder(root, run, dict(state), token)
+    finally:
+        token.close()
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["state"] == "draining"
+    assert lease["job_remove_pending"] is True
+    assert not (managed / "results" / "index.jsonl").exists()
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    token = (run / "token-standin").open("a+")
+    try:
+        node._release_holder(root, run, lease, token)
+    finally:
+        token.close()
+    released = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert released["state"] == "released"
+    assert released["job_remove_pending"] is False
+
+
+def _dead_holder_request(tmp_path, monkeypatch, *, state_name, deadline_offset):
+    import builtins
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(
+        builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
+        str(tmp_path / "auth.json"), raising=False)
+    managed = tmp_path / "managed"
+    run = managed / "runs" / "abc"
+    run.mkdir(parents=True)
+    remote = {
+        "host": "h", "pid": "44", "start_token": "st",
+        "run_dir": str(run), "lease_id": "abc", "lease_token": "tok",
+    }
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    state = {
+        "schema": "goalflight.remote-ci.lease.v1",
+        "lease_id": "abc", "lease_token": "tok", "state": state_name,
+        "token_index": 0, "launch_label": "com.goalflight.remote-ci.abc",
+        "coalition_id": 100, "holder_coalition_id": 5,
+        "deadline_epoch": time.time() + deadline_offset,
+        "remote_run": remote, "job_remove_pending": True,
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    return node, managed, run, remote, owner
+
+
+def test_draining_lease_retries_removal_before_the_deadline(tmp_path, monkeypatch):
+    node, managed, run, remote, owner = _dead_holder_request(
+        tmp_path, monkeypatch, state_name="draining", deadline_offset=3600)
+    removes = {"n": 0}
+
+    def remove(label):
+        del label
+        removes["n"] += 1
+        return False
+
+    monkeypatch.setattr(node, "_remove_job", remove)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    result = node.dispatch({
+        "operation": "cancel", "managed_root": str(managed), "box": "b",
+        "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
+        "lease_token": "tok", "identity": remote, "expected_owner": owner,
+    })
+    assert removes["n"] >= 1
+    assert result["status"] == "unknown"
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["state"] == "draining"
+
+
+def test_running_lease_is_not_killed_before_the_deadline(tmp_path, monkeypatch):
+    node, managed, run, remote, owner = _dead_holder_request(
+        tmp_path, monkeypatch, state_name="running", deadline_offset=3600)
+    removes = {"n": 0}
+    monkeypatch.setattr(node, "_remove_job", lambda label: removes.__setitem__("n", removes["n"] + 1) or False)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    result = node.dispatch({
+        "operation": "cancel", "managed_root": str(managed), "box": "b",
+        "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
+        "lease_token": "tok", "identity": remote, "expected_owner": owner,
+    })
+    assert removes["n"] == 0
+    assert result["status"] == "unknown"
+    assert json.loads((run / "lease.json").read_text(encoding="utf-8"))["state"] == "running"
+
+
+def test_deadline_kill_of_a_dead_holder_records_deadline(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    managed = tmp_path / "managed"
+    root = managed / "admission"
+    root.mkdir(parents=True)
+    (root / "queue.lock").write_text("", encoding="utf-8")
+    monkeypatch.setattr(node, "clear_tree", lambda *args, **kwargs: True)
+
+    def make(name, **extra):
+        run = managed / "runs" / name
+        run.mkdir(parents=True)
+        state = {
+            "lease_id": name, "lease_token": "tok", "state": "draining",
+            "token_index": 0, "launch_label": "com.goalflight.remote-ci." + name,
+        }
+        state.update(extra)
+        (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+        return run, state
+
+    run, state = make("noexit")
+    assert node.finish_dead_workload(root, run, state, "deadline")["status"] == "cancelled"
+    body = json.loads((run / "result.json").read_text(encoding="utf-8"))
+    assert body == {"returncode": 124, "timed_out": True, "status": "deadline"}
+
+    run, state = make("zero", exit_known=True, exit_code=0)
+    node.finish_dead_workload(root, run, state, "deadline")
+    body = json.loads((run / "result.json").read_text(encoding="utf-8"))
+    assert body["status"] == "deadline"
+    assert body["returncode"] == 124
+    assert body["timed_out"] is True
+
+    run, state = make("kept")
+    (run / "result.json").write_text(
+        json.dumps({"status": "died", "returncode": 9, "timed_out": False}),
+        encoding="utf-8")
+    node.finish_dead_workload(root, run, state, "deadline")
+    body = json.loads((run / "result.json").read_text(encoding="utf-8"))
+    assert body["status"] == "died"
+    assert body["returncode"] == 9
+
+
+def test_unreadable_lease_holds_capacity(tmp_path, monkeypatch):
+    import builtins
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(
+        builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
+        str(tmp_path / "auth.json"), raising=False)
+    managed = tmp_path / "managed"
+    run = managed / "runs" / "bad"
+    run.mkdir(parents=True)
+    (run / "lease.json").write_text("{", encoding="utf-8")
+    assert node.reserved_token_indexes(managed) is None
+    report = node.dispatch({
+        "operation": "health", "managed_root": str(managed), "box": "b",
+        "p_cores": 8, "token_pool_size": 2,
+    })
+    assert report["tokens"]["in_use"] == 2
+    assert report["tokens"]["free"] == 0
+
+
 @pytest.mark.parametrize("kind,status,code,extra", [
     ("capacity-refused", "capacity", 75, {}),
     ("cancelled", "cancelled", 130, {}),
@@ -1838,8 +2074,9 @@ def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_p
         assert result is not None
         assert result["status"] == "died"
         assert result["returncode"] == 19
-        with pytest.raises(ProcessLookupError):
-            os.kill(child, 0)
+        # A just-killed pid can still be a zombie. kill(pid, 0) succeeds
+        # until it is reaped, so a single check flakes. Wait until it is gone.
+        _wait_dead(child)
         _free_tokens(node)
         listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
         assert held["lease_id"] not in listed.stdout
@@ -1848,3 +2085,91 @@ def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_p
             os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch):
+    """None from the leader check is not an exit. Cleanup must wait."""
+    import builtins
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(
+        builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
+        str(tmp_path / "auth.json"), raising=False)
+    phase = {"n": 0}
+
+    def same(pid, started):
+        del pid, started
+        phase["n"] += 1
+        if phase["n"] < 5:
+            return None
+        return False
+
+    def clear(*args, **kwargs):
+        del args, kwargs
+        if phase["n"] < 5:
+            raise AssertionError("cleanup started while leader liveness was unknown")
+        return True
+
+    monkeypatch.setattr(node, "_same_process", same)
+    monkeypatch.setattr(node, "clear_tree", clear)
+    monkeypatch.setattr(node, "_submit_workload", lambda *args, **kwargs: (42, (1, 2), 100))
+    monkeypatch.setattr(node, "_await_workload_exec", lambda *args, **kwargs: True)
+    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    managed = tmp_path / "managed"
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    record = node.dispatch({
+        "operation": "enqueue", "managed_root": str(managed), "box": "b",
+        "p_cores": 100000, "token_pool_size": 1, "poll_seconds": 0.01,
+        "request_id": "leader-unknown", "arm": "candidate", "owner": owner,
+        "command_wait_seconds": 5,
+    })
+    holder = None
+    key = {
+        "operation": "status", "managed_root": str(managed), "box": "b",
+        "p_cores": 100000, "token_pool_size": 1,
+        "run_dir": record["run_directory"], "lease_token": record["lease_token"],
+    }
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = node.dispatch(key)
+            if current.get("state") == "admitted":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("holder was not admitted")
+        node.dispatch({
+            **key,
+            "operation": "start",
+            "command": {"argv": ["/bin/sleep", "30"], "env": {}, "timeout": 30},
+        })
+        deadline = time.monotonic() + 5
+        body = None
+        while time.monotonic() < deadline:
+            lease_path = Path(record["run_directory"]) / "lease.json"
+            try:
+                lease = json.loads(lease_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                lease = {}
+            remote = lease.get("remote_run") or {}
+            if remote.get("pid"):
+                holder = int(remote["pid"])
+            result_path = Path(record["run_directory"]) / "result.json"
+            if result_path.exists():
+                body = json.loads(result_path.read_text(encoding="utf-8"))
+                break
+            time.sleep(0.02)
+        assert body is not None
+        assert "leader liveness was unknown" not in str(body.get("error"))
+    finally:
+        if holder:
+            try:
+                os.kill(holder, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(holder, 0)
+            except ChildProcessError:
+                pass
