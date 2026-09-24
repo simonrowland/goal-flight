@@ -9,13 +9,52 @@ See `protocols/dispatch-danger.md` for ownership, moved roots, and dry-run flags
 ## Pin before resume or redispatch
 
 Before resuming or redispatching a worker that died or stopped, the controller
-pins its committed tip and dirty tree. For a dirty tree, run controller-side:
+must preserve the worker's repository state. The refs below live in the
+dispatch's own repository (the repository that owns `<worktree>`), not in an
+unrelated checkout.
+
+For a fresh redispatch into a pooled seat, use the normal controller dispatch
+path. `goalflight_worktree_pool.acquire_worktree_seat(..., reset=True)` is
+called by `goalflight_dispatch.py`; it quarantines product changes, including
+untracked non-ignored files, and pins unique commits under
+`refs/goalflight/keep/` before reset. Do not call its private helper directly.
+A resume skips that reset path, and a controller taking over a non-pooled or
+held worktree must use the explicit pin below.
+
+Pin `HEAD` first, even when the tree is clean; this handles a clean tree whose
+latest commits would otherwise become unreachable. Then snapshot tracked and
+untracked (but not ignored) files with a temporary index:
 
 ```bash
-git -C <worktree> stash create "<id> uncommitted"   # capture the returned <sha>
-git update-ref refs/keep/<dispatch-id>-dirty-<date> <sha>
+repo=<dispatch-repository>
+worktree=<worktree>
+head=$(git -C "$worktree" rev-parse HEAD^{commit})
+git -C "$repo" update-ref "refs/goalflight/keep/<dispatch-id>/head" "$head"
+
+index=$(mktemp)
+rm -f "$index"
+trap 'rm -f "$index"' EXIT
+GIT_INDEX_FILE="$index" git -C "$worktree" read-tree HEAD
+GIT_INDEX_FILE="$index" git -C "$worktree" add -A
+tree=$(GIT_INDEX_FILE="$index" git -C "$worktree" write-tree)
+head_tree=$(git -C "$repo" rev-parse "$head^{tree}")
+if test "$tree" != "$head_tree"; then
+  commit=$(git -C "$repo" commit-tree "$tree" -p "$head" \
+    -m "preserve <dispatch-id> dirty worktree")
+  git -C "$repo" update-ref \
+    "refs/goalflight/keep/<dispatch-id>/dirty-<date>" "$commit"
+fi
 ```
 
+`git add -A` records untracked files that are not ignored; ignored files stay
+out of the snapshot. If `tree == head_tree`, no dirty ref is needed, but the
+`.../head` ref remains the required pin. Verify each ref with
+`git -C "$repo" rev-parse --verify <ref>^{commit}` before changing the tree.
+Before deciding that a worker is dead, reconcile process identity (including
+PID start time), status and ledger, terminal markers, output growth, and the
+dirty tree; quiet network waits or tests are not proof of death. COMPLETE,
+RESULT, and READY still need idle/controller-dead reconciliation. A rollover
+can lose notifications, not durable status, ledger, resume, or reconcile state.
 Workers cannot update refs. Only after this pin may the controller resume,
 redispatch, or let the seat be reused.
 

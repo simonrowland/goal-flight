@@ -302,12 +302,7 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 - **Stdin wedge.** `codex exec` reads stdin to EOF even with a positional prompt; missing `< /dev/null` on bash-tail review hangs.
 - **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
 - **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
-- **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
-- **Stopped is not failed — RESUME it, with your answer.** A worker that hit a quota wall, returned `BLOCKED:`, or paused for a clarification/plan approval needs an ANSWER, not a new brief; redispatching re-derives its whole context to deliver one sentence (append the answer to its brief file, then `resume --prompt-file <that same file>`).
-- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, pin commits and dirty work, then `goalflight_dispatch.py resume <id> --prompt-file <the SAME brief, with your answer appended>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
-- **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
-- **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
-- **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
+- **Worker recovery:** reconcile identity, status, markers, output, and dirty tree before pinning; use `protocols/dispatch-resume.md` for the full procedure.
 
 ## Capacity and rate limits
 

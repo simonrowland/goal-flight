@@ -188,9 +188,12 @@ dispatch metadata or the prompt path.
     Flight Routing block + top-of-file blockquote activation directive
     from the template (idempotent — check for the section header first).
     Don't change the file's git-tracking state.
-  - **present, already has the section**: inspect dispatch examples against
-    current routing guidance and refresh stale snippets, including obsolete
-    flags such as `--submit`; init does not rewrite an existing routing block.
+  - **present, already has the section**: init preserves the existing block's
+    local dispatch examples; it does not regenerate them or refresh stale
+    snippets, including obsolete `--submit` flags. It may still update the
+    managed skill-root and RESUME-NOTES pointer lines. To refresh the examples,
+    compare the section with `<skill-root>/templates/project-agents.md` and
+    manually replace only those examples, preserving project-specific additions.
   - For projects with multiple operators / public history that want the
     goal-flight routing tracked: maintain `.agent-context/goal-flight.md`
     separately, tracked, and reference it from the (per-operator,
