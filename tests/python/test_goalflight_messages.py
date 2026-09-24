@@ -882,16 +882,19 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 )
                 assert_true("concurrent cursor advance committed", advanced.committed)
                 release_cas.set()
-                worker.join(timeout=5)
+                worker.join()
                 assert_true(
-                    "drain race thread exited; "
+                    "drain race completed with exactly one CAS loss; "
                     f"return={outcome['return']!r}; "
                     f"exception={outcome['exception']!r}; "
                     f"blocked_peek_entered={peek_calls > 0} calls={peek_calls} "
                     f"threads={peek_thread_names!r}; "
                     f"blocked_advance_entered={advance_calls > 0} calls={advance_calls} "
                     f"threads={advance_thread_names!r}",
-                    not worker.is_alive(),
+                    outcome["return"] == 3
+                    and outcome["exception"] is None
+                    and advance_calls == 2
+                    and advance_thread_names == ["drain-race-cli", "MainThread"],
                 )
 
             combined_lines = [
@@ -909,6 +912,12 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 ],
             )
             assert_true("racing drain bypasses wake-entry notices", wake_notice.call_count == 0)
+            after = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+            assert_true(
+                "drain race leaves the cursor at the competing advance",
+                after.cursor_version == advanced.value["cursor_version"]
+                and not after.items,
+            )
 
 
 def test_messages_main_trap_is_one_actionable_line_mutation_pair() -> None:
