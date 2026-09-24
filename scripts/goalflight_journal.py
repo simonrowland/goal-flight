@@ -139,13 +139,8 @@ OUTBOX_RETRY_BASE_S = 1.0
 WAKE_WEBHOOK_OUTBOX_RETRY_BASE_S = 1.0
 WAKE_WEBHOOK_OUTBOX_RETRY_CAP_S = 60.0
 WAKE_WEBHOOK_OUTBOX_FLUSH_LIMIT = 8
-# The live incident cleared within roughly one minute while the journal stayed
-# healthy. Seventy-five seconds covers that measured minute plus 15 seconds of
-# scheduler/load margin. A smaller bound repeats the observed false teardown;
-# doubling it to 150 seconds would add 75 seconds of unwitnessed failure before
-# a genuinely unreachable journal is reported and re-armed, with no measured
-# recovery benefit. Per-process exponential jitter keeps the three witnesses'
-# probes independent inside the shared bound.
+# Retained for callers that still pass an open retry budget. Permission and
+# CANTOPEN failures are terminal; only SQLite busy contention uses retry_budget_s.
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
@@ -1497,9 +1492,7 @@ class Journal:
                     raise
                 return self._reader_connection
         started = time.monotonic()
-        open_started = started
         attempts = 0
-        open_failures = 0
         while True:
             attempts += 1
             self._require_existing_database()
@@ -1517,12 +1510,10 @@ class Journal:
                         timeout=0,
                         isolation_level=None,
                     )
-            except (JournalDisappeared, JournalIOError) as exc:
-                open_failures += 1
-                self._raise_disappeared_or_unverified(exc)
-                if self._open_retry_delay(open_started, open_failures):
-                    continue
-                raise self._open_io_failure(open_started, open_failures, exc) from exc
+            except JournalDisappeared:
+                raise
+            except JournalIOError as exc:
+                self._raise_terminal_open_failure(exc)
             except sqlite3.DatabaseError as exc:
                 # Busy is stage- and client-agnostic: a read-write client can
                 # hit it here at connect (WAL shared-memory recovery/checkpoint
@@ -1539,11 +1530,7 @@ class Journal:
                 if _is_corruption_error(exc):
                     self._handle_corruption(exc, run_integrity_check=False)
                 if _is_cantopen(exc):
-                    open_failures += 1
-                    self._raise_disappeared_or_unverified(exc)
-                    if self._open_retry_delay(open_started, open_failures):
-                        continue
-                    raise self._open_io_failure(open_started, open_failures, exc) from exc
+                    self._raise_terminal_open_failure(exc)
                 if self._read_only_client:
                     raise JournalIOError(
                         f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1571,14 +1558,7 @@ class Journal:
                     self._handle_corruption(exc, run_integrity_check=False)
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
-                        open_failures += 1
-                        self._raise_disappeared_or_unverified(exc)
-                        if self._open_retry_delay(open_started, open_failures):
-                            continue
-                        raise self._open_io_failure(
-                            open_started, open_failures, exc
-                        ) from exc
-                    self._raise_disappeared_or_unverified(exc)
+                        self._raise_terminal_open_failure(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -2573,13 +2553,7 @@ class Journal:
         return time.monotonic() < deadline
 
     def _raise_disappeared_or_unverified(self, cause: BaseException) -> None:
-        """Reclassify a low-level open/read failure by path presence.
-
-        Present: return, so the caller keeps its own retry/IO-failure path.
-        Genuinely absent: JournalDisappeared. Unverifiable (unreadable):
-        JournalIOError — an unreadable path is not absence, and the IO
-        verdict is what the caller's budget-exhausted path would raise anyway.
-        """
+        """Reclassify a low-level failure by the journal path's presence."""
         presence = _lstat_presence(self.path)
         if presence == "absent":
             raise JournalDisappeared(
@@ -2591,35 +2565,16 @@ class Journal:
                 f"unverified: {self.path}"
             ) from cause
 
-    def _open_retry_delay(self, started: float, failures: int) -> bool:
-        remaining = self.open_retry_budget_s - (time.monotonic() - started)
-        if remaining <= 0:
-            return False
-        exponent = min(max(0, failures - 1), 16)
-        ceiling = min(
-            JOURNAL_OPEN_RETRY_INITIAL_S * (2**exponent),
-            JOURNAL_OPEN_RETRY_MAX_S,
-        )
-        # Full jitter avoids phase-locking the stream, backup, and watchdog.
-        delay = min(random.uniform(ceiling / 2, ceiling), remaining)
-        if delay > 0:
-            time.sleep(delay)
-        # Permit one final measured attempt at the deadline; the next failure
-        # observes the exhausted bound and returns a durable IO verdict.
-        return True
-
-    def _open_io_failure(
-        self,
-        started: float,
-        failures: int,
-        cause: BaseException,
-    ) -> JournalIOError:
-        elapsed = time.monotonic() - started
-        return JournalIOError(
-            f"journal IO open failure after {failures} attempts within "
-            f"{elapsed:.3f}s (budget {self.open_retry_budget_s:.3f}s); "
-            f"journal path is still present: {self.path}: {cause}"
-        )
+    def _raise_terminal_open_failure(self, cause: BaseException) -> None:
+        """Fail closed on an open failure instead of retrying it as contention."""
+        self._require_existing_database()
+        if isinstance(cause, JournalIOError):
+            raise JournalIOError(
+                f"journal open failed for {self.path}: {cause}"
+            ) from cause
+        raise JournalIOError(
+            f"journal open failed for {self.path}: {cause}; failing closed"
+        ) from cause
 
     def _assert_identity(self, connection: sqlite3.Connection) -> None:
         try:

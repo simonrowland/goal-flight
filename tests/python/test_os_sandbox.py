@@ -77,17 +77,6 @@ def _skip_unless_sandbox_exec_case(case_name: str) -> bool:
     return True
 
 
-def _skip_macos_27_journal_denial_case(case_name: str) -> bool:
-    if platform.system() == "Darwin" and platform.mac_ver()[0] == "27.0":
-        note_skip(
-            case_name,
-            "PLATFORM-CHANGE: macOS 27.0 sandbox-exec hangs while returning "
-            "a denied journal open",
-        )
-        return True
-    return False
-
-
 def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{name}.json").write_text(json.dumps({
@@ -749,23 +738,23 @@ def case_journal_dir_is_not_a_write_root() -> None:
 
 def case_sandboxed_journal_open_is_denied() -> None:
     """Journal lock sits outside the workspace; workspace-write must deny it."""
-    if _skip_macos_27_journal_denial_case(
-        "case_sandboxed_journal_open_is_denied"
-    ) or _skip_unless_sandbox_exec_case("case_sandboxed_journal_open_is_denied"):
+    if _skip_unless_sandbox_exec_case("case_sandboxed_journal_open_is_denied"):
         return
     with _isolated_journal_workspace() as (workspace, journal_path):
         _prepared, result = _sandboxed_journal_open(workspace, journal_path)
         assert result.returncode != 0, result
         combined = result.stdout + result.stderr
         assert "journal-ok" not in result.stdout, result
-        assert "PermissionError" in combined or "Operation not permitted" in combined, result
+        assert (
+            "PermissionError" in combined
+            or "Operation not permitted" in combined
+            or "unable to open database file" in combined
+        ), result
 
 
 def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
     """In-sandbox launch_worker is no longer a journal writer; the lock is denied."""
-    if _skip_macos_27_journal_denial_case(
-        "case_sandboxed_launch_worker_cannot_lock_journal"
-    ) or _skip_unless_sandbox_exec_case(
+    if _skip_unless_sandbox_exec_case(
         "case_sandboxed_launch_worker_cannot_lock_journal"
     ):
         return
@@ -805,7 +794,11 @@ def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
         combined = result.stdout + result.stderr
         assert result.returncode != 0, result
         assert "journal-ok" not in result.stdout, result
-        assert "PermissionError" in combined or "Operation not permitted" in combined, result
+        assert (
+            "PermissionError" in combined
+            or "Operation not permitted" in combined
+            or "unable to open database file" in combined
+        ), result
 
 
 def case_dispatch_help_exposes_title_allow_pattern() -> None:

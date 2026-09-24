@@ -154,6 +154,7 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
     tmp_path: Path,
 ) -> None:
     project, _authority = _quiesced_journal(monkeypatch, tmp_path)
+    calls: list[str] = []
 
     def unavailable_connect(
         database: str | Path,
@@ -162,6 +163,7 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
         timeout: float = 5.0,
         isolation_level: str | None = "",
     ) -> sqlite3.Connection:
+        calls.append(os.fspath(database))
         del database, uri, timeout, isolation_level
         raise sqlite3.OperationalError("unable to open database file")
 
@@ -174,6 +176,7 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
         reader.epochs()
 
     assert not isinstance(captured.value, journal.JournalIntegrityError)
+    assert len(calls) == 2, "readonly and rw probes must not retry a CANTOPEN"
 
 
 def test_absent_reader_keeps_legacy_unavailable_semantics(

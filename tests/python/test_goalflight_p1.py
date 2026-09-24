@@ -375,7 +375,7 @@ def test_existing_journal_missing_required_tables_and_bad_epoch_types_fail_close
         opened.epochs()
 
 
-def test_present_journal_open_failure_retries_then_recovers(
+def test_present_journal_open_failure_fails_fast(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
@@ -393,19 +393,19 @@ def test_present_journal_open_failure_retries_then_recovers(
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
-    reopened = journal.Journal(
-        project,
-        open_retry_budget_s=0.1,
-        jitter_min_s=0.001,
-        jitter_max_s=0.002,
-    )
+    with pytest.raises(journal.JournalIOError, match="journal open failed"):
+        journal.Journal(
+            project,
+            open_retry_budget_s=0.1,
+            jitter_min_s=0.001,
+            jitter_max_s=0.002,
+        )
 
     assert failed_opens == 1
-    assert reopened.path == authority.path
-    assert reopened.epochs().schema == journal.CURRENT_SCHEMA_EPOCH
+    assert authority.path.exists()
 
 
-def test_present_journal_permanent_open_failure_is_bounded_io_not_disappearance(
+def test_present_journal_open_failure_is_terminal_io_not_disappearance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
@@ -431,10 +431,9 @@ def test_present_journal_permanent_open_failure_is_bounded_io_not_disappearance(
     elapsed = time.monotonic() - started
 
     assert authority.path.exists(), "the injected opener must not remove the journal"
-    assert attempts > 1, "a first-open exit silently defeats transient survival"
+    assert attempts == 2, "readonly and rw probes are required, but must not retry"
     assert elapsed < 0.5, "the retry budget must remain a bound"
-    assert "still present" in str(captured.value)
-    assert "after" in str(captured.value)
+    assert "journal open failed" in str(captured.value)
     assert not isinstance(captured.value, journal.JournalDisappeared)
 
 
@@ -467,7 +466,7 @@ def test_unreadable_journal_parent_is_io_not_disappearance(
         os.chmod(journal_dir, 0o700)
 
 
-def test_open_retry_still_detects_replacement_database(
+def test_open_failure_still_detects_replacement_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
