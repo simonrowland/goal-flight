@@ -593,7 +593,7 @@ def case_agent_state_roots_are_explicit_exception() -> None:
     if _skip_unless_sandbox_exec_case("case_agent_state_roots_are_explicit_exception"):
         return
     old_home = os.environ.get("HOME")
-    base = ROOT / f".goalflight-os-sandbox-agent-state-{os.getpid()}"
+    base = Path.home() / f".goalflight-os-sandbox-agent-state-{os.getpid()}"
     workspace = base / "workspace"
     fake_home = base / "home"
     outside = fake_home / "outside.txt"
