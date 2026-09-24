@@ -162,7 +162,10 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
     assert "goalflight_dispatch.py withdraw stopped-earlier --superseded-by followup" in output.err
     assert "--reason 'retry same task after held dispatch ended'" in output.err
     assert "--controller-label owner" in output.err
-    assert "Or re-run it with --retry-of stopped-earlier" in output.err
+    assert "  1. " in output.err
+    assert "  2. " in output.err
+    assert "--dispatch-id followup" in output.err
+    assert "--retry-of" not in output.err
     assert "reconcile-outbox" not in output.err
 
 
@@ -400,7 +403,9 @@ def test_dead_hold_refusal_names_resume_not_reconcile(launch_authority, capsys, 
     assert f'state="{state}"' in output.err
     assert "worker_cwd=" in output.err
     assert "reconcile-outbox" not in output.err
-    assert "holder liveness is indeterminate" in output.err
+    assert "withdraw dry-run refused" in output.err
+    assert "  1. " not in output.err
+    assert "--superseded-by" not in output.err
     assert "resume" in output.err.lower()
     assert "interim" in output.err
 

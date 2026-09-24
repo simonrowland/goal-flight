@@ -250,6 +250,43 @@ def test_unreadable_ledger_marks_status_worker_unverified(
         "unknown_reasons": ["ledger unreadable rows=1: OSError: ledger denied"],
     }
     assert "total unverified: 1" in traffic.render(summary)
+    assert "lower bound; unverified" in traffic.render(summary)
+
+
+def test_unreadable_ledger_with_only_terminal_sidecars_stays_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    for dispatch_id in ("terminal-one", "terminal-two"):
+        (dispatch_dir / f"{dispatch_id}.status.json").write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "agent": "codex",
+                    "model": "gpt-5.6-sol",
+                    "worker_pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 2
+    assert summary["models"]["UNKNOWN"]["unverified"] == 2
+    assert summary["unknown_reasons"] == [
+        "ledger unreadable rows=1: OSError: ledger denied"
+    ]
+    assert "total live (lower bound; unverified): 0" in traffic.render(summary)
 
 
 def test_unreadable_ledger_and_status_dir_report_unknown(

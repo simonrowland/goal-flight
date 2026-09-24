@@ -3468,11 +3468,11 @@ def _reconcile_outbox_guidance(project_root: str) -> str:
 def _withdraw_recovery_plan(
     dispatch_id: str, project_root: str,
 ) -> tuple[Path, dict | None, dict, dict[Path, dict], str | None]:
-    """Run the withdrawal liveness preflight and return its actor details.
+    """Run the exact withdrawal dry-run preflight and return its actor details.
 
-    ``operator`` is used only for this read-only probe so an unowned dead row
-    can be classified. The mutating command still uses the recorded owner, or
-    the explicit operator override when the row has no owner.
+    The first probe discovers the recorded owner without changing state. The
+    second probe uses the same owner/operator arguments that the printed
+    command will use, so guidance is emitted only when that command is safe.
     """
     probe = argparse.Namespace(
         dispatch_id=dispatch_id,
@@ -3486,27 +3486,54 @@ def _withdraw_recovery_plan(
     )
     owner = (record or {}).get("controller_label") or attempt.get("owner_controller_label")
     owner = str(owner).strip() if owner else None
+    _withdraw_preflight(
+        argparse.Namespace(
+            dispatch_id=dispatch_id,
+            project_root=str(root),
+            operator=owner is None,
+            controller_label=owner,
+            dry_run=True,
+        )
+    )
     return root, record, attempt, carriers, owner
 
 
-def _retry_recovery_command(
+def _withdraw_recovery_command(
     held_id: str,
     replacement_id: str,
     project_root: str,
     *,
+    state: str,
     owner: str | None = None,
     operator: bool = False,
 ) -> str:
     command = [
         sys.executable, str(Path(__file__).resolve()), "withdraw", held_id,
-        "--superseded-by", replacement_id, "--reason",
-        "retry same task after held dispatch ended", "--project-root", project_root,
     ]
+    if state in {"worker_dead", "stale_dead"}:
+        command.extend(("--superseded-by", replacement_id))
+    command.extend((
+        "--reason", "retry same task after held dispatch ended",
+        "--project-root", project_root,
+    ))
     if owner:
         command.extend(("--controller-label", owner))
     elif operator:
         command.append("--operator")
     return shlex.join(command)
+
+
+def _rerun_dispatch_command(args, replacement_id: str) -> str:
+    original = list(getattr(args, "_original_argv", None) or [])
+    if original:
+        original = _set_option_before_worker_remainder(
+            original, "--dispatch-id", replacement_id
+        )
+    else:
+        original = ["--dispatch-id", replacement_id]
+    return shlex.join([
+        sys.executable, str(Path(__file__).resolve()), *original,
+    ])
 
 
 def _completion_refusal_guidance(
@@ -3523,24 +3550,48 @@ def _completion_refusal_guidance(
         lines = []
         for dispatch_id, state in held:
             try:
-                root, _record, _attempt, _carriers, owner = _withdraw_recovery_plan(
+                root, _record, attempt, _carriers, owner = _withdraw_recovery_plan(
                     dispatch_id, project_root
                 )
             except Exception as exc:
                 liveness = getattr(exc, "liveness", None)
                 if liveness == "live":
                     lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder is LIVE. Do not withdraw it.")
-                else:
+                elif liveness == "indeterminate":
                     lines.append(f"{task_text} is held by {dispatch_id} (state {state}); holder liveness is indeterminate. Do not withdraw it yet. Resume it or wait for verification; opening a new task row is interim.")
+                else:
+                    lines.append(
+                        f"{task_text} is held by {dispatch_id} (state {state}); "
+                        f"withdraw dry-run refused ({exc}). Do not withdraw it; "
+                        "resume it or wait for verification; opening a new task "
+                        "row is interim."
+                    )
                 continue
-            command = _retry_recovery_command(
+            withdrawal_state = str(
+                attempt.get("terminal_state") or state
+            )
+            if withdrawal_state not in {"worker_dead", "stale_dead", "abandoned"}:
+                lines.append(
+                    f"{task_text} is held by {dispatch_id} (state {state}); "
+                    f"withdrawal state is {withdrawal_state or 'unknown'}. "
+                    "No withdrawal command is safe; inspect the holder before retrying."
+                )
+                continue
+            command = _withdraw_recovery_command(
                 dispatch_id,
                 replacement,
                 str(root),
+                state=withdrawal_state,
                 owner=owner,
                 operator=owner is None,
             )
-            lines.append(f"{task_text} is held by {dispatch_id} (state {state}). To retry the same task: {command}, then re-run this dispatch. Or re-run it with --retry-of {dispatch_id}.")
+            rerun = _rerun_dispatch_command(args, replacement)
+            lines.append(
+                f"{task_text} is held by {dispatch_id} (state {state}). "
+                "Run these steps to retry the same task:\n"
+                f"  1. {command}\n"
+                f"  2. {rerun}"
+            )
         text = "\n".join(lines)
         return text + ("\n" + _reconcile_outbox_guidance(project_root) if publication_failed else "")
     if held and live:
@@ -3596,73 +3647,6 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
         flush=True,
     )
     raise DispatchUsageError(message)
-
-
-def _prepare_retry_of(args) -> None:
-    """Withdraw one confirmed stale holder before ordinary launch admission."""
-    held_id = str(getattr(args, "retry_of", "") or "").strip()
-    if not held_id:
-        return
-    task_ids = set(getattr(args, "task_ids", []) or [])
-    if not task_ids:
-        raise DispatchUsageError("--retry-of requires at least one --task held by that dispatch")
-
-    replacement_id = str(getattr(args, "dispatch_id", "") or "").strip()
-    if not replacement_id:
-        raise DispatchUsageError("--retry-of requires a resolved replacement dispatch id")
-    if replacement_id == held_id:
-        raise DispatchUsageError("--retry-of and --dispatch-id must name different dispatches")
-
-    try:
-        project_root = _project_root(args)
-        root, record, attempt, carriers, owner = _withdraw_recovery_plan(
-            held_id, str(project_root)
-        )
-        requested_label = str(
-            getattr(args, "controller_label", None)
-            or os.environ.get("GOALFLIGHT_CONTROLLER_LABEL")
-            or ""
-        ).strip() or None
-        if owner is not None and requested_label != owner:
-            raise ValueError(
-                f"dispatch belongs to {owner!r}; use its --controller-label, "
-                "or the human owner may pass --operator"
-            )
-        withdraw_args = argparse.Namespace(
-            dispatch_id=held_id,
-            project_root=str(root),
-            operator=owner is None,
-            controller_label=owner if owner is not None else None,
-        )
-        entry = next(iter(carriers.values()), {})
-        missing = sorted(task_ids - set(_entry_task_ids(entry, record)))
-        if missing:
-            raise ValueError(
-                f"holder does not hold task ids {', '.join(missing)}"
-            )
-        held_state = str((record or {}).get("state") or (record or {}).get("terminal_state") or attempt.get("terminal_state") or "")
-        if held_state not in _SELF_HELD_LEDGER_STATES:
-            raise ValueError(
-                f"holder state {held_state or 'unknown'} is not stale"
-            )
-
-        command = [held_id, "--reason", "retry same task after held dispatch ended", "--superseded-by", replacement_id, "--project-root", str(root)]
-        if withdraw_args.operator:
-            command.append("--operator")
-        else:
-            command.extend(("--controller-label", str(withdraw_args.controller_label)))
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = _cmd_withdraw(command)
-        if code != 0:
-            detail = output.getvalue().strip()
-            raise ValueError(detail or "withdraw failed")
-    except Exception as exc:
-        if getattr(args, "_auto_dispatch_id_reserved", False):
-            _release_auto_dispatch_id_reservation(
-                replacement_id, _dispatch_base_dir()
-            )
-        raise DispatchUsageError(f"--retry-of {held_id} refused: {exc}") from exc
 
 
 def _emit_launch_wake_notice() -> None:
@@ -5929,26 +5913,6 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
             fh.write("\n")
         return dispatch_id
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
-
-
-def _release_auto_dispatch_id_reservation(dispatch_id: str, base: Path) -> None:
-    path = base / ".dispatch-ids" / f"{dispatch_id}.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("dispatch_id") != dispatch_id
-            or payload.get("pid") != os.getpid()
-        ):
-            return
-        path.unlink()
-    except (OSError, TypeError, ValueError):
-        return
-
-
-def _release_retry_dispatch_id_reservation(args, base: Path) -> None:
-    if getattr(args, "retry_of", None) and getattr(args, "_auto_dispatch_id_reserved", False):
-        _release_auto_dispatch_id_reservation(args.dispatch_id, base)
 
 
 @dataclass(frozen=True)
@@ -8584,7 +8548,6 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--codex-resume-home": "preserve",
     "--codex-home-owner-dispatch-id": "preserve",
     "--dispatch-id": "replace",
-    "--retry-of": "strip",
     "--tail": "replace",
     "--status-json": "replace",
     "--foreground": "strip",
@@ -8639,7 +8602,6 @@ _REPLAY_VALUE_OPTIONS = {
     "--codex-resume-home",
     "--codex-home-owner-dispatch-id",
     "--dispatch-id",
-    "--retry-of",
     "--tail",
     "--status-json",
     "--queue-launch-token",
@@ -19990,10 +19952,6 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail", help="Worker output sink (auto: <state>/dispatch/<id>.tail)")
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")
-    parser.add_argument(
-        "--retry-of",
-        help="Withdraw a confirmed stale holder before retrying its linked task(s)",
-    )
     parser.add_argument("--poll-secs", type=float, default=2.0)
     parser.add_argument(
         "--max-idle-secs",
@@ -20271,23 +20229,16 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
-            args._auto_dispatch_id_reserved = False
             if not args.dispatch_id:
                 args.dispatch_id = (
                     _default_dispatch_id(args.agent)
                     if goalflight_compat.is_windows()
                     else _reserve_auto_dispatch_id(args.agent, base)
                 )
-                args._auto_dispatch_id_reserved = not goalflight_compat.is_windows()
-            try:
-                _refuse_reused_dispatch_id_for_launch(
-                    args.dispatch_id,
-                    allow_queued=args.from_queue,
-                )
-                _prepare_retry_of(args)
-            except DispatchUsageError:
-                _release_retry_dispatch_id_reservation(args, base)
-                raise
+            _refuse_reused_dispatch_id_for_launch(
+                args.dispatch_id,
+                allow_queued=args.from_queue,
+            )
             _emit_launch_wake_notice()
             # Direct resume launches must validate before exempting lineage or
             # binding a seat; claim-boundary validation remains under its lock.
@@ -20338,7 +20289,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
         except DispatchUsageError as e:
-            _release_retry_dispatch_id_reservation(args, base)
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
 
@@ -20366,11 +20316,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Auto-derive id + paths so the common call is one line.
     base = _dispatch_base_dir()
-    args._auto_dispatch_id_reserved = False
     if not args.dispatch_id:
         try:
             args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
-            args._auto_dispatch_id_reserved = True
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
@@ -20379,7 +20327,6 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue,
         )
-        _prepare_retry_of(args)
         _emit_launch_wake_notice()
         # Validate direct resumes before lineage exemption and seat mutation.
         if args.parent_dispatch_id:
@@ -20404,7 +20351,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
         return 1
     except DispatchUsageError as e:
-        _release_retry_dispatch_id_reservation(args, base)
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     # Occupancy is the filesystem-corruption gate; it must refuse a second

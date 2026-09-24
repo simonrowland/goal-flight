@@ -228,10 +228,30 @@ def _dispatch_records(
         reason = f"ledger unreadable rows=1: {ledger_read_error or 'unknown error'}"
         if status_error:
             reason += "; " + status_error
+        # A terminal sidecar cannot prove that its worker is gone while the
+        # ledger is unreadable. Count every sidecar that the later candidate
+        # pass will skip (terminal, stale, or missing a worker pid) as an
+        # unverified source instead of turning an all-terminal scan into a
+        # confident zero.
+        unaccounted_sidecars = sum(
+            1
+            for payload in status_payloads
+            if any(
+                goalflight_dispatch_states.is_terminal_state(payload.get(field))
+                for field in ("state", "terminal_state")
+            )
+            or not (
+                isinstance(payload.get("worker_pid"), int)
+                and payload["worker_pid"] > 0
+                and _record_is_recent(payload, now=now)
+            )
+        )
         source_records.append(
             {
                 "_source_unverified_reason": reason,
-                "_source_unverified_count": 0 if status_payloads else 1,
+                "_source_unverified_count": (
+                    unaccounted_sidecars if status_payloads else 1
+                ),
             }
         )
     if unreadable_rows:
@@ -568,9 +588,13 @@ def render(summary: Mapping[str, object]) -> str:
                 f"{controller_text}{warning_text}"
             )
     reasons = summary.get("unknown_reasons")
-    if isinstance(reasons, Sequence) and reasons:
+    totals_unverified = isinstance(reasons, Sequence) and bool(reasons)
+    if totals_unverified:
         lines.append("  UNKNOWN: " + "; ".join(str(reason) for reason in reasons))
-    lines.append(f"  total live: {int(summary.get('total', 0))}")
+    total_label = "total live"
+    if totals_unverified:
+        total_label += " (lower bound; unverified)"
+    lines.append(f"  {total_label}: {int(summary.get('total', 0))}")
     lines.append(f"  total unverified: {int(summary.get('unverified_total', 0))}")
     return "\n".join(lines)
 
@@ -588,12 +612,14 @@ def live_mix_pointer(summary: Mapping[str, object]) -> str:
                     counts[family] += int(details.get("count", 0))
     joined = ", ".join(f"{family} {counts[family]}" for family in POINTER_FAMILIES)
     reasons = summary.get("unknown_reasons")
+    totals_unverified = isinstance(reasons, Sequence) and bool(reasons)
     unknown = (
         "; UNKNOWN: " + "; ".join(str(reason) for reason in reasons)
-        if isinstance(reasons, Sequence) and reasons
+        if totals_unverified
         else ""
     )
-    return f"live mix: {joined}{unknown}; see /goal-flight traffic"
+    lower_bound = "; totals lower bound (unverified)" if totals_unverified else ""
+    return f"live mix: {joined}{lower_bound}{unknown}; see /goal-flight traffic"
 
 
 def build_parser() -> argparse.ArgumentParser:
