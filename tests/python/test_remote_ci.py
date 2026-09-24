@@ -391,14 +391,16 @@ def test_run_command_reports_unknown_when_group_leader_is_not_signalable(
             raise subprocess.TimeoutExpired(["fake"], timeout)
 
     process = Process()
-    monkeypatch.setattr(ci.subprocess, "Popen", lambda *args, **kwargs: process)
-    monkeypatch.setattr(ci.goalflight_compat, "process_start_identity",
-                        lambda pid: {"pid": pid, "start_token": "old"})
-    monkeypatch.setattr(ci.goalflight_compat, "process_identity_matches",
-                        lambda *_: identity_match)
-    monkeypatch.setattr(ci.os, "getpgid", lambda pid: 4242)
-    monkeypatch.setattr(ci.os, "killpg", lambda *args: pytest.fail("reused group was signalled"))
-    result = run_command(["fake"], timeout=0.1)
+    with monkeypatch.context() as patch:
+        patch.setattr(ci.subprocess, "Popen", lambda *args, **kwargs: process)
+        patch.setattr(ci.goalflight_compat, "process_start_identity",
+                      lambda pid: {"pid": pid, "start_token": "old"})
+        patch.setattr(ci.goalflight_compat, "process_identity_matches",
+                      lambda *_: identity_match)
+        patch.setattr(ci.os, "getpgid", lambda pid: 4242)
+        patch.setattr(ci.os, "killpg",
+                      lambda *args: pytest.fail("reused group was signalled"))
+        result = run_command(["fake"], timeout=0.1)
     assert result.unknown is True
     assert result.timed_out is True
     assert process.stdout.closed and process.stderr.closed
@@ -1701,7 +1703,8 @@ def test_kill_escalation_stops_when_the_pid_is_reused(monkeypatch):
     assert signal.SIGKILL not in signals
 
 
-def test_private_tree_proof_uses_the_recorded_coalition_without_parentage(tmp_path, monkeypatch):
+def test_same_boot_coalition_id_uses_xnu_monotonicity_without_parentage(tmp_path, monkeypatch):
+    """XNU's boot-local monotonic ID makes the recorded coalition stable."""
     import goalflight_remote_ci_node as node
 
     run = tmp_path / "run"
@@ -1718,6 +1721,26 @@ def test_private_tree_proof_uses_the_recorded_coalition_without_parentage(tmp_pa
         "workload_pid": 4242, "workload_start": [1, 2],
     }
     assert node._private_tree_proof(state, 100, [(99991, (1, 2))], run=run) is True
+
+
+def test_same_boot_stale_coalition_record_is_not_private(tmp_path, monkeypatch):
+    """An inconsistent same-boot wrapper record fails closed as a poison."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 4242, "start": [1, 2], "coalition_id": 101,
+        "boot_session": "boot-a",
+    }), encoding="utf-8")
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 7)
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    state = {
+        "coalition_id": 100, "coalition_boot_session": "boot-a",
+        "holder_coalition_id": 5, "holder_coalition_boot_session": "boot-a",
+        "workload_pid": 4242, "workload_start": [1, 2],
+    }
+    assert node._private_tree_proof(state, 100, run=run) is False
 
 
 def test_stale_coalition_boot_session_is_not_proven_private(tmp_path, monkeypatch):

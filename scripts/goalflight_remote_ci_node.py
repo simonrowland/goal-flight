@@ -650,6 +650,14 @@ def _private_tree_proof(state, cid, members=None, run=None):
             or state.get("coalition_id") != cid
             or not _positive_cid(cid)):
         return False
+    # XNU initializes coalition_next_id once per boot and assigns
+    # coalition_next_id++ under the coalition list lock; coalition.id is
+    # documented as monotonically increasing. That makes the boot-session
+    # fence the incarnation fence for a coalition ID within one boot.
+    # Source:
+    # https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/coalition.c#L88-L90
+    # https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/coalition.c#L258-L260
+    # https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/coalition.c#L1228-L1268
     boot = state.get("coalition_boot_session")
     if not isinstance(boot, str) or not boot or _boot_session_id() != boot:
         return False
