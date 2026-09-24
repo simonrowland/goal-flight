@@ -1902,6 +1902,7 @@ def _resume_worktree_is_descendant(
 
 
 def _resume_recovery_refs_for_parent(
+    project_root: Path,
     parent_dispatch_id: str,
 ) -> list[str]:
     """Find refs recorded when this dispatch's seat was reclaimed.
@@ -1935,6 +1936,36 @@ def _resume_recovery_refs_for_parent(
             value = candidate.get(key)
             if value and str(value) not in refs:
                 refs.append(str(value))
+    dispatch_token = re.escape(str(parent_dispatch_id))
+    for pattern in (
+        "refs/goalflight/keep/",
+        "refs/heads/goalflight/quarantine/",
+    ):
+        proc = goalflight_worktree_pool._git_proc(
+            project_root,
+            "for-each-ref",
+            "--format=%(refname)",
+            pattern,
+        )
+        if proc is None or proc.returncode != 0:
+            detail = (
+                (proc.stderr or proc.stdout).strip()
+                if proc is not None
+                else "git for-each-ref could not run"
+            ) or (f"exit {proc.returncode}" if proc is not None else "unknown error")
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: could not inspect recovery refs for "
+                f"{parent_dispatch_id}: {detail}"
+            )
+        for ref in proc.stdout.splitlines():
+            ref = ref.strip()
+            leaf = ref.rsplit("/", 1)[-1]
+            if (
+                ref
+                and re.search(rf"(?:^|-){dispatch_token}(?:-|$)", leaf)
+                and ref not in refs
+            ):
+                refs.append(ref)
     return refs
 
 
@@ -1949,7 +1980,7 @@ def _resume_worktree_branch_spec(
     branch and recorded head are; a free seat may only be prepared after both
     agree. Legacy records can still recover their ``seat/<id>`` branch.
     """
-    recovery_refs = _resume_recovery_refs_for_parent(parent_dispatch_id)
+    recovery_refs = _resume_recovery_refs_for_parent(project_root, parent_dispatch_id)
     if recovery_refs:
         raise goalflight_worktree_pool.WorktreeCwdRefused(
             f"resume refused: recycled worktree for {parent_dispatch_id} has "
@@ -2107,11 +2138,16 @@ def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id
 def _worktree_occupancy_before_reset(args):
     """Check a selected existing seat before the pool mutates it."""
     def check(path: Path) -> None:
+        checked_path = str(path.resolve(strict=False))
+        previous_path = getattr(args, "_worktree_occupancy_checked_path", None)
+        if previous_path and previous_path != checked_path:
+            _release_worktree_occupancy_lock(args)
         args.cwd = str(path)
         args._worktree_occupancy_warning = _prepare_attempt_worktree_occupancy(
             args
         )
         args._worktree_occupancy_checked = True
+        args._worktree_occupancy_checked_path = checked_path
 
     return check
 
@@ -2143,7 +2179,24 @@ def _validate_resume_worktree_source(
             )
         ):
             return
-        _resume_worktree_branch_spec(project_root, parent_dispatch_id, record)
+        expected_branch, expected_head, _keep_ref, _quarantine_ref = (
+            _resume_worktree_branch_spec(project_root, parent_dispatch_id, record)
+        )
+        try:
+            actual_branch = goalflight_worktree_pool._git(
+                cwd, "rev-parse", "--abbrev-ref", "HEAD"
+            )
+            actual_head = goalflight_worktree_pool._git(cwd, "rev-parse", "HEAD")
+        except goalflight_worktree_pool.WorktreeSeatError as exc:
+            raise DispatchUsageError(
+                f"resume refused: could not inspect recorded worktree {cwd}: {exc}"
+            ) from exc
+        if actual_branch != expected_branch or actual_head != expected_head:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: recorded checkout {cwd} has actual branch "
+                f"{actual_branch} at {actual_head}; expected branch "
+                f"{expected_branch} at {expected_head}"
+            )
     except goalflight_task.TaskError as exc:
         raise DispatchUsageError(f"resume refused: parent project_root {raw_root} is missing or invalid") from exc
     except goalflight_worktree_pool.WorktreeSeatError as exc:
@@ -2462,10 +2515,15 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     """Bind a seat after account/capacity admission and before launch writes."""
     lease = _bind_dispatch_worktree(args)
     warning = getattr(args, "_worktree_occupancy_warning", None)
-    if not getattr(args, "_worktree_occupancy_checked", False):
+    checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
+    current_path = str(Path(str(_worker_cwd(args))).resolve(strict=False))
+    if checked_path != current_path:
+        if checked_path:
+            _release_worktree_occupancy_lock(args)
         warning = _prepare_attempt_worktree_occupancy(args)
         args._worktree_occupancy_warning = warning
         args._worktree_occupancy_checked = True
+        args._worktree_occupancy_checked_path = current_path
     if warning is not None:
         args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
     return lease
@@ -6003,6 +6061,82 @@ def _finalize_grok_resume(
     return materialized, prompt_path, engine_session_id
 
 
+def _prepare_unpinned_codex_resume(args) -> None:
+    """Select the effective account for an unpinned resume without writes."""
+    selected_account, rejections = select_codex_account(
+        model=getattr(args, "model", None)
+    )
+    args._codex_selected_account = selected_account
+    args._codex_account_rejections = rejections
+    args._capacity_account = selected_account
+
+
+def _resolve_unpinned_codex_resume(args, dispatch_id: str) -> None:
+    """Build the selected resume home after account and seat admission."""
+    selected_account = (
+        getattr(args, "_codex_selected_account", None)
+        or getattr(args, "_capacity_account", None)
+    )
+    try:
+        preflight_home, effective_account = resolve_codex_home(
+            _project_root(args),
+            selected_account,
+            dispatch_id,
+        )
+    except Exception as exc:
+        raise DispatchUsageError(
+            "resume refused: codex account resolution failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if preflight_home is None and effective_account is None:
+        if selected_account:
+            raise DispatchUsageError(
+                "resume refused: selected Codex account could not be resolved: "
+                f"{selected_account}"
+            )
+        return
+    if preflight_home is None and effective_account == "host":
+        args._codex_resume_pre_resolved = {
+            "home": None,
+            "account": "host",
+        }
+        args._codex_selected_account = None
+        args._capacity_account = None
+        return
+    if (
+        not isinstance(preflight_home, str)
+        or not isinstance(effective_account, str)
+        or not preflight_home
+        or not effective_account
+    ):
+        raise DispatchUsageError(
+            "resume refused: codex account resolver returned an invalid home "
+            "or effective account"
+        )
+    expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
+        strict=False
+    )
+    if Path(preflight_home).resolve(strict=False) != expected_home:
+        raise DispatchUsageError(
+            "resume refused: codex account resolver returned home "
+            f"{preflight_home!r} for {dispatch_id}, expected {expected_home}"
+        )
+    args._codex_resume_pre_resolved = {
+        "home": preflight_home,
+        "account": effective_account,
+    }
+    args._codex_selected_account = (
+        effective_account
+        if effective_account not in {"host", "default"}
+        else None
+    )
+    args._capacity_account = (
+        None
+        if effective_account in {"host", "default"}
+        else effective_account
+    )
+
+
 def _preflight_resume_dispatch(
     source: dict,
     *,
@@ -6064,14 +6198,7 @@ def _preflight_resume_dispatch(
             args._capacity_account = effective_account
             args._codex_resume_pre_resolved = {"home": preflight_home, "account": effective_account}
         else:
-            record = source.get("record") or {}
-            parent_account = record.get("effective_account") or record.get("account")
-            if isinstance(parent_account, str) and parent_account and parent_account != "default":
-                args._capacity_account = parent_account
-            else:
-                args._capacity_account, _rejected = select_codex_account(
-                    model=getattr(args, "model", None)
-                )
+            _prepare_unpinned_codex_resume(args)
     elif engine == "grok":
         args._capacity_account = (
             getattr(args, "account", None) or grok_selected_account(args)
@@ -6261,30 +6388,45 @@ def _default_dispatch_id(agent: str) -> str:
     return os.environ.get("GOALFLIGHT_DISPATCH_ID_SEED") or f"{agent}-{os.getpid()}-{int(time.time())}"
 
 
+def _write_dispatch_id_reservation(agent: str, ids_dir: Path, dispatch_id: str) -> str:
+    lock_path = ids_dir / f"{dispatch_id}.json"
+    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "dispatch_id": dispatch_id,
+                "agent": agent,
+                "reserved_at": int(time.time()),
+                "pid": os.getpid(),
+            },
+            fh,
+            sort_keys=True,
+        )
+        fh.write("\n")
+    return dispatch_id
+
+
+def _reserve_resume_dispatch_id(agent: str, base: Path, dispatch_id: str) -> str:
+    ids_dir = base / ".dispatch-ids"
+    ids_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        return _write_dispatch_id_reservation(agent, ids_dir, dispatch_id)
+    except FileExistsError as exc:
+        raise DispatchUsageError(
+            f"resume refused: dispatch id {dispatch_id!r} was reserved concurrently"
+        ) from exc
+
+
 def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
     stem = _default_dispatch_id(agent)
     ids_dir = base / ".dispatch-ids"
     ids_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     for attempt in range(1000):
         dispatch_id = stem if attempt == 0 else f"{stem}-{attempt + 1}"
-        lock_path = ids_dir / f"{dispatch_id}.json"
         try:
-            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            return _write_dispatch_id_reservation(agent, ids_dir, dispatch_id)
         except FileExistsError:
             continue
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "dispatch_id": dispatch_id,
-                    "agent": agent,
-                    "reserved_at": int(time.time()),
-                    "pid": os.getpid(),
-                },
-                fh,
-                sort_keys=True,
-            )
-            fh.write("\n")
-        return dispatch_id
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
 
 
@@ -20539,7 +20681,14 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         args.dispatch_id, allow_queued=True
                     )
                 else:
-                    _refuse_existing_dispatch_id_for_resume(args.dispatch_id)
+                    parent_record = _find_dispatch_record(args.parent_dispatch_id) or {}
+                    _refuse_existing_dispatch_id_for_resume(
+                        args.dispatch_id,
+                        project_root=(
+                            getattr(args, "project_root", None)
+                            or parent_record.get("project_root")
+                        ),
+                    )
             _refuse_launch_blocked_by_completion_authority(args)
             resume_source = _validate_resume_source(
                 args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
@@ -20563,16 +20712,17 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         )
         try:
             base = _dispatch_base_dir()
-            reserved_id = _reserve_auto_dispatch_id(args.agent, base)
+            reserved_id = _reserve_resume_dispatch_id(
+                args.agent,
+                base,
+                str(resume_plan["dispatch_id"]),
+            )
         except BaseException:
             _release_capacity(resume_lease_id, "failed", "resume admission failed")
             raise
         args.dispatch_id = reserved_id
         resume_plan["reserved_dispatch_id"] = reserved_id
         resume_plan["capacity_lease_id"] = resume_lease_id
-        if reserved_id != resume_plan["dispatch_id"]:
-            cleanup_codex_dispatch_home(resume_plan["dispatch_id"])
-            args._codex_resume_pre_resolved = None
         args._original_argv = _set_option_before_worker_remainder(
             list(argv),
             "--dispatch-id",
@@ -20819,12 +20969,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             and resume_engine == "codex"
             and not getattr(args, "account", None)
         ):
-            parent_record = _find_dispatch_record(args.parent_dispatch_id) or {}
-            parent_account = parent_record.get("effective_account") or parent_record.get(
-                "account"
-            )
-            if parent_account and parent_account != "default":
-                args._capacity_account = str(parent_account)
+            _prepare_unpinned_codex_resume(args)
 
         if (
             _account_engine(args.agent) == "codex"
@@ -20942,6 +21087,12 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             _account_engine(args.agent) == "codex"
             and not goalflight_compat.is_windows()
         ):
+            if (
+                getattr(args, "parent_dispatch_id", None)
+                and not getattr(args, "account", None)
+                and getattr(args, "_codex_resume_pre_resolved", None) is None
+            ):
+                _resolve_unpinned_codex_resume(args, args.dispatch_id)
             if getattr(args, "parent_dispatch_id", None):
                 resume_home = Path(
                     getattr(args, "_codex_resume_source_home", args.codex_resume_home)
@@ -21007,8 +21158,46 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         args.codex_resume_home = codex_dispatch_home
                         summary_head["codex_home_owner_dispatch_id"] = args.dispatch_id
                     elif source_is_canonical:
-                        codex_dispatch_home = str(resume_home)
-                        effective_account = parent_account
+                        pre_resolved = getattr(
+                            args, "_codex_resume_pre_resolved", None
+                        )
+                        target_account = getattr(
+                            args, "_codex_selected_account", None
+                        ) or (
+                            pre_resolved.get("account")
+                            if isinstance(pre_resolved, dict)
+                            else None
+                        )
+                        if target_account and target_account not in {
+                            "host",
+                            "default",
+                            parent_account,
+                        }:
+                            # Unpinned resume follows fresh dispatch account
+                            # selection; copy the source rollout into the
+                            # resolver-selected home instead of retaining an
+                            # exhausted parent account.
+                            codex_dispatch_home, effective_account = (
+                                _seed_codex_resume_home_from_canonical(
+                                    project_root,
+                                    args.parent_dispatch_id,
+                                    resume_home,
+                                    args.codex_session_id,
+                                    dispatch_id=args.dispatch_id,
+                                    account=target_account,
+                                    model=getattr(args, "model", None),
+                                    pre_resolved=pre_resolved,
+                                )
+                            )
+                            codex_home_owner_dispatch_id = args.dispatch_id
+                            args.codex_home_owner_dispatch_id = args.dispatch_id
+                            args.codex_resume_home = codex_dispatch_home
+                            summary_head["codex_home_owner_dispatch_id"] = (
+                                args.dispatch_id
+                            )
+                        else:
+                            codex_dispatch_home = str(resume_home)
+                            effective_account = parent_account
                     else:
                         pre_resolved = getattr(
                             args, "_codex_resume_pre_resolved", None

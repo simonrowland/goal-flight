@@ -1289,7 +1289,7 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
 
     prompt = tmp_path / "resume.md"
     prompt.write_text("Add one more feature.", encoding="utf-8")
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_args: fresh_child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_args: fresh_child_id)
     spawn_calls, worker_pids = _stub_resume_runtime(monkeypatch)
 
     def identity_matches(probe: dict) -> tuple[bool, str]:

@@ -875,6 +875,64 @@ def test_same_account_canonical_resume_is_unchanged(
     assert not _dispatch_home(tmp_path, child_id).exists()
 
 
+def test_resume_command_unpinned_canonical_home_uses_effective_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "unpinned-canonical-parent"
+    child_id = "unpinned-canonical-child"
+    source, rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="exhausted-seat"
+    )
+    assert rollout is not None
+    target = _dispatch_home(tmp_path, child_id)
+    prompt = tmp_path / "unpinned-resume.md"
+    prompt.write_text("Continue on a healthy account.\n", encoding="utf-8")
+    resolve_calls: list[tuple[str | None, str]] = []
+
+    def resolve(
+        _project_root: Path,
+        explicit_account: str | None,
+        dispatch_id: str,
+    ) -> tuple[str, str]:
+        resolve_calls.append((explicit_account, dispatch_id))
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "auth.json").write_text("healthy-seat-login", encoding="utf-8")
+        return str(target), "healthy-seat"
+
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(
+        D,
+        "select_codex_account",
+        lambda **_kwargs: ("healthy-seat", []),
+    )
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+    capacity_accounts: list[str | None] = []
+    monkeypatch.setattr(
+        D,
+        "_acquire_capacity",
+        lambda args, **_kwargs: capacity_accounts.append(
+            getattr(args, "_capacity_account", None)
+        )
+        or "lease-unpinned",
+    )
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
+
+    assert resolve_calls == [("healthy-seat", child_id)]
+    assert capacity_accounts == ["healthy-seat"]
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    assert worker["env"]["CODEX_HOME"] == str(target)
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["effective_account"] == "healthy-seat"
+    assert child["codex_home"] == str(target)
+    assert S.rollout_path(target, OTHER_CANONICAL_SESSION_ID) is not None
+    assert S.rollout_path(source, OTHER_CANONICAL_SESSION_ID) == rollout
+
+
 def test_cross_account_canonical_resume_without_rollout_fails_loudly(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1020,7 +1078,7 @@ def test_resume_command_reuses_one_effective_account_preflight(
     )
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
     _stub_detached_runtime(monkeypatch)
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_a, **_k: child_id)
     capacity_accounts: list[str | None] = []
     monkeypatch.setattr(
         D,
@@ -1211,7 +1269,7 @@ def test_resume_replayed_child_id_refuses_before_account_home_build(
     prompt.write_text(
         "Continue without rebuilding the replayed child.\n", encoding="utf-8"
     )
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_a, **_k: child_id)
     monkeypatch.setattr(D, "_codex_seat_api", lambda: SimpleNamespace())
     monkeypatch.setattr(
         D,
@@ -1273,7 +1331,7 @@ def test_resume_legacy_controller_label_is_enforced_from_argv(
     prompt.write_text("Continue.\n", encoding="utf-8")
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_args, **_kwargs: pytest.fail(
             "legacy controller-label mismatch must refuse before reservation"
         ),
@@ -1535,7 +1593,7 @@ def test_resume_reconnects_through_current_controller_after_restart(
     )
     prompt = tmp_path / "restart-resume.md"
     prompt.write_text("Continue after the controller restart.\n", encoding="utf-8")
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_a, **_k: child_id)
     _stub_detached_runtime(monkeypatch)
 
     try:
@@ -1633,6 +1691,70 @@ def test_resume_refuses_child_id_reserved_in_journal_before_launch(
     assert launched == []
     assert not L.record_path(child_id).exists()
     assert "already has a journal attempt" in capsys.readouterr().err
+
+
+def test_direct_resume_journal_fence_uses_parent_project_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "direct-journal-parent"
+    child_id = "direct-journal-child"
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(tmp_path),
+            "engine_session_id": SESSION_ID,
+        }
+    )
+    prompt = tmp_path / "direct-journal.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+    seen: list[tuple[str, str | Path | None]] = []
+
+    def fence(dispatch_id: str, *, project_root=None) -> None:
+        seen.append((dispatch_id, project_root))
+        raise D.DispatchUsageError("journal fence")
+
+    monkeypatch.setattr(D, "_refuse_existing_dispatch_id_for_resume", fence)
+
+    assert D.main(
+        [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            child_id,
+            "--parent-dispatch-id",
+            parent_id,
+            "--engine-session-id",
+            SESSION_ID,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--unregistered-forced",
+        ]
+    ) == 64
+    assert seen == [(child_id, str(tmp_path))]
+
+
+def test_resume_final_id_reservation_does_not_suffix_the_fenced_id(
+    tmp_path: Path,
+) -> None:
+    child_id = "exact-resume-child"
+    ids = tmp_path / ".dispatch-ids"
+    ids.mkdir(parents=True)
+    (ids / f"{child_id}.json").write_text("reserved\n", encoding="utf-8")
+
+    with pytest.raises(D.DispatchUsageError, match="reserved concurrently"):
+        D._reserve_resume_dispatch_id("codex", tmp_path, child_id)
+    assert not (ids / f"{child_id}-2.json").exists()
 
 
 def test_resume_explicit_controller_beacon_replaces_recorded_identity(
@@ -1763,8 +1885,8 @@ def test_resume_by_single_registered_controller_records_owner(
     )
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: child_id,
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: child_id,
     )
     _spawn_calls, leases = _stub_detached_runtime(monkeypatch)
 
@@ -1928,8 +2050,8 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     monkeypatch.setattr(D, "_CODEX_RESUME_CLAIM_VALIDATED_HOOK", claim_validated)
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: f"resume-child-{os.getpid()}",
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: f"resume-child-{os.getpid()}",
     )
 
     results = ctx.Queue()
@@ -2025,8 +2147,8 @@ def test_dead_preclaim_is_reconciled_before_retry(
     )
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: f"resume-child-{os.getpid()}",
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: f"resume-child-{os.getpid()}",
     )
 
     claimant = ctx.Process(
@@ -2076,8 +2198,8 @@ def test_closed_occupancy_fd_does_not_block_resume(
     _stub_detached_runtime(monkeypatch)
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "closed-fd-child",
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: "closed-fd-child",
     )
     # A closed descriptor number, not a live flock holder.
     monkeypatch.setenv(WP.OCCUPANCY_LOCK_FD_ENV, "999999")
@@ -2104,8 +2226,8 @@ def test_live_occupancy_holder_still_blocks_resume(
     _stub_detached_runtime(monkeypatch)
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "live-occ-child",
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: "live-occ-child",
     )
     lock = WP.try_acquire_worktree_path_lock(tmp_path, "live-holder")
     try:
@@ -2211,7 +2333,7 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
         return original_record(args, lease)
 
     monkeypatch.setattr(D, "_record_dispatch_worktree", record_bind)
-    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_args: child_id)
+    monkeypatch.setattr(D, "_reserve_resume_dispatch_id", lambda *_args: child_id)
 
     with pytest.raises(SystemExit) as exc_info:
         D._cmd_resume(
@@ -2250,8 +2372,8 @@ def test_parent_child_grandchild_resume_preserves_original_home_owner(
     reserved_ids = iter((child_id, grandchild_id))
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: next(reserved_ids),
+        "_reserve_resume_dispatch_id",
+        lambda _agent, _base, _dispatch_id: next(reserved_ids),
     )
     monkeypatch.setattr(D, "_dispatch_base_dir", lambda: dispatch_base)
 
@@ -2316,7 +2438,7 @@ def test_resume_fails_honestly_without_fresh_dispatch(
     prompt.write_text("Apply revisions.", encoding="utf-8")
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_args, **_kwargs: pytest.fail(
             "honest failure must not allocate a fresh dispatch"
         ),
@@ -2376,7 +2498,7 @@ def test_resume_refuses_worker_dead_source_whose_pid_is_live(
     monkeypatch.setattr(L, "identity_matches", lambda _record: (True, "live"))
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_args, **_kwargs: pytest.fail(
             "a live pid must not allocate a child dispatch"
         ),
@@ -2439,7 +2561,7 @@ def test_resume_refuses_live_or_indeterminate_source_with_exact_error(
     monkeypatch.setattr(L, "identity_matches", lambda _record: identity_result)
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_args, **_kwargs: pytest.fail(
             "live-source refusal must not allocate a child dispatch"
         ),
@@ -2480,7 +2602,7 @@ def test_resume_refuses_existing_nonterminal_child_for_same_session(
     prompt.write_text("Apply revisions.", encoding="utf-8")
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_args, **_kwargs: pytest.fail(
             "duplicate-child refusal must not allocate another child"
         ),

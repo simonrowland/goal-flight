@@ -8,7 +8,6 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("worktree seat leases require POSIX fcntl locks")
 
 import json
-import datetime as dt
 import os
 from pathlib import Path
 import shutil
@@ -237,6 +236,39 @@ def test_occupancy_refuses_before_existing_seat_reset(
     assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == branch_before
 
 
+def test_occupancy_is_rechecked_when_resume_falls_back_to_another_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "s-1"
+    second = tmp_path / "s-2"
+    args = SimpleNamespace(
+        cwd=str(first),
+        dispatch_id="resume-child",
+        _worktree_occupancy_checked=False,
+        _worktree_occupancy_checked_path=str(first.resolve()),
+        _worktree_occupancy_warning=None,
+        _worktree_occupancy_lock=None,
+    )
+    seen: list[str] = []
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_worktree_occupancy",
+        lambda current: seen.append(current.cwd) or None,
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_worker_cwd", lambda current: Path(current.cwd))
+
+    def bind(current):
+        goalflight_dispatch._worktree_occupancy_before_reset(current)(first)
+        current.cwd = str(second)
+        return object()
+
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", bind)
+
+    goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert seen == [str(first), str(second)]
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -344,6 +376,71 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
         assert not (seat.parent / "s-2").exists()
     finally:
         resumed.release()
+
+
+def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent"
+    child_id = "resume-child"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    recorded_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "worktree/foreign", recorded_head)
+    _git(seat, "checkout", "worktree/foreign")
+    parent.release()
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": f"worktree/{parent_id}",
+            "worktree_head": recorded_head,
+            "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+            ],
+        }
+    )
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the worker.\n", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "grok_selected_account", lambda _args: None)
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "main",
+        lambda argv=None, **_kwargs: launched.append(list(argv or [])) or 0,
+    )
+
+    assert goalflight_dispatch._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    error = capsys.readouterr().err
+    assert "actual branch worktree/foreign" in error
+    assert f"expected branch worktree/{parent_id}" in error
+    assert recorded_head in error
+    assert launched == []
 
 
 def test_resume_in_place_accepts_recorded_linked_worktree_without_seat(
@@ -641,7 +738,13 @@ def test_resume_recycled_branch_divergence_is_refused_before_new_seat(
         recorded_head,
     )
     parent.release()
-    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo,
+        "reclaimer",
+        occupy_path=old_seat,
+        reset=False,
+        expected_prior_dispatch_id="resume-parent",
+    )
     args = SimpleNamespace(
         worktree="HEAD",
         parent_dispatch_id="resume-parent",
@@ -888,6 +991,8 @@ def test_resume_recycled_dirty_state_uses_reclaim_owner(
 
     reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
     assert reclaimer.quarantine_branch
+    if reclaimed_for == "other-parent":
+        _git(repo, "update-ref", "-d", f"refs/heads/{reclaimer.quarantine_branch}")
     goalflight_ledger.write_record(
         {
             "schema": goalflight_ledger.SCHEMA,
@@ -966,6 +1071,8 @@ def test_resume_recycled_dirty_state_finds_archived_reclaimer(
     assert reclaimer.quarantine_branch
     recovery_ref = reclaimer.quarantine_branch
     reclaimer.release()
+    # Simulate a crash after the reclaim ref was published but before the
+    # reclaimer could publish its ledger row.
     old = "2000-01-01T00:00:00+00:00"
     goalflight_ledger.write_record(
         {
@@ -983,25 +1090,6 @@ def test_resume_recycled_dirty_state_finds_archived_reclaimer(
             "ended_at": old,
             "updated_at": old,
         }
-    )
-    goalflight_ledger.write_record(
-        {
-            "schema": goalflight_ledger.SCHEMA,
-            "dispatch_id": "reclaimer",
-            "agent": "codex",
-            "engine": "codex",
-            "state": "complete",
-            "terminal_state": "complete",
-            "project_root": str(repo),
-            "worktree_path": str(old_seat),
-            "worktree_quarantine_ref": recovery_ref,
-            "worktree_reclaimed_dispatch_id": "resume-parent",
-            "ended_at": old,
-            "updated_at": old,
-        }
-    )
-    goalflight_ledger.archive_terminal_records(
-        now=dt.datetime(2000, 2, 1, tzinfo=dt.timezone.utc)
     )
     args = SimpleNamespace(
         worktree="HEAD",

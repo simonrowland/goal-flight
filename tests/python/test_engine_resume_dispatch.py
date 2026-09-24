@@ -214,7 +214,7 @@ def test_resume_refuses_grok_without_recorded_handle(
     prompt.write_text("continue.\n", encoding="utf-8")
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_a, **_k: pytest.fail("missing handle must not allocate a child"),
     )
     rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])
@@ -517,7 +517,7 @@ def test_resume_refuses_live_grok_source(
     monkeypatch.setattr(L, "identity_matches", lambda _record: (True, "live"))
     monkeypatch.setattr(
         D,
-        "_reserve_auto_dispatch_id",
+        "_reserve_resume_dispatch_id",
         lambda *_a, **_k: pytest.fail("live-source refusal must not allocate"),
     )
     rc = D.main(["resume", parent_id, "--prompt-file", str(prompt)])

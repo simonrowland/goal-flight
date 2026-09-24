@@ -1176,7 +1176,12 @@ def _quarantine_dirty_worktree(
         )
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    branch = f"{QUARANTINE_REF_PREFIX}/{seat_name}-{stamp}"
+    safe_dispatch_id = (
+        re.sub(r"[^A-Za-z0-9._-]+", "-", str(abandoned_dispatch_id))
+        .strip(".-")
+        or "unknown-dispatch"
+    )
+    branch = f"{QUARANTINE_REF_PREFIX}/{seat_name}-{safe_dispatch_id}-{stamp}"
     message = (
         f"quarantine abandoned {seat_name}\n\n"
         f"Previous dispatch: {abandoned_dispatch_id}\n"
@@ -1288,7 +1293,7 @@ def _prepare_claimed_seat(
             worktree_path,
             base_commit=base_commit,
             moving_ref=safety.get("moving_ref"),
-            worktree_id=seat_name,
+            worktree_id=f"{seat_name}-{prior_dispatch_id or 'unknown-dispatch'}",
         )
         if pinned["verdict"] != YES:
             raise WorktreeSeatResetRefused(
