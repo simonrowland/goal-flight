@@ -39,6 +39,7 @@ inside the admission token. Keep credentials out of configuration and logs.
       "env": {}
     }
   },
+  "repo": "<stable-repository-id>",
   "admission": {"queue_wait_seconds": 300},
   "runner": {
     "command": ["<node-runner>", "{sha}", "{run_dir}", "{selection}"],
@@ -70,14 +71,22 @@ pins P-core and token defaults in `<managed-root>/admission/policy.json`. A
 conflicting enqueue fails closed.
 list, reap, cancel, and the other recovery operations still run, so a corrected
 config can clean the box without hand-editing `policy.json`.
-The root must be absolute and durable, never under `/tmp`.
+The root must be absolute and durable, never under `/tmp`. Optional `repo`
+is a stable repository id. The controller passes it on enqueue. Slots and
+result lines use it; a config that omits it uses `default`.
 
 The shared directory contains `tokens/`, `tickets/`, a monotonic
-`sequence.json`, `queue.lock`, and `runs/<lease-id>/`. Persistent token
-sentinels must never be unlinked. The holder keeps a separate incarnation
-lock. The workload inherits the token flock, so SIGKILL of the holder releases
-the incarnation lock but not the token while that workload is still running.
-A second admission cannot take the slot. Numbered tickets are allocated under the shared queue lock;
+`sequence.json`, and `queue.lock`. Run bodies live in
+`<managed-root>/runs/<lease-id>/`. Leases left under
+`<managed-root>/admission/runs/` are still listed, statused, cancelled, and
+cleared, and a non-released one still reserves its token index. Persistent
+token sentinels must never be unlinked. The holder keeps a separate
+incarnation lock. The workload inherits the token flock. SIGKILL of the
+holder releases that flock only when the workload did not inherit the
+descriptor; the lease stays `running` or `draining` until cleanup proves the
+tree dead and writes `released` under `queue.lock`. A second admission cannot
+take the token or the slot while that lease is unresolved. Numbered tickets
+are allocated under the shared queue lock;
 project request names and controller clocks do not determine cross-project
 order. Abandoned tickets are removed only when their holder lock is free.
 
@@ -95,6 +104,7 @@ One managed root per box holds the whole lifecycle:
 ```text
 <managed-root>/admission/    tokens, tickets, policy, queue
 <managed-root>/repos/<repo>/slots/s-01 … s-N
+<managed-root>/repos/<repo>/slot-meta/s-01.json   not inside the checkout
 <managed-root>/runs/<lease-id>/
 <managed-root>/results/index.jsonl
 <managed-root>/keep/
@@ -107,7 +117,8 @@ it does not create another directory. A dirty git slot is moved into
 deleted by GC.
 
 The node command receives `GOALFLIGHT_REMOTE_CI_SLOT_DIR`,
-`GOALFLIGHT_REMOTE_CI_RUN_DIR`, and `GOALFLIGHT_REMOTE_CI_RESULT_INDEX`
+`GOALFLIGHT_REMOTE_CI_RUN_DIR`, `GOALFLIGHT_REMOTE_CI_RESULT_INDEX`, and
+`GOALFLIGHT_REMOTE_CI_RUN` set to the lease id
 (`{slot_dir}` / `{checkout_dir}` is the slot). Adapters (battery, pm2, kiln)
 must checkout `--detach <sha>` inside that slot only. They must not
 `git worktree add` a per-SHA path or write a checkout under `$HOME`. Migrating
@@ -117,9 +128,10 @@ overwrite the holder's records.
 
 On release the node appends one JSON line to `results/index.jsonl`
 (`run_id`, `repo`, `sha`, `slot`, `host`, `start`, `finish`, `status`,
-`exit_code`, `body_path`, `bytes`) before any body is removed. GC deletes only
+`exit_code`, `body_path`, `bytes`), fsyncs that file, and fsyncs the results
+directory when creating it, before any body is removed. GC deletes only
 a released body that already has that line, has no live `pid + start_token +
-run_dir`, and has no process whose cwd is the run or the slot. Successful
+run_dir`, and has no process whose cwd is the run directory. Successful
 bodies are kept for 7 days and the newest 20. Other terminal bodies are kept
 for 14 days and the newest 50. Unknown, unreadable, or live bodies stay.
 `gc` prints `class`, `bytes`, and `path`; `gc --apply` deletes eligible
@@ -199,13 +211,19 @@ holder reads the cancellation request and kills **its own** process group. No
 controller process signals a guessed or reused node PID.
 
 Unknown identity stays unknown and is kept. A dead holder is kept until the
-command deadline stored on the lease. After that deadline, reap kills the workload's process group with SIGTERM, a
-short grace, then SIGKILL, and also any descendant that left the group but
-whose cwd is still the slot or the run directory (`lsof -d cwd`, one
-snapshot). The token is released only after that tree is gone. If a
-descendant cannot be proved dead, the result stays unknown and the token
-stays taken. `clear` is the same tree kill for a holder that is already dead
-and should not wait out the deadline. It writes
+command deadline stored on the lease. After that deadline, reap sets the
+lease to `draining` and kills the workload's session with SIGTERM, a short
+grace, then SIGKILL. It also kills descendants found by `proc_listchildpids`
+while their parent is alive, any same-user process whose environment still
+has `GOALFLIGHT_REMOTE_CI_RUN=<lease_id>`, and a cwd inside the run directory.
+A cwd inside the slot is signalled only when the slot's current lease is this
+run. The token is released only after that tree is proved dead. If a
+descendant cannot be proved dead, the lease stays `draining` and the token
+index stays reserved even if the flock is gone. A descendant that removes the
+marker and is reparented before the snapshot (parent already dead) is not
+visible to `ps -axwwE` on macOS 27, which does not show another process's
+environment; that residual case stays held. `clear` is the same tree kill for
+a holder that is already dead and should not wait out the deadline. It writes
 `<managed-root>/admission/audit.log`. A live holder is not cleared. The
 controller does not keep a request-state mirror beside `result_dir`.
 

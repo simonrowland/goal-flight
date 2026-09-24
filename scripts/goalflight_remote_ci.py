@@ -209,6 +209,9 @@ class DaemonConfig:
     admission: AdmissionConfig
     runner: RunnerConfig
     selection: SelectionRules
+    # Stable repository id. Slots and result lines are per repo; omitted means
+    # "default" so an existing config keeps its current directory.
+    repo: str = "default"
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any], *, path: Path) -> "DaemonConfig":
@@ -320,6 +323,10 @@ class DaemonConfig:
                 "selection.max_targeted_files",
             ),
         )
+        if "repo" in raw and raw.get("repo") not in (None, ""):
+            repo = _safe_id(raw.get("repo"), "repo")
+        else:
+            repo = "default"
         return cls(
             path=path,
             queue_dir=queue_dir,
@@ -332,6 +339,7 @@ class DaemonConfig:
             admission=admission_config,
             runner=runner_config,
             selection=selection_rules,
+            repo=repo,
         )
 
 
@@ -870,7 +878,8 @@ class RemoteRunner:
         # this controller must still present the owner it admitted under.
         expected_owner = self._owner()
         try:
-            record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm, owner=expected_owner)
+            record = node.call("enqueue", request_id=spec.request_id, arm=spec.arm,
+                               owner=expected_owner, repo=self.config.repo)
             key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
             self._inflight.add((key["run_dir"], key["lease_token"]))
             while True:

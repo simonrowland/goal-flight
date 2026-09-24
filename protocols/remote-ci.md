@@ -104,29 +104,62 @@ Admission requires a free token and measured `load1 <= p_cores`; it precedes
 command expansion, checkout, object movement, and rendering.
 
 The node writes durable PID + incarnation token + run directory before it
-accepts the command. The workload inherits the token flock, so the slot
-outlives the holder, including a holder SIGKILL, until that workload exits or
-its deadline is enforced. One host-level authority file pins the managed root;
-a second root on that box is rejected. Reaping and lease listing read node
-state through the same `remote_exec` primitive. There is no controller-side
-copy of the lease and no request-state mirror. A live owner that has dropped
-the lease releases it on its next reap or admission wait. Another host still
-treats that live owner as busy. An admitted holder that never receives a
-command or a release drops the token after 30 seconds. After the command
-deadline, reap kills an orphan whose process group is still the holder's.
-`clear` does the same before the deadline and appends an audit line.
+accepts the command. The workload inherits the token flock, and the node also
+keeps an explicit lease state. `admitted`, `running`, and `draining` reserve
+the token index and the slot whether or not the flock is still held. Closing
+a file descriptor does not release capacity. Cleanup sets `draining` under
+the admission lock, kills the tree, and writes `released` under that same
+lock only after the tree is proved dead. `UNKNOWN` stays `draining`. One
+host-level authority file pins the managed root; a second root on that box
+is rejected. Reaping and lease listing read node state through the same
+`remote_exec` primitive, including leases still stored under
+`<managed-root>/admission/runs/` from the layout before runs moved to
+`<managed-root>/runs/`. There is no controller-side copy of the lease and no
+request-state mirror. A live owner that has dropped the lease releases it on
+its next reap or admission wait. Another host still treats that live owner
+as busy. An admitted holder that never receives a command or a release drops
+the token after 30 seconds. A holder killed before the workload starts is
+released on the next admission once the slot is proved empty. After the
+command deadline, reap kills the workload's own session: SIGTERM, a short
+grace, then SIGKILL. `clear` does the same before the deadline and appends
+an audit line.
 
 Cancellation compares all identity fields, requires `expected_owner`, and asks
-the proven holder to kill its own group. It never signals a guessed PID. A
-stale owner loses to reattach. Reaping also requires proof that the owning
-controller is dead before it cancels a live holder; liveness from another
-controller host or an unavailable probe is unknown and cannot authorize that
-cancellation. A dead holder inside its deadline stays unknown, and its
-workload keeps the token. Past the deadline the node may kill the proven
-group. Checkouts live in the run directory's `checkout` folder, not under
-`$HOME`. Released run bodies are capped by age and count; `results.log` keeps
-one line each. Token sentinel files are not deleted. A conflicting cap still
-refuses enqueue; list and reap do not, so a corrected config can recover.
+the proven holder to kill its own workload tree. It never signals a guessed
+PID. A stale owner loses to reattach. Reaping also requires proof that the
+owning controller is dead before it cancels a live holder; liveness from
+another controller host or an unavailable probe is unknown and cannot
+authorize that cancellation. A dead holder inside its deadline stays unknown,
+and its workload keeps the token. Past the deadline the node may kill the
+proved tree. Cleanup signals a process in a slot only when that slot's
+current lease is the run being cleaned, so a stale reap cannot kill the next
+occupant. An unresolved slot stays reserved.
+
+The workload is started with `GOALFLIGHT_REMOTE_CI_RUN=<lease_id>`. The
+verifier looks for that marker in same-user environments (`ps -axwwE -o pid=
+-o command=` and the env region of `sysctl kern.procargs2`), keeps the
+process-group check, and keeps a cwd check of the run directory. On macOS 27
+(build 26A428) `ps -axwwE` does not show another process's environment: a
+`/bin/sleep` started with the marker in its env appeared as `/bin/sleep 30`
+and nothing else, and `KERN_PROCARGS2` returned only argc and argv. While the
+parent is still alive, `proc_listchildpids` still sees a child that called
+`setsid`, changed directory to `/`, and closed its descriptors, because
+`setsid` does not reparent. That walk is what makes cancel and reap find the
+child. A descendant that scrubs `GOALFLIGHT_REMOTE_CI_RUN` and whose parent
+has already exited (the child was reparented before the snapshot) cannot be
+found. That is a residual risk: the lease stays `draining` when a recorded
+pid cannot be proved dead, and it is released when the parent was still alive
+for the snapshot and every captured pid is gone.
+
+Checkouts are the fixed slots `repos/<repo>/slots/s-01`…`s-N`, not a
+directory per SHA and not under `$HOME`. The controller passes `repo` from
+its config (omitted means `default`). Slot bookkeeping lives in
+`repos/<repo>/slot-meta/`, outside the checkout, so a clean git tree is not
+quarantined. The result index is fsync'd, and its directory is fsync'd when
+the file is created, before a body can be deleted. Released run bodies are
+capped by age and count; `results/index.jsonl` keeps one line each. Token
+sentinel files are not deleted. A conflicting cap still refuses enqueue; list
+and reap do not, so a corrected config can recover.
 
 Receipts must contain the answering node's measured hostname. Health returns
 node-measured load, hostname, and actual token locks. Shared live caps reside

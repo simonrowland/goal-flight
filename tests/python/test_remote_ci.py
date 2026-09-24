@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -1026,3 +1027,306 @@ def test_cancel_kills_a_setsid_descendant_before_releasing_the_token(node_env, t
     with pytest.raises(ProcessLookupError):
         os.kill(child, 0)
     _free_tokens(node)
+
+
+def _two_token(tmp_path):
+    raw = _raw_config(tmp_path, token_pool_size=2)
+    root = tmp_path / "two-token-node"
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(root)
+    path = tmp_path / "two-token.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_config(path)
+    executor = ScriptedExecutor(root)
+    runner = RemoteRunner(config, executor=executor)
+    return config, executor, runner, runner.nodes["box-a"]
+
+
+def _wait_dead(pid):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"pid {pid} still alive")
+
+
+def test_cancel_kills_a_child_that_setsid_chdirs_and_closes_fds(node_env, tmp_path):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "detached.pid"
+    start(node, held,
+          "import subprocess, time\n"
+          "child = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True,"
+          " cwd='/', close_fds=True)\n"
+          f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+          "time.sleep(60)\n")
+    child = _child_pid(pidfile)
+    assert os.getpgid(child) == child
+    assert _cancel(node, held)["status"] == "cancelled"
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    _free_tokens(node)
+
+
+def test_reap_holds_capacity_until_the_escaped_child_is_dead(node_env, tmp_path):
+    _, _, runner, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    pidfile = tmp_path / "reap-detached.pid"
+    node.call("start", **key(held), command={
+        "argv": [sys.executable, "-c",
+                 "import subprocess, time\n"
+                 "child = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True,"
+                 " cwd='/', close_fds=True)\n"
+                 f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+                 "time.sleep(60)\n"],
+        "env": {},
+        "timeout": 0.4,
+    })
+    child = _child_pid(pidfile)
+    try:
+        os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
+        time.sleep(0.7)
+        assert node.call("health")["tokens"]["in_use"] == 1
+        assert runner.reap()[0]["status"] == "cancelled"
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        _free_tokens(node)
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_draining_lease_reserves_a_token_with_no_flock(node_env):
+    _, executor, _, node = node_env
+    managed = executor.root
+    run = managed / "runs" / "drainlease"
+    run.mkdir(parents=True)
+    remote = {
+        "host": "measured-node", "pid": "999999", "start_token": "s",
+        "run_dir": str(run), "lease_id": "drainlease", "lease_token": "tok",
+    }
+    (run / "lease.json").write_text(json.dumps({
+        "schema": "goalflight.remote-ci.lease.v1",
+        "lease_id": "drainlease", "lease_token": "tok",
+        "state": "draining", "token_index": 0,
+        "run_directory": str(run), "remote_run": remote,
+    }), encoding="utf-8")
+    (run / "owner.json").write_text(json.dumps(RemoteRunner._owner()), encoding="utf-8")
+    admission = managed / "admission"
+    admission.mkdir(parents=True, exist_ok=True)
+    (admission / "policy.json").write_text(
+        json.dumps({"p_cores": 20, "token_pool_size": 1}), encoding="utf-8")
+    assert node.call("health")["tokens"]["in_use"] == 1
+    waiting = enqueue(node, "blocked-by-drain")
+    time.sleep(0.25)
+    assert node.call("status", **key(waiting))["state"] == "queued"
+    assert node.call("health")["tokens"]["in_use"] == 1
+
+
+def test_unresolved_slot_stays_reserved_for_the_successor(tmp_path):
+    config, executor, runner, node = _two_token(tmp_path)
+    child_b = None
+    try:
+        first = wait_state(node, enqueue(node, "run-a"), {"admitted"})
+        pidfile = tmp_path / "a.pid"
+        start(node, first,
+              "import os, time\n"
+              f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+              "time.sleep(30)\n")
+        workload = _child_pid(pidfile)
+        running = wait_state(node, first, {"running"})
+        os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
+        os.kill(workload, signal.SIGKILL)
+        _wait_dead(workload)
+        lease_path = Path(running["run_directory"]) / "lease.json"
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease["deadline_epoch"] = time.time() - 1
+        lease_path.write_text(json.dumps(lease), encoding="utf-8")
+        # A different controller host keeps reap from treating B as forgotten.
+        other = dict(RemoteRunner._owner(), owner_host="not-this-host")
+        second = wait_state(node, enqueue(node, "run-b", owner=other), {"admitted"})
+        assert second["slot"] != running["slot"]
+        bpid = tmp_path / "b.pid"
+        start(node, second,
+              "import os, time\n"
+              f"open({str(bpid)!r}, 'w').write(str(os.getpid()))\n"
+              "time.sleep(30)\n")
+        child_b = _child_pid(bpid)
+        results = {row["lease_id"]: row["status"] for row in runner.reap()}
+        assert results[running["lease_id"]] == "cancelled"
+        os.kill(child_b, 0)
+    finally:
+        if child_b is not None:
+            try:
+                os.kill(child_b, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        executor.close(config)
+
+
+def test_stale_clear_does_not_signal_the_slots_current_occupant(tmp_path):
+    config, executor, _, node = _two_token(tmp_path)
+    sleeper = None
+    try:
+        first = wait_state(node, enqueue(node, "run-a"), {"admitted"})
+        pidfile = tmp_path / "fence.pid"
+        start(node, first,
+              "import os, time\n"
+              f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+              "time.sleep(30)\n")
+        workload = _child_pid(pidfile)
+        running = wait_state(node, first, {"running"})
+        os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
+        os.kill(workload, signal.SIGKILL)
+        _wait_dead(workload)
+        slot = Path(running["slot"])
+        marker = slot.parent.parent / "slot-meta" / (slot.name + ".json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        current = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+        current.update(state="leased", lease_id="successor-not-a")
+        marker.write_text(json.dumps(current), encoding="utf-8")
+        # Our child, so a killed process stays a zombie until we wait on it.
+        # os.kill(pid, 0) still succeeds for that zombie and would hide the kill.
+        sleeper = subprocess.Popen(["/bin/sleep", "60"], cwd=slot, start_new_session=True)
+        time.sleep(0.2)
+        node.call("clear", **key(running), identity=running["remote_run"])
+        waited, _status = os.waitpid(sleeper.pid, os.WNOHANG)
+        assert waited == 0
+        os.kill(sleeper.pid, 0)
+    finally:
+        if sleeper is not None:
+            try:
+                os.kill(sleeper.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        executor.close(config)
+
+
+def test_clean_git_slot_is_reused_instead_of_quarantined(node_env):
+    _, executor, _, node = node_env
+    held = wait_state(node, enqueue(node, "init"), {"admitted"})
+    start(node, held,
+          "import pathlib, subprocess\n"
+          "subprocess.check_call(['git', 'init'])\n"
+          "pathlib.Path('README').write_text('x')\n"
+          "subprocess.check_call(['git', 'add', 'README'])\n"
+          "subprocess.check_call(['git', '-c', 'user.email=t@example.com',"
+          " '-c', 'user.name=t', 'commit', '-m', 'init'])\n")
+    released = wait_state(node, held, {"released"})
+    slot = Path(released["slot"])
+    assert (slot / ".git").is_dir()
+    assert not (slot / "SLOT.json").exists()
+    assert not (slot / "slot.lock").exists()
+    again = wait_state(node, enqueue(node, "reuse"), {"admitted"})
+    start(node, again, "import os, sys\nsys.exit(0 if os.path.isdir('.git') else 3)\n")
+    done = wait_state(node, again, {"released"})
+    assert done["result"]["returncode"] == 0
+    quarantine = executor.root / "quarantine"
+    assert not quarantine.exists() or not any(quarantine.iterdir())
+    assert (Path(again["slot"]) / ".git").is_dir()
+
+
+def test_result_index_is_fsynced_before_a_body_can_be_collected(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    kinds = []
+
+    def spy(fd):
+        kinds.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+
+    monkeypatch.setattr(node.os, "fsync", spy)
+    managed = tmp_path / "managed"
+    run = managed / "runs" / "abc"
+    run.mkdir(parents=True)
+    (run / "result.json").write_text(json.dumps({"returncode": 0}), encoding="utf-8")
+    node.append_result(managed, {
+        "lease_id": "abc", "repo": "goal-flight", "release_reason": "completed",
+    }, run)
+    assert False in kinds and True in kinds
+    line = json.loads((managed / "results" / "index.jsonl").read_text(encoding="utf-8"))
+    assert line["run_id"] == "abc"
+    assert line["repo"] == "goal-flight"
+
+
+def test_legacy_admission_runs_remain_recoverable(node_env):
+    _, executor, _, node = node_env
+    managed = executor.root
+    run = managed / "admission" / "runs" / "legacylease"
+    run.mkdir(parents=True)
+    remote = {
+        "host": "h", "pid": "4242", "start_token": "st", "run_dir": str(run),
+        "lease_id": "legacylease", "lease_token": "tok",
+    }
+    owner = RemoteRunner._owner()
+    (run / "lease.json").write_text(json.dumps({
+        "schema": "goalflight.remote-ci.lease.v1",
+        "lease_id": "legacylease", "lease_token": "tok",
+        "state": "running", "token_index": 0,
+        "run_directory": str(run), "remote_run": remote,
+        "managed_run_directory": str(managed),
+    }), encoding="utf-8")
+    (run / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    admission = managed / "admission"
+    admission.mkdir(parents=True, exist_ok=True)
+    (admission / "policy.json").write_text(
+        json.dumps({"p_cores": 20, "token_pool_size": 1}), encoding="utf-8")
+    assert any(row["lease_id"] == "legacylease" for row in node.call("list"))
+    assert node.call("status", run_dir=str(run), lease_token="tok")["state"] == "running"
+    assert node.call("health")["tokens"]["in_use"] == 1
+    waiting = enqueue(node, "needs-a-token")
+    time.sleep(0.25)
+    assert node.call("status", **key(waiting))["state"] == "queued"
+    unknown = node.call("cancel", run_dir=str(run), lease_token="tok", identity=remote,
+                        expected_owner=owner)
+    assert unknown["status"] == "unknown"
+    assert node.call("health")["tokens"]["in_use"] == 1
+    cleared = node.call("clear", run_dir=str(run), lease_token="tok", identity=remote)
+    assert cleared["status"] == "cleared"
+    wait_state(node, waiting, {"admitted"})
+
+
+def test_controller_repo_reaches_the_slot_and_the_result(tmp_path):
+    raw = _raw_config(tmp_path, token_pool_size=1)
+    raw["repo"] = "goal-flight"
+    root = tmp_path / "repo-node"
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(root)
+    path = tmp_path / "repo.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _green_config(load_config(path))
+    executor = ScriptedExecutor(root)
+    seen = {}
+
+    def before(payload):
+        if payload["operation"] == "enqueue":
+            seen["repo"] = payload.get("repo")
+
+    executor.before = before
+    try:
+        runner = RemoteRunner(config, executor=executor)
+        outcome = runner.run_arm(spec())
+        assert seen["repo"] == "goal-flight"
+        assert outcome.lease["slot"].endswith("/repos/goal-flight/slots/s-01")
+        # The watch returns when result.json appears, before the holder fsyncs
+        # the index and marks the lease released.
+        wait_state(runner.nodes["box-a"], outcome.lease, {"released"})
+        line = json.loads((root / "results" / "index.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        assert line["repo"] == "goal-flight"
+        kiln = replace(config, repo="kiln")
+        executor.before = None
+        kiln_runner = RemoteRunner(kiln, executor=executor)
+        second = kiln_runner.run_arm(spec("request-2"))
+        assert second.lease["slot"].endswith("/repos/kiln/slots/s-01")
+        wait_state(kiln_runner.nodes["box-a"], second.lease, {"released"})
+        assert '"repo": "kiln"' in (root / "results" / "index.jsonl").read_text(encoding="utf-8")
+    finally:
+        executor.close(config)
+
+
+def test_unreachable_keep_machinery_is_gone():
+    source = (ROOT / "scripts" / "goalflight_remote_ci_node.py").read_text(encoding="utf-8")
+    assert "unknown-descendants" not in source
+    assert "def token_held" not in source
