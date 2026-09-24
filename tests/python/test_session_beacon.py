@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -21,6 +22,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_compat as compat  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_task as task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
@@ -40,6 +42,138 @@ def _root(
     root = tmp_path / name
     root.mkdir()
     return root
+
+
+def test_controller_registration_refuses_volatile_root_before_registry_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    assert task.volatile_project_root_match(root) is not None
+    monkeypatch.delenv(task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, raising=False)
+
+    def unexpected_registry_write(*_args, **_kwargs):
+        raise AssertionError("registry must not be opened")
+
+    monkeypatch.setattr(
+        sessions.goalflight_journal,
+        "open_or_create_journal",
+        unexpected_registry_write,
+    )
+    registered = sessions.register_controller(root, "engine", session_id="nonce")
+    joined = sessions.join_controller(root, "engine", session_id="nonce")
+    startup = sessions.claim_controller_startup(root, label="engine", environ={})
+
+    for result, key in (
+        (registered, "registered"),
+        (joined, "joined"),
+        (startup, "claimed"),
+    ):
+        assert result[key] is False
+        assert result["reason"] == "volatile_project_root"
+        assert str(root.resolve()) in result["message"]
+        assert "a reboot wipes it" in result["message"]
+        assert "durable repo root" in result["message"]
+
+
+def test_inherited_scoped_override_refuses_subprocess_outside_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root(monkeypatch, tmp_path)
+    scope = Path(os.environ[task.ALLOW_VOLATILE_PROJECT_ROOT_ENV])
+    assert scope.is_absolute() and scope.is_dir()
+    with tempfile.TemporaryDirectory(prefix="gf-outside-scope-", dir="/tmp") as raw:
+        outside = Path(raw).resolve()
+        with pytest.raises(ValueError):
+            outside.relative_to(scope.resolve())
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_session_status.py"),
+                "--project-root",
+                str(outside),
+                "--controller-startup",
+                "--session-label",
+                "outside",
+            ],
+            cwd=outside,
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["claimed"] is False
+    assert payload["reason"] == "volatile_project_root"
+    assert str(outside) in payload["message"]
+
+
+def test_registration_refuses_symlink_into_volatile_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root(monkeypatch, tmp_path)
+    with tempfile.TemporaryDirectory(prefix="gf-symlink-target-", dir="/tmp") as raw:
+        link = tmp_path / "durable-looking-project"
+        try:
+            link.symlink_to(raw, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+        result = sessions.register_controller(link, "symlink", session_id="nonce")
+    assert result["registered"] is False
+    assert result["reason"] == "volatile_project_root"
+
+
+def test_registration_refuses_tmp_aliases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root(monkeypatch, tmp_path)
+    private_tmp = Path("/private/tmp")
+    if not private_tmp.is_dir():
+        pytest.skip("/private/tmp alias unavailable")
+    with tempfile.TemporaryDirectory(prefix="gf-tmp-alias-", dir="/tmp") as raw:
+        tmp_root = Path(raw)
+        private_alias = private_tmp / tmp_root.relative_to("/tmp")
+        assert private_alias.resolve() == tmp_root.resolve()
+        for candidate in (tmp_root, private_alias):
+            result = sessions.register_controller(candidate, "alias", session_id="nonce")
+            assert result["registered"] is False
+            assert result["reason"] == "volatile_project_root"
+
+
+def test_registration_refuses_trailing_tmpdir_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root(monkeypatch, tmp_path)
+    with tempfile.TemporaryDirectory(prefix="gf-custom-tmpdir-", dir=str(ROOT)) as raw:
+        monkeypatch.setenv("TMPDIR", f"{raw}/")
+        project = Path(raw) / "project"
+        project.mkdir()
+        result = sessions.register_controller(project, "tmpdir", session_id="nonce")
+    assert result["registered"] is False
+    assert result["reason"] == "volatile_project_root"
+
+
+def test_registration_refuses_relative_volatile_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _root(monkeypatch, tmp_path)
+    with tempfile.TemporaryDirectory(prefix="gf-relative-root-", dir="/tmp") as raw:
+        monkeypatch.chdir(raw)
+        result = sessions.register_controller(Path("."), "relative", session_id="nonce")
+    assert result["registered"] is False
+    assert result["reason"] == "volatile_project_root"
+
+
+@pytest.mark.parametrize("override", ["relative-scope", "/path/that/does/not/exist"])
+def test_invalid_scoped_override_does_not_allow_volatile_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: str
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    monkeypatch.setenv(task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, override)
+    result = sessions.register_controller(root, "invalid-scope", session_id="nonce")
+    assert result["registered"] is False
+    assert result["reason"] == "volatile_project_root"
 
 
 def test_controller_startup_adopts_live_incumbent_label_and_advertises_reseat(

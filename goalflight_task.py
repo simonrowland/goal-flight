@@ -53,6 +53,7 @@ PROJECT_REGISTRY_INDEX_SCHEMA = "goalflight.projects-index.v1"
 PROJECT_STORE_META_SCHEMA = "goalflight.project-store-meta.v1"
 VIEW_MANIFEST_SCHEMA = "goalflight.view-manifest.v1"
 PROJECT_REGISTRY_THROTTLE_S = 3600
+ALLOW_VOLATILE_PROJECT_ROOT_ENV = "GOALFLIGHT_ALLOW_VOLATILE_PROJECT_ROOT"
 # Decisions mint d-NNN so they cannot collide with a project's ratified q-series.
 # VALID_FAMILIES keeps q for legacy rows that already used that prefix.
 FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "d"}
@@ -393,6 +394,37 @@ def utc_now() -> str:
 
 def _resolve_loose(path: Path) -> Path:
     return path.expanduser().resolve(strict=False)
+
+
+def volatile_project_root_match(project_root: Path | str) -> tuple[Path, Path] | None:
+    """Return the real project root and volatile base when it is disposable."""
+    resolved = Path(os.path.realpath(os.path.expanduser(os.fspath(project_root))))
+    bases: list[Path] = [Path("/tmp"), Path("/private/tmp")]
+    tmpdir = os.environ.get("TMPDIR", "").strip()
+    if tmpdir:
+        bases.append(Path(os.path.realpath(os.path.expanduser(tmpdir))))
+    var_folders = Path(os.path.realpath("/var/folders"))
+    try:
+        relative = resolved.relative_to(var_folders)
+    except ValueError:
+        relative = None
+    if relative is not None:
+        parts = relative.parts
+        for index, part in enumerate(parts):
+            if part == "T":
+                bases.append(var_folders.joinpath(*parts[: index + 1]))
+    seen: set[Path] = set()
+    for base in bases:
+        base = Path(os.path.realpath(os.path.expanduser(os.fspath(base))))
+        if base in seen:
+            continue
+        seen.add(base)
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            continue
+        return resolved, base
+    return None
 
 
 def _strip_managed_worktree(path: Path) -> Path:

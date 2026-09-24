@@ -867,6 +867,43 @@ def case_orphan_check_survives_a_raising_rule() -> None:
     assert got["known"] is False and "journal exploded" in got["detail"], got
 
 
+def case_doctor_warns_for_volatile_and_missing_registered_roots() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-registry-") as td:
+        volatile = Path(td) / "volatile-project"
+        volatile.mkdir()
+        missing = Path(td) / "missing-project"
+        journal_path = Path(td) / "state-journal.sqlite3"
+        with patch.object(
+            goalflight_doctor.goalflight_journal,
+            "iter_journal_files",
+            return_value=[journal_path],
+        ), patch.object(
+            goalflight_doctor.goalflight_controllers,
+            "peek_active_lease_identities",
+            return_value=(
+                [(str(volatile), "temp-controller"), (str(missing), "missing-controller")],
+                None,
+            ),
+        ):
+            result = goalflight_doctor.check_registered_controller_project_roots()
+    assert result["ok"] is False
+    assert {entry["label"] for entry in result["entries"]} == {
+        "temp-controller",
+        "missing-controller",
+    }
+    assert "temp-controller" in result["warning"]
+    assert str(volatile) in result["warning"]
+    assert "missing-controller" in result["warning"]
+    assert str(missing) in result["warning"]
+    assert result["warning"].count(
+        "re-register with --controller-startup from the durable repo root"
+    ) == 2
+
+
+def test_doctor_warns_for_volatile_and_missing_registered_roots() -> None:
+    case_doctor_warns_for_volatile_and_missing_registered_roots()
+
+
 def main() -> None:
     case_doctor_reports_platform_fields_for_windows()
     case_doctor_reports_platform_fields_for_linux()
@@ -904,6 +941,7 @@ def main() -> None:
     case_orphan_check_is_silent_when_none_are_orphaned()
     case_orphan_check_passes_unknown_through_rather_than_zero()
     case_orphan_check_survives_a_raising_rule()
+    case_doctor_warns_for_volatile_and_missing_registered_roots()
     print("OK: doctor tests pass")
 
 

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import datetime as dt
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -597,6 +598,39 @@ def test_dispatch_explicit_takeover_supersedes_live_holder(
     assert ended["state"] == "SUPERSEDED"
     assert ended["ended_reason"] == "explicit-takeover"
     assert ended["ended_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("parent_dispatch_id", "takeover"),
+    [(None, False), (None, True), ("resume-parent", False)],
+    ids=["auto-register", "takeover", "resume"],
+)
+def test_dispatch_registration_paths_refuse_volatile_root_outside_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    parent_dispatch_id: str | None,
+    takeover: bool,
+) -> None:
+    _state(monkeypatch, tmp_path)
+    with tempfile.TemporaryDirectory(prefix="gf-dispatch-outside-", dir="/tmp") as raw:
+        outside = Path(raw)
+        if parent_dispatch_id is not None:
+            monkeypatch.setattr(
+                dispatch,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {"controller_label": "owner"},
+            )
+            monkeypatch.setenv(sessions.CONTROLLER_PID_ENV, "62001")
+        args = _args(
+            controller_beacon_pid=None if parent_dispatch_id else 62001,
+            parent_dispatch_id=parent_dispatch_id,
+            takeover=takeover,
+        )
+        result = dispatch._stamp_controller_session(args, outside)
+    assert result["claimed"] is False
+    assert result["reason"] == "volatile_project_root"
+    assert result["visible_warning"] is True
+    assert str(outside.resolve()) in result["message"]
 
 
 def test_dispatch_main_returns_visible_label_in_use_before_launch(

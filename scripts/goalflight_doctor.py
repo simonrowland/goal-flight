@@ -22,6 +22,7 @@ import tempfile
 import time
 
 import goalflight_compat
+import goalflight_controllers
 import goalflight_dispatch
 import goalflight_task
 
@@ -841,6 +842,67 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
         "active_but_dead_controller_leases_in_project": dead_count,
         "unknown_controller_lease_holders_in_project": unknown_count,
         "leases": leases,
+    }
+
+
+def check_registered_controller_project_roots() -> dict:
+    """Warn for active controller entries rooted in disposable or missing paths."""
+    try:
+        journal_files = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError as exc:
+        return {
+            "ok": False,
+            "error": f"controller registry index unreadable: {type(exc).__name__}: {exc}",
+            "entries": [],
+        }
+
+    entries: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for journal_path in journal_files:
+        pairs, error = goalflight_controllers.peek_active_lease_identities(journal_path)
+        if pairs is None:
+            return {
+                "ok": False,
+                "error": (
+                    f"controller registry {journal_path} unreadable: "
+                    f"{error or 'unknown'}"
+                ),
+                "entries": entries,
+            }
+        for raw_root, label in pairs:
+            root = str(raw_root).strip()
+            label = str(label).strip()
+            if not root or not label or (label, root) in seen:
+                continue
+            seen.add((label, root))
+            volatile = goalflight_task.volatile_project_root_match(root)
+            if volatile is not None:
+                reason = "volatile temporary directory"
+            else:
+                try:
+                    present = Path(root).is_dir()
+                except OSError:
+                    present = False
+                if present:
+                    continue
+                reason = "project root no longer exists"
+            entries.append(
+                {
+                    "label": label,
+                    "project_root": root,
+                    "reason": reason,
+                }
+            )
+
+    warning = "; ".join(
+        f"{entry['label']} at {entry['project_root']}: {entry['reason']}; "
+        "re-register with --controller-startup from the durable repo root"
+        for entry in entries
+    )
+    return {
+        "ok": not entries,
+        "entries": entries,
+        "warning": warning or None,
     }
 
 
@@ -3588,6 +3650,7 @@ def doctor(
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
+        "registered_controller_project_roots": check_registered_controller_project_roots(),
         "account_state_freshness": account_state_freshness,
         "seat_state_freshness": account_state_freshness,
         "orphaned_listeners": check_orphaned_listeners(repo),
@@ -3921,6 +3984,13 @@ def collect_human_lines(payload: dict) -> list[str]:
                     f"unknown={controller_leases.get('unknown_controller_lease_holders_in_project', 0)}"
                 )
             ),
+        ),
+        status_line(
+            (payload.get("registered_controller_project_roots") or {}).get("ok"),
+            "registered controller project roots",
+            (payload.get("registered_controller_project_roots") or {}).get("warning")
+            or (payload.get("registered_controller_project_roots") or {}).get("error")
+            or "all registered roots are durable and present",
         ),
     ]
     for lease in controller_leases.get("leases") or []:

@@ -20,6 +20,7 @@ incremented when meaningful skill behaviour changes.
 
 - Account validation runs before any dispatch side effect on every launch path.
 - Unknown liveness evidence from a failed process probe is reported as unknown (never live or dead), so pending sidecars are not settled on it.
+- Controller registration refuses volatile temporary project roots and doctor warns about existing registrations that point to them or missing roots.
 
 ## [1.7.1] - 2026-09-23
 
