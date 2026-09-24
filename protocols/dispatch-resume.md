@@ -90,11 +90,19 @@ you want to keep, not by what killed the worker.
   SAME engine session id. The child keeps `parent_dispatch_id` so ledger and
   journal stay one story. The Goal Flight launch id is new because each
   spawn is a new process, lease, and status file; the conversation handle is
-  not. Resume reattaches to the existing worktree, branch, and partial
-  artifacts — it does not acquire a sibling pooled worktree. Quota-exhausted,
-  dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
-  continuable. `--account <account>` pins a surviving account; default selection
-  skips recently quota-exhausted accounts until their reset.
+  not. Resume reattaches to the recorded worktree when its lock and holder are
+  still valid. If the pool recycled that path, it validates the parent's own
+  `worktree/<dispatch-id>` branch (or legacy `seat/<dispatch-id>`) against the
+  recorded head or keep ref, then acquires a free pooled seat on that branch.
+  It never resets a seat held by another dispatch. Quota-exhausted, dead-pid,
+  stale_dead, and plan-approval pauses (USER-NEED / !READY) are continuable.
+  `--account <account>` pins a surviving account; default selection skips
+  recently quota-exhausted accounts until their reset.
+- `--model <model>` and `--reasoning-effort <level>` replace the recorded
+  values for this resumed attempt; they are not appended as duplicate flags.
+  The effective values are recorded in the child ledger and status JSON. Codex
+  resumes can therefore continue the same session on a stronger model. Grok
+  accepts the model override through its normal resume argv and admission path.
 - Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
   (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume
@@ -124,6 +132,10 @@ you want to keep, not by what killed the worker.
   automatic retry behavior. Grok bash has no OS-sandbox flag: on that launch
   path, `read-only` installs its Bash/Write/Edit deny rules and `workspace-write`
   removes them. A fresh writable Grok dispatch simply omits `--read-only`.
+- An explicit Codex account is resolved through the same account resolver used
+  by a fresh dispatch before the resume child ledger or worktree claim is
+  created. If that resolver cannot produce the requested account home, resume
+  refuses without changing the seat lock or ledger.
 - Ownership is recorded at dispatch time; a resumed dispatch keeps its
   original owner, so wakes still route to the controller that started it.
 - Never resume a source that is still live or whose liveness is
@@ -145,6 +157,11 @@ you want to keep, not by what killed the worker.
   A healthy-account Grok cross-account resume is not refused for a missing
   local artifact; it takes the reconstruction path above. It must not appear
   to carry a session when it has actually started a reconstructed one.
+- If a recycled worktree's branch is missing or its tip diverges from the
+  recorded head, resume names the branch and refuses. When reclaiming dirty
+  state produced a `refs/goalflight/keep/*` or quarantine ref, the ref is
+  printed so the operator can recover it. If no pooled seat is free, the
+  existing exhaustion message remains authoritative.
 
 ## Capture
 

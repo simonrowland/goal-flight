@@ -13,6 +13,11 @@ Rebuild working context from files and procedural status.
 > `goalflight_dispatch.py resume <id>` — never write it a fresh brief. See
 > `protocols/dispatch-resume.md`.
 
+The worker-resume command accepts optional per-attempt overrides:
+`--account <account>`, `--model <model>`, and
+`--reasoning-effort <level>`. Model and reasoning values replace the recorded
+launch values while preserving the engine session and resume lineage.
+
 Applies only when Goal Flight was already in play (see `protocols/state-handoff.md`).
 Read and run `protocols/session-preflight.md` as the controller-start hook before
 rebuilding status.

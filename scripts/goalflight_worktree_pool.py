@@ -1404,6 +1404,7 @@ def acquire_worktree_seat(
     dispatch_id: str,
     *,
     base: str | None = None,
+    branch: str | None = None,
     managed_root: Path | None = None,
     controller_label: str | None = None,
     reset: bool = True,
@@ -1423,7 +1424,16 @@ def acquire_worktree_seat(
     label = default_controller_ring_label(controller_label, project_root=project_root)
     resolved_base = base if base is not None else default_seat_base(project_root)
     base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
-    branch = seat_branch_name(dispatch_id)
+    branch = str(branch or seat_branch_name(dispatch_id)).strip()
+    branch_suffix = branch.split("/", 1)[1] if "/" in branch else ""
+    if (
+        not is_worktree_branch(branch)
+        or not branch_suffix
+        or not _SAFE_RING_LABEL.fullmatch(branch_suffix)
+    ):
+        raise WorktreeSeatError(
+            f"invalid managed worktree branch {branch!r}; expected worktree/<id> or seat/<id>"
+        )
 
     worktrees_root = project_root / "worktrees"
     if worktrees_root.is_symlink():

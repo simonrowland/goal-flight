@@ -846,6 +846,112 @@ def test_cross_account_canonical_resume_without_rollout_fails_loudly(
     assert not _dispatch_home(tmp_path, child_id).exists()
 
 
+def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "host-login-parent"
+    child_id = "host-login-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record["effective_account"] = "source-account"
+    L.write_record(record)
+    _configure_account(tmp_path, "host-login")
+    prompt = tmp_path / "host-login.md"
+    prompt.write_text("Continue on the host login.\n", encoding="utf-8")
+    calls: list[tuple[str | None, str]] = []
+
+    def resolve_seat(_project_root: str, account: str | None, dispatch_id: str):
+        calls.append((account, dispatch_id))
+        return str(home), "host-login"
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+
+    def rebuild(
+        _project_root: Path,
+        _parent_id: str,
+        expected_home: Path,
+        _session_id: str,
+        **kwargs,
+    ) -> tuple[str, str]:
+        assert kwargs["pre_resolved"] == {
+            "home": str(home),
+            "account": "host-login",
+            "source_is_canonical": False,
+        }
+        return str(expected_home), "host-login"
+
+    monkeypatch.setattr(D, "_rebuild_codex_resume_home", rebuild)
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=home,
+            prompt=prompt,
+            session_id=SESSION_ID,
+            account="host-login",
+        )
+    )
+
+    assert rc == 0
+    assert calls == [("host-login", parent_id)]
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["effective_account"] == "host-login"
+
+
+def test_resume_account_resolution_refuses_before_ledger_or_seat_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "unresolvable-account-parent"
+    child_id = "unresolvable-account-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record["effective_account"] = "source-account"
+    L.write_record(record)
+    _configure_account(tmp_path, "missing-seat")
+    prompt = tmp_path / "missing-seat.md"
+    prompt.write_text("Continue.\n", encoding="utf-8")
+
+    def resolve_seat(_project_root: str, _account: str | None, _dispatch_id: str):
+        return None, None
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=home,
+            prompt=prompt,
+            session_id=SESSION_ID,
+            account="missing-seat",
+        )
+    )
+
+    assert rc == 64
+    assert "missing-seat" in capsys.readouterr().err
+    assert not L.record_path(child_id).exists()
+    assert not (tmp_path / "worktrees").exists()
+
+
 def test_launch_without_recordable_codex_home_warns_not_resumable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1001,7 +1107,22 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     parent_id = "verb-parent"
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
-    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record["model"] = "recorded-model"
+    record["reasoning_effort"] = "low"
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--model",
+        "recorded-model",
+        "--reasoning-effort",
+        "low",
+        "--task",
+        "t-123",
+        "--cwd",
+        str(tmp_path),
+    ]
+    L.write_record(record)
     prompt = tmp_path / "revisions.md"
     prompt.write_text("Revise the implementation.", encoding="utf-8")
     captured: list[list[str]] = []
@@ -1021,6 +1142,10 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
             parent_id,
             "--prompt-file",
             str(prompt),
+            "--model",
+            "gpt-5.6",
+            "--reasoning-effort",
+            "xhigh",
             "--unregistered-forced",
             "--controller-label",
             "resume-test",
@@ -1048,6 +1173,10 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     assert launch[launch.index("--controller-session-id") + 1] == (
         "resume-test-nonce"
     )
+    assert launch.count("--model") == 1
+    assert launch[launch.index("--model") + 1] == "gpt-5.6"
+    assert launch.count("--reasoning-effort") == 1
+    assert launch[launch.index("--reasoning-effort") + 1] == "xhigh"
     assert "--account" not in launch
 
 
@@ -1298,6 +1427,10 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
             str(home),
             "--codex-home-owner-dispatch-id",
             parent_id,
+            "--model",
+            "gpt-5.6",
+            "--reasoning-effort",
+            "xhigh",
             "--launch-detached",
         ]
     )
@@ -1309,6 +1442,10 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
     assert worker["env"]["CODEX_HOME"] == str(home)
     assert worker["stdin_path"] is not None  # prompt fed from file, not argv
     assert worker["argv"][worker["argv"].index("resume") + 1] == SESSION_ID
+    assert worker["argv"].count("--model") == 1
+    assert worker["argv"][worker["argv"].index("--model") + 1] == "gpt-5.6"
+    assert '-c' in worker["argv"]
+    assert 'model_reasoning_effort="xhigh"' in worker["argv"]
     assert (
         watcher["argv"][watcher["argv"].index("--codex-dispatch-home") + 1]
         == str(home)
@@ -1325,11 +1462,15 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
     assert ledger["codex_home"] == str(home)
     assert ledger["codex_home_owner_dispatch_id"] == parent_id
     assert ledger["effective_account"] == "new-seat"
+    assert ledger["model"] == "gpt-5.6"
+    assert ledger["reasoning_effort"] == "xhigh"
     assert status["state"] == "starting"
     assert status["parent_dispatch_id"] == parent_id
     assert status["codex_session_id"] == SESSION_ID
     assert status["codex_home"] == str(home)
     assert status["codex_home_owner_dispatch_id"] == parent_id
+    assert status["model"] == "gpt-5.6"
+    assert status["reasoning_effort"] == "xhigh"
     aggregate = next(
         row
         for row in L.status_payload()["records"]

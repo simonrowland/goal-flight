@@ -232,6 +232,32 @@ def test_fallback_uses_measured_selector_not_configured_order(
     assert calls == [{"model": None, "exclude": {"old"}, "named_only": True}]
 
 
+def test_resume_model_override_reaches_grok_admission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accounts(tmp_path, "old")
+    record = _record(tmp_path)
+    record["model"] = "recorded-model"
+    seen: list[str | None] = []
+
+    def admission(_account: str, *, model: str | None = None) -> None:
+        seen.append(model)
+
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_grok_account_admission_reason", admission)
+
+    argv = D._resume_launch_argv(
+        _source(record),
+        child_dispatch_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        resume_args=_resume_args(model="grok-stronger"),
+    )
+
+    assert seen == ["grok-stronger"]
+    assert argv.count("--model") == 1
+    assert _option(argv, "--model") == "grok-stronger"
+
+
 def test_measured_unhealthy_owner_falls_back_without_ledger_wall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
