@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 import threading
 import time
@@ -820,8 +821,15 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
             captured: dict[str, object] = {}
             original_peek = goalflight_journal.Journal.cursor_peek
             original_advance = goalflight_journal.Journal.advance_cursor
+            peek_calls = 0
+            peek_thread_names: list[str] = []
+            advance_calls = 0
+            advance_thread_names: list[str] = []
 
             def blocked_peek(self, *args, **kwargs):
+                nonlocal peek_calls
+                peek_calls += 1
+                peek_thread_names.append(threading.current_thread().name)
                 snapshot = original_peek(self, *args, **kwargs)
                 if threading.current_thread().name == "drain-race-cli":
                     captured["snapshot"] = snapshot
@@ -830,6 +838,9 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 return snapshot
 
             def blocked_advance(self, *args, **kwargs):
+                nonlocal advance_calls
+                advance_calls += 1
+                advance_thread_names.append(threading.current_thread().name)
                 if threading.current_thread().name == "drain-race-cli":
                     cas_ready.set()
                     assert release_cas.wait(5), "drain race CAS was not released"
@@ -837,11 +848,14 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
 
             stdout = io.StringIO()
             stderr = io.StringIO()
-            outcome: dict[str, int] = {}
+            outcome: dict[str, object] = {"return": None, "exception": None}
 
             def drain() -> None:
-                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    outcome["rc"] = _carrier_messages.main(argv)
+                try:
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        outcome["return"] = _carrier_messages.main(argv)
+                except BaseException:
+                    outcome["exception"] = traceback.format_exc()
 
             with (
                 mock.patch.object(goalflight_journal.Journal, "cursor_peek", blocked_peek),
@@ -856,6 +870,8 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 assert_true("drain captured its snapshot", snapshot_ready.wait(5))
                 snapshot = captured["snapshot"]
                 positions = _carrier_messages._cursor_positions(snapshot.items)
+                release_snapshot.set()
+                assert_true("drain reached its CAS", cas_ready.wait(5))
                 advanced = authority.advance_cursor(
                     label,
                     nonce=lease.nonce,
@@ -865,18 +881,25 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                     actor="concurrent-test-controller",
                 )
                 assert_true("concurrent cursor advance committed", advanced.committed)
-                release_snapshot.set()
-                assert_true("drain reached its CAS", cas_ready.wait(5))
                 release_cas.set()
                 worker.join(timeout=5)
-                assert_true("drain race thread exited", not worker.is_alive())
+                assert_true(
+                    "drain race thread exited; "
+                    f"return={outcome['return']!r}; "
+                    f"exception={outcome['exception']!r}; "
+                    f"blocked_peek_entered={peek_calls > 0} calls={peek_calls} "
+                    f"threads={peek_thread_names!r}; "
+                    f"blocked_advance_entered={advance_calls > 0} calls={advance_calls} "
+                    f"threads={advance_thread_names!r}",
+                    not worker.is_alive(),
+                )
 
             combined_lines = [
                 line
                 for line in (stdout.getvalue() + stderr.getvalue()).splitlines()
                 if line
             ]
-            assert_true("drain race exits CAS-lost", outcome["rc"] == 3)
+            assert_true("drain race exits CAS-lost", outcome["return"] == 3)
             assert_true(
                 "drain race shows the attempted item before reporting CAS loss",
                 combined_lines
