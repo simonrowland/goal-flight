@@ -1671,15 +1671,16 @@ def _refuse_ignored_tree_collisions(
         if not path:
             continue
         components = path.split("/")
-        for end in range(1, len(components) + 1):
-            prefix = "/".join(components[:end])
-            if prefix in tree_paths or any(
-                tree_path.startswith(prefix + "/") for tree_path in tree_paths
-            ):
-                raise WorktreeSeatResetRefused(
-                    f"ignored path {raw_path!r} collides with HEAD or target tree; "
-                    "refusing reset"
-                )
+        if path in tree_paths or any(
+            tree_path.startswith(path + "/") for tree_path in tree_paths
+        ) or any(
+            "/".join(components[:end]) in tree_paths
+            for end in range(1, len(components))
+        ):
+            raise WorktreeSeatResetRefused(
+                f"ignored path {raw_path!r} collides with HEAD or target tree; "
+                "refusing reset"
+            )
 
 
 def _prepare_seat_checkout(

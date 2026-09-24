@@ -2127,7 +2127,10 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
             try:
                 lease = _bind_dispatch_worktree(args)
                 break
-            except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+            except (
+                goalflight_worktree_pool.WorktreeSeatUnavailable,
+                goalflight_worktree_pool.WorktreeSeatResetRefused,
+            ) as exc:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     args._worktree_seat_refused = True

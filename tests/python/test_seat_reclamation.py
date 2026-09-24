@@ -185,6 +185,62 @@ def test_ignored_head_collision_retains_seat(holder):
     ) == ""
 
 
+@pytest.mark.parametrize(
+    ("ignore_pattern", "tracked_path", "ignored_path", "ignored_is_file", "reuses"),
+    [
+        (
+            "__pycache__/",
+            "rf/coupling/tracked.py",
+            "rf/coupling/__pycache__",
+            False,
+            True,
+        ),
+        ("build/", "build/x", "build", False, False),
+        ("out", "out/x", "out", True, False),
+    ],
+)
+def test_ignored_paths_match_tree_collisions_exactly(
+    holder, ignore_pattern, tracked_path, ignored_path, ignored_is_file, reuses
+):
+    repo, path, row = holder
+    (path / ".gitignore").write_text(ignore_pattern + "\n")
+    if ignored_path == "rf/coupling/__pycache__":
+        anchor = path / "rf/coupling/existing.py"
+        anchor.parent.mkdir(parents=True)
+        anchor.write_text("existing\n")
+        _git(path, "add", ".gitignore", "rf/coupling/existing.py")
+    else:
+        _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore reset fixture")
+
+    target = repo / tracked_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("target\n")
+    if reuses:
+        (repo / ".gitignore").write_text(ignore_pattern + "\n")
+        _git(repo, "add", ".gitignore", tracked_path)
+    else:
+        _git(repo, "add", tracked_path)
+    _git(repo, "commit", "-m", "add reset fixture target")
+
+    ignored = path / ignored_path
+    if ignored_is_file:
+        ignored.write_text("must survive reset\n")
+    else:
+        ignored.mkdir(parents=True)
+        (ignored / "payload").write_text("must survive reset\n")
+
+    if reuses:
+        with pool.acquire_worktree_seat(repo, "next") as lease:
+            assert lease.path == path
+            assert ignored.exists()
+    else:
+        with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
+            pool.acquire_worktree_seat(repo, "next")
+        assert ignored.exists()
+        assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 @pytest.mark.parametrize("missing", [False, True])
 def test_hidden_index_edit_retains_seat(holder, flag, missing):
@@ -578,6 +634,22 @@ def test_seat_wait_retries_without_terminal_record(monkeypatch):
     assert bind.call_count == 2
 
 
+def test_retained_seat_wait_retries_without_terminal_record(monkeypatch):
+    args = SimpleNamespace(capacity_wait_s=10)
+    lease = object()
+    bind = Mock(
+        side_effect=[
+            pool.WorktreeSeatResetRefused("all available worktrees would lose work"),
+            lease,
+        ]
+    )
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", bind)
+    monkeypatch.setattr(dispatch.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dispatch, "_prepare_attempt_worktree_occupancy", lambda args: None)
+    assert dispatch._admit_dispatch_worktree(args) is lease
+    assert bind.call_count == 2
+
+
 def test_seat_wait_expiry_is_admission_refusal(monkeypatch):
     args = SimpleNamespace(capacity_wait_s=None)
     def refuse(bind_args):
@@ -730,6 +802,81 @@ def test_full_pool_waits_then_launches_same_id(tmp_path, monkeypatch):
         assert marker.exists()
     finally:
         holder.release()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.communicate(timeout=5)
+
+
+# HOST-ONLY: launches a detached dispatcher; do not run in a worker worktree.
+def test_retained_seat_waits_then_launches_same_id(tmp_path, monkeypatch):
+    env = _env(tmp_path, seats=1)
+    for key, value in env.items():
+        if key.startswith("GOALFLIGHT_"):
+            monkeypatch.setenv(key, value)
+    repo = _make_repo(tmp_path)
+    holder = pool.acquire_worktree_seat(repo, "held")
+    seat = holder.path
+    holder.release()
+    ledger.record_path("held").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "held",
+                "state": "complete",
+                "worker_pid": os.getpid(),
+                "worker_identity": {
+                    "pid": os.getpid(),
+                    "start_token": "previous-generation",
+                },
+            }
+        )
+    )
+
+    (seat / ".gitignore").write_text("build/\n")
+    _git(seat, "add", ".gitignore")
+    _git(seat, "commit", "-m", "ignore retained-seat fixture")
+    target = repo / "build" / "x"
+    target.parent.mkdir()
+    target.write_text("target\n")
+    _git(repo, "add", "build/x")
+    _git(repo, "commit", "-m", "add retained-seat target")
+    collision = seat / "build"
+    collision.mkdir()
+    (collision / "payload").write_text("must survive until release\n")
+
+    marker = tmp_path / "launched"
+    command = _dispatch_cmd(
+        tmp_path,
+        repo,
+        "waiting",
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('launched')",
+    )
+    command[command.index("--") : command.index("--")] = ["--capacity-wait-s", "5"]
+
+    def release_collision() -> None:
+        (collision / "payload").unlink()
+        collision.rmdir()
+
+    proc = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    timer = threading.Timer(0.5, release_collision)
+    timer.start()
+    try:
+        stdout, stderr = proc.communicate(timeout=20)
+        assert proc.returncode == 0, stdout + stderr
+        assert stdout.count("DISPATCH-LAUNCHED") == 1
+        assert "DISPATCH-BLOCKED" not in stdout
+        assert marker.exists()
+    finally:
+        timer.cancel()
+        timer.join()
         if proc.poll() is None:
             proc.terminate()
             proc.communicate(timeout=5)
