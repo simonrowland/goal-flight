@@ -92,8 +92,14 @@ you want to keep, not by what killed the worker.
   spawn is a new process, lease, and status file; the conversation handle is
   not. Resume reattaches to the recorded worktree when its lock and holder are
   still valid. If the pool recycled that path, it validates the parent's own
-  `worktree/<dispatch-id>` branch (or legacy `seat/<dispatch-id>`) against the
-  recorded head or keep ref, then acquires a free pooled seat on that branch.
+  resume-lineage `worktree/<dispatch-id>` branch (or legacy
+  `seat/<dispatch-id>`) against the recorded head or keep ref, then acquires a
+  free pooled seat on that branch. Reclaimers record which dispatch they
+  displaced; resume checks those refs in hot and archived ledger rows, refuses
+  to continue silently, and prints one `git worktree add <recovery-path> <ref>`
+  command for recovery. Unrelated historical refs do not block another
+  dispatch. A missing checkout's stale Git registration is pruned only after
+  the path is proven absent.
   A branch tip descended from the recorded head is accepted as worker progress
   on that dispatch's own branch; an unrelated or foreign-dispatch tip is still
   refused. If the recorded checkout was deleted, the same normal replacement

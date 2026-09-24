@@ -899,6 +899,68 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
     assert child["codex_home_owner_dispatch_id"] == child_id
 
 
+def test_resume_command_reuses_one_effective_account_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "single-preflight-parent"
+    child_id = "single-preflight-child"
+    source = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
+    record["effective_account"] = "source-account"
+    record["dispatch_argv"] = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--cwd",
+        str(tmp_path),
+    ]
+    L.write_record(record)
+    _configure_account(tmp_path, "alias")
+    prompt = tmp_path / "single-preflight.md"
+    prompt.write_text("Continue exactly once.\n", encoding="utf-8")
+    target = _dispatch_home(tmp_path, child_id)
+    calls: list[tuple[str | None, str]] = []
+
+    def resolve(
+        _project_root: Path,
+        explicit_account: str | None,
+        dispatch_id: str,
+    ) -> tuple[str, str]:
+        calls.append((explicit_account, dispatch_id))
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "auth.json").write_text("effective-seat", encoding="utf-8")
+        return str(target), "effective-seat"
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve),
+    )
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+
+    assert D._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "alias",
+            "--unregistered-forced",
+        ]
+    ) == 0
+
+    assert calls == [("alias", child_id)]
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["effective_account"] == "effective-seat"
+    assert child["codex_home"] == str(target)
+    assert S.rollout_path(target, SESSION_ID) is not None
+
+
 def test_resume_capacity_uses_resolver_effective_account(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1016,6 +1078,76 @@ def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
     assert not (reservations / f"{child_id}.json").exists()
     assert not L.record_path(child_id).exists()
     assert not _dispatch_home(tmp_path, child_id).exists()
+
+
+def test_resume_replayed_child_id_refuses_before_account_home_build(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "replay-parent"
+    child_id = "replay-child"
+    source = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=source)
+    existing = _write_parent_record(
+        tmp_path,
+        dispatch_id=child_id,
+        session_id=OTHER_CANONICAL_SESSION_ID,
+        home=_dispatch_home(tmp_path, child_id),
+    )
+    existing.update(
+        {
+            "state": "running",
+            "terminal_state": "unknown",
+            "parent_dispatch_id": parent_id,
+        }
+    )
+    L.write_record(existing)
+    existing_home = _dispatch_home(tmp_path, child_id)
+    _write_rollout(existing_home, OTHER_CANONICAL_SESSION_ID)
+    _configure_account(tmp_path, "new-account")
+    prompt = tmp_path / "replay.md"
+    prompt.write_text(
+        "Continue without rebuilding the replayed child.\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(D, "_reserve_auto_dispatch_id", lambda *_a, **_k: child_id)
+    monkeypatch.setattr(D, "_codex_seat_api", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        D,
+        "resolve_codex_home",
+        lambda *_a, **_k: pytest.fail("replayed child must refuse before home build"),
+    )
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            child_id,
+            "--parent-dispatch-id",
+            parent_id,
+            "--codex-session-id",
+            SESSION_ID,
+            "--engine-session-id",
+            SESSION_ID,
+            "--codex-resume-home",
+            str(source),
+            "--codex-home-owner-dispatch-id",
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "new-account",
+            "--unregistered-forced",
+        ]
+    )
+
+    assert rc == 64
+    assert "already has a non-terminal ledger record" in capsys.readouterr().err
+    assert S.rollout_path(existing_home, OTHER_CANONICAL_SESSION_ID) is not None
 
 
 def test_resume_legacy_controller_label_is_enforced_from_argv(
@@ -2267,7 +2399,8 @@ def test_resume_refuses_existing_nonterminal_child_for_same_session(
             "state": "running",
             "terminal_state": "unknown",
             "parent_dispatch_id": parent_id,
-            "codex_home_owner_dispatch_id": parent_id,
+            "codex_home": str(_dispatch_home(tmp_path, child_id)),
+            "codex_home_owner_dispatch_id": child_id,
         }
     )
     L.write_record(child)

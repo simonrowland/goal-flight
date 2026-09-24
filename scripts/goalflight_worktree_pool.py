@@ -140,6 +140,7 @@ class WorktreeSeatLease:
         quarantine_branch: str | None,
         branch: str,
         keep_ref: str | None = None,
+        reclaimed_dispatch_id: str | None = None,
         controller_label: str | None = None,
     ) -> None:
         self.path = path
@@ -148,6 +149,7 @@ class WorktreeSeatLease:
         self.quarantine_branch = quarantine_branch
         self.branch = branch
         self.keep_ref = keep_ref
+        self.reclaimed_dispatch_id = reclaimed_dispatch_id
         self.controller_label = controller_label
         self._lock_file: TextIO | None = lock_file
 
@@ -994,6 +996,11 @@ def _create_seat_worktree(
     branch: str,
     base_commit: str,
 ) -> None:
+    # A deleted checkout can remain in Git's worktree admin list. The path is
+    # proven absent at this point, so prune stale registration before the
+    # replacement add; never prune an occupied or merely unreadable path.
+    if not worktree_path.exists() and not worktree_path.is_symlink():
+        _git(project_root, "worktree", "prune")
     ref = f"refs/heads/{branch}"
     exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
     if exists is None:
@@ -1263,6 +1270,7 @@ def _prepare_claimed_seat(
             lock_file=lock_file,
             quarantine_branch=None,
             branch=actual,
+            reclaimed_dispatch_id=None,
             controller_label=controller_label,
         )
     keep_ref = None
@@ -1320,6 +1328,9 @@ def _prepare_claimed_seat(
         quarantine_branch=quarantine_branch,
         branch=actual_branch,
         keep_ref=keep_ref,
+        reclaimed_dispatch_id=(
+            prior_dispatch_id if prior_dispatch_id != "unknown-dispatch" else None
+        ),
         controller_label=controller_label,
     )
 

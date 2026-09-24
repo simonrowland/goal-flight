@@ -1479,6 +1479,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "worktree_branch",
         "worktree_keep_ref",
         "worktree_quarantine_ref",
+        "worktree_reclaimed_dispatch_id",
     ):
         value = getattr(args, key, None)
         if value:
@@ -1605,6 +1606,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "worktree_branch",
                 "worktree_keep_ref",
                 "worktree_quarantine_ref",
+                "worktree_reclaimed_dispatch_id",
             ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
@@ -2867,6 +2869,9 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--worktree-seat", help=argparse.SUPPRESS)
     rec.add_argument("--worktree-path", help=argparse.SUPPRESS)
     rec.add_argument("--worktree-base", help=argparse.SUPPRESS)
+    rec.add_argument(
+        "--worktree-reclaimed-dispatch-id", help=argparse.SUPPRESS
+    )
     rec.add_argument("--os-sandbox-json")
     # RUNNING belongs to the worker's pre-exec journal claim. A bare record
     # command can truthfully prepare STARTING, but it cannot impersonate that
