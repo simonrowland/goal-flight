@@ -2114,13 +2114,16 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
     resolution and capacity acquisition happen before it; a refusal or wait
     therefore cannot create, reset, or hold a worktree seat.
     """
-    wait_s = max(0.0, float(getattr(args, "capacity_wait_s", None) or 0.0))
+    requested_wait = getattr(args, "capacity_wait_s", None)
+    wait_s = max(0.0, float(requested_wait or 0.0))
     deadline = time.monotonic() + wait_s
     previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
     # Zero is an immediate non-blocking lock budget. A positive monotonic
     # deadline is used for polling; None retains the direct-call blocking
     # behavior for callers that do not go through admission.
-    args._worktree_capacity_deadline = deadline if wait_s else 0.0
+    args._worktree_capacity_deadline = (
+        deadline if wait_s else (0.0 if requested_wait is not None else None)
+    )
     last_wait_error = None
     try:
         while True:

@@ -113,6 +113,88 @@ def test_quarantine_preserves_force_staged_ignored_file(holder):
         assert _git(repo, "show", refs[0] + ":valuable.bin") == "keep this"
 
 
+def test_quarantine_refuses_staged_goalflight_entry(holder):
+    repo, path, row = holder
+    (path / ".gitignore").write_text(".goal-flight/\n")
+    _git(path, "add", ".gitignore")
+    _git(path, "commit", "-m", "ignore goal-flight")
+    notes = path / ".goal-flight" / "seat" / "memory.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("keep this\n")
+    _git(path, "add", "-f", ".goal-flight/seat/memory.md")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="staged .goal-flight"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert notes.read_text() == "keep this\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+def test_quarantine_refuses_clean_filter_bytes(holder, monkeypatch):
+    repo, path, row = holder
+    payload = path / "valuable.dat"
+    payload.write_text("base worktree bytes\n")
+    _git(path, "add", "valuable.dat")
+    _git(path, "commit", "-m", "track filter candidate")
+    (path / ".gitattributes").write_text("*.dat filter=pointer\n")
+    _git(path, "add", ".gitattributes")
+    _git(path, "commit", "-m", "configure pointer filter")
+    clean_filter = path / "clean-filter.sh"
+    clean_filter.write_text("#!/bin/sh\nprintf 'LFS_POINTER\\n'\n")
+    clean_filter.chmod(0o755)
+    _git(path, "config", "filter.pointer.clean", str(clean_filter))
+    _git(path, "config", "filter.pointer.smudge", "cat")
+    _git(path, "config", "filter.pointer.required", "true")
+    payload.write_text("raw worktree bytes\n")
+    assert _git(path, "check-attr", "filter", "--", "valuable.dat").endswith(
+        "filter: pointer"
+    )
+    real_git = pool._git
+    def clean_status(cwd, *args, **kwargs):
+        if args[:2] == ("status", "--porcelain=v1"):
+            return ""
+        return real_git(cwd, *args, **kwargs)
+    monkeypatch.setattr(pool, "_git", clean_status)
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="active clean"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert payload.read_text() == "raw worktree bytes\n"
+    assert _git(path, "branch", "--show-current") == "worktree/old"
+
+
+def test_quarantine_failure_skips_candidate_and_reuses_next(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo = _make_repo(tmp_path)
+    bad = pool.acquire_worktree_seat(repo, "bad")
+    good = pool.acquire_worktree_seat(repo, "good")
+    nested = bad.path / "nested"
+    nested.mkdir()
+    _git(nested, "init")
+    bad_path = bad.path
+    good_path = good.path
+    bad.release()
+    good.release()
+
+    records = {
+        ident: {
+            "dispatch_id": ident,
+            "state": "complete",
+            "worker_pid": 34567,
+            "worker_identity": {"pid": 34567, "start_token": f"{ident}-token"},
+        }
+        for ident in ("bad", "good")
+    }
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: False,
+    )
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == good_path
+    assert nested.exists()
+    assert bad_path != good_path
+
+
 def test_quarantine_refuses_separate_staged_and_working_versions(holder):
     repo, path, row = holder
     (path / "tracked.txt").write_text("staged\n")
@@ -183,6 +265,25 @@ def test_local_config_cap_overrides_env(tmp_path, monkeypatch):
     monkeypatch.delenv("GOALFLIGHT_WORKTREES_PER_REPO")
     monkeypatch.delenv("GOALFLIGHT_WORKTREE_SEATS", raising=False)
     assert pool.configured_worktree_seats() == 15
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 2.5, "2"])
+def test_invalid_local_config_cap_fails_loudly(tmp_path, monkeypatch, value):
+    config = tmp_path / "capacity.json"
+    config.write_text(json.dumps({"worktrees_per_repo": value}))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", str(config))
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    with pytest.raises(pool.WorktreeSeatError, match="worktrees_per_repo"):
+        pool.configured_worktree_seats()
+
+
+def test_unparseable_local_config_cap_fails_loudly(tmp_path, monkeypatch):
+    config = tmp_path / "capacity.json"
+    config.write_text("not json")
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", str(config))
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    with pytest.raises(pool.WorktreeSeatError, match="invalid JSON"):
+        pool.configured_worktree_seats()
 
 
 def test_seat_wait_retries_without_terminal_record(monkeypatch):

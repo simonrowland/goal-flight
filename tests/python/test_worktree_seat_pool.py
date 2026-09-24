@@ -604,7 +604,6 @@ def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
                 "notes content kept",
                 notes.read_text(encoding="utf-8") == "keep me\n",
             )
-            assert_true("RESULT.md cleared", not (reused.path / "RESULT.md").exists())
             branches = git(
                 repo,
                 "for-each-ref",
@@ -612,6 +611,11 @@ def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
                 "refs/heads/goalflight/quarantine/",
             ).splitlines()
             assert_true("quarantine captured RESULT.md", len(branches) == 1)
+            assert_true(
+                "ignored notes remain outside quarantine",
+                ".goal-flight/seat/memory.md" not in _tree_names(repo, branches[0]),
+            )
+            assert_true("RESULT.md cleared", not (reused.path / "RESULT.md").exists())
             assert_true(
                 "RESULT.md in quarantine",
                 git(repo, "show", f"{branches[0]}:RESULT.md") == "old result",

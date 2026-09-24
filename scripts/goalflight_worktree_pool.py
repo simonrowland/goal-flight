@@ -19,7 +19,6 @@ from typing import TextIO
 
 import goalflight_compat
 import goalflight_ledger
-from goalflight_agent_limits import load_local_overrides
 
 
 WORKTREES_PER_REPO_ENV = "GOALFLIGHT_WORKTREES_PER_REPO"
@@ -202,9 +201,35 @@ class WorktreeSeatLease:
 
 
 def configured_worktree_seats() -> int:
-    configured = load_local_overrides().get("worktrees_per_repo")
-    if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
-        return configured
+    raw_conf_path = os.environ.get("GOALFLIGHT_CAPACITY_CONF", "").strip()
+    conf_path = (
+        Path(raw_conf_path).expanduser()
+        if raw_conf_path
+        else Path.home() / ".goal-flight" / "capacity.local.json"
+    )
+    if conf_path == Path(os.devnull):
+        local_overrides = {}
+    else:
+        try:
+            local_overrides = json.loads(conf_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            local_overrides = {}
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise WorktreeSeatError(
+                f"capacity override {conf_path} is unreadable or invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(local_overrides, dict):
+            raise WorktreeSeatError(
+                f"capacity override {conf_path} must contain a JSON object"
+            )
+    if "worktrees_per_repo" in local_overrides:
+        configured = local_overrides["worktrees_per_repo"]
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+            return configured
+        raise WorktreeSeatError(
+            f"{conf_path}: worktrees_per_repo must be a positive integer, "
+            f"got {configured!r}"
+        )
     raw = os.environ.get(WORKTREES_PER_REPO_ENV)
     env_name = WORKTREES_PER_REPO_ENV
     if raw is None or not raw.strip():
@@ -1422,12 +1447,23 @@ def _quarantine_dirty_worktree(
     seat_name: str,
     abandoned_dispatch_id: str,
 ) -> str | None:
+    staged_reserved = _git(
+        worktree_path,
+        "diff",
+        "--cached",
+        "--name-only",
+        "--",
+        ".goal-flight",
+    )
+    if staged_reserved:
+        raise WorktreeSeatResetRefused(
+            f"dirty worktree {seat_name} has staged .goal-flight content "
+            "that cannot be safely reset; refusing reclaim"
+        )
     dirty = _git(worktree_path, "status", "--porcelain=v1", "--untracked-files=all")
     product = [
         line for line in dirty.splitlines() if line.strip() and _porcelain_is_product(line)
     ]
-    if not product:
-        return None
     staged_and_worktree = [
         line
         for line in product
@@ -1440,6 +1476,44 @@ def _quarantine_dirty_worktree(
             f"dirty worktree {seat_name} has separate staged and working versions "
             "that cannot be represented by one quarantine commit; refusing reset"
         )
+
+    filter_paths: list[str] = []
+    for line in product:
+        for path in _porcelain_relpaths(line):
+            if path not in filter_paths and (worktree_path / path).is_file():
+                filter_paths.append(path)
+    tracked_paths = [
+        path for path in _git(worktree_path, "ls-files", "-z").split("\0") if path
+    ]
+    for path in tracked_paths:
+        if path not in filter_paths:
+            filter_paths.append(path)
+    for path in filter_paths:
+        worktree_file = worktree_path / path
+        if not worktree_file.is_file():
+            continue
+        attribute = _git(worktree_path, "check-attr", "filter", "--", path)
+        marker = ": filter: "
+        if marker not in attribute:
+            continue
+        filter_name = attribute.rsplit(marker, 1)[1].strip()
+        if filter_name in {"", "unspecified", "unset"}:
+            continue
+        stored_entry = _git(worktree_path, "ls-files", "--stage", "--", path)
+        if not stored_entry:
+            raise WorktreeSeatResetRefused(
+                f"worktree {seat_name} path {path} uses active clean/process "
+                f"filter {filter_name!r} but has no stored bytes; refusing reset"
+            )
+        raw_oid = _git(worktree_path, "hash-object", "--", path)
+        stored_oid = stored_entry.splitlines()[0].split()[1]
+        if raw_oid != stored_oid:
+            raise WorktreeSeatResetRefused(
+                f"worktree {seat_name} path {path} uses active clean/process "
+                f"filter {filter_name!r} and would lose raw bytes; refusing reset"
+            )
+    if not product:
+        return None
 
     # `:(exclude)` of an ignored path makes `git add` exit 1, so a worktree that
     # contains `.goal-flight/` cannot be reclaimed. Add normally, then unstage
@@ -1621,11 +1695,18 @@ def _prepare_claimed_seat_locked(
                 raise WorktreeSeatResetRefused(
                     f"saved head {keep_ref} did not verify; refusing reset"
                 )
-    quarantine_branch = _quarantine_dirty_worktree(
-        worktree_path,
-        seat_name=seat_name,
-        abandoned_dispatch_id=prior_dispatch_id,
-    )
+    try:
+        quarantine_branch = _quarantine_dirty_worktree(
+            worktree_path,
+            seat_name=seat_name,
+            abandoned_dispatch_id=prior_dispatch_id,
+        )
+    except WorktreeSeatResetRefused:
+        raise
+    except (WorktreeSeatError, OSError) as exc:
+        raise WorktreeSeatResetRefused(
+            f"cannot quarantine dirty worktree {seat_name}: {exc}"
+        ) from exc
     _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
     remaining = _git(
         worktree_path,

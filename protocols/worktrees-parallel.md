@@ -27,6 +27,8 @@ Rules:
   <repo>; oldest holders: …` and never mints an unmanaged checkout. Holders
   show dispatch id, ledger controller label, state, and worker identity;
   directory labels and allocator PIDs are not ownership evidence.
+  A malformed file or non-positive/non-integer `worktrees_per_repo` fails
+  loudly; fallback applies only when the file is absent or omits that key.
   Explicit `--capacity-wait-s` also bounds seat polling. Without it, exhaustion
   refuses immediately. A refused seat admission leaves no dispatch ledger row
   or terminal notification and does not consume the task id.
@@ -50,7 +52,15 @@ Rules:
   `refs/goalflight/keep/<dispatch-id>/dirty-<UTC-time>` (also exposed through
   the legacy `goalflight/quarantine/s-<N>-<UTC-time>` branch), then checks out the new branch at `<base>` and
   runs `git clean -fd -e .goal-flight`. Unknown status, refs, or identity
-  evidence retains the worktree.
+  evidence retains the worktree. Staged entries under `.goal-flight/` also
+  retain the worktree; ignored untracked notes there are intentionally left in
+  the reused seat and are not in the keep ref because the reserved namespace
+  is preserved by `git clean -fd -e .goal-flight` (a documented cross-dispatch
+  leak).
+- Allocation lock ownership covers candidate selection, quarantine, and reset
+  so ref pinning and checkout remain one transaction. Slow quarantine can
+  serialize reclaimers; there is no FIFO queue, and an explicit capacity wait
+  bounds contenders.
 - A reclaimed `BLOCKED` worker is not automatically re-seated yet. Resume
   validates the recorded seat and refuses safely; automatic resume re-seating
   is a separate fix.
