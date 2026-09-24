@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -958,6 +959,7 @@ def test_resume_command_reuses_one_effective_account_preflight(
     prompt = tmp_path / "single-preflight.md"
     prompt.write_text("Continue exactly once.\n", encoding="utf-8")
     target = _dispatch_home(tmp_path, child_id)
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
     calls: list[tuple[str | None, str]] = []
 
     def resolve(
@@ -975,7 +977,8 @@ def test_resume_command_reuses_one_effective_account_preflight(
         "_codex_seat_api",
         lambda: SimpleNamespace(
             resolve_codex_seat=resolve,
-            resolve_codex_account=lambda *_args: "effective-seat",
+            cleanup_dispatch_home=lambda dispatch_id: target.exists()
+            and shutil.rmtree(target),
         ),
     )
     monkeypatch.setattr(D, "resolve_codex_home", resolve)
@@ -1473,6 +1476,7 @@ def test_resume_legacy_duplicate_model_flags_keep_last_occurrence(
         "_default_dispatch_id",
         lambda _agent: "legacy-duplicate-child",
     )
+    monkeypatch.setattr(D, "_validate_codex_reasoning_effort", lambda *_args: None)
     monkeypatch.setattr(
         D,
         "main",
@@ -2765,6 +2769,19 @@ def test_resume_of_quota_exhausted_dispatch_honors_account(
     prompt = tmp_path / "revisions.md"
     prompt.write_text("Continue after quota death.\n", encoding="utf-8")
     captured: list[list[str]] = []
+    target = _dispatch_home(tmp_path, "quota-resume-child")
+
+    def resolve_seat(_project_root: str, account: str, dispatch_id: str):
+        assert account == "25ca6b"
+        assert dispatch_id == "quota-resume-child"
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target), account
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
     monkeypatch.setattr(
         D,
         "_default_dispatch_id",

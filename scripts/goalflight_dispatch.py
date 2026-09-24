@@ -2109,7 +2109,7 @@ def _validate_resume_worktree_source(
     """Validate branch lineage and reclaim refs before resume side effects."""
     raw_root = record.get("project_root")
     if not raw_root:
-        return
+        raise DispatchUsageError(f"resume refused: dispatch {parent_dispatch_id} is missing a project root")
     try:
         project_root = goalflight_task.resolve_project_root(str(raw_root))
         if not goalflight_worktree_pool.is_managed_worktree_path(
@@ -3739,6 +3739,7 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
     # reject a broken chain that could otherwise make recovery fail open.
     exempt: list[str] = []
     seen: set[str] = set()
+    project_root: Path | None = None
     current = str(parent_dispatch_id or "").strip()
     for _ in range(_RESUME_LINEAGE_WALK_LIMIT):
         if not current:
@@ -3754,15 +3755,26 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
                 f"resume refused: missing or unreadable lineage ancestor {current}"
             )
         if not record.get("project_root"):
-            raise goalflight_worktree_pool.WorktreeCwdRefused(
-                f"resume refused: lineage ancestor {current} is missing a project root"
+            raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: lineage ancestor {current} is missing a project root")
+        try:
+            candidate_root = goalflight_task.resolve_project_root(
+                str(record["project_root"])
             )
+        except (OSError, ValueError) as exc:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: lineage ancestor {current} has an invalid project root") from exc
+        if project_root is not None and candidate_root != project_root:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: lineage ancestor {current} belongs to a different project root")
+        project_root = project_root or candidate_root
         exempt.append(current)
         current = str(record.get("parent_dispatch_id") or "").strip()
     else:
         raise goalflight_worktree_pool.WorktreeCwdRefused(
             f"resume refused: lineage exceeds {_RESUME_LINEAGE_WALK_LIMIT} ancestors"
         )
+    root_id = exempt[-1]
+    root_branch = str(record.get("worktree_branch") or "").strip()
+    if root_branch and (not goalflight_worktree_pool.is_worktree_branch(root_branch) or root_branch.rsplit("/", 1)[-1] != root_id):
+        raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: root lineage branch {root_branch} does not belong to root dispatch {root_id}")
     return exempt
 
 
@@ -5644,16 +5656,13 @@ def _cmd_resume(argv: list[str]) -> int:
             child_dispatch_id=candidate_dispatch_id,
             prompt_path=prompt_path,
             resume_args=args,
-            defer_grok_side_effects=True,
         )
         preflight = _preflight_resume_dispatch(
             source,
             candidate_argv=candidate_argv,
-            resume_args=args,
-            prompt_path=prompt_path,
             dispatch_id=candidate_dispatch_id,
         )
-    except DispatchUsageError as exc:
+    except (DispatchUsageError, goalflight_worktree_pool.WorktreeSeatError) as exc:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
     child_dispatch_id = preflight["dispatch_id"]
@@ -5669,6 +5678,7 @@ def _cmd_resume(argv: list[str]) -> int:
             reservation = _dispatch_base_dir() / ".dispatch-ids" / f"{cleanup_id}.json"
             with contextlib.suppress(OSError):
                 reservation.unlink()
+            for home_id in {child_dispatch_id, cleanup_id}: cleanup_codex_dispatch_home(home_id)
     return result
 
 
@@ -5780,7 +5790,6 @@ def _resume_launch_argv(
     child_dispatch_id: str,
     prompt_path: Path,
     resume_args,
-    defer_grok_side_effects: bool = False,
 ) -> list[str]:
     record = source["record"]
     recorded = _dispatch_argv_from_record(record)
@@ -5851,8 +5860,6 @@ def _resume_launch_argv(
     if not (isinstance(owner_account, str) and owner_account and owner_account != "default"):
         owner_account = None
     requested = resume_account.strip() if isinstance(resume_account, str) and resume_account.strip() else None
-    resume_mode = "same-account"
-    reconstruction_prompt: Path | None = None
 
     if engine == "codex":
         # Codex carries --codex-resume-home, so the rollout is read from the
@@ -5890,44 +5897,6 @@ def _resume_launch_argv(
                         no_healthy_seat_message(
                             engine, owner_account or "unknown", sorted(configured)
                         )
-                    )
-        if target and owner_account and target != owner_account:
-            if defer_grok_side_effects:
-                resume_mode = "carried"
-            else:
-                try:
-                    ok, detail = migrate_seat_session(
-                        engine=engine,
-                        session_id=source["session_id"],
-                        worker_cwd=str(cwd),
-                        from_account=owner_account,
-                        to_account=target,
-                    )
-                except (OSError, RuntimeError, ValueError) as exc:
-                    ok, detail = False, f"session carry failed: {type(exc).__name__}: {exc}"
-                print(
-                    f"goalflight_dispatch: resume account move {owner_account} -> {target}: {detail}",
-                    file=sys.stderr,
-                )
-                if ok:
-                    resume_mode = "carried"
-                else:
-                    reconstruction_prompt = _build_grok_reconstruction_prompt(
-                        record,
-                        parent_dispatch_id=str(
-                            getattr(resume_args, "parent_dispatch_id", None)
-                            or resume_args.dispatch_id
-                        ),
-                        child_dispatch_id=child_dispatch_id,
-                        session_id=source["session_id"],
-                        cwd=cwd,
-                        controller_prompt=prompt_path,
-                    )
-                    resume_mode = "reconstructed"
-                    print(
-                        "goalflight_dispatch: Grok session carry was unavailable; "
-                        "using resumed-by-reconstruction",
-                        file=sys.stderr,
                     )
         if target:
             replace["--account"] = target
@@ -5974,30 +5943,6 @@ def _resume_launch_argv(
         )
         + sandbox_strip_options,
     )
-    if source["engine"] == "grok":
-        replace_mode = resume_mode
-        if not defer_grok_side_effects:
-            resume_args.resume_mode = replace_mode
-            resume_args.resume_reconstruction = resume_mode == "reconstructed"
-        argv = _set_option_before_worker_remainder(
-            argv, "--resume-mode", replace_mode
-        )
-        if resume_mode == "reconstructed":
-            reconstructed_session_id = goalflight_engine_sessions.new_session_id(
-                "grok"
-            )
-            if not defer_grok_side_effects:
-                resume_args.engine_session_id = reconstructed_session_id
-                resume_args.prompt_file = str(reconstruction_prompt)
-            argv = _set_option_before_worker_remainder(
-                argv, "--prompt-file", str(reconstruction_prompt)
-            )
-            argv = _set_option_before_worker_remainder(
-                argv,
-                "--engine-session-id",
-                reconstructed_session_id,
-            )
-            argv = _insert_before_worker_remainder(argv, ["--resume-reconstruction"])
     if "--account" not in replace:
         # Drop a recorded pin onto a now-exhausted (or Codex-rotating) account
         # so default selection can skip recently exhausted accounts.
@@ -6005,12 +5950,59 @@ def _resume_launch_argv(
     return argv
 
 
+def _finalize_grok_resume(
+    source: dict,
+    args,
+    *,
+    prompt_path: Path,
+    dispatch_base: Path,
+    orientation_path: Path | None,
+) -> tuple[list[str], Path, str]:
+    source_cwd = _resume_worker_cwd(source["record"], override=_option_value_before_worker_remainder(args._original_argv, "--cwd", last=True))
+    final_cwd = _worker_cwd(args)
+    record = source["record"]
+    owner_account = record.get("effective_account") or record.get("account")
+    owner_account = owner_account if isinstance(owner_account, str) and owner_account != "default" else None
+    target_account = _option_value_before_worker_remainder(args._original_argv, "--account", last=True) or owner_account
+    resume_mode = "same-account"
+    reconstruction_prompt = None
+    if target_account and owner_account and (target_account != owner_account or source_cwd != final_cwd):
+        try:
+            ok, detail = migrate_seat_session(
+                engine="grok", session_id=source["session_id"], worker_cwd=str(source_cwd),
+                destination_cwd=str(final_cwd), from_account=owner_account, to_account=target_account,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            ok, detail = False, f"session carry failed: {type(exc).__name__}: {exc}"
+        print(f"goalflight_dispatch: resume account move {owner_account} -> {target_account}: {detail}", file=sys.stderr)
+        if ok:
+            resume_mode = "carried"
+        else:
+            reconstruction_prompt = _build_grok_reconstruction_prompt(
+                record, parent_dispatch_id=str(args.parent_dispatch_id), child_dispatch_id=str(args.dispatch_id),
+                session_id=source["session_id"], cwd=final_cwd, controller_prompt=prompt_path,
+            )
+            resume_mode = "reconstructed"
+            print("goalflight_dispatch: Grok session carry was unavailable; using resumed-by-reconstruction", file=sys.stderr)
+    args.resume_mode, args.resume_reconstruction = resume_mode, resume_mode == "reconstructed"
+    materialized = list(args._original_argv)
+    for flag, value in (("--cwd", final_cwd), ("--resume-mode", resume_mode)):
+        materialized = _set_option_before_worker_remainder(materialized, flag, str(value))
+    engine_session_id = source["session_id"]
+    if reconstruction_prompt:
+        engine_session_id = goalflight_engine_sessions.new_session_id("grok")
+        args.engine_session_id, args.prompt_file = engine_session_id, str(reconstruction_prompt)
+        for flag, value in (("--prompt-file", reconstruction_prompt), ("--engine-session-id", engine_session_id)):
+            materialized = _set_option_before_worker_remainder(materialized, flag, str(value))
+        materialized = _insert_before_worker_remainder(materialized, ["--resume-reconstruction"])
+        prompt_path = _materialize_steer_prompt(reconstruction_prompt, dispatch_base, args.dispatch_id, agent=args.agent, orientation_path=orientation_path)
+    return materialized, prompt_path, engine_session_id
+
+
 def _preflight_resume_dispatch(
     source: dict,
     *,
     candidate_argv: list[str],
-    resume_args,
-    prompt_path: Path,
     dispatch_id: str,
 ) -> dict:
     """Validate a resume and return the launch plan without writing state."""
@@ -6027,35 +6019,46 @@ def _preflight_resume_dispatch(
     if args.shape == "acp":
         _normalize_acp_agent(args)
     parent_dispatch_id = str(args.parent_dispatch_id)
-    _refuse_launch_blocked_by_completion_authority(args)
     account_env = _validate_before_side_effects(args, raw)
     _validate_resume_worktree_source(
         parent_dispatch_id,
         source["record"],
         _resume_worker_cwd(source["record"], override=getattr(args, "cwd", None)),
     )
+    _refuse_launch_blocked_by_completion_authority(args)
     engine = _account_engine(args.agent)
+    preflight_home = None
     if engine == "codex":
         requested = str(getattr(args, "account", None) or "").strip() or None
         if requested:
             api = _codex_seat_api()
-            normalizer = getattr(api, "resolve_codex_account", None) if api else None
-            args._capacity_account = requested
-            if callable(normalizer):
-                root = str(_project_root(args))
-                for params in (
-                    (root, requested, getattr(args, "model", None)),
-                    (root, requested),
+            resolver = getattr(api, "resolve_codex_seat", None)
+            if not callable(resolver):
+                raise DispatchUsageError(
+                    "resume refused: the Codex account resolver does not support "
+                    "effective-account resolution"
+                )
+            try:
+                preflight_home, effective_account = resolver(
+                    str(_project_root(args)), requested, dispatch_id
+                )
+                expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
+                if (
+                    not isinstance(preflight_home, str)
+                    or not isinstance(effective_account, str)
+                    or not preflight_home
+                    or not effective_account
+                    or Path(preflight_home).resolve(strict=False) != expected_home
                 ):
-                    try:
-                        resolved = normalizer(*params)
-                    except BaseException:
-                        continue
-                    if isinstance(resolved, tuple) and len(resolved) == 2:
-                        resolved = resolved[1]
-                    if isinstance(resolved, str) and resolved.strip():
-                        args._capacity_account = resolved.strip()
-                        break
+                    raise ValueError("resolver returned an invalid home or account")
+            except Exception as exc:
+                cleanup_codex_dispatch_home(dispatch_id)
+                raise DispatchUsageError(
+                    f"resume refused: codex account resolver failed for {requested!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            args._capacity_account = effective_account
+            args._codex_resume_pre_resolved = {"home": preflight_home, "account": effective_account}
         else:
             record = source.get("record") or {}
             parent_account = record.get("effective_account") or record.get("account")
@@ -6069,7 +6072,16 @@ def _preflight_resume_dispatch(
         args._capacity_account = (
             getattr(args, "account", None) or grok_selected_account(args)
         )
-    project_root = _project_root(args)
+    if engine == "codex" and not raw:
+        codex_env = {**os.environ, **account_env}
+        validation_home = preflight_home or source.get("codex_home")
+        if validation_home is not None:
+            codex_env["CODEX_HOME"] = str(validation_home)
+        try:
+            _validate_codex_reasoning_effort(args, codex_env)
+        except BaseException:
+            cleanup_codex_dispatch_home(dispatch_id) if preflight_home is not None else None
+            raise
     if engine == "codex":
         resume_lock = _codex_resume_lock(
             Path(source["codex_home"]), source["session_id"]
@@ -6107,13 +6119,14 @@ def _preflight_resume_dispatch(
             )
     except BaseException:
         resume_lock.__exit__(*sys.exc_info())
+        if preflight_home is not None:
+            cleanup_codex_dispatch_home(dispatch_id)
         raise
     return {
         "args": args,
         "account_env": account_env,
         "capacity_account": getattr(args, "_capacity_account", None),
         "dispatch_id": dispatch_id,
-        "prompt_path": prompt_path,
         "source": source,
         "resume_lock": resume_lock,
     }
@@ -7047,6 +7060,7 @@ def migrate_seat_session(
     engine: str,
     session_id: str,
     worker_cwd: str,
+    destination_cwd: str | None = None,
     from_account: str,
     to_account: str,
 ) -> tuple[bool, str]:
@@ -7062,10 +7076,11 @@ def migrate_seat_session(
 
     Returns (ok, detail). Never raises on a missing source: the caller refuses.
     """
-    if from_account == to_account:
+    destination_cwd = destination_cwd or worker_cwd
+    if from_account == to_account and worker_cwd == destination_cwd:
         return True, "same seat; no migration needed"
     src = _seat_session_dir(from_account, engine, worker_cwd, session_id)
-    dst = _seat_session_dir(to_account, engine, worker_cwd, session_id)
+    dst = _seat_session_dir(to_account, engine, destination_cwd, session_id)
     if src is None or dst is None:
         return False, f"engine {engine!r} has no known seat-scoped session layout"
     if not src.is_dir():
@@ -7082,11 +7097,10 @@ def migrate_seat_session(
     try:
         shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
         os.replace(tmp, dst)
-        shutil.rmtree(src)
     except OSError:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    return True, f"migrated {from_account} -> {to_account}: {dst}"
+    return True, f"copied {from_account} -> {to_account}: {dst}"
 
 
 _GROK_RECONSTRUCTION_LINES = 60
@@ -20547,6 +20561,9 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         args.dispatch_id = reserved_id
         resume_plan["reserved_dispatch_id"] = reserved_id
         resume_plan["capacity_lease_id"] = resume_lease_id
+        if reserved_id != resume_plan["dispatch_id"]:
+            cleanup_codex_dispatch_home(resume_plan["dispatch_id"])
+            args._codex_resume_pre_resolved = None
         args._original_argv = _set_option_before_worker_remainder(
             list(argv),
             "--dispatch-id",
@@ -20708,68 +20725,14 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         return 64
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
-
     steer_file = _steer_file(args.dispatch_id)
-    # Create the mailbox NOW, empty, so the path the briefing advertises is
-    # real from the worker's first iteration.
-    #
-    # The steer preamble tells the worker "You have a steer mailbox at
-    # $GOALFLIGHT_STEER_FILE. Read it AT THE TOP OF EACH ITERATION" -- an
-    # assertion of existence. The file used to be created only when the first
-    # steer was sent, so a worker obeying that instruction on a dispatch that
-    # never received one got "No such file or directory" and reasonably read
-    # an advertised-but-absent channel as a fault. Observed 2026-08-24: a
-    # worker listed exactly that as one of its blockers and stopped.
-    #
-    # An empty carrier parses as zero messages, so this changes nothing for a
-    # dispatch that does get steered; it only makes "no steers yet" look like
-    # an empty mailbox instead of a missing one.
-    try:
-        steer_file.parent.mkdir(parents=True, exist_ok=True)
-        steer_file.touch(mode=0o600, exist_ok=True)
-    except OSError as exc:
-        # Never fail a dispatch over the mailbox: a worker with no steer file
-        # loses steering, while a worker that never launches loses everything.
-        print(
-            f"goalflight_dispatch: could not pre-create steer mailbox {steer_file}: "
-            f"{type(exc).__name__}: {exc}; steering will start on first message",
-            file=sys.stderr,
-        )
-    prompt_path = None if raw else _resolve_prompt_file(args, base)
-    original_prompt_path = prompt_path
-    orientation_path = None if raw else _project_orientation_path(
-        _project_root(args),
-        disabled=bool(getattr(args, "no_orientation", False)),
-    )
-    if prompt_path:
-        prompt_path = _materialize_steer_prompt(
-            prompt_path,
-            base,
-            args.dispatch_id,
-            agent=args.agent,
-            orientation_path=orientation_path,
-        )
-    try:
-        worker_argv, stdin_path = build_worker(args, prompt_path, raw)
-    except DispatchUsageError as e:
-        print(f"goalflight_dispatch: {e}", file=sys.stderr)
-        return 64
-    if not worker_argv:
-        print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X` "
-              "or `-- <cmd...>`", file=sys.stderr)
-        return 64
-
+    prompt_path = None
+    original_prompt_path = None
+    orientation_path = None
+    worker_argv: list[str] = []
+    stdin_path = None
+    worker_stdout_mode = "wb"
     project_root = _project_root(args)
-    try:
-        _mark_queue_claim_launch_started(args)
-    except DispatchUsageError as e:
-        print(f"goalflight_dispatch: {e}", file=sys.stderr)
-        return 64
-
-    tail.parent.mkdir(parents=True, exist_ok=True)
-    _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
-    worker_stdout_mode = "ab" if dispatch_warnings else "wb"
-    _reap_quota_stuck_before_bash_launch()
     worker_pid = None
     worker_spawn_attempted = False
     watcher_pid = None
@@ -20952,6 +20915,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     + str(controller_claim.get("reason") or "unknown"),
                     file=sys.stderr,
                 )
+        # Controller ownership is checked before worktree admission so a
+        # foreign beacon cannot touch a seat. The worktree is then the last
+        # refusal point before prompt, mailbox, and tail writes.
+        worktree_seat = _admit_dispatch_worktree(args)
+        occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
         try:
             registration_warning = _prepare_attempt_controller_registration(
                 args,
@@ -20961,28 +20929,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
         if registration_warning is not None:
-            _emit_dispatch_warnings(
-                [registration_warning],
-                tail_path=tail,
-                reset_tail=False,
-            )
+            dispatch_warnings = [*dispatch_warnings, registration_warning]
             worker_stdout_mode = "ab"
-        if resume_plan is not None and _account_engine(args.agent) == "grok":
-            materialized = _resume_launch_argv(
-                resume_plan["source"],
-                child_dispatch_id=args.dispatch_id,
-                prompt_path=Path(resume_plan["prompt_path"]),
-                resume_args=args,
-            )
-            args._original_argv = list(materialized)
-            if args.resume_reconstruction:
-                prompt_path = _materialize_steer_prompt(
-                    Path(args.prompt_file),
-                    base,
-                    args.dispatch_id,
-                    agent=args.agent,
-                    orientation_path=orientation_path,
-                )
+        if occupancy_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+            worker_stdout_mode = "ab"
         if _account_engine(args.agent) == "grok" and not args.account:
             # Same contract as the codex pointer: args.account stays None so the
             # ledger records "default" (nothing pinned), while effective_account
@@ -21134,6 +21085,55 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     ):
                         codex_dispatch_home = str(canonical_home)
                         effective_account = args.account
+        # No launch-facing files are written until controller, worktree, and
+        # registration checks have all accepted the attempt.
+        try:
+            _mark_queue_claim_launch_started(args)
+        except DispatchUsageError as e:
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
+        try:
+            steer_file.parent.mkdir(parents=True, exist_ok=True)
+            steer_file.touch(mode=0o600, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"goalflight_dispatch: could not pre-create steer mailbox {steer_file}: "
+                f"{type(exc).__name__}: {exc}; steering will start on first message",
+                file=sys.stderr,
+            )
+        prompt_path = None if raw else _resolve_prompt_file(args, base)
+        original_prompt_path = prompt_path
+        orientation_path = None if raw else _project_orientation_path(
+            project_root,
+            disabled=bool(getattr(args, "no_orientation", False)),
+        )
+        if prompt_path:
+            prompt_path = _materialize_steer_prompt(
+                prompt_path,
+                base,
+                args.dispatch_id,
+                agent=args.agent,
+                orientation_path=orientation_path,
+            )
+        if resume_plan is not None and _account_engine(args.agent) == "grok":
+            args._original_argv, prompt_path, engine_session_id = _finalize_grok_resume(
+                resume_plan["source"], args, prompt_path=prompt_path,
+                dispatch_base=base, orientation_path=orientation_path,
+            )
+            if args.account:
+                effective_account = args.account
+        try:
+            worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+        except DispatchUsageError as e:
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
+        if not worker_argv:
+            print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X` "
+                  "or `-- <cmd...>`", file=sys.stderr)
+            return 64
+        tail.parent.mkdir(parents=True, exist_ok=True)
+        _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
+        _reap_quota_stuck_before_bash_launch()
         resume_lock = contextlib.nullcontext()
         resume_lock_kind = None
         if getattr(args, "parent_dispatch_id", None) and resume_engine == "codex":
@@ -21204,25 +21204,16 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 )
         ledger_recorded = True
         if resume_plan is not None:
-            resume_plan["resume_lock"].__exit__(None, None, None)
-            resume_plan["resume_lock"] = None
-        if not raw:
+            held_resume_lock = resume_plan.pop("resume_lock", None)
+            if held_resume_lock is not None:
+                held_resume_lock.__exit__(None, None, None)
+        if not raw and resume_plan is None:
             codex_env = {**os.environ, **account_env}
             if codex_dispatch_home is not None:
                 codex_env["CODEX_HOME"] = codex_dispatch_home
             _validate_codex_reasoning_effort(args, codex_env)
-        worktree_seat = _admit_dispatch_worktree(args)
-        occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
-        if occupancy_warning is not None:
-            _emit_dispatch_warnings(
-                [occupancy_warning],
-                tail_path=tail,
-                reset_tail=False,
-            )
-            worker_stdout_mode = "ab"
         request_envelope = _queue_request_envelope(args)
         if worktree_seat is not None:
-            worker_argv, stdin_path = build_worker(args, prompt_path, raw)
             summary_head["worktree_id"] = worktree_seat.seat_name
             summary_head["worktree_seat"] = worktree_seat.seat_name
             summary_head["worktree_path"] = str(worktree_seat.path)
@@ -21239,7 +21230,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     worktree_seat.reclaimed_dispatch_id
                 )
         elif getattr(args, "_worktree_path", None):
-            worker_argv, stdin_path = build_worker(args, prompt_path, raw)
             summary_head["worktree_id"] = getattr(args, "_worktree_id", None)
             summary_head["worktree_seat"] = getattr(args, "_worktree_id", None)
             summary_head["worktree_path"] = getattr(args, "_worktree_path", None)

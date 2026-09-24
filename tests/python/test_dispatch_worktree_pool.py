@@ -141,6 +141,27 @@ def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
         holder.release()
 
 
+def test_unknown_free_lock_counts_against_pool_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "unknown-holder")
+    seat = holder.path
+    holder.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).write_text(
+        "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatUnavailable) as exc_info:
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "new-dispatch")
+
+    message = str(exc_info.value)
+    assert "1/1 worktrees busy" in message
+    assert "s-1=unknown-dispatch" in message
+    assert "none recorded" not in message
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -682,6 +703,96 @@ def test_resume_rejects_inconsistent_lineage(
 
     with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused, match=expected):
         goalflight_dispatch._resume_lineage_dispatch_ids("lineage-child")
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("different-project-root", "different project root"),
+        ("wrong-root-branch", "does not belong to root dispatch lineage-root"),
+    ],
+)
+def test_resume_command_rejects_inconsistent_lineage_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "lineage-parent"
+    root_id = "lineage-root"
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = parent.path
+    head = _git(repo, "rev-parse", f"worktree/{parent_id}")
+    parent.release()
+    if case == "different-project-root":
+        other_root = tmp_path / "other"
+        other_root.mkdir()
+        root_project = _make_repo(other_root)
+        root_branch = f"worktree/{root_id}"
+    else:
+        root_project = repo
+        root_branch = "worktree/not-the-root"
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": root_id,
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(root_project),
+            "worktree_branch": root_branch,
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "parent_dispatch_id": root_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "account": "default",
+            "engine_session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_branch": f"worktree/{root_id}",
+            "worktree_head": head,
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+            ],
+        }
+    )
+    prompt = tmp_path / "lineage-resume.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = f"{case}-resume-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(goalflight_dispatch, "_validate_before_side_effects", lambda *_args: {})
+    monkeypatch.setattr(goalflight_dispatch, "grok_selected_account", lambda _args: None)
+
+    assert goalflight_dispatch._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    assert expected in capsys.readouterr().err
+    assert not goalflight_ledger.record_path(child_id).exists()
+    assert not (
+        goalflight_dispatch._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
+    ).exists()
 
 
 @pytest.mark.parametrize("reclaimed_for", ["resume-parent", "other-parent"])

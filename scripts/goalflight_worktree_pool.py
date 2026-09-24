@@ -1506,23 +1506,31 @@ def acquire_worktree_seat(
         capacity_occupied_paths: set[Path] = set()
         probe_flags = flags & ~os.O_CREAT
 
+        def note_capacity_occupant(candidate_path: Path, metadata: dict) -> None:
+            resolved_candidate = candidate_path.resolve(strict=False)
+            if resolved_candidate not in capacity_occupied_paths:
+                capacity_occupied_paths.add(resolved_candidate)
+                capacity_occupants.append((str(candidate_path), metadata))
+
+        occupied_target = Path(occupy_path).expanduser().resolve(strict=False) if occupy_path is not None else None
         for candidate_path, candidate_lock in [*global_candidates, *legacy_candidates]:
+            if occupied_target is not None and candidate_path.resolve(strict=False) == occupied_target:
+                continue
             if not candidate_lock.is_file():
                 continue
             try:
                 probe_fd = os.open(candidate_lock, probe_flags, 0o600)
             except OSError:
+                note_capacity_occupant(candidate_path, {})
                 continue
             probe_file = os.fdopen(probe_fd, "r+", encoding="utf-8")
             try:
                 fcntl.flock(probe_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                resolved_candidate = candidate_path.resolve(strict=False)
-                if resolved_candidate not in capacity_occupied_paths:
-                    capacity_occupied_paths.add(resolved_candidate)
-                    capacity_occupants.append(
-                        (str(candidate_path), _lock_metadata(probe_file))
-                    )
+                note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
+            else:
+                if _known_lock_dispatch_id(probe_file) is None:
+                    note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
             finally:
                 probe_file.close()
 

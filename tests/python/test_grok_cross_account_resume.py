@@ -106,6 +106,39 @@ def _option(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
+def _finalize_resume(
+    record: dict,
+    resume_args,
+    *,
+    child_id: str,
+    prompt_path: Path,
+    dispatch_base: Path,
+    final_cwd: Path | None = None,
+) -> tuple[list[str], Path, str]:
+    resume_args.dispatch_id = child_id
+    resume_args.parent_dispatch_id = record["dispatch_id"]
+    resume_args.agent = record["agent"]
+    resume_args.cwd = record["worker_cwd"]
+    resume_args.prompt_file = str(prompt_path)
+    resume_args.engine_session_id = SESSION
+    argv = D._resume_launch_argv(
+        _source(record),
+        child_dispatch_id=child_id,
+        prompt_path=prompt_path,
+        resume_args=resume_args,
+    )
+    resume_args._original_argv = argv
+    if final_cwd is not None:
+        resume_args.cwd = str(final_cwd)
+    return D._finalize_grok_resume(
+        _source(record),
+        resume_args,
+        prompt_path=prompt_path,
+        dispatch_base=dispatch_base,
+        orientation_path=None,
+    )
+
+
 def test_same_account_resume_is_preferred(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _accounts(tmp_path, "old", "new")
     record = _record(tmp_path)
@@ -113,9 +146,12 @@ def test_same_account_resume_is_preferred(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
     monkeypatch.setattr(D, "migrate_seat_session", lambda **kwargs: pytest.fail("same account must not carry"))
 
-    argv = D._resume_launch_argv(
-        _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
-        resume_args=_resume_args(),
+    argv, _prompt_path, _session_id = _finalize_resume(
+        record,
+        _resume_args(),
+        child_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        dispatch_base=tmp_path / "dispatch",
     )
 
     assert _option(argv, "--account") == "old"
@@ -258,16 +294,46 @@ def test_walled_account_carries_session_to_healthy_account(
         lambda **kwargs: "new",
     )
 
-    argv = D._resume_launch_argv(
-        _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
-        resume_args=_resume_args(),
+    argv, _prompt_path, _session_id = _finalize_resume(
+        record,
+        _resume_args(),
+        child_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        dispatch_base=tmp_path / "dispatch",
     )
 
     assert _option(argv, "--account") == "new"
     assert _option(argv, "--resume-mode") == "carried"
     assert _option(argv, "--engine-session-id") == SESSION
-    assert not D._seat_session_dir("old", "grok", record["worker_cwd"], SESSION).exists()
+    assert D._seat_session_dir("old", "grok", record["worker_cwd"], SESSION).is_dir()
     assert D._seat_session_dir("new", "grok", record["worker_cwd"], SESSION).is_dir()
+
+
+def test_walled_account_carries_session_into_final_resumed_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accounts(tmp_path, "old", "new")
+    record = _record(tmp_path)
+    source_cwd = Path(record["worker_cwd"])
+    final_cwd = tmp_path / "reclaimed-seat"
+    final_cwd.mkdir()
+    _session("old", source_cwd)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda account, **kwargs: account == "old")
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **kwargs: "new")
+
+    argv, _prompt_path, _session_id = _finalize_resume(
+        record,
+        _resume_args(),
+        child_id="grok-relocated-child",
+        prompt_path=Path(record["prompt_path"]),
+        dispatch_base=tmp_path / "dispatch",
+        final_cwd=final_cwd,
+    )
+
+    assert _option(argv, "--cwd") == str(final_cwd)
+    assert _option(argv, "--account") == "new"
+    assert D._seat_session_dir("old", "grok", str(source_cwd), SESSION).is_dir()
+    assert D._seat_session_dir("new", "grok", str(final_cwd), SESSION).is_dir()
 
 
 def test_failed_carry_reconstructs_prompt_and_starts_fresh(
@@ -289,9 +355,12 @@ def test_failed_carry_reconstructs_prompt_and_starts_fresh(
 
     controller_prompt = tmp_path / "controller.md"
     controller_prompt.write_text("Controller says: continue from the dirty tree.\n", encoding="utf-8")
-    argv = D._resume_launch_argv(
-        _source(record), child_dispatch_id="grok-child", prompt_path=controller_prompt,
-        resume_args=_resume_args(),
+    argv, _prompt_path, _session_id = _finalize_resume(
+        record,
+        _resume_args(),
+        child_id="grok-child",
+        prompt_path=controller_prompt,
+        dispatch_base=tmp_path / "dispatch",
     )
 
     reconstructed = Path(_option(argv, "--prompt-file"))
@@ -326,9 +395,12 @@ def test_reconstruction_does_not_refuse_with_healthy_account(
     )
     monkeypatch.setattr(D, "migrate_seat_session", lambda **kwargs: (False, "missing artifact"))
 
-    argv = D._resume_launch_argv(
-        _source(record), child_dispatch_id="grok-child", prompt_path=Path(record["prompt_path"]),
-        resume_args=_resume_args(),
+    argv, _prompt_path, _session_id = _finalize_resume(
+        record,
+        _resume_args(),
+        child_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        dispatch_base=tmp_path / "dispatch",
     )
 
     assert _option(argv, "--account") == "new"
