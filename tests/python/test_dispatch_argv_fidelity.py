@@ -343,6 +343,19 @@ def test_resume_preserves_os_sandbox_and_cwd(
     assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
 
 
+def test_legacy_resume_replays_recorded_model(tmp_path: Path) -> None:
+    argv = D._synthesize_resume_base_argv(
+        {
+            "agent": "grok-code",
+            "shape": "bash",
+            "record": {"model": "grok-build"},
+        },
+        cwd=tmp_path,
+    )
+
+    assert _option_value(argv, "--model") == "grok-build"
+
+
 def test_resume_preserves_read_only_without_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

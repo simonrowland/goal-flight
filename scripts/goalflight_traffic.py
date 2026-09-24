@@ -7,6 +7,8 @@ import argparse
 import collections
 import json
 import re
+import subprocess
+import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -21,6 +23,7 @@ MODEL_FLAGS = {
     "astra": "use sparingly",
 }
 POINTER_FAMILIES = ("luna", "grok", "astra", "sol")
+STATUS_SCAN_LIMIT = 256
 
 
 def _read_json_mapping(path: Path) -> dict[str, object] | None:
@@ -31,11 +34,25 @@ def _read_json_mapping(path: Path) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _dispatch_status_payloads(dispatch_dir: Path) -> list[dict[str, object]]:
+def _dispatch_status_payloads(
+    dispatch_dir: Path,
+    *,
+    limit: int = STATUS_SCAN_LIMIT,
+) -> list[dict[str, object]]:
     try:
-        paths = sorted(dispatch_dir.glob("*.status.json"))
+        paths = list(dispatch_dir.glob("*.status.json"))
     except OSError:
         return []
+    if limit > 0 and len(paths) > limit:
+        def _mtime(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        paths = sorted(paths, key=_mtime, reverse=True)[:limit]
+    else:
+        paths.sort()
     payloads = []
     for path in paths:
         payload = _read_json_mapping(path)
@@ -46,6 +63,36 @@ def _dispatch_status_payloads(dispatch_dir: Path) -> list[dict[str, object]]:
     return payloads
 
 
+def _timestamp(value: object) -> float | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        parsed = goalflight_ledger.parse_utc(value)
+        if parsed is not None:
+            return parsed.timestamp()
+    return None
+
+
+def _record_is_recent(record: Mapping[str, object], *, now: float) -> bool:
+    cutoff = now - goalflight_ledger.STATUS_RECENT_WINDOW_DAYS * 86400.0
+    observed = [
+        timestamp
+        for key in ("updated_at", "started_at", "created_at")
+        if (timestamp := _timestamp(record.get(key))) is not None
+    ]
+    status_path = record.get("status_path")
+    if isinstance(status_path, str) and status_path:
+        try:
+            observed.append(Path(status_path).expanduser().stat().st_mtime)
+        except OSError:
+            pass
+    # Legacy/status-only fixtures without any age evidence stay visible. Any
+    # row with evidence is bounded to the same warm window as usage/status.
+    return not observed or max(observed) >= cutoff
+
+
 def _dispatch_records(
     *,
     ledger_records: Sequence[Mapping[str, object]] | None = None,
@@ -53,7 +100,10 @@ def _dispatch_records(
 ) -> list[dict[str, object]]:
     if ledger_records is None:
         try:
-            ledger_records = goalflight_ledger.read_records()
+            ledger_records = goalflight_ledger.read_records(
+                skip_terminal=True,
+                recent_window_days=goalflight_ledger.STATUS_RECENT_WINDOW_DAYS,
+            )
         except (OSError, ValueError):
             ledger_records = []
 
@@ -67,10 +117,21 @@ def _dispatch_records(
         ledger_states[dispatch_id] = record.get("state")
 
     status_dir = dispatch_dir or goalflight_dispatch_paths.dispatch_base_dir()
+    # Status directories retain terminal history on some installations. A
+    # bounded recent scan keeps status-only launches visible without reopening
+    # every historical sidecar on each /usage invocation.
     status_payloads = _dispatch_status_payloads(status_dir)
+    status_ids = {str(payload["dispatch_id"]) for payload in status_payloads}
+    now = time.time()
     for record in list(records.values()):
+        if str(record.get("dispatch_id")) in status_ids:
+            continue
         status_path = record.get("status_path")
-        if isinstance(status_path, str) and status_path:
+        if (
+            isinstance(status_path, str)
+            and status_path
+            and _record_is_recent(record, now=now)
+        ):
             payload = _read_json_mapping(Path(status_path).expanduser())
             if payload is not None and payload.get("dispatch_id"):
                 status_payloads.append(payload)
@@ -116,15 +177,127 @@ def _tail_model(tail_path: object) -> str | None:
 
 def _dispatch_model(record: Mapping[str, object]) -> str:
     agent = str(record.get("agent") or "?")
-    if agent.startswith("grok"):
-        return "grok"
-    if agent.startswith("cursor"):
-        return "cursor"
     recorded = record.get("model")
     if isinstance(recorded, str) and recorded.strip():
         return recorded.strip()
     tail_path = record.get("stdout_path") or record.get("tail_path")
-    return _tail_model(tail_path) or f"{agent}:?"
+    tail_model = _tail_model(tail_path)
+    if tail_model:
+        return tail_model
+    if agent.startswith("grok"):
+        return "grok"
+    if agent.startswith("cursor"):
+        return "cursor"
+    return f"{agent}:?"
+
+
+def _identity_probe_error(pid: int) -> dict[str, object]:
+    return {
+        "pid": pid,
+        "identity_available": False,
+        "identity_probe_error": True,
+        "identity_source": "traffic_ps_probe_error",
+    }
+
+
+def _batch_process_identities(pids: Sequence[int]) -> dict[int, dict[str, object] | None]:
+    """Read current identities for all candidate PIDs with one ps invocation."""
+    unique_pids = sorted({pid for pid in pids if isinstance(pid, int) and pid > 0})
+    if not unique_pids:
+        return {}
+
+    compat = goalflight_ledger.goalflight_compat
+    if compat.is_windows():
+        # Windows has no ps equivalent. Keep the existing native identity path
+        # rather than weakening PID-reuse checks for the read-only view.
+        return {pid: goalflight_ledger.process_identity(pid) for pid in unique_pids}
+
+    liveness: dict[int, bool | None] = {}
+    result: dict[int, dict[str, object] | None] = {}
+    active: list[int] = []
+    for pid in unique_pids:
+        try:
+            live = compat.pid_liveness(pid)
+        except (OSError, subprocess.SubprocessError):
+            live = None
+        liveness[pid] = live
+        if live is False:
+            result[pid] = None
+        else:
+            active.append(pid)
+    if not active:
+        return result
+
+    try:
+        completed = subprocess.run(
+            [
+                "ps",
+                "-o",
+                "pid=,ppid=,pgid=,lstart=,comm=,args=",
+                "-p",
+                ",".join(str(pid) for pid in active),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        completed = None
+
+    if completed is None or (completed.returncode != 0 and not completed.stdout):
+        return {
+            **result,
+            **{
+                pid: (None if liveness[pid] is False else _identity_probe_error(pid))
+                for pid in active
+            },
+        }
+
+    parsed: dict[int, dict[str, object]] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(None, 9)
+        if len(fields) < 9 or not fields[0].isdigit():
+            continue
+        pid = int(fields[0])
+        if pid not in active:
+            continue
+        parsed[pid] = {
+            "pid": pid,
+            "ppid": fields[1],
+            "pgid": fields[2],
+            "lstart": " ".join(fields[3:8]),
+            "comm": fields[8],
+            "args": fields[9] if len(fields) > 9 else None,
+        }
+
+    for pid in active:
+        current = parsed.get(pid)
+        if current is None:
+            try:
+                still_live = compat.pid_liveness(pid)
+            except (OSError, subprocess.SubprocessError):
+                still_live = None
+            result[pid] = None if still_live is False else _identity_probe_error(pid)
+            continue
+        try:
+            start_identity = compat.process_start_identity(pid)
+        except (OSError, subprocess.SubprocessError):
+            start_identity = None
+        if isinstance(start_identity, Mapping) and start_identity.get("start_token"):
+            current["start_token"] = start_identity["start_token"]
+        if not current.get("lstart"):
+            current.update(
+                {
+                    "identity_available": False,
+                    "identity_probe_error": True,
+                    "identity_source": "ps_identity_incomplete",
+                }
+            )
+        result[pid] = current
+    return result
 
 
 def _record_bucket(
@@ -159,6 +332,8 @@ def live_workers_by_model(
     buckets: dict[str, dict[str, object]] = {}
     total = 0
     unverified_total = 0
+    candidates: list[dict[str, object]] = []
+    now = time.time()
     for record in _dispatch_records(
         ledger_records=ledger_records,
         dispatch_dir=dispatch_dir,
@@ -166,12 +341,24 @@ def live_workers_by_model(
         if not isinstance(record.get("worker_pid"), int) or record["worker_pid"] <= 0:
             continue
         if any(
-            record.get(field) in goalflight_dispatch_states.TERMINAL_STATES
+            goalflight_dispatch_states.is_terminal_state(record.get(field))
             for field in ("state", "terminal_state")
         ):
             continue
+        if not _record_is_recent(record, now=now):
+            continue
+        candidates.append(record)
+
+    identities = _batch_process_identities(
+        [int(record["worker_pid"]) for record in candidates]
+    )
+    for record in candidates:
+        pid = int(record["worker_pid"])
         try:
-            liveness, _reason = goalflight_ledger.worker_identity_liveness(record)
+            liveness, _reason = goalflight_ledger.worker_identity_liveness(
+                record,
+                current_identity=identities.get(pid),
+            )
         except (OSError, TypeError, ValueError):
             continue
         model = _dispatch_model(record)

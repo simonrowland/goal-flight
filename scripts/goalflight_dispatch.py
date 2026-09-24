@@ -5390,6 +5390,9 @@ def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
         "--cwd",
         str(cwd),
     ]
+    model = record.get("model")
+    if isinstance(model, str) and model.strip():
+        argv += ["--model", model.strip()]
     posture = record.get("os_sandbox")
     requested = None
     if isinstance(posture, dict):
@@ -7811,6 +7814,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     prompt_path=prompt_path,
                     task_ids=getattr(args, "task_ids", []),
                     agent=args.agent,
+                    model=getattr(args, "model", None),
                     engine=_account_engine(args.agent) or args.agent,
                     shape=args.shape,
                     account=args.account or "default",

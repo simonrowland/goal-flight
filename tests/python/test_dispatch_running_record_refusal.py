@@ -379,6 +379,28 @@ def test_spawned_worker_genuine_refusal_writes_status_and_warns(
     assert "registry" in export_calls
 
 
+def test_explicit_model_is_durable_in_running_ledger_record(
+    tmp_path: Path,
+    spawned_worker: subprocess.Popen,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    args = _dispatch_args(project, "durable-model")
+    args.model = "grok-build"
+    _prepare_starting_attempt(args, project, tmp_path)
+    L.claim_attempt_running(project, args.dispatch_id, spawned_worker.pid)
+
+    assert _record(
+        args,
+        project,
+        tmp_path,
+        worker_pid=spawned_worker.pid,
+        state="running",
+    ) is None
+
+    assert _ledger_record(args.dispatch_id)["model"] == "grok-build"
+
+
 def test_startup_race_is_retried_and_commits_once_running(
     tmp_path: Path,
     export_calls: list[str],
@@ -669,6 +691,20 @@ def test_acp_spawned_worker_genuine_refusal_writes_status_and_warns(
     assert "cas_lost" in err
     assert f"pid {spawned_worker.pid}" in err
     assert str(tmp_path / f"{dispatch_id}.status.json") in err
+
+
+def test_explicit_acp_model_is_durable_in_ledger_record(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "durable-acp-model"
+    cfg = _acp_cfg(dispatch_id)
+    cfg.model = "grok-build"
+
+    _record_acp(
+        cfg, project, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="starting"
+    )
+
+    assert _ledger_record(dispatch_id)["model"] == "grok-build"
 
 
 def test_acp_no_worker_spawned_refusal_still_raises(

@@ -666,6 +666,7 @@ def _record_acp_ledger_state(
                     prompt_path=cfg.prompt or getattr(cfg, "original_prompt_file", None),
                     task_ids=getattr(cfg, "task_ids", []),
                     agent=cfg.agent,
+                    model=getattr(cfg, "model", None),
                     engine=goalflight_ledger.infer_engine(cfg.agent),
                     shape="acp",
                     account=getattr(cfg, "account", None) or "default",
