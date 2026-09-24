@@ -436,6 +436,148 @@ def test_unreadable_ledger_row_with_terminal_sidecar_is_unverified(tmp_path: Pat
     ]
 
 
+def test_unreadable_ledger_row_with_running_sidecar_is_counted_once(
+    tmp_path: Path,
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    unreadable_path = tmp_path / "runs.d" / "running-corrupt.json"
+    (dispatch_dir / "running-corrupt.status.json").write_text(
+        json.dumps({
+            "dispatch_id": "running-corrupt",
+            "state": "running",
+            "worker_pid": os.getpid(),
+            "worker_identity": {"pid": os.getpid(), "start_token": "sidecar"},
+        }),
+        encoding="utf-8",
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[{
+            "dispatch_id": "running-corrupt",
+            "state": "unreadable",
+            "path": str(unreadable_path),
+        }],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {unreadable_path}"
+    ]
+
+
+def test_referenced_status_read_failure_is_unknown_once(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    status_path = tmp_path / "missing.status.json"
+    (dispatch_dir / "status-missing.status.json").write_text(
+        json.dumps({"dispatch_id": "status-missing", "state": "running"}),
+        encoding="utf-8",
+    )
+    pid = os.getpid()
+    summary = traffic.live_workers_by_model(
+        ledger_records=[{
+            "dispatch_id": "status-missing",
+            "state": "running",
+            "worker_pid": pid,
+            "worker_identity": {"pid": pid, "start_token": "ledger"},
+            "model": "gpt-5.6-sol",
+            "controller_label": "controller",
+            "status_path": str(status_path),
+        }],
+        dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"status file unreadable or malformed: {status_path}"
+    ]
+
+
+def test_status_only_ledger_read_failure_is_unknown_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    status_path = dispatch_dir / "status-only.status.json"
+    status_path.write_text(
+        json.dumps({
+            "dispatch_id": "status-only",
+            "state": "running",
+            "worker_pid": os.getpid(),
+            "worker_identity": {"pid": os.getpid(), "start_token": "status"},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_record",
+        lambda _dispatch_id: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[], dispatch_dir=dispatch_dir,
+    )
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "ledger read failed: OSError: ledger denied"
+    ]
+
+
+def test_ledger_identity_fields_are_authoritative_over_status(tmp_path: Path) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    pid = os.getpid()
+    ledger_identity = {"pid": pid, "start_token": "ledger"}
+    status_identity = {"pid": pid, "start_token": "status"}
+    (dispatch_dir / "authority.status.json").write_text(
+        json.dumps({
+            "dispatch_id": "authority",
+            "state": "running",
+            "worker_pid": pid,
+            "worker_identity": status_identity,
+            "model": "status-model",
+            "controller_label": "status-controller",
+        }),
+        encoding="utf-8",
+    )
+    ledger_record = {
+        "dispatch_id": "authority",
+        "state": "running",
+        "worker_pid": pid,
+        "worker_identity": ledger_identity,
+        "model": "ledger-model",
+        "controller_label": "ledger-controller",
+    }
+
+    merged = traffic._dispatch_records(
+        ledger_records=[ledger_record], dispatch_dir=dispatch_dir,
+    )
+    record = next(record for record in merged if record.get("dispatch_id") == "authority")
+    assert record["worker_pid"] == pid
+    assert record["worker_identity"] == ledger_identity
+    assert record["model"] == "ledger-model"
+    assert record["controller_label"] == "ledger-controller"
+
+    summary = traffic.live_workers_by_model(
+        ledger_records=[ledger_record], dispatch_dir=dispatch_dir,
+    )
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "status model disagrees with ledger"
+    ]
+
+
 def test_terminal_ledger_state_wins_over_live_sidecar(
     tmp_path: Path, monkeypatch
 ) -> None:

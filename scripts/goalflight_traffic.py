@@ -103,6 +103,69 @@ def _record_is_recent(record: Mapping[str, object], *, now: float) -> bool:
     return not observed or max(observed) >= cutoff
 
 
+_TRAFFIC_AUTHORITY_FIELDS = (
+    "worker_pid",
+    "worker_identity",
+    "expected_worker_identity",
+    "model",
+    "controller_label",
+)
+
+
+def _traffic_worker_identity(record: Mapping[str, object]) -> Mapping[str, object] | None:
+    for key in ("worker_identity", "expected_worker_identity"):
+        value = record.get(key)
+        if isinstance(value, Mapping) and value:
+            return value
+    return None
+
+
+def _traffic_status_mismatch(
+    ledger_record: Mapping[str, object], status: Mapping[str, object]
+) -> str | None:
+    for field in ("worker_pid", "model", "controller_label"):
+        ledger_value = ledger_record.get(field)
+        status_value = status.get(field)
+        if ledger_value not in (None, "") and status_value not in (None, ""):
+            if str(ledger_value) != str(status_value):
+                return f"status {field} disagrees with ledger"
+    ledger_identity = _traffic_worker_identity(ledger_record)
+    status_identity = _traffic_worker_identity(status)
+    if ledger_identity and status_identity:
+        for field in ("pid", "start_token", "lstart"):
+            ledger_value = ledger_identity.get(field)
+            status_value = status_identity.get(field)
+            if ledger_value not in (None, "") and status_value not in (None, ""):
+                if str(ledger_value) != str(status_value):
+                    return f"status worker identity {field} disagrees with ledger"
+    return None
+
+
+def _merge_traffic_status(
+    record: dict[str, object],
+    status: Mapping[str, object],
+    *,
+    ledger_authoritative: bool,
+) -> str | None:
+    """Merge one status source without replacing ledger authority fields."""
+    if not ledger_authoritative:
+        record.update({key: value for key, value in status.items() if value is not None})
+        return None
+    mismatch = _traffic_status_mismatch(record, status)
+    for key, value in status.items():
+        if value is None or key in _TRAFFIC_AUTHORITY_FIELDS:
+            continue
+        record[key] = value
+    if "worker_pid" in status:
+        record["_status_worker_pid"] = status.get("worker_pid")
+    status_identity = _traffic_worker_identity(status)
+    if status_identity is not None:
+        record["_status_worker_identity"] = dict(status_identity)
+    if "worker_alive" in status:
+        record["_status_worker_alive"] = status.get("worker_alive")
+    return mismatch
+
+
 def _dispatch_records(
     *,
     ledger_records: Sequence[Mapping[str, object]] | None = None,
@@ -123,21 +186,29 @@ def _dispatch_records(
 
     records: dict[str, dict[str, object]] = {}
     ledger_states: dict[str, tuple[object, object]] = {}
-    ledger_unverified_ids: set[str] = set()
-    unreadable_rows: list[tuple[str | None, str]] = []
+    unverified_by_id: dict[str, str] = {}
+    anonymous_unreadable: list[str] = []
+
+    def mark_unverified(dispatch_id: object, reason: str) -> None:
+        key = str(dispatch_id or "")
+        if not key:
+            anonymous_unreadable.append(reason)
+            return
+        previous = unverified_by_id.get(key)
+        if previous is None:
+            unverified_by_id[key] = reason
+        elif reason not in previous:
+            unverified_by_id[key] = f"{previous}; {reason}"
+
     for record in ledger_records:
         if not isinstance(record, Mapping):
-            unreadable_rows.append((None, "invalid ledger row"))
+            anonymous_unreadable.append("invalid ledger row")
             continue
         record_dict = dict(record)
         if goalflight_ledger.record_is_unreadable(record_dict):
-            unreadable_rows.append(
-                (
-                    str(record_dict.get("dispatch_id"))
-                    if record_dict.get("dispatch_id")
-                    else None,
-                    str(record_dict.get("path") or "unreadable ledger row"),
-                )
+            mark_unverified(
+                record_dict.get("dispatch_id"),
+                f"ledger unreadable rows=1: {record_dict.get('path') or 'unreadable ledger row'}",
             )
         if not record_dict.get("dispatch_id"):
             continue
@@ -147,28 +218,43 @@ def _dispatch_records(
             record_dict.get("state"),
             record_dict.get("terminal_state"),
         )
-        if goalflight_ledger.record_is_unreadable(record_dict):
-            ledger_unverified_ids.add(dispatch_id)
 
     status_dir = dispatch_dir or goalflight_dispatch_paths.dispatch_base_dir()
     # Status directories retain terminal history on some installations. A
     # bounded recent scan keeps status-only launches visible without reopening
     # every historical sidecar on each /usage invocation.
     status_payloads, status_error, status_error_count = _dispatch_status_payloads(status_dir)
-    status_ids = {str(payload["dispatch_id"]) for payload in status_payloads}
+    status_sources = {
+        (
+            str(payload["dispatch_id"]),
+            str(Path(str(payload["status_path"])).expanduser()),
+        )
+        for payload in status_payloads
+        if payload.get("status_path")
+    }
     now = time.time()
     for record in list(records.values()):
-        if str(record.get("dispatch_id")) in status_ids:
-            continue
         status_path = record.get("status_path")
-        if (
-            isinstance(status_path, str)
-            and status_path
-            and _record_is_recent(record, now=now)
-        ):
-            payload = _read_json_mapping(Path(status_path).expanduser())
-            if payload is not None and payload.get("dispatch_id"):
+        if isinstance(status_path, str) and status_path:
+            status_file = Path(status_path).expanduser()
+            status_key = (str(record.get("dispatch_id")), str(status_file))
+            if status_key in status_sources:
+                continue
+            payload = _read_json_mapping(status_file)
+            if payload is None:
+                mark_unverified(
+                    record.get("dispatch_id"),
+                    f"status file unreadable or malformed: {status_file}",
+                )
+            elif payload.get("dispatch_id") != record.get("dispatch_id"):
+                mark_unverified(
+                    record.get("dispatch_id"),
+                    f"status dispatch mismatch: {status_file}",
+                )
+            else:
+                payload.setdefault("status_path", str(status_file))
                 status_payloads.append(payload)
+                status_sources.add((str(payload["dispatch_id"]), str(status_file)))
 
     # ``read_records(skip_terminal=True)`` intentionally avoids parsing old
     # terminal rows. Recheck only status candidates so a terminal ledger row
@@ -176,28 +262,25 @@ def _dispatch_records(
     if not ledger_unreadable:
         for payload in status_payloads:
             dispatch_id = str(payload["dispatch_id"])
-            worker_pid = payload.get("worker_pid")
-            if dispatch_id in ledger_states or not (
-                isinstance(worker_pid, int) and worker_pid > 0
-            ):
+            if dispatch_id in ledger_states:
                 continue
             try:
                 ledger_record = goalflight_ledger.read_record(dispatch_id)
-            except (OSError, ValueError):
-                ledger_record = None
-            if not isinstance(ledger_record, Mapping):
+            except (OSError, ValueError) as exc:
+                mark_unverified(
+                    dispatch_id,
+                    f"ledger read failed: {type(exc).__name__}: {exc}",
+                )
+                continue
+            if ledger_record is None:
                 continue
             ledger_record = dict(ledger_record)
             if goalflight_ledger.record_is_unreadable(ledger_record):
-                unreadable_rows.append(
-                    (
-                        dispatch_id,
-                        str(ledger_record.get("path") or "unreadable ledger row"),
-                    )
+                mark_unverified(
+                    dispatch_id,
+                    f"ledger unreadable rows=1: {ledger_record.get('path') or 'unreadable ledger row'}",
                 )
-                ledger_unverified_ids.add(dispatch_id)
-            else:
-                records.setdefault(dispatch_id, {}).update(ledger_record)
+            records[dispatch_id] = ledger_record
             ledger_states[dispatch_id] = (
                 ledger_record.get("state"),
                 ledger_record.get("terminal_state"),
@@ -206,18 +289,21 @@ def _dispatch_records(
     for payload in status_payloads:
         dispatch_id = str(payload["dispatch_id"])
         record = records.setdefault(dispatch_id, {})
-        for key, value in payload.items():
-            if value is not None:
-                record[key] = value
+        ledger_authoritative = dispatch_id in ledger_states
+        mismatch = _merge_traffic_status(
+            record, payload, ledger_authoritative=ledger_authoritative,
+        )
+        if mismatch:
+            mark_unverified(dispatch_id, mismatch)
         # The ledger's lifecycle state is authoritative; status.json is a
         # heartbeat copy and can lag during terminal publication.
-        if dispatch_id in ledger_states:
+        if ledger_authoritative:
             ledger_state, ledger_terminal_state = ledger_states[dispatch_id]
             if ledger_state is not None:
                 record["state"] = ledger_state
             if ledger_terminal_state is not None:
                 record["terminal_state"] = ledger_terminal_state
-        if ledger_unreadable or dispatch_id in ledger_unverified_ids:
+        if ledger_unreadable:
             record["_ledger_unverified"] = True
         record.setdefault("status_path", payload.get("status_path"))
         if not record.get("stdout_path") and record.get("tail_path"):
@@ -227,9 +313,10 @@ def _dispatch_records(
             if isinstance(expected, Mapping):
                 record["worker_identity"] = dict(expected)
 
-    for dispatch_id in ledger_unverified_ids:
-        if dispatch_id in records:
-            records[dispatch_id]["_ledger_unverified"] = True
+    for dispatch_id, reason in unverified_by_id.items():
+        record = records.setdefault(dispatch_id, {"dispatch_id": dispatch_id})
+        record["_source_unverified_reason"] = reason
+        record["_source_unverified_count"] = 1
 
     source_records: list[dict[str, object]] = []
     if status_error and not ledger_unreadable:
@@ -271,14 +358,14 @@ def _dispatch_records(
                 ),
             }
         )
-    if unreadable_rows:
-        paths = ", ".join(path for _dispatch_id, path in unreadable_rows)
+    if anonymous_unreadable:
+        paths = ", ".join(anonymous_unreadable)
         source_records.append(
             {
                 "_source_unverified_reason": (
-                    f"ledger unreadable rows={len(unreadable_rows)}: {paths}"
+                    f"ledger unreadable rows={len(anonymous_unreadable)}: {paths}"
                 ),
-                "_source_unverified_count": len(unreadable_rows),
+                "_source_unverified_count": len(anonymous_unreadable),
             }
         )
     return source_records + list(records.values())
@@ -506,6 +593,13 @@ def live_workers_by_model(
                 )
             except (OSError, TypeError, ValueError):
                 continue
+            status_alive = record.get("_status_worker_alive")
+            if status_alive is True and liveness == "dead":
+                liveness = "unknown"
+            elif status_alive is False and liveness == "live":
+                liveness = "unknown"
+            elif status_alive not in (None, True, False):
+                liveness = "unknown"
         model = _dispatch_model(record)
         controller = str(record.get("controller_label") or "?")
         if liveness == "live":

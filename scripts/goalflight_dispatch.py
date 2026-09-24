@@ -10737,6 +10737,119 @@ class _WithdrawPreflightRefusal(ValueError):
         self.liveness = liveness
 
 
+def _withdraw_liveness_preflight(
+    *,
+    dispatch_id: str,
+    attempt: dict,
+    record: dict | None,
+    worker: dict,
+    carriers: dict[Path, dict],
+    status_path: object,
+) -> None:
+    """Require every recorded worker source to prove the same dead holder."""
+    evidence_count = 0
+
+    def check(source: str, pid: object, identity: object) -> None:
+        nonlocal evidence_count
+        if pid in (None, ""):
+            if identity not in (None, {}):
+                raise _WithdrawPreflightRefusal(
+                    f"{source} worker identity has no pid; worker liveness is indeterminate. "
+                    "Wait for the worker identity to be recorded before retrying.",
+                    liveness="indeterminate",
+                )
+            return
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            raise _WithdrawPreflightRefusal(
+                f"{source} worker {pid} has no start identity; worker liveness is indeterminate. "
+                "Wait for the worker identity to be recorded before retrying.",
+                liveness="indeterminate",
+            )
+        evidence_count += 1
+        state, reason = _queue_claim_identity_status(pid, identity)
+        if state != "dead":
+            raise _WithdrawPreflightRefusal(
+                f"{source} worker {pid} is {state} ({reason}); withdraw never kills a live worker. "
+                "Steer the worker to stop, wait for exit, and verify its identity before retrying.",
+                liveness=("live" if state == "live" else "indeterminate"),
+            )
+
+    ledger = record or {}
+    check("ledger", ledger.get("worker_pid"), ledger.get("worker_identity"))
+    check("journal", worker.get("pid"), worker)
+    for path, carrier in carriers.items():
+        check(
+            str(path), carrier.get("queue_worker_pid"),
+            carrier.get("queue_worker_identity"),
+        )
+        check(
+            f"{path} claimer", carrier.get("queue_claimer_pid"),
+            carrier.get("queue_claimer_identity"),
+        )
+        check(
+            f"{path} launcher", carrier.get("queue_launcher_pid"),
+            carrier.get("queue_launcher_identity"),
+        )
+
+    if status_path not in (None, ""):
+        status, status_reason = _abandoned_status_payload(
+            {"dispatch_id": dispatch_id, "status_path": status_path}
+        )
+        if status is None:
+            raise _WithdrawPreflightRefusal(
+                f"status sidecar is {status_reason}; worker liveness is indeterminate. "
+                "Wait for the status evidence to become readable before retrying.",
+                liveness="indeterminate",
+            )
+        status_identity = status.get("expected_worker_identity") or status.get("worker_identity")
+        status_pid = status.get("worker_pid")
+        if status_pid not in (None, "") or status_identity not in (None, {}):
+            check("status", status_pid, status_identity)
+        elif status.get("worker_alive") is True:
+            raise _WithdrawPreflightRefusal(
+                "status sidecar reports a live worker; withdraw never kills a live worker. "
+                "Wait for exit and verify its identity before retrying.",
+                liveness="live",
+            )
+        elif status.get("worker_alive") is False:
+            evidence_count += 1
+        else:
+            state = status.get("terminal_pending_state") or status.get("state")
+            if not goalflight_dispatch_states.is_terminal_state(state):
+                raise _WithdrawPreflightRefusal(
+                    "status sidecar has no worker identity; worker liveness is indeterminate. "
+                    "Wait for the status evidence to become complete before retrying.",
+                    liveness="indeterminate",
+                )
+
+    for evidence in (ledger, *carriers.values()):
+        if _queue_claim_worker_spawn_intent(evidence) and not (
+            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
+        ):
+            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
+            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
+                raise _WithdrawPreflightRefusal(
+                    "spawn intent has no worker pid and is not older than the claim-stale window "
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
+                    liveness="indeterminate",
+                )
+
+    lifecycle = attempt.get("lifecycle_state")
+    if lifecycle in {goalflight_journal.ATTEMPT_STARTING, goalflight_journal.ATTEMPT_RUNNING}:
+        if lifecycle == goalflight_journal.ATTEMPT_RUNNING and not worker.get("pid"):
+            raise _WithdrawPreflightRefusal(
+                "RUNNING attempt has no journal worker identity; worker liveness is indeterminate. "
+                "Wait for the worker identity to be recorded before retrying.",
+                liveness="indeterminate",
+            )
+        if evidence_count == 0:
+            raise _WithdrawPreflightRefusal(
+                f"{lifecycle} attempt has no worker or spawn identity; worker liveness is indeterminate. "
+                "Wait for launch to settle before retrying.",
+                liveness="indeterminate",
+            )
+
+
 def _withdraw_preflight(args, queue_dir: Path | None = None):
     """Read authority and identity evidence without creating any state."""
     record = goalflight_ledger.read_record(args.dispatch_id)
@@ -10778,41 +10891,20 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     if not args.operator and (not args.controller_label or args.controller_label != owner):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
-    liveness_evidence = []
-    for source, pid, identity in (
-        ("ledger", (record or {}).get("worker_pid"), (record or {}).get("worker_identity")),
-        ("journal", worker.get("pid"), worker),
-        *((str(path), evidence.get("queue_worker_pid"), evidence.get("queue_worker_identity"))
-          for path, evidence in carriers.items()),
-    ):
-        if not pid:
-            continue
-        liveness_evidence.append((source, pid))
-        status, reason = _queue_claim_identity_status(pid, identity)
-        if status != "dead":
-            raise _WithdrawPreflightRefusal(
-                f"{source} worker {pid} is {status} ({reason}); withdraw never kills a live worker. "
-                "Steer the worker to stop, wait for exit, and verify its identity before retrying.",
-                liveness=("live" if status == "live" else "indeterminate"),
-            )
-    if attempt.get("lifecycle_state") == goalflight_journal.ATTEMPT_RUNNING and not liveness_evidence:
-        raise _WithdrawPreflightRefusal(
-            "RUNNING attempt has no worker identity; worker liveness is indeterminate. "
-            "Wait for the worker identity to be recorded before retrying.",
-            liveness="indeterminate",
-        )
-    for evidence in (record or {}, *carriers.values()):
-        if _queue_claim_worker_spawn_intent(evidence) and not (
-            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
-        ):
-            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
-            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
-                raise _WithdrawPreflightRefusal(
-                    "spawn intent has no worker pid and is not older than the claim-stale window "
-                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
-                    liveness="indeterminate",
-                )
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
+    status_path = (record or {}).get("status_path") or entry.get("status_path")
+    _withdraw_liveness_preflight(
+        dispatch_id=args.dispatch_id,
+        attempt=attempt,
+        record=record,
+        worker=worker,
+        carriers=carriers,
+        status_path=status_path,
+    )
+    if attempt.get("terminal_state") == "superseded" and not outcome.get("withdrawn_by"):
+        raise ValueError(
+            "superseded attempt has no withdrawn_by; its task-release effect is unproven"
+        )
     withdrawn = attempt.get("terminal_state") in {"withdrawn", "superseded"} and bool(outcome.get("withdrawn_by"))
     return root, authority, attempt, record, carriers, outcome, withdrawn
 

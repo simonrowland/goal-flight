@@ -438,6 +438,52 @@ def test_running_worker_without_identity_refused(prepared):
     assert carrier.exists()
 
 
+def test_starting_worker_without_identity_refused(prepared):
+    _, authority, attempt, carrier = prepared
+    started = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert started.committed and started.value is not None
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "liveness is indeterminate" in result["reason"]
+    assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_STARTING
+    assert carrier.exists()
+
+
+def test_status_sidecar_live_vetoes_dead_ledger_worker(prepared, tmp_path):
+    project, authority, attempt, carrier = prepared
+    status_path = tmp_path / "live.status.json"
+    status_path.write_text(
+        json.dumps({
+            "dispatch_id": "withdraw-test",
+            "state": "running",
+            "worker_alive": True,
+        })
+    )
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        status_path=str(status_path),
+        worker_pid=999_999_999,
+        worker_identity={"pid": 999_999_999, "start_token": "gone"},
+    )
+    ledger.write_record(record)
+    carrier.write_text(json.dumps(record))
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="blocked",
+        observation={"state": "blocked", "reason": "stale worker"},
+    ).committed
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "status sidecar reports a live worker" in result["reason"]
+    assert attempt_row(authority)["terminal_state"] == "blocked"
+    assert carrier.exists()
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
+
+
 def test_foreign_controller_refused_and_operator_allowed(prepared):
     _, authority, _, _ = prepared
     code, result = withdraw("--controller-label", "foreign")
@@ -692,7 +738,7 @@ def test_unowned_guidance_command_runs_with_operator(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "terminal_state", ["worker_dead", "stale_dead", "abandoned"],
+    "terminal_state", ["worker_dead", "stale_dead", "abandoned", "superseded"],
 )
 def test_guidance_withdraw_step_runs_for_each_holder_state(
     prepared, terminal_state
@@ -710,7 +756,11 @@ def test_guidance_withdraw_step_runs_for_each_holder_state(
     assert authority.commit_terminal(
         attempt.attempt_id,
         terminal_state=terminal_state,
-        observation={"state": terminal_state, "reason": "stale worker"},
+        observation={
+            "state": terminal_state,
+            "reason": "stale worker",
+            **({"withdrawn_by": "owner"} if terminal_state == "superseded" else {}),
+        },
     ).committed
 
     guidance = dispatch._completion_refusal_guidance(
@@ -735,7 +785,9 @@ def test_guidance_withdraw_step_runs_for_each_holder_state(
         shlex.split(command), cwd=project, text=True, capture_output=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert ledger.read_record("withdraw-test")["terminal_state"] == "withdrawn"
+    assert ledger.read_record("withdraw-test")["terminal_state"] in {
+        "withdrawn", "superseded"
+    }
     assert dispatch._ledger_task_ids_advanced(
         ["t-guidance"],
         self_dispatch_id="replacement-guidance",
@@ -792,31 +844,79 @@ def test_guidance_withdraw_repairs_final_without_outbox(prepared, terminal_state
     )
 
 
-def test_guidance_does_not_offer_rerun_with_mixed_holders(
-    prepared, monkeypatch
-):
-    project, _authority, _attempt, _carrier = prepared
-    monkeypatch.setattr(
-        dispatch,
-        "_withdraw_recovery_plan",
-        lambda _dispatch_id, project_root: (
-            Path(project_root), {"terminal_state": "worker_dead"}, "owner"
-        ),
+def test_guidance_does_not_offer_rerun_with_mixed_holders(prepared):
+    project, authority, attempt, carrier = prepared
+    holder = ledger.read_record("withdraw-test")
+    holder.update(
+        task_ids=["t-mixed"], state="worker_dead", terminal_state="worker_dead",
+        worker_still_alive=False,
     )
+    ledger.write_record(holder)
+    carrier.write_text(json.dumps(holder))
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="worker_dead",
+        observation={"state": "worker_dead", "reason": "stale worker"},
+    ).committed
+
+    second = authority.prepare_attempt(
+        "live-holder", owner_controller_label="owner", owner_session_nonce="test-session",
+    )
+    assert second.committed and second.value is not None
+    started = authority.start_attempt(second.value.attempt_id, second.value.launch_token)
+    assert started.committed and started.value is not None
+    assert authority.mark_attempt_running(
+        second.value.attempt_id,
+        second.value.launch_token,
+        launch_epoch=started.value.launch_epoch,
+        worker_instance={},
+    ).committed
+    ledger.write_record({
+        "dispatch_id": "live-holder", "controller_label": "owner",
+        "project_root": str(project), "state": "worker_dead",
+        "terminal_state": "worker_dead", "task_ids": ["t-mixed"],
+        "worker_still_alive": False,
+    })
 
     guidance = dispatch._completion_refusal_guidance(
         [
-            'dispatch_id="dead-holder" state="worker_dead"',
-            'dispatch_id="live-holder" state="running"',
+            'dispatch_id="withdraw-test" state="worker_dead"',
+            'dispatch_id="live-holder" state="worker_dead"',
         ],
         str(project),
         args=SimpleNamespace(task_ids=["t-mixed"]),
     )
 
-    assert "goalflight_dispatch.py withdraw dead-holder" in guidance
+    assert "goalflight_dispatch.py withdraw withdraw-test" in guidance
     assert "then re-run your dispatch command" not in guidance
-    assert "live-holder state=running" in guidance
-    assert "live or liveness is indeterminate" in guidance
+    assert "live-holder state=worker_dead" in guidance
+    assert "live-holder state=worker_dead: liveness is indeterminate" in guidance
+
+
+def test_guidance_refuses_superseded_without_withdrawn_by(prepared):
+    project, authority, attempt, carrier = prepared
+    holder = ledger.read_record("withdraw-test")
+    holder.update(
+        task_ids=["t-superseded"], state="superseded", terminal_state="superseded",
+        worker_still_alive=False,
+    )
+    ledger.write_record(holder)
+    carrier.write_text(json.dumps(holder))
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="superseded",
+        observation={"state": "superseded", "reason": "replacement"},
+    ).committed
+
+    guidance = dispatch._completion_refusal_guidance(
+        ['dispatch_id="withdraw-test" state="superseded"'],
+        str(project),
+        args=SimpleNamespace(task_ids=["t-superseded"]),
+    )
+
+    assert "goalflight_dispatch.py" not in guidance
+    assert "task-release effect is unproven" in guidance
+    assert "then re-run your dispatch command" not in guidance
 
 
 def test_guidance_withdraws_multiple_holders_then_reruns_original_command(prepared):
