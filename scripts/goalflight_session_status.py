@@ -103,8 +103,24 @@ _EXPECTED_OPTIONAL_ERRORS = (
 
 
 def _controller_project_root_refusal(project_root: Path) -> str | None:
-    if os.environ.get(goalflight_task.ALLOW_VOLATILE_PROJECT_ROOT_ENV) == "1":
-        return None
+    override = os.environ.get(goalflight_task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, "").strip()
+    if override:
+        override_root = Path(override)
+        if override_root.is_absolute():
+            try:
+                override_root = Path(os.path.realpath(os.fspath(override_root)))
+                resolved = Path(
+                    os.path.realpath(os.path.expanduser(os.fspath(project_root)))
+                )
+                if override_root.is_dir():
+                    try:
+                        resolved.relative_to(override_root)
+                    except ValueError:
+                        pass
+                    else:
+                        return None
+            except (OSError, ValueError):
+                pass
     match = goalflight_task.volatile_project_root_match(project_root)
     if match is None:
         return None
