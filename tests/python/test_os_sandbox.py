@@ -976,15 +976,15 @@ def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
     goalflight_acp_run.agent_command = (
         lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     )
-    workspace = ROOT / f".goalflight-os-sandbox-warn-{os.getpid()}"
-    shutil.rmtree(workspace, ignore_errors=True)
-    workspace.mkdir()
+    # Direct ACP runs must use the project root in-place or a managed pooled
+    # seat; an arbitrary child directory is not a valid --cwd.
+    workspace = ROOT
     try:
         with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-warn-") as tmp:
             tmp_path = Path(tmp)
-            # Journal must sit outside /tmp so this is not accidentally
-            # granted by the temp-root rule; create it next to the workspace.
-            journal_state = workspace.parent / f".goalflight-os-sandbox-warn-journal-{os.getpid()}"
+            # This case runs with the sandbox off, so keep its journal beside
+            # the temporary adapter state rather than dirtying the project tree.
+            journal_state = tmp_path / "journal"
             shutil.rmtree(journal_state, ignore_errors=True)
             os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(journal_state)
             goalflight_journal.Journal.create(str(workspace))
@@ -1051,11 +1051,6 @@ def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
             os.environ.pop("GOALFLIGHT_STEER_FILE", None)
         else:
             os.environ["GOALFLIGHT_STEER_FILE"] = old_steer
-        shutil.rmtree(workspace, ignore_errors=True)
-        shutil.rmtree(
-            ROOT / f".goalflight-os-sandbox-warn-journal-{os.getpid()}",
-            ignore_errors=True,
-        )
 
 
 async def _run_sandbox_probe(profile: str) -> dict:

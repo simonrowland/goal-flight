@@ -2407,6 +2407,7 @@ def case_runner_unknown_descendants_cannot_override_hard_wall() -> None:
             extra_env={
                 "PATH": env["PATH"],
                 "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
             },
             timeout_s=20.0,
@@ -2462,6 +2463,7 @@ def case_runner_indeterminate_liveness_does_not_kill() -> None:
                 "PATH": env["PATH"],
                 "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "8",
                 "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES": "1",
                 "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
             },
             state_snapshot=state_snapshot,
@@ -2896,8 +2898,6 @@ def case_test_mode_hooks_require_gate() -> None:
 def case_acp_missing_prompt_commits_terminal_outbox() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        sandbox = tmp / "sandbox"
-        sandbox.mkdir()
         status = tmp / "missing-prompt.status.json"
         missing_prompt = tmp / "missing.prompt.md"
         wrapper = _make_fake_agent_wrapper(tmp)
@@ -2925,14 +2925,14 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
                 "--dispatch-id",
                 "acp-missing-prompt",
                 "--cwd",
-                str(sandbox),
+                str(ROOT),
                 "--prompt",
                 str(missing_prompt),
                 "--status-json",
                 str(status),
                 "--json",
             ],
-            cwd=sandbox,
+            cwd=ROOT,
             env=env,
             text=True,
             encoding="utf-8",
