@@ -25,12 +25,15 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch  # noqa: E402
 import goalflight_journal  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_task  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_terminal  # noqa: E402
 
+PROJECT_ROOT = goalflight_task.resolve_project_root(str(ROOT))
+
 
 @contextlib.contextmanager
-def _state_dir(tmp: Path):
+def _state_dir(tmp: Path, *, project_root: Path = PROJECT_ROOT):
     isolated = {
         "GOALFLIGHT_STATE_DIR": str(tmp),
         "GOALFLIGHT_DISPATCH_DIR": str(tmp / "dispatch"),
@@ -39,6 +42,7 @@ def _state_dir(tmp: Path):
         "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
         "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp / "wake-ledger"),
+        "GOALFLIGHT_PROJECT_ROOT": str(project_root),
     }
     old = {key: os.environ.get(key) for key in isolated}
     os.environ.update(isolated)
@@ -52,7 +56,7 @@ def _state_dir(tmp: Path):
                 os.environ[key] = value
 
 
-def _env(tmp: Path) -> dict[str, str]:
+def _env(tmp: Path, *, project_root: Path = PROJECT_ROOT) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp)
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
@@ -61,8 +65,67 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
+    env["GOALFLIGHT_PROJECT_ROOT"] = str(project_root)
     env["PYTHONPATH"] = str(SCRIPTS) + os.pathsep + env.get("PYTHONPATH", "")
     return env
+
+
+def _host_pool_snapshot() -> tuple[object, str]:
+    common_dir = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    common_path = Path(common_dir)
+    if not common_path.is_absolute():
+        common_path = ROOT / common_path
+    lock_root = common_path.resolve() / "goalflight-worktree-seat-locks"
+    locks: object = None
+    if lock_root.exists():
+        rows: list[tuple[object, ...]] = []
+        for current, directories, files in os.walk(lock_root):
+            directories.sort()
+            files.sort()
+            current_path = Path(current)
+            rel = current_path.relative_to(lock_root)
+            current_stat = current_path.stat()
+            rows.append(("dir", str(rel), current_stat.st_mtime_ns))
+            for name in files:
+                path = current_path / name
+                path_stat = path.stat()
+                rows.append(
+                    ("file", str(path.relative_to(lock_root)), path_stat.st_mtime_ns, path.read_bytes())
+                )
+        locks = tuple(rows)
+    worktrees = subprocess.run(
+        ["git", "-C", str(ROOT), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return locks, worktrees
+
+
+@contextlib.contextmanager
+def _host_pool_guard():
+    before = _host_pool_snapshot()
+    failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        after = _host_pool_snapshot()
+        if before != after:
+            message = (
+                "test mutated the enclosing repository's worktree pool; "
+                "dispatch launch was not isolated"
+            )
+            if failure is None:
+                raise AssertionError(message)
+            raise AssertionError(message) from failure
 
 
 def _mailbox(tmp: Path, dispatch_id: str) -> Path:
@@ -544,6 +607,7 @@ def case_spawn_exports_steer_env() -> None:
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        project_root, _worktree, _orientation = _repo_with_orientation(tmp)
         dispatch_id = "env-export"
         tail = tmp / "tail.log"
         status = tmp / "status.json"
@@ -576,7 +640,8 @@ def case_spawn_exports_steer_env() -> None:
                 "-c",
                 worker_code,
             ],
-            env=_env(tmp),
+            cwd=project_root,
+            env=_env(tmp, project_root=project_root),
             capture_output=True,
             text=True,
             timeout=30,
@@ -587,7 +652,15 @@ def case_spawn_exports_steer_env() -> None:
         assert str(DISPATCH.resolve()) in tail_text, tail_text
 
 
-def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], seen_path: Path) -> str:
+def _run_prompt_env_case(
+    tmp: Path,
+    project_root: Path,
+    dispatch_id: str,
+    prompt_args: list[str],
+    seen_path: Path,
+    *,
+    launch_cwd: Path | None = None,
+) -> str:
     worker_code = (
         "import os; "
         "from pathlib import Path; "
@@ -604,32 +677,37 @@ def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], se
 
     try:
         goalflight_dispatch.build_worker = fake_build_worker
-        with _state_dir(tmp):
+        with _state_dir(tmp, project_root=project_root):
             proc_out = io.StringIO()
             proc_err = io.StringIO()
-            with contextlib.redirect_stdout(proc_out), contextlib.redirect_stderr(proc_err):
-                rc = goalflight_dispatch.main(
-                    [
-                        "--agent",
-                        "codex",
-                        "--unregistered-forced",
-                        "--dispatch-id",
-                        dispatch_id,
-                        "--tail",
-                        str(tmp / f"{dispatch_id}.tail"),
-                        "--status-json",
-                        str(tmp / f"{dispatch_id}.status.json"),
-                        "--poll-secs",
-                        "0.1",
-                        "--max-idle-secs",
-                        "5",
-                        "--capacity-wait-s",
-                        "0",
-                        "--foreground",
-                        "--ignore-git-warn",
-                        *prompt_args,
-                    ]
-                )
+            previous_cwd = Path.cwd()
+            os.chdir(launch_cwd or project_root)
+            try:
+                with contextlib.redirect_stdout(proc_out), contextlib.redirect_stderr(proc_err):
+                    rc = goalflight_dispatch.main(
+                        [
+                            "--agent",
+                            "codex",
+                            "--unregistered-forced",
+                            "--dispatch-id",
+                            dispatch_id,
+                            "--tail",
+                            str(tmp / f"{dispatch_id}.tail"),
+                            "--status-json",
+                            str(tmp / f"{dispatch_id}.status.json"),
+                            "--poll-secs",
+                            "0.1",
+                            "--max-idle-secs",
+                            "5",
+                            "--capacity-wait-s",
+                            "0",
+                            "--foreground",
+                            "--ignore-git-warn",
+                            *prompt_args,
+                        ]
+                    )
+            finally:
+                os.chdir(previous_cwd)
     finally:
         goalflight_dispatch.build_worker = old_build_worker
 
@@ -673,10 +751,13 @@ def case_inline_prompt_exports_original_prompt_file() -> None:
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        project_root, _worktree, _orientation = _repo_with_orientation(tmp)
         dispatch_id = "inline-prompt-env"
         prompt_text = "Line one\n\nLine three\n"
         seen = tmp / "seen-inline.txt"
-        seen_text = _run_prompt_env_case(tmp, dispatch_id, ["--prompt", prompt_text], seen)
+        seen_text = _run_prompt_env_case(
+            tmp, project_root, dispatch_id, ["--prompt", prompt_text], seen
+        )
         prompt_env, steer_env = seen_text.splitlines()
         expected_prompt = tmp / "dispatch" / f"{dispatch_id}.prompt"
 
@@ -694,11 +775,14 @@ def case_prompt_file_exports_given_path() -> None:
 
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
+        project_root, _worktree, _orientation = _repo_with_orientation(tmp)
         dispatch_id = "file-prompt-env"
         prompt_file = tmp / "brief.md"
         prompt_file.write_text("Read the durable brief.\n", encoding="utf-8")
         seen = tmp / "seen-file.txt"
-        seen_text = _run_prompt_env_case(tmp, dispatch_id, ["--prompt-file", str(prompt_file)], seen)
+        seen_text = _run_prompt_env_case(
+            tmp, project_root, dispatch_id, ["--prompt-file", str(prompt_file)], seen
+        )
         prompt_env, steer_env = seen_text.splitlines()
 
         # Export contract: resolved absolute path (symlink-canonical), so the
@@ -727,7 +811,12 @@ def case_relative_prompt_file_exports_resolved_absolute_path() -> None:
         try:
             os.chdir(prompt_dir)
             seen_text = _run_prompt_env_case(
-                tmp, dispatch_id, ["--prompt-file", "brief.md"], seen
+                tmp,
+                repo,
+                dispatch_id,
+                ["--prompt-file", "brief.md"],
+                seen,
+                launch_cwd=prompt_dir,
             )
         finally:
             os.chdir(prev_cwd)
@@ -954,7 +1043,7 @@ def case_preamble_routing_matrix() -> None:
     assert "not on VERIFICATION" in scope_marker
 
 
-def main() -> None:
+def _run_cases() -> None:
     case_bash_append_and_list_with_ack()
     case_shape_routing_and_missing_record()
     case_acp_list_reads_status_ack_dict()
@@ -981,6 +1070,11 @@ def main() -> None:
     case_execution_preamble_does_not_excuse_id_less_success_markers()
     case_codex_prompt_does_not_add_grok_contract()
     case_preamble_routing_matrix()
+
+
+def main() -> None:
+    with _host_pool_guard():
+        _run_cases()
     print("OK: goalflight_dispatch steer tests pass")
 
 
