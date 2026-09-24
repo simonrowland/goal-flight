@@ -195,6 +195,118 @@ def test_normalized_terminal_state_is_excluded(tmp_path: Path, monkeypatch) -> N
     ) == {"total": 0, "unverified_total": 0, "models": {}}
 
 
+def test_unreadable_ledger_marks_status_worker_unverified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dispatch_dir = tmp_path / "dispatch"
+    dispatch_dir.mkdir()
+    pid = os.getpid()
+    identity = {
+        "pid": pid,
+        "start_token": "same-process",
+        "identity_available": True,
+    }
+    (dispatch_dir / "ledger-unknown.status.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "ledger-unknown",
+                "state": "running",
+                "agent": "codex",
+                "model": "gpt-5.6-sol",
+                "controller_label": "unknown-ledger",
+                "worker_pid": pid,
+                "worker_identity": identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+    probed = []
+
+    def fake_batch(pids):
+        probed.extend(pids)
+        return {pid: identity for pid in pids}
+
+    monkeypatch.setattr(traffic, "_batch_process_identities", fake_batch)
+
+    summary = traffic.live_workers_by_model(dispatch_dir=dispatch_dir)
+
+    assert probed == []
+    assert summary == {
+        "total": 0,
+        "unverified_total": 1,
+        "models": {
+            "gpt-5.6-sol": {
+                "count": 0,
+                "unverified": 1,
+                "controllers": {},
+                "unverified_controllers": {"unknown-ledger": 1},
+            }
+        },
+    }
+    assert "total unverified: 1" in traffic.render(summary)
+
+
+def test_terminal_ledger_state_wins_over_live_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs.d"
+    dispatch_dir = state_dir / "dispatch"
+    runs_dir.mkdir(parents=True)
+    dispatch_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    pid = os.getpid()
+    identity = {
+        "pid": pid,
+        "start_token": "same-process",
+        "identity_available": True,
+    }
+    ledger_record = {
+        "dispatch_id": "terminal-live",
+        "state": "complete",
+        "terminal_state": "complete",
+        "worker_pid": pid,
+        "worker_identity": identity,
+    }
+    (runs_dir / "terminal-live.json").write_text(
+        json.dumps(ledger_record, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    (dispatch_dir / "terminal-live.status.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "terminal-live",
+                "state": "running",
+                "agent": "codex",
+                "model": "gpt-5.6-sol",
+                "controller_label": "stale-sidecar",
+                "worker_pid": pid,
+                "worker_identity": identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    probed = []
+
+    def fake_batch(pids):
+        probed.extend(pids)
+        return {pid: identity for pid in pids}
+
+    monkeypatch.setattr(traffic, "_batch_process_identities", fake_batch)
+
+    assert traffic.live_workers_by_model(dispatch_dir=dispatch_dir) == {
+        "total": 0,
+        "unverified_total": 0,
+        "models": {},
+    }
+    assert probed == []
+
+
 def test_batch_identity_probe_uses_one_ps_call(monkeypatch) -> None:
     pids = [111, 222]
     calls = []

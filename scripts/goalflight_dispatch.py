@@ -5334,6 +5334,15 @@ def _dispatch_argv_from_record(record: dict) -> list[str]:
     return []
 
 
+def _resume_model_from_record(record: dict) -> str | None:
+    recorded = record.get("model")
+    if isinstance(recorded, str) and recorded.strip():
+        return recorded.strip()
+    return _option_value_before_worker_remainder(
+        _dispatch_argv_from_record(record), "--model"
+    )
+
+
 def _resume_cwd_from_record(record: dict) -> Path | None:
     envelope = (
         record.get("request_envelope")
@@ -5378,7 +5387,9 @@ def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
     )
 
 
-def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
+def _synthesize_resume_base_argv(
+    source: dict, *, cwd: Path, model: str | None = None
+) -> list[str]:
     """Fallback when an older record never stored dispatch_argv."""
     record = source["record"]
     shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
@@ -5390,9 +5401,10 @@ def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
         "--cwd",
         str(cwd),
     ]
-    model = record.get("model")
-    if isinstance(model, str) and model.strip():
-        argv += ["--model", model.strip()]
+    if model is None:
+        model = _resume_model_from_record(record)
+    if model:
+        argv += ["--model", model]
     posture = record.get("os_sandbox")
     requested = None
     if isinstance(posture, dict):
@@ -5426,11 +5438,14 @@ def _resume_launch_argv(
     resume_args,
 ) -> list[str]:
     record = source["record"]
+    resume_model = _resume_model_from_record(record)
     recorded = _dispatch_argv_from_record(record)
     cwd = _resume_worker_cwd(
         record, override=getattr(resume_args, "cwd", None)
     )
-    base = recorded or _synthesize_resume_base_argv(source, cwd=cwd)
+    base = recorded or _synthesize_resume_base_argv(
+        source, cwd=cwd, model=resume_model
+    )
     replace = {
         "--dispatch-id": child_dispatch_id,
         "--prompt-file": str(prompt_path),
@@ -5485,7 +5500,6 @@ def _resume_launch_argv(
         # registry and fail 404, losing the whole context. So: choose a seat
         # that can actually run, then MOVE the session to it.
         configured = set(_configured_account_names(engine))
-        resume_model = record.get("model")
         target = requested or owner_account
         if not requested and owner_account:
             owner_healthy = (

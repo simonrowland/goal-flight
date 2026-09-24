@@ -98,6 +98,7 @@ def _dispatch_records(
     ledger_records: Sequence[Mapping[str, object]] | None = None,
     dispatch_dir: Path | None = None,
 ) -> list[dict[str, object]]:
+    ledger_unreadable = False
     if ledger_records is None:
         try:
             ledger_records = goalflight_ledger.read_records(
@@ -106,15 +107,22 @@ def _dispatch_records(
             )
         except (OSError, ValueError):
             ledger_records = []
+            ledger_unreadable = True
 
     records: dict[str, dict[str, object]] = {}
-    ledger_states: dict[str, object] = {}
+    ledger_states: dict[str, tuple[object, object]] = {}
+    ledger_unverified_ids: set[str] = set()
     for record in ledger_records:
         if not isinstance(record, Mapping) or not record.get("dispatch_id"):
             continue
         dispatch_id = str(record["dispatch_id"])
         records[dispatch_id] = dict(record)
-        ledger_states[dispatch_id] = record.get("state")
+        ledger_states[dispatch_id] = (
+            record.get("state"),
+            record.get("terminal_state"),
+        )
+        if goalflight_ledger.record_is_unreadable(dict(record)):
+            ledger_unverified_ids.add(dispatch_id)
 
     status_dir = dispatch_dir or goalflight_dispatch_paths.dispatch_base_dir()
     # Status directories retain terminal history on some installations. A
@@ -136,6 +144,32 @@ def _dispatch_records(
             if payload is not None and payload.get("dispatch_id"):
                 status_payloads.append(payload)
 
+    # ``read_records(skip_terminal=True)`` intentionally avoids parsing old
+    # terminal rows. Recheck only status candidates so a terminal ledger row
+    # still wins over a stale running sidecar without reopening the ledger.
+    if not ledger_unreadable:
+        for payload in status_payloads:
+            dispatch_id = str(payload["dispatch_id"])
+            worker_pid = payload.get("worker_pid")
+            if dispatch_id in ledger_states or not (
+                isinstance(worker_pid, int) and worker_pid > 0
+            ):
+                continue
+            try:
+                ledger_record = goalflight_ledger.read_record(dispatch_id)
+            except (OSError, ValueError):
+                ledger_record = None
+            if not isinstance(ledger_record, Mapping):
+                continue
+            if goalflight_ledger.record_is_unreadable(dict(ledger_record)):
+                ledger_unverified_ids.add(dispatch_id)
+            else:
+                records.setdefault(dispatch_id, {}).update(ledger_record)
+            ledger_states[dispatch_id] = (
+                ledger_record.get("state"),
+                ledger_record.get("terminal_state"),
+            )
+
     for payload in status_payloads:
         dispatch_id = str(payload["dispatch_id"])
         record = records.setdefault(dispatch_id, {})
@@ -144,8 +178,14 @@ def _dispatch_records(
                 record[key] = value
         # The ledger's lifecycle state is authoritative; status.json is a
         # heartbeat copy and can lag during terminal publication.
-        if dispatch_id in ledger_states and ledger_states[dispatch_id] is not None:
-            record["state"] = ledger_states[dispatch_id]
+        if dispatch_id in ledger_states:
+            ledger_state, ledger_terminal_state = ledger_states[dispatch_id]
+            if ledger_state is not None:
+                record["state"] = ledger_state
+            if ledger_terminal_state is not None:
+                record["terminal_state"] = ledger_terminal_state
+        if ledger_unreadable or dispatch_id in ledger_unverified_ids:
+            record["_ledger_unverified"] = True
         record.setdefault("status_path", payload.get("status_path"))
         if not record.get("stdout_path") and record.get("tail_path"):
             record["stdout_path"] = record["tail_path"]
@@ -350,17 +390,24 @@ def live_workers_by_model(
         candidates.append(record)
 
     identities = _batch_process_identities(
-        [int(record["worker_pid"]) for record in candidates]
+        [
+            int(record["worker_pid"])
+            for record in candidates
+            if not record.get("_ledger_unverified")
+        ]
     )
     for record in candidates:
         pid = int(record["worker_pid"])
-        try:
-            liveness, _reason = goalflight_ledger.worker_identity_liveness(
-                record,
-                current_identity=identities.get(pid),
-            )
-        except (OSError, TypeError, ValueError):
-            continue
+        if record.get("_ledger_unverified"):
+            liveness = "unknown"
+        else:
+            try:
+                liveness, _reason = goalflight_ledger.worker_identity_liveness(
+                    record,
+                    current_identity=identities.get(pid),
+                )
+            except (OSError, TypeError, ValueError):
+                continue
         model = _dispatch_model(record)
         controller = str(record.get("controller_label") or "?")
         if liveness == "live":

@@ -356,6 +356,68 @@ def test_legacy_resume_replays_recorded_model(tmp_path: Path) -> None:
     assert _option_value(argv, "--model") == "grok-build"
 
 
+def test_legacy_dispatch_argv_model_reaches_account_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = tmp_path / "grok-worktree"
+    worktree.mkdir()
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("continue.\n", encoding="utf-8")
+    model = "grok-build"
+    source = {
+        "record": {
+            "worker_cwd": str(worktree),
+            "effective_account": "seat-a",
+            "account": "default",
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--dispatch-id",
+                "legacy-model-parent",
+                "--cwd",
+                str(worktree),
+                "--model",
+                model,
+            ],
+        },
+        "engine": "grok",
+        "agent": "grok-code",
+        "shape": "bash",
+        "session_id": SESSION_ID,
+    }
+    resume_args = argparse.Namespace(
+        dispatch_id="legacy-model-parent",
+        cwd=None,
+        unregistered_forced=True,
+        controller_label=None,
+        controller_pid=None,
+        controller_session_id=None,
+        account=None,
+        os_sandbox=None,
+    )
+    observed_models = []
+    monkeypatch.setattr(D, "_configured_account_names", lambda _engine: ["seat-a"])
+    monkeypatch.setattr(D, "_seat_probe_says_usable", lambda _seat, _engine: True)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        D,
+        "_grok_account_admission_reason",
+        lambda _account, *, model=None: observed_models.append(model) or None,
+    )
+
+    launch = D._resume_launch_argv(
+        source,
+        child_dispatch_id="legacy-model-child",
+        prompt_path=prompt,
+        resume_args=resume_args,
+    )
+
+    assert _option_value(launch, "--model") == model
+    assert observed_models == [model]
+
+
 def test_resume_preserves_read_only_without_os_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
