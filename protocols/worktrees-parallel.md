@@ -58,10 +58,10 @@ Rules:
   untracked notes there are intentionally left in the reused seat and are not
   in the keep ref because the reserved namespace is preserved by `git clean
   -fd -e .goal-flight` (a documented cross-dispatch leak).
-- Allocation lock ownership covers candidate selection, quarantine, and reset
-  so ref pinning and checkout remain one transaction. Slow quarantine can
-  serialize reclaimers; there is no FIFO queue, and an explicit capacity wait
-  bounds contenders.
+- Allocation lock ownership covers only the short candidate-claim critical
+  section. The per-seat lock then excludes writers while quarantine and reset
+  run, so slow quarantine does not serialize reclaimers; there is no FIFO
+  queue, and an explicit capacity wait bounds contenders.
 - A reclaimed `BLOCKED` worker is not automatically re-seated yet. Resume
   validates the recorded seat and refuses safely; automatic resume re-seating
   is a separate fix.

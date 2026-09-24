@@ -553,6 +553,22 @@ def _git(
     return result.stdout.strip()
 
 
+def _git_nul(
+    cwd: Path,
+    *args: str,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run a Git command whose NUL-delimited output must keep path bytes."""
+    result = _git_proc(cwd, *args, input_text=input_text, env=env)
+    if result is None:
+        raise WorktreeSeatError(f"git {' '.join(args)} could not run in {cwd}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise WorktreeSeatError(f"git {' '.join(args)} failed in {cwd}: {detail}")
+    return result.stdout
+
+
 def _git_identity(cwd: Path) -> tuple[str, str, str] | None:
     """Return realpath git-dir, common-dir, and worktree top-level."""
     try:
@@ -812,32 +828,66 @@ def _write_ring_hwm(lock_root: Path, hwm: int) -> None:
     tmp.replace(path)
 
 
-def _porcelain_relpaths(line: str) -> list[str]:
-    text = line.rstrip("\n")
-    if len(text) < 4:
-        return []
-    rest = text[3:]
-    if any(code in {"R", "C"} for code in text[:2]) and " -> " in rest:
-        return [part.replace("\\", "/").strip() for part in rest.split(" -> ", 1)]
-    return [rest.replace("\\", "/").strip()]
+def _parse_porcelain_z(output: str) -> list[tuple[str, tuple[str, ...]]]:
+    fields = output.split("\0")
+    records: list[tuple[str, tuple[str, ...]]] = []
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            raise WorktreeSeatResetRefused(
+                "malformed NUL-delimited Git status; refusing reset"
+            )
+        status = record[:2]
+        paths = [record[3:]]
+        if any(code in {"R", "C"} for code in status):
+            if index >= len(fields) or not fields[index]:
+                raise WorktreeSeatResetRefused(
+                    "malformed NUL-delimited rename status; refusing reset"
+                )
+            paths.append(fields[index])
+            index += 1
+        records.append((status, tuple(paths)))
+    return records
 
 
-def _porcelain_tree_paths(line: str) -> list[str]:
-    paths = _porcelain_relpaths(line)
-    if "D" in line[:2]:
-        return []
-    if any(code in {"R", "C"} for code in line[:2]):
-        return paths[-1:]
+def _status_records(
+    worktree_path: Path, *, untracked: str = "all"
+) -> list[tuple[str, tuple[str, ...]]]:
+    output = _git_nul(
+        worktree_path,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        f"--untracked-files={untracked}",
+        "--ignore-submodules=none",
+    )
+    return _parse_porcelain_z(output)
+
+
+def _status_tree_paths(record: tuple[str, tuple[str, ...]]) -> tuple[str, ...]:
+    status, paths = record
+    if "D" in status:
+        return ()
+    if "R" in status:
+        return paths[:1]
     return paths
 
 
-def _porcelain_is_product(line: str) -> bool:
-    paths = _porcelain_relpaths(line)
+def _status_is_product(record: tuple[str, tuple[str, ...]]) -> bool:
+    status, paths = record
     if not paths:
-        return bool(line.strip())
-    if line[:2] != "??":
+        return bool(status.strip())
+    if status != "??":
         return True
     return any(not is_reserved_seat_notes_path(path) for path in paths)
+
+
+def _nul_paths(output: str) -> tuple[str, ...]:
+    return tuple(path for path in output.split("\0") if path)
 
 
 def classify_dispatch_cwd(
@@ -1124,7 +1174,12 @@ def check_reset_preserves_commits(
 def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
     """YES clean / NO dirty / UNKNOWN. Same three-state as worktree GC check_clean."""
     proc = _git_proc(
-        worktree_path, "status", "--porcelain=v1", "--untracked-files=all"
+        worktree_path,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
     )
     if proc is None:
         return _condition(
@@ -1135,11 +1190,10 @@ def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
         return _condition(
             UNKNOWN, f"git status failed ({detail}), so cleanliness is unknown"
         )
-    dirty = [
-        line
-        for line in proc.stdout.splitlines()
-        if line.strip() and _porcelain_is_product(line)
-    ]
+    try:
+        dirty = [record for record in _parse_porcelain_z(proc.stdout) if _status_is_product(record)]
+    except WorktreeSeatResetRefused as exc:
+        return _condition(UNKNOWN, str(exc))
     if dirty:
         return _condition(
             NO,
@@ -1407,29 +1461,63 @@ def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
     return 0 if head == str(base_commit).strip() else 1
 
 
+def _tree_paths(cwd: Path, treeish: str) -> set[str]:
+    return set(
+        _nul_paths(_git_nul(cwd, "ls-tree", "-r", "-z", "--name-only", treeish))
+    )
+
+
+def _refuse_ignored_tree_collisions(
+    worktree_path: Path, *, head: str, target: str
+) -> None:
+    ignored = _nul_paths(
+        _git_nul(
+            worktree_path,
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        )
+    )
+    if not ignored:
+        return
+    tree_paths = _tree_paths(worktree_path, head) | _tree_paths(worktree_path, target)
+    for raw_path in ignored:
+        path = raw_path.rstrip("/")
+        if not path:
+            continue
+        components = path.split("/")
+        for end in range(1, len(components) + 1):
+            prefix = "/".join(components[:end])
+            if prefix in tree_paths or any(
+                tree_path.startswith(prefix + "/") for tree_path in tree_paths
+            ):
+                raise WorktreeSeatResetRefused(
+                    f"ignored path {raw_path!r} collides with HEAD or target tree; "
+                    "refusing reset"
+                )
+
+
 def _prepare_seat_checkout(
     worktree_path: Path, *, branch: str, base_commit: str
 ) -> None:
     current_branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
     current_head = _git(worktree_path, "rev-parse", "HEAD")
-    tracked_status = _git(
-        worktree_path, "status", "--porcelain", "--untracked-files=no"
-    )
+    tracked_status = _status_records(worktree_path, untracked="no")
     needs_checkout = (
         current_branch != branch or current_head != base_commit or tracked_status
     )
     if needs_checkout:
-        _git(
-            worktree_path,
-            "-c",
-            "submodule.recurse=false",
-            "reset",
-            "--hard",
-            "HEAD",
+        # The collision check makes a forced checkout safe for ignored bytes;
+        # no preceding reset is needed once the dirty state is quarantined.
+        _refuse_ignored_tree_collisions(
+            worktree_path, head=current_head, target=base_commit
         )
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
     # when a temp repo has not gitignored ``.goal-flight/``. Clean before the
-    # non-forced checkout so quarantined untracked files cannot block it.
+    # forced checkout so quarantined untracked files cannot block it.
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
     if needs_checkout:
         _git(
@@ -1438,6 +1526,7 @@ def _prepare_seat_checkout(
             "submodule.recurse=false",
             "checkout",
             "--no-overwrite-ignore",
+            "-f",
             "-B",
             branch,
             base_commit,
@@ -1480,38 +1569,33 @@ def _quarantine_dirty_worktree(
     seat_name: str,
     abandoned_dispatch_id: str,
 ) -> str | None:
-    hidden_entries = _git(worktree_path, "ls-files", "-v", "-z").split("\0")
+    hidden_entries = _nul_paths(_git_nul(worktree_path, "ls-files", "-v", "-z"))
     for entry in hidden_entries:
-        if not entry:
-            continue
-        tag, _, path = entry.partition(" ")
-        if (tag.islower() or tag == "S") and (
-            (worktree_path / path).exists() or (worktree_path / path).is_symlink()
-        ):
+        if len(entry) < 3 or entry[1] != " ":
+            raise WorktreeSeatResetRefused(
+                f"malformed hidden index entry in dirty worktree {seat_name}; "
+                "refusing reset"
+            )
+        tag, path = entry[0], entry[2:]
+        if tag.islower() or tag == "S":
             raise WorktreeSeatResetRefused(
                 f"dirty worktree {seat_name} has hidden index entry {path!r}; "
                 "refusing reset"
             )
 
-    status = _git_proc(
-        worktree_path,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--ignore-submodules=none",
-    )
-    if status is None or status.returncode != 0:
-        raise WorktreeSeatResetRefused(
-            f"cannot inspect dirty worktree {seat_name}; refusing reset"
-        )
-    dirty = status.stdout
+    records = _status_records(worktree_path)
     submodule_paths = set()
-    for entry in _git(worktree_path, "ls-files", "--stage").splitlines():
-        fields = entry.split(None, 3)
-        if len(fields) == 4 and fields[0] == "160000":
-            submodule_paths.add(fields[3])
-    for line in dirty.splitlines():
-        paths = _porcelain_relpaths(line)
+    for entry in _nul_paths(_git_nul(worktree_path, "ls-files", "--stage", "-z")):
+        metadata, separator, path = entry.partition("\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise WorktreeSeatResetRefused(
+                f"malformed index entry in dirty worktree {seat_name}; refusing reset"
+            )
+        if fields[0] == "160000":
+            submodule_paths.add(path)
+    for record in records:
+        _status, paths = record
         if any(
             path == submodule or path.startswith(submodule + "/")
             for path in paths
@@ -1524,21 +1608,18 @@ def _quarantine_dirty_worktree(
     reserved_untracked = list(
         dict.fromkeys(
             path
-            for line in dirty.splitlines()
-            if line[:2] == "??"
-            for path in _porcelain_relpaths(line)
+            for status, paths in records
+            if status == "??"
+            for path in paths
             if is_reserved_seat_notes_path(path)
         )
     )
-    product = [
-        line for line in dirty.splitlines() if line.strip() and _porcelain_is_product(line)
-    ]
+    product = [record for record in records if _status_is_product(record)]
     staged_and_worktree = [
-        line
-        for line in product
-        if len(line) >= 2
-        and line[0] not in {" ", "?"}
-        and line[1] not in {" ", "?"}
+        record
+        for record in product
+        if record[0][0] not in {" ", "?"}
+        and record[0][1] not in {" ", "?"}
     ]
     if staged_and_worktree:
         raise WorktreeSeatResetRefused(
@@ -1547,30 +1628,48 @@ def _quarantine_dirty_worktree(
         )
 
     dirty_paths = list(
-        dict.fromkeys(path for line in product for path in _porcelain_tree_paths(line))
+        dict.fromkeys(path for record in product for path in _status_tree_paths(record))
     )
-    if dirty_paths:
-        attributes = _git(
+    tracked_paths = _nul_paths(_git_nul(worktree_path, "ls-files", "-z"))
+    attribute_paths = tuple(dict.fromkeys((*tracked_paths, *dirty_paths)))
+    if attribute_paths:
+        # A clean lfs-filtered file is safe: status confirms that its worktree
+        # bytes are the smudge of the pinned pointer, and the LFS object lives
+        # in the common .git/lfs/objects shared by all worktrees. Other clean
+        # filters may be lossy, so they retain the seat.
+        attributes = _git_nul(
             worktree_path,
             "check-attr",
+            "-z",
             "--stdin",
             "filter",
             "working-tree-encoding",
             "eol",
             "text",
-            input_text="\n".join(dirty_paths) + "\n",
+            input_text="\0".join(attribute_paths) + "\0",
         )
-        for line in attributes.splitlines():
-            fields = line.rsplit(": ", 2)
-            if len(fields) != 3:
-                continue
-            attribute = fields[1]
-            value = fields[2].strip()
+        fields = attributes.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 3:
+            raise WorktreeSeatResetRefused(
+                f"malformed Git attributes in dirty worktree {seat_name}; refusing reset"
+            )
+        dirty_set = set(dirty_paths)
+        for index in range(0, len(fields), 3):
+            path, attribute, value = fields[index : index + 3]
             active_filter = attribute == "filter" and value not in {
                 "",
                 "unspecified",
                 "unset",
             }
+            if active_filter and (value != "lfs" or path in dirty_set):
+                raise WorktreeSeatResetRefused(
+                    f"dirty worktree {seat_name} path {path!r} uses active "
+                    f"filter {value!r}; refusing reset"
+                )
+            if path not in dirty_set:
+                continue
             reencodes = False
             if attribute == "working-tree-encoding":
                 reencodes = value not in {"", "unspecified", "unset"}
@@ -1578,7 +1677,7 @@ def _quarantine_dirty_worktree(
                 attribute == "eol" and value in {"lf", "crlf"}
             ) or (attribute == "text" and value in {"set", "auto"}):
                 try:
-                    data = (worktree_path / fields[0]).read_bytes()
+                    data = (worktree_path / path).read_bytes()
                 except OSError:
                     reencodes = True
                 else:
@@ -1592,10 +1691,10 @@ def _quarantine_dirty_worktree(
                         reencodes = b"\r\n" in data and (
                             value == "set" or b"\x00" not in data
                         )
-            if not active_filter and not reencodes:
+            if not reencodes:
                 continue
             raise WorktreeSeatResetRefused(
-                f"dirty worktree {seat_name} path {fields[0]} uses active "
+                f"dirty worktree {seat_name} path {path!r} uses active "
                 f"{attribute} {value!r}; refusing reset"
             )
     if not product:
@@ -1676,9 +1775,7 @@ def _quarantine_dirty_worktree(
     )
     dirty_ref = f"refs/{KEEP_REF_PREFIX}/{abandoned_dispatch_id}/dirty-{stamp}"
     _update_ref_and_verify(worktree_path, dirty_ref, commit, old="")
-    tree_paths = set(
-        _git(worktree_path, "ls-tree", "-r", "--name-only", dirty_ref).splitlines()
-    )
+    tree_paths = _tree_paths(worktree_path, dirty_ref)
     missing_paths = sorted(set(dirty_paths) - tree_paths)
     if missing_paths:
         raise WorktreeSeatResetRefused(
@@ -1806,17 +1903,7 @@ def _prepare_claimed_seat_locked(
         ) from exc
     try:
         _prepare_seat_checkout(worktree_path, branch=branch, base_commit=base_commit)
-        remaining = _git(
-            worktree_path,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        )
-        leftover = [
-            line
-            for line in remaining.splitlines()
-            if line.strip() and _porcelain_is_product(line)
-        ]
+        leftover = [record for record in _status_records(worktree_path) if _status_is_product(record)]
         if leftover:
             raise WorktreeSeatError(
                 f"worktree {seat_name} is not clean after acquire-time reset"
