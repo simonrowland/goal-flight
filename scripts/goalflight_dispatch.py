@@ -10887,7 +10887,7 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
     if goalflight_ledger.record_is_unreadable(record):
         raise ValueError("ledger is unreadable; repair its evidence before withdrawing")
     index = _build_queue_carrier_index(queue_dir or _queue_entry_path(args.dispatch_id).parent)
-    statuses = index.carriers_by_id.get(args.dispatch_id, [])
+    statuses = index.carriers_by_id.get(args.dispatch_id.casefold(), [])
     for active in ([index.listing_error] if index.listing_error is not None else statuses):
         if active.kind in {ClaimCarrierKind.LIVE, ClaimCarrierKind.UNKNOWN}:
             raise _WithdrawPreflightRefusal(
@@ -11574,7 +11574,7 @@ class _QueueCarrierIndex:
             return self.listing_error
         if not dispatch_id:
             return ClaimCarrierStatus()
-        return self.by_id.get(dispatch_id) or ClaimCarrierStatus()
+        return self.by_id.get(dispatch_id.casefold()) or ClaimCarrierStatus()
 
 
 def _build_queue_carrier_index(
@@ -11595,10 +11595,22 @@ def _build_queue_carrier_index(
             )
         collected: dict[str, list[ClaimCarrierStatus]] = {}
 
-        def _add(dispatch_id: str, status: ClaimCarrierStatus) -> None:
-            if not dispatch_id:
+        def _add(filename_id: str, status: ClaimCarrierStatus) -> None:
+            if not filename_id:
                 return
-            collected.setdefault(dispatch_id, []).append(status)
+            collected.setdefault(filename_id.casefold(), []).append(status)
+
+        def _payload_mismatch(
+            path: Path, filename_id: str, payload: dict,
+        ) -> ClaimCarrierStatus | None:
+            payload_id = payload.get("dispatch_id")
+            if payload_id not in (None, "") and str(payload_id).casefold() != filename_id.casefold():
+                return ClaimCarrierStatus(
+                    ClaimCarrierKind.UNKNOWN,
+                    "carrier_dispatch_id_mismatch",
+                    str(path),
+                )
+            return None
 
         for path in listing:
             if not path.name.endswith(".json"):
@@ -11618,10 +11630,11 @@ def _build_queue_carrier_index(
                 )
                 continue
             if isinstance(payload, dict):
-                _add(
-                    str(payload.get("dispatch_id") or path.stem),
-                    ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path)),
-                )
+                filename_id = path.stem
+                mismatch = _payload_mismatch(path, filename_id, payload)
+                _add(filename_id, mismatch or ClaimCarrierStatus(
+                    ClaimCarrierKind.QUEUED, "queued_envelope", str(path),
+                ))
         for claim in listing:
             if ".json.claimed-" not in claim.name:
                 continue
@@ -11634,10 +11647,8 @@ def _build_queue_carrier_index(
                 _add(filename_id, _adjudicate_claim_marker(claim, None))
                 continue
             if isinstance(payload, dict):
-                _add(
-                    str(payload.get("dispatch_id") or filename_id),
-                    _adjudicate_claim_marker(claim, payload),
-                )
+                mismatch = _payload_mismatch(claim, filename_id, payload)
+                _add(filename_id, mismatch or _adjudicate_claim_marker(claim, payload))
         by_id = {
             dispatch_id: _prefer_claim_carrier(statuses)
             for dispatch_id, statuses in collected.items()

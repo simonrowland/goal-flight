@@ -566,6 +566,38 @@ def test_all_carrier_status_paths_veto_live_worker(prepared, claimed, tmp_path):
     assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
 
 
+def test_carrier_filename_payload_mismatch_refuses_withdraw(
+    prepared, claimed, monkeypatch
+):
+    project, authority, attempt, _carrier = prepared
+    record_dead_worker_evidence(project, authority, attempt)
+    live_pid = 999_999_998
+    live_identity = {"pid": live_pid, "start_token": "live"}
+    original_status = dispatch._queue_claim_identity_status
+
+    def identity_status(pid, identity):
+        if pid == live_pid:
+            return "live", "test_live_carrier"
+        return original_status(pid, identity)
+
+    monkeypatch.setattr(dispatch, "_queue_claim_identity_status", identity_status)
+    entry = json.loads(claimed.read_text())
+    entry.update(
+        dispatch_id="other",
+        queue_claimer_pid=live_pid,
+        queue_claimer_identity=live_identity,
+    )
+    claimed.write_text(json.dumps(entry))
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "carrier_dispatch_id_mismatch" in result["reason"]
+    assert claimed.exists()
+    assert attempt_row(authority)["terminal_state"] is None
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "unknown"
+
+
 def test_status_sidecar_live_vetoes_dead_ledger_worker(prepared, tmp_path):
     project, authority, attempt, carrier = prepared
     status_path = tmp_path / "live.status.json"
