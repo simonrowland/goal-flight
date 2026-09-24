@@ -4313,16 +4313,23 @@ def _worker_liveness_warning(record: dict) -> str | None:
         )
     prior = record.get("worker_identity") or {}
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
-        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
+        )
     matched, reason = goalflight_ledger.compare_process_identities(
         int(pid), prior, current
     )
     if reason == "identity_indeterminate":
-        return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
+        return (
+            f"WARN: dispatch {dispatch_id} worker identity indeterminate; "
+            "message recorded but worker delivery was not attempted"
+        )
     if not matched:
         return (
             f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
-            f"({reason}); message appended but may target stale state"
+            f"({reason}); message recorded but worker delivery was not attempted "
+            "and may target stale state"
         )
     return None
 

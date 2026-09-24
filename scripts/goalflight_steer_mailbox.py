@@ -6,6 +6,7 @@ Deploy this lock convention only after REV 5's zero-live-dispatch cutover gate.
 from __future__ import annotations
 
 import errno
+import contextlib
 import json
 import math
 import os
@@ -41,6 +42,8 @@ WORKER_WAIT_CLEANUP_MODE = "--worker-wait-cleanup"
 WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
 WORKER_WAIT_CLEANUP_END = "end"
 WORKER_WAIT_CLEANUP_TIMEOUT = "timeout"
+WORKER_WAIT_CLEANUP_FAILED = "failed"
+WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS = 1.0
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -139,6 +142,7 @@ def worker_wait_cleanup_slot_path(
         WORKER_WAIT_CLEANUP_RECEIPT,
         WORKER_WAIT_CLEANUP_END,
         WORKER_WAIT_CLEANUP_TIMEOUT,
+        WORKER_WAIT_CLEANUP_FAILED,
     }:
         raise ValueError("worker wait cleanup slot requires a known operation")
     token = str(wait_id or "").strip()
@@ -154,6 +158,45 @@ def worker_wait_cleanup_slot_path(
     return mailbox.with_name(
         f".{mailbox.stem}.cleanup.{operation}.{token}.{reply_seq}.lock"
     )
+
+
+@contextlib.contextmanager
+def _worker_wait_reply_admission(
+    path: Path,
+    wait_id: str,
+    *,
+    arm_seq: int,
+):
+    """Mark a validated reply writer while its mailbox append is in flight."""
+    slot = _try_acquire_worker_wait_cleanup_slot(
+        path,
+        WORKER_WAIT_CLEANUP_END,
+        wait_id,
+        arm_seq,
+    )
+    if slot is None:
+        raise TimeoutError("worker wait reply admission is already in flight")
+    try:
+        yield
+    finally:
+        slot.release()
+
+
+def _worker_wait_reply_admission_held(
+    path: Path,
+    wait_id: str,
+    arm_seq: int,
+) -> bool:
+    """Probe whether a validated reply writer still owns its admission mark."""
+    try:
+        return _worker_wait_cleanup_slot_held(
+            path,
+            WORKER_WAIT_CLEANUP_END,
+            wait_id,
+            arm_seq,
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def _append_worker_wait_reply_receipt(
@@ -331,6 +374,7 @@ def _worker_wait_cleanup_command(
         WORKER_WAIT_CLEANUP_RECEIPT,
         WORKER_WAIT_CLEANUP_END,
         WORKER_WAIT_CLEANUP_TIMEOUT,
+        WORKER_WAIT_CLEANUP_FAILED,
     } or not wait_id or not wait_id.isalnum() or not dispatch_id or arm_seq <= 0:
         raise ValueError("worker wait cleanup requires one exact correlated reply")
     command = [
@@ -343,9 +387,9 @@ def _worker_wait_cleanup_command(
         wait_id,
         str(arm_seq),
     ]
-    if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+    if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
         if reply is not None:
-            raise ValueError("timeout cleanup cannot carry a reply")
+            raise ValueError("settlement cleanup cannot carry a reply")
         return command
     if (
         reply is None
@@ -399,31 +443,29 @@ def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> No
             pass
 
 
-def schedule_worker_wait_timeout_cleanup(
+def schedule_worker_wait_settlement_cleanup(
     path: Path,
     arm: dict,
+    *,
+    decision: str,
 ) -> None:
-    """Finish a deadline settlement after a bounded waiter return.
-
-    The helper is used only when the deadline collides with a mailbox lock. It
-    owns the same durable end-row operation as the waiter, but can wait for a
-    slow fsync after the worker has returned its deadline result.
-    """
+    """Finish one bounded waiter settlement after its caller returns."""
+    operation = {
+        "timeout": WORKER_WAIT_CLEANUP_TIMEOUT,
+        "failed": WORKER_WAIT_CLEANUP_FAILED,
+    }.get(decision)
+    if operation is None:
+        raise ValueError("worker wait cleanup requires timeout or failed decision")
     try:
         command = _worker_wait_cleanup_command(
-            WORKER_WAIT_CLEANUP_TIMEOUT,
+            operation,
             path,
             arm,
             None,
         )
         wait_id = str(arm.get("question_id") or "").strip()
         arm_seq = int(arm["seq"])
-        if _worker_wait_cleanup_slot_held(
-            path,
-            WORKER_WAIT_CLEANUP_TIMEOUT,
-            wait_id,
-            arm_seq,
-        ):
+        if _worker_wait_cleanup_slot_held(path, operation, wait_id, arm_seq):
             return
         subprocess.Popen(
             command,
@@ -434,10 +476,20 @@ def schedule_worker_wait_timeout_cleanup(
             close_fds=True,
         )
     except (OSError, RuntimeError, ValueError, TypeError):
-        # A later wait can settle the expired arm or recover a reply that won
-        # the race. The durable arm must not turn a bounded deadline into a
-        # process failure merely because cleanup launch was unavailable.
+        # A later wait can settle the arm or recover a reply that won the
+        # race. The durable arm must not turn a bounded wait into a process
+        # failure merely because cleanup launch was unavailable.
         pass
+
+
+def schedule_worker_wait_timeout_cleanup(path: Path, arm: dict) -> None:
+    """Finish a deadline settlement after a bounded waiter return."""
+    schedule_worker_wait_settlement_cleanup(path, arm, decision="timeout")
+
+
+def schedule_worker_wait_failed_cleanup(path: Path, arm: dict) -> None:
+    """Finish a failed question publication after a bounded waiter return."""
+    schedule_worker_wait_settlement_cleanup(path, arm, decision="failed")
 
 
 def _run_worker_wait_cleanup(argv: list[str]) -> int:
@@ -446,7 +498,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
         return 64
     _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq = argv[:6]
     raw_reply_seq = argv[6] if len(argv) == 7 else None
-    if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+    if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
         if raw_reply_seq is not None:
             return 64
     elif operation in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
@@ -479,7 +531,7 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
     if slot is None:
         return 0
     try:
-        if operation == WORKER_WAIT_CLEANUP_TIMEOUT:
+        if operation in {WORKER_WAIT_CLEANUP_TIMEOUT, WORKER_WAIT_CLEANUP_FAILED}:
             arm, _reply = _cleanup_arm_and_reply_from_mailbox(
                 path,
                 dispatch_id=dispatch_id,
@@ -490,8 +542,18 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
             append_worker_wait_ended(
                 path,
                 arm,
-                decision="timeout",
-                context={"reason": "deadline_lock_timeout"},
+                decision=(
+                    "timeout"
+                    if operation == WORKER_WAIT_CLEANUP_TIMEOUT
+                    else "failed"
+                ),
+                context={
+                    "reason": (
+                        "deadline_lock_timeout"
+                        if operation == WORKER_WAIT_CLEANUP_TIMEOUT
+                        else "question_publication_failed"
+                    )
+                },
                 lock_timeout_secs=None,
             )
             return 0
@@ -717,6 +779,7 @@ def append_steer_entry(
     awake_mono_ns: int | None = None,
     lock_timeout_secs: float | None = None,
     validate_existing: Callable[[list[dict]], None] | None = None,
+    write_guard: Callable[[], object] | None = None,
 ) -> dict:
     if direction not in STEER_DIRECTIONS:
         raise ValueError(f"unsupported steer direction: {direction!r}")
@@ -772,7 +835,9 @@ def append_steer_entry(
             ).encode("utf-8")
         except (TypeError, ValueError, OverflowError, RecursionError) as exc:
             raise ValueError(f"steer entry is not JSON-serializable: {exc}") from exc
-        carrier.append_bytes(encoded)
+        guard = write_guard() if write_guard is not None else contextlib.nullcontext()
+        with guard:
+            carrier.append_bytes(encoded)
         return entry
 
 
@@ -1109,6 +1174,7 @@ def append_worker_wait_reply(
     # Keep the classification explicit on every admitted row; a timeout race
     # must never turn a late reply into an absent context field.
     reply_context: dict[str, object] = {"late": False}
+    reply_arm_seq: list[int] = []
 
     def validate(entries: list[dict]) -> None:
         arm = next(
@@ -1128,6 +1194,7 @@ def append_worker_wait_reply(
             arm_seq = int(arm["seq"])
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValueError("worker wait arm has invalid seq") from exc
+        reply_arm_seq[:] = [arm_seq]
         context = arm.get("context")
         deadline_ns = (
             context.get("deadline_awake_mono_ns")
@@ -1178,6 +1245,11 @@ def append_worker_wait_reply(
         cross_project=cross_project,
         validate_existing=validate,
         lock_timeout_secs=lock_timeout_secs,
+        write_guard=lambda: _worker_wait_reply_admission(
+            path,
+            wait_id,
+            arm_seq=reply_arm_seq[0],
+        ),
     )
 
 
@@ -1265,13 +1337,65 @@ def append_worker_wait_started(
             after_seq=prior_seq,
         ) is not None:
             return
-        if active_worker_wait(entries, dispatch_id=dispatch_id) is not None:
+        prior_context = prior.get("context")
+        started_ns = prior.get("awake_mono_ns")
+        deadline_ns = (
+            prior_context.get("deadline_awake_mono_ns")
+            if isinstance(prior_context, dict)
+            else None
+        )
+        if (
+            not isinstance(started_ns, int)
+            or isinstance(started_ns, bool)
+            or started_ns <= 0
+            or not isinstance(deadline_ns, int)
+            or isinstance(deadline_ns, bool)
+            or deadline_ns <= started_ns
+        ):
+            # An unverifiable arm stays unsettled. Renewal must not turn
+            # malformed or incomplete identity into a fabricated timeout.
+            return
+        effective_deadline_ns = min(
+            deadline_ns,
+            started_ns + int(MAX_WORKER_WAIT_TIMEOUT_SECS * 1_000_000_000),
+        )
+        decision = None
+        if int(active_monotonic() * 1_000_000_000) >= effective_deadline_ns:
+            decision = "timeout"
+        else:
+            waiter_pid = prior_context.get("waiter_pid") if isinstance(prior_context, dict) else None
+            waiter_start_token = (
+                prior_context.get("waiter_start_token")
+                if isinstance(prior_context, dict)
+                else None
+            )
+            if (
+                isinstance(waiter_pid, bool)
+                or not isinstance(waiter_pid, int)
+                or waiter_pid <= 0
+                or not isinstance(waiter_start_token, str)
+                or not waiter_start_token
+            ):
+                return
+            identity_state = goalflight_compat.process_identity_matches(
+                waiter_pid,
+                waiter_start_token,
+            )
+            if identity_state is False:
+                decision = "failed"
+            elif identity_state is None:
+                # UNKNOWN is not proof that the waiter is dead. Keep the arm
+                # so a later reply remains correlated to its live owner.
+                return
+            else:
+                return
+        if decision is None:
             return
         try:
             append_worker_wait_ended(
                 path,
                 prior,
-                decision="timeout",
+                decision=decision,
                 context={"reason": "prior_wait_not_active"},
                 lock_timeout_secs=lock_budget(),
             )
@@ -1638,9 +1762,55 @@ def wait_for_worker_entries(
         schedule_worker_wait_reply_cleanup(path, arm, reply)
         return result
 
+    def recover_admitted_reply(arm: dict) -> dict | None:
+        """Recover a reply whose validated writer still owns the mailbox lock."""
+        wait_id = str(arm.get("question_id") or "").strip()
+        if not wait_id or not _worker_wait_reply_admission_held(
+            path,
+            wait_id,
+            int(arm["seq"]),
+        ):
+            return None
+        recovery_deadline = (
+            active_monotonic() + WORKER_WAIT_REPLY_RECOVERY_GRACE_SECS
+        )
+        while True:
+            remaining = recovery_deadline - active_monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                entries = read_steer_entries(
+                    path,
+                    lock_timeout_secs=min(0.05, remaining),
+                    quarantine_errors=False,
+                )
+            except TimeoutError:
+                entries = None
+            if entries is not None:
+                replies = _worker_wait_replies(
+                    entries,
+                    dispatch_id=dispatch_id,
+                    wait_id=wait_id,
+                    after_seq=int(arm["seq"]),
+                )
+                if len(replies) > 1:
+                    raise ValueError("worker wait has multiple correlated replies")
+                if replies:
+                    return replies[0]
+                if not _worker_wait_reply_admission_held(
+                    path,
+                    wait_id,
+                    int(arm["seq"]),
+                ):
+                    return None
+            time.sleep(min(poll_secs, max(0.0, recovery_deadline - active_monotonic())))
+
     def deadline_result(arm: dict | None = None) -> dict:
         settled = True
         if arm is not None:
+            admitted_reply = recover_admitted_reply(arm)
+            if admitted_reply is not None:
+                return deliver_reply(arm, admitted_reply, recovered=True)
             try:
                 append_worker_wait_ended(
                     path,
@@ -1752,6 +1922,7 @@ def wait_for_worker_entries(
             }
         )
     except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
         try:
             append_worker_wait_ended(
                 path,
@@ -1761,17 +1932,24 @@ def wait_for_worker_entries(
                     "reason": "question_publication_failed",
                     "error": f"{type(exc).__name__}: {exc}",
                 },
-                lock_timeout_secs=None,
+                lock_timeout_secs=remaining_secs(),
             )
+        except TimeoutError as settlement_exc:
+            schedule_worker_wait_failed_cleanup(path, arm)
+            raise ValueError(
+                "worker wait question publication failed: "
+                f"{failure}; failed to settle wait within its deadline: "
+                f"{type(settlement_exc).__name__}: {settlement_exc}"
+            ) from exc
         except Exception as settlement_exc:
             raise ValueError(
                 "worker wait question publication failed: "
-                f"{type(exc).__name__}: {exc}; failed to settle wait: "
+                f"{failure}; failed to settle wait: "
                 f"{type(settlement_exc).__name__}: {settlement_exc}"
             ) from exc
         raise ValueError(
             "worker wait question publication failed: "
-            f"{type(exc).__name__}: {exc}"
+            f"{failure}"
         ) from exc
     report(
         {

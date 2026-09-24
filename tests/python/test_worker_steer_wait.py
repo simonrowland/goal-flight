@@ -530,6 +530,78 @@ with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
             holder.wait(timeout=5)
 
 
+def test_publication_failure_settlement_does_not_wait_on_mailbox_lock(
+    tmp_path: Path,
+) -> None:
+    mailbox = tmp_path / "publication-lock.steer.jsonl"
+    ready = tmp_path / "publication-lock.ready"
+    holder_code = r'''
+import os
+import time
+from pathlib import Path
+import goalflight_messages as messages
+
+with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
+    Path(os.environ["TEST_READY_FILE"]).write_text("ready", encoding="utf-8")
+    time.sleep(0.8)
+'''
+    env = _env(tmp_path)
+    env.update(
+        {
+            "TEST_STEER_FILE": str(mailbox),
+            "TEST_READY_FILE": str(ready),
+        }
+    )
+    holder: subprocess.Popen | None = None
+
+    def broken_publish(_event: dict) -> None:
+        nonlocal holder
+        holder = subprocess.Popen([sys.executable, "-c", holder_code], env=env)
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "publication lock holder did not become ready"
+        raise RuntimeError("controller carrier unavailable")
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(ValueError, match="question publication failed"):
+            steer.wait_for_worker_entries(
+                mailbox,
+                dispatch_id="publication-lock",
+                acked_seqs=set(),
+                question_kind="USER-NEED",
+                question_text="must be visible",
+                timeout_secs=0.2,
+                poll_secs=0.05,
+                publish_question=broken_publish,
+            )
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.6, f"publication settlement waited on mailbox lock: {elapsed:.3f}s"
+        assert holder is not None
+        holder.wait(timeout=3)
+        deadline = time.monotonic() + 2
+        entries: list[dict] = []
+        while time.monotonic() < deadline:
+            entries = steer.read_steer_entries(mailbox)
+            if any(
+                entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+                and entry.get("decision") == "failed"
+                for entry in entries
+            ):
+                break
+            time.sleep(0.01)
+        assert any(
+            entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+            and entry.get("decision") == "failed"
+            for entry in entries
+        ), entries
+    finally:
+        if holder is not None and holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+
 def test_carrier_validation_error_fails_closed(
     tmp_path: Path,
     monkeypatch,
@@ -599,7 +671,7 @@ time.sleep(5)
     assert any(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
         and entry.get("reply_to") == entries[0].get("question_id")
-        and entry.get("decision") == "timeout"
+        and entry.get("decision") == "failed"
         for entry in entries
     ), entries
     assert steer.active_worker_wait(entries, dispatch_id="dead-waiter") is None
@@ -631,6 +703,44 @@ def test_wait_arm_matches_only_its_exact_question_marker(tmp_path: Path) -> None
     }
     assert not watch._worker_wait_marker_matches(stale, wait_state, "correlation")
     assert watch._worker_wait_marker_matches(current, wait_state, "correlation")
+
+
+def test_unknown_waiter_identity_keeps_prior_arm_unsettled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = tmp_path / "unknown-waiter.steer.jsonl"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id="unknown-waiter",
+        timeout_secs=5,
+        question_kind="USER-NEED",
+        question_text="keep the live question",
+    )
+    monkeypatch.setattr(
+        steer.goalflight_compat,
+        "process_identity_matches",
+        lambda _pid, _token: None,
+    )
+
+    with pytest.raises(ValueError, match="renewal refused"):
+        steer.append_worker_wait_started(
+            mailbox,
+            dispatch_id="unknown-waiter",
+            timeout_secs=1,
+            question_kind="USER-NEED",
+            question_text="replacement question",
+        )
+
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1, entries
+    assert not any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+        and entry.get("reply_to") == arm["question_id"]
+        for entry in entries
+    ), entries
 
 
 def test_unsettled_wait_cannot_be_renewed_and_settlement_does_not_resurrect_it(

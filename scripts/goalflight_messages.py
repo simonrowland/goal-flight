@@ -2624,33 +2624,23 @@ def _stamp_controller_source_label(source: dict) -> None:
 
 
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
-    """Return the declared live controller that authored an outbound steer.
+    """Return an explicitly carried controller session, without acquiring.
 
-    Missing or ambiguous identity stays ``None``. Wake filtering treats that as
-    unknown correspondence and wakes; it must never guess an author and silence
-    mail that may have come from another controller.
+    Steer is a short-lived sideband command. Re-probing the controller lease
+    here used the project-root write/read canonicalizer, which shells out to
+    git before the message carrier was written. A missing or ambiguous session
+    stays ``None``; source metadata is descriptive and wake filtering must not
+    guess an author.
     """
+    for key in ("GOALFLIGHT_CONTROLLER_SESSION_ID", "GOALFLIGHT_CONTROLLER_LEASE_NONCE"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
     record, _classification = _dispatch_record(dispatch_id)
-    project_root = (record or {}).get("project_root")
-    if not project_root:
-        return None
-    try:
-        import goalflight_session_status  # type: ignore
-
-        label = goalflight_session_status.resolve_controller_label()
-        pid = goalflight_session_status.resolve_controller_pid()
-        if label is None or pid is None:
-            return None
-        session = goalflight_session_status.live_session(
-            Path(str(project_root)),
-            label=label,
-            pid=pid,
-        )
-    except _EXPECTED_OPTIONAL_ERRORS:
-        return None
-    if not session or session.get("conflicting_beacons") or not session.get("id"):
-        return None
-    return str(session["id"])
+    session_id = (record or {}).get("controller_session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
 
 
 def _steer_sender_project_root() -> Path:
@@ -2688,8 +2678,67 @@ def _canonical_steer_project_root(value: object) -> Path | None:
     try:
         root = Path(value).expanduser().resolve(strict=False)
         return root if root.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _steer_project_identity(root: Path) -> tuple[object, ...] | None:
+    """Return a worktree-invariant identity using only local metadata.
+
+    Ledger roots are collapsed through git when they are written. A steer must
+    not run git again, but a controller may invoke it from a linked worktree.
+    The linked worktree's ``.git`` file points at a gitdir whose ``commondir``
+    names the same repository metadata directory as the main checkout.
+    """
+    current = root
+    while True:
+        marker = current / ".git"
+        try:
+            marker_stat = marker.stat()
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+            continue
+        except OSError:
+            return None
+
+        if stat.S_ISDIR(marker_stat.st_mode):
+            try:
+                common_stat = marker.stat()
+            except OSError:
+                return None
+            return ("git", common_stat.st_dev, common_stat.st_ino)
+        if not stat.S_ISREG(marker_stat.st_mode):
+            return None
+        try:
+            line = marker.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError, UnicodeError):
+            return None
+        prefix = "gitdir:"
+        if not line.lower().startswith(prefix):
+            return None
+        gitdir = Path(line[len(prefix) :].strip())
+        if not gitdir.is_absolute():
+            gitdir = marker.parent / gitdir
+        try:
+            gitdir = gitdir.resolve(strict=False)
+            common_file = gitdir / "commondir"
+            common = common_file.read_text(encoding="utf-8").strip()
+            common_path = Path(common)
+            if not common_path.is_absolute():
+                common_path = gitdir / common_path
+            common_stat = common_path.resolve(strict=False).stat()
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return ("git", common_stat.st_dev, common_stat.st_ino)
+
+    try:
+        path_stat = root.stat()
     except OSError:
         return None
+    return ("path", path_stat.st_dev, path_stat.st_ino)
 
 
 def _validate_steer_sender_project(
@@ -2708,14 +2757,20 @@ def _validate_steer_sender_project(
         record.get("project_root") if isinstance(record, dict) else None
     )
     sender_root = _canonical_steer_project_root(sender.get("project_root"))
-    if target_root is None or sender_root is None:
+    target_identity = (
+        _steer_project_identity(target_root) if target_root is not None else None
+    )
+    sender_identity = (
+        _steer_project_identity(sender_root) if sender_root is not None else None
+    )
+    if target_identity is None or sender_identity is None:
         if cross_project:
             return
         raise MessageError(
             "steer refused: project_root identity is unknown for the sender or "
             f"target dispatch {dispatch_id}; pass --cross-project to override"
         )
-    if target_root == sender_root:
+    if target_identity == sender_identity:
         return
     if cross_project:
         return
