@@ -609,7 +609,7 @@ def test_legacy_launch_timeout_count_does_not_spend_new_failure_budget(
 @pytest.mark.parametrize(
     ("returncode", "diagnostic"),
     [
-        (2, "refusing to git worktree add; wait for a seat"),
+        (2, "refusing to git worktree add; wait for a worktree"),
         (73, "controller label in use"),
         (64, "queue claim launch marker failed: OSError"),
     ],
@@ -1843,6 +1843,10 @@ def test_real_worktree_seat_child_does_not_emit_proven_prefix_or_spend_budget(
                 "test-dispatch",
                 "--worktree",
                 "HEAD",
+                "--controller-label",
+                "drain-test",
+                "--controller-pid",
+                str(os.getpid()),
                 "--unregistered-forced",
                 "--ignore-git-warn",
                 "--",
@@ -1855,7 +1859,7 @@ def test_real_worktree_seat_child_does_not_emit_proven_prefix_or_spend_budget(
         holder.release()
     captured = capsys.readouterr()
     assert code == 2, (code, captured)
-    assert "wait for a seat" in captured.err
+    assert "wait for a worktree" in captured.err
     assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.out
     assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.err
 

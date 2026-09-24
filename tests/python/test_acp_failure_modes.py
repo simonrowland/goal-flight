@@ -32,6 +32,8 @@ FAKE_AGENT = ROOT / "tests/fixtures/acp_fake_agent.py"
 
 from goalflight_acp_client import (  # noqa: E402
     ACP_IMPORT_ERROR,
+    ACP_SDK_IMPORTABLE,
+    ACP_SDK_REEXEC,
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
@@ -42,7 +44,26 @@ from goalflight_acp_client import (  # noqa: E402
     PoolExhaustedError,
     RequestPermissionResponse,
     _classify_oversized_json_rpc_head,
+    acp_sdk_resolution,
 )
+
+
+def _ensure_acp_test_interpreter() -> None:
+    """Run this SDK-dependent script with the configured ACP interpreter."""
+    resolution = acp_sdk_resolution()
+    if resolution.state == ACP_SDK_IMPORTABLE:
+        return
+    if resolution.state == ACP_SDK_REEXEC and resolution.target_python:
+        os.execv(resolution.target_python, [resolution.target_python, *sys.argv])
+    print(
+        "SKIP: test_acp_failure_modes: ACP SDK requirement unsatisfied: "
+        f"{resolution.reason}"
+    )
+    raise SystemExit(0)
+
+
+_ensure_acp_test_interpreter()
+
 from goalflight_acp_run import (  # noqa: E402
     _apply_user_confirm_reply_batch,
     _finalize_provisional_user_confirm_yes,
@@ -503,7 +524,6 @@ def _run_fake_runner(
                 "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": scenario,
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
                 "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
                 "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
@@ -893,7 +913,6 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
             "GOALFLIGHT_STATE_DIR": str(state_dir),
             "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
             "GOALFLIGHT_FAKE_ACP_SCENARIO": "echo",
-            "GOALFLIGHT_ACP_PYTHON": sys.executable,
             "GOALFLIGHT_CAPACITY_CONF": os.devnull,
             "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
         }
@@ -2161,7 +2180,6 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": "user_confirm_hang_after_marker",
                 "GOALFLIGHT_FAKE_ACP_HANG_S": "30",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
                 "GOALFLIGHT_ADAPTERS_DIR": str(adapters_dir),
                 "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
@@ -2878,7 +2896,6 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
                 "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
                 "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
                 "GOALFLIGHT_TEST_MODE": "1",
-                "GOALFLIGHT_ACP_PYTHON": sys.executable,
             }
         )
         proc = subprocess.run(
