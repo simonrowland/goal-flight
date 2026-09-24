@@ -337,6 +337,7 @@ class CarrierReadStatus(str, Enum):
     OK = "ok"
     CORRUPT_RECORDS_QUARANTINED = "corrupt-records-quarantined"
     CARRIER_UNREADABLE = "CARRIER-UNREADABLE"
+    CARRIER_MISSING = "CARRIER-MISSING"
 
 
 @dataclass(frozen=True)
@@ -433,6 +434,34 @@ def inbox_path(messages_dir: Path, dispatch_id: str) -> Path:
     if candidate.parent != resolved_base:
         raise MessageError(f"dispatch_id: resolved inbox escapes messages directory: {dispatch_id!r}")
     return candidate
+
+
+def _reject_casefold_stream_collision(messages_dir: Path, dispatch_id: str) -> None:
+    """Reject a case-only carrier name collision before any post write."""
+    token = validate_stream_id(dispatch_id)
+    directory = _lexical_absolute(Path(messages_dir))
+    try:
+        entries = list(directory.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise MessageError(f"cannot inspect message directory {directory}: {exc}") from exc
+    requested = token.casefold()
+    for entry in sorted(entries, key=lambda candidate: candidate.name):
+        name = entry.name
+        if not name.endswith(".jsonl") or name.endswith(".quarantine.jsonl"):
+            continue
+        existing = name[: -len(".jsonl")]
+        if (
+            existing != token
+            and existing.casefold() == requested
+            and STREAM_TOKEN_RE.fullmatch(existing)
+        ):
+            raise MessageError(
+                "dispatch_id case collision: requested "
+                f"{token!r} conflicts with existing carrier id {existing!r} "
+                f"at {entry}; dispatch ids are case-sensitive"
+            )
 
 
 def mail_lock_path(path: Path) -> Path:
@@ -1017,6 +1046,21 @@ def controller_address_project_root(project_root: Path | str) -> str:
     return _canonical_project_root_text(str(project_root))
 
 
+def _normalize_controller_addressee(addressee: object) -> object:
+    """Store controller roots in their canonical spelling at post time."""
+    if not isinstance(addressee, dict):
+        return addressee
+    root = addressee.get("project_root")
+    if not isinstance(root, str) or not root.strip():
+        return addressee
+    normalized = dict(addressee)
+    try:
+        normalized["project_root"] = controller_address_project_root(root)
+    except Exception as exc:
+        raise MessageError(f"addressee.project_root: {exc}") from exc
+    return normalized
+
+
 def controller_addressee_label(envelope: dict) -> str | None:
     addressee = envelope.get("addressee") if isinstance(envelope, dict) else None
     if not isinstance(addressee, dict) or addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
@@ -1376,13 +1420,15 @@ def _require_carrier_path(path: Path) -> str:
     return validate_stream_id(canonical.stem, path=f"{canonical}.stream")
 
 
-def _read_nofollow_bytes(path: Path) -> bytes:
+def _read_nofollow_bytes(path: Path, *, missing_ok: bool = True) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
+        if not missing_ok:
+            raise
         return b""
     except OSError as exc:
         raise MessageError(f"{path}: unreadable carrier: {type(exc).__name__}: {exc}") from exc
@@ -1511,10 +1557,14 @@ def carrier_transaction(
     """Lock one canonical carrier, then re-resolve and validate its identity."""
     canonical = _canonical_jsonl_path(Path(path), allow_quarantine=quarantine_sidecar)
     canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Case variants are distinct names on case-sensitive filesystems but one
+    # carrier on case-insensitive filesystems. Serialize both through one
+    # folded lock so the under-lock collision check is authoritative.
+    lock_path = canonical.with_name(canonical.name.casefold())
     lock_context = (
-        mail_lock(canonical)
+        mail_lock(lock_path)
         if lock_timeout_secs is None
-        else mail_lock(canonical, timeout_secs=lock_timeout_secs)
+        else mail_lock(lock_path, timeout_secs=lock_timeout_secs)
     )
     with lock_context:
         locked_canonical = _canonical_jsonl_path(
@@ -1602,7 +1652,26 @@ def _read_envelope_records(
     path = _canonical_jsonl_path(Path(path))
     expected_dispatch_id = _require_carrier_path(path)
     try:
-        data = _read_nofollow_bytes(path) if locked_data is None else locked_data
+        data = (
+            _read_nofollow_bytes(path, missing_ok=False)
+            if locked_data is None
+            else locked_data
+        )
+    except FileNotFoundError:
+        error = _carrier_error(
+            path,
+            line_no=None,
+            offset=None,
+            reason="carrier is missing",
+            raw_line=None,
+            envelopes=[],
+        )
+        error["carrier_status"] = CarrierReadStatus.CARRIER_MISSING.value
+        return CarrierReadResult(
+            CarrierReadStatus.CARRIER_MISSING,
+            (),
+            (error,),
+        )
     except MessageError as exc:
         error = _carrier_error(
             path,
@@ -1619,6 +1688,7 @@ def _read_envelope_records(
             (error,),
         )
     envelopes: list[dict] = []
+    seen_sequences: set[int] = set()
     errors: list[dict[str, object]] = []
     offset = 0
     for line_no, chunk in enumerate(data.splitlines(keepends=True), start=1):
@@ -1647,6 +1717,10 @@ def _read_envelope_records(
                 )
             except (MessageError, ValueError, RecursionError) as exc:
                 reason = str(exc)
+        if reason is None:
+            sequence = int(envelope["seq"])  # validate_envelope checked the shape
+            if sequence in seen_sequences:
+                reason = f"duplicate sequence number: {sequence}"
         if reason is not None:
             error = _carrier_error(
                 path,
@@ -1663,6 +1737,7 @@ def _read_envelope_records(
             if not tolerate_errors:
                 break
             continue
+        seen_sequences.add(int(envelope["seq"]))
         envelopes.append(envelope)  # type: ignore[arg-type]
     status = (
         CarrierReadStatus.CORRUPT_RECORDS_QUARANTINED
@@ -1675,8 +1750,31 @@ def _read_envelope_records(
 def read_envelopes_result(
     path: Path, *, tolerate_errors: bool = True
 ) -> CarrierReadResult:
-    """Return the explicit ok/quarantined/unreadable carrier read state."""
-    return _read_envelope_records(path, tolerate_errors=tolerate_errors)
+    """Return the explicit ok/quarantined/missing/unreadable carrier state."""
+    try:
+        return _read_envelope_records(path, tolerate_errors=tolerate_errors)
+    except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        display_path = str(path)
+        try:
+            display_path = str(_lexical_absolute(Path(path)))
+        except (OSError, RuntimeError, TypeError, ValueError):
+            pass
+        reason = str(exc) or f"{type(exc).__name__}: carrier read failed"
+        return CarrierReadResult(
+            CarrierReadStatus.CARRIER_UNREADABLE,
+            (),
+            (
+                {
+                    "path": display_path,
+                    "line": None,
+                    "offset": None,
+                    "error": f"{display_path}: {reason}",
+                    "reason": reason,
+                    "validated_envelopes": 0,
+                    "validated_through_seq": 0,
+                },
+            ),
+        )
 
 
 def _read_envelope_prefix(path: Path) -> tuple[list[dict], dict[str, object] | None]:
@@ -1932,6 +2030,7 @@ def post_message(
     project_journal_delivery: bool = True,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
+    addressee = _normalize_controller_addressee(addressee)
     _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
     _reject_unaddressed_controller_mail(
         msg_type=msg_type,
@@ -1951,6 +2050,7 @@ def post_message(
     except Exception:
         payload = {"text": "[redacted]"}
     path = inbox_path(messages_dir, dispatch_id)
+    _reject_casefold_stream_collision(messages_dir, dispatch_id)
     _require_carrier_path(path)
     provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
     base_source = {
@@ -2009,6 +2109,10 @@ def post_message(
         else None
     )
     with carrier_transaction(path, lock_timeout_secs=steer_lock_timeout) as transaction:
+        # Recheck while holding the carrier lock so a concurrent creator cannot
+        # win the case-insensitive name race between the preflight scan and
+        # this append.
+        _reject_casefold_stream_collision(messages_dir, dispatch_id)
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
             (
@@ -3269,10 +3373,28 @@ def logical_envelopes_for_paths(
             else path.stem
         )
         if tolerate_errors:
-            envelopes = read_envelopes_tolerant(
-                path,
-                carrier_errors=carrier_errors,
-            )
+            try:
+                envelopes = read_envelopes_tolerant(
+                    path,
+                    carrier_errors=carrier_errors,
+                )
+            except (MessageError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                error = {
+                    "path": str(path),
+                    "carrier_path": str(path),
+                    "error": str(exc),
+                    "reason": str(exc),
+                }
+                if carrier_errors is not None:
+                    if not any(
+                        item.get("carrier_path") == error["carrier_path"]
+                        and item.get("error") == error["error"]
+                        for item in carrier_errors
+                    ):
+                        carrier_errors.append(error)
+                else:
+                    _emit_carrier_error(error)
+                continue
         else:
             envelopes = read_envelopes(path)
         for envelope in envelopes:
@@ -4017,36 +4139,6 @@ def _controller_label_for_owned_dispatches(
     return next(iter(labels))
 
 
-def _controller_scope_kind(
-    envelope: dict,
-    *,
-    owned_dispatch_ids: set[str],
-    legacy_addressed_dispatch_ids: set[str],
-    task_store_dispatch_id: str | None,
-    controller_label: str | None,
-    controller_project_root: str,
-) -> str | None:
-    """Single authority for whether one envelope belongs to this controller."""
-    dispatch_id = str(envelope.get("dispatch_id") or "")
-    addressee_label = controller_addressee_label(envelope)
-    if addressee_label is not None:
-        addressee_root = controller_addressee_project_root(envelope)
-        if (
-            controller_label is not None
-            and addressee_label == controller_label
-            and addressee_root == controller_project_root
-        ):
-            return "controller"
-        return None
-    if dispatch_id in owned_dispatch_ids:
-        return "worker"
-    if dispatch_id == task_store_dispatch_id:
-        return "task-store"
-    if dispatch_id in legacy_addressed_dispatch_ids:
-        return "legacy-controller"
-    return None
-
-
 def _controller_scope_inputs(
     project_root: Path,
     *,
@@ -4145,6 +4237,7 @@ def _listener_envelope(
     *,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> dict | None:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
@@ -4177,8 +4270,17 @@ def _listener_envelope(
         }
     path = Path(carrier_path)
     result = read_envelopes_result(path)
-    if result.status is not CarrierReadStatus.OK:
-        raise MessageError(f"carrier is corrupt or unreadable: {path}")
+    for raw_error in result.errors:
+        error = dict(raw_error)
+        error.setdefault("carrier_path", str(path))
+        if carrier_errors is None:
+            _emit_carrier_error(error)
+        elif not any(
+            item.get("carrier_path") == error["carrier_path"]
+            and item.get("error") == error.get("error")
+            for item in carrier_errors
+        ):
+            carrier_errors.append(error)
     origin_node = str(row.get("origin_node") or "")
     event_uuid = str(row.get("event_uuid") or "")
     stream_seq = int(row.get("stream_seq") or 0)
@@ -4193,7 +4295,13 @@ def _listener_envelope(
         ),
         None,
     )
+    if envelope is not None:
+        return envelope
     if envelope is None:
+        details = "; ".join(
+            str(error.get("error") or error.get("reason") or result.status.value)
+            for error in result.errors
+        )
         assignments = authority.read_all(
             """SELECT recipient_label, projected_at, withdrawn_at FROM delivery_events
                WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
@@ -4220,12 +4328,26 @@ def _listener_envelope(
                 for item in live_assignments
             ):
                 return None
+        # Carrier state is never a settlement decision. Only returning the
+        # matching envelope lets the caller show and advance this delivery.
+        diagnostic = "journal delivery assignment has no projected carrier row"
+        if result.status is CarrierReadStatus.CARRIER_MISSING:
+            details = (
+                f"{diagnostic}; {details or 'carrier is missing'}; carrier row absent; "
+                "delivery remains pending; projection/withdrawal evidence "
+                f"incomplete; inspect delivery_events in {authority.path}"
+            )
+        elif result.status is CarrierReadStatus.OK:
+            details = (
+                f"{diagnostic}; valid carrier row does not match the journal delivery identity "
+                f"(event/source/sequence); {details or 'no matching envelope'}"
+            )
+        else:
+            details = f"{diagnostic}; {details or result.status.value}"
         raise MessageError(
-            "journal delivery assignment has no projected carrier row: "
-            f"event_uuid={event_uuid} origin_node={origin_node} "
-            f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
-            f"carrier row absent from {path}; projection/withdrawal evidence incomplete; "
-            f"inspect delivery_events in {authority.path}"
+            "STUCK: carrier delivery is not reportable; "
+            f"path={path}; reason={details}; delivery_id={event_uuid}; "
+            f"event_uuid={event_uuid}"
         )
     return envelope
 
@@ -4665,9 +4787,26 @@ def controller_mail_summary(
     carrier_errors: list[dict[str, object]] = []
     for row in rows:
         try:
-            envelope = _listener_envelope(authority, row, controller_label=label)
+            envelope = _listener_envelope(
+                authority,
+                row,
+                controller_label=label,
+                carrier_errors=carrier_errors,
+            )
         except MessageError as exc:
-            carrier_errors.append({"error": str(exc), "carrier_path": row.get("carrier_path")})
+            error = {"error": str(exc), "carrier_path": row.get("carrier_path")}
+            existing_error = next(
+                (
+                    item
+                    for item in carrier_errors
+                    if item.get("carrier_path") == error["carrier_path"]
+                ),
+                None,
+            )
+            if existing_error is None:
+                carrier_errors.append(error)
+            else:
+                existing_error.update(error)
             continue
         if envelope is None:
             continue
@@ -5720,19 +5859,62 @@ def _envelopes_with_rows(
     *,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
 ) -> list[tuple[dict, dict]]:
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
     items = []
+    observed_errors: list[dict[str, object]] = []
     for row in rows:
-        envelope = _listener_envelope(
-            authority,
-            row,
-            controller_label=controller_label,
-            attention_by_id=attention_by_id,
-        )
+        try:
+            envelope = _listener_envelope(
+                authority,
+                row,
+                controller_label=controller_label,
+                attention_by_id=attention_by_id,
+                carrier_errors=observed_errors,
+            )
+        except MessageError as exc:
+            carrier_path = str(row.get("carrier_path") or "")
+            detail = str(exc)
+            existing_error = next(
+                (
+                    item
+                    for item in observed_errors
+                    if item.get("carrier_path") == carrier_path
+                ),
+                None,
+            )
+            error = {
+                "carrier_path": carrier_path,
+                "error": detail,
+                "reason": detail,
+            }
+            if detail.startswith("STUCK:"):
+                error.update(
+                    {
+                        "status": "STUCK",
+                        "delivery_id": str(row.get("event_uuid") or ""),
+                    }
+                )
+            if existing_error is None:
+                observed_errors.append(error)
+            else:
+                existing_error.update(error)
+            continue
         if envelope is not None:
             items.append((row, envelope))
+    if carrier_errors is not None:
+        for error in observed_errors:
+            if not any(
+                item.get("carrier_path") == error.get("carrier_path")
+                and item.get("error") == error.get("error")
+                for item in carrier_errors
+            ):
+                carrier_errors.append(error)
+    else:
+        for error in observed_errors:
+            _emit_carrier_error(error)
     return items
 
 
@@ -5780,6 +5962,28 @@ def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
             positions[stream_id] = max(
                 positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
             )
+    return positions
+
+
+def _cursor_positions_for_shown_rows(
+    rows: list[dict] | tuple[dict, ...],
+    shown_items: list[tuple[dict, dict]],
+) -> dict[str, int]:
+    """Return positions only for streams whose peek rows were shown."""
+    shown_rows = {id(row) for row, _envelope in shown_items}
+    positions: dict[str, int] = {}
+    blocked: set[str] = set()
+    for row in rows:
+        stream_id = str(row.get("stream_id") or "")
+        if not stream_id or stream_id in blocked:
+            continue
+        if id(row) not in shown_rows:
+            blocked.add(stream_id)
+            positions.pop(stream_id, None)
+            continue
+        positions[stream_id] = max(
+            positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
+        )
     return positions
 
 
@@ -6010,7 +6214,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             raise MessageError("active controller lease is unavailable")
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
-        items_with_rows = _envelopes_with_rows(authority, rows, controller_label=controller_label)
+        carrier_errors: list[dict[str, object]] = []
+        items_with_rows = _envelopes_with_rows(
+            authority,
+            rows,
+            controller_label=controller_label,
+            carrier_errors=carrier_errors,
+        )
         if since is not None:
             items_with_rows = [
                 (row, envelope)
@@ -6035,7 +6245,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
     ) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
-    positions = _cursor_positions(rows)
+    for error in carrier_errors:
+        _emit_carrier_error(error)
+    shown_items = items_with_rows if drain else visible_items
+    positions = _cursor_positions_for_shown_rows(
+        rows,
+        shown_items,
+    )
+    position_snapshots = {
+        stream_id: peek.stream_snapshots[stream_id]
+        for stream_id in positions
+    }
     # --summary-only/--since are diagnostic: they must not look like a drain
     # recipe for a filtered subset, which would skip unshown mail.
     if summary_only or since_text:
@@ -6047,10 +6267,36 @@ def cmd_relay(args: argparse.Namespace) -> int:
             lease_nonce=lease.nonce,
             cursor_version=peek.cursor_version,
             positions=positions,
-            stream_snapshots=peek.stream_snapshots,
+            stream_snapshots=position_snapshots,
         )
     if drain:
         if not positions:
+            if items_with_rows or carrier_errors:
+                if getattr(args, "json", False):
+                    payload = {
+                        "controller_label": controller_label,
+                        "cursor_version": peek.cursor_version,
+                        "drained": 0,
+                        "items": envelopes,
+                        "status": "blocked",
+                    }
+                    if carrier_errors:
+                        payload["carrier_errors"] = carrier_errors
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    for row, envelope in items_with_rows:
+                        print(format_receipt_headline(row, envelope), flush=True)
+                        if getattr(args, "bodies", False):
+                            payload = envelope.get("payload")
+                            payload = payload if isinstance(payload, dict) else {}
+                            body = payload.get("text")
+                            if isinstance(body, str) and body:
+                                print(body, flush=True)
+                    print("drain blocked · unresolved mail remains", file=sys.stderr)
+                emit_listener_activity_signal(
+                    project_root=root, controller_label=controller_label
+                )
+                return 3
             if getattr(args, "json", False):
                 print(
                     json.dumps(
@@ -6060,6 +6306,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             "drained": 0,
                             "items": [],
                             "status": "no_mail",
+                            **({"carrier_errors": carrier_errors} if carrier_errors else {}),
                         },
                         sort_keys=True,
                     )
@@ -6088,7 +6335,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 controller_label,
                 nonce=lease.nonce,
                 expected_cursor_version=peek.cursor_version,
-                expected_stream_snapshots=peek.stream_snapshots,
+                expected_stream_snapshots=position_snapshots,
                 advances=positions,
                 actor=f"controller:{os.getpid()}:relay-drain",
             )
@@ -6146,19 +6393,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
         if getattr(args, "json", False):
-            print(
-                json.dumps(
-                    {
-                        "controller_label": controller_label,
-                        "cursor_version": cursor_version,
-                        "drained": len(envelopes),
-                        "items": envelopes,
-                        "previous_cursor_version": previous_version,
-                        "status": "drained",
-                    },
-                    sort_keys=True,
-                )
-            )
+            payload = {
+                "controller_label": controller_label,
+                "cursor_version": cursor_version,
+                "drained": len(envelopes),
+                "items": envelopes,
+                "previous_cursor_version": previous_version,
+                "status": "drained",
+            }
+            if carrier_errors:
+                payload["carrier_errors"] = carrier_errors
+            print(json.dumps(payload, sort_keys=True))
         else:
             print(
                 f"drained {len(envelopes)} · cursor "
@@ -6181,6 +6426,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
             "stream_snapshots": peek.stream_snapshots,
             "advance_command": advance_command,
         }
+        if carrier_errors:
+            payload["carrier_errors"] = carrier_errors
         if summary_only:
             payload["counts"] = counts
             seen: dict[str, dict[str, object]] = {}
@@ -7925,6 +8172,7 @@ def cmd_follow(args) -> int:
     # advance the journal: a replacement must replay unacknowledged mail.
     delivered: set[tuple[str, int, str]] = set()
     seen_rewinds: dict[str, int] = {}
+    active_carrier_errors: dict[tuple[str, str], dict[str, object]] = {}
     reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
@@ -8033,11 +8281,42 @@ def cmd_follow(args) -> int:
                     and int(item.get("stream_seq") or 0)
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 ]
+                carrier_errors: list[dict[str, object]] = []
                 visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
-                    _envelopes_with_rows(authority, candidate_rows, controller_label=label),
+                    _envelopes_with_rows(
+                        authority,
+                        candidate_rows,
+                        controller_label=label,
+                        carrier_errors=carrier_errors,
+                    ),
                     controller_label=label,
                     lease_nonce=nonce,
                 )
+                new_carrier_error = False
+                for error in carrier_errors:
+                    identity = (
+                        str(error.get("carrier_path") or ""),
+                        str(error.get("error") or error.get("reason") or ""),
+                    )
+                    if identity not in active_carrier_errors:
+                        if not emit(
+                            _follow_fault_record(
+                                "carrier-corrupt",
+                                f"{identity[0]}: {identity[1]}",
+                            )
+                        ):
+                            return 0
+                        new_carrier_error = True
+                    active_carrier_errors[identity] = error
+                active_carrier_errors = {
+                    (
+                        str(error.get("carrier_path") or ""),
+                        str(error.get("error") or error.get("reason") or ""),
+                    ): error
+                    for error in carrier_errors
+                }
+                if new_carrier_error:
+                    next_heartbeat = time.monotonic() + heartbeat_s
                 try:
                     if reset_owner_ring:
                         # The exclusive monitor slot proves the prior follow
@@ -8150,6 +8429,14 @@ def cmd_follow(args) -> int:
                 # keeps an event from batching with a contradictory idle beat.
                 next_heartbeat = now + heartbeat_s
             elif now >= next_heartbeat:
+                for identity in active_carrier_errors:
+                    if not emit(
+                        _follow_fault_record(
+                            "carrier-corrupt",
+                            f"{identity[0]}: {identity[1]}",
+                        )
+                    ):
+                        return 0
                 heartbeat_seq += 1
                 if not emit(_follow_heartbeat_record(heartbeat_seq, heartbeat_s)):
                     return 0
@@ -8768,15 +9055,47 @@ def cmd_listen(args) -> int:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
 
-    # Fix the report-pending threshold before publishing journal coverage.
+    # Fix the report-pending snapshot before publishing journal coverage.
     # Producers and controllers treat an ARMED coverage row as the listener's
     # readiness boundary; taking this snapshot afterwards lets an event posted
-    # beyond that boundary leak into arm_high and become silent backlog.
-    arm_high: dict[str, int] = {}
+    # beyond that boundary leak into the pending report.
     arm_snapshot = None
     report_claim = None
     pending_report_settled = True
     prearmed_visible_items: list[tuple[dict, dict]] | None = None
+    prearmed_materialized_items: list[tuple[dict, dict]] | None = None
+    reported_carrier_errors: set[tuple[str, str]] = set()
+    stuck_carrier_seen = False
+
+    def listener_envelopes(
+        source,
+        rows: list[dict] | tuple[dict, ...],
+        *,
+        attention_by_id: dict[str, dict[str, object]] | None = None,
+    ) -> list[tuple[dict, dict]]:
+        nonlocal stuck_carrier_seen
+        errors: list[dict[str, object]] = []
+        items = _envelopes_with_rows(
+            source,
+            rows,
+            controller_label=label,
+            attention_by_id=attention_by_id,
+            carrier_errors=errors,
+        )
+        stuck_carrier_seen = stuck_carrier_seen or any(
+            error.get("status") == "STUCK"
+            for error in errors
+        )
+        for error in errors:
+            identity = (
+                str(error.get("carrier_path") or ""),
+                str(error.get("error") or error.get("reason") or ""),
+            )
+            if identity in reported_carrier_errors:
+                continue
+            reported_carrier_errors.add(identity)
+            _emit_carrier_error(error)
+        return items
 
     def arm_once():
         result = authority.arm_listener(
@@ -8791,6 +9110,33 @@ def cmd_listen(args) -> int:
                 result.reason or "listener coverage arm remained busy"
             )
         return result
+
+    def pending_report_suppression() -> dict[str, int]:
+        try:
+            state = goalflight_wake.recover_pending_report_state(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            # A claim becomes a suppression boundary only after its report is
+            # emitted to the controller; a merely claimed boundary is unseen.
+            if state is None or state.phase != "reported":
+                return {}
+            # Unknown zombie state fails open here: a duplicate report is
+            # recoverable by the controller, while hiding mail is not.
+            if (
+                goalflight_wake._pending_report_owner_liveness(state) is not True
+                or goalflight_compat.pid_is_zombie(state.owner_pid) is not False
+            ):
+                return {}
+            return dict(state.positions)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            goalflight_wake.PendingReportStateError,
+        ):
+            return {}
 
     try:
         if getattr(args, "report_pending", False):
@@ -8810,7 +9156,6 @@ def cmd_listen(args) -> int:
             if persisted_state is not None:
                 # The claim never raises its water. Covered streams may drop
                 # off so a replacement re-reports only the unconsumed remainder.
-                arm_high = dict(persisted_state.positions)
                 pending_report_settled = persisted_state.phase == "acknowledged"
                 if not pending_report_settled:
                     settled = _settle_pending_report_if_consumed(
@@ -8829,47 +9174,60 @@ def cmd_listen(args) -> int:
                             lease_nonce=nonce,
                         )
             elif arm_snapshot is not None and arm_snapshot.items:
-                local_high = _cursor_positions(arm_snapshot.items)
-                if not args.json:
-                    # Human-readable envelopes must exist before the durable
-                    # claim: a query-stage busy cannot stamp a high-water that
-                    # no arm actually reported.
-                    prearmed_visible_items = _retry_listener_journal_busy(
-                        lambda: _foreign_controller_items(
-                            _envelopes_with_rows(
-                                authority,
-                                list(arm_snapshot.items),
-                                controller_label=label,
-                            ),
-                            controller_label=label,
-                            lease_nonce=nonce,
-                        ),
-                        busy_error=goalflight_journal.JournalBusy,
-                        tolerance=journal_tolerance,
-                        poll_s=poll,
-                        on_degraded=startup_degraded,
-                        on_recovered=startup_recovered,
+                # Materialize before the durable claim: a query-stage busy or
+                # carrier fault must not stamp a high-water no arm actually
+                # reported. JSON still validates carriers; it only omits bodies
+                # from the wake record.
+                prearmed_items = _retry_listener_journal_busy(
+                    lambda: listener_envelopes(
+                        authority,
+                        list(arm_snapshot.items),
+                    ),
+                    busy_error=goalflight_journal.JournalBusy,
+                    tolerance=journal_tolerance,
+                    poll_s=poll,
+                    on_degraded=startup_degraded,
+                    on_recovered=startup_recovered,
+                )
+                prearmed_materialized_items = prearmed_items
+                reported_items = (
+                    prearmed_items
+                    if args.json
+                    else _foreign_controller_items(
+                        prearmed_items,
+                        controller_label=label,
+                        lease_nonce=nonce,
                     )
+                )
+                local_high = _cursor_positions_for_shown_rows(
+                    list(arm_snapshot.items),
+                    prearmed_items,
+                )
+                prearmed_visible_items = reported_items
                 # The first arm publishes a complete claim atomically. A loser
                 # reloads that claim's water and discards its later local water,
                 # so mail arriving behind the winner remains ringable.
-                report_claim = goalflight_wake.acquire_pending_report(
-                    project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                    positions=local_high,
-                    cursor_version=arm_snapshot.cursor_version,
-                    stream_snapshots=arm_snapshot.stream_snapshots,
-                )
-                winner_state = goalflight_wake.recover_pending_report_state(
-                    project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                )
-                if winner_state is None:
-                    raise MessageError("pending-report claim was not published")
-                arm_high = dict(winner_state.positions)
-                pending_report_settled = winner_state.phase == "acknowledged"
+                if local_high:
+                    report_claim = goalflight_wake.acquire_pending_report(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                        positions=local_high,
+                        cursor_version=arm_snapshot.cursor_version,
+                        stream_snapshots={
+                            stream_id: snapshot
+                            for stream_id, snapshot in arm_snapshot.stream_snapshots.items()
+                            if stream_id in local_high
+                        },
+                    )
+                    winner_state = goalflight_wake.recover_pending_report_state(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                    if winner_state is None:
+                        raise MessageError("pending-report claim was not published")
+                    pending_report_settled = winner_state.phase == "acknowledged"
 
         armed = _retry_listener_journal_busy(
             arm_once,
@@ -9334,6 +9692,46 @@ def cmd_listen(args) -> int:
         ):
             quarantine_claim_unit()
             return True
+        claimed_positions = dict(report_positions)
+        if visible_items is None:
+            materialized_items = _retry_listener_journal_busy(
+                lambda: listener_envelopes(
+                    authority,
+                    list(report_items),
+                ),
+                busy_error=goalflight_journal.JournalBusy,
+                tolerance=journal_tolerance,
+                poll_s=poll,
+                on_degraded=startup_degraded,
+                on_recovered=startup_recovered,
+            )
+            visible_arm_items = _foreign_controller_items(
+                materialized_items,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            shown_items = materialized_items if args.json else visible_arm_items
+        else:
+            visible_arm_items = visible_items
+            shown_items = prearmed_materialized_items or visible_arm_items
+        report_positions = _cursor_positions_for_shown_rows(
+            list(report_items),
+            shown_items,
+        )
+        # Never retain a durable claim's water for a row that this attempt did
+        # not show or successfully quarantine. A partial report remains
+        # pending, while safe siblings can still be delivered below.
+        report_complete = report_positions == claimed_positions
+        report_snapshots = {
+            stream_id: stream_snapshot
+            for stream_id, stream_snapshot in claim.stream_snapshots.items()
+            if stream_id in report_positions
+        }
+        if report_snapshots.keys() != report_positions.keys():
+            quarantine_claim_unit()
+            return True
+        if not report_positions:
+            return True
         arm_advance = _cursor_advance_command(
             project_root=project_root,
             controller_label=label,
@@ -9344,7 +9742,18 @@ def cmd_listen(args) -> int:
         )
         arm_payload = {
             "kind": "pending-at-arm",
-            "items": report_items,
+            "items": (
+                [
+                    row
+                    for row, _envelope in (
+                        materialized_items
+                        if visible_items is None
+                        else (prearmed_materialized_items or visible_arm_items)
+                    )
+                ]
+                if args.json
+                else report_items
+            ),
             "cursor_version": claim.cursor_version,
             "advance_command": arm_advance,
         }
@@ -9354,23 +9763,11 @@ def cmd_listen(args) -> int:
                 flush=True,
             )
         else:
-            visible_arm_items = visible_items
-            if visible_arm_items is None:
-                visible_arm_items = _retry_listener_journal_busy(
-                    lambda: _foreign_controller_items(
-                        _envelopes_with_rows(authority, list(report_items), controller_label=label),
-                        controller_label=label,
-                        lease_nonce=nonce,
-                    ),
-                    busy_error=goalflight_journal.JournalBusy,
-                    tolerance=journal_tolerance,
-                    poll_s=poll,
-                    on_degraded=startup_degraded,
-                    on_recovered=startup_recovered,
-                )
             for row, envelope in visible_arm_items:
                 print(format_receipt_headline(row, envelope), flush=True)
             print(f"advance: {arm_advance}", flush=True)
+        if not report_complete:
+            return True
         if claim.claim_token is None or not goalflight_wake.mark_pending_report_reported(
             project_root,
             controller_label=label,
@@ -9420,7 +9817,9 @@ def cmd_listen(args) -> int:
     observed_data_version: int | None = None
     observed_lease = None
     peek_needed = True
+    stuck_carrier_retry = False
     while True:
+        stuck_carrier_seen = False
         parent_result = parent_exit()
         if parent_result is not None:
             return parent_result
@@ -9444,6 +9843,11 @@ def cmd_listen(args) -> int:
                         lease_nonce=nonce,
                         claim_positions=observed_report.positions,
                     )
+                    if settled is None:
+                        poll_result = wait_for_next_poll()
+                        if poll_result is not None:
+                            return poll_result
+                        continue
                     if settled is True:
                         pending_report_settled = True
                     elif settled is False:
@@ -9485,6 +9889,8 @@ def cmd_listen(args) -> int:
                     pending_report_settled = True
             except (OSError, RuntimeError, ValueError):
                 pending_report_settled = False
+        if stuck_carrier_seen:
+            peek_needed = True
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
         # untracked process consume the ring during the grace window.
@@ -9531,6 +9937,7 @@ def cmd_listen(args) -> int:
                 controller_label=label,
                 lease_nonce=nonce,
             )
+            suppression = pending_report_suppression()
             watchdog_status = witness_status.get("watchdog")
             watchdog_state = (
                 str(watchdog_status.get("state") or "")
@@ -9575,31 +9982,37 @@ def cmd_listen(args) -> int:
                     return finish_watchdog_dead(claim_state=claim_state)
             wakeable_items = False
             if journal_changed or peek_needed:
-                # With an arm-time backlog the cheap limit-1 peek would forever
-                # see the oldest (already-reported) item; peek wide and ring only
-                # for events beyond the arm-time high-water.
+                # With a reported pending report, the cheap limit-1 peek would
+                # forever see
+                # the oldest already-reported item; peek wide and ring only for
+                # events beyond the live claim's durable high-water.
                 # Self-authored rows can sort before foreign mail indefinitely, so
                 # a limit-1 peek cannot implement skip-without-wedging semantics.
-                peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
-                candidate_rows = [
+                # A stuck carrier can be restored without a journal write. Keep
+                # polling its durable row, but avoid a SQLite peek storm until the
+                # data version changes or the carrier becomes readable.
+                if not (stuck_carrier_retry and not journal_changed):
+                    peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
+                visible_rows = [
                     item
                     for item in peek.items
-                    if str(item.get("wake_class") or "") == "waking"
-                    and (
-                        not arm_high
-                        or int(item.get("stream_seq") or 0)
-                        > arm_high.get(str(item.get("stream_id") or ""), 0)
-                    )
+                    if not suppression
+                    or int(item.get("stream_seq") or 0)
+                    > suppression.get(str(item.get("stream_id") or ""), 0)
                 ]
-                candidate_attention = _attention_items_for_rows(
+                candidate_rows = [
+                    item
+                    for item in visible_rows
+                    if str(item.get("wake_class") or "") == "waking"
+                ]
+                visible_attention = _attention_items_for_rows(
                     read_authority,
-                    candidate_rows,
+                    visible_rows,
                 )
-                candidate_items = _envelopes_with_rows(
+                candidate_items = listener_envelopes(
                     read_authority,
                     candidate_rows,
-                    controller_label=label,
-                    attention_by_id=candidate_attention,
+                    attention_by_id=visible_attention,
                 )
                 wakeable_items = bool(
                     _foreign_controller_items(
@@ -9608,22 +10021,26 @@ def cmd_listen(args) -> int:
                         lease_nonce=nonce,
                     )
                 )
-                peek_needed = wakeable_items
-                if wakeable_items and not args.json:
+                # A carrier can be restored without changing SQLite data_version.
+                stuck_carrier_retry = stuck_carrier_seen
+                peek_needed = wakeable_items or stuck_carrier_seen
+                if wakeable_items:
                     # The non-JSON listener is the controller: it prints every
-                    # buffered item before exiting. Materialize those envelopes
-                    # while coverage and the kernel waiter are still live and before
-                    # claiming the one ring for this cursor version.
+                    # buffered item before exiting. Materialize the complete
+                    # snapshot while coverage and the kernel waiter are still
+                    # live and before claiming the one ring for this cursor
+                    # version. JSON emits only the wake, but still needs the
+                    # same carrier boundary for its advance command.
                     # Reuse a waking synthetic candidate's attention read when the
                     # complete snapshot is rendered. When the candidate is a normal
                     # carrier, a quiet synthetic backlog is loaded once here.
+                    ring_materialized_items = listener_envelopes(
+                        read_authority,
+                        visible_rows,
+                        attention_by_id=visible_attention,
+                    )
                     visible_ring_items = _foreign_controller_items(
-                        _envelopes_with_rows(
-                            read_authority,
-                            list(peek.items),
-                            controller_label=label,
-                            attention_by_id=candidate_attention,
-                        ),
+                        ring_materialized_items,
                         controller_label=label,
                         lease_nonce=nonce,
                     )
@@ -9715,16 +10132,33 @@ def cmd_listen(args) -> int:
                 if retry_result is not None:
                     return retry_result
                 continue
-            positions = _cursor_positions(snapshot.items)
+            positions = _cursor_positions_for_shown_rows(
+                visible_rows,
+                ring_materialized_items,
+            )
+            position_snapshots = {
+                stream_id: snapshot.stream_snapshots[stream_id]
+                for stream_id in positions
+            }
             advance_command = _cursor_advance_command(
                 project_root=project_root,
                 controller_label=label,
                 lease_nonce=nonce,
                 cursor_version=snapshot.cursor_version,
                 positions=positions,
-                stream_snapshots=snapshot.stream_snapshots,
+                stream_snapshots=position_snapshots,
             )
             if advance_command is None:
+                with contextlib.suppress(OSError, RuntimeError, ValueError):
+                    goalflight_wake.release_ring_claim(
+                        project_root,
+                        controller_label=label,
+                        cursor_version=snapshot.cursor_version,
+                    )
+                if not args.json:
+                    assert visible_ring_items is not None
+                    for row, envelope in visible_ring_items:
+                        print(format_receipt_headline(row, envelope), flush=True)
                 return finish(
                     "corrupt",
                     code=2,

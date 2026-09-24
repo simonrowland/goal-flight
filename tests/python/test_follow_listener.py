@@ -1229,6 +1229,50 @@ def test_journal_failure_is_a_waking_stdout_record(
     )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        journal.JournalBusy("materialization busy"),
+        journal.JournalUpgradeRequired("materialization upgrade required"),
+    ],
+)
+def test_materialization_propagates_journal_failures(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: RuntimeError,
+) -> None:
+    project, _env, lease = isolated
+    authority = journal.Journal(project)
+    row = {
+        "carrier_path": str(project / "carrier.jsonl"),
+        "stream_id": "materialization-failure",
+        "stream_seq": 1,
+    }
+
+    def fail_materialization(*_args: object, **_kwargs: object) -> dict:
+        raise failure
+
+    monkeypatch.setattr(messages, "_listener_envelope", fail_materialization)
+    with pytest.raises(type(failure), match=str(failure)):
+        messages._envelopes_with_rows(
+            authority,
+            [row],
+            controller_label=lease.label,
+            carrier_errors=[],
+        )
+
+
+def test_cursor_boundary_excludes_unshown_rows() -> None:
+    first = {"stream_id": "stream", "stream_seq": 1}
+    second = {"stream_id": "stream", "stream_seq": 2}
+    other = {"stream_id": "other", "stream_seq": 1}
+    shown = [(second, {"id": "second"}), (other, {"id": "other"})]
+
+    assert messages._cursor_positions_for_shown_rows(
+        [first, second, other], shown
+    ) == {"other": 1}
+
+
 def test_listener_survives_present_journal_open_failure_and_times_out(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,

@@ -213,7 +213,7 @@ def resolve_project_root(requested: object, config: MailRpcConfig) -> Path:
         path = Path(raw).expanduser()
         if not path.is_dir():
             raise MailRpcError("project_root is not a directory on the journal host")
-        return path
+        return Path(os.path.realpath(path))
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     import goalflight_journal  # noqa: F401  # puts the repo root on sys.path

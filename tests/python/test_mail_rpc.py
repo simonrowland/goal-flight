@@ -145,6 +145,28 @@ def test_post_peek_and_drain(mail_server: str, tmp_path: Path) -> None:
     assert again["result"]["items"] == []
 
 
+def test_post_canonicalizes_project_root_alias(mail_server: str, tmp_path: Path) -> None:
+    del mail_server
+    project = _project(tmp_path)
+    alias = tmp_path / "mail-rpc-project-alias"
+    alias.symlink_to(project, target_is_directory=True)
+    _claim(project, LABEL)
+
+    status, posted = rpc.client_call(
+        "/v1/post",
+        {
+            "dispatch_id": "mail-rpc-canonical-root",
+            "type": "controller-notice",
+            "to_controller": LABEL,
+            "text": "canonical root",
+            "project_root": str(alias),
+        },
+    )
+    assert status == 200, posted
+    envelope = posted["result"]["envelope"]
+    assert envelope["addressee"]["project_root"] == str(project.resolve())
+
+
 def test_advisory_and_unaddressed_match_cli(mail_server: str, tmp_path: Path) -> None:
     del mail_server
     project = _project(tmp_path)
