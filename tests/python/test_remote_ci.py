@@ -831,7 +831,7 @@ def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp
                                            ("owner_host", "owner_pid", "owner_identity")})
         # The dead holder used to leave the launchd job until the deadline.
         assert result["status"] in {"cleared", "cancelled"}
-        _wait_dead(child)
+        _wait_dead(child, node, held)
     finally:
         try:
             os.kill(child, signal.SIGKILL)
@@ -1040,7 +1040,7 @@ def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
         lease["deadline_epoch"] = time.time() - 1
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert runner.reap()[0]["status"] == "cancelled"
-        _wait_dead(child)
+        _wait_dead(child, node, held)
         _free_tokens(node)
     finally:
         try:
@@ -1070,7 +1070,7 @@ def test_operator_clear_audits_a_dead_holder(node_env, tmp_path):
         assert result["status"] == "cleared"
         audit = (executor.root / "admission" / "audit.log").read_text(encoding="utf-8")
         assert held["lease_id"] in audit and "operator-clear" in audit
-        _wait_dead(child)
+        _wait_dead(child, node, held)
         _free_tokens(node)
     finally:
         try:
@@ -1183,7 +1183,7 @@ def test_cancel_kills_background_grandchildren_before_releasing_the_token(node_e
         os.kill(pid, 0)
     assert _cancel(node, held)["status"] == "cancelled"
     for pid in pids:
-        _wait_dead(pid)
+        _wait_dead(pid, node, held)
     _free_tokens(node)
 
 
@@ -1203,7 +1203,7 @@ def test_cancel_kills_a_setsid_descendant_before_releasing_the_token(node_env, t
     child = _child_pid(pidfile)
     os.kill(child, 0)
     assert _cancel(node, held)["status"] == "cancelled"
-    _wait_dead(child)
+    _wait_dead(child, node, held)
     _free_tokens(node)
 
 
@@ -1219,19 +1219,21 @@ def _two_token(tmp_path):
     return config, executor, runner, runner.nodes["box-a"]
 
 
-def _wait_dead(pid):
+def _wait_dead(pid, node=None, record=None):
     """Wait until ``pid`` is gone, including a zombie.
 
     ``kill(pid, 0)`` still succeeds for a zombie. ``getpgid`` does not.
+    A slow reap is not a 2s failure. The error includes the launch state.
     """
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
             os.getpgid(pid)
         except ProcessLookupError:
             return
-        time.sleep(0.01)
-    raise AssertionError(f"pid {pid} still alive")
+        time.sleep(0.05)
+    raise AssertionError(
+        f"pid {pid} still alive\n" + _diagnose_launch(node, record))
 
 
 def test_cancel_kills_a_child_that_setsid_chdirs_and_closes_fds(node_env, tmp_path):
@@ -1247,7 +1249,7 @@ def test_cancel_kills_a_child_that_setsid_chdirs_and_closes_fds(node_env, tmp_pa
     child = _child_pid(pidfile)
     assert os.getpgid(child) == child
     assert _cancel(node, held)["status"] == "cancelled"
-    _wait_dead(child)
+    _wait_dead(child, node, held)
     _free_tokens(node)
 
 
@@ -1274,7 +1276,7 @@ def test_reap_holds_capacity_until_the_escaped_child_is_dead(node_env, tmp_path)
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert node.call("health")["tokens"]["in_use"] == 1
         assert runner.reap()[0]["status"] == "cancelled"
-        _wait_dead(child)
+        _wait_dead(child, node, held)
         _free_tokens(node)
     finally:
         try:
@@ -1324,7 +1326,7 @@ def test_unresolved_slot_stays_reserved_for_the_successor(tmp_path):
         running = wait_state(node, first, {"running"})
         os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
         os.kill(workload, signal.SIGKILL)
-        _wait_dead(workload)
+        _wait_dead(workload, node, running)
         lease_path = Path(running["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
         lease["deadline_epoch"] = time.time() - 1
@@ -1365,7 +1367,7 @@ def test_stale_clear_does_not_signal_the_slots_current_occupant(tmp_path):
         running = wait_state(node, first, {"running"})
         os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
         os.kill(workload, signal.SIGKILL)
-        _wait_dead(workload)
+        _wait_dead(workload, node, running)
         slot = Path(running["slot"])
         marker = slot.parent.parent / "slot-meta" / (slot.name + ".json")
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1567,7 +1569,7 @@ def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
         assert running.get("workload_start")
         os.kill(int(running["remote_run"]["pid"]), signal.SIGKILL)
         os.kill(int(running["workload_pid"]), signal.SIGKILL)
-        _wait_dead(int(running["workload_pid"]))
+        _wait_dead(int(running["workload_pid"]), node, held)
         os.kill(child, 0)
         lease_path = Path(running["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
@@ -1575,7 +1577,7 @@ def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert node.call("health")["tokens"]["in_use"] == 1
         assert runner.reap()[0]["status"] == "cancelled"
-        _wait_dead(child)
+        _wait_dead(child, node, held)
         _free_tokens(node)
     finally:
         try:
@@ -1624,7 +1626,7 @@ def test_sigterm_grandchild_is_killed_with_the_coalition(node_env, tmp_path):
     try:
         # getpgid, not kill(pid, 0): a zombie is not a live grandchild, and
         # launchd's reap timing is global state left by earlier jobs.
-        _wait_dead(child)
+        _wait_dead(child, node, held)
     finally:
         try:
             os.kill(child, signal.SIGKILL)
@@ -1762,6 +1764,7 @@ def test_job_label_is_durable_before_launchctl_submit(tmp_path, monkeypatch):
         if argv[:2] == ["launchctl", "submit"]:
             lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
             seen["label"] = lease.get("launch_label")
+            seen["submitted"] = lease.get("launch_submitted")
             seen["gate"] = (run / "workload-go").exists()
 
             class Result:
@@ -1775,6 +1778,7 @@ def test_job_label_is_durable_before_launchctl_submit(tmp_path, monkeypatch):
     monkeypatch.setattr(node.subprocess, "run", fake_run)
     assert node._submit_workload(run, state, ["/bin/true"], {}, "") == "submit refused"
     assert seen["label"] == "com.goalflight.remote-ci.abc"
+    assert seen["submitted"] is True
     assert seen["gate"] is False
 
 
@@ -2216,6 +2220,164 @@ def test_cwd_intruders_sees_through_a_symlink(tmp_path):
         proc.wait(timeout=5)
 
 
+def test_cwd_intruders_matches_a_case_variant(tmp_path):
+    """Same directory, different spelling. realpath keeps the caller's case."""
+    import goalflight_remote_ci_node as node
+
+    real = tmp_path / "CaseSlot"
+    real.mkdir()
+    variant = tmp_path / "caseslot"
+    assert variant.exists()
+    assert os.stat(real).st_ino == os.stat(variant).st_ino
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], cwd=real)
+    try:
+        found = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            found = node.cwd_intruders([variant])
+            if found and proc.pid in found:
+                break
+            time.sleep(0.05)
+        assert found is not None and proc.pid in found
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_unreadable_cwd_liveness_is_not_an_empty_slot(tmp_path, monkeypatch):
+    """EPERM is not ESRCH. An unverifiable occupant keeps the slot."""
+    import goalflight_remote_ci_node as node
+
+    real = tmp_path / "real"
+    real.mkdir()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], cwd=real)
+    real_getpgid = os.getpgid
+    try:
+        seen = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            seen = node.cwd_intruders([real])
+            if seen and proc.pid in seen:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("cwd occupant was not visible")
+
+        def getpgid(pid):
+            if int(pid) == proc.pid:
+                raise PermissionError(1, "Operation not permitted")
+            return real_getpgid(pid)
+
+        monkeypatch.setattr(node.os, "getpgid", getpgid)
+        assert node.cwd_intruders([real]) is None
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_absent_launch_with_a_live_cwd_is_not_empty(tmp_path, monkeypatch):
+    """Intent without launch_submitted, job absent, someone still in the dir."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "slot": str(run),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], cwd=run)
+    try:
+        seen = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            seen = node.cwd_intruders([run])
+            if seen and proc.pid in seen:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("cwd occupant was not visible")
+        assert node.clear_tree(tmp_path, state, run) is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_absent_launch_releases_when_cwd_is_empty(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "slot": str(run),
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(node, "_job_view", lambda label: "absent")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    assert node.clear_tree(tmp_path, state, run) is True
+
+
+def test_reused_job_pid_is_not_adopted(tmp_path, monkeypatch):
+    """A pid that changes between the listing and the identity read is not killed."""
+    import goalflight_remote_ci_node as node
+
+    run = tmp_path / "run"
+    run.mkdir()
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    calls = {"n": 0}
+
+    def job_view(label):
+        del label
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ("running", 50, None)
+        return ("running", 99, None)
+
+    killed = []
+    monkeypatch.setattr(node, "_job_view", job_view)
+    monkeypatch.setattr(node, "_stable_identity", lambda pid: ((1, 2), 777))
+    monkeypatch.setattr(node, "_coalition_id", lambda pid: 5)
+    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
+    monkeypatch.setattr(node, "_remove_job", lambda label: False)
+    monkeypatch.setattr(node.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert node.clear_tree(tmp_path, state, run) is False
+    assert state.get("coalition_id") != 777
+    assert killed == []
+
+
+def test_command_timeout_does_not_prove_an_empty_tree(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    def boom(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout") or 10)
+
+    monkeypatch.setattr(node.subprocess, "run", boom)
+    assert node._launchctl_jobs() is None
+    assert node._job_view("com.goalflight.remote-ci.abc") == "unknown"
+    assert node.cwd_snapshot() is None
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "lease.json").write_text("{}", encoding="utf-8")
+    state = {
+        "lease_id": "abc", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.abc",
+        "slot": str(run),
+    }
+    assert node.clear_tree(tmp_path, state, run) is False
+    assert node._remove_job("com.goalflight.remote-ci.abc") is False
+
+
 def test_unlisted_submit_is_not_an_empty_tree(tmp_path, monkeypatch):
     import goalflight_remote_ci_node as node
 
@@ -2237,6 +2399,8 @@ def test_unlisted_submit_is_not_an_empty_tree(tmp_path, monkeypatch):
     assert node._submit_workload(run, state, ["/bin/sleep", "1"], {}, "") is None
     assert state.get("launch_submitted") is True
     assert not state.get("launch_seen")
+    # The job was never listed. A live cwd is not an empty tree.
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [os.getpid()])
     assert node.clear_tree(tmp_path, state, run) is False
 
 
@@ -2408,6 +2572,20 @@ def test_wait_dead_treats_a_zombie_as_gone(monkeypatch):
     _wait_dead(123)
 
 
+def test_wait_dead_dumps_state_when_the_pid_survives(monkeypatch):
+    clock = {"n": 0}
+
+    def monotonic():
+        clock["n"] += 1
+        return 0.0 if clock["n"] < 3 else 100.0
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 0)
+    with pytest.raises(AssertionError, match="no launch diagnostic context"):
+        _wait_dead(123)
+
+
 @pytest.mark.parametrize("kind,status,code,extra", [
     ("capacity-refused", "capacity", 75, {}),
     ("cancelled", "cancelled", 130, {}),
@@ -2491,7 +2669,7 @@ def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_p
         assert result["returncode"] == 19
         # A just-killed pid can still be a zombie. kill(pid, 0) succeeds
         # until it is reaped, so a single check flakes. Wait until it is gone.
-        _wait_dead(child)
+        _wait_dead(child, node, held)
         _free_tokens(node)
         listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
         assert held["lease_id"] not in listed.stdout

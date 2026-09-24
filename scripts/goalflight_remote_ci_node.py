@@ -97,6 +97,24 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def _fsync_file(path):
+    """Fsync a file and its directory. False if that proof cannot be made."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        dirfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except OSError:
+        return False
+    return True
+
+
 def read_json(path):
     return json.loads(path.read_text())
 
@@ -278,14 +296,25 @@ def _limit(request, key, default, numeric):
     return min(default, value)
 
 
+# A hung launchctl or lsof must not sit on the capacity path until the
+# transport kills it. Timing out is unknown, which keeps the slot.
+_COMMAND_TIMEOUT_SECONDS = 10
+
+
+def _run_command(argv):
+    """Completed process, or None if it failed to start or timed out."""
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=_COMMAND_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def cwd_snapshot():
     """One lsof of every process cwd. None means the snapshot cannot be trusted."""
-    try:
-        proc = subprocess.run(["lsof", "-nP", "-d", "cwd", "-F", "pn"],
-                              capture_output=True, text=True)
-    except OSError:
-        return None
-    if proc.returncode not in (0, 1):
+    proc = _run_command(["lsof", "-nP", "-d", "cwd", "-F", "pn"])
+    if proc is None or proc.returncode not in (0, 1):
         return None
     rows = []
     pid = None
@@ -297,24 +326,52 @@ def cwd_snapshot():
     return rows
 
 
-def _canon_path(path):
-    """Resolve symlinks. None if the path cannot be named.
+def _directory_id(path):
+    """(realpath, dev, ino). None if the directory cannot be named.
 
-    ``/var`` is a symlink to ``/private/var`` on macOS. ``lsof`` reports the
-    resolved cwd. Comparing only ``normpath`` strings then says a live
-    process is not in the slot, and that ``[]`` releases it.
+    realpath spelling is not identity. On a case-insensitive volume the
+    same directory keeps whatever case the caller passed.
     """
     try:
-        return os.path.realpath(path)
+        st = os.stat(path)
+        text = os.path.realpath(path)
     except OSError:
         return None
+    return text, st.st_dev, st.st_ino
+
+
+def _casefold_parts(path):
+    return [part.casefold() for part in path.split(os.sep)]
+
+
+def _path_is_under(path, root_text, root_dev, root_ino):
+    """True if ``path`` is that directory or inside it.
+
+    None means the answer cannot be proved. The decision is the directory
+    inode, not the realpath string.
+    """
+    try:
+        text = os.path.realpath(path)
+    except OSError:
+        return None
+    root_parts = _casefold_parts(root_text)
+    parts = _casefold_parts(text)
+    if parts[:len(root_parts)] != root_parts:
+        return False
+    boundary = os.sep.join(text.split(os.sep)[:len(root_parts)]) or os.sep
+    try:
+        st = os.stat(boundary)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) == (root_dev, root_ino)
 
 
 def cwd_intruders(paths):
     """Pids whose cwd is under ``paths``. None means the snapshot failed.
 
     Slot, GC, and pre-launch checks only. This is not proof a workload tree
-    is dead; that proof is the launchd coalition.
+    is dead; that proof is the launchd coalition. Only ESRCH means the pid
+    is gone. Any other liveness error is unverifiable and keeps the slot.
     """
     snap = cwd_snapshot()
     if snap is None:
@@ -323,23 +380,30 @@ def cwd_intruders(paths):
     for path in paths:
         if not path:
             continue
-        resolved = _canon_path(path)
-        if resolved is None:
+        ident = _directory_id(path)
+        if ident is None:
             return None
-        roots.append(resolved)
+        roots.append(ident)
     found = []
     for pid, cwd in snap:
         if not cwd:
             continue
-        cwd_n = _canon_path(cwd)
-        if cwd_n is None:
-            return None
-        if not any(cwd_n == root or cwd_n.startswith(root + os.sep) for root in roots):
+        matched = False
+        for root_text, root_dev, root_ino in roots:
+            under = _path_is_under(cwd, root_text, root_dev, root_ino)
+            if under is None:
+                return None
+            if under:
+                matched = True
+                break
+        if not matched:
             continue
         try:
             os.getpgid(pid)
-        except OSError:
+        except ProcessLookupError:
             continue
+        except OSError:
+            return None
         found.append(pid)
     return found
 
@@ -739,10 +803,12 @@ def _adopt_launch(run, state):
         _remember_identity(run, state)
         return "unknown"
     if view == "absent":
-        # Submit returned and the job has not been listed yet. Absence is
-        # launchd being slow, not proof nothing was started.
-        if _workload_released(run, state) or (
-                state.get("launch_submitted") and not state.get("launch_seen")):
+        # The label is durable before submit. Absence can mean the job has
+        # not been listed yet, or that it already ran and left the list.
+        # Neither is an empty tree unless the run directory and slot are.
+        paths = [p for p in (run, state.get("slot")) if p]
+        intruders = cwd_intruders(paths) if paths else []
+        if intruders is None or intruders:
             state["job_remove_pending"] = True
             _remember_identity(run, state)
             return "unknown"
@@ -764,7 +830,7 @@ def _adopt_launch(run, state):
         state["job_remove_pending"] = False
         _remember_identity(run, state)
         return "empty"
-    identity = _stable_identity(pid)
+    identity = _identity_for_job(label, pid)
     if identity is None:
         state["job_remove_pending"] = True
         _remember_identity(run, state)
@@ -855,11 +921,8 @@ def _job_label(lease_id):
 
 def _launchctl_jobs():
     """label -> (pid or None, exit code or None). None if the list failed."""
-    try:
-        listed = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-    except OSError:
-        return None
-    if listed.returncode != 0:
+    listed = _run_command(["launchctl", "list"])
+    if listed is None or listed.returncode != 0:
         return None
     jobs = {}
     for line in listed.stdout.splitlines():
@@ -901,9 +964,7 @@ def _remove_job(label):
         return True
     if _job_view(label) == "unknown":
         return False
-    try:
-        subprocess.run(["launchctl", "remove", label], capture_output=True, text=True)
-    except OSError:
+    if _run_command(["launchctl", "remove", label]) is None:
         return False
     return _job_view(label) == "absent"
 
@@ -970,6 +1031,25 @@ def _stable_identity(pid):
     return start, first
 
 
+def _identity_for_job(label, pid):
+    """(start, coalition) while ``pid`` is still this job, else None.
+
+    The pid from a listing and the start time are one identity. A pid
+    reused before the coalition read belongs to someone else: do not adopt
+    it, and do not signal it. The caller re-reads the job.
+    """
+    identity = _stable_identity(pid)
+    if identity is None:
+        return None
+    start, cid = identity
+    view = _job_view(label)
+    if not (isinstance(view, tuple) and view[0] == "running" and view[1] == pid):
+        return None
+    if _stable_identity(pid) != (start, cid):
+        return None
+    return start, cid
+
+
 _WORKLOAD_WRAPPER = (
     "import json, os, sys, time\n"
     "spec = json.loads(open(sys.argv[1], encoding='utf-8').read())\n"
@@ -1031,18 +1111,30 @@ def _submit_workload(run, state, argv, env, cwd):
     stdout.touch()
     stderr.touch()
     state["launch_label"] = label
+    # Intent is durable before the syscall. A holder killed during submit
+    # must not recover as "the job never existed".
+    state["launch_submitted"] = True
     state["job_remove_pending"] = True
     write_json(run / "lease.json", state)
+    if not _fsync_file(run / "lease.json"):
+        return None
+    try:
+        recorded = read_json(run / "lease.json")
+    except (OSError, ValueError):
+        return None
+    if recorded.get("launch_submitted") is not True or recorded.get("launch_label") != label:
+        return None
     try:
         submitted = subprocess.run(
             ["launchctl", "submit", "-l", label, "-o", str(stdout), "-e", str(stderr),
              "--", sys.executable, str(wrapper_path), str(spec_path), str(gate_path)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=_COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None
     except OSError as exc:
         return str(exc)
     if submitted.returncode != 0:
         return submitted.stderr.strip() or "launchctl submit failed"
-    state["launch_submitted"] = True
     _remember_identity(run, state)
     # A slow launchd must not become "the job never existed". Expiry keeps
     # the label and leaves the tree unknown.
@@ -1060,7 +1152,7 @@ def _submit_workload(run, state, argv, env, cwd):
                 state["exit_known"] = True
             _remember_identity(run, state)
             return None
-        identity = _stable_identity(pid)
+        identity = _identity_for_job(label, pid)
         if identity is None:
             time.sleep(0.02)
             continue
@@ -1080,16 +1172,8 @@ def _submit_workload(run, state, argv, env, cwd):
         # a tree it cannot name.
         try:
             lease_path = run / "lease.json"
-            fd = os.open(str(lease_path), os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            dirfd = os.open(str(run), os.O_RDONLY)
-            try:
-                os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
+            if not _fsync_file(lease_path):
+                return "coalition id was not durable"
             recorded = read_json(lease_path)
         except (OSError, ValueError):
             return "coalition id was not durable"

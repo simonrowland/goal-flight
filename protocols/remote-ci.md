@@ -131,9 +131,12 @@ owning controller is dead before it cancels a live holder; liveness from
 another controller host or an unavailable probe is unknown and cannot
 authorize that cancellation. A dead holder is reaped immediately: its
 launchd job is removed and its tree is killed. The token stays until that
-tree is proved dead. A cwd snapshot that misses the occupant, or a launchd
-job that was submitted and has not been listed yet, is unknown and keeps
-capacity. Past the deadline the same kill records the deadline outcome.
+tree is proved dead. A cwd snapshot that misses the occupant, or that cannot
+prove a matching pid is gone, keeps capacity. A launch intent is durable
+before submit. An intent whose job is not listed is released only when the
+run directory and the slot cwd are empty; otherwise it stays unknown. A
+launchctl or cwd command that times out is unknown and keeps capacity. Past
+the deadline the same kill records the deadline outcome.
 Cleanup signals a process in a slot only when that slot's
 current lease is the run being cleaned, so a stale reap cannot kill the next
 occupant. An unresolved slot stays reserved.
