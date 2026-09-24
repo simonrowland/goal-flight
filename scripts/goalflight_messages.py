@@ -4045,21 +4045,10 @@ def _listener_envelope(
                 and recipient not in {"*", controller_label}
             ):
                 return None
-            withdrawal_error = _withdraw_carrier_delivery(
-                authority,
-                row,
-                controller_label=controller_label,
-            )
-            if withdrawal_error is None and settled_rows is not None:
-                settled_rows.append(row)
             raise MessageError(
-                f"carrier is corrupt or unreadable: {path}"
-                + (f": {details}" if details else f": {result.status.value}")
-                + (
-                    f"; delivery withdrawal failed: {withdrawal_error}"
-                    if withdrawal_error
-                    else "; delivery assignment withdrawn"
-                )
+                "STUCK: carrier corruption; "
+                f"path={path}; reason={details or result.status.value}; "
+                f"delivery_id={event_uuid}"
             )
         assignments = authority.read_all(
             """SELECT recipient_label, projected_at, withdrawn_at FROM delivery_events
@@ -5691,17 +5680,22 @@ def _envelopes_with_rows(
                 ),
                 None,
             )
-            if existing_error is None:
-                observed_errors.append(
+            error = {
+                "carrier_path": carrier_path,
+                "error": detail,
+                "reason": detail,
+            }
+            if detail.startswith("STUCK:"):
+                error.update(
                     {
-                        "carrier_path": carrier_path,
-                        "error": detail,
-                        "reason": detail,
+                        "status": "STUCK",
+                        "delivery_id": str(row.get("event_uuid") or ""),
                     }
                 )
+            if existing_error is None:
+                observed_errors.append(error)
             else:
-                existing_error["error"] = detail
-                existing_error["reason"] = detail
+                existing_error.update(error)
             continue
         if envelope is not None:
             items.append((row, envelope))
@@ -9631,6 +9625,7 @@ def cmd_listen(args) -> int:
     observed_data_version: int | None = None
     observed_lease = None
     peek_needed = True
+    missing_carrier_retry = False
     while True:
         missing_carrier_seen = False
         parent_result = parent_exit()
@@ -9801,7 +9796,11 @@ def cmd_listen(args) -> int:
                 # events beyond the live claim's durable high-water.
                 # Self-authored rows can sort before foreign mail indefinitely, so
                 # a limit-1 peek cannot implement skip-without-wedging semantics.
-                peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
+                # A missing carrier can be restored without a journal write. Keep
+                # polling its durable row, but avoid a SQLite peek storm until the
+                # data version changes or the carrier becomes readable.
+                if not (missing_carrier_retry and not journal_changed):
+                    peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
                 visible_rows = [
                     item
                     for item in peek.items
@@ -9831,6 +9830,7 @@ def cmd_listen(args) -> int:
                     )
                 )
                 # A carrier can be restored without changing SQLite data_version.
+                missing_carrier_retry = missing_carrier_seen
                 peek_needed = wakeable_items or missing_carrier_seen
                 if wakeable_items:
                     # The non-JSON listener is the controller: it prints every

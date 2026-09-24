@@ -580,12 +580,19 @@ def test_unread_reported_flush_is_re_reported_after_reporter_dies(
     assert payloads[-1]["reason"] == "timeout"
 
 
-def test_unknown_owner_liveness_allows_duplicate_report(
+@pytest.mark.parametrize(
+    ("phase", "zombie_probe"),
+    [("reported", None), ("claimed", False)],
+    ids=["unknown-reported-owner", "known-live-claimed-owner"],
+)
+def test_pending_report_suppression_allows_unseen_or_unknown_mail(
     isolated: tuple[Path, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    phase: str,
+    zombie_probe: bool | None,
 ) -> None:
-    """Unknown zombie state favors a duplicate report over hidden mail."""
+    """Only a known-live reported owner may suppress a duplicate report."""
     project, env = isolated
     authority = journal.open_or_create_journal(project)
     lease = authority.claim_or_renew_lease(
@@ -596,8 +603,8 @@ def test_unknown_owner_liveness_allows_duplicate_report(
     _post(env, project, "reported before unknown probe", dispatch_id=dispatch_id)
     identity = messages.goalflight_compat.process_start_identity(os.getpid())
     assert identity is not None
-    reported = SimpleNamespace(
-        phase="reported",
+    pending = SimpleNamespace(
+        phase=phase,
         positions={dispatch_id: 1},
         owner_pid=os.getpid(),
         owner_start_token=str(identity["start_token"]),
@@ -605,9 +612,13 @@ def test_unknown_owner_liveness_allows_duplicate_report(
     monkeypatch.setattr(
         wake,
         "recover_pending_report_state",
-        lambda *_args, **_kwargs: reported,
+        lambda *_args, **_kwargs: pending,
     )
-    monkeypatch.setattr(messages.goalflight_compat, "pid_is_zombie", lambda _pid: None)
+    monkeypatch.setattr(
+        messages.goalflight_compat,
+        "pid_is_zombie",
+        lambda _pid: zombie_probe,
+    )
     monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
     monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
     args = SimpleNamespace(

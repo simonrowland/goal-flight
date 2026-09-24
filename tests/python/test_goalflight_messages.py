@@ -1076,6 +1076,89 @@ def test_corrupt_carrier_is_reported_once_while_relay_delivers_healthy_mail() ->
             )
 
 
+def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "corrupt-drain-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+            clear=False,
+        ), mock.patch.object(_carrier_messages, "_current_project_root", return_value=project):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "corrupt-drain-test"},
+            )
+            assert_true("corrupt drain lease claimed", claimed.committed)
+            bad = _carrier_messages.post_message(
+                dispatch_id="corrupt-drain",
+                msg_type="controller-notice",
+                payload={"text": "must remain pending"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+            carrier = Path(bad["path"])
+            carrier.write_text("{corrupt carrier row\n", encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "--fleet-dir",
+                        env["GOALFLIGHT_FLEET_DIR"],
+                        "relay",
+                        "--drain",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            assert_true("corrupt drain is blocked", rc == 3)
+            assert_true("corrupt drain reports blocked", payload["status"] == "blocked")
+            errors = payload.get("carrier_errors") or []
+            assert_true("corrupt drain reports one stuck delivery", len(errors) == 1)
+            stuck = errors[0]
+            assert_true("stuck status is explicit", stuck.get("status") == "STUCK")
+            assert_true(
+                "stuck report names delivery",
+                stuck.get("delivery_id") == bad["envelope"]["id"],
+            )
+            assert_true("stuck report names carrier", str(carrier) in stuck["error"])
+            assert_true("stuck report names reason", "invalid JSON" in stuck["reason"])
+            assert_true("quarantine is recorded", _carrier_messages.quarantine_path(carrier).is_file())
+            assignment = authority.read_all(
+                "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+                (bad["envelope"]["id"],),
+            )
+            assert_true(
+                "corrupt delivery remains pending",
+                assignment
+                and assignment[0]["projected_at"] is not None
+                and assignment[0]["withdrawn_at"] is None,
+            )
+            lease = authority.active_lease(label)
+            assert_true("corrupt drain lease remains readable", lease is not None)
+            assert_true(
+                "corrupt drain cursor remains pending",
+                authority.cursor_peek(label, nonce=lease.nonce).items,
+            )
+            assert_true("stuck warning is emitted", "STUCK:" in stderr.getvalue())
+
+
 def test_duplicate_carrier_sequence_is_quarantined_without_hiding_valid_rows() -> None:
     with tempfile.TemporaryDirectory() as td:
         messages_dir = Path(td) / "messages"
