@@ -24,6 +24,7 @@ different surface and stays omitted; nothing here touches it.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -236,6 +237,16 @@ def test_grok_read_only_profile_fences_project_and_allows_account_state() -> Non
                 f"\\.{escaped_stem}\\.cleanup\\.{operation}"
                 in profile
             )
+        regex_rules = [
+            line for line in profile.splitlines() if '(regex #"' in line
+        ]
+        # macOS 27's SBPL regex engine rejects bounded quantifiers; keep every
+        # generated profile regex unbounded (controller host experiment).
+        assert regex_rules
+        assert all(
+            re.search(r"\{[0-9]+(?:,[0-9]+)?\}", line) is None
+            for line in regex_rules
+        ), regex_rules
 
 
 def test_read_only_profile_rejects_state_symlink_outside_selected_account() -> None:
