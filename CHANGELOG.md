@@ -8,6 +8,12 @@ incremented when meaningful skill behaviour changes.
 
 ## [1.7.2] - 2026-09-23
 
+### Added
+
+- Added `/goal-flight traffic` for live workers grouped by model and
+  controller, with warnings for sol/astra overuse and a separate unverified
+  identity count; `/goal-flight usage` points to it.
+
 ### Changed
 
 - Capacity is enforced per provider account as well as per engine pool (codex 30 and grok 50 sessions per account by default; configurable in the machine-local capacity profile). Existing engine-wide reservations migrate to their accounts.

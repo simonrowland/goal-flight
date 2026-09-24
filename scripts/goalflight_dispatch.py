@@ -4240,6 +4240,8 @@ def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
         "status_path": str(status_path),
         "updated_at": int(time.time()),
     }
+    if getattr(args, "model", None):
+        payload["model"] = str(args.model)
     write_status(status_path, payload)
     return payload, status_path
 
@@ -7568,6 +7570,9 @@ def _prelaunch_status_metadata(
         "controller_pid": _controller_pid(args),
         "controller_label": _controller_label(args),
     }
+    model = getattr(args, "model", None)
+    if model:
+        metadata["model"] = str(model)
     worktree_id = getattr(args, "_worktree_id", None)
     worktree_path = getattr(args, "_worktree_path", None)
     if worktree_id:

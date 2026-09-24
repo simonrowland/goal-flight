@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 import goalflight_dispatch_states
 import goalflight_ledger
 import goalflight_rate_pressure
+import goalflight_traffic
 
 
 DEFAULT_TIMEOUT_S = 20.0
@@ -1500,8 +1501,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         now=now,
         deep=args.deep,
     )
+    live_worker_summary = goalflight_traffic.live_workers_by_model()
     if args.json:
-        print(json.dumps(rows, indent=2))
+        print(
+            json.dumps(
+                {"rows": rows, goalflight_traffic.JSON_KEY: live_worker_summary},
+                indent=2,
+            )
+        )
     else:
         try:
             import goalflight_capacity
@@ -1510,6 +1517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             capacity_rows = goalflight_capacity.account_capacity_status()
         print(render_table(rows, now=now, capacity_rows=capacity_rows))
+        print(goalflight_traffic.live_mix_pointer(live_worker_summary))
         try:
             import goalflight_messages
         except Exception:
