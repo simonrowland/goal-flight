@@ -2165,9 +2165,6 @@ def _validate_resume_worktree_source(
             cwd, project_root=project_root
         ):
             return
-        # Pre-1.7.2 records did not persist branch/head metadata. Preserve
-        # their exact-seat resume path; a recycled seat still reaches the
-        # replacement path, which refuses without durable branch evidence.
         if not any(
             record.get(key)
             for key in (
@@ -2178,6 +2175,37 @@ def _validate_resume_worktree_source(
                 "worktree_quarantine_ref",
             )
         ):
+            try:
+                actual_branch = goalflight_worktree_pool._git(
+                    cwd, "rev-parse", "--abbrev-ref", "HEAD"
+                )
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise DispatchUsageError(
+                    f"resume refused: could not inspect recorded worktree {cwd}: {exc}"
+                ) from exc
+            try:
+                lineage_ids = _resume_lineage_dispatch_ids(parent_dispatch_id)
+                root_dispatch_id = lineage_ids[-1] if lineage_ids else ""
+                expected_branch = (
+                    goalflight_worktree_pool.worktree_branch_name(root_dispatch_id)
+                    if root_dispatch_id
+                    else ""
+                )
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded checkout {cwd} has actual branch "
+                    f"{actual_branch}; expected branch <unknown>: {exc}"
+                ) from exc
+            if not expected_branch:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded checkout {cwd} has actual branch "
+                    f"{actual_branch}; expected branch <unknown>"
+                )
+            if actual_branch != expected_branch:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded checkout {cwd} has actual branch "
+                    f"{actual_branch}; expected branch {expected_branch}"
+                )
             return
         expected_branch, expected_head, _keep_ref, _quarantine_ref = (
             _resume_worktree_branch_spec(project_root, parent_dispatch_id, record)

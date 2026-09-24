@@ -378,10 +378,12 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
         resumed.release()
 
 
+@pytest.mark.parametrize("legacy", [False, True], ids=["recorded", "legacy"])
 def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    legacy: bool,
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
@@ -396,32 +398,34 @@ def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
     _git(repo, "branch", "worktree/foreign", recorded_head)
     _git(seat, "checkout", "worktree/foreign")
     parent.release()
-    goalflight_ledger.write_record(
-        {
-            "schema": goalflight_ledger.SCHEMA,
-            "dispatch_id": parent_id,
-            "agent": "grok-code",
-            "engine": "grok",
-            "shape": "bash",
-            "state": "blocked",
-            "terminal_state": "blocked",
-            "project_root": str(repo),
-            "worker_cwd": str(seat),
-            "worktree_id": seat.name,
-            "worktree_path": str(seat),
-            "worktree_branch": f"worktree/{parent_id}",
-            "worktree_head": recorded_head,
-            "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
-            "dispatch_argv": [
-                "--agent",
-                "grok-code",
-                "--shape",
-                "bash",
-                "--cwd",
-                str(seat),
-            ],
-        }
-    )
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": parent_id,
+        "agent": "grok-code",
+        "engine": "grok",
+        "shape": "bash",
+        "state": "blocked",
+        "terminal_state": "blocked",
+        "project_root": str(repo),
+        "worker_cwd": str(seat),
+        "worktree_id": seat.name,
+        "worktree_path": str(seat),
+        "worktree_branch": f"worktree/{parent_id}",
+        "worktree_head": recorded_head,
+        "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+        "dispatch_argv": [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--cwd",
+            str(seat),
+        ],
+    }
+    if legacy:
+        record.pop("worktree_branch")
+        record.pop("worktree_head")
+    goalflight_ledger.write_record(record)
     prompt = tmp_path / "resume.md"
     prompt.write_text("Continue the worker.\n", encoding="utf-8")
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
@@ -439,7 +443,8 @@ def test_resume_refuses_exact_seat_on_foreign_branch_before_skip_reset_launch(
     error = capsys.readouterr().err
     assert "actual branch worktree/foreign" in error
     assert f"expected branch worktree/{parent_id}" in error
-    assert recorded_head in error
+    if not legacy:
+        assert recorded_head in error
     assert launched == []
 
 
