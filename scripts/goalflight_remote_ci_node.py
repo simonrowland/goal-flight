@@ -297,6 +297,19 @@ def cwd_snapshot():
     return rows
 
 
+def _canon_path(path):
+    """Resolve symlinks. None if the path cannot be named.
+
+    ``/var`` is a symlink to ``/private/var`` on macOS. ``lsof`` reports the
+    resolved cwd. Comparing only ``normpath`` strings then says a live
+    process is not in the slot, and that ``[]`` releases it.
+    """
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return None
+
+
 def cwd_intruders(paths):
     """Pids whose cwd is under ``paths``. None means the snapshot failed.
 
@@ -306,10 +319,21 @@ def cwd_intruders(paths):
     snap = cwd_snapshot()
     if snap is None:
         return None
-    roots = [os.path.normpath(str(path)) for path in paths if path]
+    roots = []
+    for path in paths:
+        if not path:
+            continue
+        resolved = _canon_path(path)
+        if resolved is None:
+            return None
+        roots.append(resolved)
     found = []
     for pid, cwd in snap:
-        cwd_n = os.path.normpath(cwd) if cwd else ""
+        if not cwd:
+            continue
+        cwd_n = _canon_path(cwd)
+        if cwd_n is None:
+            return None
         if not any(cwd_n == root or cwd_n.startswith(root + os.sep) for root in roots):
             continue
         try:
@@ -629,7 +653,7 @@ def _store_members(run, state, members):
 _LEASE_KEYS = (
     "launch_label", "coalition_id", "holder_coalition_id", "workload_pid",
     "workload_start", "exit_code", "exit_known", "members", "job_remove_pending",
-    "pending_result",
+    "pending_result", "launch_submitted", "launch_seen",
 )
 
 
@@ -715,8 +739,11 @@ def _adopt_launch(run, state):
         _remember_identity(run, state)
         return "unknown"
     if view == "absent":
-        if _workload_released(run, state):
-            state["job_remove_pending"] = False
+        # Submit returned and the job has not been listed yet. Absence is
+        # launchd being slow, not proof nothing was started.
+        if _workload_released(run, state) or (
+                state.get("launch_submitted") and not state.get("launch_seen")):
+            state["job_remove_pending"] = True
             _remember_identity(run, state)
             return "unknown"
         state["job_remove_pending"] = False
@@ -1015,13 +1042,18 @@ def _submit_workload(run, state, argv, env, cwd):
         return str(exc)
     if submitted.returncode != 0:
         return submitted.stderr.strip() or "launchctl submit failed"
-    deadline = time.monotonic() + 5
+    state["launch_submitted"] = True
+    _remember_identity(run, state)
+    # A slow launchd must not become "the job never existed". Expiry keeps
+    # the label and leaves the tree unknown.
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         view = _job_view(label)
         if view == "unknown" or view == "absent":
             time.sleep(0.02)
             continue
         kind, pid, code = view
+        state["launch_seen"] = True
         if kind == "exited":
             if isinstance(code, int) and not isinstance(code, bool):
                 state["exit_code"] = code
@@ -1065,7 +1097,9 @@ def _submit_workload(run, state, argv, env, cwd):
             return "coalition id was not durable"
         gate_path.write_text("1")
         return pid, start, cid
-    return "launchctl job did not appear"
+    state["job_remove_pending"] = True
+    _remember_identity(run, state)
+    return None
 
 def past_deadline(state):
     deadline = state.get("deadline_epoch")
@@ -1862,17 +1896,23 @@ def dispatch(request):
                 fresh.update(read_json(run / 'owner.json'))
                 if past_deadline(fresh):
                     return finish_dead_workload(root, run, fresh, 'deadline')
-                # Cleanup already started. Retry job removal on every reap,
-                # not only after the deadline. A running lease stays unknown
-                # so a live workload is not killed early.
-                if fresh.get('state') == 'draining':
+                # The holder is gone, so nothing else will remove this job.
+                # Kill the tree now. Capacity stays until that kill is proved.
+                # A running workload is not left in the user launchd domain
+                # until the deadline.
+                if fresh.get('launch_label') or fresh.get('coalition_id') or fresh.get('state') == 'draining':
                     return finish_dead_workload(root, run, fresh, 'reap')
                 return {'status': 'unknown'}
             write_json(run / 'cancel.json', request['identity'])
             # An admitted holder may not have received its command yet.
             if not (run / 'command.json').exists():
                 write_json(run / 'release.json', {})
-        deadline = time.monotonic() + 5
+        # clear_tree walks the process table. Under load that exceeds a few
+        # seconds. Returning unknown while the holder is still killing leaves
+        # the job in this user domain. Wait until the holder drops the lock.
+        # Stay under the transport timeout. A slow clear still returns
+        # unknown rather than being killed mid-scan.
+        deadline = time.monotonic() + 20
         while locked(run / 'holder.lock') and time.monotonic() < deadline:
             time.sleep(0.02)
         return {'status': 'unknown' if locked(run / 'holder.lock') else 'cancelled'}
