@@ -3348,10 +3348,9 @@ def _nonterminal_dispatch_reuse_reason(
     if record is None:
         return None
     if goalflight_ledger.record_is_unreadable(record):
-        # Unlistable runs.d makes every id look present-but-unreadable.
-        # That is not proof the id is taken; occupancy fail-closes on the
-        # directory itself. Inventing a duplicate here stalls every launch.
-        return None
+        return (
+            f"ledger record unreadable path={record.get('path') or '-'}"
+        )
     if (
         allow_queued
         and record.get("state") == "queued"

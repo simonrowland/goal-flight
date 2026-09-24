@@ -247,6 +247,7 @@ def test_unreadable_ledger_marks_status_worker_unverified(
                 "unverified_controllers": {"unknown-ledger": 1},
             }
         },
+        "unknown_reasons": ["ledger unreadable rows=1: OSError: ledger denied"],
     }
     assert "total unverified: 1" in traffic.render(summary)
 
@@ -270,10 +271,59 @@ def test_unreadable_ledger_and_status_dir_report_unknown(
     assert summary["unverified_total"] == 1
     assert summary["models"]["UNKNOWN"]["unverified"] == 1
     assert summary["unknown_reasons"] == [
-        f"ledger unreadable; status directory unavailable: {dispatch_dir}"
+        f"ledger unreadable rows=1: OSError: ledger denied; status directory unavailable: {dispatch_dir}"
     ]
     assert "UNKNOWN:" in traffic.render(summary)
     assert "UNKNOWN:" in traffic.live_mix_pointer(summary)
+
+
+def test_unreadable_ledger_with_empty_status_dir_reports_unknown(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    state_dir = tmp_path / "state"
+    dispatch_dir = state_dir / "dispatch"
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setattr(
+        traffic.goalflight_ledger,
+        "read_records",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("ledger denied")),
+    )
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        "ledger unreadable rows=1: OSError: ledger denied"
+    ]
+
+
+def test_corrupt_ledger_row_without_sidecar_is_unverified(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs.d"
+    dispatch_dir = state_dir / "dispatch"
+    runs_dir.mkdir(parents=True)
+    dispatch_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(dispatch_dir))
+    corrupt = runs_dir / "corrupt-row.json"
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    assert traffic.main(["--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)[traffic.JSON_KEY]
+
+    assert summary["total"] == 0
+    assert summary["unverified_total"] == 1
+    assert summary["models"]["UNKNOWN"]["unverified"] == 1
+    assert summary["unknown_reasons"] == [
+        f"ledger unreadable rows=1: {corrupt}"
+    ]
 
 
 def test_terminal_ledger_state_wins_over_live_sidecar(

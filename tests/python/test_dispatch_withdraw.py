@@ -698,6 +698,26 @@ def test_main_validates_replacement_id_before_retry_withdraw(
     assert attempt_row(prepared[1])["terminal_state"] == "worker_dead"
 
 
+def test_main_refuses_corrupt_replacement_before_retry_withdraw(
+    prepared, monkeypatch, capsys
+):
+    project = _make_retry_holder(prepared)
+    corrupt = ledger.record_path("replacement", create=False)
+    corrupt.write_text("{not-json", encoding="utf-8")
+    _stub_main_admission(monkeypatch)
+
+    code = dispatch.main([
+        "--agent", "codex", "--shape", "bash", "--dispatch-id", "replacement",
+        "--retry-of", "withdraw-test", "--task", "t-123", "--prompt", "retry",
+        "--cwd", str(project), "--controller-label", "owner",
+    ])
+
+    assert code == 64
+    assert "replacement" in capsys.readouterr().err
+    assert ledger.read_record("withdraw-test")["terminal_state"] == "worker_dead"
+    assert attempt_row(prepared[1])["terminal_state"] == "worker_dead"
+
+
 def test_main_releases_auto_id_when_retry_preflight_refuses(
     prepared, monkeypatch, capsys
 ):

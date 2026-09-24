@@ -101,29 +101,45 @@ def _dispatch_records(
     dispatch_dir: Path | None = None,
 ) -> list[dict[str, object]]:
     ledger_unreadable = False
+    ledger_read_error: str | None = None
     if ledger_records is None:
         try:
             ledger_records = goalflight_ledger.read_records(
                 skip_terminal=True,
                 recent_window_days=goalflight_ledger.STATUS_RECENT_WINDOW_DAYS,
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             ledger_records = []
             ledger_unreadable = True
+            ledger_read_error = f"{type(exc).__name__}: {exc}"
 
     records: dict[str, dict[str, object]] = {}
     ledger_states: dict[str, tuple[object, object]] = {}
     ledger_unverified_ids: set[str] = set()
+    unreadable_rows: list[tuple[str | None, str]] = []
     for record in ledger_records:
-        if not isinstance(record, Mapping) or not record.get("dispatch_id"):
+        if not isinstance(record, Mapping):
+            unreadable_rows.append((None, "invalid ledger row"))
             continue
-        dispatch_id = str(record["dispatch_id"])
-        records[dispatch_id] = dict(record)
+        record_dict = dict(record)
+        if goalflight_ledger.record_is_unreadable(record_dict):
+            unreadable_rows.append(
+                (
+                    str(record_dict.get("dispatch_id"))
+                    if record_dict.get("dispatch_id")
+                    else None,
+                    str(record_dict.get("path") or "unreadable ledger row"),
+                )
+            )
+        if not record_dict.get("dispatch_id"):
+            continue
+        dispatch_id = str(record_dict["dispatch_id"])
+        records[dispatch_id] = record_dict
         ledger_states[dispatch_id] = (
-            record.get("state"),
-            record.get("terminal_state"),
+            record_dict.get("state"),
+            record_dict.get("terminal_state"),
         )
-        if goalflight_ledger.record_is_unreadable(dict(record)):
+        if goalflight_ledger.record_is_unreadable(record_dict):
             ledger_unverified_ids.add(dispatch_id)
 
     status_dir = dispatch_dir or goalflight_dispatch_paths.dispatch_base_dir()
@@ -163,7 +179,14 @@ def _dispatch_records(
                 ledger_record = None
             if not isinstance(ledger_record, Mapping):
                 continue
-            if goalflight_ledger.record_is_unreadable(dict(ledger_record)):
+            ledger_record = dict(ledger_record)
+            if goalflight_ledger.record_is_unreadable(ledger_record):
+                unreadable_rows.append(
+                    (
+                        dispatch_id,
+                        str(ledger_record.get("path") or "unreadable ledger row"),
+                    )
+                )
                 ledger_unverified_ids.add(dispatch_id)
             else:
                 records.setdefault(dispatch_id, {}).update(ledger_record)
@@ -196,15 +219,39 @@ def _dispatch_records(
             if isinstance(expected, Mapping):
                 record["worker_identity"] = dict(expected)
 
-    if ledger_unreadable and status_error:
-        return [
+    for dispatch_id in ledger_unverified_ids:
+        if dispatch_id in records:
+            records[dispatch_id]["_ledger_unverified"] = True
+
+    source_records: list[dict[str, object]] = []
+    if ledger_unreadable:
+        reason = f"ledger unreadable rows=1: {ledger_read_error or 'unknown error'}"
+        if status_error:
+            reason += "; " + status_error
+        source_records.append(
+            {
+                "_source_unverified_reason": reason,
+                "_source_unverified_count": 0 if status_payloads else 1,
+            }
+        )
+    if unreadable_rows:
+        paths = ", ".join(path for _dispatch_id, path in unreadable_rows)
+        unresolved = sum(
+            1
+            for dispatch_id, _path in unreadable_rows
+            if not dispatch_id
+            or not isinstance(records.get(dispatch_id, {}).get("worker_pid"), int)
+            or records.get(dispatch_id, {}).get("worker_pid", 0) <= 0
+        )
+        source_records.append(
             {
                 "_source_unverified_reason": (
-                    "ledger unreadable; " + status_error
-                )
+                    f"ledger unreadable rows={len(unreadable_rows)}: {paths}"
+                ),
+                "_source_unverified_count": unresolved,
             }
-        ]
-    return list(records.values())
+        )
+    return source_records + list(records.values())
 
 
 def _tail_model(tail_path: object) -> str | None:
@@ -391,8 +438,13 @@ def live_workers_by_model(
     ):
         if record.get("_source_unverified_reason"):
             unknown_reasons.append(str(record["_source_unverified_reason"]))
-            _record_bucket(buckets, "UNKNOWN", "UNKNOWN", "unverified")
-            unverified_total += 1
+            try:
+                source_count = max(0, int(record.get("_source_unverified_count", 1)))
+            except (TypeError, ValueError):
+                source_count = 1
+            for _ in range(source_count):
+                _record_bucket(buckets, "UNKNOWN", "UNKNOWN", "unverified")
+            unverified_total += source_count
             continue
         if not isinstance(record.get("worker_pid"), int) or record["worker_pid"] <= 0:
             continue
