@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_dispatch as dispatch  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
@@ -417,6 +418,146 @@ def test_dispatch_auto_claim_conflict_is_visible_and_never_steals(
     assert "--takeover" in str(result["message"])
     assert args.controller_label is None and args.controller_session_id is None
     assert authority.active_lease("owner") == incumbent.value
+
+
+@pytest.mark.parametrize("identity", ["beacon-pid", "session-id"])
+def test_resume_refuses_live_controller_from_different_recorded_label(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity: str,
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    parent_id = "resume-parent-recorded-owner"
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "state": "blocked",
+            "controller_label": "recorded-owner",
+        }
+    )
+    live_pid = os.getpid()
+    live_identity = sessions._controller_process_identity(live_pid)
+    assert live_identity is not None
+    incumbent = authority.claim_or_renew_lease(
+        "foreign-owner",
+        principal={
+            "pid": live_pid,
+            "start_token": live_identity["start_token"],
+        },
+    )
+    assert incumbent.committed and incumbent.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="foreign-owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: live_identity if pid == live_pid else None,
+    )
+    args = _args(
+        controller_label="recorded-owner",
+        controller_beacon_pid=live_pid if identity == "beacon-pid" else None,
+        controller_session_id=(
+            incumbent.value.nonce if identity == "session-id" else None
+        ),
+        parent_dispatch_id=parent_id,
+    )
+
+    try:
+        refused = dispatch._stamp_controller_session(args, root)
+    finally:
+        holder.close()
+
+    assert refused["reason"] == "resume_controller_label_mismatch"
+    assert "resume refused" in refused["message"]
+    assert "foreign-owner" in refused["message"]
+    assert "recorded-owner" in refused["message"]
+    assert authority.active_lease("foreign-owner") == incumbent.value
+    assert authority.active_lease("recorded-owner") is None
+
+
+def test_resume_refuses_explicit_controller_label_different_from_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    parent_id = "resume-parent-explicit-label"
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "state": "blocked",
+            "controller_label": "recorded-owner",
+        }
+    )
+    args = _args(
+        controller_label="explicit-owner",
+        controller_beacon_pid=None,
+        parent_dispatch_id=parent_id,
+    )
+
+    refused = dispatch._stamp_controller_session(args, root)
+
+    assert refused["reason"] == "resume_controller_label_mismatch"
+    assert "explicit-owner" in refused["message"]
+    assert "recorded-owner" in refused["message"]
+    assert authority.active_lease("recorded-owner") is None
+
+
+def test_resume_accepts_live_controller_with_recorded_label(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    parent_id = "resume-parent-matching-label"
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "state": "blocked",
+            "controller_label": "recorded-owner",
+        }
+    )
+    live_pid = os.getpid()
+    live_identity = sessions._controller_process_identity(live_pid)
+    assert live_identity is not None
+    incumbent = authority.claim_or_renew_lease(
+        "recorded-owner",
+        principal={
+            "pid": live_pid,
+            "start_token": live_identity["start_token"],
+        },
+    )
+    assert incumbent.committed and incumbent.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="recorded-owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: live_identity if pid == live_pid else None,
+    )
+    args = _args(
+        controller_label="recorded-owner",
+        controller_beacon_pid=live_pid,
+        parent_dispatch_id=parent_id,
+    )
+
+    try:
+        accepted = dispatch._stamp_controller_session(args, root)
+    finally:
+        holder.close()
+
+    assert accepted["reason"] == "resolved_kernel_live_controller"
+    assert accepted["claimed"] is False
+    assert args.controller_label == "recorded-owner"
+    assert args.controller_session_id == incumbent.value.nonce
+    assert authority.active_lease("recorded-owner") == incumbent.value
 
 
 def test_dispatch_explicit_takeover_supersedes_live_holder(

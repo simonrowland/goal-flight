@@ -5291,6 +5291,17 @@ def _cmd_resume(argv: list[str]) -> int:
         source = _validate_resume_source(
             args.dispatch_id, reconcile_dead_preclaim=True
         )
+        recorded_label = _resume_recorded_controller_label(source["record"])
+        if (
+            recorded_label is not None
+            and args.controller_label is not None
+            and str(args.controller_label).strip() != recorded_label
+        ):
+            raise DispatchUsageError(
+                "resume refused: --controller-label "
+                f"{args.controller_label!r} does not match the recorded "
+                f"controller label {recorded_label!r}"
+            )
         _resume_worker_cwd(
             source["record"], override=getattr(args, "cwd", None)
         )
@@ -5344,6 +5355,11 @@ def _resume_cwd_from_record(record: dict) -> Path | None:
         if raw:
             return Path(str(raw)).expanduser().resolve(strict=False)
     return None
+
+
+def _resume_recorded_controller_label(record: dict) -> str | None:
+    value = record.get("controller_label")
+    return str(value).strip() if value and str(value).strip() else None
 
 
 def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
@@ -5420,7 +5436,7 @@ def _resume_launch_argv(
     inject: list[str] = ["--skip-seat-reset"]
     if resume_args.unregistered_forced:
         inject.append("--unregistered-forced")
-    recorded_label = record.get("controller_label")
+    recorded_label = _resume_recorded_controller_label(record)
     if (
         resume_args.controller_label is None
         and _option_value_before_worker_remainder(base, "--controller-label") is None
@@ -6069,6 +6085,65 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
         requested_session_id = ambient_lease_nonce
     child_role = _controller_child_role(args)
     ident = _controller_dispatch_identity(args, root)
+    parent_dispatch_id = str(getattr(args, "parent_dispatch_id", None) or "").strip()
+    recorded_resume_label = None
+    if parent_dispatch_id:
+        parent_record = _find_dispatch_record(parent_dispatch_id)
+        if isinstance(parent_record, dict):
+            recorded_resume_label = _resume_recorded_controller_label(parent_record)
+    if recorded_resume_label is not None:
+        if requested_label != recorded_resume_label:
+            return {
+                "claimed": False,
+                "reason": "resume_controller_label_mismatch",
+                "message": (
+                    "resume refused: controller label "
+                    f"{requested_label!r} does not match the dispatch's "
+                    f"recorded controller label {recorded_resume_label!r}"
+                ),
+            }
+        explicit_pid = (
+            getattr(args, "controller_beacon_pid", None) is not None
+            or getattr(args, "controller_pid", None) is not None
+        )
+        if explicit_pid or explicit_session_id is not None:
+            probe_state, candidate = _session_from_fused_lookup(
+                ident.lookup,
+                label=recorded_resume_label,
+                pid=requested_pid if explicit_pid else None,
+                session_id=requested_session_id if explicit_session_id else None,
+            )
+            if probe_state != "live" or not isinstance(candidate, dict):
+                _, foreign_candidate = _session_from_fused_lookup(
+                    ident.lookup,
+                    label=None,
+                    pid=requested_pid if explicit_pid else None,
+                    session_id=requested_session_id if explicit_session_id else None,
+                )
+                foreign_label = (
+                    str(foreign_candidate.get("label") or "")
+                    if isinstance(foreign_candidate, dict)
+                    else None
+                )
+                identity = (
+                    f"pid {requested_pid}"
+                    if explicit_pid
+                    else f"session id {requested_session_id!r}"
+                )
+                detail = (
+                    f"belongs to controller label {foreign_label!r}"
+                    if foreign_label
+                    else "does not identify a live controller"
+                )
+                return {
+                    "claimed": False,
+                    "reason": "resume_controller_label_mismatch",
+                    "message": (
+                        f"resume refused: controller {identity} {detail}; "
+                        f"dispatch requires recorded controller label "
+                        f"{recorded_resume_label!r}"
+                    ),
+                }
     session: dict | None = None
     claim_result: dict[str, object]
     self_resolved = (
@@ -19870,6 +19945,13 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "goalflight_dispatch: "
                 + str(controller_claim.get("message") or "label in use; rerun with --takeover"),
+                file=sys.stderr,
+            )
+            return 73
+        if controller_claim.get("reason") == "resume_controller_label_mismatch":
+            print(
+                "goalflight_dispatch: "
+                + str(controller_claim.get("message") or "resume controller identity mismatch"),
                 file=sys.stderr,
             )
             return 73
