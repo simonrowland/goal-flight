@@ -106,6 +106,11 @@ LIVENESS_VERDICTS = frozenset(
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    guard_error = goalflight_worktree_pool.guard_worktree_mutation(repo, *args)
+    if guard_error is not None:
+        return subprocess.CompletedProcess(
+            ["git", "-C", str(repo), *args], 128, "", guard_error
+        )
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,

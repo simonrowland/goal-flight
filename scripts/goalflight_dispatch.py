@@ -4009,11 +4009,11 @@ def _release_withdrawn_worktree(record: dict | None, dispatch_id: str) -> None:
         return
     path = record.get("worker_cwd") or record.get("worktree_path")
     root = record.get("project_root")
-    if not path or not root:
+    if not root:
         return
     with contextlib.suppress(Exception):
         goalflight_worktree_pool.release_worktree_for_dispatch(
-            Path(str(root)), str(path), dispatch_id
+            Path(str(root)), path, dispatch_id
         )
 
 
@@ -5367,7 +5367,10 @@ def _resume_cwd_from_record(record: dict) -> Path | None:
         request.get("cwd"),
     ):
         if raw:
-            return Path(str(raw)).expanduser().resolve(strict=False)
+            candidate = Path(str(raw)).expanduser()
+            if not candidate.is_absolute():
+                continue
+            return Path(os.path.realpath(str(candidate)))
     return None
 
 
@@ -5378,9 +5381,18 @@ def _resume_recorded_controller_label(record: dict) -> str | None:
 
 def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
     if override:
-        return Path(str(override)).expanduser().resolve(strict=False)
+        path = Path(str(override)).expanduser().resolve(strict=False)
+        if not path.is_dir():
+            raise DispatchUsageError(
+                f"resume refused: explicit worker cwd {path} is missing or unresolved"
+            )
+        return path
     path = _resume_cwd_from_record(record)
     if path is not None:
+        if not path.is_dir():
+            raise DispatchUsageError(
+                f"resume refused: recorded worker cwd {path} is missing or unresolved"
+            )
         return path
     raise DispatchUsageError(
         "resume refused: record has no worker cwd evidence "

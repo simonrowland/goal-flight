@@ -64,6 +64,29 @@ YES = "yes"
 NO = "no"
 UNKNOWN = "unknown"
 
+_GIT_MUTATING_COMMANDS = frozenset(
+    {
+        "add",
+        "apply",
+        "checkout",
+        "clean",
+        "commit",
+        "cherry-pick",
+        "merge",
+        "mv",
+        "read-tree",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "sparse-checkout",
+        "switch",
+        "update-index",
+    }
+)
+_GIT_WORKTREE_TARGET_COMMANDS = frozenset({"add", "lock", "move", "remove", "unlock"})
+
 
 class WorktreeSeatError(RuntimeError):
     """Base error for managed worktree acquisition (legacy class name)."""
@@ -497,12 +520,146 @@ def _git(
     return result.stdout.strip()
 
 
+def _git_identity(cwd: Path) -> tuple[str, str, str] | None:
+    """Return realpath git-dir, common-dir, and worktree top-level."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(cwd),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(values) != 3:
+        return None
+    return (
+        os.path.realpath(values[0]),
+        os.path.realpath(values[1]),
+        os.path.realpath(values[2]),
+    )
+
+
+def _git_worktree_target_args(args: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Return worktree paths, or None when a mutating target is ambiguous."""
+    if len(args) < 2 or args[0] != "worktree":
+        return ()
+    subcommand = args[1]
+    if subcommand not in _GIT_WORKTREE_TARGET_COMMANDS:
+        return ()
+    values: list[str] = []
+    index = 2
+    while index < len(args):
+        value = args[index]
+        if value == "--":
+            values.extend(args[index + 1 :])
+            break
+        if value in {"-b", "-B", "--branch", "--orphan", "--reason"}:
+            index += 2
+            continue
+        if (
+            value.startswith("--branch=")
+            or value.startswith("--orphan=")
+            or value.startswith("--reason=")
+        ):
+            index += 1
+            continue
+        if value.startswith("-"):
+            index += 1
+            continue
+        values.append(value)
+        index += 1
+    required = 2 if subcommand == "move" else 1
+    if len(values) < required:
+        return None
+    return tuple(values[:required])
+
+
+def guard_worktree_mutation(cwd: Path, *args: str) -> str | None:
+    """Refuse worktree mutations whose target is the repository main checkout."""
+    if not args:
+        return None
+    command = args[0]
+    if command == "worktree":
+        targets = _git_worktree_target_args(args)
+        if targets is None:
+            return f"refusing git {' '.join(args)}: cannot determine target worktree"
+        if not targets:
+            return None
+    elif command == "stash":
+        if len(args) > 1 and args[1] in {"list", "show"}:
+            return None
+        targets = (str(cwd),)
+    elif command in _GIT_MUTATING_COMMANDS:
+        targets = (str(cwd),)
+    else:
+        return None
+
+    source = _git_identity(cwd)
+    if source is None:
+        return f"refusing git {' '.join(args)}: cannot verify repository identity"
+    if command != "worktree":
+        if source[0] == source[1]:
+            return (
+                f"refusing git {' '.join(args)}: target {source[2]} is the "
+                "repository main worktree"
+            )
+        return None
+    source_main = source[1]
+    source_main = os.path.realpath(str(Path(source_main).parent))
+    for raw_target in targets:
+        target = Path(raw_target).expanduser()
+        if not target.is_absolute():
+            target = cwd / target
+        target_real = os.path.realpath(str(target))
+        if target_real == source_main:
+            return (
+                f"refusing git {' '.join(args)}: target {target_real} is the "
+                "repository main worktree"
+            )
+        target_identity = _git_identity(Path(target_real)) if Path(target_real).is_dir() else None
+        if target_identity is None:
+            if command == "worktree":
+                continue
+            return (
+                f"refusing git {' '.join(args)}: cannot verify target worktree "
+                f"{target_real}"
+            )
+        target_git, target_common, target_top = target_identity
+        if target_git == target_common or target_top == source_main:
+            return (
+                f"refusing git {' '.join(args)}: target {target_real} is the "
+                "repository main worktree"
+            )
+    return None
+
+
 def _git_proc(
     cwd: Path,
     *args: str,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
+    guard_error = guard_worktree_mutation(cwd, *args)
+    if guard_error is not None:
+        return subprocess.CompletedProcess(
+            ["git", *args], 128, "", guard_error
+        )
     try:
         return subprocess.run(
             ["git", *args],
@@ -1763,7 +1920,7 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
 
 
 def release_worktree_for_dispatch(
-    project_root: Path, worktree_path: str | Path, dispatch_id: str
+    project_root: Path, worktree_path: str | Path | None, dispatch_id: str
 ) -> tuple[bool, str]:
     """Clear stale occupant metadata after a terminal withdrawal.
 
@@ -1772,7 +1929,17 @@ def release_worktree_for_dispatch(
     is not live, so withdrawal cannot strand a dead holder while preserving
     the no-kill contract.
     """
-    path = Path(worktree_path).expanduser().resolve(strict=False)
+    if worktree_path is None or not str(worktree_path).strip():
+        return False, "refusing release: no worktree seat path was recorded"
+    raw_path = Path(str(worktree_path)).expanduser()
+    if not raw_path.is_absolute():
+        return False, f"refusing release: worktree seat path is not absolute: {worktree_path}"
+    path = Path(os.path.realpath(str(raw_path)))
+    root = Path(os.path.realpath(str(project_root)))
+    if path == root:
+        return False, f"refusing release: worktree seat path resolves to project root: {path}"
+    if not path.is_dir():
+        return False, f"refusing release: worktree seat path is unresolved: {path}"
     if not is_managed_worktree_path(path, project_root=project_root):
         return False, "path is not a managed repository worktree"
     lock_path = worktree_lock_path_for_path(project_root, path)
