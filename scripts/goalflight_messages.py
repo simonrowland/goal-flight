@@ -10005,14 +10005,14 @@ def cmd_listen(args) -> int:
                     for item in visible_rows
                     if str(item.get("wake_class") or "") == "waking"
                 ]
-                visible_attention = _attention_items_for_rows(
+                candidate_attention = _attention_items_for_rows(
                     read_authority,
-                    visible_rows,
+                    candidate_rows,
                 )
                 candidate_items = listener_envelopes(
                     read_authority,
                     candidate_rows,
-                    attention_by_id=visible_attention,
+                    attention_by_id=candidate_attention,
                 )
                 wakeable_items = bool(
                     _foreign_controller_items(
@@ -10034,6 +10034,10 @@ def cmd_listen(args) -> int:
                     # Reuse a waking synthetic candidate's attention read when the
                     # complete snapshot is rendered. When the candidate is a normal
                     # carrier, a quiet synthetic backlog is loaded once here.
+                    visible_attention = _attention_items_for_rows(
+                        read_authority,
+                        peek.items,
+                    )
                     ring_materialized_items = listener_envelopes(
                         read_authority,
                         visible_rows,
