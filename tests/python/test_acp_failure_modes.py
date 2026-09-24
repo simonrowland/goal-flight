@@ -1262,7 +1262,7 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_pause",
+        "progress_then_silent",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
@@ -1270,7 +1270,6 @@ def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
         max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
-            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
             "GOALFLIGHT_TEST_MODE": "1",
             "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
         },
@@ -1279,6 +1278,12 @@ def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
 
     worker_pid = status.get("worker_pid")
     try:
+        worker_identity = goalflight_compat.process_start_identity(worker_pid)
+        assert (
+            worker_identity
+            and worker_identity.get("pid") == worker_pid
+            and worker_identity.get("start_token")
+        ), (status, worker_identity, stderr)
         assert returncode != 0, (stdout, stderr, status)
         assert status["state"] == "liveness_indeterminate", status
         assert status["error"]["reason"] == "event_silence_outer_bound", status
