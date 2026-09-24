@@ -1002,6 +1002,12 @@ class RemoteRunner:
         results = []
         for name, node in self.nodes.items():
             for record in node.call("list"):
+                if record.get("state") == "UNREADABLE":
+                    results.append({
+                        "box": name, "lease_id": None, "status": "unreadable",
+                        "path": record.get("path"),
+                    })
+                    continue
                 if record["state"] == "released":
                     continue
                 status = "unknown"

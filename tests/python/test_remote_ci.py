@@ -85,6 +85,107 @@ def _box(config: DaemonConfig) -> BoxConfig:
 
 
 
+_REMOTE_CI_LABEL = "com.goalflight.remote-ci."
+# Coalition ids a test's teardown swept. The autouse fixture checks they
+# have no live member after the launchd job is gone.
+_swept_coalitions: list[int] = []
+
+
+# Bound before tests replace subprocess.run. Teardown must still see launchctl.
+_launchctl_run = subprocess.run
+
+
+def _remote_ci_launchd_jobs():
+    """label -> pid or None. None if launchctl cannot be listed."""
+    try:
+        listed = _launchctl_run(["launchctl", "list"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if listed.returncode != 0:
+        return None
+    jobs = {}
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            parts = line.split()
+        if len(parts) < 3:
+            continue
+        label = parts[-1]
+        if not label.startswith(_REMOTE_CI_LABEL):
+            continue
+        jobs[label] = int(parts[0]) if parts[0].isdigit() else None
+    return jobs
+
+
+def _sweep_managed_jobs(managed: Path) -> None:
+    """Remove this root's launchd jobs and kill coalition members still alive."""
+    import goalflight_remote_ci_node as node
+
+    runs = []
+    for root in (managed / "runs", managed / "admission" / "runs"):
+        if root.is_dir():
+            runs.extend(path for path in root.iterdir() if path.is_dir() and not path.is_symlink())
+    for run in runs:
+        try:
+            lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        label = lease.get("launch_label") or ""
+        cid = lease.get("coalition_id")
+        holder = lease.get("holder_coalition_id")
+        if label:
+            _launchctl_run(["launchctl", "remove", label], capture_output=True, text=True)
+        # The login-session coalition is never a kill target. A lease that
+        # failed to record a private id must not take the test process with it.
+        if (isinstance(cid, int) and not isinstance(cid, bool) and cid > 0
+                and cid != holder):
+            _swept_coalitions.append(cid)
+            members = node._coalition_members(cid)
+            if members:
+                for pid, _start in members:
+                    if pid <= 1 or pid == os.getpid():
+                        continue
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
+def _live_coalition_members(coalitions: list[int]) -> list[tuple[int, object]]:
+    import goalflight_remote_ci_node as node
+
+    found = []
+    for cid in coalitions:
+        members = node._coalition_members(cid)
+        if not members:
+            continue
+        for pid, start in members:
+            if pid > 1 and pid != os.getpid():
+                found.append((pid, start))
+    return found
+
+
+@pytest.fixture(autouse=True)
+def no_leftover_remote_ci_job(request):
+    """Fail if a test leaves a launchd job or a live coalition member.
+
+    Jobs are per-user, not per tmp_path. A later test sees whatever the
+    previous test did not remove.
+    """
+    before = _remote_ci_launchd_jobs()
+    _swept_coalitions.clear()
+    yield
+    after = _remote_ci_launchd_jobs()
+    if before is None or after is None:
+        raise AssertionError(
+            f"{request.node.nodeid}: launchctl list failed; cannot prove jobs were removed")
+    leaked = {label: pid for label, pid in after.items() if label not in before}
+    members = _live_coalition_members(list(_swept_coalitions))
+    if leaked or members:
+        raise AssertionError(
+            f"{request.node.nodeid} left remote CI state behind: jobs={leaked} members={members}")
+
+
 class ScriptedExecutor:
     """Run the shipped node program in an isolated fake box; never SSH or ps."""
 
@@ -116,13 +217,25 @@ class ScriptedExecutor:
 
     def close(self, config):
         node = RemoteRunner(config, executor=self).nodes["box-a"]
-        for record in node.call("list"):
+        try:
+            records = node.call("list")
+        except ci.RemoteCIError:
+            records = []
+        for record in records:
+            if record.get("state") == "UNREADABLE":
+                continue
             key = {"run_dir": record["run_directory"], "lease_token": record["lease_token"]}
             owner = {name: record.get(name) for name in ("owner_host", "owner_pid", "owner_identity")}
-            if record.get("remote_run"):
-                node.call("cancel", **key, identity=record["remote_run"], expected_owner=owner)
-            elif record["state"] != "released":
-                node.call("release", **key, expected_owner=owner)
+            try:
+                if record.get("remote_run"):
+                    node.call("cancel", **key, identity=record["remote_run"], expected_owner=owner)
+                elif record.get("state") != "released":
+                    node.call("release", **key, expected_owner=owner)
+            except ci.RemoteCIError:
+                pass
+        # Cancel of a dead holder before the deadline returns unknown and
+        # leaves the launchd job. The next test shares this user domain.
+        _sweep_managed_jobs(self.root)
 
 
 @pytest.fixture
@@ -1037,10 +1150,14 @@ def _two_token(tmp_path):
 
 
 def _wait_dead(pid):
+    """Wait until ``pid`` is gone, including a zombie.
+
+    ``kill(pid, 0)`` still succeeds for a zombie. ``getpgid`` does not.
+    """
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         try:
-            os.kill(pid, 0)
+            os.getpgid(pid)
         except ProcessLookupError:
             return
         time.sleep(0.01)
@@ -1431,8 +1548,15 @@ def test_sigterm_grandchild_is_killed_with_the_coalition(node_env, tmp_path):
         raise AssertionError("workload did not exec: " + command)
     assert _cancel(node, held)["status"] == "cancelled"
     child = _child_pid(pidfile)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child, 0)
+    try:
+        # getpgid, not kill(pid, 0): a zombie is not a live grandchild, and
+        # launchd's reap timing is global state left by earlier jobs.
+        _wait_dead(child)
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     _free_tokens(node)
 
 
@@ -1713,6 +1837,36 @@ def test_complete_rescan_after_a_mid_check_death_proves_empty(monkeypatch):
     assert node._coalition_members(100) == []
 
 
+def test_pid_that_vanishes_during_classify_does_not_end_the_pass(monkeypatch):
+    """A member that disappears while it is being classified is not an empty tree.
+
+    The pid list can omit a child that already exists. A process that was
+    read in this coalition and then vanished must start another full pass.
+    A process that was already gone before its coalition was read is not
+    that member; otherwise a busy machine could never prove a tree empty.
+    """
+    import goalflight_remote_ci_node as node
+
+    snapshots = iter([[10], [10], [11], [11]])
+    reads = {"n": 0}
+
+    def all_pids():
+        return list(next(snapshots))
+
+    def coalition(pid):
+        if pid != 10:
+            return 100
+        reads["n"] += 1
+        return 100 if reads["n"] == 1 else None
+
+    monkeypatch.setattr(node, "_all_pids", all_pids)
+    monkeypatch.setattr(node, "_pid_exists", lambda pid: pid != 10)
+    monkeypatch.setattr(node, "_coalition_id", coalition)
+    monkeypatch.setattr(node, "_start_time", lambda pid: None if pid == 10 else (5, pid))
+    monkeypatch.setattr(node, "_same_process", lambda pid, started: pid != 10)
+    assert node._coalition_members(100) == [(11, (5, 11))]
+
+
 def test_child_born_during_the_scan_is_not_an_empty_tree(monkeypatch):
     import goalflight_remote_ci_node as node
 
@@ -1914,6 +2068,52 @@ def test_draining_lease_retries_removal_before_the_deadline(tmp_path, monkeypatc
     assert lease["state"] == "draining"
 
 
+def test_draining_lease_without_launch_identity_keeps_capacity(tmp_path, monkeypatch):
+    """Pre-deadline reap must not treat 'no label' as an empty tree."""
+    import builtins
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(
+        builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
+        str(tmp_path / "auth.json"), raising=False)
+    managed = tmp_path / "managed"
+    run = managed / "runs" / "abc"
+    run.mkdir(parents=True)
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    remote = {
+        "host": "h", "pid": "44", "start_token": "st",
+        "run_dir": str(run), "lease_id": "abc", "lease_token": "tok",
+    }
+    owner = {"owner_host": "h", "owner_pid": 1, "owner_identity": "t"}
+    state = {
+        "schema": "goalflight.remote-ci.lease.v1",
+        "lease_id": "abc", "lease_token": "tok", "state": "draining",
+        "token_index": 0, "slot": str(slot),
+        "deadline_epoch": time.time() + 3600,
+        "remote_run": remote,
+    }
+    (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [os.getpid()])
+    result = node.dispatch({
+        "operation": "cancel", "managed_root": str(managed), "box": "b",
+        "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
+        "lease_token": "tok", "identity": remote, "expected_owner": owner,
+    })
+    assert result["status"] == "unknown"
+    lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+    assert lease["state"] == "draining"
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths: None)
+    again = node.dispatch({
+        "operation": "cancel", "managed_root": str(managed), "box": "b",
+        "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
+        "lease_token": "tok", "identity": remote, "expected_owner": owner,
+    })
+    assert again["status"] == "unknown"
+    assert json.loads((run / "lease.json").read_text(encoding="utf-8"))["state"] == "draining"
+
+
 def test_running_lease_is_not_killed_before_the_deadline(tmp_path, monkeypatch):
     node, managed, run, remote, owner = _dead_holder_request(
         tmp_path, monkeypatch, state_name="running", deadline_offset=3600)
@@ -1991,6 +2191,28 @@ def test_unreadable_lease_holds_capacity(tmp_path, monkeypatch):
     })
     assert report["tokens"]["in_use"] == 2
     assert report["tokens"]["free"] == 0
+    listed = node.dispatch({
+        "operation": "list", "managed_root": str(managed), "box": "b",
+        "p_cores": 8, "token_pool_size": 2,
+    })
+    unread = [row for row in listed if row.get("state") == "UNREADABLE"]
+    assert len(unread) == 1
+    assert unread[0]["path"] == str(run / "lease.json")
+    assert unread[0]["run_directory"] == str(run)
+
+
+def test_wait_dead_treats_a_zombie_as_gone(monkeypatch):
+    clock = {"n": 0}
+
+    def monotonic():
+        clock["n"] += 1
+        return 0.0 if clock["n"] < 6 else 10.0
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError(pid)))
+    _wait_dead(123)
 
 
 @pytest.mark.parametrize("kind,status,code,extra", [

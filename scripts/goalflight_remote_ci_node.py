@@ -416,9 +416,10 @@ def _all_pids():
 def _classify_pid(pid, cid):
     """One pid against one coalition.
 
-    Returns ('member', start), 'other', or None. None is UNKNOWN: the query
-    failed, the pid disappeared, or membership and start time did not describe
-    the same incarnation. A successful read of a different coalition is 'other'.
+    Returns ('member', start), 'other', 'vanished', or None. None is UNKNOWN:
+    the query failed or the pid was already gone. 'vanished' means this
+    coalition was read and then the process did not stay still. A successful
+    read of a different coalition is 'other'.
     """
     found = _coalition_id(pid)
     if found is None:
@@ -429,14 +430,20 @@ def _classify_pid(pid, cid):
     again = _coalition_id(pid)
     start_again = _start_time(pid)
     if again != found or start is None or start_again != start:
-        return None
+        # In this coalition, then gone or inconsistent before the read
+        # finished. Not the same as a process that was already dead.
+        return "vanished"
     return ("member", start)
 
 
 def _collect_members(cid, pids, found):
-    """Classify ``pids`` into ``found``. None if a live pid cannot be named."""
+    """Classify ``pids`` into ``found``. None if this pass is not proof."""
     for pid in pids:
         kind = _classify_pid(pid, cid)
+        if kind == "vanished":
+            # A member disappeared mid-classify. A child may already exist
+            # and have been omitted from this pid list. Start a new pass.
+            return None
         if kind is None:
             if _pid_exists(pid) is False:
                 found.pop(pid, None)
@@ -683,6 +690,12 @@ def clear_tree(managed, state, run):
         if label or state.get("workload_pid") or state.get("members") or _gate_open(run):
             state["job_remove_pending"] = bool(label)
             _remember_identity(run, state)
+            return False
+        # No launch identity is not proof the slot is empty. A pre-start
+        # holder can be draining with a live cwd and nothing else to name.
+        paths = [p for p in (run, state.get("slot")) if p]
+        intruders = cwd_intruders(paths)
+        if intruders is None or intruders:
             return False
         return True
     return _kill_members(run, state, cid, label)
@@ -1754,7 +1767,15 @@ def dispatch(request):
             try:
                 rows.append(record(path))
             except (OSError, ValueError):
-                continue
+                # An unreadable lease holds the whole pool. Name it so the
+                # operator can see which file, instead of an empty list.
+                rows.append({
+                    "state": "UNREADABLE",
+                    "run_directory": str(path),
+                    "path": str(path / "lease.json"),
+                    "lease_id": None,
+                    "lease_token": None,
+                })
         return rows
     if operation == 'gc':
         return gc_run_bodies(managed, request, bool(request.get('apply')))
