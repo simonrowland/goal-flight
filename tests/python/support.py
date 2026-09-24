@@ -170,6 +170,25 @@ def acp_sdk_unavailable_reason(interpreter: str) -> str | None:
     return f"interpreter {path} cannot import acp and pydantic: {detail}"
 
 
+def ensure_acp_test_interpreter(test_name: str) -> None:
+    """Run an ACP SDK test with the configured interpreter when needed."""
+    import goalflight_acp_client
+
+    resolution = goalflight_acp_client.acp_sdk_resolution()
+    if resolution.state == goalflight_acp_client.ACP_SDK_IMPORTABLE:
+        return
+    if (
+        resolution.state == goalflight_acp_client.ACP_SDK_REEXEC
+        and resolution.target_python
+    ):
+        os.execv(resolution.target_python, [resolution.target_python, *sys.argv])
+    print(
+        f"SKIP: {test_name}: ACP SDK requirement unsatisfied: "
+        f"{resolution.reason}"
+    )
+    raise SystemExit(0)
+
+
 def _current_test_name() -> str:
     return Path(sys.argv[0]).name or "test"
 

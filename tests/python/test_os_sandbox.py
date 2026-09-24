@@ -5,7 +5,11 @@ from __future__ import annotations
 
 REQUIRES_ACP_SDK = True
 
-from support import note_skip, skip_case_posix_on_native_windows
+from support import (
+    ensure_acp_test_interpreter,
+    note_skip,
+    skip_case_posix_on_native_windows,
+)
 
 import argparse
 import asyncio
@@ -25,6 +29,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+ensure_acp_test_interpreter("test_os_sandbox")
 
 import goalflight_acp_run  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
@@ -1072,8 +1077,10 @@ async def _run_sandbox_probe(profile: str) -> dict:
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
             _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
             status_path = tmp_path / f"{profile}.status.json"
+            tail_path = status_path.with_suffix(".tail")
+            tail_path.touch()
             dispatch_id = f"test-os-sandbox-{profile}-{os.getpid()}"
-            return await goalflight_acp_run.run(
+            payload = await goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-sandbox",
                     unregistered_forced=True,
@@ -1085,6 +1092,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
                     prompt=None,
                     prompt_text="probe writes",
                     mode="one-shot",
+                    tail=str(tail_path),
                     status_json=str(status_path),
                     idle_timeout=5.0,
                     heartbeat_interval=0.2,
@@ -1105,6 +1113,32 @@ async def _run_sandbox_probe(profile: str) -> dict:
                     json=True,
                 )
             )
+            if payload.get("state") != "complete":
+                # The temporary directory is removed before the caller sees
+                # this payload, so surface the artifacts while they exist.
+                print("OS sandbox ACP probe diagnostics:", file=sys.stderr)
+                print(f"payload error: {payload.get('error')!r}", file=sys.stderr)
+                for label, path in (
+                    ("status", status_path),
+                    (
+                        "agent stderr",
+                        Path(str(payload.get("agent_stderr_path") or "<missing>")),
+                    ),
+                    ("tail", tail_path),
+                ):
+                    try:
+                        contents = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError as exc:
+                        contents = f"<unavailable: {type(exc).__name__}: {exc}>"
+                    print(f"{label} [{path}]:", file=sys.stderr)
+                    print(contents or "<empty>", file=sys.stderr)
+                error = payload.get("error")
+                if isinstance(error, dict):
+                    print(
+                        f"agent stderr tail: {error.get('agent_stderr_tail', '<empty>')}",
+                        file=sys.stderr,
+                    )
+            return payload
     finally:
         goalflight_acp_run.agent_command = old_agent_command
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 REQUIRES_ACP_SDK = True
 
-from support import skip_posix_on_native_windows
+from support import ensure_acp_test_interpreter, skip_posix_on_native_windows
 
 skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and signals")
 
@@ -29,11 +29,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 FAKE_AGENT = ROOT / "tests/fixtures/acp_fake_agent.py"
+ensure_acp_test_interpreter("test_acp_failure_modes")
 
 from goalflight_acp_client import (  # noqa: E402
     ACP_IMPORT_ERROR,
-    ACP_SDK_IMPORTABLE,
-    ACP_SDK_REEXEC,
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
@@ -44,25 +43,7 @@ from goalflight_acp_client import (  # noqa: E402
     PoolExhaustedError,
     RequestPermissionResponse,
     _classify_oversized_json_rpc_head,
-    acp_sdk_resolution,
 )
-
-
-def _ensure_acp_test_interpreter() -> None:
-    """Run this SDK-dependent script with the configured ACP interpreter."""
-    resolution = acp_sdk_resolution()
-    if resolution.state == ACP_SDK_IMPORTABLE:
-        return
-    if resolution.state == ACP_SDK_REEXEC and resolution.target_python:
-        os.execv(resolution.target_python, [resolution.target_python, *sys.argv])
-    print(
-        "SKIP: test_acp_failure_modes: ACP SDK requirement unsatisfied: "
-        f"{resolution.reason}"
-    )
-    raise SystemExit(0)
-
-
-_ensure_acp_test_interpreter()
 
 from goalflight_acp_run import (  # noqa: E402
     _apply_user_confirm_reply_batch,
@@ -1137,33 +1118,25 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
     """Acceptance: production bounds preserve 55 minutes of buffered work."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        args = argparse.Namespace(
-            dispatch_id="read-only-buffered-acceptance",
-            agent="codex",
-            account=None,
-            read_only=True,
-            os_sandbox=None,
-            controller_pid=None,
-            controller_session_id=None,
-            controller_label=None,
-            task_ids=[],
-            launch_detached=False,
-            queue_launch_token=None,
-            cwd=str(ROOT),
-            prompt="buffered acceptance",
-            prompt_file=None,
-            no_orientation=True,
-            model=None,
-            priority="normal",
-            capacity_wait_s=0,
-            max_idle_secs=None,
-            poll_secs=0.05,
-            permission_mode="auto",
-            permission_dir=None,
-            permission_inline_timeout_s=None,
-            permission_user_timeout_s=None,
-            interactive=False,
-            context_mode=None,
+        args = goalflight_dispatch._build_launch_parser().parse_args(
+            [
+                "--dispatch-id",
+                "read-only-buffered-acceptance",
+                "--agent",
+                "codex",
+                "--read-only",
+                "--cwd",
+                str(ROOT),
+                "--prompt",
+                "buffered acceptance",
+                "--no-orientation",
+                "--capacity-wait-s",
+                "0",
+                "--poll-secs",
+                "0.05",
+                "--permission-mode",
+                "auto",
+            ]
         )
         goalflight_dispatch._apply_max_idle_default(args)
         cfg = goalflight_dispatch._build_acp_cfg(
