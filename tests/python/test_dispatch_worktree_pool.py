@@ -139,6 +139,105 @@ def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
         holder.release()
 
 
+def test_full_pool_branch_refusal_leaves_main_checkout_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "held-occupant")
+    before = (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "branch", "--show-current"),
+        (repo / ".git" / "index").read_bytes(),
+    )
+    try:
+        command = _dispatch_cmd(
+            tmp_path,
+            repo,
+            "need-a-seat-at-main",
+            sys.executable,
+            "-c",
+            "print('nope')",
+        )
+        separator = command.index("--")
+        command[separator:separator] = ["--worktree", "main"]
+        proc = subprocess.run(
+            command,
+            cwd=str(repo),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 2, combined
+        assert "worktrees busy in repo" in combined, combined
+        assert (
+            _git(repo, "rev-parse", "HEAD"),
+            _git(repo, "branch", "--show-current"),
+            (repo / ".git" / "index").read_bytes(),
+        ) == before
+    finally:
+        holder.release()
+
+
+def test_main_worktree_mutation_guard_refuses_reset(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    before = _git(repo, "rev-parse", "HEAD")
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatError,
+        match="repository main worktree",
+    ):
+        goalflight_worktree_pool._git(repo, "reset", "--hard")
+    assert _git(repo, "rev-parse", "HEAD") == before
+
+
+def test_release_refuses_missing_unresolved_or_main_seat(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    before = (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "branch", "--show-current"),
+        (repo / ".git" / "index").read_bytes(),
+    )
+    goalflight_dispatch._release_withdrawn_worktree(
+        {"project_root": str(repo), "worker_cwd": None, "worktree_path": None},
+        "completed-seatless",
+    )
+    for path, expected in (
+        (None, "no worktree seat path was recorded"),
+        (str(repo), "resolves to project root"),
+        (str(tmp_path / "missing-seat"), "unresolved"),
+    ):
+        released, reason = goalflight_worktree_pool.release_worktree_for_dispatch(
+            repo, path, "completed-seatless"
+        )
+        assert not released
+        assert expected in reason
+    assert (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "branch", "--show-current"),
+        (repo / ".git" / "index").read_bytes(),
+    ) == before
+
+
+def test_resume_refuses_missing_or_relative_recorded_seat(tmp_path: Path, monkeypatch) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError, match="no worker cwd evidence"
+    ):
+        goalflight_dispatch._resume_worker_cwd({"worker_cwd": "."})
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError,
+        match="missing or unresolved",
+    ):
+        goalflight_dispatch._resume_worker_cwd(
+            {"worker_cwd": str(tmp_path / "missing-seat")}
+        )
+
+
 def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
