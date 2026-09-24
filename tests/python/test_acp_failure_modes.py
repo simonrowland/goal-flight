@@ -5,7 +5,11 @@ from __future__ import annotations
 
 REQUIRES_ACP_SDK = True
 
-from support import ensure_acp_test_interpreter, skip_posix_on_native_windows
+from support import (
+    ensure_acp_test_interpreter,
+    registered_child_environment,
+    skip_posix_on_native_windows,
+)
 
 skip_posix_on_native_windows("uses POSIX process groups, start_new_session, and signals")
 
@@ -511,8 +515,6 @@ def _run_fake_runner(
         )
         if extra_env:
             env.update(extra_env)
-        with patch.dict(os.environ, env, clear=False):
-            goalflight_journal.Journal.create(ROOT)
         args = [
             sys.executable,
             "scripts/goalflight_acp_run.py",
@@ -548,41 +550,42 @@ def _run_fake_runner(
             args.extend(["--user-confirm-timeout-s", str(user_confirm_timeout_s)])
         if stall_kill:
             args.append("--stall-kill")
-        proc = subprocess.Popen(
-            args,
-            cwd=ROOT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            _kill_from_status(status)
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            stdout, stderr = proc.communicate()
-            raise AssertionError(f"{scenario} runner timed out\nstdout={stdout}\nstderr={stderr}")
-        if not status.exists():
-            raise AssertionError(f"{scenario} wrote no status\nstdout={stdout}\nstderr={stderr}")
-        status_payload = json.loads(status.read_text())
-        if state_snapshot is not None:
-            capacity_path = state_dir / "capacity.json"
-            state_snapshot["capacity"] = (
-                json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
+        with registered_child_environment(ROOT, env=env) as child_env:
+            proc = subprocess.Popen(
+                args,
+                cwd=ROOT,
+                env=child_env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
-            runs_dir = state_dir / "runs.d"
-            state_snapshot["records"] = [
-                json.loads(path.read_text())
-                for path in sorted(runs_dir.glob("*.json"))
-            ] if runs_dir.exists() else []
-        return proc.returncode, status_payload, stdout, stderr
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                _kill_from_status(status)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                stdout, stderr = proc.communicate()
+                raise AssertionError(f"{scenario} runner timed out\nstdout={stdout}\nstderr={stderr}")
+            if not status.exists():
+                raise AssertionError(f"{scenario} wrote no status\nstdout={stdout}\nstderr={stderr}")
+            status_payload = json.loads(status.read_text())
+            if state_snapshot is not None:
+                capacity_path = state_dir / "capacity.json"
+                state_snapshot["capacity"] = (
+                    json.loads(capacity_path.read_text()) if capacity_path.exists() else {}
+                )
+                runs_dir = state_dir / "runs.d"
+                state_snapshot["records"] = [
+                    json.loads(path.read_text())
+                    for path in sorted(runs_dir.glob("*.json"))
+                ] if runs_dir.exists() else []
+            return proc.returncode, status_payload, stdout, stderr
 
 
 @skipif(os.name == "nt", reason="matrix timeout reap is POSIX process-group behavior")
@@ -964,8 +967,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert status["killed_by_heartbeat"] is False, status
         assert status["wedged_by_heartbeat"] is False, status
         assert status["markers"]["STALLED"], status
-        assert status.get("controller_session_id") is None, status
-        assert status.get("controller_pid") is None, status
+        assert status.get("controller_session_id"), status
+        assert status.get("controller_pid") == os.getpid(), status
         assert _pid_alive(worker_pid), (status, stderr)
 
         dispatch_id = status["dispatch_id"]
@@ -973,8 +976,8 @@ def case_runner_progress_stall_detaches_by_default() -> None:
         assert records and records[-1].get("state") == "stalled", records
         assert records[-1].get("terminal_state") == "stalled", records[-1]
         assert records[-1].get("worker_still_alive") is True, records[-1]
-        assert records[-1].get("controller_session_id") is None, records[-1]
-        assert records[-1].get("controller_pid") is None, records[-1]
+        assert records[-1].get("controller_session_id"), records[-1]
+        assert records[-1].get("controller_pid") == os.getpid(), records[-1]
         leases = [
             lease
             for lease in (state_snapshot.get("capacity", {}).get("leases") or {}).values()
@@ -1466,13 +1469,25 @@ def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
             timeout_s=30.0,
         )
 
+    # 8cd581d4 changed unmeasurable positive-CPU silence from a kill to a
+    # bounded indeterminate result with the worker detached for the operator.
     assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "failed", status
-    assert status["error"]["reason"] == "empty_session", status
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["reason"] == "event_silence_outer_bound", status
+    assert (
+        status["error"]["observed_state"]
+        == "positive_cpu_without_observable_progress"
+    ), status
+    assert status["error"]["recent_forward_progress_observed"] is False, status
+    assert status["liveness_indeterminate_probes"] == 3, status
     assert status["killed_by_heartbeat"] is False, status
-    assert status["wedge_progress_seen"] >= 5, status
-    assert status["worker_alive"] is False, status
-    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+    assert status["worker_alive"] is True, status
+    worker_pid = status.get("worker_pid")
+    try:
+        assert status["wedge_progress_seen"] >= 1, status
+        assert _pid_alive(worker_pid), (status, stderr)
+    finally:
+        _force_kill(worker_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2170,6 +2185,10 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 "GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE": "1",
             }
         )
+        child_stack = contextlib.ExitStack()
+        child_env = child_stack.enter_context(
+            registered_child_environment(ROOT, env=env)
+        )
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -2204,7 +2223,7 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 "--json",
             ],
             cwd=ROOT,
-            env=env,
+            env=child_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2237,6 +2256,7 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
             proc.communicate(timeout=10)
+            child_stack.close()
 
 
 def case_user_confirm_midturn_deadline_reenables_remote_silence_terminal() -> None:
@@ -2676,7 +2696,8 @@ def case_handshake_wedge_kills_before_respawn() -> None:
                 for pid in spawned:
                     _force_kill(pid)
 
-    asyncio.run(_run())
+    with registered_child_environment(ROOT):
+        asyncio.run(_run())
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2715,7 +2736,8 @@ def case_pool_exhaustion_then_drain() -> None:
                 for pid in spawned:
                     _force_kill(pid)
 
-    asyncio.run(_run())
+    with registered_child_environment(ROOT):
+        asyncio.run(_run())
 
 
 def case_env_ipc_paths_are_constrained() -> None:

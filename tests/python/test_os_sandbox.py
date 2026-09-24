@@ -8,6 +8,7 @@ REQUIRES_ACP_SDK = True
 from support import (
     ensure_acp_test_interpreter,
     note_skip,
+    registered_child_environment,
     skip_case_posix_on_native_windows,
 )
 
@@ -992,41 +993,42 @@ def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
             _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
             status_path = tmp_path / "status.json"
             stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                payload = asyncio.run(
-                    goalflight_acp_run.run(
-                        argparse.Namespace(
-                            agent="fake-sandbox",
-                            unregistered_forced=True,
-                            cwd=str(workspace),
-                            session_id="title-allow-warn-session",
-                            dispatch_id=f"test-title-allow-warn-{os.getpid()}",
-                            prompt_id=None,
-                            prompt=None,
-                            prompt_text="COMPLETE: warn probe",
-                            mode="one-shot",
-                            status_json=str(status_path),
-                            idle_timeout=5.0,
-                            heartbeat_interval=0.2,
-                            wedge_samples=100,
-                            max_tool_s=60.0,
-                            max_quiet_s=60.0,
-                            progress_stall_s=60.0,
-                            liveness_profile="local_compute",
-                            remote_turn_silence_s=None,
-                            remote_turn_cancel_grace_s=0.0,
-                            cpu_epsilon=0.1,
-                            context_mode="disabled",
-                            permission_mode="auto",
-                            permission_dir=None,
-                            permission_inline_timeout_s=None,
-                            permission_user_timeout_s=None,
-                            permission_allow_tool_title_pattern=[".*"],
-                            os_sandbox=OS_SANDBOX_OFF,
-                            json=True,
+            with registered_child_environment(workspace):
+                with contextlib.redirect_stderr(stderr):
+                    payload = asyncio.run(
+                        goalflight_acp_run.run(
+                            argparse.Namespace(
+                                agent="fake-sandbox",
+                                unregistered_forced=True,
+                                cwd=str(workspace),
+                                session_id="title-allow-warn-session",
+                                dispatch_id=f"test-title-allow-warn-{os.getpid()}",
+                                prompt_id=None,
+                                prompt=None,
+                                prompt_text="COMPLETE: warn probe",
+                                mode="one-shot",
+                                status_json=str(status_path),
+                                idle_timeout=5.0,
+                                heartbeat_interval=0.2,
+                                wedge_samples=100,
+                                max_tool_s=60.0,
+                                max_quiet_s=60.0,
+                                progress_stall_s=60.0,
+                                liveness_profile="local_compute",
+                                remote_turn_silence_s=None,
+                                remote_turn_cancel_grace_s=0.0,
+                                cpu_epsilon=0.1,
+                                context_mode="disabled",
+                                permission_mode="auto",
+                                permission_dir=None,
+                                permission_inline_timeout_s=None,
+                                permission_user_timeout_s=None,
+                                permission_allow_tool_title_pattern=[".*"],
+                                os_sandbox=OS_SANDBOX_OFF,
+                                json=True,
+                            )
                         )
                     )
-                )
             text = stderr.getvalue()
             assert "WARNING — broad title-allow pattern" in text, text
             assert payload.get("state") in {"complete", "failed", "blocked_os_sandbox", "blocked_adapter_gate"}, payload
@@ -1080,39 +1082,40 @@ async def _run_sandbox_probe(profile: str) -> dict:
             tail_path = status_path.with_suffix(".tail")
             tail_path.touch()
             dispatch_id = f"test-os-sandbox-{profile}-{os.getpid()}"
-            payload = await goalflight_acp_run.run(
-                argparse.Namespace(
-                    agent="fake-sandbox",
-                    unregistered_forced=True,
-                    cwd=str(workspace),
-                    in_place=True,
-                    session_id=f"{dispatch_id}-session",
-                    dispatch_id=dispatch_id,
-                    prompt_id=None,
-                    prompt=None,
-                    prompt_text="probe writes",
-                    mode="one-shot",
-                    tail=str(tail_path),
-                    status_json=str(status_path),
-                    idle_timeout=5.0,
-                    heartbeat_interval=0.2,
-                    wedge_samples=100,
-                    max_tool_s=60.0,
-                    max_quiet_s=60.0,
-                    progress_stall_s=60.0,
-                    liveness_profile="local_compute",
-                    remote_turn_silence_s=None,
-                    remote_turn_cancel_grace_s=0.0,
-                    cpu_epsilon=0.1,
-                    context_mode="enabled",
-                    permission_mode="auto",
-                    permission_dir=None,
-                    permission_inline_timeout_s=None,
-                    permission_user_timeout_s=None,
-                    os_sandbox=profile,
-                    json=True,
+            with registered_child_environment(workspace):
+                payload = await goalflight_acp_run.run(
+                    argparse.Namespace(
+                        agent="fake-sandbox",
+                        unregistered_forced=True,
+                        cwd=str(workspace),
+                        in_place=True,
+                        session_id=f"{dispatch_id}-session",
+                        dispatch_id=dispatch_id,
+                        prompt_id=None,
+                        prompt=None,
+                        prompt_text="probe writes",
+                        mode="one-shot",
+                        tail=str(tail_path),
+                        status_json=str(status_path),
+                        idle_timeout=5.0,
+                        heartbeat_interval=0.2,
+                        wedge_samples=100,
+                        max_tool_s=60.0,
+                        max_quiet_s=60.0,
+                        progress_stall_s=60.0,
+                        liveness_profile="local_compute",
+                        remote_turn_silence_s=None,
+                        remote_turn_cancel_grace_s=0.0,
+                        cpu_epsilon=0.1,
+                        context_mode="enabled",
+                        permission_mode="auto",
+                        permission_dir=None,
+                        permission_inline_timeout_s=None,
+                        permission_user_timeout_s=None,
+                        os_sandbox=profile,
+                        json=True,
+                    )
                 )
-            )
             if payload.get("state") != "complete":
                 # The temporary directory is removed before the caller sees
                 # this payload, so surface the artifacts while they exist.
@@ -1274,39 +1277,42 @@ def case_runner_translates_claude_read_only_to_acp_permissions() -> None:
             )
             manifest_path.write_text(json.dumps(manifest))
             status_path = tmp_path / "status.json"
-            payload = asyncio.run(
-                goalflight_acp_run.run(
-                    argparse.Namespace(
-                        agent="claude",
-                        unregistered_forced=True,
-                        cwd=str(ROOT),
-                        session_id="claude-read-only-fallback",
-                        dispatch_id=f"test-claude-read-only-fallback-{os.getpid()}",
-                        prompt_id=None,
-                        prompt=None,
-                        prompt_text="COMPLETE: fallback probe",
-                        mode="one-shot",
-                        status_json=str(status_path),
-                        idle_timeout=5.0,
-                        heartbeat_interval=0.2,
-                        wedge_samples=100,
-                        max_tool_s=60.0,
-                        max_quiet_s=60.0,
-                        progress_stall_s=60.0,
-                        liveness_profile="local_compute",
-                        remote_turn_silence_s=None,
-                        remote_turn_cancel_grace_s=0.0,
-                        cpu_epsilon=0.1,
-                        context_mode="disabled",
-                        permission_mode="auto",
-                        permission_dir=None,
-                        permission_inline_timeout_s=None,
-                        permission_user_timeout_s=None,
-                        permission_allow_tool_title_pattern=[],
-                        read_only=True,
-                        os_sandbox=OS_SANDBOX_READ_ONLY,
-                        json=True,
-                    )
+
+            def _run_registered(cfg: argparse.Namespace) -> dict:
+                with registered_child_environment(ROOT):
+                    return asyncio.run(goalflight_acp_run.run(cfg))
+
+            payload = _run_registered(
+                argparse.Namespace(
+                    agent="claude",
+                    unregistered_forced=True,
+                    cwd=str(ROOT),
+                    session_id="claude-read-only-fallback",
+                    dispatch_id=f"test-claude-read-only-fallback-{os.getpid()}",
+                    prompt_id=None,
+                    prompt=None,
+                    prompt_text="COMPLETE: fallback probe",
+                    mode="one-shot",
+                    status_json=str(status_path),
+                    idle_timeout=5.0,
+                    heartbeat_interval=0.2,
+                    wedge_samples=100,
+                    max_tool_s=60.0,
+                    max_quiet_s=60.0,
+                    progress_stall_s=60.0,
+                    liveness_profile="local_compute",
+                    remote_turn_silence_s=None,
+                    remote_turn_cancel_grace_s=0.0,
+                    cpu_epsilon=0.1,
+                    context_mode="disabled",
+                    permission_mode="auto",
+                    permission_dir=None,
+                    permission_inline_timeout_s=None,
+                    permission_user_timeout_s=None,
+                    permission_allow_tool_title_pattern=[],
+                    read_only=True,
+                    os_sandbox=OS_SANDBOX_READ_ONLY,
+                    json=True,
                 )
             )
             expected = {
@@ -1327,39 +1333,37 @@ def case_runner_translates_claude_read_only_to_acp_permissions() -> None:
             ) == "deny"
 
             no_flag_status = tmp_path / "no-flag.status.json"
-            no_flag_payload = asyncio.run(
-                goalflight_acp_run.run(
-                    argparse.Namespace(
-                        agent="claude",
-                        unregistered_forced=True,
-                        cwd=str(ROOT),
-                        session_id="claude-no-sandbox-request",
-                        dispatch_id=f"test-claude-no-sandbox-request-{os.getpid()}",
-                        prompt_id=None,
-                        prompt=None,
-                        prompt_text="COMPLETE: no-flag probe",
-                        mode="one-shot",
-                        status_json=str(no_flag_status),
-                        idle_timeout=5.0,
-                        heartbeat_interval=0.2,
-                        wedge_samples=100,
-                        max_tool_s=60.0,
-                        max_quiet_s=60.0,
-                        progress_stall_s=60.0,
-                        liveness_profile="local_compute",
-                        remote_turn_silence_s=None,
-                        remote_turn_cancel_grace_s=0.0,
-                        cpu_epsilon=0.1,
-                        context_mode="disabled",
-                        permission_mode="auto",
-                        permission_dir=None,
-                        permission_inline_timeout_s=None,
-                        permission_user_timeout_s=None,
-                        permission_allow_tool_title_pattern=[],
-                        read_only=False,
-                        os_sandbox=OS_SANDBOX_OFF,
-                        json=True,
-                    )
+            no_flag_payload = _run_registered(
+                argparse.Namespace(
+                    agent="claude",
+                    unregistered_forced=True,
+                    cwd=str(ROOT),
+                    session_id="claude-no-sandbox-request",
+                    dispatch_id=f"test-claude-no-sandbox-request-{os.getpid()}",
+                    prompt_id=None,
+                    prompt=None,
+                    prompt_text="COMPLETE: no-flag probe",
+                    mode="one-shot",
+                    status_json=str(no_flag_status),
+                    idle_timeout=5.0,
+                    heartbeat_interval=0.2,
+                    wedge_samples=100,
+                    max_tool_s=60.0,
+                    max_quiet_s=60.0,
+                    progress_stall_s=60.0,
+                    liveness_profile="local_compute",
+                    remote_turn_silence_s=None,
+                    remote_turn_cancel_grace_s=0.0,
+                    cpu_epsilon=0.1,
+                    context_mode="disabled",
+                    permission_mode="auto",
+                    permission_dir=None,
+                    permission_inline_timeout_s=None,
+                    permission_user_timeout_s=None,
+                    permission_allow_tool_title_pattern=[],
+                    read_only=False,
+                    os_sandbox=OS_SANDBOX_OFF,
+                    json=True,
                 )
             )
             assert no_flag_payload["state"] == "complete", no_flag_payload
@@ -1466,7 +1470,8 @@ def case_pool_canonicalizes_os_sandbox_alias_for_reuse() -> None:
             else:
                 os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old_scenario
 
-    asyncio.run(_run())
+    with registered_child_environment(ROOT):
+        asyncio.run(_run())
 
 
 def case_pool_blocks_undeclared_os_sandbox() -> None:
