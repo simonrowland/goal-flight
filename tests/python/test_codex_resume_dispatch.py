@@ -2904,7 +2904,46 @@ def test_resume_reuses_worktree_and_does_not_mint_a_new_seat(
     """
     parent_id = "wt-resume-parent"
     worktree = tmp_path / "worktrees" / "controller" / "s-1"
-    worktree.mkdir(parents=True)
+    for git_args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "goalflight-test@example.invalid"),
+        ("config", "user.name", "Goal Flight Test"),
+    ):
+        result = subprocess.run(
+            ["git", *git_args],
+            cwd=tmp_path,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (git_args, result.stderr)
+    (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+    for git_args in (("add", "base.txt"), ("commit", "-q", "-m", "base")):
+        result = subprocess.run(
+            ["git", *git_args],
+            cwd=tmp_path,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (git_args, result.stderr)
+    result = subprocess.run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            f"worktree/{parent_id}",
+            str(worktree),
+            "HEAD",
+        ],
+        cwd=tmp_path,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
     (worktree / "partial.txt").write_text("keep me\n", encoding="utf-8")
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
