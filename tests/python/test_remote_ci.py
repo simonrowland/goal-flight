@@ -1723,8 +1723,8 @@ def test_same_boot_coalition_id_uses_xnu_monotonicity_without_parentage(tmp_path
     assert node._private_tree_proof(state, 100, [(99991, (1, 2))], run=run) is True
 
 
-def test_same_boot_stale_coalition_record_is_not_private(tmp_path, monkeypatch):
-    """An inconsistent same-boot wrapper record fails closed as a poison."""
+def test_mismatched_recorded_coalition_ids_are_not_private(tmp_path, monkeypatch):
+    """Reject a wrapper record whose coalition ID differs from durable state."""
     import goalflight_remote_ci_node as node
 
     run = tmp_path / "run"
