@@ -2246,6 +2246,16 @@ def test_supervise_proven_migration_releases_existing_coverage_once() -> None:
             "process_start_identity",
             return_value={"start_token": start_token},
         ),
+        mock.patch.object(
+            _carrier_messages,
+            "_pid_in_caller_ancestry",
+            return_value=False,
+        ),
+        mock.patch.object(
+            _carrier_messages,
+            "_pid_in_caller_process_group",
+            return_value=False,
+        ),
         mock.patch.object(_carrier_messages.os, "kill", side_effect=record_release) as kill,
         mock.patch.object(_carrier_messages.time, "sleep"),
         contextlib.redirect_stderr(stderr),
@@ -2308,6 +2318,16 @@ def test_supervise_uncertain_release_arms_proven_replacement() -> None:
             _carrier_messages.goalflight_compat,
             "process_start_identity",
             return_value={"start_token": start_token},
+        ),
+        mock.patch.object(
+            _carrier_messages,
+            "_pid_in_caller_ancestry",
+            return_value=False,
+        ),
+        mock.patch.object(
+            _carrier_messages,
+            "_pid_in_caller_process_group",
+            return_value=False,
         ),
         mock.patch.object(_carrier_messages.os, "kill") as kill,
         mock.patch.object(
