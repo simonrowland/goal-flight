@@ -150,6 +150,76 @@ def test_macos_codex_acp_read_only_uses_shared_checkout() -> None:
         assert cfg.worktree == "shared-read-only"
 
 
+def test_read_only_acp_resume_rejects_rebound_checkout_before_spawn() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = _make_repo(tmp)
+
+        def git(*args: str) -> str:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+
+        recorded_head = git("rev-parse", "HEAD")
+        parent_id = "acp-rebound-parent"
+        git("branch", f"worktree/{parent_id}", recorded_head)
+        recorded_checkout = tmp / "recorded-checkout"
+        git("worktree", "add", str(recorded_checkout), f"worktree/{parent_id}")
+        (repo / "tracked.txt").write_text("advanced\n", encoding="utf-8")
+        git("add", "tracked.txt")
+        git("commit", "-m", "advance main")
+
+        state_dir = tmp / "state"
+        record = {
+            "schema": dispatch_mod.goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "claude",
+            "engine": "claude",
+            "shape": "acp",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(recorded_checkout),
+            "worktree_id": recorded_checkout.name,
+            "worktree_path": str(recorded_checkout),
+            "worktree_branch": f"worktree/{parent_id}",
+            "worktree_head": recorded_head,
+            "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+        }
+        args = _base_acp_args(tmp, agent="claude", dispatch_id="acp-rebound-child")
+        args.cwd = str(repo)
+        args.parent_dispatch_id = parent_id
+        args.read_only = True
+        args.worker = []
+        args.shape = "acp"
+
+        with (
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(
+                goalflight_acp_run,
+                "acp_permission_read_only_supported",
+                return_value=True,
+            ),
+        ):
+            dispatch_mod.goalflight_ledger.write_record(record)
+            cfg = dispatch_mod._build_acp_cfg(
+                args, status_json=tmp / "acp-rebound.status.json"
+            )
+            assert cfg.worktree == "shared-read-only"
+            try:
+                dispatch_mod._revalidate_read_only_resume_worktree(cfg)
+            except dispatch_mod.DispatchUsageError as exc:
+                assert "actual branch main" in str(exc)
+                assert f"expected branch worktree/{parent_id}" in str(exc)
+            else:
+                raise AssertionError("rebound read-only ACP checkout was accepted")
+
+
 def test_acp_help_describes_repository_worktree_pool() -> None:
     proc = subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "goalflight_acp_run.py"), "--help"],

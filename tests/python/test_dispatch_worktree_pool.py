@@ -647,6 +647,32 @@ def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
     prompt = tmp_path / "resume.md"
     prompt.write_text("Continue the worker.\n", encoding="utf-8")
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    queue_dir = tmp_path / "dispatch-queue"
+    queue_dir.mkdir()
+    claim = queue_dir / f"{child_id}.json.claimed-1"
+    queue_token = "readonly-capacity-queue-token"
+    claim.write_text(
+        json.dumps(
+            {
+                "schema": goalflight_dispatch.DISPATCH_QUEUE_SCHEMA,
+                "dispatch_id": child_id,
+                "dispatch_argv": [
+                    "--agent",
+                    "grok-code",
+                    "--shape",
+                    "bash",
+                    "--cwd",
+                    str(seat),
+                    "--read-only",
+                ],
+                "queue_launch_token": queue_token,
+                "created_at": goalflight_ledger.utc_now(),
+                "project_root": str(repo),
+                "request": {"cwd": str(seat), "tail": str(tmp_path / "tail")},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     def acquire_capacity(*_args, **_kwargs):
         _git(seat, "checkout", "worktree/readonly-foreign")
@@ -684,12 +710,6 @@ def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
         "cleanup_dispatch_data",
         lambda *_a, **_k: None,
     )
-    monkeypatch.setattr(goalflight_dispatch, "_mark_queue_claim_launch_started", lambda _args: None)
-    monkeypatch.setattr(
-        goalflight_dispatch,
-        "_mark_queue_claim_worker_spawn_intent",
-        lambda _args: None,
-    )
     monkeypatch.setattr(
         goalflight_dispatch,
         "_attempt_claiming_worker_argv",
@@ -700,6 +720,16 @@ def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
         "_materialize_steer_prompt",
         lambda path, *_a, **_k: Path(path),
     )
+    real_main = goalflight_dispatch.main
+
+    def main_with_queue_claim(argv=None, **kwargs):
+        resume_plan = kwargs["resume_plan"]
+        resume_plan["args"].from_queue = True
+        resume_plan["args"].queue_claim_path = str(claim)
+        resume_plan["args"].queue_launch_token = queue_token
+        return real_main(argv, **kwargs)
+
+    monkeypatch.setattr(goalflight_dispatch, "main", main_with_queue_claim)
     spawned: list[object] = []
     monkeypatch.setattr(
         goalflight_dispatch,
@@ -714,6 +744,22 @@ def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
     assert "actual branch worktree/readonly-foreign" in error
     assert f"expected branch worktree/{parent_id}" in error
     assert spawned == []
+    restored_entry = json.loads(claim.read_text(encoding="utf-8"))
+    assert not restored_entry.get("queue_worker_spawn_intent")
+    for key in (
+        "queue_launch_started",
+        "queue_launch_started_at",
+        "queue_launcher_pid",
+        "queue_launcher_identity",
+    ):
+        restored_entry.pop(key, None)
+    claim.write_text(json.dumps(restored_entry), encoding="utf-8")
+    restored, _decision = goalflight_dispatch._bounded_restore_claim(
+        claim, restored_entry, queue_dir
+    )
+    assert restored is True
+    assert (queue_dir / f"{child_id}.json").exists()
+    assert not claim.exists()
 
 
 def test_resume_validates_unmanaged_git_checkout_identity_and_head(
