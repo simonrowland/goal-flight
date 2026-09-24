@@ -1060,10 +1060,20 @@ def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
     assert not _dispatch_home(tmp_path, child_id).exists()
 
 
+@pytest.mark.parametrize(
+    ("existing_state", "existing_terminal_state", "description"),
+    [
+        ("running", "unknown", "non-terminal"),
+        ("complete", "complete", "terminal"),
+    ],
+)
 def test_resume_replayed_child_id_refuses_before_account_home_build(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    existing_state: str,
+    existing_terminal_state: str,
+    description: str,
 ) -> None:
     parent_id = "replay-parent"
     child_id = "replay-child"
@@ -1078,8 +1088,8 @@ def test_resume_replayed_child_id_refuses_before_account_home_build(
     )
     existing.update(
         {
-            "state": "running",
-            "terminal_state": "unknown",
+            "state": existing_state,
+            "terminal_state": existing_terminal_state,
             "parent_dispatch_id": parent_id,
         }
     )
@@ -1126,7 +1136,7 @@ def test_resume_replayed_child_id_refuses_before_account_home_build(
     )
 
     assert rc == 64
-    assert "already has a non-terminal ledger record" in capsys.readouterr().err
+    assert f"already has a {description} ledger record" in capsys.readouterr().err
     assert S.rollout_path(existing_home, OTHER_CANONICAL_SESSION_ID) is not None
 
 
@@ -2017,18 +2027,29 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
     prompt = tmp_path / "revisions.md"
     prompt.write_text("Resume only after capacity admission.\n", encoding="utf-8")
     _stub_detached_runtime(monkeypatch)
+    target = _dispatch_home(tmp_path, child_id)
+    resolver_calls: list[str] = []
 
-    def deny_capacity(args, *, project_root, status_json):
-        D.write_status(
-            status_json,
-            {
-                "state": "blocked_capacity",
-                "reason": {"reason": "machine_worker_cap"},
-            },
-        )
+    def resolve(_project_root, _account, dispatch_id, **_kwargs):
+        resolver_calls.append(dispatch_id)
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target), "resolved-seat"
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+
+    def deny_capacity(_args, *, project_root, status_json):
+        assert status_json is None
         raise SystemExit(2)
 
     monkeypatch.setattr(D, "_acquire_capacity", deny_capacity)
+    monkeypatch.setattr(
+        D,
+        "_stamp_controller_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capacity refusal must precede controller stamping"
+        ),
+    )
     bind_calls: list[str] = []
     original_record = D._record_dispatch_worktree
 
@@ -2045,7 +2066,12 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
         )
     assert exc_info.value.code == 2
     assert bind_calls == []
-    assert json.loads(L.record_path(child_id).read_text(encoding="utf-8"))["state"] == "blocked_capacity"
+    assert resolver_calls == []
+    assert not target.exists()
+    assert not L.record_path(child_id).exists()
+    assert not (
+        D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
+    ).exists()
     # Repository-scoped pool lock files persist as registration metadata; the
     # refused child must not replace the recorded parent occupant.
     lock_path = WP.worktree_seat_lock_path(tmp_path, seat.name)
@@ -2713,6 +2739,7 @@ def test_resume_of_quota_exhausted_dispatch_honors_account(
     parent_id = "quota-parent"
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
+    _configure_account(tmp_path, "25ca6b")
     record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
     record.update(
         {

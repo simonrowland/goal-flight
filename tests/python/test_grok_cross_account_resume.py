@@ -121,6 +121,59 @@ def test_same_account_resume_is_preferred(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert "--resume-reconstruction" not in argv
 
 
+def test_invalid_grok_target_refuses_before_resume_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _accounts(tmp_path, "old")
+    record = _record(tmp_path)
+    record.update(
+        {
+            "schema": L.SCHEMA,
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(tmp_path),
+            "engine_session_id": SESSION,
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-invalid-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    migrated: list[dict] = []
+    stamped: list[dict] = []
+    monkeypatch.setattr(
+        D,
+        "migrate_seat_session",
+        lambda **kwargs: migrated.append(kwargs) or (True, "moved"),
+    )
+    monkeypatch.setattr(
+        D,
+        "_stamp_controller_session",
+        lambda *args, **kwargs: stamped.append(kwargs) or {"claimed": True},
+    )
+
+    assert D._cmd_resume(
+        [
+            record["dispatch_id"],
+            "--prompt-file",
+            str(prompt),
+            "--account",
+            "missing-grok-account",
+            "--unregistered-forced",
+        ]
+    ) == 64
+    assert "missing-grok-account" in capsys.readouterr().err
+    assert migrated == []
+    assert stamped == []
+    assert not L.record_path(child_id).exists()
+    assert not (
+        D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
+    ).exists()
+
+
 def test_walled_account_carries_session_to_healthy_account(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -142,6 +195,8 @@ def test_walled_account_carries_session_to_healthy_account(
     assert _option(argv, "--account") == "new"
     assert _option(argv, "--resume-mode") == "carried"
     assert _option(argv, "--engine-session-id") == SESSION
+    assert not D._seat_session_dir("old", "grok", record["worker_cwd"], SESSION).exists()
+    assert D._seat_session_dir("new", "grok", record["worker_cwd"], SESSION).is_dir()
 
 
 def test_failed_carry_reconstructs_prompt_and_starts_fresh(

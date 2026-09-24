@@ -758,6 +758,12 @@ def _lock_metadata(lock_file: TextIO) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _known_lock_dispatch_id(lock_file: TextIO) -> str | None:
+    value = _lock_metadata(lock_file).get("dispatch_id")
+    text = str(value or "").strip()
+    return text or None
+
+
 def _occupant_description(lock_file: TextIO, seat_name: str) -> str:
     payload = _lock_metadata(lock_file)
     dispatch_id = str(payload.get("dispatch_id") or "unknown-dispatch")
@@ -1217,7 +1223,7 @@ def _prepare_claimed_seat(
     seat_name: str,
     lock_file: TextIO,
     dispatch_id: str,
-    prior_dispatch_id: str,
+    prior_dispatch_id: str | None,
     branch: str,
     base_commit: str,
     reset: bool,
@@ -1328,9 +1334,7 @@ def _prepare_claimed_seat(
         quarantine_branch=quarantine_branch,
         branch=actual_branch,
         keep_ref=keep_ref,
-        reclaimed_dispatch_id=(
-            prior_dispatch_id if prior_dispatch_id != "unknown-dispatch" else None
-        ),
+        reclaimed_dispatch_id=prior_dispatch_id,
         controller_label=controller_label,
     )
 
@@ -1570,9 +1574,15 @@ def acquire_worktree_seat(
                     "refusing to git worktree add a new unmanaged path"
                 )
             try:
-                prior_dispatch_id = str(
-                    _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
-                )
+                prior_dispatch_id = _known_lock_dispatch_id(lock_file)
+                if (
+                    expected_prior_dispatch_id is not None
+                    and prior_dispatch_id is None
+                ):
+                    raise WorktreeSeatUnavailable(
+                        f"resume refused: worktree {seat_name} has unknown ownership; "
+                        "its lock metadata is empty or unreadable, so it is not reclaimable"
+                    )
                 if (
                     expected_prior_dispatch_id is not None
                     and prior_dispatch_id != expected_prior_dispatch_id
@@ -1642,9 +1652,7 @@ def acquire_worktree_seat(
                     lock_file.close()
                     return None
                 seat_name = worktree_path.name
-                prior_dispatch_id = str(
-                    _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
-                )
+                prior_dispatch_id = _known_lock_dispatch_id(lock_file)
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,

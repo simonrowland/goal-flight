@@ -310,6 +310,22 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         controller_label=None,
         _worktree_seat=None,
     )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": _git(repo, "rev-parse", "worktree/resume-parent"),
+        }
+    )
     try:
         with pytest.raises(
             goalflight_worktree_pool.WorktreeSeatUnavailable,
@@ -327,6 +343,31 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         )
     finally:
         resumed.release()
+
+
+def test_resume_empty_lock_metadata_is_unknown_and_not_reclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    parent.release()
+    goalflight_worktree_pool.worktree_seat_lock_path(repo, seat.name).write_text(
+        "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatUnavailable,
+        match="unknown ownership",
+    ):
+        goalflight_worktree_pool.acquire_worktree_seat(
+            repo,
+            "resume-child",
+            occupy_path=seat,
+            expected_prior_dispatch_id="resume-parent",
+        )
 
 
 def test_resume_reseats_a_recycled_worktree_on_the_parent_branch(
@@ -525,6 +566,63 @@ def test_resume_recycled_branch_accepts_root_resume_lineage(
             resumed.release()
     finally:
         reclaimer.release()
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("cycle", "lineage cycle"),
+        ("missing", "missing or unreadable lineage ancestor"),
+        ("different-root", "different project root"),
+        ("wrong-root-branch", "root lineage branch"),
+    ],
+)
+def test_resume_rejects_inconsistent_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other_repo = _make_repo(other_root)
+
+    def record(dispatch_id: str, *, parent: str | None = None, root: Path = repo, branch: str | None = None) -> dict:
+        value = {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(root),
+        }
+        if parent:
+            value["parent_dispatch_id"] = parent
+        if branch:
+            value["worktree_branch"] = branch
+        return value
+
+    if case == "cycle":
+        goalflight_ledger.write_record(record("lineage-child", parent="lineage-root"))
+        goalflight_ledger.write_record(record("lineage-root", parent="lineage-child"))
+    elif case == "missing":
+        goalflight_ledger.write_record(record("lineage-child", parent="missing"))
+    elif case == "different-root":
+        goalflight_ledger.write_record(record("lineage-child", parent="lineage-root"))
+        goalflight_ledger.write_record(record("lineage-root", root=other_repo))
+    else:
+        goalflight_ledger.write_record(
+            record("lineage-child", parent="lineage-root")
+        )
+        goalflight_ledger.write_record(
+            record("lineage-root", branch="worktree/not-the-root")
+        )
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused, match=expected):
+        goalflight_dispatch._resume_lineage_dispatch_ids("lineage-child")
 
 
 @pytest.mark.parametrize("reclaimed_for", ["resume-parent", "other-parent"])
