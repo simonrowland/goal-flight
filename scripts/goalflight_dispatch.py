@@ -10783,20 +10783,19 @@ def _withdraw_liveness_preflight(
     ledger_dead = check("ledger", ledger_pid, ledger_identity)
     journal_pid = worker.get("pid")
     journal_dead = check("journal", journal_pid, worker)
-    carrier_dead = False
     for path, carrier in carriers.items():
-        carrier_dead = check(
+        check(
             str(path), carrier.get("queue_worker_pid"),
             carrier.get("queue_worker_identity"),
-        ) or carrier_dead
-        carrier_dead = check(
+        )
+        check(
             f"{path} claimer", carrier.get("queue_claimer_pid"),
             carrier.get("queue_claimer_identity"),
-        ) or carrier_dead
-        carrier_dead = check(
+        )
+        check(
             f"{path} launcher", carrier.get("queue_launcher_pid"),
             carrier.get("queue_launcher_identity"),
-        ) or carrier_dead
+        )
 
     status_required = status_path not in (None, "")
     status_dead = not status_required
@@ -10853,17 +10852,6 @@ def _withdraw_liveness_preflight(
                 "Wait for the status evidence to become complete before retrying.",
                 liveness="indeterminate",
             )
-        worker_evidence_present = (
-            ledger_pid not in (None, "")
-            or ledger_identity not in (None, {})
-            or journal_pid not in (None, "")
-            or worker not in ({}, None)
-        )
-        if not worker_evidence_present and carrier_dead:
-            # A claimed queue carrier is the pre-worker dispatch shape: its
-            # dead claim/worker identities are the only owner evidence until
-            # the ledger and journal receive a worker identity.
-            return
         if not ledger_dead:
             raise _WithdrawPreflightRefusal(
                 f"{lifecycle} attempt has no dead ledger worker identity; "

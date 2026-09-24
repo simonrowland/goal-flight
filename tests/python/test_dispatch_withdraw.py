@@ -68,6 +68,34 @@ def attempt_row(authority):
     return authority.read_all("SELECT * FROM dispatch_attempts WHERE dispatch_id = ?", ("withdraw-test",))[0]
 
 
+def record_dead_worker_evidence(project, authority, attempt, *, pid=999_999_999):
+    identity = {"pid": pid, "start_token": "gone"}
+    row = attempt_row(authority)
+    running = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=row["launch_epoch"],
+        worker_instance=identity,
+    )
+    assert running.committed
+    status_path = project / "withdraw.status.json"
+    status_path.write_text(
+        json.dumps({
+            "dispatch_id": "withdraw-test",
+            "state": "running",
+            "worker_pid": pid,
+            "worker_identity": identity,
+        })
+    )
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        status_path=str(status_path),
+        worker_pid=pid,
+        worker_identity=identity,
+    )
+    ledger.write_record(record)
+
+
 @pytest.fixture
 def claimed(prepared):
     _, authority, attempt, carrier = prepared
@@ -93,7 +121,7 @@ def claimed(prepared):
 
 @pytest.mark.parametrize("alive", [True, False])
 def test_claimed_worker_identity(prepared, claimed, alive):
-    _, authority, _, carrier = prepared
+    project, authority, attempt, carrier = prepared
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         identity = ledger.process_identity(child.pid)
@@ -104,6 +132,9 @@ def test_claimed_worker_identity(prepared, claimed, alive):
         if not alive:
             child.terminate()
             child.wait(timeout=10)
+            record_dead_worker_evidence(
+                project, authority, attempt, pid=child.pid,
+            )
 
         original = claimed.read_bytes()
         row = attempt_row(authority)
@@ -220,9 +251,14 @@ def test_claimed_spawn_intent_waits_for_stale_window(prepared, claimed, monkeypa
 
 @pytest.mark.parametrize("ownership", ["live", "indeterminate"])
 def test_claimed_launch_ownership_rechecked_under_lock(prepared, claimed, monkeypatch, ownership):
-    _, authority, _, _ = prepared
+    project, authority, attempt, _ = prepared
+    record_dead_worker_evidence(project, authority, attempt)
     row = attempt_row(authority)
     original = claimed.read_bytes()
+    entry = json.loads(claimed.read_text())
+    launch_pids = {
+        entry.get("queue_claimer_pid"), entry.get("queue_launcher_pid"),
+    }
     original_lock = dispatch._queue_mutation_lock
     original_status = dispatch._queue_claim_identity_status
     locked = False
@@ -235,7 +271,7 @@ def test_claimed_launch_ownership_rechecked_under_lock(prepared, claimed, monkey
             yield
 
     def identity_status(pid, identity):
-        if locked:
+        if locked and pid in launch_pids:
             return ownership, "launch_changed_before_lock"
         return original_status(pid, identity)
 
@@ -248,11 +284,13 @@ def test_claimed_launch_ownership_rechecked_under_lock(prepared, claimed, monkey
     assert attempt_row(authority) == row
 
 
-@pytest.mark.parametrize("kind", ["unknown", "worker", "worker-unknown", "intent", "undated-intent"])
+@pytest.mark.parametrize("kind", ["unknown", "worker", "worker-unknown"])
 @pytest.mark.parametrize("under_lock", [False, True])
 @pytest.mark.parametrize("final", [False, True])
 def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, kind, under_lock, final):
-    _, authority, attempt, carrier = prepared
+    project, authority, attempt, carrier = prepared
+    if not final:
+        record_dead_worker_evidence(project, authority, attempt)
     if final:
         assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
     entry = json.loads(claimed.read_text())
@@ -260,14 +298,13 @@ def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, k
     original_lock = dispatch._queue_mutation_lock
     original_status = dispatch._queue_claim_identity_status
     locked = False
+    carrier_pids = {
+        entry.get("queue_claimer_pid"), entry.get("queue_launcher_pid"),
+    }
     child = None
     if kind in {"worker", "worker-unknown"}:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         entry.update(queue_worker_pid=child.pid, queue_worker_identity=ledger.process_identity(child.pid))
-    elif "intent" in kind:
-        entry.update(queue_worker_spawn_intent=True)
-        if kind == "intent":
-            entry["queue_worker_spawn_intent_at"] = time.time()
 
     @contextlib.contextmanager
     def queue_lock(path):
@@ -278,7 +315,9 @@ def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, k
             yield
 
     def identity_status(pid, identity):
-        if kind == "unknown" and (locked or not under_lock):
+        if kind == "unknown" and (
+            not under_lock or (locked and pid in carrier_pids)
+        ):
             return "indeterminate", "identity_provider_exception:OSError"
         if kind == "worker-unknown" and child and pid == child.pid:
             return "indeterminate", "identity_provider_exception:OSError"
@@ -309,7 +348,8 @@ def test_parallel_carriers_refuse_unsafe_claim(prepared, claimed, monkeypatch, k
 
 @pytest.mark.parametrize("plain,claim_count", [(True, 1), (False, 2), (True, 2)])
 def test_parallel_carriers_archive_all(prepared, claimed, monkeypatch, tmp_path, plain, claim_count):
-    _, authority, _, carrier = prepared
+    project, authority, attempt, carrier = prepared
+    record_dead_worker_evidence(project, authority, attempt)
     entry = json.loads(claimed.read_text())
     paths = [claimed]
     if plain:
@@ -483,6 +523,26 @@ def test_active_missing_identity_evidence_refused_in_guidance_and_withdraw(prepa
     assert carrier.exists()
 
 
+def test_active_carrier_worker_identity_cannot_bypass_worker_evidence(
+    prepared, claimed
+):
+    _, authority, _, _carrier = prepared
+    stale_pid = 999_999_999
+    entry = json.loads(claimed.read_text())
+    entry.update(
+        queue_worker_pid=stale_pid,
+        queue_worker_identity={"pid": stale_pid, "start_token": "gone"},
+    )
+    claimed.write_text(json.dumps(entry))
+
+    code, result = withdraw()
+
+    assert code == 1, result
+    assert "dead ledger worker identity" in result["reason"]
+    assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_STARTING
+    assert claimed.exists()
+
+
 def test_status_sidecar_live_vetoes_dead_ledger_worker(prepared, tmp_path):
     project, authority, attempt, carrier = prepared
     status_path = tmp_path / "live.status.json"
@@ -606,7 +666,8 @@ def test_concurrent_withdrawal_is_noop_after_lock(prepared, monkeypatch, tmp_pat
 
 @pytest.mark.parametrize("boundary", ["ledger", "carrier"])
 def test_partial_withdrawal_retry_repairs_publication(prepared, claimed, monkeypatch, boundary):
-    _, authority, _, _ = prepared
+    project, authority, attempt, _ = prepared
+    record_dead_worker_evidence(project, authority, attempt)
     original = claimed.read_bytes()
     original_replace = Path.replace
 
