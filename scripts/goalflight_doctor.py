@@ -200,22 +200,30 @@ def _ripgrep_private_path(path: str | None) -> bool:
     except (OSError, RuntimeError):
         return True
 
-    shared_dirs = {
-        Path("/opt/homebrew/bin"),
-        Path("/usr/local/bin"),
-        Path("/usr/bin"),
-        home / ".local/bin",
-        home / "bin",
-        home / ".cargo/bin",
-        home / ".nix-profile/bin",
-        Path("/run/current-system/sw/bin"),
-    }
+    try:
+        shared_dirs = {
+            directory.resolve()
+            for directory in (
+                Path("/opt/homebrew/bin"),
+                Path("/usr/local/bin"),
+                Path("/usr/bin"),
+                home / ".local/bin",
+                home / "bin",
+                home / ".cargo/bin",
+                home / ".nix-profile/bin",
+                Path("/run/current-system/sw/bin"),
+            )
+        }
+    except (OSError, RuntimeError):
+        return True
     nix_profiles = Path("/nix/var/nix/profiles")
-    for directory in (candidate_dir, resolved_dir):
-        if directory in shared_dirs:
-            return False
-        if directory.parent.parent == nix_profiles and directory.name == "bin":
-            return False
+    if resolved_dir in shared_dirs:
+        return False
+    if any(
+        directory.parent.parent == nix_profiles and directory.name == "bin"
+        for directory in (candidate_dir, resolved_dir)
+    ):
+        return False
     return True
 
 
