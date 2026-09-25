@@ -101,6 +101,30 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+def test_daemon_spawn_uses_file_backed_spec_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        assert "input" not in kwargs
+        spec_file = kwargs["stdin"]
+        spec_file.seek(0)
+        observed["spec"] = json.loads(spec_file.read().decode("utf-8"))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"pid": 123}\n', stderr=""
+        )
+
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    prompt = "prompt-" + ("x" * 100_000)
+    pid = D._spawn_daemonized_process(
+        ["worker", prompt], env={}, label="file-backed-spec"
+    )
+
+    assert pid == 123
+    assert observed["spec"]["argv"] == ["worker", prompt]
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],

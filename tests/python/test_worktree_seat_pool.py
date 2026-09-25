@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -114,6 +115,108 @@ def record_finished_holder(
 def finish_seat_holder(lease: goalflight_worktree_pool.WorktreeSeatLease) -> None:
     lease.release()
     record_finished_holder(lease.dispatch_id)
+
+
+def test_large_reset_attribute_check_returns_blocker_under_watchdog() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        bulk = repo / "bulk"
+        bulk.mkdir()
+        for index in range(20_000):
+            name = f"{index:05d}-{'x' * 100}.txt"
+            (bulk / name).write_text("tracked\n", encoding="utf-8")
+        git(repo, "add", "--", ".")
+        git(repo, "commit", "-m", "many tracked paths")
+
+        seed = goalflight_worktree_pool.acquire_worktree_seat(repo, "large-seed")
+        finish_seat_holder(seed)
+
+        real_git = shutil.which("git")
+        assert real_git is not None
+        fake_git_dir = Path(td) / "fake-bin"
+        fake_git_dir.mkdir()
+        fake_git = fake_git_dir / "git"
+        fake_git.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "import sys\n"
+            "import time\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'check-attr':\n"
+            "    sys.stderr.buffer.write(b'x' * 1_000_000)\n"
+            "    sys.stderr.flush()\n"
+            "    time.sleep(60)\n"
+            "os.execv(os.environ['B450_REAL_GIT'], [os.environ['B450_REAL_GIT'], *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o755)
+
+        child_code = "\n".join(
+            [
+                "import sys",
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})",
+                "from pathlib import Path",
+                "import goalflight_worktree_pool as pool",
+                "setattr(pool, 'SEAT_RESET_GIT_TIMEOUT_S', 0.5)",
+                "try:",
+                "    pool.acquire_worktree_seat(Path(sys.argv[1]), 'large-reset')",
+                "except pool.WorktreeSeatResetRefused as exc:",
+                "    print('blocked: ' + str(exc), flush=True)",
+                "else:",
+                "    raise AssertionError('reset unexpectedly completed')",
+            ]
+        )
+        child_env = os.environ.copy()
+        child_env["B450_REAL_GIT"] = real_git
+        child_env["PATH"] = f"{fake_git_dir}{os.pathsep}{child_env['PATH']}"
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(repo)],
+            cwd=str(repo),
+            env=child_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = child.communicate(timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            with contextlib.suppress(OSError):
+                os.killpg(child.pid, signal.SIGKILL)
+            child.communicate()
+            raise AssertionError(
+                "reset-safety check did not return its bounded blocker under the watchdog"
+            ) from exc
+        result = subprocess.CompletedProcess(
+            child.args, child.returncode, stdout=stdout, stderr=stderr
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.startswith("blocked: "), result.stdout
+        assert "timed out" in result.stdout, result.stdout
+
+
+def test_git_proc_uses_file_for_large_input() -> None:
+    payload = "path-one\0path-two\n"
+    observed: dict[str, object] = {}
+    real_run = goalflight_worktree_pool.subprocess.run
+
+    def capture_run(argv, **kwargs):
+        observed.update(kwargs)
+        assert "input" not in kwargs
+        input_file = kwargs["stdin"]
+        input_file.seek(0)
+        assert input_file.read() == payload.encode("utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    goalflight_worktree_pool.subprocess.run = capture_run
+    try:
+        result = goalflight_worktree_pool._git_proc(
+            Path("."), "check-attr", "--stdin", input_text=payload
+        )
+    finally:
+        goalflight_worktree_pool.subprocess.run = real_run
+
+    assert result is not None and result.returncode == 0
+    assert observed["stdin"] is not None
 
 
 @contextlib.contextmanager
@@ -1372,10 +1475,10 @@ def test_exact_retry_base_skips_checkout() -> None:
         real_git = goalflight_worktree_pool._git
         checkout_calls: list[tuple[str, ...]] = []
 
-        def recording_git(worktree: Path, *args: str) -> str:
+        def recording_git(worktree: Path, *args: str, **kwargs) -> str:
             if args and args[0] == "checkout":
                 checkout_calls.append(args)
-            return real_git(worktree, *args)
+            return real_git(worktree, *args, **kwargs)
 
         goalflight_worktree_pool._git = recording_git
         try:
@@ -1677,6 +1780,8 @@ def main() -> None:
         test_hard_ceiling_is_lazy_and_reuses_seats,
         test_process_concurrency_gets_distinct_seats_and_names_all_occupants,
         test_dirty_seat_is_quarantined_then_reset_on_acquire,
+        test_large_reset_attribute_check_returns_blocker_under_watchdog,
+        test_git_proc_uses_file_for_large_input,
         test_sigkill_releases_kernel_lease_without_cleanup,
         test_path_lock_sigkill_releases_without_cleanup,
         test_path_locks_on_different_trees_do_not_serialize,

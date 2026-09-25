@@ -1352,18 +1352,25 @@ def _spawn_daemonized_process(
             fd for fd in inherited_lock_fds if fd not in occupancy_fds
         )
         child_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
-    helper = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
-        input=json.dumps(spec, sort_keys=True),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=child_env,
-        timeout=30,
-        pass_fds=inherited_lock_fds,
-        **_detached_popen_kwargs(),
-    )
+    spec_bytes = json.dumps(spec, sort_keys=True).encode("utf-8")
+    # Keep the daemon handoff off the stdin pipe. Worker argv can contain a
+    # materialized prompt, while this helper also captures its output pipes.
+    with tempfile.TemporaryFile(mode="w+b") as spec_file:
+        spec_file.write(spec_bytes)
+        spec_file.flush()
+        spec_file.seek(0)
+        helper = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
+            stdin=spec_file,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env,
+            timeout=30,
+            pass_fds=inherited_lock_fds,
+            **_detached_popen_kwargs(),
+        )
     if helper.returncode != 0:
         detail = (helper.stderr or helper.stdout or "").strip().splitlines()[-1:]
         raise RuntimeError(f"{label} daemon spawn failed: {detail[0] if detail else helper.returncode}")

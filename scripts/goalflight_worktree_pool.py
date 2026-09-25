@@ -66,6 +66,7 @@ READ_ONLY_WORKTREE_DIR = ".goalflight-readonly"
 READ_ONLY_WORKTREE_KEEP = 4
 READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 READ_ONLY_GIT_TIMEOUT_S = 30.0
+SEAT_RESET_GIT_TIMEOUT_S = 30.0
 READ_ONLY_REAP_TIMEOUT_S = 30.0
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
@@ -939,19 +940,28 @@ def _git_proc(
             ["git", *args], 128, "", guard_error
         )
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            input=input_text,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            check=False,
-            timeout=timeout,
-        )
+        run_kwargs = {
+            "cwd": str(cwd),
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+            "check": False,
+            "timeout": timeout,
+        }
+        if input_text is None:
+            return subprocess.run(["git", *args], **run_kwargs)
+        # Do not make communicate() write a potentially unbounded input string
+        # to a pipe while Git's captured output pipes can fill.
+        with tempfile.TemporaryFile(mode="w+b") as input_file:
+            input_file.write(input_text.encode("utf-8", errors="replace"))
+            input_file.flush()
+            input_file.seek(0)
+            return subprocess.run(
+                ["git", *args], stdin=input_file, **run_kwargs
+            )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             ["git", *args], 124, "", "git command timed out"
@@ -1263,7 +1273,10 @@ def _parse_porcelain_z(output: str) -> list[tuple[str, tuple[str, ...]]]:
 
 
 def _status_records(
-    worktree_path: Path, *, untracked: str = "all"
+    worktree_path: Path,
+    *,
+    untracked: str = "all",
+    timeout: float | None = None,
 ) -> list[tuple[str, tuple[str, ...]]]:
     output = _git_nul(
         worktree_path,
@@ -1272,6 +1285,7 @@ def _status_records(
         "-z",
         f"--untracked-files={untracked}",
         "--ignore-submodules=none",
+        timeout=timeout,
     )
     return _parse_porcelain_z(output)
 
@@ -1852,8 +1866,12 @@ def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
     return prior_dispatch_id
 
 
-def _refnames(cwd: Path) -> tuple[list[str] | None, str]:
-    proc = _git_proc(cwd, "for-each-ref", "--format=%(refname)")
+def _refnames(
+    cwd: Path, *, timeout: float | None = None
+) -> tuple[list[str] | None, str]:
+    proc = _git_proc(
+        cwd, "for-each-ref", "--format=%(refname)", timeout=timeout
+    )
     if proc is None:
         return None, "git for-each-ref could not run"
     if proc.returncode != 0:
@@ -1868,6 +1886,7 @@ def check_reset_preserves_commits(
     start: str,
     base_commit: str,
     moving_ref: str | None,
+    timeout: float | None = None,
 ) -> dict[str, str]:
     """YES if moving ``start`` to ``base_commit`` would not lose unique commits.
 
@@ -1876,7 +1895,7 @@ def check_reset_preserves_commits(
     passes ``moving_ref=None``: nothing currently names those commits.
     UNKNOWN retains — losing a commit is irreversible.
     """
-    refs, err = _refnames(cwd)
+    refs, err = _refnames(cwd, timeout=timeout)
     if refs is None:
         return _condition(
             UNKNOWN,
@@ -1887,7 +1906,15 @@ def check_reset_preserves_commits(
         if moving_ref and ref == moving_ref:
             continue
         exclude.append(ref)
-    proc = _git_proc(cwd, "rev-list", "--oneline", start, "--not", *exclude)
+    proc = _git_proc(
+        cwd,
+        "rev-list",
+        "--oneline",
+        start,
+        "--not",
+        *exclude,
+        timeout=timeout,
+    )
     if proc is None:
         return _condition(
             UNKNOWN, "git rev-list could not run; unique commits are unknown"
@@ -1948,12 +1975,15 @@ def pin_unique_commits(
     base_commit: str,
     moving_ref: str | None,
     worktree_id: str,
+    timeout: float | None = None,
 ) -> dict[str, str | None]:
     """Durably pin commits that a reset would otherwise make unreachable."""
-    refs, err = _refnames(worktree_path)
+    refs, err = _refnames(worktree_path, timeout=timeout)
     if refs is None:
         return {"verdict": UNKNOWN, "reason": f"cannot list refs ({err})", "keep_ref": None}
-    head_proc = _git_proc(worktree_path, "rev-parse", "HEAD^{commit}")
+    head_proc = _git_proc(
+        worktree_path, "rev-parse", "HEAD^{commit}", timeout=timeout
+    )
     if head_proc is None or head_proc.returncode != 0:
         return {"verdict": UNKNOWN, "reason": "cannot resolve worktree HEAD", "keep_ref": None}
     head = head_proc.stdout.strip()
@@ -1962,7 +1992,9 @@ def pin_unique_commits(
         if moving_ref and ref == moving_ref:
             continue
         exclude.append(ref)
-    unique = _git_proc(worktree_path, "rev-list", head, "--not", *exclude)
+    unique = _git_proc(
+        worktree_path, "rev-list", head, "--not", *exclude, timeout=timeout
+    )
     if unique is None or unique.returncode != 0:
         return {
             "verdict": UNKNOWN,
@@ -1975,14 +2007,22 @@ def pin_unique_commits(
     safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(worktree_id)).strip(".-") or "worktree"
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     keep_ref = f"refs/{KEEP_REF_PREFIX}/{stamp}-{safe_id}-{head[:12]}"
-    updated = _git_proc(worktree_path, "update-ref", keep_ref, head, "")
+    updated = _git_proc(
+        worktree_path, "update-ref", keep_ref, head, "", timeout=timeout
+    )
     if updated is None or updated.returncode != 0:
         return {
             "verdict": UNKNOWN,
             "reason": "cannot durably create keep ref",
             "keep_ref": None,
         }
-    verified = _git_proc(worktree_path, "rev-parse", "--verify", f"{keep_ref}^{{commit}}")
+    verified = _git_proc(
+        worktree_path,
+        "rev-parse",
+        "--verify",
+        f"{keep_ref}^{{commit}}",
+        timeout=timeout,
+    )
     if verified is None or verified.returncode != 0 or verified.stdout.strip() != head:
         return {
             "verdict": UNKNOWN,
@@ -2127,7 +2167,14 @@ def evaluate_seat_reset_safety(
     Unique-commits-vs-other-refs is a different question than GC's
     merged-into-integration, so that conjunct stays here.
     """
-    abbrev_proc = _git_proc(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    timeout = SEAT_RESET_GIT_TIMEOUT_S
+    abbrev_proc = _git_proc(
+        worktree_path,
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+        timeout=timeout,
+    )
     if abbrev_proc is None or abbrev_proc.returncode != 0:
         detail = "git rev-parse --abbrev-ref HEAD could not run"
         if abbrev_proc is not None:
@@ -2140,7 +2187,7 @@ def evaluate_seat_reset_safety(
     abbrev = abbrev_proc.stdout.strip() or "HEAD"
     detached = abbrev == "HEAD"
 
-    head_proc = _git_proc(worktree_path, "rev-parse", "HEAD")
+    head_proc = _git_proc(worktree_path, "rev-parse", "HEAD", timeout=timeout)
     if head_proc is None or head_proc.returncode != 0:
         detail = "cannot resolve HEAD"
         if head_proc is not None:
@@ -2154,7 +2201,11 @@ def evaluate_seat_reset_safety(
 
     if detached:
         commits = check_reset_preserves_commits(
-            worktree_path, start=head, base_commit=base_commit, moving_ref=None
+            worktree_path,
+            start=head,
+            base_commit=base_commit,
+            moving_ref=None,
+            timeout=timeout,
         )
     elif abbrev == new_branch:
         commits = check_reset_preserves_commits(
@@ -2162,6 +2213,7 @@ def evaluate_seat_reset_safety(
             start=head,
             base_commit=base_commit,
             moving_ref=f"refs/heads/{new_branch}",
+            timeout=timeout,
         )
     else:
         commits = _condition(
@@ -2169,7 +2221,7 @@ def evaluate_seat_reset_safety(
             f"branch {abbrev!r} remains after checkout of {new_branch!r}",
         )
 
-    clean = check_seat_cleanliness(worktree_path)
+    clean = check_seat_cleanliness(worktree_path, timeout=timeout)
     conditions = {"commits_preserved": commits, "cleanliness": clean}
     blockers: list[str] = []
     if commits["verdict"] != YES:
@@ -2319,15 +2371,31 @@ def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
     return 0 if head == str(base_commit).strip() else 1
 
 
-def _tree_paths(cwd: Path, treeish: str) -> set[str]:
+def _tree_paths(
+    cwd: Path, treeish: str, *, timeout: float | None = None
+) -> set[str]:
     return set(
-        _nul_paths(_git_nul(cwd, "ls-tree", "-r", "-z", "--name-only", treeish))
+        _nul_paths(
+            _git_nul(
+                cwd,
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                treeish,
+                timeout=timeout,
+            )
+        )
     )
 
 
-def _tree_blob_ids(cwd: Path, treeish: str) -> dict[str, str]:
+def _tree_blob_ids(
+    cwd: Path, treeish: str, *, timeout: float | None = None
+) -> dict[str, str]:
     blobs: dict[str, str] = {}
-    for entry in _git_nul(cwd, "ls-tree", "-r", "-z", treeish).split("\0"):
+    for entry in _git_nul(
+        cwd, "ls-tree", "-r", "-z", treeish, timeout=timeout
+    ).split("\0"):
         if not entry:
             continue
         metadata, separator, path = entry.partition("\t")
@@ -2351,8 +2419,13 @@ def _tree_blob_ids(cwd: Path, treeish: str) -> dict[str, str]:
     return blobs
 
 
-def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
-    tree_blobs = _tree_blob_ids(worktree_path, "HEAD")
+def _prove_lfs_objects(
+    worktree_path: Path,
+    paths: list[str],
+    *,
+    timeout: float | None = None,
+) -> None:
+    tree_blobs = _tree_blob_ids(worktree_path, "HEAD", timeout=timeout)
     blob_ids: list[str] = []
     for path in paths:
         blob_id = tree_blobs.get(path)
@@ -2367,6 +2440,7 @@ def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
         "cat-file",
         "--batch",
         input_text="\n".join(requested) + "\n",
+        timeout=timeout,
     )
     if batch is None or batch.returncode != 0:
         raise WorktreeSeatResetRefused(
@@ -2401,7 +2475,9 @@ def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
         contents[blob_id] = content
         offset = content_end + 1
 
-    common_lfs = _git_common_dir(worktree_path) / "lfs" / "objects"
+    common_lfs = (
+        _git_common_dir(worktree_path, timeout=timeout) / "lfs" / "objects"
+    )
     for path, blob_id in zip(paths, blob_ids):
         pointer = contents.get(blob_id, "")
         oid_match = re.search(r"(?m)^oid sha256:([0-9a-f]{64})$", pointer)
@@ -2444,7 +2520,11 @@ def _prove_lfs_objects(worktree_path: Path, paths: list[str]) -> None:
 
 
 def _refuse_ignored_tree_collisions(
-    worktree_path: Path, *, head: str, target: str
+    worktree_path: Path,
+    *,
+    head: str,
+    target: str,
+    timeout: float | None = None,
 ) -> None:
     ignored = _nul_paths(
         _git_nul(
@@ -2455,15 +2535,26 @@ def _refuse_ignored_tree_collisions(
             "--ignored",
             "--exclude-standard",
             "--directory",
+            timeout=timeout,
         )
     )
     if not ignored:
         return
-    tree_paths = _tree_paths(worktree_path, head) | _tree_paths(worktree_path, target)
-    ignorecase = _git_proc(worktree_path, "config", "--bool", "core.ignorecase")
+    tree_paths = _tree_paths(
+        worktree_path, head, timeout=timeout
+    ) | _tree_paths(worktree_path, target, timeout=timeout)
+    ignorecase = _git_proc(
+        worktree_path, "config", "--bool", "core.ignorecase", timeout=timeout
+    )
+    if ignorecase is None or ignorecase.returncode not in (0, 1):
+        detail = "git config core.ignorecase could not run"
+        if ignorecase is not None:
+            detail = (ignorecase.stderr or ignorecase.stdout or "").strip() or detail
+        raise WorktreeSeatResetRefused(
+            f"cannot determine filesystem case-sensitivity ({detail}); refusing reset"
+        )
     case_insensitive = bool(
-        ignorecase is not None
-        and ignorecase.returncode == 0
+        ignorecase.returncode == 0
         and ignorecase.stdout.strip().lower() == "true"
     )
     if case_insensitive:
@@ -2554,8 +2645,11 @@ def _precheck_quarantine_worktree(
     worktree_path: Path,
     *,
     seat_name: str,
+    timeout: float | None = None,
 ) -> tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]]:
-    hidden_entries = _nul_paths(_git_nul(worktree_path, "ls-files", "-v", "-z"))
+    hidden_entries = _nul_paths(
+        _git_nul(worktree_path, "ls-files", "-v", "-z", timeout=timeout)
+    )
     for entry in hidden_entries:
         if len(entry) < 3 or entry[1] != " ":
             raise WorktreeSeatResetRefused(
@@ -2569,9 +2663,11 @@ def _precheck_quarantine_worktree(
                 "refusing reset"
             )
 
-    records = _status_records(worktree_path)
+    records = _status_records(worktree_path, timeout=timeout)
     submodule_paths = set()
-    for entry in _nul_paths(_git_nul(worktree_path, "ls-files", "--stage", "-z")):
+    for entry in _nul_paths(
+        _git_nul(worktree_path, "ls-files", "--stage", "-z", timeout=timeout)
+    ):
         metadata, separator, path = entry.partition("\t")
         fields = metadata.split()
         if not separator or len(fields) != 3:
@@ -2616,7 +2712,9 @@ def _precheck_quarantine_worktree(
     dirty_paths = list(
         dict.fromkeys(path for record in product for path in _status_tree_paths(record))
     )
-    tracked_paths = _nul_paths(_git_nul(worktree_path, "ls-files", "-z"))
+    tracked_paths = _nul_paths(
+        _git_nul(worktree_path, "ls-files", "-z", timeout=timeout)
+    )
     attribute_paths = tuple(dict.fromkeys((*tracked_paths, *dirty_paths)))
     if attribute_paths:
         # A clean lfs-filtered file is safe: status confirms that its worktree
@@ -2633,6 +2731,7 @@ def _precheck_quarantine_worktree(
             "eol",
             "text",
             input_text="\0".join(attribute_paths) + "\0",
+            timeout=timeout,
         )
         fields = attributes.split("\0")
         if fields and fields[-1] == "":
@@ -2687,7 +2786,7 @@ def _precheck_quarantine_worktree(
                 f"{attribute} {value!r}; refusing reset"
             )
         if lfs_paths:
-            _prove_lfs_objects(worktree_path, lfs_paths)
+            _prove_lfs_objects(worktree_path, lfs_paths, timeout=timeout)
     return reserved_untracked, product, dirty_paths
 
 
@@ -2903,13 +3002,22 @@ def _prepare_claimed_seat_locked(
     head = None
     if existing and reset:
         try:
-            head = _git(worktree_path, "rev-parse", "HEAD")
+            head = _git(
+                worktree_path,
+                "rev-parse",
+                "HEAD",
+                timeout=SEAT_RESET_GIT_TIMEOUT_S,
+            )
             _refuse_ignored_tree_collisions(
-                worktree_path, head=head, target=base_commit
+                worktree_path,
+                head=head,
+                target=base_commit,
+                timeout=SEAT_RESET_GIT_TIMEOUT_S,
             )
             precheck = _precheck_quarantine_worktree(
                 worktree_path,
                 seat_name=seat_name,
+                timeout=SEAT_RESET_GIT_TIMEOUT_S,
             )
         except WorktreeSeatResetRefused:
             raise
@@ -2925,6 +3033,7 @@ def _prepare_claimed_seat_locked(
             base_commit=base_commit,
             moving_ref=safety.get("moving_ref"),
             worktree_id=f"{seat_name}-{prior_dispatch_id or 'unknown-dispatch'}",
+            timeout=SEAT_RESET_GIT_TIMEOUT_S,
         )
         if pinned["verdict"] != YES:
             raise WorktreeSeatResetRefused(
