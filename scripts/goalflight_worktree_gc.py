@@ -658,13 +658,15 @@ def _acquire_pool_action_lock(
     repo: Path, path: str
 ) -> tuple[object | None, str | None]:
     """Hold a registered pool lock across recheck, pin, and removal."""
-    verdict, _reason, lock_path, lock_stat = (
+    verdict, reason, lock_path, lock_stat = (
         goalflight_worktree_pool._registered_pool_seat_lock_info(
             path, project_root=repo
         )
     )
-    if verdict != YES:
+    if verdict == NO:
         return None, None
+    if verdict != YES:
+        return None, f"pool worktree action lock unavailable: {reason}"
     handle, error = _open_validated_pool_lock(lock_path, lock_stat)
     if error == "registered pool worktree is held by a live lease":
         return None, "registered pool worktree became held before action"
@@ -675,8 +677,11 @@ def _acquire_read_only_action_lock(
     repo: Path,
 ) -> tuple[object | None, str | None]:
     """Hold the allocator's detached-checkout lock across GC recheck/removal."""
-    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
     try:
+        registry_root = goalflight_worktree_pool._git_common_dir(
+            repo, timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S
+        )
+        lock_path = registry_root / "goalflight-worktree-seat-locks" / "readonly-allocation.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
@@ -684,7 +689,7 @@ def _acquire_read_only_action_lock(
         fd = goalflight_worktree_pool._open_registered_lock(
             lock_path,
             flags,
-            registry_root=goalflight_worktree_pool._git_common_dir(repo),
+            registry_root=registry_root,
             allow_create=True,
             allow_unregistered=True,
         )
@@ -698,7 +703,8 @@ def _acquire_read_only_action_lock(
         goalflight_worktree_pool._adopt_exclusive_lock(
             lock_path,
             handle.fileno(),
-            registry_root=goalflight_worktree_pool._git_common_dir(repo),
+            registry_root=registry_root,
+            deadline=time.monotonic() + goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
         )
     except BlockingIOError:
         handle.close()
@@ -883,19 +889,7 @@ def _prune_worktrees(repo: Path) -> tuple[bool, str]:
 
 def _pin_before_remove(repo: Path, path: str) -> tuple[str | None, str | None]:
     """Keep the candidate's current commit durable before destructive removal."""
-    head = _git(Path(path), "rev-parse", "HEAD^{commit}")
-    if head.returncode != 0 or not head.stdout.strip():
-        return None, (head.stderr or head.stdout).strip() or "cannot resolve candidate HEAD"
-    stamp = str(int(time.time() * 1_000_000))
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in Path(path).name)
-    ref = f"refs/goalflight/keep/gc-{stamp}-{safe}-{head.stdout.strip()[:12]}"
-    updated = _git(repo, "update-ref", ref, head.stdout.strip(), "")
-    if updated.returncode != 0:
-        return None, (updated.stderr or updated.stdout).strip() or "cannot create keep ref"
-    verified = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
-    if verified.returncode != 0 or verified.stdout.strip() != head.stdout.strip():
-        return None, "keep ref did not verify after creation"
-    return ref, None
+    return goalflight_worktree_pool.pin_worktree_head_before_remove(repo, path)
 
 
 def apply_removals(

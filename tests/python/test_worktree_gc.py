@@ -808,6 +808,31 @@ def test_gc_revalidates_held_pool_lock_identity(
         backup.rename(parent)
 
 
+def test_gc_unregistered_pool_lock_requires_action_exclusion(
+    repo: Path,
+) -> None:
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "unregistered-gc")
+    seat = lease.path
+    lease.release()
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["locks"].pop(
+        goalflight_worktree_pool._lock_registry_key(lock_path), None
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    handle, error = goalflight_worktree_gc._acquire_pool_action_lock(
+        repo, str(seat)
+    )
+    if handle is not None:
+        handle.close()
+    assert handle is None
+    assert error and "action lock unavailable" in error
+
+
 def test_adhoc_worktree_named_wt_n_is_reclaimable(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

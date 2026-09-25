@@ -66,6 +66,7 @@ READ_ONLY_WORKTREE_DIR = ".goalflight-readonly"
 READ_ONLY_WORKTREE_KEEP = 4
 READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 READ_ONLY_GIT_TIMEOUT_S = 30.0
+READ_ONLY_REAP_TIMEOUT_S = 30.0
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
@@ -106,6 +107,10 @@ class WorktreeSeatError(RuntimeError):
 
 class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured worktree is held."""
+
+
+class WorktreeReadOnlyLockTimeout(WorktreeSeatUnavailable):
+    """Raised when the detached-checkout allocation lock cannot be acquired."""
 
 
 class WorktreeSeatReclaimed(WorktreeSeatUnavailable):
@@ -489,13 +494,18 @@ def read_only_worktree_path_verdict(
         if root_real != root:
             return UNKNOWN, f"read-only root resolves through a symlink: {root}"
         relative = candidate.relative_to(root)
-    except (OSError, ValueError):
+    except ValueError:
         return NO, f"{candidate} is not under {root}"
+    except OSError as exc:
+        return UNKNOWN, f"{candidate} could not be classified ({exc})"
     if len(relative.parts) != 1:
         return NO, f"{candidate} is not a direct read-only checkout"
-    if is_pool_seat_path(candidate) or is_managed_worktree_path(
+    managed_verdict, managed_reason = managed_worktree_path_verdict(
         candidate, project_root=project_root
-    ):
+    )
+    if managed_verdict == UNKNOWN:
+        return UNKNOWN, managed_reason
+    if is_pool_seat_path(candidate) or managed_verdict == YES:
         return UNKNOWN, f"{candidate} is also a pooled worktree path"
     if candidate.is_symlink():
         return UNKNOWN, f"read-only checkout is a symlink: {candidate}"
@@ -515,17 +525,31 @@ def is_read_only_worktree_path(path: str | Path, *, project_root: Path) -> bool:
 
 
 def is_managed_worktree_path(path: str | Path, *, project_root: Path) -> bool:
-    """Recognize new repo-wide paths and legacy label-ring paths."""
+    """Recognize a path; callers needing safety reasons must use the tri-state helper."""
+    verdict, _reason = managed_worktree_path_verdict(path, project_root=project_root)
+    return verdict == YES
+
+
+def managed_worktree_path_verdict(
+    path: str | Path, *, project_root: Path
+) -> tuple[str, str]:
+    """Classify a managed-looking path without turning inspection errors into NO."""
     try:
         resolved = Path(path).resolve()
         root = repository_worktree_root(project_root).resolve()
         rel = resolved.relative_to(root)
-    except (OSError, ValueError):
-        return False
+    except ValueError:
+        return NO, f"{path} is not under the managed worktree root"
+    except OSError as exc:
+        return UNKNOWN, f"{path} could not be classified ({exc})"
     parts = rel.parts
     if len(parts) == 1:
-        return is_captive_seat_name(parts[0])
-    return len(parts) == 2 and is_captive_seat_name(parts[1])
+        if is_captive_seat_name(parts[0]):
+            return YES, f"{path} is a managed pooled worktree"
+        return NO, f"{path} is not a managed pooled worktree"
+    if len(parts) == 2 and is_captive_seat_name(parts[1]):
+        return YES, f"{path} is a managed pooled worktree"
+    return NO, f"{path} is not a managed pooled worktree"
 
 
 def is_controller_ring_seat(
@@ -690,7 +714,12 @@ def _registered_pool_seat_lock_info(
     except OSError as exc:
         return "unknown", str(exc), None, None
     if registered is None:
-        return "unknown", f"worktree lock identity is not registered ({lock_path})", None, None
+        return (
+            "unknown",
+            f"worktree lock identity is not registered ({lock_path})",
+            lock_path,
+            current,
+        )
     if (
         current.st_dev != registered.st_dev
         or current.st_ino != registered.st_ino
@@ -1083,8 +1112,33 @@ def _registered_stat_from_record(
     return os.stat_result((stat.S_IFREG, inode, device, 1, 0, 0, 0, 0, 0, 0))
 
 
+def _flock_exclusive_until(
+    fd: int, *, deadline: float | None, description: str
+) -> None:
+    """Take an exclusive flock, bounded when a transaction supplies a deadline."""
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OSError(
+                    errno.ETIMEDOUT,
+                    f"{description} wait expired",
+                )
+            time.sleep(min(0.05, remaining))
+
+
 def _record_lock_identity(
-    lock_path: Path, fd: int, *, registry_root: Path
+    lock_path: Path,
+    fd: int,
+    *,
+    registry_root: Path,
+    deadline: float | None = None,
 ) -> os.stat_result:
     opened = os.fstat(fd)
     if not stat.S_ISREG(opened.st_mode):
@@ -1094,7 +1148,11 @@ def _record_lock_identity(
     mutex_path = registry_path.with_name(_LOCK_REGISTRY_MUTEX_NAME)
     key = _lock_registry_key(lock_path)
     with mutex_path.open("a+", encoding="utf-8") as mutex:
-        fcntl.flock(mutex.fileno(), fcntl.LOCK_EX)
+        _flock_exclusive_until(
+            mutex.fileno(),
+            deadline=deadline,
+            description="lock registry mutex",
+        )
         payload = _read_lock_registry(registry_root)
         existing = payload["locks"].get(key)
         if existing is not None:
@@ -1129,7 +1187,11 @@ def _record_lock_identity(
 
 
 def _adopt_exclusive_lock(
-    lock_path: Path, fd: int, *, registry_root: Path
+    lock_path: Path,
+    fd: int,
+    *,
+    registry_root: Path,
+    deadline: float | None = None,
 ) -> os.stat_result:
     """Register a legacy inode after its caller has acquired LOCK_EX."""
     registered = _registered_lock_identity(lock_path, registry_root=registry_root)
@@ -1137,7 +1199,12 @@ def _adopt_exclusive_lock(
         if not _lock_fd_matches_identity(fd, registered):
             raise OSError(errno.EAGAIN, f"lock identity changed while adopting: {lock_path}")
         return registered
-    return _record_lock_identity(lock_path, fd, registry_root=registry_root)
+    return _record_lock_identity(
+        lock_path,
+        fd,
+        registry_root=registry_root,
+        deadline=deadline,
+    )
 
 
 def _read_ring_hwm(lock_root: Path) -> int:
@@ -1356,15 +1423,18 @@ def _read_only_registered_worktrees(project_root: Path) -> list[Path]:
 
 
 def _registered_pool_worktrees(project_root: Path) -> list[Path]:
-    """Return registered pooled seats from Git's worktree inventory."""
+    """Return pooled seats whose lock identity can be opened or adopted."""
     paths: list[Path] = []
     for candidate in _registered_worktree_paths(project_root):
-        if not is_managed_worktree_path(candidate, project_root=project_root):
-            continue
-        verdict, _reason = registered_pool_seat_verdict(
+        managed_verdict, _managed_reason = managed_worktree_path_verdict(
             candidate, project_root=project_root
         )
-        if verdict == YES:
+        if managed_verdict != YES:
+            continue
+        verdict, _reason, lock_path, lock_stat = _registered_pool_seat_lock_info(
+            candidate, project_root=project_root
+        )
+        if verdict == YES or (verdict == UNKNOWN and lock_path is not None and lock_stat is not None):
             paths.append(candidate)
     return paths
 
@@ -1396,23 +1466,43 @@ def _try_acquire_shared_read_only_seat(
         verdict, _reason, lock_path, expected_stat = (
             _registered_pool_seat_lock_info(path, project_root=project_root)
         )
-        if verdict != YES or lock_path is None or expected_stat is None:
+        if (
+            verdict == NO
+            or lock_path is None
+            or expected_stat is None
+        ):
             return None
         flags = _lock_open_flags() & ~os.O_CREAT
+        registry_root = _git_common_dir(project_root)
         lock_fd = _open_registered_lock(
             lock_path,
             flags,
-            registry_root=_git_common_dir(project_root),
+            registry_root=registry_root,
+            allow_unregistered=verdict == UNKNOWN,
         )
     except (OSError, WorktreeSeatError):
         return None
     lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
     try:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_file.close()
-            return None
+        if verdict == UNKNOWN:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _adopt_exclusive_lock(
+                    lock_path,
+                    lock_file.fileno(),
+                    registry_root=registry_root,
+                    deadline=time.monotonic() + READ_ONLY_GIT_TIMEOUT_S,
+                )
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            except (BlockingIOError, OSError):
+                lock_file.close()
+                return None
+        else:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_file.close()
+                return None
         lease = WorktreeReadOnlySeatLease(
             path=path,
             seat_name=path.name,
@@ -1438,10 +1528,10 @@ def try_acquire_read_only_pool_seat(
     """Hold a specific pooled seat when it still matches a read-only review."""
     project_root = project_root.resolve()
     path = path.expanduser().resolve(strict=False)
-    if not is_managed_worktree_path(path, project_root=project_root):
-        return None
-    verdict, _reason = registered_pool_seat_verdict(path, project_root=project_root)
-    if verdict != YES:
+    managed_verdict, _managed_reason = managed_worktree_path_verdict(
+        path, project_root=project_root
+    )
+    if managed_verdict != YES:
         return None
     if base_commit is None:
         return None
@@ -1457,6 +1547,7 @@ def bind_read_only_worktree(
     dispatch_id: str,
     *,
     base: str | None = None,
+    reap: bool = True,
 ) -> tuple[Path, str, WorktreeReadOnlySeatLease | None]:
     """Prefer a clean, unoccupied pooled seat before the detached fallback."""
     project_root = project_root.resolve()
@@ -1476,7 +1567,7 @@ def bind_read_only_worktree(
         if lease is not None:
             return path, base_commit, lease
     path, base_commit = shared_read_only_worktree(
-        project_root, base=resolved_base
+        project_root, base=resolved_base, reap=reap
     )
     return path, base_commit, None
 
@@ -1486,6 +1577,7 @@ def _reap_read_only_worktrees(
     *,
     root: Path,
     requested_path: Path | None,
+    deadline: float | None = None,
 ) -> None:
     """Remove only old, clean, unowned registered read-only checkouts."""
     try:
@@ -1512,13 +1604,31 @@ def _reap_read_only_worktrees(
         candidates.append((mtime, path))
     candidates.sort(key=lambda item: item[0], reverse=True)
     for _mtime, path in candidates[READ_ONLY_WORKTREE_KEEP:]:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return
+        pin_timeout = (
+            READ_ONLY_GIT_TIMEOUT_S
+            if deadline is None
+            else max(0.0, min(READ_ONLY_GIT_TIMEOUT_S, deadline - time.monotonic()))
+        )
+        if pin_timeout <= 0:
+            return
+        _keep_ref, pin_error = pin_worktree_head_before_remove(
+            project_root, path, timeout=pin_timeout
+        )
+        if pin_error is not None:
+            continue
         try:
             _git(
                 project_root,
                 "worktree",
                 "remove",
                 str(path),
-                timeout=READ_ONLY_GIT_TIMEOUT_S,
+                timeout=(
+                    READ_ONLY_GIT_TIMEOUT_S
+                    if deadline is None
+                    else max(0.0, min(READ_ONLY_GIT_TIMEOUT_S, deadline - time.monotonic()))
+                ),
             )
         except WorktreeSeatError as exc:
             if "timed out" in str(exc).lower():
@@ -1869,6 +1979,40 @@ def pin_unique_commits(
         "reason": f"unique commits pinned at {keep_ref}",
         "keep_ref": keep_ref,
     }
+
+
+def pin_worktree_head_before_remove(
+    project_root: Path,
+    worktree_path: str | Path,
+    *,
+    timeout: float | None = None,
+) -> tuple[str | None, str | None]:
+    """Pin a detached worktree HEAD before its administrative entry is removed."""
+    path = Path(worktree_path)
+    try:
+        head = _git(path, "rev-parse", "HEAD^{commit}", timeout=timeout)
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", path.name).strip(".-") or "worktree"
+        stamp = str(time.time_ns())
+        keep_ref = f"refs/{KEEP_REF_PREFIX}/gc-{stamp}-{safe}-{head[:12]}"
+        _git(
+            project_root,
+            "update-ref",
+            keep_ref,
+            head,
+            "",
+            timeout=timeout,
+        )
+        if _git(
+            project_root,
+            "rev-parse",
+            "--verify",
+            f"{keep_ref}^{{commit}}",
+            timeout=timeout,
+        ) != head:
+            return None, "keep ref did not verify after creation"
+        return keep_ref, None
+    except WorktreeSeatError as exc:
+        return None, str(exc)
 
 
 def _pin_existing_target_branch(
@@ -3591,6 +3735,7 @@ def _open_registered_lock(
     mode: int = 0o600,
     allow_create: bool = False,
     allow_unregistered: bool = False,
+    registration_deadline: float | None = None,
 ) -> int:
     """Open a registered inode, with explicit legacy-lock compatibility."""
     expected_stat = _registered_lock_identity(
@@ -3656,7 +3801,12 @@ def _open_registered_lock(
             expected_stat=expected_stat,
         )
     try:
-        _record_lock_identity(lock_path, fd, registry_root=registry_root)
+        _record_lock_identity(
+            lock_path,
+            fd,
+            registry_root=registry_root,
+            deadline=registration_deadline,
+        )
     except BaseException:
         os.close(fd)
         raise
@@ -3780,25 +3930,67 @@ def _verify_read_only_root(root: Path) -> None:
 
 
 @contextmanager
-def _read_only_allocation_lock(project_root: Path):
-    lock_root = _seat_lock_root(project_root)
-    lock_root.mkdir(parents=True, exist_ok=True)
-    lock_path = read_only_allocation_lock_path(project_root)
-    fd = _open_registered_lock(
-        lock_path,
-        _lock_open_flags(),
-        registry_root=_git_common_dir(project_root),
-        allow_create=True,
-        allow_unregistered=True,
+def _read_only_allocation_lock(
+    project_root: Path,
+    *,
+    timeout_s: float | None = None,
+    deadline: float | None = None,
+):
+    started = time.monotonic()
+    if deadline is None:
+        budget = READ_ONLY_GIT_TIMEOUT_S if timeout_s is None else max(0.0, timeout_s)
+        deadline = time.monotonic() + budget
+    else:
+        budget = max(0.0, deadline - started)
+    registry_root = _git_common_dir(
+        project_root,
+        timeout=max(0.0, deadline - time.monotonic()),
     )
-    lock_file = os.fdopen(fd, "r+", encoding="utf-8")
+    lock_root = registry_root / "goalflight-worktree-seat-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / "readonly-allocation.lock"
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        _adopt_exclusive_lock(
+        fd = _open_registered_lock(
             lock_path,
-            lock_file.fileno(),
-            registry_root=_git_common_dir(project_root),
+            _lock_open_flags(),
+            registry_root=registry_root,
+            allow_create=True,
+            allow_unregistered=True,
+            registration_deadline=deadline,
         )
+    except OSError as exc:
+        if exc.errno == errno.ETIMEDOUT:
+            raise WorktreeReadOnlyLockTimeout(
+                f"read-only allocation lock wait expired after "
+                f"{budget:g}s: {lock_path}; retry after it is released"
+            ) from exc
+        raise
+    try:
+        lock_file = os.fdopen(fd, "r+", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        try:
+            _flock_exclusive_until(
+                lock_file.fileno(),
+                deadline=deadline,
+                description=f"read-only allocation lock {lock_path}",
+            )
+            _adopt_exclusive_lock(
+                lock_path,
+                lock_file.fileno(),
+                registry_root=registry_root,
+                deadline=deadline,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ETIMEDOUT:
+                raise WorktreeReadOnlyLockTimeout(
+                    f"read-only allocation lock wait expired after "
+                    f"{budget:g}s: "
+                    f"{lock_path}; retry after it is released"
+                ) from exc
+            raise
         yield lock_file
     finally:
         lock_file.close()
@@ -3821,17 +4013,26 @@ def reap_read_only_worktrees(
             return
         root.mkdir(parents=True, exist_ok=True)
         _verify_read_only_root(root)
-        with _read_only_allocation_lock(project_root):
+        deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
+        with _read_only_allocation_lock(project_root, deadline=deadline):
             _reap_read_only_worktrees(
                 project_root,
                 root=root,
                 requested_path=requested_path,
+                deadline=deadline,
             )
+    except WorktreeReadOnlyLockTimeout:
+        raise
     except (OSError, subprocess.SubprocessError, WorktreeSeatError):
         return
 
 
-def shared_read_only_worktree(project_root: Path, *, base: str | None = None) -> tuple[Path, str]:
+def shared_read_only_worktree(
+    project_root: Path,
+    *,
+    base: str | None = None,
+    reap: bool = True,
+) -> tuple[Path, str]:
     """Return a checkout shared by read-only dispatches at one commit."""
     project_root = project_root.resolve()
     _verify_project_root(project_root)
@@ -3841,13 +4042,16 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
     _verify_read_only_root(root)
     root.mkdir(parents=True, exist_ok=True)
     _verify_read_only_root(root)
-    with _read_only_allocation_lock(project_root):
+    deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
+    with _read_only_allocation_lock(project_root, deadline=deadline):
         path = root / base_commit[:16]
-        _reap_read_only_worktrees(
-            project_root,
-            root=root,
-            requested_path=path,
-        )
+        if reap:
+            _reap_read_only_worktrees(
+                project_root,
+                root=root,
+                requested_path=path,
+                deadline=deadline,
+            )
         path_state = _path_presence(path)
         if path_state == "unknown":
             raise WorktreeSeatError(

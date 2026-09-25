@@ -2418,8 +2418,22 @@ def _release_read_only_worktree_hold(args) -> None:
     args._worktree_read_only_hold = None
 
 
+def _prepare_read_only_admission(args, project_root: Path) -> None:
+    """Finish detached-checkout cleanup before any capacity lease is held."""
+    if getattr(args, "_read_only_admission_prepared", False):
+        return
+    requested_path = None
+    if _effective_read_only(args) and getattr(args, "cwd", None):
+        requested_path = Path(str(args.cwd)).expanduser()
+    goalflight_worktree_pool.reap_read_only_worktrees(
+        project_root, requested_path=requested_path
+    )
+    args._read_only_admission_prepared = True
+
+
 def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
     """Pin and touch a resumed detached checkout before capacity waiting."""
+    _prepare_read_only_admission(args, project_root)
     if not getattr(args, "parent_dispatch_id", None) or not _effective_read_only(args):
         return
     raw_cwd = getattr(args, "cwd", None)
@@ -2596,7 +2610,8 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             "shared-read-only is an internal mode and requires --read-only"
         )
     project_root = _project_root(args)
-    goalflight_worktree_pool.reap_read_only_worktrees(project_root)
+    if not getattr(args, "_worktree_capacity_lease_active", False):
+        goalflight_worktree_pool.reap_read_only_worktrees(project_root)
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
         return existing
@@ -2635,9 +2650,16 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     "review base; refusing to review its current HEAD"
                 )
             recorded_path = Path(str(cwd_raw))
-            recorded_pool_path = goalflight_worktree_pool.is_managed_worktree_path(
-                recorded_path, project_root=project_root
+            recorded_pool_verdict, recorded_pool_reason = (
+                goalflight_worktree_pool.managed_worktree_path_verdict(
+                    recorded_path, project_root=project_root
+                )
             )
+            if recorded_pool_verdict == goalflight_worktree_pool.UNKNOWN:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"read-only resume recorded worktree path could not be "
+                    f"classified: {recorded_pool_reason}"
+                )
             hold = goalflight_worktree_pool.try_acquire_read_only_pool_seat(
                 project_root,
                 recorded_path,
@@ -2650,9 +2672,12 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                         hold.path, "rev-parse", "--verify", "HEAD^{commit}"
                     ), hold,
                 )
-            elif recorded_pool_path:
+            elif recorded_pool_verdict == goalflight_worktree_pool.YES:
                 shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
-                    project_root, str(args.dispatch_id), base=recorded_base
+                    project_root,
+                    str(args.dispatch_id),
+                    base=recorded_base,
+                    reap=not getattr(args, "_worktree_capacity_lease_active", False),
                 )
                 _record_shared_read_only_worktree(
                     args, shared_path, base_commit, hold
@@ -2668,7 +2693,10 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
 
     if getattr(args, "worktree", None) == "shared-read-only":
         shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
-            project_root, str(args.dispatch_id), base=base
+            project_root,
+            str(args.dispatch_id),
+            base=base,
+            reap=not getattr(args, "_worktree_capacity_lease_active", False),
         )
         _record_shared_read_only_worktree(args, shared_path, base_commit, hold)
         return None
@@ -2838,7 +2866,10 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
 
     if _occupancy_exempt_read_only(args):
         shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
-            project_root, str(args.dispatch_id), base=base
+            project_root,
+            str(args.dispatch_id),
+            base=base,
+            reap=not getattr(args, "_worktree_capacity_lease_active", False),
         )
         _record_shared_read_only_worktree(args, shared_path, base_commit, hold)
         return None
@@ -2884,8 +2915,10 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
         wait_s = max(0.0, requested_wait)
     deadline = time.monotonic() + wait_s
     previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
+    previous_lease_active = getattr(args, "_worktree_capacity_lease_active", False)
     # Zero is an immediate non-blocking lock budget; positive deadlines poll.
     args._worktree_capacity_deadline = deadline if wait_s else 0.0
+    args._worktree_capacity_lease_active = True
     last_wait_error = None
     lease = None
     try:
@@ -2952,6 +2985,7 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 pass
         else:
             args._worktree_capacity_deadline = previous_deadline
+        args._worktree_capacity_lease_active = previous_lease_active
     try:
         warning = getattr(args, "_worktree_occupancy_warning", None)
         checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
@@ -21714,6 +21748,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             return 64
     if resume_plan is not None and shape != "acp":
         args._capacity_account = resume_plan.get("capacity_account")
+        _prepare_read_only_admission(args, _project_root(args))
         resume_lease_id = _acquire_capacity(
             args,
             project_root=_project_root(args),

@@ -888,8 +888,8 @@ def test_read_only_resume_touches_checkout_under_allocation_lock(
     real_lock = goalflight_worktree_pool._read_only_allocation_lock
 
     @contextlib.contextmanager
-    def observed_lock(project_root: Path):
-        with real_lock(project_root):
+    def observed_lock(project_root: Path, **kwargs):
+        with real_lock(project_root, **kwargs):
             held.append(True)
             try:
                 yield

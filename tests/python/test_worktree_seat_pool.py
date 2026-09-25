@@ -8,12 +8,15 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("worktree seat leases require POSIX fcntl locks")
 
 import contextlib
+import fcntl
+import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -520,6 +523,134 @@ def test_read_only_worktree_is_shared_by_commit() -> None:
         assert_true("read-only checkout is not an exclusive pool slot", not (repo / "worktrees" / "s-1").exists())
 
 
+def test_read_only_path_probe_oserror_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    read_only_root = goalflight_worktree_pool.read_only_worktree_root(repo)
+    managed_root = goalflight_worktree_pool.repository_worktree_root(repo)
+    real_resolve = Path.resolve
+
+    def denied(path: Path, *args, **kwargs):
+        if path in {read_only_root, managed_root}:
+            raise OSError("permission denied")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", denied)
+    read_only_verdict, _ = goalflight_worktree_pool.read_only_worktree_path_verdict(
+        read_only_root / "candidate", project_root=repo
+    )
+    managed_verdict, _ = goalflight_worktree_pool.managed_worktree_path_verdict(
+        managed_root / "s-1", project_root=repo
+    )
+    assert read_only_verdict == goalflight_worktree_pool.UNKNOWN
+    assert managed_verdict == goalflight_worktree_pool.UNKNOWN
+
+
+def test_read_only_allocation_lock_wait_is_bounded(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeReadOnlyLockTimeout,
+            match="read-only allocation lock wait expired",
+        ):
+            with goalflight_worktree_pool._read_only_allocation_lock(
+                repo, timeout_s=0.05
+            ):
+                pass
+        assert time.monotonic() - started < 1.0
+
+
+def test_read_only_reaper_honors_transaction_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(goalflight_worktree_pool, "READ_ONLY_WORKTREE_KEEP", 0)
+    root = goalflight_worktree_pool.read_only_worktree_root(repo)
+    root.mkdir(parents=True)
+    paths = [root / f"old-{index}" for index in range(5)]
+    for path in paths:
+        path.mkdir()
+        os.utime(path, (1, 1))
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_read_only_registered_worktrees",
+        lambda _repo: paths,
+    )
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "read_only_worktree_usage",
+        lambda _path: {"verdict": goalflight_worktree_pool.YES},
+    )
+    clock = [0.0]
+    monkeypatch.setattr(goalflight_worktree_pool.time, "monotonic", lambda: clock[0])
+    pinned: list[Path] = []
+
+    def pin(_repo: Path, path: Path, **_kwargs):
+        pinned.append(path)
+        clock[0] += 1.0
+        return "refs/goalflight/keep/test", None
+
+    monkeypatch.setattr(goalflight_worktree_pool, "pin_worktree_head_before_remove", pin)
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_git",
+        lambda *_args, **_kwargs: "",
+    )
+    goalflight_worktree_pool._reap_read_only_worktrees(
+        repo, root=root, requested_path=None, deadline=2.0
+    )
+    assert pinned == paths[:2]
+
+
+def test_clean_legacy_ring_seat_is_adopted_and_reused(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    base = git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "legacy-writer", controller_label="legacy"
+    )
+    seat = writer.path
+    writer.release()
+    global_lock = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    git(repo, "worktree", "move", str(seat), str(legacy_path))
+    legacy_lock = (
+        goalflight_worktree_pool._seat_lock_root(repo, controller_label="legacy")
+        / "s-1.lock"
+    )
+    legacy_lock.parent.mkdir(parents=True, exist_ok=True)
+    global_lock.replace(legacy_lock)
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["locks"].pop(
+        goalflight_worktree_pool._lock_registry_key(global_lock), None
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    path, selected, hold = goalflight_worktree_pool.bind_read_only_worktree(
+        repo, "legacy-review", base=base
+    )
+    try:
+        assert path == legacy_path
+        assert selected == base
+        assert hold is not None
+        adopted = json.loads(registry_path.read_text(encoding="utf-8"))["locks"]
+        record = adopted[goalflight_worktree_pool._lock_registry_key(legacy_lock)]
+        identity = os.stat(legacy_lock)
+        assert record == {"st_dev": identity.st_dev, "st_ino": identity.st_ino}
+        assert read_only_worktrees(repo) == []
+    finally:
+        if hold is not None:
+            hold.release()
+
+
 def test_read_only_review_reuses_clean_pooled_seat_without_checkout() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         repo = make_repo(Path(td))
@@ -833,6 +964,38 @@ def test_read_only_finished_checkouts_are_reaped_on_next_allocation() -> None:
         assert len(read_only_worktrees(repo)) == 5
 
 
+def test_read_only_reaper_pins_detached_head_before_remove() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        base = add_read_only_base(repo, 0)
+        path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+            repo, base=base
+        )
+        (path / "detached-only.txt").write_text("keep this commit\n")
+        git(path, "add", "detached-only.txt")
+        git(path, "commit", "-m", "detached-only")
+        head = git(path, "rev-parse", "HEAD")
+        record_read_only_holder("finished-pin", path, state="complete")
+        os.utime(path, (1, 1))
+
+        prior_keep = goalflight_worktree_pool.READ_ONLY_WORKTREE_KEEP
+        goalflight_worktree_pool.READ_ONLY_WORKTREE_KEEP = 0
+        try:
+            goalflight_worktree_pool.reap_read_only_worktrees(repo)
+        finally:
+            goalflight_worktree_pool.READ_ONLY_WORKTREE_KEEP = prior_keep
+
+        assert not path.exists()
+        keep_refs = git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/",
+        ).splitlines()
+        keep_refs = [ref for ref in keep_refs if ref.startswith("refs/goalflight/keep/gc-")]
+        assert any(git(repo, "rev-parse", ref) == head for ref in keep_refs)
+
+
 def test_read_only_in_use_checkout_survives_the_cap() -> None:
     with tempfile.TemporaryDirectory() as td:
         repo = make_repo(Path(td))
@@ -967,6 +1130,11 @@ def test_read_only_reaper_stops_after_bounded_git_timeout(
             raise goalflight_worktree_pool.WorktreeSeatError("git command timed out")
 
         monkeypatch.setattr(goalflight_worktree_pool, "_git", timed_out)
+        monkeypatch.setattr(
+            goalflight_worktree_pool,
+            "pin_worktree_head_before_remove",
+            lambda *_args, **_kwargs: ("refs/goalflight/keep/test", None),
+        )
         goalflight_worktree_pool._reap_read_only_worktrees(
             repo, root=root, requested_path=None
         )
