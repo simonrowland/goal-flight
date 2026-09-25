@@ -686,7 +686,6 @@ def _acquire_read_only_action_lock(
             flags,
             registry_root=goalflight_worktree_pool._git_common_dir(repo),
             allow_create=True,
-            allow_unregistered=True,
         )
     except OSError as exc:
         return None, f"read-only allocation lock could not be opened ({exc})"

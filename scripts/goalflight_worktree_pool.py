@@ -1665,11 +1665,12 @@ def _holder_description(name: str, metadata: dict) -> str:
 def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
     """Existing branch names identify holders; directory labels never do."""
     metadata_dispatch_id = prior_dispatch_id
-    branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
-    for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
-        if branch.startswith(prefix + "/"):
-            prior_dispatch_id = branch[len(prefix) + 1:]
-            break
+    if worktree_path.exists():
+        branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+        for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
+            if branch.startswith(prefix + "/"):
+                prior_dispatch_id = branch[len(prefix) + 1:]
+                break
     holders = {prior_dispatch_id, metadata_dispatch_id} - {"unknown-dispatch"}
     if not holders:
         raise WorktreeSeatUnavailable(f"worktree {worktree_path} has unknown ownership")
@@ -3036,15 +3037,28 @@ def acquire_worktree_seat(
                     note_capacity_occupant(candidate_path, {})
                 continue
             try:
+                registered = (
+                    _registered_lock_identity(
+                        candidate_lock, registry_root=registry_root
+                    )
+                    is not None
+                )
+            except OSError:
+                note_capacity_occupant(
+                    candidate_path,
+                    _unregistered_lock_metadata(candidate_lock),
+                )
+                continue
+            try:
                 probe_fd = _open_registered_lock(
                     candidate_lock,
                     probe_flags,
                     registry_root=registry_root,
+                    allow_unregistered=True,
                 )
             except OSError:
-                # An unregistered legacy lock counts during the capacity pass;
-                # if a slot remains, the claim pass opens it compatibly and
-                # applies the normal metadata and ledger evidence.
+                # If the compatibility open cannot establish the lock
+                # identity, retain the candidate as an unknown occupant.
                 note_capacity_occupant(
                     candidate_path,
                     _unregistered_lock_metadata(candidate_lock),
@@ -3056,11 +3070,25 @@ def acquire_worktree_seat(
             except BlockingIOError:
                 note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
             else:
-                # An empty lock left by a failed first bind has no checkout
-                # or bytes to protect. Unknown owners still occupy any seat
-                # whose checkout exists; lock-only artifacts are reusable.
-                if _known_lock_dispatch_id(probe_file) is None and candidate_path.exists():
-                    note_capacity_occupant(candidate_path, _lock_metadata(probe_file))
+                prior_dispatch_id = _known_lock_dispatch_id(probe_file)
+                if registered:
+                    if prior_dispatch_id is None and candidate_path.exists():
+                        note_capacity_occupant(
+                            candidate_path, _lock_metadata(probe_file)
+                        )
+                elif prior_dispatch_id is None:
+                    note_capacity_occupant(
+                        candidate_path, _lock_metadata(probe_file)
+                    )
+                else:
+                    try:
+                        _validate_holder(candidate_path, prior_dispatch_id)
+                    except Exception:
+                        # Any ledger, identity, or checkout uncertainty keeps
+                        # the seat counted; the claim path repeats this check.
+                        note_capacity_occupant(
+                            candidate_path, _lock_metadata(probe_file)
+                        )
             finally:
                 probe_file.close()
 
@@ -3230,6 +3258,28 @@ def acquire_worktree_seat(
                     return None
                 seat_name = worktree_path.name
                 prior_dispatch_id = _known_lock_dispatch_id(lock_file)
+                if not path_existed and lock_existed:
+                    try:
+                        registered = (
+                            _registered_lock_identity(
+                                lock_path, registry_root=registry_root
+                            )
+                            is not None
+                        )
+                    except OSError:
+                        registered = False
+                    if prior_dispatch_id is None:
+                        if not registered:
+                            resolved_path = worktree_path.resolve(strict=False)
+                            if resolved_path not in occupied_paths:
+                                occupied_paths.add(resolved_path)
+                                occupants.append(
+                                    (str(worktree_path), _lock_metadata(lock_file))
+                                )
+                            lock_file.close()
+                            return None
+                    elif not registered:
+                        _validate_holder(worktree_path, prior_dispatch_id)
                 # A present checkout with no readable occupant is not a free
                 # seat. A resume cannot prove whether resetting it would erase
                 # another dispatch's uncommitted work; leave it untouched.

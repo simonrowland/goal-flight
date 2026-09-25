@@ -537,6 +537,34 @@ def test_read_only_gc_rejects_replaced_allocation_lock_identity(
         backup.rename(parent)
 
 
+def test_read_only_gc_rejects_replaced_unregistered_allocation_lock(
+    repo: Path,
+) -> None:
+    import fcntl
+
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    parent = lock_path.parent
+    parent.mkdir(parents=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    held = os.fdopen(fd, "r+", encoding="utf-8")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+    backup = parent.with_name(parent.name + ".real")
+    parent.rename(backup)
+    parent.mkdir()
+    lock_path.touch()
+    try:
+        handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(repo)
+        if handle is not None:
+            handle.close()
+        assert handle is None
+        assert error and "registered" in error
+    finally:
+        lock_path.unlink()
+        parent.rmdir()
+        backup.rename(parent)
+        held.close()
+
+
 def test_read_only_root_symlink_cannot_reap_pool_seat(
     tmp_path: Path, repo: Path
 ) -> None:
