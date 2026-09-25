@@ -55,6 +55,9 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
         encoding="utf-8",
     )
     ps_shim.chmod(0o755)
+    pgrep_shim = ps_dir / "pgrep"
+    pgrep_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    pgrep_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{os.environ.get('PATH', '')}"
     monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     for key, value in env.items():

@@ -63,6 +63,9 @@ def isolated(
     ps_shim = ps_dir / "ps"
     ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     ps_shim.chmod(0o755)
+    pgrep_shim = ps_dir / "pgrep"
+    pgrep_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    pgrep_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{env.get('PATH', '')}"
     monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     for key, value in env.items():
@@ -2608,6 +2611,12 @@ def test_direct_watchdog_beside_detected_supervisor_omits_backup_command(
         encoding="utf-8",
     )
     ps_shim.chmod(0o755)
+    pgrep_shim = shim_dir / "pgrep"
+    pgrep_shim.write_text(
+        "#!/bin/sh\nprintf '%s\\n' 4242\n",
+        encoding="utf-8",
+    )
+    pgrep_shim.chmod(0o755)
     direct_env = {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
     direct_env.pop("GOALFLIGHT_SUPERVISED", None)
 

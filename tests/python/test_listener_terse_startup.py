@@ -128,6 +128,9 @@ def _env_with_empty_process_listing(
     ps_shim = shim_dir / "ps"
     ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     ps_shim.chmod(0o755)
+    pgrep_shim = shim_dir / "pgrep"
+    pgrep_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    pgrep_shim.chmod(0o755)
     return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
 
 

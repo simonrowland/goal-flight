@@ -10307,12 +10307,13 @@ def cmd_supervise(args) -> int:
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return (
                 "existing wake coverage could not be measured before release; "
-                f"coverage retained: {type(exc).__name__}: {exc}"
+                "wake coverage was not verified; run --list-controllers: "
+                f"{type(exc).__name__}: {exc}"
             )
         if observed is None:
             return (
                 "existing wake coverage is indeterminate before release; "
-                "coverage retained"
+                "wake coverage was not verified; run --list-controllers"
             )
         targets = frozenset(observed)
         if not targets:
@@ -10332,12 +10333,13 @@ def cmd_supervise(args) -> int:
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return (
                 "existing wake coverage could not be revalidated before release; "
-                f"coverage retained: {type(exc).__name__}: {exc}"
+                "wake coverage was not verified; run --list-controllers: "
+                f"{type(exc).__name__}: {exc}"
             )
         if refreshed is None:
             return (
                 "existing wake coverage identity is indeterminate before release; "
-                "coverage retained"
+                "wake coverage was not verified; run --list-controllers"
             )
         target_records = {
             record.pid: record for record in targets.intersection(refreshed)
@@ -10362,7 +10364,10 @@ def cmd_supervise(args) -> int:
                     continue
                 if goalflight_wake._start_hash(start_token) == record.start_hash:
                     if pid == os.getpid():
-                        return f"refused to signal current process {pid}; coverage retained"
+                        return (
+                            f"refused to signal current process {pid}; wake "
+                            "coverage was not verified; run --list-controllers"
+                        )
                     caller_ancestry = _pid_in_caller_ancestry(pid)
                     if caller_ancestry is None:
                         identity_unknown.append(
@@ -10391,7 +10396,8 @@ def cmd_supervise(args) -> int:
         if identity_unknown:
             return (
                 "existing wake coverage identity is indeterminate before release; "
-                "coverage retained: " + "; ".join(identity_unknown)
+                "wake coverage was not verified; run --list-controllers: "
+                + "; ".join(identity_unknown)
             )
         return None
 
@@ -10507,7 +10513,7 @@ def cmd_supervise(args) -> int:
     if not probe_seen:
         print(
             "supervise: replacement did not emit the stdout-peer-liveness probe; "
-            "existing wake coverage retained",
+            "wake coverage was not verified; run --list-controllers",
             file=sys.stderr,
         )
         return result if result != 0 else supervise.SUPERVISE_START_EXIT
@@ -10897,6 +10903,15 @@ def _run_cli(argv: list[str] | None = None) -> int:
         help=(
             "restore raw stream keepalives and advisory frontier lines; default "
             "is terse — do not grep"
+        ),
+    )
+    supervise.add_argument(
+        "--takeover",
+        action="store_true",
+        help=(
+            "reclaim a recorded supervisor slot only after its PID and "
+            "start token prove the owner is dead; normal supervise starts "
+            "already self-heal proven-dead slots"
         ),
     )
     supervise.set_defaults(func=cmd_supervise)

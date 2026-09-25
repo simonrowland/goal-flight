@@ -2684,7 +2684,7 @@ def _restore_test_controller(previous: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
-def test_supervise_failed_migration_retains_existing_coverage_and_reports() -> None:
+def test_supervise_failed_migration_reports_unverified_coverage() -> None:
     import goalflight_wake
     import goalflight_wake_supervise as supervise
 
@@ -2723,7 +2723,8 @@ def test_supervise_failed_migration_retains_existing_coverage_and_reports() -> N
     assert result == 17
     kill.assert_not_called()
     assert "did not emit the stdout-peer-liveness probe" in stderr.getvalue()
-    assert "existing wake coverage retained" in stderr.getvalue()
+    assert "wake coverage was not verified" in stderr.getvalue()
+    assert "existing wake coverage retained" not in stderr.getvalue()
 
 
 def test_supervise_proven_migration_releases_existing_coverage_once() -> None:
