@@ -61,6 +61,8 @@ WORKTREE_BRANCH_PREFIX = "worktree"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
 KEEP_REF_PREFIX = "goalflight/keep"
 READ_ONLY_WORKTREE_DIR = ".goalflight-readonly"
+READ_ONLY_WORKTREE_KEEP = 4
+READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
 
 # Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
@@ -400,6 +402,22 @@ def controller_ring_root(project_root: Path, controller_label: str | None) -> Pa
 def repository_worktree_root(project_root: Path) -> Path:
     """Return the single repository-wide managed worktree directory."""
     return Path(project_root).resolve() / "worktrees"
+
+
+def read_only_worktree_root(project_root: Path) -> Path:
+    """Return the shared detached-checkout directory."""
+    return repository_worktree_root(project_root) / READ_ONLY_WORKTREE_DIR
+
+
+def is_read_only_worktree_path(path: str | Path, *, project_root: Path) -> bool:
+    """True for a direct child of the shared detached-checkout directory."""
+    try:
+        resolved = Path(path).resolve(strict=False)
+        root = read_only_worktree_root(project_root).resolve(strict=False)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return len(relative.parts) == 1
 
 
 def is_managed_worktree_path(path: str | Path, *, project_root: Path) -> bool:
@@ -963,6 +981,80 @@ def _verify_existing_seat(project_root: Path, worktree_path: Path) -> None:
         )
     if _git_common_dir(worktree_path) != _git_common_dir(project_root):
         raise WorktreeSeatError(f"managed worktree belongs to another repository: {worktree_path}")
+
+
+def read_only_worktree_usage(
+    path: str | Path,
+    *,
+    ledger_dir: Path | None = None,
+) -> dict[str, str]:
+    """Return the shared fail-closed in-use verdict for a detached checkout.
+
+    The GC owns the ledger predicate for both normal and read-only worktrees;
+    keep this import lazy because the GC imports this module for Git helpers.
+    """
+    import goalflight_worktree_gc
+
+    return goalflight_worktree_gc.check_unowned(
+        str(path), ledger_dir or goalflight_ledger.runs_dir(create=False)
+    )
+
+
+def _read_only_registered_worktrees(project_root: Path, root: Path) -> list[Path]:
+    output = _git(project_root, "worktree", "list", "--porcelain")
+    root = root.resolve(strict=False)
+    paths: list[Path] = []
+    for line in output.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        raw = line[len("worktree ") :].strip()
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+            relative = resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        if len(relative.parts) == 1:
+            paths.append(candidate)
+    return paths
+
+
+def _reap_read_only_worktrees(
+    project_root: Path,
+    *,
+    root: Path,
+    requested_path: Path,
+) -> None:
+    """Remove only old, clean, unowned registered read-only checkouts."""
+    try:
+        registered = _read_only_registered_worktrees(project_root, root)
+    except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+        return
+    requested = requested_path.resolve(strict=False)
+    now_ns = time.time_ns()
+    candidates: list[tuple[int, Path]] = []
+    for path in registered:
+        if path.resolve(strict=False) == requested:
+            continue
+        usage = read_only_worktree_usage(path)
+        if usage["verdict"] != YES:
+            continue
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if now_ns - mtime < READ_ONLY_WORKTREE_GRACE_S * 1_000_000_000:
+            continue
+        candidates.append((mtime, path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _mtime, path in candidates[READ_ONLY_WORKTREE_KEEP:]:
+        try:
+            _git(project_root, "worktree", "remove", str(path))
+        except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+            # Dirty or otherwise refused trees remain registered and intact.
+            continue
 
 
 def _write_occupant(
@@ -2753,7 +2845,7 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
     _verify_project_root(project_root)
     resolved_base = base if base is not None else default_seat_base(project_root)
     base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
-    root = repository_worktree_root(project_root) / READ_ONLY_WORKTREE_DIR
+    root = read_only_worktree_root(project_root)
     root.mkdir(parents=True, exist_ok=True)
     lock_root = _seat_lock_root(project_root)
     lock_root.mkdir(parents=True, exist_ok=True)
@@ -2763,6 +2855,11 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         path = root / base_commit[:16]
+        _reap_read_only_worktrees(
+            project_root,
+            root=root,
+            requested_path=path,
+        )
         if not path.exists():
             _git(project_root, "worktree", "add", "--detach", str(path), base_commit)
         _verify_existing_seat(project_root, path)
@@ -2771,6 +2868,10 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is at {actual}, expected {base_commit}"
             )
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
         return path, base_commit
     finally:
         lock_file.close()

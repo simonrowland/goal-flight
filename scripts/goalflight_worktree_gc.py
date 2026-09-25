@@ -17,6 +17,10 @@ four-part predicate as other registered worktrees. A directory merely *named*
 deletion exemption. If registration cannot be determined, the verdict is
 UNKNOWN and the tree is retained.
 
+Shared read-only worktrees under ``<repo>/worktrees/.goalflight-readonly`` are
+also listed. They are detached by design, so merge state is not a condition;
+cleanliness, dispatch ownership, and current-checkout protection still apply.
+
 Removal requires the CONJUNCTION of all four conditions:
 
   1. the worktree's branch is merged into the integration branch; AND
@@ -356,12 +360,15 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
 
 
 def _record_cwd_matches(record: dict[str, Any], path: str) -> bool:
-    raw_cwd = record.get("worker_cwd")
-    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
-        return False
-    cwd = _resolve(raw_cwd)
     target = _resolve(path)
-    return cwd == target or cwd.startswith(target + os.sep)
+    for key in ("worker_cwd", "worktree_path"):
+        raw_path = record.get(key)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = _resolve(raw_path)
+        if candidate == target or candidate.startswith(target + os.sep):
+            return True
+    return False
 
 
 def _record_states(record: dict[str, Any]) -> list[str]:
@@ -453,6 +460,19 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
             UNKNOWN,
             "dispatch ledger unreadable ("
             + ", ".join(unreadable)
+            + "); cannot prove no live dispatch owns this path",
+        )
+    state_unknown = [
+        str(record.get("dispatch_id") or "<unknown>")
+        for record in records
+        if not _record_states(record)
+        or any(state == "unreadable" for state in _record_states(record))
+    ]
+    if state_unknown:
+        return _condition(
+            UNKNOWN,
+            "dispatch ledger state unknown ("
+            + ", ".join(sorted(state_unknown))
             + "); cannot prove no live dispatch owns this path",
         )
     owned = [record for record in records if _record_owns_path(record, path)]
@@ -595,6 +615,38 @@ def classify(
         result["decision"] = "retain"
         result["reason"] = "main worktree is never a removal candidate"
         result["conditions"] = {}
+        return result
+
+    project_root = Path(main_path) if main_path is not None else repo
+    if goalflight_worktree_pool.is_read_only_worktree_path(
+        path, project_root=project_root
+    ):
+        usage = goalflight_worktree_pool.read_only_worktree_usage(
+            path, ledger_dir=ledger_dir
+        )
+        conditions = {
+            "clean": check_clean(path, directory_state=directory_state),
+            "unowned": usage,
+            "not_current": check_not_current(
+                path, current_checkout=current_checkout, current_error=current_error
+            ),
+        }
+        result["read_only"] = True
+        result["conditions"] = conditions
+        blockers = [
+            f"{name}: {cond['reason']}"
+            for name, cond in conditions.items()
+            if cond["verdict"] != YES
+        ]
+        if blockers:
+            result["decision"] = "retain"
+            result["reason"] = "; ".join(blockers)
+            return result
+        result["decision"] = "prune" if directory_state == "absent" else "remove"
+        result["reason"] = (
+            "read-only checkout is clean, has no live dispatch owner, and is "
+            "not the current checkout"
+        )
         return result
 
     seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
@@ -857,8 +909,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Report (or with --apply, remove) git worktrees that are merged, "
             "clean, unowned by a live dispatch, and not checked out. "
             "Registered pool worktrees are evaluated by the full predicate; a directory "
-            "merely named wt-N is ordinary litter. Run after merging "
-            "a worker branch into the integration branch."
+            "merely named wt-N is ordinary litter. Shared read-only checkouts are "
+            "evaluated without a merge condition. Run after merging a worker branch "
+            "into the integration branch."
         )
     )
     parser.add_argument(

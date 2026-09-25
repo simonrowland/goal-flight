@@ -74,14 +74,24 @@ def _merge_into_main(repo: Path, branch: str) -> None:
     _git(repo, "merge", "-q", "--ff-only", branch)
 
 
-def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path, **extra: object) -> None:
+def _add_read_only_checkout(repo: Path, index: int) -> Path:
+    _commit_in(repo, f"read-only-base-{index}.txt")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    path, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+    return path
+
+
+def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path | None, **extra: object) -> None:
     runs = goalflight_ledger.runs_dir(create=True)
     record = {
         "dispatch_id": dispatch_id,
         "state": state,
-        "worker_cwd": str(worker_cwd),
-        "project_root": str(worker_cwd),
     }
+    if worker_cwd is not None:
+        record["worker_cwd"] = str(worker_cwd)
+        record["project_root"] = str(worker_cwd)
     record.update(extra)
     name = goalflight_compat.safe_dispatch_filename(dispatch_id)
     (runs / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
@@ -333,6 +343,43 @@ def test_detached_head_is_unknown_and_retained(tmp_path: Path, repo: Path) -> No
     entry = _entry(report, wt)
     assert entry["decision"] == "retain", entry
     assert entry["conditions"]["merged"]["verdict"] == "unknown"
+
+
+def test_read_only_checkout_is_gc_candidate_without_merge_condition(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 1)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["read_only"] is True, entry
+    assert entry["decision"] == "remove", entry
+    assert "merged" not in entry["conditions"], entry
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["outcome"] == "removed", entry
+    assert not wt.exists()
+    assert os.path.realpath(wt) not in _worktree_paths(repo)
+
+
+def test_read_only_gc_uses_recorded_worktree_path_for_ownership(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 2)
+    _write_ledger(
+        "readonly-worktree-path-owner",
+        "running",
+        None,
+        worktree_path=str(wt),
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+    assert "readonly-worktree-path-owner" in entry["conditions"]["unowned"]["reason"]
 
 
 # --------------------------------------------------------------------------

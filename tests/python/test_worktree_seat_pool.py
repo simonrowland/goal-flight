@@ -58,6 +58,38 @@ def make_repo(root: Path) -> Path:
     return repo
 
 
+def add_read_only_base(repo: Path, index: int) -> str:
+    path = repo / f"read-only-base-{index}.txt"
+    path.write_text(f"base {index}\n", encoding="utf-8")
+    git(repo, "add", path.name)
+    git(repo, "commit", "-m", f"read-only base {index}")
+    return git(repo, "rev-parse", "HEAD")
+
+
+def read_only_worktrees(repo: Path) -> list[Path]:
+    root = (repo / "worktrees" / ".goalflight-readonly").resolve()
+    output = git(repo, "worktree", "list", "--porcelain")
+    paths = []
+    for line in output.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line[len("worktree ") :].strip()).resolve()
+        if path.parent == root:
+            paths.append(path)
+    return sorted(paths)
+
+
+def record_read_only_holder(dispatch_id: str, path: Path, *, state: str = "running") -> None:
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": dispatch_id,
+            "state": state,
+            "worker_cwd": str(path),
+            "worktree_path": str(path),
+        }
+    )
+
+
 def record_finished_holder(
     dispatch_id: str, identity: dict | None = None, *, state: str = "complete"
 ) -> None:
@@ -486,6 +518,105 @@ def test_read_only_worktree_is_shared_by_commit() -> None:
         assert_true("same read-only base", first_base == second_base)
         assert_true("read-only checkout is detached", git(first_path, "branch", "--show-current") == "")
         assert_true("read-only checkout is not an exclusive pool slot", not (repo / "worktrees" / "s-1").exists())
+
+
+def test_read_only_finished_checkouts_are_reaped_on_next_allocation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        paths = []
+        for index in range(7):
+            path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+                repo, base=add_read_only_base(repo, index)
+            )
+            paths.append(path)
+            record_read_only_holder(f"readonly-finished-{index}", path, state="complete")
+            os.utime(path, (index + 1, index + 1))
+
+        assert not paths[0].exists()
+        assert not paths[1].exists()
+        assert all(path.exists() for path in paths[2:])
+        assert len(read_only_worktrees(repo)) == 5
+
+
+def test_read_only_in_use_checkout_survives_the_cap() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        paths = []
+        for index in range(6):
+            path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+                repo, base=add_read_only_base(repo, index)
+            )
+            paths.append(path)
+            os.utime(path, (index + 1, index + 1))
+            if index == 0:
+                record_read_only_holder("readonly-live", path)
+
+        assert paths[0].exists()
+        assert len(read_only_worktrees(repo)) == 6
+
+
+def test_read_only_allocation_grace_closes_ledger_registration_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        monkeypatch.setattr(goalflight_worktree_pool, "READ_ONLY_WORKTREE_KEEP", 0)
+        first, _base = goalflight_worktree_pool.shared_read_only_worktree(
+            repo, base=add_read_only_base(repo, 0)
+        )
+        stray = first.parent / "stray-not-registered"
+        stray.mkdir()
+
+        second, _base = goalflight_worktree_pool.shared_read_only_worktree(
+            repo, base=add_read_only_base(repo, 1)
+        )
+
+        assert first.exists(), "fresh allocation must survive before ledger registration"
+        assert second.exists()
+        assert stray.is_dir(), "unregistered stray directories are never removed"
+
+
+def test_unreadable_read_only_ledger_keeps_every_checkout() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        paths = []
+        for index in range(5):
+            path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+                repo, base=add_read_only_base(repo, index)
+            )
+            paths.append(path)
+            os.utime(path, (index + 1, index + 1))
+        runs = goalflight_ledger.runs_dir(create=True)
+        (runs / "unreadable.json").write_text("{not json", encoding="utf-8")
+
+        path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+            repo, base=add_read_only_base(repo, 5)
+        )
+
+        assert path.exists()
+        assert all(item.exists() for item in paths)
+        assert len(read_only_worktrees(repo)) == 6
+
+
+def test_dirty_read_only_checkout_is_kept_when_git_refuses_remove() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        paths = []
+        for index in range(5):
+            path, _base = goalflight_worktree_pool.shared_read_only_worktree(
+                repo, base=add_read_only_base(repo, index)
+            )
+            paths.append(path)
+            os.utime(path, (index + 1, index + 1))
+        dirty_file = paths[0] / "uncommitted.txt"
+        dirty_file.write_text("keep me\n", encoding="utf-8")
+
+        goalflight_worktree_pool.shared_read_only_worktree(
+            repo, base=add_read_only_base(repo, 5)
+        )
+
+        assert paths[0].is_dir()
+        assert dirty_file.read_text(encoding="utf-8") == "keep me\n"
 
 
 @pytest.mark.parametrize("bind_step", ["create", "verify", "pin", "quarantine", "checkout"])

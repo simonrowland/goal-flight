@@ -19831,6 +19831,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     )
     if outer_seat_bound:
         acp_worktree = "off"
+    elif getattr(args, "in_place", False):
+        acp_worktree = "off"
     elif _occupancy_exempt_read_only(args):
         acp_worktree = "shared-read-only"
     elif deferred_worktree:
