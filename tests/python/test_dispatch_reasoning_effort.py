@@ -109,6 +109,204 @@ def test_grok_model_refusal_lists_actual_levels(grok_home):
         validate_grok(grok_home, "grok-4.5", "xhigh")
 
 
+def test_grok_catalog_refusal_does_not_refresh_seat_state(monkeypatch, tmp_path):
+    home = tmp_path / "grok-home"
+    grok_dir = home / ".grok"
+    grok_dir.mkdir(parents=True)
+    (grok_dir / "auth.json").write_text("{}")
+    (grok_dir / "config.toml").write_text('[ui]\npermission_mode = "always-approve"\n')
+    (grok_dir / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": {
+                    "grok-4.5": {
+                        "info": {
+                            "supports_reasoning_effort": True,
+                            "reasoning_efforts": [{"id": "high"}],
+                        }
+                    }
+                }
+            }
+        )
+    )
+    seat_state = tmp_path / "grok-seat-states.json"
+    original = b"before\n"
+    seat_state.write_bytes(original)
+
+    def select_seat(**kwargs):
+        if kwargs.get("allow_refresh", True):
+            seat_state.write_bytes(b"refreshed\n")
+        return "seat"
+
+    monkeypatch.setattr(D, "_select_healthy_grok_account", select_seat)
+    monkeypatch.setattr(D, "_account_home", lambda _account, _engine: home)
+    args = D._build_launch_parser().parse_args(
+        [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--model",
+            "grok-4.5",
+            "--reasoning-effort",
+            "xhigh",
+            "--prompt",
+            "implement the requested change",
+        ]
+    )
+
+    with pytest.raises(D.DispatchUsageError, match="not supported for Grok model"):
+        D._validate_before_side_effects(args, [])
+    assert seat_state.read_bytes() == original
+
+
+def test_grok_catalog_selection_is_reused_by_launch(monkeypatch, grok_home):
+    grok_dir = grok_home / ".grok"
+    (grok_dir / "auth.json").write_text("{}")
+    (grok_dir / "config.toml").write_text('[ui]\npermission_mode = "always-approve"\n')
+    selected = []
+
+    def select_seat(**_kwargs):
+        selected.append(True)
+        return "seat-a" if len(selected) == 1 else "seat-b"
+
+    monkeypatch.setattr(D, "_select_healthy_grok_account", select_seat)
+    monkeypatch.setattr(D, "_account_home", lambda _account, _engine: grok_home)
+    args = D._build_launch_parser().parse_args(
+        [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--reasoning-effort",
+            "xhigh",
+            "--prompt",
+            "implement the requested change",
+        ]
+    )
+
+    validated_env = D._validate_before_side_effects(args, [])
+    launched_env = D._resolve_launch_account_env(args)
+    assert len(selected) == 1
+    assert args._grok_selected_account == "seat-a"
+    assert validated_env["HOME"] == launched_env["HOME"] == str(grok_home)
+
+
+def test_missing_grok_state_refuses_effort_without_refresh(monkeypatch, tmp_path):
+    import grok_seats
+
+    home = tmp_path / "grok-home"
+    grok_dir = home / ".grok"
+    grok_dir.mkdir(parents=True)
+    (grok_dir / "auth.json").write_text("{}")
+    (grok_dir / "config.toml").write_text('[ui]\npermission_mode = "always-approve"\n')
+    state_path = tmp_path / "grok-seat-states.json"
+    monkeypatch.setattr(grok_seats, "STATE_PATH", state_path)
+    monkeypatch.setattr(D, "_account_home", lambda _account, _engine: home)
+    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *_args, **_kwargs: None)
+
+    def refresh_states(**_kwargs):
+        state_path.write_text("refreshed\n")
+        return {
+            "version": 1,
+            "updated_at": 1,
+            "seats": {
+                "seat": {
+                    "probe_state": "usable",
+                    "auth_state": "valid",
+                    "used_percent": 1,
+                }
+            },
+        }
+
+    monkeypatch.setattr(grok_seats, "refresh_states", refresh_states)
+    args = D._build_launch_parser().parse_args(
+        [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--prompt",
+            "implement the requested change",
+            "--reasoning-effort",
+            "xhigh",
+        ]
+    )
+
+    with pytest.raises(D.DispatchUsageError, match="no usable grok seat"):
+        D._validate_before_side_effects(args, [])
+    assert not state_path.exists()
+
+
+def test_no_eligible_grok_seat_refuses_effort_without_host_fallback(monkeypatch):
+    monkeypatch.setattr(D, "_select_healthy_grok_account", lambda **_kwargs: None)
+    args = D._build_launch_parser().parse_args(
+        [
+            "--agent",
+            "grok-code",
+            "--shape",
+            "bash",
+            "--prompt",
+            "implement the requested change",
+            "--reasoning-effort",
+            "xhigh",
+        ]
+    )
+
+    with pytest.raises(D.DispatchUsageError, match="no usable grok seat"):
+        D._validate_before_side_effects(args, [])
+    assert not hasattr(args, "_grok_selected_account")
+
+
+def test_resume_acp_effort_refuses_before_resume_lock(monkeypatch, tmp_path):
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("continue")
+    state_root = tmp_path / "goalflight-state"
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state_root))
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
+    monkeypatch.setattr(D, "_validate_resume_worktree_source", lambda *_args: None)
+    monkeypatch.setattr(
+        D, "_refuse_launch_blocked_by_completion_authority", lambda *_args: None
+    )
+    monkeypatch.setattr(D, "_normalize_acp_agent", lambda _args: None)
+    monkeypatch.setattr(D, "grok_selected_account", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(D, "_revalidate_resume_claim", lambda **_kwargs: None)
+    source = {
+        "record": {"worker_cwd": str(tmp_path), "project_root": str(tmp_path)},
+        "engine": "grok",
+        "session_id": "session-1",
+    }
+    candidate = [
+        "--agent",
+        "grok-code",
+        "--shape",
+        "acp",
+        "--prompt-file",
+        str(prompt),
+        "--parent-dispatch-id",
+        "parent-1",
+        "--engine-session-id",
+        "session-1",
+        "--cwd",
+        str(tmp_path),
+        "--reasoning-effort",
+        "xhigh",
+    ]
+    preflight = None
+    try:
+        with pytest.raises(D.DispatchUsageError, match="not supported for Grok ACP"):
+            preflight = D._preflight_resume_dispatch(
+                source,
+                candidate_argv=candidate,
+                dispatch_id="child-1",
+            )
+    finally:
+        if preflight is not None:
+            preflight["resume_lock"].__exit__(None, None, None)
+    lock_dir = state_root / "dispatch-homes" / ".resume-locks"
+    assert not lock_dir.exists() or not list(lock_dir.iterdir())
+
+
 def test_grok_cache_fallback_uses_model_family(grok_home):
     cache = grok_home / ".grok" / "models_cache.json"
     cache.unlink()
