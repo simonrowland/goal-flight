@@ -6646,11 +6646,17 @@ def _resume_launch_argv(
             if owner_healthy:
                 target = owner_account
             else:
-                target = _select_healthy_grok_account(
-                    model=resume_model,
-                    exclude={owner_account} if owner_account else None,
-                    named_only=True,
-                )
+                selection_kwargs = {
+                    "model": resume_model,
+                    "exclude": {owner_account} if owner_account else None,
+                    "named_only": True,
+                }
+                # An effort-bearing resume must reach catalog validation
+                # before a stale-seat refresh can write state. Keep this
+                # fallback read-only until preflight accepts the effort.
+                if requested_reasoning_effort or recorded_reasoning_effort:
+                    selection_kwargs["allow_refresh"] = False
+                target = _select_healthy_grok_account(**selection_kwargs)
                 if target is None:
                     # Every configured account is walled or unmeasured. Launching
                     # anyway spends a dispatch to rediscover the same 402 or auth

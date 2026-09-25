@@ -477,6 +477,76 @@ def test_resume_preserves_grok_reasoning_effort(
     assert _option(argv, "--reasoning-effort") == "xhigh"
 
 
+def test_unsupported_effort_resume_does_not_refresh_seat_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _accounts(tmp_path, "old", "new")
+    for account in ("old", "new"):
+        home = Path.home() / ".goal-flight" / "accounts" / account / "grok"
+        (home / ".grok").mkdir(parents=True, exist_ok=True)
+        (home / ".grok" / "auth.json").write_text("token", encoding="utf-8")
+        (home / ".grok" / "config.toml").write_text(
+            '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+        )
+    new_home = Path.home() / ".goal-flight" / "accounts" / "new" / "grok"
+    (new_home / ".grok" / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": {
+                    "grok-4.5": {
+                        "info": {
+                            "supports_reasoning_effort": True,
+                            "reasoning_efforts": [{"id": "high"}],
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    seat_state = tmp_path / "grok-seat-states.json"
+    before = b"stale-state-before\n"
+    seat_state.write_bytes(before)
+    record = _record(tmp_path)
+    record.update(
+        {
+            "schema": L.SCHEMA,
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(tmp_path),
+            "engine_session_id": SESSION,
+            "model": "grok-4.5",
+            "reasoning_effort": "xhigh",
+        }
+    )
+    record["dispatch_argv"].extend(
+        ["--model", "grok-4.5", "--reasoning-effort", "xhigh"]
+    )
+    L.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-unsupported-effort-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_seat_probe_says_usable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
+
+    def selecting_seat(**kwargs):
+        if kwargs.get("allow_refresh", True):
+            seat_state.write_bytes(b"refreshed-by-resume\n")
+        return "new"
+
+    monkeypatch.setattr(D, "_select_healthy_grok_account", selecting_seat)
+
+    assert D._cmd_resume(
+        [record["dispatch_id"], "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    assert "not supported for Grok model" in capsys.readouterr().err
+    assert seat_state.read_bytes() == before
+
+
 def test_measured_unhealthy_owner_falls_back_without_ledger_wall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
