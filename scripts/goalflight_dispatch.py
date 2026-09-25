@@ -21756,6 +21756,24 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         if registration_warning is not None:
             dispatch_warnings = [*dispatch_warnings, registration_warning]
             worker_stdout_mode = "ab"
+
+        def record_worktree_wait() -> None:
+            nonlocal ledger_recorded
+            if ledger_recorded:
+                return
+            _record_ledger(
+                args,
+                project_root=project_root,
+                prompt_path=None,
+                status_json=status_json,
+                tail=tail,
+                lease_id=lease_id,
+                worker_pid=None,
+                state="waiting_capacity",
+            )
+            ledger_recorded = True
+
+        record_worktree_wait()
         try:
             if lease_id is None:
                 lease_id = _acquire_capacity(
@@ -21786,22 +21804,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 and args.queue_claim_path
             )
             raise
-        def record_worktree_wait() -> None:
-            nonlocal ledger_recorded
-            if ledger_recorded:
-                return
-            _record_ledger(
-                args,
-                project_root=project_root,
-                prompt_path=None,
-                status_json=status_json,
-                tail=tail,
-                lease_id=lease_id,
-                worker_pid=None,
-                state="waiting_capacity",
-            )
-            ledger_recorded = True
-
         args._worktree_wait_callback = record_worktree_wait
         try:
             worktree_seat = _admit_dispatch_worktree(args)
