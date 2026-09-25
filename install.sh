@@ -55,6 +55,10 @@ ensure_ripgrep() {
     local brew_path=""
     brew_path="$(command -v brew 2>/dev/null || true)"
     if [[ -n "$brew_path" ]]; then
+      if [[ ! -t 0 || -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${GITLAB_CI:-}" || -n "${TF_BUILD:-}" || -n "${CIRCLECI:-}" || -n "${TRAVIS:-}" || -n "${JENKINS_URL:-}" || -n "${BUILDKITE:-}" || -n "${DRONE:-}" ]]; then
+        printf 'WARN: rg is missing; install it with: brew install ripgrep. Continuing installer.\n' >&2
+        return 0
+      fi
       printf 'DEPS rg: missing; running brew install ripgrep (%s)\n' "$brew_path"
       if "$brew_path" install ripgrep; then
         if rg_path="$(command -v rg 2>/dev/null)" && rg --version >/dev/null 2>&1; then

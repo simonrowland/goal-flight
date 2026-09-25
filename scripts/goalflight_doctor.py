@@ -187,21 +187,36 @@ def version(binary: str, *args: str) -> dict:
 
 
 def _ripgrep_private_path(path: str | None) -> bool:
-    """Flag rg paths hidden under HOME unless they use a standard bin root."""
+    """Flag rg paths outside the standard shared binary directories."""
     if not path:
         return False
     try:
-        home = Path.home()
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
-        relative = candidate.relative_to(home)
-    except (OSError, ValueError):
-        return False
-    parts = relative.parts
-    if len(parts) < 2 or not parts[0].startswith("."):
-        return False
-    return tuple(parts[:2]) not in {(".local", "bin"), (".cargo", "bin")}
+        candidate_dir = candidate.parent
+        resolved_dir = candidate_dir.resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return True
+
+    shared_dirs = {
+        Path("/opt/homebrew/bin"),
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        home / ".local/bin",
+        home / "bin",
+        home / ".cargo/bin",
+        home / ".nix-profile/bin",
+        Path("/run/current-system/sw/bin"),
+    }
+    nix_profiles = Path("/nix/var/nix/profiles")
+    for directory in (candidate_dir, resolved_dir):
+        if directory in shared_dirs:
+            return False
+        if directory.parent.parent == nix_profiles and directory.name == "bin":
+            return False
+    return True
 
 
 def _ripgrep_install_hint() -> str:
@@ -238,7 +253,7 @@ def check_ripgrep() -> dict:
     if not present:
         out["detail"] = "rg is absent from PATH"
     elif private_path:
-        out["detail"] = "rg resolves inside a hidden HOME directory"
+        out["detail"] = "rg resolves inside a private tool directory"
     return out
 
 

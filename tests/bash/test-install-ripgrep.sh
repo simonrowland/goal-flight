@@ -34,25 +34,70 @@ assert_contains 'skipped (--no-deps)' "$skip_output"
 echo 'test1 pass: --no-deps skips package manager'
 
 NO_DEPS=0
-brew_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
+brew_output="$(PATH="$FAKE_BIN" ensure_ripgrep </dev/null 2>&1)"
 assert_contains 'brew install ripgrep' "$brew_output"
-assert_contains 'failed; continuing installer' "$brew_output"
+[[ ! -s "$BREW_LOG" ]] || { echo 'FAIL: non-interactive install invoked brew' >&2; exit 1; }
+echo 'test2 pass: non-interactive macOS install prints brew command and continues'
+
+: > "$BREW_LOG"
+ci_output="$(CI=1 PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
+assert_contains 'brew install ripgrep' "$ci_output"
+[[ ! -s "$BREW_LOG" ]] || { echo 'FAIL: CI install invoked brew' >&2; exit 1; }
+echo 'test3 pass: CI macOS install prints brew command and continues'
+
+: > "$BREW_LOG"
+PYTHON_BIN="$(command -v python3)"
+interactive_output="$(PATH="$FAKE_BIN" "$PYTHON_BIN" - "$INSTALL_SH" "$FAKE_BIN" <<'PY'
+import os
+import pty
+import sys
+
+install_sh, fake_bin = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    child_env = os.environ.copy()
+    child_env["PATH"] = fake_bin
+    for name in ("CI", "GITHUB_ACTIONS", "GITLAB_CI", "TF_BUILD", "CIRCLECI", "TRAVIS", "JENKINS_URL", "BUILDKITE", "DRONE"):
+        child_env.pop(name, None)
+    os.execve(
+        "/bin/bash",
+        ["bash", "-c", 'source "$1"; NO_DEPS=0; ensure_ripgrep', "bash", install_sh],
+        child_env,
+    )
+
+output = bytearray()
+while True:
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    output.extend(chunk)
+_, status = os.waitpid(pid, 0)
+if os.waitstatus_to_exitcode(status) != 0:
+    raise SystemExit(1)
+sys.stdout.buffer.write(output)
+PY
+)"
+assert_contains 'brew install ripgrep' "$interactive_output"
 grep -qx 'install ripgrep' "$BREW_LOG"
-echo 'test2 pass: missing macOS rg invokes brew once and continues on failure'
+echo 'test4 pass: interactive non-CI macOS install invokes brew'
 
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/rg"
 chmod +x "$FAKE_BIN/rg"
 present_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains "present ($FAKE_BIN/rg)" "$present_output"
-echo 'test3 pass: existing rg is idempotent'
+echo 'test5 pass: existing rg is idempotent'
 
 printf '#!/bin/sh\nexit 1\n' > "$FAKE_BIN/rg"
 chmod +x "$FAKE_BIN/rg"
 : > "$BREW_LOG"
-broken_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
+broken_output="$(PATH="$FAKE_BIN" ensure_ripgrep </dev/null 2>&1)"
 assert_contains 'rg --version failed' "$broken_output"
-grep -qx 'install ripgrep' "$BREW_LOG"
-echo 'test4 pass: broken rg is not treated as usable'
+assert_contains 'brew install ripgrep' "$broken_output"
+[[ ! -s "$BREW_LOG" ]] || { echo 'FAIL: non-interactive broken-rg check invoked brew' >&2; exit 1; }
+echo 'test6 pass: broken rg is not treated as usable'
 
 rm -f "$FAKE_BIN/rg"
 PKG_LOG="$TMPROOT/package-manager.log"
@@ -63,7 +108,7 @@ chmod +x "$FAKE_BIN/uname"
 linux_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains 'sudo apt-get update && sudo apt-get install -y ripgrep' "$linux_output"
 [[ ! -s "$PKG_LOG" ]] || { echo 'FAIL: Linux dependency check ran apt-get' >&2; exit 1; }
-echo 'test5 pass: Linux path prints apt command without running package manager'
+echo 'test7 pass: Linux path prints apt command without running package manager'
 
 FAKE_SETUP="$TMPROOT/setup.sh"
 SETUP_LOG="$TMPROOT/setup-args.log"
@@ -77,4 +122,4 @@ if grep -qx -- '--no-deps' "$SETUP_LOG"; then
   echo 'FAIL: --no-deps leaked into setup argv' >&2
   exit 1
 fi
-echo 'test6 pass: --no-deps is stripped before setup'
+echo 'test8 pass: --no-deps is stripped before setup'

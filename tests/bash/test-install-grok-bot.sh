@@ -49,7 +49,7 @@ fi
   || fail "dry-run mutated grok-bot workflows skill"
 echo "test1 pass: grok-bot dry-run plans wrapper copy and mutates nothing"
 
-install_alias_dry="$(bash "$REPO_ROOT/install.sh" --grok-bot --addons '')"
+install_alias_dry="$(bash "$REPO_ROOT/install.sh" --no-deps --grok-bot --addons '')"
 printf '%s\n' "$install_alias_dry" | grep -q 'DRY-RUN setup agent=grok-bot' \
   || fail "install.sh --grok-bot alias did not select grok-bot setup"
 echo "test2 pass: install.sh --grok-bot is a dry-run alias"
@@ -73,7 +73,7 @@ grep -q 'Grok Bot' "$GOALFLIGHT_GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" \
 echo "test4 pass: apply writes the workflows-library wrapper"
 
 oneshot_root="$TMP_ROOT/oneshot-workflows"
-oneshot_out="$(bash "$REPO_ROOT/install.sh" grok-bot "$oneshot_root" --addons '' 2>&1)"
+oneshot_out="$(bash "$REPO_ROOT/install.sh" --no-deps grok-bot "$oneshot_root" --addons '' 2>&1)"
 printf '%s\n' "$oneshot_out" | grep -q '^APPLY ' \
   || fail "install.sh grok-bot <root> should apply writes"
 [ -f "$oneshot_root/goal-flight/SKILL.md" ] \
@@ -528,7 +528,7 @@ grep -q 'goalflight_grok_bot_listen.py' "$wrapper" \
   || fail "resume must prefer goalflight_grok_bot_listen.py when present"
 # Re-install after the wrapper edit path: copy still matches source hash.
 slash_root="$TMP_ROOT/slash-workflows"
-slash_out="$(bash "$REPO_ROOT/install.sh" grok-bot "$slash_root" --addons '' 2>&1)"
+slash_out="$(bash "$REPO_ROOT/install.sh" --no-deps grok-bot "$slash_root" --addons '' 2>&1)"
 printf '%s\n' "$slash_out" | grep -q '^APPLY ' \
   || fail "install.sh grok-bot must still apply after slash fold"
 [ -f "$slash_root/goal-flight/SKILL.md" ] \

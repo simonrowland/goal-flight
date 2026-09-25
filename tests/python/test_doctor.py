@@ -131,6 +131,49 @@ def test_doctor_ripgrep_probe_reports_present_path_and_version() -> None:
     case_doctor_ripgrep_probe_reports_present_path_and_version()
 
 
+def case_doctor_ripgrep_probe_flags_vendored_path_but_allows_nix_path() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-rg-shared-paths-") as td:
+        root = Path(td)
+        home = root / "home"
+        vendored_bin = root / "tool" / "node_modules" / "codex-path"
+        nix_profile_target = root / "nix-profile-target"
+        nix_bin = nix_profile_target / "bin"
+        vendored_bin.mkdir(parents=True)
+        nix_bin.mkdir(parents=True)
+        (home / ".nix-profile").parent.mkdir(parents=True)
+        (home / ".nix-profile").symlink_to(nix_profile_target, target_is_directory=True)
+        nix_bin = home / ".nix-profile" / "bin"
+        vendored_rg = vendored_bin / "rg"
+        nix_rg = nix_bin / "rg"
+        _write_fake_rg(vendored_rg)
+        _write_fake_rg(nix_rg)
+
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "PATH": str(vendored_bin)},
+            clear=False,
+        ):
+            vendored_payload = goalflight_doctor.check_ripgrep()
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "PATH": str(nix_bin)},
+            clear=False,
+        ):
+            nix_payload = goalflight_doctor.check_ripgrep()
+
+    assert vendored_payload["private_path"] is True
+    assert vendored_payload["ok"] is False
+    assert nix_payload["private_path"] is False
+    assert nix_payload["ok"] is True
+    assert goalflight_doctor._ripgrep_private_path(
+        "/nix/var/nix/profiles/default/bin/rg"
+    ) is False
+
+
+def test_doctor_ripgrep_probe_flags_vendored_path_but_allows_nix_path() -> None:
+    case_doctor_ripgrep_probe_flags_vendored_path_but_allows_nix_path()
+
+
 def case_doctor_ripgrep_probe_reports_absent_with_install_hint() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-doctor-rg-absent-") as td:
         with patch.dict(os.environ, {"PATH": td}, clear=False):
