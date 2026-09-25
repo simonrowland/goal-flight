@@ -199,8 +199,11 @@ def test_primitive_empty_readable_dir_still_unowned(tmp_path: Path) -> None:
     wt = tmp_path / "wt"
     wt.mkdir()
     verdict = gc.check_unowned(str(wt), directory)
-    assert verdict["verdict"] == "yes"
-    assert "no non-terminal dispatch records this path" in verdict["reason"]
+    # Since 2bac1601, an observed empty ledger is fail-closed: a mis-resolved
+    # or replaced state directory can hide the dispatch that owns this path.
+    assert verdict["verdict"] == "unknown"
+    assert "unreadable or empty" in verdict["reason"]
+    assert "cannot prove no live dispatch owns this path" in verdict["reason"]
 
 
 def test_c1_unlistable_ledger_dir_is_not_unowned(tmp_path: Path) -> None:
