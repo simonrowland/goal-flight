@@ -21731,6 +21731,31 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     expected_session_id=engine_session_id,
                     exclude_dispatch_id=args.dispatch_id,
                 )
+        if not goalflight_compat.is_windows():
+            controller_claim = _stamp_controller_session(args, project_root)
+            if controller_claim.get("reason") in {
+                "label_in_use",
+                "resume_controller_label_mismatch",
+            }:
+                print(
+                    "goalflight_dispatch: "
+                    + str(
+                        controller_claim.get("message")
+                        or controller_claim.get("reason")
+                    ),
+                    file=sys.stderr,
+                )
+                return 73
+            if controller_claim.get("visible_warning"):
+                print(
+                    "goalflight_dispatch: controller auto-claim unavailable: "
+                    + str(controller_claim.get("reason") or "unknown"),
+                    file=sys.stderr,
+                )
+        registration_warning = _prepare_attempt_controller_registration(args, project_root)
+        if registration_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, registration_warning]
+            worker_stdout_mode = "ab"
         try:
             if lease_id is None:
                 lease_id = _acquire_capacity(
@@ -21761,35 +21786,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 and args.queue_claim_path
             )
             raise
-        if not goalflight_compat.is_windows():
-            controller_claim = _stamp_controller_session(args, project_root)
-            if controller_claim.get("reason") in {
-                "label_in_use",
-                "resume_controller_label_mismatch",
-            }:
-                if lease_id is not None:
-                    _release_capacity(
-                        lease_id, "failed", str(controller_claim.get("reason"))
-                    )
-                print(
-                    "goalflight_dispatch: "
-                    + str(
-                        controller_claim.get("message")
-                        or controller_claim.get("reason")
-                    ),
-                    file=sys.stderr,
-                )
-                return 73
-            if controller_claim.get("visible_warning"):
-                print(
-                    "goalflight_dispatch: controller auto-claim unavailable: "
-                    + str(controller_claim.get("reason") or "unknown"),
-                    file=sys.stderr,
-                )
-        registration_warning = _prepare_attempt_controller_registration(args, project_root)
-        if registration_warning is not None:
-            dispatch_warnings = [*dispatch_warnings, registration_warning]
-            worker_stdout_mode = "ab"
         def record_worktree_wait() -> None:
             nonlocal ledger_recorded
             if ledger_recorded:
