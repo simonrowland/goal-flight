@@ -151,7 +151,7 @@ class WorktreeCwdRefused(WorktreeSeatError):
 
 
 class WorktreePathLock:
-    """Exclusive kernel lock on an arbitrary worktree path.
+    """Kernel lock on an arbitrary worktree path.
 
     Ownership is the open file description: close the descriptor (or die) and
     the kernel releases the claim. Do not LOCK_UN while a worker may still
@@ -244,11 +244,13 @@ class WorktreeReadOnlySeatLease:
         seat_name: str,
         dispatch_id: str,
         lock_file: TextIO,
+        path_lock: WorktreePathLock | None = None,
     ) -> None:
         self.path = path
         self.seat_name = seat_name
         self.dispatch_id = dispatch_id
         self._lock_file: TextIO | None = lock_file
+        self._path_lock = path_lock
 
     def fileno(self) -> int:
         if self._lock_file is None:
@@ -263,6 +265,10 @@ class WorktreeReadOnlySeatLease:
         if lock_file is None:
             return
         self._lock_file = None
+        path_lock = self._path_lock
+        self._path_lock = None
+        if path_lock is not None:
+            path_lock.release()
         lock_file.close()
 
     def __enter__(self) -> "WorktreeReadOnlySeatLease":
@@ -1483,6 +1489,7 @@ def _try_acquire_shared_read_only_seat(
     except (OSError, WorktreeSeatError):
         return None
     lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+    path_lock: WorktreePathLock | None = None
     try:
         if verdict == UNKNOWN:
             try:
@@ -1503,11 +1510,19 @@ def _try_acquire_shared_read_only_seat(
             except BlockingIOError:
                 lock_file.close()
                 return None
+        try:
+            path_lock = _try_acquire_worktree_path_lock(
+                path, dispatch_id, shared=True
+            )
+        except (WorktreePathLockBusy, WorktreePathLockUnknown):
+            lock_file.close()
+            return None
         lease = WorktreeReadOnlySeatLease(
             path=path,
             seat_name=path.name,
             dispatch_id=dispatch_id,
             lock_file=lock_file,
+            path_lock=path_lock,
         )
         if not _read_only_seat_matches(path, base_commit):
             lease.release()
@@ -4188,14 +4203,19 @@ def worktree_path_lock_path(target: Path) -> Path:
     return target / f".{OCCUPANCY_LOCK_NAME}"
 
 
-def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePathLock:
-    """Acquire an exclusive, non-blocking kernel lock on ``target``.
+def _try_acquire_worktree_path_lock(
+    target: Path,
+    dispatch_id: str,
+    *,
+    shared: bool,
+) -> WorktreePathLock:
+    """Acquire a non-blocking shared or exclusive kernel lock on ``target``.
 
     Failure to acquire is occupancy: ``WorktreePathLockBusy``. Failure to
     evaluate the lock at all (unreadable path, fd exhaustion) is
-    ``WorktreePathLockUnknown``. The returned lock must be inherited by the
-    worker; closing it in the launcher without passing the fd vacates the tree
-    while the worker still writes.
+    ``WorktreePathLockUnknown``. Exclusive callers must inherit the returned
+    lock in the worker; read-only callers retain their shared handle in the
+    controller lease.
     """
     try:
         resolved = Path(os.path.realpath(str(target)))
@@ -4249,7 +4269,8 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
         ) from exc
     lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(lock_file.fileno(), lock_mode | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         payload = _lock_metadata(lock_file)
         occupant_id = str(payload.get("dispatch_id") or "unknown-dispatch")
@@ -4269,7 +4290,7 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
             f"({type(exc).__name__}: {exc})"
         ) from exc
     try:
-        if registry_root is not None:
+        if registry_root is not None and not shared:
             try:
                 _adopt_exclusive_lock(
                     lock_path, lock_file.fileno(), registry_root=registry_root
@@ -4279,10 +4300,11 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
                     f"worktree occupancy lock identity of {resolved} could not be adopted "
                     f"({type(exc).__name__}: {exc})"
                 ) from exc
-        os.set_inheritable(lock_file.fileno(), True)
-        _write_occupant(
-            lock_file, seat_name=resolved.name, dispatch_id=dispatch_id
-        )
+        if not shared:
+            os.set_inheritable(lock_file.fileno(), True)
+            _write_occupant(
+                lock_file, seat_name=resolved.name, dispatch_id=dispatch_id
+            )
         return WorktreePathLock(
             path=resolved,
             lock_file=lock_file,
@@ -4291,3 +4313,8 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
     except BaseException:
         lock_file.close()
         raise
+
+
+def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePathLock:
+    """Acquire an exclusive, non-blocking kernel lock on ``target``."""
+    return _try_acquire_worktree_path_lock(target, dispatch_id, shared=False)

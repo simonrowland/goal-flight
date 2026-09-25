@@ -563,6 +563,68 @@ def test_read_only_bind_uses_clean_pooled_seat_for_bash_and_acp(
         goalflight_dispatch._release_read_only_worktree_hold(args)
 
 
+@pytest.mark.parametrize("shape", ["bash", "acp"])
+def test_read_only_pooled_hold_blocks_writer_path_lock_and_releases(
+    tmp_path: Path, shape: str
+) -> None:
+    repo = _make_repo(tmp_path)
+    (repo / "review-base.txt").write_text("review base\n", encoding="utf-8")
+    _git(repo, "add", "review-base.txt")
+    _git(repo, "commit", "-m", "review base")
+    base = _git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "writer-path-hold", base=base
+    )
+    seat = writer.path
+    finish_seat_holder(writer)
+
+    def read_only_args(dispatch_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            agent="codex-acp" if shape == "acp" else "grok-code",
+            shape=shape,
+            read_only=True,
+            worker=[],
+            project_root=str(repo),
+            cwd=None,
+            worktree="shared-read-only",
+            worktree_base=base,
+            worktree_root=None,
+            dispatch_id=dispatch_id,
+            controller_label=None,
+            skip_seat_reset=False,
+            in_place=False,
+            from_queue=False,
+            _worktree_seat=None,
+        )
+
+    first = read_only_args("review-path-one")
+    assert goalflight_dispatch._bind_dispatch_worktree(first) is None
+    first_hold = first._worktree_read_only_hold
+    assert first_hold is not None
+    assert Path(first.cwd).resolve() == seat.resolve()
+    try:
+        with pytest.raises(goalflight_worktree_pool.WorktreePathLockBusy):
+            goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                seat, "writer-path"
+            )
+
+        second = read_only_args("review-path-two")
+        assert goalflight_dispatch._bind_dispatch_worktree(second) is None
+        second_hold = second._worktree_read_only_hold
+        assert second_hold is not None
+        try:
+            assert Path(second.cwd).resolve() == seat.resolve()
+        finally:
+            goalflight_dispatch._release_read_only_worktree_hold(second)
+    finally:
+        goalflight_dispatch._release_read_only_worktree_hold(first)
+
+    writer_path_lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+        seat, "writer-after-reviews"
+    )
+    writer_path_lock.release()
+
+
 def test_non_in_place_acp_read_only_resume_admits_detached_checkout(
     tmp_path: Path,
 ) -> None:
