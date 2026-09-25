@@ -22742,7 +22742,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             and not detached_launched
             and final_worker_alive is not True
         ):
-            if resume_home_created and not worker_spawn_attempted:
+            if (
+                resume_home_created
+                and getattr(args, "parent_dispatch_id", None)
+                and not worker_spawn_attempted
+            ):
                 owned_home = _codex_dispatch_homes_dir() / str(args.dispatch_id)
                 try:
                     if owned_home.is_symlink():
