@@ -569,6 +569,70 @@ def test_read_only_review_falls_back_from_dirty_or_mismatched_seat(mutation: str
         assert hold is None
 
 
+def test_dirty_submodule_seat_falls_back_instead_of_being_shared(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    subrepo = tmp_path / "subrepo"
+    git(tmp_path, "init", str(subrepo))
+    git(subrepo, "config", "user.email", "goalflight-test@example.invalid")
+    git(subrepo, "config", "user.name", "Goal Flight Test")
+    (subrepo / "tracked.txt").write_text("submodule\n", encoding="utf-8")
+    git(subrepo, "add", "tracked.txt")
+    git(subrepo, "commit", "-m", "submodule base")
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(subrepo),
+        "modules/sub",
+    )
+    git(repo, "commit", "-m", "add submodule")
+    base = git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "writer-dirty-submodule", base=base
+    )
+    seat = writer.path
+    git(
+        seat,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+    )
+    finish_seat_holder(writer)
+    (seat / "modules" / "sub" / "local.txt").write_text("dirty\n", encoding="utf-8")
+
+    path, _selected, hold = goalflight_worktree_pool.bind_read_only_worktree(
+        repo, "review-dirty-submodule", base=base
+    )
+    try:
+        assert path != seat
+        assert hold is None
+    finally:
+        if hold is not None:
+            hold.release()
+
+
+def test_dirty_shared_read_only_fallback_fails_without_reset() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        base = add_read_only_base(repo, 0)
+        path, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+        dirty_file = path / "untracked-review-file"
+        dirty_file.write_text("keep\n", encoding="utf-8")
+
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeSeatError,
+            match="shared read-only worktree .* is not clean",
+        ):
+            goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+
+        assert dirty_file.read_text(encoding="utf-8") == "keep\n"
+        assert path.is_dir()
+
+
 def test_read_only_review_rechecks_after_shared_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         repo = make_repo(Path(td))
@@ -591,6 +655,37 @@ def test_read_only_review_rechecks_after_shared_hold(monkeypatch: pytest.MonkeyP
         assert hold is None
         assert path.parent.name == goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
         assert calls == 2
+
+
+def test_shared_hold_recheck_uses_bounded_git_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(Path(td))
+        base = add_read_only_base(repo, 0)
+        writer = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "writer-timeout", base=base
+        )
+        seat = writer.path
+        finish_seat_holder(writer)
+        real_git_proc = goalflight_worktree_pool._git_proc
+        status_timeouts: list[float | None] = []
+
+        def timed_status(cwd: Path, *args: str, **kwargs):
+            if cwd.resolve() == seat.resolve() and args and args[0] == "status":
+                status_timeouts.append(kwargs.get("timeout"))
+                return subprocess.CompletedProcess(
+                    ["git", *args], 124, "", "git command timed out"
+                )
+            return real_git_proc(cwd, *args, **kwargs)
+
+        monkeypatch.setattr(goalflight_worktree_pool, "_git_proc", timed_status)
+        hold = goalflight_worktree_pool._try_acquire_shared_read_only_seat(
+            repo, seat, base, "review-timeout"
+        )
+
+        assert hold is None
+        assert status_timeouts == [goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S]
 
 
 def test_two_read_only_reviews_share_one_seat_and_release_on_crash() -> None:

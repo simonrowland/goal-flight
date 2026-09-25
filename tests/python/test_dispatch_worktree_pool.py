@@ -7,6 +7,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("worktree seat leases require POSIX fcntl locks")
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -549,6 +550,7 @@ def test_non_in_place_acp_read_only_resume_admits_detached_checkout(
         worktree_root=None,
         parent_dispatch_id="readonly-acp-parent",
         dispatch_id="readonly-acp-child",
+        _worktree_base_commit=base,
         controller_label=None,
         skip_seat_reset=True,
         in_place=False,
@@ -608,6 +610,68 @@ def test_read_only_resume_falls_back_when_recorded_pool_seat_cannot_be_held(
         assert args._worktree_read_only_hold is None
     finally:
         writer.release()
+
+
+def test_read_only_resume_refuses_missing_recorded_review_base(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "readonly-missing-base-writer", base=base
+    )
+    seat = writer.path
+    writer.release()
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-missing-base-parent",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_path": str(seat),
+        }
+    )
+    args = SimpleNamespace(
+        agent="claude-acp",
+        shape="acp",
+        read_only=True,
+        worker=[],
+        project_root=str(repo),
+        cwd=str(seat),
+        worktree="shared-read-only",
+        worktree_base=None,
+        worktree_root=None,
+        parent_dispatch_id="readonly-missing-base-parent",
+        dispatch_id="readonly-missing-base-child",
+        controller_label=None,
+        skip_seat_reset=True,
+        in_place=False,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="without a resolvable review base",
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+    assert not (repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR).exists()
+
+
+def test_public_shared_read_only_mode_is_rejected_for_writers(tmp_path: Path) -> None:
+    parser = goalflight_dispatch._build_launch_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--worktree", "shared-read-only"])
+
+    args = SimpleNamespace(
+        worktree="shared-read-only",
+        read_only=False,
+        project_root=str(tmp_path),
+    )
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError,
+        match="internal mode and requires --read-only",
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
 
 
 def test_dispatch_admission_reaps_read_only_checkouts(
@@ -690,6 +754,49 @@ def test_read_only_resume_records_and_touches_checkout_before_waiting(
     assert args._worktree_base_commit == base
     assert checkout.stat().st_mtime_ns > old_ns
     assert goalflight_dispatch._ledger_worker_cwd(args, "waiting_capacity") == str(checkout)
+
+
+def test_read_only_resume_touches_checkout_under_allocation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
+        repo, base=base
+    )
+    held: list[bool] = []
+    real_lock = goalflight_worktree_pool._read_only_allocation_lock
+
+    @contextlib.contextmanager
+    def observed_lock(project_root: Path):
+        with real_lock(project_root):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+
+    real_utime = goalflight_dispatch.os.utime
+
+    def checked_utime(*args, **kwargs):
+        assert held, "resume protection must hold the allocation lock while touching"
+        return real_utime(*args, **kwargs)
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_read_only_allocation_lock", observed_lock
+    )
+    monkeypatch.setattr(goalflight_dispatch.os, "utime", checked_utime)
+    args = SimpleNamespace(
+        parent_dispatch_id="readonly-parent",
+        dispatch_id="readonly-child",
+        agent="codex",
+        shape="bash",
+        read_only=True,
+        cwd=str(checkout),
+    )
+
+    goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+    assert args._worktree_path == str(checkout)
 
 
 def test_occupancy_refusal_releases_bound_seat(

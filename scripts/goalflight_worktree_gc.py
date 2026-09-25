@@ -357,17 +357,20 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
     """
     state = _presence(ledger_dir)
     if state == "absent":
-        # No runs directory at all: no dispatch has ever recorded a claim here.
-        return [], []
+        # No runs directory is not proof that no dispatch owns the path: a
+        # live row may be temporarily hidden while the ledger is replaced.
+        return [], [f"{ledger_dir} (absent)"]
     if state == "unknown":
         return [], [str(ledger_dir)]
     listing, children = goalflight_fs.list_dir_suffix(ledger_dir, ".json")
-    if listing == "absent":
-        return [], []
     if listing == "unreadable":
         # glob swallows PermissionError and yields []; iterdir raises.
         # An unlistable runs dir is not "no owner".
         return [], [str(ledger_dir)]
+    if listing == "absent" or not children:
+        # A readable-but-empty ledger is the same fail-closed condition as a
+        # missing ledger. It does not positively prove that this path is free.
+        return [], [f"{ledger_dir} (empty)"]
     records: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for child in sorted(children):
@@ -508,7 +511,7 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
     if unreadable:
         return _condition(
             UNKNOWN,
-            "dispatch ledger unreadable ("
+            "dispatch ledger unreadable or empty ("
             + ", ".join(unreadable)
             + "); cannot prove no live dispatch owns this path",
         )

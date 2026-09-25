@@ -98,7 +98,11 @@ def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path | None, **extra
     (runs / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
-def _run(repo_arg: Path, *extra: str) -> tuple[subprocess.CompletedProcess[str], dict]:
+def _run(
+    repo_arg: Path, *extra: str, seed_terminal: bool = True
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    if seed_terminal and not goalflight_ledger.runs_dir(create=False).exists():
+        _write_ledger("test-terminal-ledger-row", "complete", None)
     done = subprocess.run(
         [sys.executable, str(SCRIPT), str(repo_arg), "--json", *extra],
         capture_output=True, text=True,
@@ -333,6 +337,24 @@ def test_unreadable_ledger_retains_as_unknown_not_as_unowned(
     assert "unreadable" in unowned["reason"]
     # Distinct from retained-because-owned: no dispatch is claimed as owner.
     assert "non-terminal dispatch" not in unowned["reason"]
+
+
+@pytest.mark.parametrize("ledger_state", ["absent", "empty"])
+def test_missing_or_empty_ledger_retains_as_unknown(
+    repo: Path, ledger_state: str
+) -> None:
+    wt = _add_read_only_checkout(repo, 7)
+    runs = goalflight_ledger.runs_dir(create=False)
+    if ledger_state == "empty":
+        runs.mkdir(parents=True)
+
+    _done, report = _run(repo, seed_terminal=False)
+
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    unowned = entry["conditions"]["unowned"]
+    assert unowned["verdict"] == "unknown", entry
+    assert "unreadable or empty" in unowned["reason"]
 
 
 def test_detached_head_is_unknown_and_retained(tmp_path: Path, repo: Path) -> None:
@@ -598,6 +620,7 @@ def test_report_only_is_default_and_prints_retention_reasons(
     _merge_into_main(repo, "sweepable")
     kept = _add_worktree(repo, tmp_path, "kept")
     _commit_in(kept, "other.txt")  # unmerged
+    _write_ledger("test-terminal-ledger-row", "complete", None)
 
     done = subprocess.run(
         [sys.executable, str(SCRIPT), str(repo)],

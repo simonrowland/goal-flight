@@ -539,6 +539,15 @@ def _parse_reasoning_effort(value: str) -> str:
     return level
 
 
+def _parse_public_worktree_ref(value: str) -> str:
+    """Keep the internal shared-review sentinel out of the public REF parser."""
+    if str(value).strip() == "shared-read-only":
+        raise argparse.ArgumentTypeError(
+            "shared-read-only is an internal read-only mode, not a public Git ref"
+        )
+    return value
+
+
 def _parse_os_sandbox_arg(value: str) -> str:
     """Accept hyphen/underscore/collapsed aliases of the sanctioned profiles.
 
@@ -2407,20 +2416,21 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
     if not raw_cwd:
         return
     path = Path(str(raw_cwd)).expanduser().resolve(strict=False)
-    verdict, _reason = goalflight_worktree_pool.read_only_worktree_path_verdict(
-        path, project_root=project_root
-    )
-    if verdict != goalflight_worktree_pool.YES:
-        return
-    args._worktree_id = path.name
-    args._worktree_path = str(path)
-    args._worktree_read_only = True
-    with contextlib.suppress(goalflight_worktree_pool.WorktreeSeatError):
-        args._worktree_base_commit = goalflight_worktree_pool._git(
-            path, "rev-parse", "--verify", "HEAD^{commit}"
+    with goalflight_worktree_pool._read_only_allocation_lock(project_root):
+        verdict, _reason = goalflight_worktree_pool.read_only_worktree_path_verdict(
+            path, project_root=project_root
         )
-    with contextlib.suppress(OSError):
-        os.utime(path, None)
+        if verdict != goalflight_worktree_pool.YES:
+            return
+        args._worktree_id = path.name
+        args._worktree_path = str(path)
+        args._worktree_read_only = True
+        with contextlib.suppress(goalflight_worktree_pool.WorktreeSeatError):
+            args._worktree_base_commit = goalflight_worktree_pool._git(
+                path, "rev-parse", "--verify", "HEAD^{commit}"
+            )
+        with contextlib.suppress(OSError):
+            os.utime(path, None)
 
 
 def _ledger_worker_cwd(args, state: str) -> str | None:
@@ -2528,6 +2538,13 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     Existing seats run the occupancy check while this helper's pool lock
     protects them from reset; new seats are checked after creation.
     """
+    if (
+        getattr(args, "worktree", None) == "shared-read-only"
+        and not _effective_read_only(args)
+    ):
+        raise DispatchUsageError(
+            "shared-read-only is an internal mode and requires --read-only"
+        )
     project_root = _project_root(args)
     goalflight_worktree_pool.reap_read_only_worktrees(project_root)
     existing = getattr(args, "_worktree_seat", None)
@@ -2548,12 +2565,12 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         project_root = _project_root(args)
         cwd_raw = getattr(args, "cwd", None)
         if cwd_raw:
-            recorded_base = getattr(args, "_worktree_base_commit", None)
             parent_record = _find_dispatch_record(str(args.parent_dispatch_id)) or {}
             recorded_ref = getattr(args, "_worktree_base_commit", None) or (
                 parent_record.get("worktree_head")
                 or parent_record.get("worktree_base")
             )
+            recorded_base = None
             if recorded_ref:
                 with contextlib.suppress(goalflight_worktree_pool.WorktreeSeatError):
                     recorded_base = goalflight_worktree_pool._git(
@@ -2562,6 +2579,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                         "--verify",
                         f"{recorded_ref}^{{commit}}",
                     )
+            if not recorded_base:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    "read-only resume recorded a worktree without a resolvable "
+                    "review base; refusing to review its current HEAD"
+                )
             recorded_path = Path(str(cwd_raw))
             recorded_pool_path = goalflight_worktree_pool.is_managed_worktree_path(
                 recorded_path, project_root=project_root
@@ -2579,11 +2601,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     ), hold,
                 )
             elif recorded_pool_path:
-                if not recorded_base:
-                    raise goalflight_worktree_pool.WorktreeCwdRefused(
-                        "read-only resume recorded a pooled worktree without a "
-                        "review base; refusing to use it without a shared hold"
-                    )
                 shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
                     project_root, str(args.dispatch_id), base=recorded_base
                 )
@@ -21076,6 +21093,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         "--at",
         dest="worktree",
         metavar="REF",
+        type=_parse_public_worktree_ref,
         help=(
             "Prepare the pooled worktree at git ref REF (HEAD, main, a commit). "
             "This is not an opt-in to the pool: every dispatch acquires a "

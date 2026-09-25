@@ -1130,17 +1130,17 @@ def _registered_pool_worktrees(project_root: Path) -> list[Path]:
 def _read_only_seat_matches(path: Path, base_commit: str) -> bool:
     """Require the exact review base and an entirely clean checkout."""
     try:
-        if _git(path, "rev-parse", "--verify", "HEAD^{commit}") != base_commit:
+        if _git(
+            path,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            timeout=READ_ONLY_GIT_TIMEOUT_S,
+        ) != base_commit:
             return False
     except WorktreeSeatError:
         return False
-    status = _git_proc(
-        path,
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-    )
-    return status is not None and status.returncode == 0 and status.stdout == ""
+    return check_seat_cleanliness(path, timeout=READ_ONLY_GIT_TIMEOUT_S)["verdict"] == YES
 
 
 def _try_acquire_shared_read_only_seat(
@@ -1194,10 +1194,7 @@ def try_acquire_read_only_pool_seat(
     if verdict != YES:
         return None
     if base_commit is None:
-        try:
-            base_commit = _git(path, "rev-parse", "--verify", "HEAD^{commit}")
-        except WorktreeSeatError:
-            return None
+        return None
     if not _read_only_seat_matches(path, base_commit):
         return None
     return _try_acquire_shared_read_only_seat(
@@ -1499,7 +1496,9 @@ def check_reset_preserves_commits(
     )
 
 
-def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
+def check_seat_cleanliness(
+    worktree_path: Path, *, timeout: float | None = None
+) -> dict[str, str]:
     """YES clean / NO dirty / UNKNOWN. Same three-state as worktree GC check_clean."""
     proc = _git_proc(
         worktree_path,
@@ -1508,6 +1507,7 @@ def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
         "-z",
         "--untracked-files=all",
         "--ignore-submodules=none",
+        timeout=timeout,
     )
     if proc is None:
         return _condition(
@@ -3138,6 +3138,11 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
         if actual != base_commit:
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is at {actual}, expected {base_commit}"
+            )
+        clean = check_seat_cleanliness(path)
+        if clean["verdict"] != YES:
+            raise WorktreeSeatError(
+                f"shared read-only worktree {path} is not clean: {clean['reason']}"
             )
         try:
             os.utime(path, None)
