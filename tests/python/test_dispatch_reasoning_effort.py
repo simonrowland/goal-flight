@@ -34,6 +34,37 @@ def validate(home, model="capable", effort="max"):
     D._validate_codex_reasoning_effort(args, {"CODEX_HOME": str(home)})
 
 
+@pytest.fixture
+def grok_home(tmp_path):
+    home = tmp_path / "grok-home"
+    (home / ".grok").mkdir(parents=True)
+    models = {
+        "grok-4.5": {
+            "info": {
+                "supports_reasoning_effort": True,
+                "reasoning_effort": "high",
+                "reasoning_efforts": [{"id": level} for level in ("high", "medium", "low")],
+            }
+        },
+        "grok-4.7": {
+            "info": {
+                "supports_reasoning_effort": True,
+                "reasoning_effort": "high",
+                "reasoning_efforts": [{"id": level} for level in ("xhigh", "high", "medium", "low")],
+            }
+        },
+    }
+    (home / ".grok" / "models_cache.json").write_text(
+        json.dumps({"models": models})
+    )
+    return home
+
+
+def validate_grok(home, model=None, effort="xhigh", agent="grok-code"):
+    args = SimpleNamespace(agent=agent, model=model, reasoning_effort=effort)
+    D._validate_grok_reasoning_effort(args, {"HOME": str(home)})
+
+
 def test_max_accepted_and_transmitted(codex_home):
     assert D._parse_reasoning_effort("MAX") == "max"
     validate(codex_home)
@@ -45,12 +76,48 @@ def test_max_accepted_and_transmitted(codex_home):
         D._parse_reasoning_effort("typo")
 
 
+def test_grok_reasoning_effort_is_transmitted_to_cli():
+    args = SimpleNamespace(
+        agent="grok-code",
+        model="grok-4.7",
+        reasoning_effort="xhigh",
+        cwd=None,
+        read_only=False,
+        os_sandbox=None,
+        parent_dispatch_id=None,
+        resume_reconstruction=False,
+        engine_session_id=None,
+    )
+    argv, _ = D.build_worker(args, Path("prompt.md"), [])
+    assert argv[argv.index("--reasoning-effort") + 1] == "xhigh"
+
+
 def test_model_refusal_lists_actual_levels(codex_home):
     with pytest.raises(D.DispatchUsageError, match="'limited'; supported levels: high, low$"):
         validate(codex_home, "limited")
     # Even historically accepted levels must obey the model's catalog entry.
     with pytest.raises(D.DispatchUsageError, match="supported levels: high, low$"):
         validate(codex_home, "limited", "xhigh")
+
+
+def test_grok_model_refusal_lists_actual_levels(grok_home):
+    validate_grok(grok_home, effort="xhigh")
+    with pytest.raises(
+        D.DispatchUsageError,
+        match="'grok-4.5'; supported levels: high, low, medium$",
+    ):
+        validate_grok(grok_home, "grok-4.5", "xhigh")
+
+
+def test_grok_cache_fallback_uses_model_family(grok_home):
+    cache = grok_home / ".grok" / "models_cache.json"
+    cache.unlink()
+    validate_grok(grok_home, "grok-4.5", "high")
+    with pytest.raises(
+        D.DispatchUsageError,
+        match="'grok-4.5'; supported levels: high, low, medium; using fallback static set",
+    ):
+        validate_grok(grok_home, "grok-4.5", "xhigh")
 
 
 def test_default_model_and_explicit_override(codex_home):
@@ -122,13 +189,27 @@ def test_acp_refuses_effort_before_launch_setup(monkeypatch, capsys, agent, rout
     assert "without --interactive or a raw command after --" in error
 
 
+@pytest.mark.parametrize("agent", sorted(D.GROK_ACP_REASONING_AGENTS))
+def test_grok_acp_refuses_effort_without_session_options(
+    monkeypatch, capsys, agent
+):
+    def unexpected_setup(*_args, **_kwargs):
+        pytest.fail("unsupported Grok ACP effort reached launch setup")
+
+    monkeypatch.setattr(D, "_ensure_assigned_engine_session", unexpected_setup)
+    assert D.main([
+        "--agent", agent, "--shape", "acp", "--model", "grok-4.7",
+        "--reasoning-effort", "xhigh", "--prompt", "read only",
+    ]) == 64
+    error = capsys.readouterr().err
+    assert "not supported for Grok ACP" in error
+    assert "no Grok session-options hook" in error
+
+
 @pytest.mark.parametrize("route", [
     ["--agent", "codex", "--", "codex", "exec", "read only"],
     ["--agent", "claude"],
     ["--agent", "claude", "--shape", "bash"],
-    ["--agent", "grok-code"],
-    ["--agent", "grok-research"],
-    ["--agent", "grok-acp"],
     ["--agent", "cursor"],
     ["--agent", "moonshot"],
     ["--agent", "codex-acp"],
@@ -145,7 +226,8 @@ def test_unsupported_routes_refuse_effort(monkeypatch, capsys, route, replay):
         argv = D._reconstruct_launch_argv(argv)
         assert D._option_value_before_worker_remainder(argv, "--reasoning-effort") == "max"
     assert D.main(argv) == 64
-    assert "--reasoning-effort requires --agent codex --shape bash" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "--reasoning-effort requires --agent codex --shape bash" in error
 
 
 @pytest.mark.parametrize("route", [[], ["--shape", "bash"]])

@@ -459,6 +459,24 @@ def test_resume_model_override_reaches_grok_admission(
     assert _option(argv, "--model") == "grok-stronger"
 
 
+def test_resume_preserves_grok_reasoning_effort(
+    tmp_path: Path,
+) -> None:
+    record = _record(tmp_path)
+    record["reasoning_effort"] = "xhigh"
+    record["dispatch_argv"].extend(["--reasoning-effort", "xhigh"])
+
+    argv = D._resume_launch_argv(
+        _source(record),
+        child_dispatch_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        resume_args=_resume_args(account="old"),
+    )
+
+    assert argv.count("--reasoning-effort") == 1
+    assert _option(argv, "--reasoning-effort") == "xhigh"
+
+
 def test_measured_unhealthy_owner_falls_back_without_ledger_wall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -483,6 +501,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
         dispatch_id="grok-child",
         agent="grok-code",
         model="gpt-5.6-sol",
+        reasoning_effort="xhigh",
         shape="bash",
         controller_session_id=None,
         controller_pid=None,
@@ -499,6 +518,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
     )
     metadata = D._prelaunch_status_metadata(args)
     assert metadata["model"] == "gpt-5.6-sol"
+    assert metadata["reasoning_effort"] == "xhigh"
     assert metadata["resume_mode"] == "reconstructed"
     watcher = D._watcher_spawn_argv(
         worker_pid=123,
