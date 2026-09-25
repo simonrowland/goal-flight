@@ -21334,6 +21334,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         args._original_argv = list(argv)
         _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
     if args.stats is not None:
+        _emit_launch_wake_notice()
         try:
             payload = goalflight_ledger.stats_payload(args.stats)
         except ValueError as e:
