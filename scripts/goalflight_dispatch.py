@@ -22976,16 +22976,24 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
-        elif final_worker_alive is None and not worker_pid:
-            # No positive spawn result is explicit pre-spawn evidence. Preserve
-            # it in the terminal ledger so a reserved lease can be released;
-            # an unknown positive worker PID remains UNKNOWN and cannot release
-            # an unattached lease during the spawn handoff.
+        elif (
+            final_worker_alive is None
+            and not worker_pid
+            and not worker_spawn_attempted
+        ):
+            # No spawn attempt is explicit pre-spawn evidence. Once the helper
+            # has been called, a missing PID is an ambiguous post-fork handoff;
+            # reconciliation must retain the lease rather than release a live
+            # child that the helper may already have created.
             final_worker_alive = False
-        if lease_id and final_worker_alive is False and not worker_pid:
-            # _spawn_daemonized_process raised before returning a pid. That is
-            # launcher-owned proof of non-launch, so do not leave the durable
-            # reservation in spawning until its TTL expires.
+        if (
+            lease_id
+            and final_worker_alive is False
+            and not worker_pid
+            and not worker_spawn_attempted
+        ):
+            # No spawn attempt means launcher-owned proof of non-launch. An
+            # attempted spawn with no returned PID is unknown and must leak.
             try:
                 goalflight_capacity.mark_lease_spawn_failed(
                     lease_id, reason=final_reason or "spawn_failed"

@@ -681,10 +681,11 @@ def _acquire_read_only_action_lock(
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = goalflight_worktree_pool._open_lock_path_safely(
+        fd = goalflight_worktree_pool._open_registered_lock(
             lock_path,
             flags,
-            expected_stat=goalflight_worktree_pool._lock_path_identity(lock_path),
+            registry_root=goalflight_worktree_pool._git_common_dir(repo),
+            allow_create=True,
         )
     except OSError as exc:
         return None, f"read-only allocation lock could not be opened ({exc})"

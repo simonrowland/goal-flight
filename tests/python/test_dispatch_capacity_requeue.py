@@ -541,7 +541,7 @@ def test_acp_detached_launcher_reads_final_capacity_status_before_exit() -> None
         assert "DISPATCH-BLOCKED" in stdout.getvalue(), stdout.getvalue()
 
 
-def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
+def test_spawn_handoff_retains_lease_when_spawn_result_is_ambiguous() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         repo = _make_repo(tmp)
@@ -549,6 +549,7 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
         dispatch_id = "spawn-failure-capacity-lifecycle"
         events: list[tuple[str, str | None]] = []
         guard_restored = False
+        live_child: subprocess.Popen[str] | None = None
         original_spawning = D.goalflight_capacity.mark_lease_spawning
         original_spawn_failed = D.goalflight_capacity.mark_lease_spawn_failed
         lease_rows: list[dict] = []
@@ -570,7 +571,14 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
             return restore
 
         def spawn_failure(*_args, **_kwargs):
+            nonlocal live_child
             assert guard_restored, "capacity signal guard remained active during spawn"
+            live_child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             raise RuntimeError("spawn failure")
 
         old_env = os.environ.copy()
@@ -610,6 +618,13 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
                     D.goalflight_capacity.load_state().get("leases", {}).values()
                 )
         finally:
+            if live_child is not None and live_child.poll() is None:
+                live_child.terminate()
+                try:
+                    live_child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    live_child.kill()
+                    live_child.wait(timeout=5)
             os.environ.clear()
             os.environ.update(old_env)
 
@@ -617,11 +632,9 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
         assert [event[0] for event in events] == [
             "spawning",
             "guard_restored",
-            "spawn_failed",
         ], events
         lease = next(row for row in lease_rows if row.get("dispatch_id") == dispatch_id)
-        assert lease.get("launch_state") == "spawn_failed", lease
-        assert lease.get("state") == "error", lease
+        assert lease.get("launch_state") == "spawning", lease
 
 
 def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:

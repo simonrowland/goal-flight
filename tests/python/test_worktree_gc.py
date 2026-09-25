@@ -515,40 +515,25 @@ def test_read_only_gc_holds_allocator_lock_across_remove_recheck(
 
 
 def test_read_only_gc_rejects_replaced_allocation_lock_identity(
-    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path
 ) -> None:
     with goalflight_worktree_pool._read_only_allocation_lock(repo):
         pass
     lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
     parent = lock_path.parent
     backup = parent.with_name(parent.name + ".real")
-    replacement = tmp_path / "replacement-lock-root"
-    original = goalflight_worktree_pool._lock_path_identity
-    swapped = False
-
-    def race(path: Path):
-        nonlocal swapped
-        identity = original(path)
-        if path == lock_path and not swapped:
-            parent.rename(backup)
-            replacement.mkdir()
-            (replacement / lock_path.name).touch()
-            parent.symlink_to(replacement, target_is_directory=True)
-            swapped = True
-        return identity
-
-    monkeypatch.setattr(goalflight_worktree_pool, "_lock_path_identity", race)
+    parent.rename(backup)
+    parent.mkdir()
+    (parent / lock_path.name).touch()
     try:
         handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(repo)
         if handle is not None:
             handle.close()
-        assert swapped
         assert handle is None
-        assert error
+        assert error and "identity" in error
     finally:
-        parent.unlink()
-        replacement.joinpath(lock_path.name).unlink()
-        replacement.rmdir()
+        (parent / lock_path.name).unlink()
+        parent.rmdir()
         backup.rename(parent)
 
 

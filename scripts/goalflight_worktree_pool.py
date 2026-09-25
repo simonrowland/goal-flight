@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import errno
 import fcntl
@@ -65,6 +66,7 @@ READ_ONLY_WORKTREE_DIR = ".goalflight-readonly"
 READ_ONLY_WORKTREE_KEEP = 4
 READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 READ_ONLY_GIT_TIMEOUT_S = 30.0
+_LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
 
 # Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
@@ -628,7 +630,8 @@ def _registered_pool_seat_lock_info(
         )
 
     try:
-        lock_root = _git_common_dir(root) / "goalflight-worktree-seat-locks"
+        registry_root = _git_common_dir(root)
+        lock_root = registry_root / "goalflight-worktree-seat-locks"
     except WorktreeSeatError as exc:
         return "unknown", f"worktree lock directory unreadable ({exc})", None, None
     if lock_subdir:
@@ -643,7 +646,6 @@ def _registered_pool_seat_lock_info(
                 None,
                 None,
             )
-        st = os.lstat(lock_path)
     except FileNotFoundError:
         return (
             "no",
@@ -659,16 +661,41 @@ def _registered_pool_seat_lock_info(
             None,
         )
 
-    if stat.S_ISLNK(st.st_mode):
-        return "unknown", f"worktree lock is a symlink ({lock_path})", None, None
-    if not stat.S_ISREG(st.st_mode):
+    try:
+        current = os.lstat(lock_path)
+    except FileNotFoundError:
+        try:
+            registered = _registered_lock_identity(
+                lock_path, registry_root=registry_root
+            )
+        except OSError as exc:
+            return "unknown", str(exc), None, None
+        if registered is not None:
+            return "unknown", f"registered worktree lock disappeared ({lock_path})", None, None
         return (
-            "unknown",
-            f"worktree lock is not a regular file ({lock_path})",
+            "no",
+            f"no worktree lock for {seat_name}; path is not a registered pool worktree",
             None,
             None,
         )
-    return "yes", f"registered pool worktree {seat_name}", lock_path, st
+    except OSError as exc:
+        return "unknown", f"worktree lock unreadable for {seat_name} ({exc})", None, None
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        return "unknown", f"worktree lock is not a regular file ({lock_path})", None, None
+    try:
+        registered = _registered_lock_identity(
+            lock_path, registry_root=registry_root
+        )
+    except OSError as exc:
+        return "unknown", str(exc), None, None
+    if registered is None:
+        return "unknown", f"worktree lock identity is not registered ({lock_path})", None, None
+    if (
+        current.st_dev != registered.st_dev
+        or current.st_ino != registered.st_ino
+    ):
+        return "unknown", f"worktree lock identity changed ({lock_path})", None, None
+    return "yes", f"registered pool worktree {seat_name}", lock_path, registered
 
 
 def registered_pool_seat_verdict(
@@ -981,6 +1008,82 @@ def _ring_state_path(lock_root: Path) -> Path:
     return lock_root / "ring.json"
 
 
+def _lock_registry_path(registry_root: Path) -> Path:
+    return Path(registry_root) / _LOCK_REGISTRY_NAME
+
+
+def _lock_registry_key(lock_path: Path) -> str:
+    return os.path.normpath(os.path.abspath(os.fspath(lock_path)))
+
+
+def _read_lock_registry(registry_root: Path) -> dict:
+    path = _lock_registry_path(registry_root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"locks": {}}
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise OSError(errno.EIO, f"lock registration is unreadable: {path}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("locks", {}), dict):
+        raise OSError(errno.EIO, f"lock registration is invalid: {path}")
+    return payload
+
+
+def _registered_lock_identity(
+    lock_path: Path, *, registry_root: Path
+) -> os.stat_result | None:
+    payload = _read_lock_registry(registry_root)
+    record = payload["locks"].get(_lock_registry_key(lock_path))
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        raise OSError(errno.EIO, f"lock registration entry is invalid: {lock_path}")
+    try:
+        device = int(record["st_dev"])
+        inode = int(record["st_ino"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OSError(errno.EIO, f"lock registration entry is invalid: {lock_path}") from exc
+    if device < 0 or inode <= 0:
+        raise OSError(errno.EIO, f"lock registration entry is invalid: {lock_path}")
+    return os.stat_result((stat.S_IFREG, inode, device, 1, 0, 0, 0, 0, 0, 0))
+
+
+def _record_lock_identity(
+    lock_path: Path, fd: int, *, registry_root: Path
+) -> os.stat_result:
+    opened = os.fstat(fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise OSError(errno.ELOOP, f"lock path is not a regular file: {lock_path}")
+    registry_path = _lock_registry_path(registry_root)
+    payload = _read_lock_registry(registry_root)
+    key = _lock_registry_key(lock_path)
+    existing = payload["locks"].get(key)
+    if existing is not None:
+        registered = _registered_lock_identity(lock_path, registry_root=registry_root)
+        if registered is None or (
+            registered.st_dev != opened.st_dev or registered.st_ino != opened.st_ino
+        ):
+            raise OSError(errno.EAGAIN, f"lock identity changed while registering: {lock_path}")
+        return registered
+    payload["locks"][key] = {
+        "st_dev": int(opened.st_dev),
+        "st_ino": int(opened.st_ino),
+    }
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = registry_path.with_name(
+        f"{registry_path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+    )
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(registry_path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    return os.stat_result(
+        (stat.S_IFREG, opened.st_ino, opened.st_dev, 1, 0, 0, 0, 0, 0, 0)
+    )
+
+
 def _read_ring_hwm(lock_root: Path) -> int:
     path = _ring_state_path(lock_root)
     try:
@@ -1240,10 +1343,10 @@ def _try_acquire_shared_read_only_seat(
         if verdict != YES or lock_path is None or expected_stat is None:
             return None
         flags = _lock_open_flags() & ~os.O_CREAT
-        lock_fd = _open_lock_path_safely(
+        lock_fd = _open_registered_lock(
             lock_path,
             flags,
-            expected_stat=expected_stat,
+            registry_root=_git_common_dir(project_root),
         )
     except (OSError, WorktreeSeatError):
         return None
@@ -2817,14 +2920,16 @@ def acquire_worktree_seat(
     if lock_root.exists() and not lock_root.is_dir():
         raise WorktreeSeatError(f"worktree lock root is not a directory: {lock_root}")
     lock_root.mkdir(parents=True, exist_ok=True)
+    registry_root = _git_common_dir(project_root)
 
     flags = _lock_open_flags()
     allocation_lock_path = lock_root / "allocation.lock"
     try:
-        allocation_fd = _open_lock_path_safely(
+        allocation_fd = _open_registered_lock(
             allocation_lock_path,
             flags,
-            expected_stat=_lock_path_identity(allocation_lock_path),
+            registry_root=registry_root,
+            allow_create=True,
         )
     except OSError as exc:
         raise WorktreeSeatError(
@@ -2885,10 +2990,10 @@ def acquire_worktree_seat(
                     note_capacity_occupant(candidate_path, {})
                 continue
             try:
-                probe_fd = _open_lock_path_safely(
+                probe_fd = _open_registered_lock(
                     candidate_lock,
                     probe_flags,
-                    expected_stat=_lock_path_identity(candidate_lock),
+                    registry_root=registry_root,
                 )
             except OSError:
                 note_capacity_occupant(candidate_path, {})
@@ -2939,10 +3044,11 @@ def acquire_worktree_seat(
                 project_root, worktree_path, managed_root=managed_root
             )
             try:
-                lock_fd = _open_lock_path_safely(
+                lock_fd = _open_registered_lock(
                     lock_path,
                     flags,
-                    expected_stat=_lock_path_identity(lock_path),
+                    registry_root=registry_root,
+                    allow_create=True,
                 )
             except OSError as exc:
                 raise WorktreeSeatError(
@@ -3040,10 +3146,11 @@ def acquire_worktree_seat(
             lock_existed = lock_path.is_file()
             path_existed = worktree_path.exists()
             try:
-                lock_fd = _open_lock_path_safely(
+                lock_fd = _open_registered_lock(
                     lock_path,
                     flags,
-                    expected_stat=_lock_path_identity(lock_path),
+                    registry_root=registry_root,
+                    allow_create=True,
                 )
             except OSError as exc:
                 raise WorktreeSeatError(
@@ -3220,7 +3327,7 @@ def _lock_open_flags() -> int:
 
 
 def _lock_path_identity(lock_path: Path) -> os.stat_result | None:
-    """Read the current regular lock inode without following the leaf."""
+    """Read an unregistered in-place occupancy lock's current leaf identity."""
     try:
         identity = os.lstat(lock_path)
     except FileNotFoundError:
@@ -3250,12 +3357,80 @@ def _lock_fd_matches_identity(
     )
 
 
+def _open_registered_lock(
+    lock_path: Path,
+    flags: int,
+    *,
+    registry_root: Path,
+    mode: int = 0o600,
+    allow_create: bool = False,
+) -> int:
+    """Open only the inode recorded by registration, registering new locks once."""
+    expected_stat = _registered_lock_identity(
+        lock_path, registry_root=registry_root
+    )
+    if expected_stat is not None:
+        return _open_lock_path_safely(
+            lock_path,
+            flags & ~os.O_CREAT,
+            mode,
+            expected_stat=expected_stat,
+        )
+    if not allow_create:
+        raise OSError(
+            errno.EPERM,
+            f"lock identity is not registered: {lock_path}",
+        )
+    try:
+        os.lstat(lock_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise
+    else:
+        raise OSError(
+            errno.EPERM,
+            f"lock identity is not registered: {lock_path}",
+        )
+    try:
+        fd = _open_lock_path_safely(
+            lock_path,
+            flags | os.O_CREAT,
+            mode,
+            create_only=True,
+        )
+    except FileExistsError:
+        # Another allocator may have completed registration between the lstat
+        # and create. Re-read the durable record; never adopt the existing path.
+        expected_stat = _registered_lock_identity(
+            lock_path, registry_root=registry_root
+        )
+        if expected_stat is None:
+            raise OSError(
+                errno.EPERM,
+                f"lock identity is not registered: {lock_path}",
+            )
+        return _open_lock_path_safely(
+            lock_path,
+            flags & ~os.O_CREAT,
+            mode,
+            expected_stat=expected_stat,
+        )
+    try:
+        _record_lock_identity(lock_path, fd, registry_root=registry_root)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _open_lock_path_safely(
     lock_path: Path,
     flags: int,
     mode: int = 0o600,
     *,
     expected_stat: os.stat_result | None = None,
+    create_only: bool = False,
 ) -> int:
     """Open a lock only after safely walking every parent directory.
 
@@ -3284,6 +3459,25 @@ def _open_lock_path_safely(
             os.close(parent_fd)
             parent_fd = next_fd
         leaf = parts[-1]
+        if expected_stat is None and create_only:
+            fd = os.open(
+                leaf,
+                flags | os.O_CREAT | os.O_EXCL,
+                mode,
+                dir_fd=parent_fd,
+            )
+            try:
+                created_stat = os.fstat(fd)
+            except OSError:
+                os.close(fd)
+                raise
+            if stat.S_ISREG(created_stat.st_mode):
+                return fd
+            os.close(fd)
+            raise OSError(
+                errno.ELOOP,
+                f"created lock is not a regular file: {path}",
+            )
         if expected_stat is None:
             try:
                 expected_stat = os.stat(
@@ -3351,10 +3545,11 @@ def _read_only_allocation_lock(project_root: Path):
     lock_root = _seat_lock_root(project_root)
     lock_root.mkdir(parents=True, exist_ok=True)
     lock_path = read_only_allocation_lock_path(project_root)
-    fd = _open_lock_path_safely(
+    fd = _open_registered_lock(
         lock_path,
         _lock_open_flags(),
-        expected_stat=_lock_path_identity(lock_path),
+        registry_root=_git_common_dir(project_root),
+        allow_create=True,
     )
     lock_file = os.fdopen(fd, "r+", encoding="utf-8")
     try:
@@ -3561,6 +3756,9 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
             f"cannot create occupancy lock directory {lock_path.parent} ({exc})"
         ) from exc
     try:
+        # Generic in-place occupancy locks have no pooled-seat registration
+        # record. Keep their existing safe walk; do not invent a registry
+        # identity that cannot be established independently.
         lock_fd = _open_lock_path_safely(
             lock_path,
             _lock_open_flags(),
