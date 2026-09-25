@@ -305,6 +305,8 @@ Claude Code and Grok Bot are the featured orchestrators; the Claude Code wrapper
 maintained path and Grok Bot is installed the same way (see below). Further ports for
 Codex, Cursor, and OpenCode are implemented and unsupported. To install any of them:
 
+`install.sh` checks for ripgrep (`rg`), installs it with Homebrew on macOS when available, and otherwise prints installation instructions; pass `--no-deps` to skip dependency setup.
+
 ```bash
 git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~/.goal-flight
 ./install.sh grok-bot

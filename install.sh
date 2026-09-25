@@ -7,17 +7,83 @@ WORKER_PATH="${REPO_ROOT}/scripts/hosts/fleet/setup_worker_path.sh"
 TRAITS_SCRIPT="$REPO_ROOT/scripts/goalflight_agent_traits.py"
 
 WITH_AGENT_TRAITS=0
+NO_DEPS=0
 DETECTED_HOST=""
 
 for arg in "$@"; do
   if [[ "$arg" == --with-agent-traits ]]; then
     WITH_AGENT_TRAITS=1
+  elif [[ "$arg" == --no-deps ]]; then
+    NO_DEPS=1
   fi
 done
+
+INSTALL_ARGS=()
+for arg in "$@"; do
+  [[ "$arg" == --no-deps ]] || INSTALL_ARGS+=("$arg")
+done
+if [[ "${#INSTALL_ARGS[@]}" -gt 0 ]]; then
+  set -- "${INSTALL_ARGS[@]}"
+else
+  set --
+fi
 
 ensure_mac_worker_bins() {
   if [[ "$(uname -s)" == Darwin && -x "${WORKER_PATH}" ]]; then
     bash "${WORKER_PATH}"
+  fi
+}
+
+ensure_ripgrep() {
+  if [[ "$NO_DEPS" -eq 1 ]]; then
+    printf 'DEPS rg: skipped (--no-deps)\n'
+    return 0
+  fi
+
+  local rg_path=""
+  if rg_path="$(command -v rg 2>/dev/null)" && rg --version >/dev/null 2>&1; then
+    printf 'DEPS rg: present (%s)\n' "$rg_path"
+    return 0
+  fi
+  if [[ -n "$rg_path" ]]; then
+    printf 'WARN: rg resolves at %s but rg --version failed; treating it as unavailable.\n' "$rg_path" >&2
+  fi
+
+  local os=""
+  os="$(uname -s 2>/dev/null || true)"
+  if [[ "$os" == Darwin ]]; then
+    local brew_path=""
+    brew_path="$(command -v brew 2>/dev/null || true)"
+    if [[ -n "$brew_path" ]]; then
+      if [[ ! -t 0 || -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" || -n "${GITLAB_CI:-}" || -n "${TF_BUILD:-}" || -n "${CIRCLECI:-}" || -n "${TRAVIS:-}" || -n "${JENKINS_URL:-}" || -n "${BUILDKITE:-}" || -n "${DRONE:-}" ]]; then
+        printf 'WARN: rg is missing; install it with: brew install ripgrep. Continuing installer.\n' >&2
+        return 0
+      fi
+      printf 'DEPS rg: missing; running brew install ripgrep (%s)\n' "$brew_path"
+      if "$brew_path" install ripgrep; then
+        if rg_path="$(command -v rg 2>/dev/null)" && rg --version >/dev/null 2>&1; then
+          printf 'DEPS rg: installed (%s)\n' "$rg_path"
+        else
+          printf 'WARN: brew install ripgrep succeeded but usable rg is still absent from PATH; continuing installer.\n' >&2
+        fi
+      else
+        printf 'WARN: brew install ripgrep failed; continuing installer without rg.\n' >&2
+      fi
+    else
+      printf 'WARN: rg is missing; install it with: brew install ripgrep (brew not found). Continuing installer.\n' >&2
+    fi
+  elif [[ "$os" == Linux ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      printf 'WARN: rg is missing; install it with: sudo apt-get update && sudo apt-get install -y ripgrep. Continuing installer.\n' >&2
+    elif command -v dnf >/dev/null 2>&1; then
+      printf 'WARN: rg is missing; install it with: sudo dnf install -y ripgrep. Continuing installer.\n' >&2
+    elif command -v pacman >/dev/null 2>&1; then
+      printf 'WARN: rg is missing; install it with: sudo pacman -S --needed ripgrep. Continuing installer.\n' >&2
+    else
+      printf 'WARN: rg is missing; install ripgrep with your Linux package manager (apt, dnf, or pacman). Continuing installer.\n' >&2
+    fi
+  else
+    printf 'WARN: rg is missing; install ripgrep with your operating system package manager. Continuing installer.\n' >&2
   fi
 }
 
@@ -174,6 +240,9 @@ run_setup_and_traits() {
   return "$rc"
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  ensure_ripgrep
+
 if [[ $# -ge 1 ]]; then
   detect_host_from_args "$1" "$@"
   case "$1" in
@@ -239,3 +308,4 @@ fi
 
 detect_host_from_args "" "$@"
 run_setup_and_traits "$@"
+fi
