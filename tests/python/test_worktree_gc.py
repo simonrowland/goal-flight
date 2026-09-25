@@ -80,6 +80,7 @@ def _add_read_only_checkout(repo: Path, index: int) -> Path:
         ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
     ).stdout.strip()
     path, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+    os.utime(path, (1, 1))
     return path
 
 
@@ -364,6 +365,24 @@ def test_read_only_checkout_is_gc_candidate_without_merge_condition(
     assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
+def test_read_only_gc_retains_checkout_inside_grace_window(repo: Path) -> None:
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    wt, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["grace"]["verdict"] == "no", entry
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert wt.is_dir()
+
+
 def test_read_only_gc_uses_recorded_worktree_path_for_ownership(
     tmp_path: Path, repo: Path
 ) -> None:
@@ -380,6 +399,116 @@ def test_read_only_gc_uses_recorded_worktree_path_for_ownership(
     assert entry["decision"] == "retain", entry
     assert entry["conditions"]["unowned"]["verdict"] == "no", entry
     assert "readonly-worktree-path-owner" in entry["conditions"]["unowned"]["reason"]
+
+
+@pytest.mark.parametrize("record_fields", [{}, {"worker_cwd": "relative/missing"}])
+def test_read_only_gc_retains_for_incomplete_nonterminal_ledger_row(
+    tmp_path: Path, repo: Path, record_fields: dict[str, str]
+) -> None:
+    wt = _add_read_only_checkout(repo, 3)
+    worker_cwd = (
+        Path(record_fields["worker_cwd"])
+        if "worker_cwd" in record_fields
+        else None
+    )
+    _write_ledger("readonly-incomplete-owner", "running", worker_cwd)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+    assert "no usable worker_cwd" in entry["conditions"]["unowned"]["reason"]
+
+
+def test_read_only_gc_matches_case_variant_ledger_path(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 4)
+    _write_ledger(
+        "readonly-case-owner",
+        "running",
+        Path(str(wt).swapcase()),
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+
+
+def test_read_only_gc_retains_conflicting_nonterminal_ledger_state(
+    repo: Path,
+) -> None:
+    wt = _add_read_only_checkout(repo, 6)
+    _write_ledger(
+        "readonly-conflicting-state",
+        "running",
+        None,
+        terminal_state="complete",
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+
+
+def test_read_only_gc_holds_allocator_lock_across_remove_recheck(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 5)
+    _done, report = _run(repo)
+    current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+    observed: dict[str, bool] = {}
+
+    def remove_without_touching_tree(_repo: Path, _path: str) -> tuple[bool, str]:
+        lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+        try:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                observed["held"] = True
+            else:
+                observed["held"] = False
+        finally:
+            handle.close()
+        return True, ""
+
+    monkeypatch.setattr(goalflight_worktree_gc, "_remove_worktree", remove_without_touching_tree)
+    goalflight_worktree_gc.apply_removals(
+        repo,
+        report["entries"],
+        into="main",
+        ledger_dir=goalflight_ledger.runs_dir(create=False),
+        main_path=goalflight_worktree_gc.main_worktree_path(repo),
+        current_checkout=current_checkout,
+        current_error=current_error,
+    )
+    assert observed == {"held": True}
+    assert wt.is_dir()
+
+
+def test_read_only_root_symlink_cannot_reap_pool_seat(
+    tmp_path: Path, repo: Path
+) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink safety test requires POSIX links")
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "symlink-seat")
+    seat = lease.path
+    lease.release()
+    root = repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
+    root.symlink_to(repo / "worktrees", target_is_directory=True)
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatError):
+        goalflight_worktree_pool.shared_read_only_worktree(repo)
+    goalflight_worktree_pool._reap_read_only_worktrees(
+        repo, root=root, requested_path=root / "requested"
+    )
+    assert seat.is_dir()
 
 
 # --------------------------------------------------------------------------

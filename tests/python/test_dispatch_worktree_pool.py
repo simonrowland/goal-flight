@@ -489,6 +489,209 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
         resumed.release()
 
 
+@pytest.mark.parametrize("shape", ["bash", "acp"])
+def test_read_only_bind_uses_clean_pooled_seat_for_bash_and_acp(
+    tmp_path: Path, shape: str
+) -> None:
+    repo = _make_repo(tmp_path)
+    (repo / "review-base.txt").write_text("review base\n", encoding="utf-8")
+    _git(repo, "add", "review-base.txt")
+    _git(repo, "commit", "-m", "review base")
+    base = _git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "writer-review-base", base=base
+    )
+    seat = writer.path
+    finish_seat_holder(writer)
+    args = SimpleNamespace(
+        agent="codex-acp" if shape == "acp" else "grok-code",
+        shape=shape,
+        read_only=True,
+        worker=[],
+        project_root=str(repo),
+        cwd=None,
+        worktree="shared-read-only",
+        worktree_base=base,
+        worktree_root=None,
+        dispatch_id=f"review-{shape}",
+        controller_label=None,
+        skip_seat_reset=False,
+        in_place=False,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+    hold = args._worktree_read_only_hold
+    try:
+        assert hold is not None
+        assert Path(args.cwd).resolve() == seat.resolve()
+        assert not (repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR).exists()
+    finally:
+        goalflight_dispatch._release_read_only_worktree_hold(args)
+
+
+def test_non_in_place_acp_read_only_resume_admits_detached_checkout(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+    args = SimpleNamespace(
+        agent="claude-acp",
+        shape="acp",
+        read_only=True,
+        worker=[],
+        project_root=str(repo),
+        cwd=str(checkout),
+        worktree="shared-read-only",
+        worktree_base=base,
+        worktree_root=None,
+        parent_dispatch_id="readonly-acp-parent",
+        dispatch_id="readonly-acp-child",
+        controller_label=None,
+        skip_seat_reset=True,
+        in_place=False,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    assert goalflight_dispatch._requested_worktree_base(args) == base
+    assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+    assert Path(args.cwd).resolve() == checkout.resolve()
+    assert len(goalflight_worktree_pool._read_only_registered_worktrees(repo)) == 1
+
+
+def test_read_only_resume_falls_back_when_recorded_pool_seat_cannot_be_held(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "readonly-resume-writer", base=base
+    )
+    seat = writer.path
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-resume-parent",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_path": str(seat),
+            "worktree_head": base,
+        }
+    )
+    try:
+        args = SimpleNamespace(
+            agent="claude-acp",
+            shape="acp",
+            read_only=True,
+            worker=[],
+            project_root=str(repo),
+            cwd=str(seat),
+            worktree="shared-read-only",
+            worktree_base=base,
+            worktree_root=None,
+            parent_dispatch_id="readonly-resume-parent",
+            dispatch_id="readonly-resume-child",
+            controller_label=None,
+            skip_seat_reset=True,
+            in_place=False,
+            from_queue=False,
+            _worktree_seat=None,
+        )
+
+        assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+        assert Path(args.cwd).parent.name == goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
+        assert Path(args.cwd).resolve() != seat.resolve()
+        assert args._worktree_read_only_hold is None
+    finally:
+        writer.release()
+
+
+def test_dispatch_admission_reaps_read_only_checkouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "reap_read_only_worktrees",
+        lambda project_root: calls.append(project_root),
+    )
+    args = SimpleNamespace(
+        agent="codex",
+        shape="bash",
+        read_only=False,
+        worker=[],
+        project_root=str(repo),
+        cwd=None,
+        worktree="off",
+        in_place=False,
+        dispatch_id="writer-admission",
+        _worktree_seat=None,
+    )
+
+    assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+    assert calls == [repo.resolve()]
+
+
+def test_acp_in_place_nested_cwd_is_rejected_during_admission(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    nested = repo / "nested"
+    nested.mkdir()
+    args = SimpleNamespace(
+        agent="codex-acp",
+        shape="acp",
+        read_only=False,
+        worker=[],
+        project_root=str(repo),
+        cwd=str(nested),
+        worktree="off",
+        worktree_root=None,
+        dispatch_id="acp-nested-in-place",
+        controller_label=None,
+        skip_seat_reset=False,
+        in_place=True,
+        from_queue=False,
+        capacity_wait_s=0,
+        dispatch_warnings=[],
+        _worktree_seat=None,
+    )
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused, match="--in-place"):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+
+def test_read_only_resume_records_and_touches_checkout_before_waiting(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
+        repo, base=base
+    )
+    old_ns = 1_000_000_000
+    os.utime(checkout, ns=(old_ns, old_ns))
+    args = SimpleNamespace(
+        parent_dispatch_id="readonly-parent",
+        dispatch_id="readonly-child",
+        agent="codex",
+        shape="bash",
+        read_only=True,
+        cwd=str(checkout),
+    )
+
+    goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+
+    assert args._worktree_path == str(checkout)
+    assert args._worktree_id == checkout.name
+    assert args._worktree_base_commit == base
+    assert checkout.stat().st_mtime_ns > old_ns
+    assert goalflight_dispatch._ledger_worker_cwd(args, "waiting_capacity") == str(checkout)
+
+
 def test_occupancy_refusal_releases_bound_seat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

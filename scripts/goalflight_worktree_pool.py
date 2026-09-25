@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import re
 import shutil
@@ -63,6 +64,7 @@ KEEP_REF_PREFIX = "goalflight/keep"
 READ_ONLY_WORKTREE_DIR = ".goalflight-readonly"
 READ_ONLY_WORKTREE_KEEP = 4
 READ_ONLY_WORKTREE_GRACE_S = 60 * 60
+READ_ONLY_GIT_TIMEOUT_S = 30.0
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
 
 # Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
@@ -201,6 +203,44 @@ class WorktreeSeatLease:
         lock_file.close()
 
     def __enter__(self) -> "WorktreeSeatLease":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
+
+
+class WorktreeReadOnlySeatLease:
+    """A shared kernel lock held for a read-only review's lifetime."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        seat_name: str,
+        dispatch_id: str,
+        lock_file: TextIO,
+    ) -> None:
+        self.path = path
+        self.seat_name = seat_name
+        self.dispatch_id = dispatch_id
+        self._lock_file: TextIO | None = lock_file
+
+    def fileno(self) -> int:
+        if self._lock_file is None:
+            raise WorktreeSeatError(
+                f"read-only worktree lease already released: {self.seat_name}"
+            )
+        return self._lock_file.fileno()
+
+    def release(self) -> None:
+        """Drop this process's descriptor; the shared lock then disappears."""
+        lock_file = self._lock_file
+        if lock_file is None:
+            return
+        self._lock_file = None
+        lock_file.close()
+
+    def __enter__(self) -> "WorktreeReadOnlySeatLease":
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
@@ -409,15 +449,49 @@ def read_only_worktree_root(project_root: Path) -> Path:
     return repository_worktree_root(project_root) / READ_ONLY_WORKTREE_DIR
 
 
-def is_read_only_worktree_path(path: str | Path, *, project_root: Path) -> bool:
-    """True for a direct child of the shared detached-checkout directory."""
+def read_only_allocation_lock_path(project_root: Path) -> Path:
+    """Return the lock shared by detached-checkout allocation and GC."""
+    return _seat_lock_root(project_root) / "readonly-allocation.lock"
+
+
+def read_only_worktree_path_verdict(
+    path: str | Path, *, project_root: Path
+) -> tuple[str, str]:
+    """Classify a read-only path without following a symlink into the pool."""
+    root = read_only_worktree_root(project_root)
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(project_root).resolve() / candidate
     try:
-        resolved = Path(path).resolve(strict=False)
-        root = read_only_worktree_root(project_root).resolve(strict=False)
-        relative = resolved.relative_to(root)
+        if root.is_symlink():
+            return UNKNOWN, f"read-only root is a symlink: {root}"
+        root_real = root.resolve(strict=False)
+        if root_real != root:
+            return UNKNOWN, f"read-only root resolves through a symlink: {root}"
+        relative = candidate.relative_to(root)
     except (OSError, ValueError):
-        return False
-    return len(relative.parts) == 1
+        return NO, f"{candidate} is not under {root}"
+    if len(relative.parts) != 1:
+        return NO, f"{candidate} is not a direct read-only checkout"
+    if is_pool_seat_path(candidate) or is_managed_worktree_path(
+        candidate, project_root=project_root
+    ):
+        return UNKNOWN, f"{candidate} is also a pooled worktree path"
+    if candidate.is_symlink():
+        return UNKNOWN, f"read-only checkout is a symlink: {candidate}"
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError as exc:
+        return UNKNOWN, f"read-only checkout could not be resolved ({exc})"
+    if resolved.parent != root_real:
+        return UNKNOWN, f"read-only checkout resolves outside {root}"
+    return YES, f"direct child of {root}"
+
+
+def is_read_only_worktree_path(path: str | Path, *, project_root: Path) -> bool:
+    """True for a safe direct child of the shared detached-checkout directory."""
+    verdict, _reason = read_only_worktree_path_verdict(path, project_root=project_root)
+    return verdict == YES
 
 
 def is_managed_worktree_path(path: str | Path, *, project_root: Path) -> bool:
@@ -566,8 +640,9 @@ def _git(
     *args: str,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
-    result = _git_proc(cwd, *args, input_text=input_text, env=env)
+    result = _git_proc(cwd, *args, input_text=input_text, env=env, timeout=timeout)
     if result is None:
         raise WorktreeSeatError(f"git {' '.join(args)} could not run in {cwd}")
     if result.returncode != 0:
@@ -581,9 +656,10 @@ def _git_nul(
     *args: str,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Run a Git command whose NUL-delimited output must keep path bytes."""
-    result = _git_proc(cwd, *args, input_text=input_text, env=env)
+    result = _git_proc(cwd, *args, input_text=input_text, env=env, timeout=timeout)
     if result is None:
         raise WorktreeSeatError(f"git {' '.join(args)} could not run in {cwd}")
     if result.returncode != 0:
@@ -726,6 +802,7 @@ def _git_proc(
     *args: str,
     input_text: str | None = None,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
     guard_error = guard_worktree_mutation(cwd, *args)
     if guard_error is not None:
@@ -744,6 +821,11 @@ def _git_proc(
             stderr=subprocess.PIPE,
             env=env,
             check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            ["git", *args], 124, "", "git command timed out"
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1000,9 +1082,14 @@ def read_only_worktree_usage(
     )
 
 
-def _read_only_registered_worktrees(project_root: Path, root: Path) -> list[Path]:
-    output = _git(project_root, "worktree", "list", "--porcelain")
-    root = root.resolve(strict=False)
+def _registered_worktree_paths(project_root: Path) -> list[Path]:
+    output = _git(
+        project_root,
+        "worktree",
+        "list",
+        "--porcelain",
+        timeout=READ_ONLY_GIT_TIMEOUT_S,
+    )
     paths: list[Path] = []
     for line in output.splitlines():
         if not line.startswith("worktree "):
@@ -1011,32 +1098,160 @@ def _read_only_registered_worktrees(project_root: Path, root: Path) -> list[Path
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = project_root / candidate
-        try:
-            resolved = candidate.resolve(strict=False)
-            relative = resolved.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if len(relative.parts) == 1:
+        paths.append(candidate)
+    return paths
+
+
+def _read_only_registered_worktrees(project_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for candidate in _registered_worktree_paths(project_root):
+        verdict, _reason = read_only_worktree_path_verdict(
+            candidate, project_root=project_root
+        )
+        if verdict == YES:
             paths.append(candidate)
     return paths
+
+
+def _registered_pool_worktrees(project_root: Path) -> list[Path]:
+    """Return registered pooled seats from Git's worktree inventory."""
+    paths: list[Path] = []
+    for candidate in _registered_worktree_paths(project_root):
+        if not is_managed_worktree_path(candidate, project_root=project_root):
+            continue
+        verdict, _reason = registered_pool_seat_verdict(
+            candidate, project_root=project_root
+        )
+        if verdict == YES:
+            paths.append(candidate)
+    return paths
+
+
+def _read_only_seat_matches(path: Path, base_commit: str) -> bool:
+    """Require the exact review base and an entirely clean checkout."""
+    try:
+        if _git(path, "rev-parse", "--verify", "HEAD^{commit}") != base_commit:
+            return False
+    except WorktreeSeatError:
+        return False
+    status = _git_proc(
+        path,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
+    return status is not None and status.returncode == 0 and status.stdout == ""
+
+
+def _try_acquire_shared_read_only_seat(
+    project_root: Path,
+    path: Path,
+    base_commit: str,
+    dispatch_id: str,
+) -> WorktreeReadOnlySeatLease | None:
+    """Take a non-blocking shared hold, then close the HEAD/status race."""
+    try:
+        lock_path = worktree_lock_path_for_path(project_root, path)
+        flags = _lock_open_flags() & ~os.O_CREAT
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except (OSError, WorktreeSeatError):
+        return None
+    lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return None
+        lease = WorktreeReadOnlySeatLease(
+            path=path,
+            seat_name=path.name,
+            dispatch_id=dispatch_id,
+            lock_file=lock_file,
+        )
+        if not _read_only_seat_matches(path, base_commit):
+            lease.release()
+            return None
+        return lease
+    except BaseException:
+        lock_file.close()
+        raise
+
+
+def try_acquire_read_only_pool_seat(
+    project_root: Path,
+    path: Path,
+    dispatch_id: str,
+    *,
+    base_commit: str | None = None,
+) -> WorktreeReadOnlySeatLease | None:
+    """Hold a specific pooled seat when it still matches a read-only review."""
+    project_root = project_root.resolve()
+    path = path.expanduser().resolve(strict=False)
+    if not is_managed_worktree_path(path, project_root=project_root):
+        return None
+    verdict, _reason = registered_pool_seat_verdict(path, project_root=project_root)
+    if verdict != YES:
+        return None
+    if base_commit is None:
+        try:
+            base_commit = _git(path, "rev-parse", "--verify", "HEAD^{commit}")
+        except WorktreeSeatError:
+            return None
+    if not _read_only_seat_matches(path, base_commit):
+        return None
+    return _try_acquire_shared_read_only_seat(
+        project_root, path, base_commit, dispatch_id
+    )
+
+
+def bind_read_only_worktree(
+    project_root: Path,
+    dispatch_id: str,
+    *,
+    base: str | None = None,
+) -> tuple[Path, str, WorktreeReadOnlySeatLease | None]:
+    """Prefer a clean, unoccupied pooled seat before the detached fallback."""
+    project_root = project_root.resolve()
+    _verify_project_root(project_root)
+    resolved_base = base if base is not None else default_seat_base(project_root)
+    base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
+    try:
+        candidates = _registered_pool_worktrees(project_root)
+    except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+        candidates = []
+    for path in candidates:
+        if not _read_only_seat_matches(path, base_commit):
+            continue
+        lease = _try_acquire_shared_read_only_seat(
+            project_root, path, base_commit, dispatch_id
+        )
+        if lease is not None:
+            return path, base_commit, lease
+    path, base_commit = shared_read_only_worktree(
+        project_root, base=resolved_base
+    )
+    return path, base_commit, None
 
 
 def _reap_read_only_worktrees(
     project_root: Path,
     *,
     root: Path,
-    requested_path: Path,
+    requested_path: Path | None,
 ) -> None:
     """Remove only old, clean, unowned registered read-only checkouts."""
     try:
-        registered = _read_only_registered_worktrees(project_root, root)
+        registered = _read_only_registered_worktrees(project_root)
     except (OSError, subprocess.SubprocessError, WorktreeSeatError):
         return
-    requested = requested_path.resolve(strict=False)
+    requested = (
+        requested_path.resolve(strict=False) if requested_path is not None else None
+    )
     now_ns = time.time_ns()
     candidates: list[tuple[int, Path]] = []
     for path in registered:
-        if path.resolve(strict=False) == requested:
+        if requested is not None and path.resolve(strict=False) == requested:
             continue
         usage = read_only_worktree_usage(path)
         if usage["verdict"] != YES:
@@ -1051,9 +1266,19 @@ def _reap_read_only_worktrees(
     candidates.sort(key=lambda item: item[0], reverse=True)
     for _mtime, path in candidates[READ_ONLY_WORKTREE_KEEP:]:
         try:
-            _git(project_root, "worktree", "remove", str(path))
-        except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+            _git(
+                project_root,
+                "worktree",
+                "remove",
+                str(path),
+                timeout=READ_ONLY_GIT_TIMEOUT_S,
+            )
+        except WorktreeSeatError as exc:
+            if "timed out" in str(exc).lower():
+                return
             # Dirty or otherwise refused trees remain registered and intact.
+            continue
+        except (OSError, subprocess.SubprocessError):
             continue
 
 
@@ -2839,6 +3064,56 @@ def _lock_open_flags() -> int:
     return flags
 
 
+def _verify_read_only_root(root: Path) -> None:
+    if root.is_symlink():
+        raise WorktreeSeatError(f"read-only worktree root must not be a symlink: {root}")
+    try:
+        if root.resolve(strict=False) != root:
+            raise WorktreeSeatError(
+                f"read-only worktree root resolves through a symlink: {root}"
+            )
+    except OSError as exc:
+        raise WorktreeSeatError(
+            f"read-only worktree root could not be resolved: {root}: {exc}"
+        ) from exc
+
+
+@contextmanager
+def _read_only_allocation_lock(project_root: Path):
+    lock_root = _seat_lock_root(project_root)
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = read_only_allocation_lock_path(project_root)
+    fd = os.open(lock_path, _lock_open_flags(), 0o600)
+    lock_file = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield lock_file
+    finally:
+        lock_file.close()
+
+
+def reap_read_only_worktrees(
+    project_root: Path, *, requested_path: Path | None = None
+) -> None:
+    """Reap old detached checkouts under the allocator's transaction lock."""
+    project_root = project_root.resolve()
+    root = read_only_worktree_root(project_root)
+    try:
+        _verify_read_only_root(root)
+        if not root.exists():
+            return
+        root.mkdir(parents=True, exist_ok=True)
+        _verify_read_only_root(root)
+        with _read_only_allocation_lock(project_root):
+            _reap_read_only_worktrees(
+                project_root,
+                root=root,
+                requested_path=requested_path,
+            )
+    except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+        return
+
+
 def shared_read_only_worktree(project_root: Path, *, base: str | None = None) -> tuple[Path, str]:
     """Return a checkout shared by read-only dispatches at one commit."""
     project_root = project_root.resolve()
@@ -2846,14 +3121,10 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
     resolved_base = base if base is not None else default_seat_base(project_root)
     base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
     root = read_only_worktree_root(project_root)
+    _verify_read_only_root(root)
     root.mkdir(parents=True, exist_ok=True)
-    lock_root = _seat_lock_root(project_root)
-    lock_root.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_root / "readonly-allocation.lock"
-    fd = os.open(lock_path, _lock_open_flags(), 0o600)
-    lock_file = os.fdopen(fd, "r+", encoding="utf-8")
-    try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    _verify_read_only_root(root)
+    with _read_only_allocation_lock(project_root):
         path = root / base_commit[:16]
         _reap_read_only_worktrees(
             project_root,
@@ -2873,8 +3144,6 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
         except OSError:
             pass
         return path, base_commit
-    finally:
-        lock_file.close()
 
 
 def release_worktree_for_dispatch(
