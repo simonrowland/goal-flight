@@ -301,8 +301,16 @@ def test_retained_legacy_ring_seat_counts_toward_cap(holder):
     assert (collision / "payload").read_text() == "must survive\n"
 
 
-def test_unregistered_legacy_ring_lock_reports_holder_and_counts_toward_cap(holder):
-    repo, path, _row = holder
+def test_unregistered_live_legacy_ring_lock_reports_holder_and_counts_toward_cap(
+    holder, monkeypatch
+):
+    repo, path, row = holder
+    row["state"] = "running"
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: True,
+    )
     global_lock = pool.worktree_lock_path_for_path(repo, path)
     legacy_path = repo / "worktrees" / "legacy" / "s-1"
     legacy_path.parent.mkdir(parents=True)
@@ -324,7 +332,7 @@ def test_unregistered_legacy_ring_lock_reports_holder_and_counts_toward_cap(hold
         pool.acquire_worktree_seat(repo, "next")
     message = str(caught.value)
     assert "lock holder: s-1=unknown-dispatch" not in message
-    assert "s-1=old controller=owner state=complete worker exited" in message
+    assert "s-1=old controller=owner state=running worker_pid=34567" in message
     assert legacy_path.is_dir()
 
 
@@ -414,6 +422,40 @@ def test_unregistered_missing_checkout_requires_holder_evidence(
 
     with pool.acquire_worktree_seat(repo, "next") as lease:
         assert lease.path == repo / "worktrees" / "s-2"
+
+
+def test_unreadable_present_checkout_is_unknown_for_holder_validation(holder, monkeypatch):
+    repo, path, row = holder
+    _git(path, "checkout", "-q", "-b", "worktree/live")
+    records = {
+        "old": row,
+        "live": {
+            "dispatch_id": "live",
+            "state": "running",
+            "worker_pid": 45678,
+            "worker_identity": {"pid": 45678, "start_token": "live-token"},
+        },
+    }
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: token == "live-token",
+    )
+
+    parent = path.parent
+    parent.chmod(0)
+    try:
+        try:
+            os.stat(path)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("filesystem does not enforce mode 000 on parent traversal")
+        with pytest.raises(pool.WorktreeSeatUnavailable, match="could not be inspected"):
+            pool._validate_holder(path, "old")
+    finally:
+        parent.chmod(0o755)
 
 
 def test_ignored_listing_is_scoped_to_each_candidate_seat(tmp_path, monkeypatch):

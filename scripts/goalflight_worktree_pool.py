@@ -67,6 +67,7 @@ READ_ONLY_WORKTREE_KEEP = 4
 READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 READ_ONLY_GIT_TIMEOUT_S = 30.0
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
+_LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
 
 # Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
@@ -998,7 +999,13 @@ def worktree_seat_lock_path(
             / sanitize_controller_ring_label(controller_label)
             / seat_name
         )
-        if direct.exists() or not legacy.exists():
+        direct_state = _path_presence(direct)
+        legacy_state = _path_presence(legacy)
+        if "unknown" in {direct_state, legacy_state}:
+            raise WorktreeSeatError(
+                f"cannot determine pooled seat path while resolving {worktree_path}"
+            )
+        if direct_state == "present" or legacy_state == "absent":
             return _seat_lock_root(project_root) / f"{seat_name}.lock"
         return _seat_lock_root(project_root, controller_label=controller_label) / f"{seat_name}.lock"
     return _seat_lock_root(project_root) / f"{seat_name}.lock"
@@ -1083,33 +1090,54 @@ def _record_lock_identity(
     if not stat.S_ISREG(opened.st_mode):
         raise OSError(errno.ELOOP, f"lock path is not a regular file: {lock_path}")
     registry_path = _lock_registry_path(registry_root)
-    payload = _read_lock_registry(registry_root)
-    key = _lock_registry_key(lock_path)
-    existing = payload["locks"].get(key)
-    if existing is not None:
-        registered = _registered_lock_identity(lock_path, registry_root=registry_root)
-        if registered is None or (
-            registered.st_dev != opened.st_dev or registered.st_ino != opened.st_ino
-        ):
-            raise OSError(errno.EAGAIN, f"lock identity changed while registering: {lock_path}")
-        return registered
-    payload["locks"][key] = {
-        "st_dev": int(opened.st_dev),
-        "st_ino": int(opened.st_ino),
-    }
     registry_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = registry_path.with_name(
-        f"{registry_path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
-    )
-    try:
-        temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-        temporary.replace(registry_path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
+    mutex_path = registry_path.with_name(_LOCK_REGISTRY_MUTEX_NAME)
+    key = _lock_registry_key(lock_path)
+    with mutex_path.open("a+", encoding="utf-8") as mutex:
+        fcntl.flock(mutex.fileno(), fcntl.LOCK_EX)
+        payload = _read_lock_registry(registry_root)
+        existing = payload["locks"].get(key)
+        if existing is not None:
+            registered = _registered_stat_from_record(lock_path, existing)
+            if (
+                registered.st_dev != opened.st_dev
+                or registered.st_ino != opened.st_ino
+            ):
+                raise OSError(
+                    errno.EAGAIN,
+                    f"lock identity changed while registering: {lock_path}",
+                )
+            return registered
+        payload["locks"][key] = {
+            "st_dev": int(opened.st_dev),
+            "st_ino": int(opened.st_ino),
+        }
+        temporary = registry_path.with_name(
+            f"{registry_path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            temporary.replace(registry_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
     return os.stat_result(
         (stat.S_IFREG, opened.st_ino, opened.st_dev, 1, 0, 0, 0, 0, 0, 0)
     )
+
+
+def _adopt_exclusive_lock(
+    lock_path: Path, fd: int, *, registry_root: Path
+) -> os.stat_result:
+    """Register a legacy inode after its caller has acquired LOCK_EX."""
+    registered = _registered_lock_identity(lock_path, registry_root=registry_root)
+    if registered is not None:
+        if not _lock_fd_matches_identity(fd, registered):
+            raise OSError(errno.EAGAIN, f"lock identity changed while adopting: {lock_path}")
+        return registered
+    return _record_lock_identity(lock_path, fd, registry_root=registry_root)
 
 
 def _read_ring_hwm(lock_root: Path) -> int:
@@ -1665,7 +1693,12 @@ def _holder_description(name: str, metadata: dict) -> str:
 def _validate_holder(worktree_path: Path, prior_dispatch_id: str) -> str:
     """Existing branch names identify holders; directory labels never do."""
     metadata_dispatch_id = prior_dispatch_id
-    if worktree_path.exists():
+    presence = _path_presence(worktree_path)
+    if presence == "unknown":
+        raise WorktreeSeatUnavailable(
+            f"worktree {worktree_path} could not be inspected; holder is unknown"
+        )
+    if presence == "present":
         branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
         for prefix in (WORKTREE_BRANCH_PREFIX, SEAT_BRANCH_PREFIX):
             if branch.startswith(prefix + "/"):
@@ -2012,7 +2045,12 @@ def _create_seat_worktree(
     # A deleted checkout can remain in Git's worktree admin list. The path is
     # proven absent at this point, so prune stale registration before the
     # replacement add; never prune an occupied or merely unreadable path.
-    if not worktree_path.exists() and not worktree_path.is_symlink():
+    presence = _path_presence(worktree_path)
+    if presence == "unknown":
+        raise WorktreeSeatError(
+            f"cannot inspect worktree path {worktree_path}; refusing prune or add"
+        )
+    if presence == "absent":
         _git(project_root, "worktree", "prune")
     ref = f"refs/heads/{branch}"
     exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
@@ -2604,7 +2642,12 @@ def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
     """Exclude writers using the path lock before any checkout or reset."""
     expected = kwargs.pop("expected_prior_dispatch_id", None)
     path = kwargs["worktree_path"]
-    if path.exists() and kwargs["reset"]:
+    presence = _path_presence(path)
+    if presence == "unknown":
+        raise WorktreeSeatUnavailable(
+            f"worktree {path} could not be inspected; refusing reset or recreate"
+        )
+    if presence == "present" and kwargs["reset"]:
         try:
             occupancy = try_acquire_worktree_path_lock(path, kwargs["dispatch_id"])
         except (WorktreePathLockBusy, WorktreePathLockUnknown) as exc:
@@ -2637,7 +2680,12 @@ def _prepare_claimed_seat_locked(
     controller_label: str | None = None,
     before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
-    existing = worktree_path.exists() or worktree_path.is_symlink()
+    presence = _path_presence(worktree_path)
+    if presence == "unknown":
+        raise WorktreeSeatResetRefused(
+            f"cannot inspect worktree {worktree_path}; refusing reset"
+        )
+    existing = presence == "present"
     safety: dict | None = None
     if existing:
         _verify_existing_seat(project_root, worktree_path)
@@ -2957,13 +3005,21 @@ def acquire_worktree_seat(
         managed_root = repository_worktree_root(project_root)
     if managed_root.is_symlink():
         raise WorktreeSeatError(f"managed worktree root must not be a symlink: {managed_root}")
-    if managed_root.exists() and not managed_root.is_dir():
+    managed_root_state = _path_presence(managed_root)
+    if managed_root_state == "unknown":
+        raise WorktreeSeatError(
+            f"managed worktree root could not be inspected: {managed_root}"
+        )
+    if managed_root_state == "present" and not managed_root.is_dir():
         raise WorktreeSeatError(f"managed worktree root is not a directory: {managed_root}")
 
     lock_root = _seat_lock_root(project_root)
     if lock_root.is_symlink():
         raise WorktreeSeatError(f"worktree lock root must not be a symlink: {lock_root}")
-    if lock_root.exists() and not lock_root.is_dir():
+    lock_root_state = _path_presence(lock_root)
+    if lock_root_state == "unknown":
+        raise WorktreeSeatError(f"worktree lock root could not be inspected: {lock_root}")
+    if lock_root_state == "present" and not lock_root.is_dir():
         raise WorktreeSeatError(f"worktree lock root is not a directory: {lock_root}")
     lock_root.mkdir(parents=True, exist_ok=True)
     registry_root = _git_common_dir(project_root)
@@ -2993,6 +3049,16 @@ def acquire_worktree_seat(
             deadline=capacity_deadline,
         )
         allocation_locked = True
+        try:
+            _adopt_exclusive_lock(
+                allocation_lock_path,
+                allocation_file.fileno(),
+                registry_root=registry_root,
+            )
+        except OSError as exc:
+            raise WorktreeSeatError(
+                f"cannot register worktree allocation lock {allocation_lock_path}: {exc}"
+            ) from exc
 
         def release_allocation_lock() -> None:
             nonlocal allocation_locked
@@ -3032,8 +3098,13 @@ def acquire_worktree_seat(
         for candidate_path, candidate_lock in [*global_candidates, *legacy_candidates]:
             if occupied_target is not None and candidate_path.resolve(strict=False) == occupied_target:
                 continue
-            if not candidate_lock.is_file():
-                if candidate_path.exists():
+            lock_state = _path_presence(candidate_lock)
+            candidate_state = _path_presence(candidate_path)
+            if lock_state == "unknown" or candidate_state == "unknown":
+                note_capacity_occupant(candidate_path, {})
+                continue
+            if lock_state == "absent":
+                if candidate_state == "present":
                     note_capacity_occupant(candidate_path, {})
                 continue
             try:
@@ -3072,7 +3143,7 @@ def acquire_worktree_seat(
             else:
                 prior_dispatch_id = _known_lock_dispatch_id(probe_file)
                 if registered:
-                    if prior_dispatch_id is None and candidate_path.exists():
+                    if prior_dispatch_id is None and candidate_state == "present":
                         note_capacity_occupant(
                             candidate_path, _lock_metadata(probe_file)
                         )
@@ -3104,7 +3175,12 @@ def acquire_worktree_seat(
 
         if occupy_path is not None:
             worktree_path = Path(occupy_path).expanduser().resolve(strict=False)
-            if not worktree_path.exists():
+            worktree_state = _path_presence(worktree_path)
+            if worktree_state == "unknown":
+                raise WorktreeCwdRefused(
+                    f"refusing to inspect --cwd {worktree_path}"
+                )
+            if worktree_state == "absent":
                 raise WorktreeCwdRefused(
                     f"refusing to create missing --cwd {worktree_path}"
                 )
@@ -3159,6 +3235,14 @@ def acquire_worktree_seat(
                     "refusing to git worktree add a new unmanaged path"
                 )
             try:
+                try:
+                    _adopt_exclusive_lock(
+                        lock_path, lock_file.fileno(), registry_root=registry_root
+                    )
+                except OSError as exc:
+                    raise WorktreeSeatError(
+                        f"cannot register worktree lock {lock_path}: {exc}"
+                    ) from exc
                 prior_dispatch_id = _known_lock_dispatch_id(lock_file)
                 if (
                     expected_prior_dispatch_id is not None
@@ -3224,8 +3308,25 @@ def acquire_worktree_seat(
             *,
             require_ancestor: bool = False,
         ):
-            lock_existed = lock_path.is_file()
-            path_existed = worktree_path.exists()
+            lock_state = _path_presence(lock_path)
+            path_state = _path_presence(worktree_path)
+            if lock_state == "unknown" or path_state == "unknown":
+                resolved_path = worktree_path.resolve(strict=False)
+                if resolved_path not in occupied_paths:
+                    occupied_paths.add(resolved_path)
+                    occupants.append((str(worktree_path), {}))
+                return None
+            lock_existed = lock_state == "present"
+            path_existed = path_state == "present"
+            try:
+                registered_before_open = (
+                    _registered_lock_identity(
+                        lock_path, registry_root=registry_root
+                    )
+                    is not None
+                )
+            except OSError:
+                registered_before_open = False
             try:
                 lock_fd = _open_registered_lock(
                     lock_path,
@@ -3256,20 +3357,19 @@ def acquire_worktree_seat(
                 ) is not True:
                     lock_file.close()
                     return None
+                try:
+                    _adopt_exclusive_lock(
+                        lock_path, lock_file.fileno(), registry_root=registry_root
+                    )
+                except OSError as exc:
+                    raise WorktreeSeatUnavailable(
+                        f"worktree lock identity could not be adopted: {exc}"
+                    ) from exc
                 seat_name = worktree_path.name
                 prior_dispatch_id = _known_lock_dispatch_id(lock_file)
                 if not path_existed and lock_existed:
-                    try:
-                        registered = (
-                            _registered_lock_identity(
-                                lock_path, registry_root=registry_root
-                            )
-                            is not None
-                        )
-                    except OSError:
-                        registered = False
                     if prior_dispatch_id is None:
-                        if not registered:
+                        if not registered_before_open:
                             resolved_path = worktree_path.resolve(strict=False)
                             if resolved_path not in occupied_paths:
                                 occupied_paths.add(resolved_path)
@@ -3278,14 +3378,19 @@ def acquire_worktree_seat(
                                 )
                             lock_file.close()
                             return None
-                    elif not registered:
+                    elif not registered_before_open:
                         _validate_holder(worktree_path, prior_dispatch_id)
                 # A present checkout with no readable occupant is not a free
                 # seat. A resume cannot prove whether resetting it would erase
                 # another dispatch's uncommitted work; leave it untouched.
                 # Brand-new slots remain allocatable because they have no
                 # checkout to protect yet.
-                if prior_dispatch_id is None and worktree_path.exists():
+                current_path_state = _path_presence(worktree_path)
+                if current_path_state == "unknown":
+                    raise WorktreeSeatUnavailable(
+                        f"worktree {worktree_path} could not be inspected; holder is unknown"
+                    )
+                if prior_dispatch_id is None and current_path_state == "present":
                     lock_file.close()
                     return None
                 release_allocation_lock()
@@ -3321,7 +3426,11 @@ def acquire_worktree_seat(
                 return None
             except BaseException:
                 try:
-                    if not lock_existed and not path_existed and worktree_path.exists():
+                    if (
+                        not lock_existed
+                        and not path_existed
+                        and _path_presence(worktree_path) == "present"
+                    ):
                         # A failed first bind may have created a checkout after
                         # the lock was opened. It contains only the requested
                         # base; remove that unclaimed checkout so a retry does
@@ -3430,6 +3539,19 @@ def _lock_open_flags() -> int:
     return flags
 
 
+def _path_presence(path: Path) -> str:
+    """Distinguish a missing path from one that cannot be inspected."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        if exc.errno == errno.ENOTDIR:
+            return "absent"
+        return "unknown"
+    return "present"
+
+
 def _lock_path_identity(lock_path: Path) -> os.stat_result | None:
     """Read an unregistered in-place occupancy lock's current leaf identity."""
     try:
@@ -3482,9 +3604,9 @@ def _open_registered_lock(
             expected_stat=expected_stat,
         )
     if allow_unregistered:
-        # Tolerate locks created before the registry existed. This compatibility
-        # path never writes a registration record; callers apply their normal
-        # metadata and ledger evidence before reclaiming a pooled seat.
+        # Tolerate locks created before the registry existed. Callers that have
+        # taken an exclusive lock may adopt the opened inode; probes and shared
+        # readers leave this compatibility path unregistered.
         legacy_stat = _lock_path_identity(lock_path)
         if legacy_stat is not None:
             return _open_lock_path_safely(
@@ -3636,7 +3758,7 @@ def _open_lock_path_safely(
             os.close(fd)
             raise OSError(
                 errno.EAGAIN,
-                f"lock identity changed while opening: {path}",
+                f"registered lock identity changed while opening: {path}",
             )
         return fd
     finally:
@@ -3672,6 +3794,11 @@ def _read_only_allocation_lock(project_root: Path):
     lock_file = os.fdopen(fd, "r+", encoding="utf-8")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _adopt_exclusive_lock(
+            lock_path,
+            lock_file.fileno(),
+            registry_root=_git_common_dir(project_root),
+        )
         yield lock_file
     finally:
         lock_file.close()
@@ -3685,7 +3812,12 @@ def reap_read_only_worktrees(
     root = read_only_worktree_root(project_root)
     try:
         _verify_read_only_root(root)
-        if not root.exists():
+        root_state = _path_presence(root)
+        if root_state == "unknown":
+            raise WorktreeSeatError(
+                f"read-only worktree root could not be inspected: {root}"
+            )
+        if root_state == "absent":
             return
         root.mkdir(parents=True, exist_ok=True)
         _verify_read_only_root(root)
@@ -3716,7 +3848,12 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
             root=root,
             requested_path=path,
         )
-        if not path.exists():
+        path_state = _path_presence(path)
+        if path_state == "unknown":
+            raise WorktreeSeatError(
+                f"shared read-only worktree could not be inspected: {path}"
+            )
+        if path_state == "absent":
             _git(
                 project_root,
                 "worktree",
@@ -3885,9 +4022,9 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
                     f"cannot resolve lock registration for Git worktree {resolved}: {exc}"
                 ) from exc
         # Git-backed trees use the durable lock identity discipline. Existing
-        # pre-registry locks are tolerated without writing a registration;
-        # non-Git trees have no independent registration root and retain the
-        # old fail-closed safe walk.
+        # pre-registry locks are tolerated on open and adopted after an
+        # exclusive writer lock; non-Git trees have no independent registration
+        # root and retain the old fail-closed safe walk.
         if registry_root is None:
             lock_fd = _open_lock_path_safely(
                 lock_path,
@@ -3928,6 +4065,16 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
             f"({type(exc).__name__}: {exc})"
         ) from exc
     try:
+        if registry_root is not None:
+            try:
+                _adopt_exclusive_lock(
+                    lock_path, lock_file.fileno(), registry_root=registry_root
+                )
+            except OSError as exc:
+                raise WorktreePathLockUnknown(
+                    f"worktree occupancy lock identity of {resolved} could not be adopted "
+                    f"({type(exc).__name__}: {exc})"
+                ) from exc
         os.set_inheritable(lock_file.fileno(), True)
         _write_occupant(
             lock_file, seat_name=resolved.name, dispatch_id=dispatch_id

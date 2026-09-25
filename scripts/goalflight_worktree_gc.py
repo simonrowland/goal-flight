@@ -686,6 +686,7 @@ def _acquire_read_only_action_lock(
             flags,
             registry_root=goalflight_worktree_pool._git_common_dir(repo),
             allow_create=True,
+            allow_unregistered=True,
         )
     except OSError as exc:
         return None, f"read-only allocation lock could not be opened ({exc})"
@@ -694,6 +695,11 @@ def _acquire_read_only_action_lock(
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        goalflight_worktree_pool._adopt_exclusive_lock(
+            lock_path,
+            handle.fileno(),
+            registry_root=goalflight_worktree_pool._git_common_dir(repo),
+        )
     except BlockingIOError:
         handle.close()
         return None, "read-only allocation is active; retry after it completes"

@@ -548,6 +548,13 @@ def test_read_only_gc_rejects_replaced_unregistered_allocation_lock(
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     held = os.fdopen(fd, "r+", encoding="utf-8")
     fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+    # The allocator adopts the original pre-registry inode while holding it.
+    # GC must then reject the replacement rather than trust the new path leaf.
+    goalflight_worktree_pool._adopt_exclusive_lock(
+        lock_path,
+        held.fileno(),
+        registry_root=goalflight_worktree_pool._git_common_dir(repo),
+    )
     backup = parent.with_name(parent.name + ".real")
     parent.rename(backup)
     parent.mkdir()
@@ -563,6 +570,58 @@ def test_read_only_gc_rejects_replaced_unregistered_allocation_lock(
         parent.rmdir()
         backup.rename(parent)
         held.close()
+
+
+def test_read_only_gc_adopts_pre_registry_lock_on_first_run(repo: Path) -> None:
+    root = repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
+    candidate = root / "host-state"
+    root.mkdir(parents=True)
+    _git(repo, "worktree", "add", "-q", "--detach", str(candidate), "HEAD")
+    os.utime(candidate, (1, 1))
+
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    if registry_path.exists():
+        registry_path.unlink()
+
+    _done, report = _run(repo, "--apply")
+    entry = _entry(report, candidate)
+    assert entry["outcome"] == "removed", entry
+    assert "changed_before_remove" not in json.dumps(entry)
+    assert not candidate.exists()
+    assert registry_path.exists()
+
+
+def test_exclusive_open_adopts_pre_registry_lock_and_reuses_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    lock_path.parent.mkdir(parents=True)
+    lock_path.touch()
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    if registry_path.exists():
+        registry_path.unlink()
+
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        record = payload["locks"][goalflight_worktree_pool._lock_registry_key(lock_path)]
+        identity = os.stat(lock_path)
+        assert record == {"st_dev": identity.st_dev, "st_ino": identity.st_ino}
+
+    def compatibility_path_must_not_run(_path: Path):
+        pytest.fail("second open used the unregistered compatibility path")
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_lock_path_identity", compatibility_path_must_not_run
+    )
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        pass
 
 
 def test_read_only_root_symlink_cannot_reap_pool_seat(
