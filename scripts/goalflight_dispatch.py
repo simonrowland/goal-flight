@@ -6489,6 +6489,51 @@ def _resolve_unpinned_codex_resume(args, dispatch_id: str) -> None:
     )
 
 
+def _preflight_codex_resume_account(
+    args,
+    *,
+    project_root: Path,
+    dispatch_id: str,
+) -> str:
+    requested = str(getattr(args, "account", None) or "").strip() or None
+    if requested is None:
+        raise DispatchUsageError("resume refused: Codex account is missing")
+    api = _codex_seat_api()
+    resolver = getattr(api, "resolve_codex_seat", None)
+    if not callable(resolver):
+        raise DispatchUsageError(
+            "resume refused: the Codex account resolver does not support "
+            "effective-account resolution"
+        )
+    try:
+        preflight_home, effective_account = resolver(
+            str(project_root), requested, dispatch_id
+        )
+        expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
+            strict=False
+        )
+        if (
+            not isinstance(preflight_home, str)
+            or not isinstance(effective_account, str)
+            or not preflight_home
+            or not effective_account
+            or Path(preflight_home).resolve(strict=False) != expected_home
+        ):
+            raise ValueError("resolver returned an invalid home or account")
+    except Exception as exc:
+        cleanup_codex_dispatch_home(dispatch_id)
+        raise DispatchUsageError(
+            f"resume refused: codex account resolver failed for {requested!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    args._capacity_account = effective_account
+    args._codex_resume_pre_resolved = {
+        "home": preflight_home,
+        "account": effective_account,
+    }
+    return preflight_home
+
+
 def _preflight_resume_dispatch(
     source: dict,
     *,
@@ -6527,34 +6572,11 @@ def _preflight_resume_dispatch(
     if engine == "codex":
         requested = str(getattr(args, "account", None) or "").strip() or None
         if requested:
-            api = _codex_seat_api()
-            resolver = getattr(api, "resolve_codex_seat", None)
-            if not callable(resolver):
-                raise DispatchUsageError(
-                    "resume refused: the Codex account resolver does not support "
-                    "effective-account resolution"
-                )
-            try:
-                preflight_home, effective_account = resolver(
-                    str(_project_root(args)), requested, dispatch_id
-                )
-                expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
-                if (
-                    not isinstance(preflight_home, str)
-                    or not isinstance(effective_account, str)
-                    or not preflight_home
-                    or not effective_account
-                    or Path(preflight_home).resolve(strict=False) != expected_home
-                ):
-                    raise ValueError("resolver returned an invalid home or account")
-            except Exception as exc:
-                cleanup_codex_dispatch_home(dispatch_id)
-                raise DispatchUsageError(
-                    f"resume refused: codex account resolver failed for {requested!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            args._capacity_account = effective_account
-            args._codex_resume_pre_resolved = {"home": preflight_home, "account": effective_account}
+            preflight_home = _preflight_codex_resume_account(
+                args,
+                project_root=_project_root(args),
+                dispatch_id=dispatch_id,
+            )
         else:
             _prepare_unpinned_codex_resume(args)
     elif engine == "grok":
@@ -21743,6 +21765,33 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     expected_session_id=engine_session_id,
                     exclude_dispatch_id=args.dispatch_id,
                 )
+        if (
+            resume_plan is None
+            and getattr(args, "parent_dispatch_id", None)
+            and resume_engine == "codex"
+            and getattr(args, "account", None)
+            and getattr(args, "_codex_resume_pre_resolved", None) is None
+        ):
+            parent_record = _find_dispatch_record(args.parent_dispatch_id) or {}
+            parent_account = parent_record.get("effective_account") or parent_record.get(
+                "account"
+            )
+            canonical_home = goalflight_codex_sessions.canonical_account_home(
+                parent_account
+            )
+            recorded_parent_home = parent_record.get("codex_home")
+            source_is_canonical = (
+                canonical_home is not None
+                and isinstance(recorded_parent_home, str)
+                and Path(recorded_parent_home).expanduser() == canonical_home
+            )
+            if not source_is_canonical or args.account != parent_account:
+                codex_dispatch_home = _preflight_codex_resume_account(
+                    args,
+                    project_root=project_root,
+                    dispatch_id=args.dispatch_id,
+                )
+                effective_account = args._capacity_account
         if not goalflight_compat.is_windows():
             controller_claim = _stamp_controller_session(args, project_root)
             if controller_claim.get("reason") in {
