@@ -220,7 +220,8 @@ def test_present_mode_leaves_worker_argv_unchanged(tmp_path: Path) -> None:
 
 def test_launch_wrapper_is_the_only_account_env_call_in_main() -> None:
     source = (SCRIPTS / "goalflight_dispatch.py").read_text(encoding="utf-8")
-    assert source.count("_resolve_launch_account_env(args)") == 3
+    assert "def _resolve_launch_account_env(args)" in source
+    assert "_guard_grok_seat_permission_mode(args, account_env)" in source
     assert "else _resolve_launch_account_env(args)" in source
     assert "account_env = _resolve_launch_account_env(args)" in source
     assert "account_env = _resolve_account_env(args)" in source

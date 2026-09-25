@@ -4296,7 +4296,11 @@ def _refuse_existing_journal_attempt_for_resume(
         ).attempt_for_dispatch(dispatch_id)
     except goalflight_journal.JournalDisappeared:
         return
-    except goalflight_journal.JournalError as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalError,
+    ) as exc:
         raise DispatchUsageError(
             f"resume refused: could not inspect the journal for child dispatch {dispatch_id!r} "
             f"({type(exc).__name__}: {exc})"
@@ -6007,6 +6011,13 @@ def _cmd_resume(argv: list[str]) -> int:
         source = _validate_resume_source(
             args.dispatch_id, reconcile_dead_preclaim=False
         )
+        _validate_resume_worktree_source(
+            args.dispatch_id,
+            source["record"],
+            _resume_worker_cwd(
+                source["record"], override=getattr(args, "cwd", None)
+            ),
+        )
         recorded_label = _resume_recorded_controller_label(source["record"])
         if (
             recorded_label is not None
@@ -6478,6 +6489,46 @@ def _resolve_unpinned_codex_resume(args, dispatch_id: str) -> None:
     )
 
 
+def _preflight_codex_resume_account(
+    args,
+    *,
+    project_root: Path,
+    dispatch_id: str,
+) -> str:
+    requested = str(getattr(args, "account", None) or "").strip() or None
+    if requested is None:
+        raise DispatchUsageError("resume refused: Codex account is missing")
+    try:
+        preflight_home, effective_account = resolve_codex_home(
+            project_root,
+            requested,
+            dispatch_id,
+        )
+        expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
+            strict=False
+        )
+        if (
+            not isinstance(preflight_home, str)
+            or not isinstance(effective_account, str)
+            or not preflight_home
+            or not effective_account
+            or Path(preflight_home).resolve(strict=False) != expected_home
+        ):
+            raise ValueError("resolver returned an invalid home or account")
+    except Exception as exc:
+        cleanup_codex_dispatch_home(dispatch_id)
+        raise DispatchUsageError(
+            f"resume refused: codex account resolver failed for {requested!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    args._capacity_account = effective_account
+    args._codex_resume_pre_resolved = {
+        "home": preflight_home,
+        "account": effective_account,
+    }
+    return preflight_home
+
+
 def _preflight_resume_dispatch(
     source: dict,
     *,
@@ -6516,34 +6567,11 @@ def _preflight_resume_dispatch(
     if engine == "codex":
         requested = str(getattr(args, "account", None) or "").strip() or None
         if requested:
-            api = _codex_seat_api()
-            resolver = getattr(api, "resolve_codex_seat", None)
-            if not callable(resolver):
-                raise DispatchUsageError(
-                    "resume refused: the Codex account resolver does not support "
-                    "effective-account resolution"
-                )
-            try:
-                preflight_home, effective_account = resolver(
-                    str(_project_root(args)), requested, dispatch_id
-                )
-                expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
-                if (
-                    not isinstance(preflight_home, str)
-                    or not isinstance(effective_account, str)
-                    or not preflight_home
-                    or not effective_account
-                    or Path(preflight_home).resolve(strict=False) != expected_home
-                ):
-                    raise ValueError("resolver returned an invalid home or account")
-            except Exception as exc:
-                cleanup_codex_dispatch_home(dispatch_id)
-                raise DispatchUsageError(
-                    f"resume refused: codex account resolver failed for {requested!r}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            args._capacity_account = effective_account
-            args._codex_resume_pre_resolved = {"home": preflight_home, "account": effective_account}
+            preflight_home = _preflight_codex_resume_account(
+                args,
+                project_root=_project_root(args),
+                dispatch_id=dispatch_id,
+            )
         else:
             _prepare_unpinned_codex_resume(args)
     elif engine == "grok":
@@ -21323,6 +21351,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         args._original_argv = list(argv)
         _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
     if args.stats is not None:
+        _emit_launch_wake_notice()
         try:
             payload = goalflight_ledger.stats_payload(args.stats)
         except ValueError as e:
@@ -21731,6 +21760,76 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     expected_session_id=engine_session_id,
                     exclude_dispatch_id=args.dispatch_id,
                 )
+        if (
+            resume_plan is None
+            and getattr(args, "parent_dispatch_id", None)
+            and resume_engine == "codex"
+            and getattr(args, "account", None)
+            and getattr(args, "_codex_resume_pre_resolved", None) is None
+        ):
+            parent_record = _find_dispatch_record(args.parent_dispatch_id) or {}
+            parent_account = parent_record.get("effective_account") or parent_record.get(
+                "account"
+            )
+            canonical_home = goalflight_codex_sessions.canonical_account_home(
+                parent_account
+            )
+            recorded_parent_home = parent_record.get("codex_home")
+            source_is_canonical = (
+                canonical_home is not None
+                and isinstance(recorded_parent_home, str)
+                and Path(recorded_parent_home).expanduser() == canonical_home
+            )
+            if not source_is_canonical or args.account != parent_account:
+                codex_dispatch_home = _preflight_codex_resume_account(
+                    args,
+                    project_root=project_root,
+                    dispatch_id=args.dispatch_id,
+                )
+                effective_account = args._capacity_account
+        if not goalflight_compat.is_windows():
+            controller_claim = _stamp_controller_session(args, project_root)
+            if controller_claim.get("reason") in {
+                "label_in_use",
+                "resume_controller_label_mismatch",
+            }:
+                print(
+                    "goalflight_dispatch: "
+                    + str(
+                        controller_claim.get("message")
+                        or controller_claim.get("reason")
+                    ),
+                    file=sys.stderr,
+                )
+                return 73
+            if controller_claim.get("visible_warning"):
+                print(
+                    "goalflight_dispatch: controller auto-claim unavailable: "
+                    + str(controller_claim.get("reason") or "unknown"),
+                    file=sys.stderr,
+                )
+        registration_warning = _prepare_attempt_controller_registration(args, project_root)
+        if registration_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, registration_warning]
+            worker_stdout_mode = "ab"
+
+        def record_worktree_wait() -> None:
+            nonlocal ledger_recorded
+            if ledger_recorded:
+                return
+            _record_ledger(
+                args,
+                project_root=project_root,
+                prompt_path=None,
+                status_json=status_json,
+                tail=tail,
+                lease_id=lease_id,
+                worker_pid=None,
+                state="waiting_capacity",
+            )
+            ledger_recorded = True
+
+        record_worktree_wait()
         try:
             if lease_id is None:
                 lease_id = _acquire_capacity(
@@ -21761,51 +21860,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 and args.queue_claim_path
             )
             raise
-        if not goalflight_compat.is_windows():
-            controller_claim = _stamp_controller_session(args, project_root)
-            if controller_claim.get("reason") in {
-                "label_in_use",
-                "resume_controller_label_mismatch",
-            }:
-                if lease_id is not None:
-                    _release_capacity(
-                        lease_id, "failed", str(controller_claim.get("reason"))
-                    )
-                print(
-                    "goalflight_dispatch: "
-                    + str(
-                        controller_claim.get("message")
-                        or controller_claim.get("reason")
-                    ),
-                    file=sys.stderr,
-                )
-                return 73
-            if controller_claim.get("visible_warning"):
-                print(
-                    "goalflight_dispatch: controller auto-claim unavailable: "
-                    + str(controller_claim.get("reason") or "unknown"),
-                    file=sys.stderr,
-                )
-        registration_warning = _prepare_attempt_controller_registration(args, project_root)
-        if registration_warning is not None:
-            dispatch_warnings = [*dispatch_warnings, registration_warning]
-            worker_stdout_mode = "ab"
-        def record_worktree_wait() -> None:
-            nonlocal ledger_recorded
-            if ledger_recorded:
-                return
-            _record_ledger(
-                args,
-                project_root=project_root,
-                prompt_path=None,
-                status_json=status_json,
-                tail=tail,
-                lease_id=lease_id,
-                worker_pid=None,
-                state="waiting_capacity",
-            )
-            ledger_recorded = True
-
         args._worktree_wait_callback = record_worktree_wait
         try:
             worktree_seat = _admit_dispatch_worktree(args)
@@ -22109,16 +22163,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         expected_session_id=engine_session_id,
                         exclude_dispatch_id=args.dispatch_id,
                     )
-            _record_ledger(
-                args,
-                project_root=project_root,
-                prompt_path=prompt_path,
-                status_json=status_json,
-                tail=tail,
-                lease_id=lease_id,
-                worker_pid=None,
-                state="waiting_capacity",
-            )
+            record_worktree_wait()
             if (
                 resume_lock_kind == "codex"
                 and _CODEX_RESUME_DURABLE_CLAIM_HOOK is not None
@@ -22744,7 +22789,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             and not detached_launched
             and final_worker_alive is not True
         ):
-            if resume_home_created and not worker_spawn_attempted:
+            if (
+                resume_home_created
+                and getattr(args, "parent_dispatch_id", None)
+                and not worker_spawn_attempted
+            ):
                 owned_home = _codex_dispatch_homes_dir() / str(args.dispatch_id)
                 try:
                     if owned_home.is_symlink():
