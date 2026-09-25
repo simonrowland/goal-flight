@@ -13,11 +13,14 @@ incremented when meaningful skill behaviour changes.
 - Added `/goal-flight traffic` for live workers grouped by model and
   controller, with warnings for sol/astra overuse and a separate unverified
   identity count; `/goal-flight usage` points to it.
+- The installer ensures a usable `rg` is available; doctor reports its path
+  and warns when it is only available inside another tool's private directory.
+- Grok workers now receive `--reasoning-effort`, validated against the models
+  available in the account catalog.
 
 ### Changed
 
 - Read-only reviews reuse worktrees instead of duplicating them. A review first looks for a registered pooled worktree already at the review base with a clean tree and takes a shared hold on it; only when none matches does it fall back to a detached checkout, and that fallback is shared by every read-only dispatch at the same commit. A writer cannot be admitted to a tree a reviewer is holding, and reviewers still share a tree with each other.
-- Detached read-only checkouts are now reclaimed. Aged, clean, unowned checkouts beyond the four newest are removed after a one-hour grace period; a checkout still in use, still inside the grace window, or carrying any uncommitted change is left alone, and a detached HEAD is pinned to a keep ref before removal. Reclamation is triggered by the next read-only allocation in that repository, so a quiet repository is not swept until it is next used and deploying does not reclaim anything on its own.
 - Worktree locks are identified by a durable registration record (device and inode) rather than by pathname, so a lock file replaced underneath an allocator is no longer mistaken for the original. Locks created before the registry existed are adopted into it on the first exclusive open, which is the only moment at which no other holder can be present; until a lock is adopted it is treated as busy rather than reclaimable. Existing installations need no migration and no operator action.
 - Capacity is enforced per provider account as well as per engine pool (codex 30 and grok 50 sessions per account by default; configurable in the machine-local capacity profile). Existing engine-wide reservations migrate to their accounts.
 - Dispatch-ledger status reads recent records and archives old ones instead of rereading full history; liveness probing is combined and retries back off.
@@ -30,6 +33,9 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Worktree safety checks no longer risk an indefinite Git pipe deadlock:
+  dispatcher checks use file-backed stdin and bounded timeouts, fail closed,
+  and report a named reason.
 - `supervise` no longer treats a failed or timed-out process listing as proof that no supervisor is running. The listing budget is raised and bounded with retries, an indeterminate result stays indeterminate, and callers neither arm a second wake pool nor release a live generation's listeners on it. Previously a listing that timed out under load was read as absence, which left controllers running with no wake coverage while reporting healthy.
 - A worktree is reclaimed only when its previous holder is in a terminal ledger state and its worker process is proven gone by process identity (pid plus start token, because pids are reused). Every indeterminate answer retains the worktree instead of reclaiming it: unreadable metadata, an unreadable or empty ledger, an unregistered lock, or a checkout whose presence cannot be confirmed. A checkout that cannot be confirmed present is no longer treated as absent.
 - Account validation runs before any dispatch side effect on every launch path.
