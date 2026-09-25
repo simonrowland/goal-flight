@@ -1033,9 +1033,37 @@ def _registered_lock_identity(
     lock_path: Path, *, registry_root: Path
 ) -> os.stat_result | None:
     payload = _read_lock_registry(registry_root)
-    record = payload["locks"].get(_lock_registry_key(lock_path))
-    if record is None:
+    key = _lock_registry_key(lock_path)
+    record = payload["locks"].get(key)
+    if record is not None:
+        return _registered_stat_from_record(lock_path, record)
+    try:
+        current = os.lstat(lock_path)
+    except FileNotFoundError:
         return None
+    if not stat.S_ISREG(current.st_mode):
+        return None
+    # Legacy label rings can move the registered lock inode from the global
+    # path to a label-local path. A moved inode is still identified by the
+    # durable registration; the pathname is only used to locate that inode.
+    matches = []
+    for registered_path, candidate in payload["locks"].items():
+        if registered_path == key:
+            continue
+        registered = _registered_stat_from_record(Path(registered_path), candidate)
+        if (
+            registered.st_dev == current.st_dev
+            and registered.st_ino == current.st_ino
+        ):
+            matches.append(registered)
+    if matches:
+        return matches[0]
+    return None
+
+
+def _registered_stat_from_record(
+    lock_path: Path, record: object
+) -> os.stat_result:
     if not isinstance(record, dict):
         raise OSError(errno.EIO, f"lock registration entry is invalid: {lock_path}")
     try:
@@ -1518,6 +1546,23 @@ def _lock_metadata(lock_file: TextIO) -> dict:
     except (OSError, ValueError, TypeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _unregistered_lock_metadata(lock_path: Path) -> dict:
+    """Read diagnostic metadata while treating an unregistered lock as busy."""
+    try:
+        fd = _open_lock_path_safely(
+            lock_path,
+            _lock_open_flags() & ~os.O_CREAT,
+            expected_stat=_lock_path_identity(lock_path),
+        )
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock_file:
+            return _lock_metadata(lock_file)
+    except OSError:
+        return {}
 
 
 def _known_lock_dispatch_id(lock_file: TextIO) -> str | None:
@@ -2930,6 +2975,7 @@ def acquire_worktree_seat(
             flags,
             registry_root=registry_root,
             allow_create=True,
+            allow_unregistered=True,
         )
     except OSError as exc:
         raise WorktreeSeatError(
@@ -2996,7 +3042,13 @@ def acquire_worktree_seat(
                     registry_root=registry_root,
                 )
             except OSError:
-                note_capacity_occupant(candidate_path, {})
+                # An unregistered legacy lock cannot be admitted or reclaimed.
+                # Read metadata only for the occupancy report; it still counts
+                # toward the cap and remains fail-closed.
+                note_capacity_occupant(
+                    candidate_path,
+                    _unregistered_lock_metadata(candidate_lock),
+                )
                 continue
             probe_file = os.fdopen(probe_fd, "r+", encoding="utf-8")
             try:
@@ -3364,8 +3416,9 @@ def _open_registered_lock(
     registry_root: Path,
     mode: int = 0o600,
     allow_create: bool = False,
+    allow_unregistered: bool = False,
 ) -> int:
-    """Open only the inode recorded by registration, registering new locks once."""
+    """Open a registered inode, with explicit legacy-lock compatibility."""
     expected_stat = _registered_lock_identity(
         lock_path, registry_root=registry_root
     )
@@ -3376,6 +3429,18 @@ def _open_registered_lock(
             mode,
             expected_stat=expected_stat,
         )
+    if allow_unregistered:
+        # Tolerate locks created before the registry existed. This compatibility
+        # path never writes a registration record; callers must not use it to
+        # reclaim an unregistered pooled seat.
+        legacy_stat = _lock_path_identity(lock_path)
+        if legacy_stat is not None:
+            return _open_lock_path_safely(
+                lock_path,
+                flags & ~os.O_CREAT,
+                mode,
+                expected_stat=legacy_stat,
+            )
     if not allow_create:
         raise OSError(
             errno.EPERM,
@@ -3550,6 +3615,7 @@ def _read_only_allocation_lock(project_root: Path):
         _lock_open_flags(),
         registry_root=_git_common_dir(project_root),
         allow_create=True,
+        allow_unregistered=True,
     )
     lock_file = os.fdopen(fd, "r+", encoding="utf-8")
     try:
@@ -3756,14 +3822,34 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
             f"cannot create occupancy lock directory {lock_path.parent} ({exc})"
         ) from exc
     try:
-        # Generic in-place occupancy locks have no pooled-seat registration
-        # record. Keep their existing safe walk; do not invent a registry
-        # identity that cannot be established independently.
-        lock_fd = _open_lock_path_safely(
-            lock_path,
-            _lock_open_flags(),
-            expected_stat=_lock_path_identity(lock_path),
-        )
+        registry_root = None
+        git_metadata = resolved / ".git"
+        git_backed = git_metadata.is_file() or git_metadata.is_dir()
+        try:
+            registry_root = _git_common_dir(resolved)
+        except WorktreeSeatError as exc:
+            if git_backed:
+                raise WorktreePathLockUnknown(
+                    f"cannot resolve lock registration for Git worktree {resolved}: {exc}"
+                ) from exc
+        # Git-backed trees use the durable lock identity discipline. Existing
+        # pre-registry locks are tolerated without writing a registration;
+        # non-Git trees have no independent registration root and retain the
+        # old fail-closed safe walk.
+        if registry_root is None:
+            lock_fd = _open_lock_path_safely(
+                lock_path,
+                _lock_open_flags(),
+                expected_stat=_lock_path_identity(lock_path),
+            )
+        else:
+            lock_fd = _open_registered_lock(
+                lock_path,
+                _lock_open_flags(),
+                registry_root=registry_root,
+                allow_create=True,
+                allow_unregistered=True,
+            )
     except OSError as exc:
         raise WorktreePathLockUnknown(
             f"cannot open worktree occupancy lock {lock_path}: {exc}"

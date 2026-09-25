@@ -301,6 +301,33 @@ def test_retained_legacy_ring_seat_counts_toward_cap(holder):
     assert (collision / "payload").read_text() == "must survive\n"
 
 
+def test_unregistered_legacy_ring_lock_reports_holder_and_counts_toward_cap(holder):
+    repo, path, _row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+
+    with pytest.raises(pool.WorktreeSeatUnavailable) as caught:
+        pool.acquire_worktree_seat(repo, "next")
+    message = str(caught.value)
+    assert "lock holder: s-1=unknown-dispatch" not in message
+    assert "s-1=old controller=owner state=complete worker exited" in message
+    assert legacy_path.is_dir()
+
+
 def test_ignored_listing_is_scoped_to_each_candidate_seat(tmp_path, monkeypatch):
     monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
     repo = _make_repo(tmp_path)
