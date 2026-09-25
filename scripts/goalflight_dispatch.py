@@ -4296,7 +4296,11 @@ def _refuse_existing_journal_attempt_for_resume(
         ).attempt_for_dispatch(dispatch_id)
     except goalflight_journal.JournalDisappeared:
         return
-    except goalflight_journal.JournalError as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalError,
+    ) as exc:
         raise DispatchUsageError(
             f"resume refused: could not inspect the journal for child dispatch {dispatch_id!r} "
             f"({type(exc).__name__}: {exc})"
