@@ -692,12 +692,14 @@ def test_pool_lock_symlink_swap_is_unknown(
         if info[0] == goalflight_worktree_pool.YES:
             lock_path = info[2]
             assert lock_path is not None
-            replacement = tmp_path / "unrelated.lock"
-            replacement.touch()
-            backup = lock_path.with_name(lock_path.name + ".real")
-            lock_path.rename(backup)
-            lock_path.symlink_to(replacement)
-            swapped.update(lock_path=lock_path, backup=backup)
+            replacement = tmp_path / "unrelated-locks"
+            replacement.mkdir()
+            (replacement / lock_path.name).touch()
+            parent = lock_path.parent
+            backup = parent.with_name(parent.name + ".real")
+            parent.rename(backup)
+            parent.symlink_to(replacement, target_is_directory=True)
+            swapped.update(parent=parent, backup=backup)
         return info
 
     monkeypatch.setattr(
@@ -718,9 +720,8 @@ def test_pool_lock_symlink_swap_is_unknown(
             assert handle is None
             assert error
     finally:
-        lock_path = swapped["lock_path"]
-        lock_path.unlink()
-        swapped["backup"].rename(lock_path)
+        swapped["parent"].unlink()
+        swapped["backup"].rename(swapped["parent"])
 
 
 def test_adhoc_worktree_named_wt_n_is_reclaimable(

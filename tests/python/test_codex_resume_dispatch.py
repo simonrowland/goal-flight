@@ -1842,6 +1842,7 @@ def test_resumed_dispatch_refuses_without_live_controller(
         controller_session_id=None,
         account=None,
         os_sandbox=None,
+        ignore_git_warn=True,
     )
     launch = D._resume_launch_argv(
         source,
@@ -1849,6 +1850,7 @@ def test_resumed_dispatch_refuses_without_live_controller(
         prompt_path=prompt,
         resume_args=resume_args,
     )
+    assert launch.count("--ignore-git-warn") == 1
     args = D._build_launch_parser().parse_args(launch)
     D._stamp_controller_session(args, tmp_path)
 

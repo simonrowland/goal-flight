@@ -64,9 +64,31 @@ def _capacity_module():
     import importlib
 
     os.environ["GOALFLIGHT_STATE_DIR"] = tempfile.mkdtemp(prefix="gf-cap-orphan-")
+    os.environ["GOALFLIGHT_JOURNAL_DIR"] = tempfile.mkdtemp(
+        prefix="gf-cap-orphan-journal-"
+    )
     import goalflight_capacity
 
     return importlib.reload(goalflight_capacity)
+
+
+def _write_waiting_record(
+    dispatch_id: str, claimant_pid: int, token: str | None
+) -> None:
+    import goalflight_ledger
+
+    identity = {"pid": claimant_pid}
+    if token is not None:
+        identity["start_token"] = token
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": dispatch_id,
+            "state": "waiting_capacity",
+            "claimant_pid": claimant_pid,
+            "claimant_identity": identity,
+            "worker_pid": None,
+        }
+    )
 
 
 def _lease(lease_id: str, *, worker, claimant, controller) -> dict:
@@ -211,11 +233,61 @@ def test_aged_unprobeable_claimant_is_not_released_at_any_age() -> None:
     )
 
 
+def test_dead_reserved_claimant_with_waiting_row_is_released_and_retained() -> None:
+    cap = _capacity_module()
+    dead = _reaped_pid()
+    dispatch_id = "reserved-waiting-orphan"
+    token = "recorded-dead-claimant-token"
+    lease = _lease(
+        dispatch_id,
+        worker=None,
+        claimant=dead,
+        controller=None,
+    )
+    lease.update(
+        dispatch_id=dispatch_id,
+        launch_state="reserved",
+        claimant_identity={"pid": dead, "start_token": token},
+    )
+    _write_waiting_record(dispatch_id, dead, token)
+    data = {"leases": {dispatch_id: lease}, "cooldowns": {}}
+
+    check(
+        "dead reserved claimant with waiting ledger row is stale",
+        dispatch_id in {row["lease_id"] for row in cap.stale_active_leases(data)},
+    )
+    missing_token = dict(lease)
+    missing_token["lease_id"] = "reserved-missing-token"
+    missing_token["dispatch_id"] = "reserved-missing-token"
+    missing_token.pop("claimant_identity")
+    data["leases"][missing_token["lease_id"]] = missing_token
+    _write_waiting_record(missing_token["dispatch_id"], dead, None)
+    check(
+        "missing claimant start token stays active",
+        missing_token not in cap.stale_active_leases(data),
+    )
+
+    cap.save_state(data)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.main(["release-stale"])
+    payload = json.loads(output.getvalue())
+    saved = cap.load_state()["leases"]
+    check("release-stale reclaims the proven orphan", dispatch_id in payload["released"])
+    check(
+        "reconciliation retains released lease history",
+        saved[dispatch_id]["state"] == "released"
+        and saved[dispatch_id].get("history_retained") is True,
+    )
+    check("release-stale exits cleanly", rc == 0)
+
+
 def main() -> int:
     test_orphaned_lease_is_stale_while_acquiring_and_working_are_not()
     test_a_live_controller_does_not_change_an_unattached_lease()
     test_unprobeable_claimant_is_not_reclaimed()
     test_aged_unprobeable_claimant_is_not_released_at_any_age()
+    test_dead_reserved_claimant_with_waiting_row_is_released_and_retained()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

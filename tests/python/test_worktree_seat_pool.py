@@ -688,6 +688,33 @@ def test_shared_hold_recheck_uses_bounded_git_timeout(
         assert status_timeouts == [goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S]
 
 
+def test_shared_hold_rejects_parent_lock_symlink(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink race test requires POSIX links")
+    repo = make_repo(tmp_path)
+    base = add_read_only_base(repo, 0)
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "writer-parent-lock-race", base=base
+    )
+    seat = writer.path
+    finish_seat_holder(writer)
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    parent = lock_path.parent
+    backup = parent.with_name(parent.name + ".real")
+    replacement = tmp_path / "unrelated-locks"
+    replacement.mkdir()
+    (replacement / lock_path.name).touch()
+    parent.rename(backup)
+    parent.symlink_to(replacement, target_is_directory=True)
+    try:
+        assert goalflight_worktree_pool._try_acquire_shared_read_only_seat(
+            repo, seat, base, "review-parent-lock-race"
+        ) is None
+    finally:
+        parent.unlink()
+        backup.rename(parent)
+
+
 def test_two_read_only_reviews_share_one_seat_and_release_on_crash() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         root = Path(td)

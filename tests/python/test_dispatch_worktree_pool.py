@@ -66,6 +66,37 @@ def _make_repo(root: Path) -> Path:
     return repo
 
 
+def _write_terminal_seat_record(
+    dispatch_id: str,
+    repo: Path,
+    seat: Path,
+    *,
+    parent_dispatch_id: str | None = None,
+) -> None:
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "agent": "codex",
+        "engine": "codex",
+        "state": "complete",
+        "terminal_state": "complete",
+        "worker_pid": 2147483647,
+        "worker_identity": {
+            "pid": 2147483647,
+            "start_token": "exited-test-worker",
+        },
+        "project_root": str(repo),
+        "worker_cwd": str(seat),
+        "worktree_id": seat.name,
+        "worktree_path": str(seat),
+        "worktree_branch": _git(seat, "rev-parse", "--abbrev-ref", "HEAD"),
+        "worktree_head": _git(seat, "rev-parse", "HEAD"),
+    }
+    if parent_dispatch_id:
+        record["parent_dispatch_id"] = parent_dispatch_id
+    goalflight_ledger.write_record(record)
+
+
 def _env(tmp: Path, *, seats: int) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
@@ -736,6 +767,15 @@ def test_read_only_resume_records_and_touches_checkout_before_waiting(
     checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
         repo, base=base
     )
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-parent",
+            "state": "blocked",
+            "worker_cwd": str(checkout),
+            "worktree_path": str(checkout),
+            "worktree_base": base,
+        }
+    )
     old_ns = 1_000_000_000
     os.utime(checkout, ns=(old_ns, old_ns))
     args = SimpleNamespace(
@@ -764,6 +804,15 @@ def test_read_only_resume_rejects_dirty_fallback_before_binding(
     checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
         repo, base=base
     )
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-parent",
+            "state": "blocked",
+            "worker_cwd": str(checkout),
+            "worktree_path": str(checkout),
+            "worktree_base": base,
+        }
+    )
     dirty_file = checkout / "resume-dirty.txt"
     dirty_file.write_text("keep me\n", encoding="utf-8")
     args = SimpleNamespace(
@@ -785,6 +834,39 @@ def test_read_only_resume_rejects_dirty_fallback_before_binding(
     assert not hasattr(args, "_worktree_path")
 
 
+def test_read_only_resume_rejects_missing_recorded_base(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
+        repo, base=base
+    )
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-legacy-parent",
+            "state": "blocked",
+            "worker_cwd": str(checkout),
+            "worktree_path": str(checkout),
+        }
+    )
+    args = SimpleNamespace(
+        parent_dispatch_id="readonly-legacy-parent",
+        dispatch_id="readonly-child",
+        agent="codex",
+        shape="bash",
+        read_only=True,
+        cwd=str(checkout),
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="without a resolvable review base",
+    ):
+        goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+    assert not hasattr(args, "_worktree_path")
+
+
 def test_read_only_resume_touches_checkout_under_allocation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -792,6 +874,15 @@ def test_read_only_resume_touches_checkout_under_allocation_lock(
     base = _git(repo, "rev-parse", "HEAD")
     checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
         repo, base=base
+    )
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "readonly-parent",
+            "state": "blocked",
+            "worker_cwd": str(checkout),
+            "worktree_path": str(checkout),
+            "worktree_base": base,
+        }
     )
     held: list[bool] = []
     real_lock = goalflight_worktree_pool._read_only_allocation_lock
@@ -1200,23 +1291,245 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         }
     )
     try:
+        args.capacity_wait_s = 600
+        started = time.monotonic()
         with pytest.raises(
-            goalflight_worktree_pool.WorktreeSeatUnavailable,
-            match=r"(?=.*1/1 worktrees busy)(?=.*s-1=reclaimer)(?=.*worker identity unknown)",
+            goalflight_worktree_pool.WorktreeSeatReclaimed,
+            match=(
+                r"resume refused: worktree s-1 was reclaimed by reclaimer; "
+                r"expected recorded holder resume-parent"
+            ),
         ):
-            goalflight_dispatch._bind_dispatch_worktree(args)
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        assert time.monotonic() - started < 1
     finally:
         reclaimer.release()
 
     record_finished_holder("reclaimer")
-    resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+    started = time.monotonic()
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatReclaimed,
+        match=(
+            r"resume refused: worktree s-1 was reclaimed by reclaimer; "
+            r"expected recorded holder resume-parent"
+        ),
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+    assert time.monotonic() - started < 1
+
+
+def test_resume_reuses_terminal_prior_resume_in_same_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    finish_seat_holder(parent)
+    _write_terminal_seat_record("resume-parent", repo, seat)
+
+    first_resume = goalflight_worktree_pool.acquire_worktree_seat(
+        repo,
+        "resume-one",
+        occupy_path=seat,
+        reset=False,
+        expected_prior_dispatch_id="resume-parent",
+    )
+    first_resume.release()
+    _write_terminal_seat_record(
+        "resume-one", repo, seat, parent_dispatch_id="resume-parent"
+    )
+
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-two",
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+        capacity_wait_s=600,
+    )
+    started = time.monotonic()
+    resumed = goalflight_dispatch._admit_dispatch_worktree(args)
     try:
+        assert resumed is not None
         assert resumed.path == seat
-        assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == (
-            "worktree/resume-parent"
-        )
+        assert time.monotonic() - started < 1
     finally:
-        resumed.release()
+        if resumed is not None:
+            resumed.release()
+
+
+def test_resume_refuses_unresolvable_terminal_holder_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    finish_seat_holder(parent)
+    _write_terminal_seat_record("resume-parent", repo, seat)
+    unresolved = goalflight_worktree_pool.acquire_worktree_seat(repo, "missing-row")
+    unresolved.release()
+
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+        capacity_wait_s=600,
+    )
+    started = time.monotonic()
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatReclaimed,
+        match=r"reclaimed by missing-row; expected recorded holder resume-parent",
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert time.monotonic() - started < 1
+
+
+def test_resume_never_steals_live_holder_in_same_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    finish_seat_holder(parent)
+    _write_terminal_seat_record("resume-parent", repo, seat)
+    live = goalflight_worktree_pool.acquire_worktree_seat(
+        repo,
+        "resume-one",
+        occupy_path=seat,
+        reset=False,
+        expected_prior_dispatch_id="resume-parent",
+    )
+    identity = goalflight_worktree_pool.goalflight_compat.process_start_identity(
+        os.getpid()
+    )
+    assert identity and identity.get("start_token")
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-one",
+            "parent_dispatch_id": "resume-parent",
+            "state": "running",
+            "project_root": str(repo),
+            "worker_pid": os.getpid(),
+            "worker_identity": identity,
+            "worker_cwd": str(seat),
+            "worktree_path": str(seat),
+            "worktree_id": seat.name,
+            "worktree_branch": _git(seat, "rev-parse", "--abbrev-ref", "HEAD"),
+            "worktree_head": _git(seat, "rev-parse", "HEAD"),
+        }
+    )
+
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-two",
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+        capacity_wait_s=600,
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeSeatReclaimed,
+            match=r"reclaimed by resume-one; expected recorded holder resume-parent",
+        ):
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        assert time.monotonic() - started < 1
+    finally:
+        live.release()
+
+
+def test_worktree_wait_announces_retry_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = SimpleNamespace(
+        cwd=str(tmp_path / "s-1"),
+        parent_dispatch_id="expected-parent",
+        worktree_pin_holder=None,
+        capacity_wait_s=1,
+        tail=str(tmp_path / "dispatch.tail"),
+        dispatch_warnings=[],
+        _worktree_occupancy_checked_path=str((tmp_path / "s-1").resolve()),
+        _worktree_occupancy_warning=None,
+        _worktree_seat=None,
+    )
+    attempts = 0
+
+    def bind(_args):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                "worktree s-1 is held: s-1=current-holder"
+            )
+        return None
+
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", bind)
+    monkeypatch.setattr(goalflight_dispatch.time, "sleep", lambda _seconds: None)
+
+    assert goalflight_dispatch._admit_dispatch_worktree(args) is None
+    notice = capsys.readouterr().err
+    assert "waiting for worktree seat s-1" in notice
+    assert "current_holder=current-holder" in notice
+    assert "expected_holder=expected-parent" in notice
+    assert "deadline=" in notice
+    assert "waiting for worktree seat s-1" in (
+        tmp_path / "dispatch.tail"
+    ).read_text(encoding="utf-8")
+
+
+def test_capacity_lease_signal_guard_releases_on_operator_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed: dict[int, object] = {}
+    signal_calls: list[tuple[int, object]] = []
+    released: list[tuple[str, str, str]] = []
+
+    def fake_signal(signum: int, handler: object) -> object:
+        signal_calls.append((signum, handler))
+        installed.setdefault(signum, handler)
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(goalflight_dispatch.signal, "signal", fake_signal)
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_release_capacity",
+        lambda lease_id, state, reason: released.append((lease_id, state, reason)),
+    )
+
+    restore = goalflight_dispatch._install_capacity_lease_signal_guard("lease-1")
+    assert restore is not None
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        with pytest.raises(SystemExit) as exc_info:
+            installed[signum](signum, None)
+        assert exc_info.value.code == 128 + signum
+
+    assert released == [
+        ("lease-1", "failed", "signal-SIGTERM"),
+        ("lease-1", "failed", "signal-SIGINT"),
+    ]
+    restore()
+    assert len(signal_calls) == 4
 
 
 def test_resume_unknown_lock_refuses_before_replacement(
@@ -1742,7 +2055,7 @@ def test_resume_recycled_dirty_state_uses_reclaim_owner(
         reclaimer.release()
 
 
-def test_resume_recycled_dirty_state_finds_archived_reclaimer(
+def test_resume_recycled_dirty_state_with_unresolved_reclaimer_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
@@ -1757,8 +2070,6 @@ def test_resume_recycled_dirty_state_finds_archived_reclaimer(
     record_finished_holder("resume-parent")
 
     reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
-    assert reclaimer.quarantine_branch
-    recovery_ref = reclaimer.quarantine_branch
     reclaimer.release()
     # Simulate a crash after the reclaim ref was published but before the
     # reclaimer could publish its ledger row.
@@ -1791,11 +2102,16 @@ def test_resume_recycled_dirty_state_finds_archived_reclaimer(
         _worktree_seat=None,
     )
 
+    started = time.monotonic()
     with pytest.raises(
-        goalflight_worktree_pool.WorktreeCwdRefused,
-        match=recovery_ref,
+        goalflight_worktree_pool.WorktreeSeatReclaimed,
+        match=(
+            r"resume refused: worktree s-1 was reclaimed by reclaimer; "
+            r"expected recorded holder resume-parent"
+        ),
     ):
         goalflight_dispatch._bind_dispatch_worktree(args)
+    assert time.monotonic() - started < 1
 
 
 def test_resume_reseats_when_recorded_worktree_checkout_is_missing(

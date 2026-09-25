@@ -612,7 +612,7 @@ def _open_validated_pool_lock(
         flags |= os.O_NOFOLLOW
     fd: int | None = None
     try:
-        fd = os.open(lock_path, flags)
+        fd = goalflight_worktree_pool._open_lock_path_safely(lock_path, flags)
         opened_stat = os.fstat(fd)
     except OSError as exc:
         if fd is not None:

@@ -105,6 +105,23 @@ class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured worktree is held."""
 
 
+class WorktreeSeatReclaimed(WorktreeSeatUnavailable):
+    """Raised when a resume's recorded seat belongs to another dispatch."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_holder: str | None = None,
+        expected_holder: str | None = None,
+        terminal_reclaimed: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.current_holder = current_holder
+        self.expected_holder = expected_holder
+        self.terminal_reclaimed = terminal_reclaimed
+
+
 class WorktreeSeatResetRefused(WorktreeSeatError):
     """Raised when resetting a free worktree would lose unique or undetermined work."""
 
@@ -1219,7 +1236,7 @@ def _try_acquire_shared_read_only_seat(
     try:
         lock_path = worktree_lock_path_for_path(project_root, path)
         flags = _lock_open_flags() & ~os.O_CREAT
-        lock_fd = os.open(lock_path, flags, 0o600)
+        lock_fd = _open_lock_path_safely(lock_path, flags)
     except (OSError, WorktreeSeatError):
         return None
     lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
@@ -1439,6 +1456,20 @@ def _holder_record(dispatch_id: str) -> tuple[dict, bool | None]:
     if identity.get("pid", pid) != pid:
         return record, None
     return record, goalflight_compat.process_identity_matches(pid, token)
+
+
+def _holder_is_terminal_or_unresolvable(dispatch_id: str) -> bool:
+    """Return whether a different unlocked holder cannot resolve transiently."""
+    record, live = _holder_record(dispatch_id)
+    if not record or live is None:
+        return True
+    if live is True:
+        return False
+    state = str(record.get("state") or "")
+    terminal = goalflight_ledger.terminal_state_for(
+        state, record.get("reason") or record.get("error")
+    )
+    return state == "cancelled" or terminal not in {"", "unknown", "watcher_stopped"}
 
 
 def _holder_description(name: str, metadata: dict) -> str:
@@ -2414,11 +2445,21 @@ def _quarantine_dirty_worktree(
 
 def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
     """Exclude writers using the path lock before any checkout or reset."""
+    expected = kwargs.pop("expected_prior_dispatch_id", None)
     path = kwargs["worktree_path"]
     if path.exists() and kwargs["reset"]:
         try:
             occupancy = try_acquire_worktree_path_lock(path, kwargs["dispatch_id"])
         except (WorktreePathLockBusy, WorktreePathLockUnknown) as exc:
+            occupant = getattr(exc, "occupant_id", None)
+            if expected is not None and occupant is not None and occupant != expected:
+                raise WorktreeSeatReclaimed(
+                    f"resume refused: worktree {path.name} was reclaimed by "
+                    f"{occupant}; expected recorded holder {expected}; "
+                    "refusing to reset or recreate it",
+                    current_holder=occupant,
+                    expected_holder=expected,
+                ) from exc
             raise WorktreeSeatUnavailable(str(exc)) from exc
         with occupancy:
             return _prepare_claimed_seat_locked(**kwargs)
@@ -2715,6 +2756,7 @@ def acquire_worktree_seat(
     reset: bool = True,
     occupy_path: Path | None = None,
     expected_prior_dispatch_id: str | None = None,
+    allowed_prior_dispatch_ids: frozenset[str] | set[str] | None = None,
     capacity_deadline: float | None = None,
     before_reset: Callable[[Path], None] | None = None,
 ) -> WorktreeSeatLease:
@@ -2891,7 +2933,20 @@ def acquire_worktree_seat(
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 occupant = _occupant_description(lock_file, seat_name)
+                current_holder = _known_lock_dispatch_id(lock_file)
                 lock_file.close()
+                if (
+                    expected_prior_dispatch_id is not None
+                    and current_holder is not None
+                    and current_holder != expected_prior_dispatch_id
+                ):
+                    raise WorktreeSeatReclaimed(
+                        f"resume refused: worktree {seat_name} was reclaimed by "
+                        f"{current_holder}; expected recorded holder "
+                        f"{expected_prior_dispatch_id}; refusing to reset or recreate it",
+                        current_holder=current_holder,
+                        expected_holder=expected_prior_dispatch_id,
+                    )
                 raise WorktreeSeatUnavailable(
                     f"worktree {seat_name} is held: {occupant}; "
                     "refusing to git worktree add a new unmanaged path"
@@ -2910,11 +2965,20 @@ def acquire_worktree_seat(
                     expected_prior_dispatch_id is not None
                     and prior_dispatch_id != expected_prior_dispatch_id
                 ):
-                    raise WorktreeSeatUnavailable(
-                        f"resume refused: worktree {seat_name} was reclaimed by "
-                        f"{prior_dispatch_id}; expected recorded holder "
-                        f"{expected_prior_dispatch_id}; refusing to reset or recreate it"
-                    )
+                    allowed = allowed_prior_dispatch_ids or set()
+                    if prior_dispatch_id not in allowed:
+                        terminal_reclaimed = (
+                            prior_dispatch_id is not None
+                            and _holder_is_terminal_or_unresolvable(prior_dispatch_id)
+                        )
+                        raise WorktreeSeatReclaimed(
+                            f"resume refused: worktree {seat_name} was reclaimed by "
+                            f"{prior_dispatch_id}; expected recorded holder "
+                            f"{expected_prior_dispatch_id}; refusing to reset or recreate it",
+                            current_holder=prior_dispatch_id,
+                            expected_holder=expected_prior_dispatch_id,
+                            terminal_reclaimed=terminal_reclaimed,
+                        )
                 release_allocation_lock()
                 return _prepare_claimed_seat(
                     project_root=project_root,
@@ -2926,6 +2990,7 @@ def acquire_worktree_seat(
                     branch=branch,
                     base_commit=base_commit,
                     reset=reset,
+                    expected_prior_dispatch_id=expected_prior_dispatch_id,
                     controller_label=label,
                     before_reset=before_reset,
                 )
@@ -3128,6 +3193,40 @@ def _lock_open_flags() -> int:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
+
+
+def _open_lock_path_safely(
+    lock_path: Path, flags: int, mode: int = 0o600
+) -> int:
+    """Open a lock only after safely walking every parent directory.
+
+    ``O_NOFOLLOW`` protects the final component, not a parent replaced between
+    registration and open. Walking from the filesystem root with directory
+    descriptors makes each parent an opened, non-symlink directory and keeps
+    the final open relative to that verified chain.
+    """
+    path = Path(lock_path)
+    if not path.is_absolute():
+        raise OSError(errno.EINVAL, f"lock path must be absolute: {path}")
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(errno.ENOTSUP, "safe lock directory open is unavailable")
+    if os.open not in getattr(os, "supports_dir_fd", set()):
+        raise OSError(errno.ENOTSUP, "openat-style lock open is unavailable")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    parts = path.parts
+    if len(parts) < 2:
+        raise OSError(errno.EINVAL, f"lock path has no parent: {path}")
+    parent_fd = os.open(path.anchor, directory_flags)
+    try:
+        for component in parts[1:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return os.open(parts[-1], flags, mode, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _verify_read_only_root(root: Path) -> None:
