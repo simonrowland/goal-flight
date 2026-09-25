@@ -150,6 +150,23 @@ def test_macos_codex_acp_read_only_uses_shared_checkout() -> None:
         assert cfg.worktree == "shared-read-only"
 
 
+def test_macos_codex_acp_read_only_in_place_uses_project_root() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="codex-ro-in-place")
+        args.read_only = True
+        args.in_place = True
+        args.worker = []
+        args.shape = "acp"
+        with patch.object(goalflight_acp_run.goalflight_compat, "is_macos", return_value=True):
+            assert goalflight_acp_run.acp_permission_read_only_supported("codex-acp")
+            cfg = dispatch_mod._build_acp_cfg(
+                args, status_json=tmp / "codex-ro-in-place.json"
+            )
+        assert cfg.worktree == "off"
+        assert cfg.cwd == str(tmp)
+
+
 def test_read_only_acp_resume_rejects_rebound_checkout_before_spawn() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

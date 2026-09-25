@@ -74,20 +74,35 @@ def _merge_into_main(repo: Path, branch: str) -> None:
     _git(repo, "merge", "-q", "--ff-only", branch)
 
 
-def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path, **extra: object) -> None:
+def _add_read_only_checkout(repo: Path, index: int) -> Path:
+    _commit_in(repo, f"read-only-base-{index}.txt")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    path, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+    os.utime(path, (1, 1))
+    return path
+
+
+def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path | None, **extra: object) -> None:
     runs = goalflight_ledger.runs_dir(create=True)
     record = {
         "dispatch_id": dispatch_id,
         "state": state,
-        "worker_cwd": str(worker_cwd),
-        "project_root": str(worker_cwd),
     }
+    if worker_cwd is not None:
+        record["worker_cwd"] = str(worker_cwd)
+        record["project_root"] = str(worker_cwd)
     record.update(extra)
     name = goalflight_compat.safe_dispatch_filename(dispatch_id)
     (runs / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
-def _run(repo_arg: Path, *extra: str) -> tuple[subprocess.CompletedProcess[str], dict]:
+def _run(
+    repo_arg: Path, *extra: str, seed_terminal: bool = True
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    if seed_terminal and not goalflight_ledger.runs_dir(create=False).exists():
+        _write_ledger("test-terminal-ledger-row", "complete", None)
     done = subprocess.run(
         [sys.executable, str(SCRIPT), str(repo_arg), "--json", *extra],
         capture_output=True, text=True,
@@ -324,6 +339,24 @@ def test_unreadable_ledger_retains_as_unknown_not_as_unowned(
     assert "non-terminal dispatch" not in unowned["reason"]
 
 
+@pytest.mark.parametrize("ledger_state", ["absent", "empty"])
+def test_missing_or_empty_ledger_retains_as_unknown(
+    repo: Path, ledger_state: str
+) -> None:
+    wt = _add_read_only_checkout(repo, 7)
+    runs = goalflight_ledger.runs_dir(create=False)
+    if ledger_state == "empty":
+        runs.mkdir(parents=True)
+
+    _done, report = _run(repo, seed_terminal=False)
+
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    unowned = entry["conditions"]["unowned"]
+    assert unowned["verdict"] == "unknown", entry
+    assert "unreadable or empty" in unowned["reason"]
+
+
 def test_detached_head_is_unknown_and_retained(tmp_path: Path, repo: Path) -> None:
     """Detached HEAD: merge state cannot be evaluated, and unknown retains."""
     wt = tmp_path / "detached"
@@ -333,6 +366,281 @@ def test_detached_head_is_unknown_and_retained(tmp_path: Path, repo: Path) -> No
     entry = _entry(report, wt)
     assert entry["decision"] == "retain", entry
     assert entry["conditions"]["merged"]["verdict"] == "unknown"
+
+
+def test_read_only_checkout_is_gc_candidate_without_merge_condition(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 1)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["read_only"] is True, entry
+    assert entry["decision"] == "remove", entry
+    assert "merged" not in entry["conditions"], entry
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["outcome"] == "removed", entry
+    assert not wt.exists()
+    assert os.path.realpath(wt) not in _worktree_paths(repo)
+
+
+def test_read_only_gc_retains_checkout_inside_grace_window(repo: Path) -> None:
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    wt, _ = goalflight_worktree_pool.shared_read_only_worktree(repo, base=base)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["grace"]["verdict"] == "no", entry
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert wt.is_dir()
+
+
+def test_read_only_gc_uses_recorded_worktree_path_for_ownership(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 2)
+    _write_ledger(
+        "readonly-worktree-path-owner",
+        "running",
+        None,
+        worktree_path=str(wt),
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+    assert "readonly-worktree-path-owner" in entry["conditions"]["unowned"]["reason"]
+
+
+@pytest.mark.parametrize("record_fields", [{}, {"worker_cwd": "relative/missing"}])
+def test_read_only_gc_retains_for_incomplete_nonterminal_ledger_row(
+    tmp_path: Path, repo: Path, record_fields: dict[str, str]
+) -> None:
+    wt = _add_read_only_checkout(repo, 3)
+    worker_cwd = (
+        Path(record_fields["worker_cwd"])
+        if "worker_cwd" in record_fields
+        else None
+    )
+    _write_ledger("readonly-incomplete-owner", "running", worker_cwd)
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+    assert "no usable worker_cwd" in entry["conditions"]["unowned"]["reason"]
+
+
+def test_read_only_gc_matches_case_variant_ledger_path(
+    tmp_path: Path, repo: Path
+) -> None:
+    wt = _add_read_only_checkout(repo, 4)
+    _write_ledger(
+        "readonly-case-owner",
+        "running",
+        Path(str(wt).swapcase()),
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+
+
+def test_read_only_gc_retains_conflicting_nonterminal_ledger_state(
+    repo: Path,
+) -> None:
+    wt = _add_read_only_checkout(repo, 6)
+    _write_ledger(
+        "readonly-conflicting-state",
+        "running",
+        None,
+        terminal_state="complete",
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+
+
+def test_read_only_gc_holds_allocator_lock_across_remove_recheck(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 5)
+    _done, report = _run(repo)
+    current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+    observed: dict[str, bool] = {}
+
+    def remove_without_touching_tree(_repo: Path, _path: str) -> tuple[bool, str]:
+        lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+        try:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                observed["held"] = True
+            else:
+                observed["held"] = False
+        finally:
+            handle.close()
+        return True, ""
+
+    monkeypatch.setattr(goalflight_worktree_gc, "_remove_worktree", remove_without_touching_tree)
+    goalflight_worktree_gc.apply_removals(
+        repo,
+        report["entries"],
+        into="main",
+        ledger_dir=goalflight_ledger.runs_dir(create=False),
+        main_path=goalflight_worktree_gc.main_worktree_path(repo),
+        current_checkout=current_checkout,
+        current_error=current_error,
+    )
+    assert observed == {"held": True}
+    assert wt.is_dir()
+
+
+def test_read_only_gc_rejects_replaced_allocation_lock_identity(
+    repo: Path
+) -> None:
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        pass
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    parent = lock_path.parent
+    backup = parent.with_name(parent.name + ".real")
+    parent.rename(backup)
+    parent.mkdir()
+    (parent / lock_path.name).touch()
+    try:
+        handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(repo)
+        if handle is not None:
+            handle.close()
+        assert handle is None
+        assert error and "identity" in error
+    finally:
+        (parent / lock_path.name).unlink()
+        parent.rmdir()
+        backup.rename(parent)
+
+
+def test_read_only_gc_rejects_replaced_unregistered_allocation_lock(
+    repo: Path,
+) -> None:
+    import fcntl
+
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    parent = lock_path.parent
+    parent.mkdir(parents=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    held = os.fdopen(fd, "r+", encoding="utf-8")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+    # The allocator adopts the original pre-registry inode while holding it.
+    # GC must then reject the replacement rather than trust the new path leaf.
+    goalflight_worktree_pool._adopt_exclusive_lock(
+        lock_path,
+        held.fileno(),
+        registry_root=goalflight_worktree_pool._git_common_dir(repo),
+    )
+    backup = parent.with_name(parent.name + ".real")
+    parent.rename(backup)
+    parent.mkdir()
+    lock_path.touch()
+    try:
+        handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(repo)
+        if handle is not None:
+            handle.close()
+        assert handle is None
+        assert error and "registered" in error
+    finally:
+        lock_path.unlink()
+        parent.rmdir()
+        backup.rename(parent)
+        held.close()
+
+
+def test_read_only_gc_adopts_pre_registry_lock_on_first_run(repo: Path) -> None:
+    root = repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
+    candidate = root / "host-state"
+    root.mkdir(parents=True)
+    _git(repo, "worktree", "add", "-q", "--detach", str(candidate), "HEAD")
+    os.utime(candidate, (1, 1))
+
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.touch()
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    if registry_path.exists():
+        registry_path.unlink()
+
+    _done, report = _run(repo, "--apply")
+    entry = _entry(report, candidate)
+    assert entry["outcome"] == "removed", entry
+    assert "changed_before_remove" not in json.dumps(entry)
+    assert not candidate.exists()
+    assert registry_path.exists()
+
+
+def test_exclusive_open_adopts_pre_registry_lock_and_reuses_identity(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    lock_path.parent.mkdir(parents=True)
+    lock_path.touch()
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    if registry_path.exists():
+        registry_path.unlink()
+
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        record = payload["locks"][goalflight_worktree_pool._lock_registry_key(lock_path)]
+        identity = os.stat(lock_path)
+        assert record == {"st_dev": identity.st_dev, "st_ino": identity.st_ino}
+
+    def compatibility_path_must_not_run(_path: Path):
+        pytest.fail("second open used the unregistered compatibility path")
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_lock_path_identity", compatibility_path_must_not_run
+    )
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        pass
+
+
+def test_read_only_root_symlink_cannot_reap_pool_seat(
+    tmp_path: Path, repo: Path
+) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink safety test requires POSIX links")
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "symlink-seat")
+    seat = lease.path
+    lease.release()
+    root = repo / "worktrees" / goalflight_worktree_pool.READ_ONLY_WORKTREE_DIR
+    root.symlink_to(repo / "worktrees", target_is_directory=True)
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatError):
+        goalflight_worktree_pool.shared_read_only_worktree(repo)
+    goalflight_worktree_pool._reap_read_only_worktrees(
+        repo, root=root, requested_path=root / "requested"
+    )
+    assert seat.is_dir()
 
 
 # --------------------------------------------------------------------------
@@ -422,6 +730,7 @@ def test_report_only_is_default_and_prints_retention_reasons(
     _merge_into_main(repo, "sweepable")
     kept = _add_worktree(repo, tmp_path, "kept")
     _commit_in(kept, "other.txt")  # unmerged
+    _write_ledger("test-terminal-ledger-row", "complete", None)
 
     done = subprocess.run(
         [sys.executable, str(SCRIPT), str(repo)],
@@ -471,6 +780,57 @@ def test_registered_pool_worktree_is_reclaimed_only_after_full_gate(
     assert entry.get("keep_ref", "").startswith("refs/goalflight/keep/")
     assert not wt.is_dir()
     assert os.path.realpath(wt) not in _worktree_paths(repo)
+
+
+def test_gc_revalidates_held_pool_lock_identity(
+    tmp_path: Path, repo: Path
+) -> None:
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "held-lock-owner")
+    seat = lease.path
+    lease.release()
+    held, error = goalflight_worktree_gc._acquire_pool_action_lock(repo, str(seat))
+    assert held is not None, error
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    parent = lock_path.parent
+    backup = parent.with_name(parent.name + ".real")
+    parent.rename(backup)
+    parent.mkdir()
+    (parent / lock_path.name).touch()
+    try:
+        result = goalflight_worktree_gc.check_pool_unlocked(
+            repo, str(seat), held_lock=held
+        )
+        assert result["verdict"] == goalflight_worktree_gc.UNKNOWN, result
+    finally:
+        held.close()
+        (parent / lock_path.name).unlink()
+        parent.rmdir()
+        backup.rename(parent)
+
+
+def test_gc_unregistered_pool_lock_requires_action_exclusion(
+    repo: Path,
+) -> None:
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "unregistered-gc")
+    seat = lease.path
+    lease.release()
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["locks"].pop(
+        goalflight_worktree_pool._lock_registry_key(lock_path), None
+    )
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    handle, error = goalflight_worktree_gc._acquire_pool_action_lock(
+        repo, str(seat)
+    )
+    if handle is not None:
+        handle.close()
+    assert handle is None
+    assert error and "action lock unavailable" in error
 
 
 def test_adhoc_worktree_named_wt_n_is_reclaimable(

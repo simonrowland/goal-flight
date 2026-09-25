@@ -821,6 +821,64 @@ def _pid_generation_matches(pid: object, lease: dict) -> bool | None:
     return current_token == expected_token
 
 
+def _prelaunch_claimant_liveness(
+    lease: dict, record: dict | None,
+) -> str | None:
+    """Classify a reserved claimant only with pid and start-token evidence."""
+    view = dict(lease)
+    if view.get("claimant_pid") is None and record:
+        view["claimant_pid"] = record.get("claimant_pid")
+    claimant_identity = view.get("claimant_identity")
+    if (
+        not isinstance(claimant_identity, dict)
+        or not claimant_identity.get("start_token")
+    ) and record:
+        record_identity = record.get("claimant_identity")
+        if isinstance(record_identity, dict):
+            view["claimant_identity"] = record_identity
+    try:
+        raw_pid = view.get("claimant_pid")
+        if isinstance(raw_pid, bool):
+            return None
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    expected = view.get("claimant_identity")
+    if not isinstance(expected, dict) or not expected.get("start_token"):
+        return None
+    expected_pid = expected.get("pid", pid)
+    if isinstance(expected_pid, bool):
+        return None
+    try:
+        if int(expected_pid) != pid:
+            return None
+    except (TypeError, ValueError):
+        return None
+    live = _probe_pid_liveness(pid)
+    if live is False:
+        return "dead"
+    if live is None:
+        return None
+    current = _process_start_identity(pid)
+    current_token = current.get("start_token") if current else None
+    if not current_token:
+        return None
+    return "live" if current_token == expected.get("start_token") else "dead"
+
+
+def _reclaimable_prelaunch_lease(lease: dict, record: dict | None) -> bool:
+    """Prove a reserved, no-worker waiting row lost its claimant."""
+    if lease.get("launch_state") != "reserved" or lease.get("worker_pid") is not None:
+        return False
+    if not isinstance(record, dict) or record.get("state") != "waiting_capacity":
+        return False
+    if record.get("worker_pid") is not None:
+        return False
+    return _prelaunch_claimant_liveness(lease, record) == "dead"
+
+
 def _worker_lease_view(lease: dict, record: dict | None = None) -> dict:
     """Combine capacity and ledger worker identity without controller fallbacks."""
     worker = dict(lease)
@@ -2053,6 +2111,9 @@ def stale_active_leases(data: dict) -> list[dict]:
         if record:
             import goalflight_ledger
 
+            if _reclaimable_prelaunch_lease(lease, record):
+                stale.append(lease)
+                continue
             if (goalflight_ledger._terminal_key(record) in dispatch_states.TERMINAL_STATES
                     and _terminal_worker_gone(lease, record)):
                 stale.append(lease)
@@ -2083,6 +2144,7 @@ def _reclaim_active_leases(
     *,
     state: str,
     reason: str,
+    preserve_history_ids: set[str] | None = None,
 ) -> list[str]:
     """Mark already-classified stale leases terminal in the supplied view."""
     released: list[str] = []
@@ -2093,9 +2155,14 @@ def _reclaim_active_leases(
         entry = data.get("leases", {}).get(lease_id)
         if not entry or entry.get("state") != "active":
             continue
-        entry["state"] = state
+        if str(lease_id) in (preserve_history_ids or set()):
+            entry["state"] = "released"
+            entry["reason"] = "orphaned_prelaunch_claimant"
+            entry["history_retained"] = True
+        else:
+            entry["state"] = state
+            entry["reason"] = reason
         entry["released_at"] = iso()
-        entry["reason"] = reason
         released.append(str(lease_id))
     return released
 
@@ -2109,6 +2176,14 @@ def reclaim_stale_leases(
 ) -> list[str]:
     """Reclaim provably stale holders without treating unknown as dead."""
     candidates = list(stale_active_leases(data))
+    preserve_history_ids = {
+        str(lease.get("lease_id"))
+        for lease in candidates
+        if lease.get("lease_id")
+        and _reclaimable_prelaunch_lease(
+            lease, _dispatch_record_for_lease(lease)
+        )
+    }
     if include_unknown_claimant:
         seen = {str(lease.get("lease_id")) for lease in candidates if lease.get("lease_id")}
         for lease in unknown_claimant_leases(data):
@@ -2121,6 +2196,7 @@ def reclaim_stale_leases(
         candidates,
         state=state,
         reason=reason,
+        preserve_history_ids=preserve_history_ids,
     )
 
 
@@ -2137,7 +2213,9 @@ def cmd_release_stale(args: argparse.Namespace) -> int:
         )
         if not args.keep:
             for lease_id in released:
-                data.get("leases", {}).pop(lease_id, None)
+                entry = data.get("leases", {}).get(lease_id)
+                if not entry or not entry.get("history_retained"):
+                    data.get("leases", {}).pop(lease_id, None)
         save_state(data)
     payload = {"ok": True, "released": released, "count": len(released)}
     print(json.dumps(payload, sort_keys=True))

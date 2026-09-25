@@ -17,6 +17,10 @@ four-part predicate as other registered worktrees. A directory merely *named*
 deletion exemption. If registration cannot be determined, the verdict is
 UNKNOWN and the tree is retained.
 
+Shared read-only worktrees under ``<repo>/worktrees/.goalflight-readonly`` are
+also listed. They are detached by design, so merge state is not a condition;
+cleanliness, dispatch ownership, and current-checkout protection still apply.
+
 Removal requires the CONJUNCTION of all four conditions:
 
   1. the worktree's branch is merged into the integration branch; AND
@@ -133,6 +137,11 @@ def _presence(path: Path) -> str:
 
 def _resolve(path: str) -> str:
     return os.path.realpath(path)
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Compare real paths conservatively across case-insensitive volumes."""
+    return _resolve(left).casefold() == _resolve(right).casefold()
 
 
 def _condition(verdict: str, reason: str) -> dict[str, str]:
@@ -319,6 +328,25 @@ def check_clean(path: str, *, directory_state: str) -> dict[str, str]:
     return _condition(YES, "worktree is clean")
 
 
+def check_read_only_grace(path: str, *, directory_state: str) -> dict[str, str]:
+    """Keep detached checkouts inside the allocator's grace window."""
+    if directory_state == "absent":
+        return _condition(YES, "checkout directory absent; no grace window applies")
+    if directory_state == "unknown":
+        return _condition(UNKNOWN, "checkout age could not be evaluated")
+    try:
+        age_s = max(0.0, time.time() - Path(path).stat().st_mtime)
+    except OSError as exc:
+        return _condition(UNKNOWN, f"checkout age could not be evaluated ({exc})")
+    grace_s = float(goalflight_worktree_pool.READ_ONLY_WORKTREE_GRACE_S)
+    if age_s < grace_s:
+        return _condition(
+            NO,
+            f"checkout is inside the {grace_s:g}s read-only grace window",
+        )
+    return _condition(YES, "read-only grace window elapsed")
+
+
 def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
     """Return (records, unreadable_files) from the dispatch runs directory.
 
@@ -329,17 +357,20 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
     """
     state = _presence(ledger_dir)
     if state == "absent":
-        # No runs directory at all: no dispatch has ever recorded a claim here.
-        return [], []
+        # No runs directory is not proof that no dispatch owns the path: a
+        # live row may be temporarily hidden while the ledger is replaced.
+        return [], [f"{ledger_dir} (absent)"]
     if state == "unknown":
         return [], [str(ledger_dir)]
     listing, children = goalflight_fs.list_dir_suffix(ledger_dir, ".json")
-    if listing == "absent":
-        return [], []
     if listing == "unreadable":
         # glob swallows PermissionError and yields []; iterdir raises.
         # An unlistable runs dir is not "no owner".
         return [], [str(ledger_dir)]
+    if listing == "absent" or not children:
+        # A readable-but-empty ledger is the same fail-closed condition as a
+        # missing ledger. It does not positively prove that this path is free.
+        return [], [f"{ledger_dir} (empty)"]
     records: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for child in sorted(children):
@@ -356,12 +387,37 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
 
 
 def _record_cwd_matches(record: dict[str, Any], path: str) -> bool:
-    raw_cwd = record.get("worker_cwd")
-    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
-        return False
-    cwd = _resolve(raw_cwd)
-    target = _resolve(path)
-    return cwd == target or cwd.startswith(target + os.sep)
+    target = _resolve(path).casefold()
+    for key in ("worker_cwd", "worktree_path"):
+        raw_path = record.get(key)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        candidate = _resolve(raw_path).casefold()
+        if candidate == target or candidate.startswith(target + os.sep):
+            return True
+    return False
+
+
+def _record_has_usable_path(record: dict[str, Any]) -> bool:
+    """True when every recorded checkout path is an existing absolute directory."""
+    saw_path = False
+    for key in ("worker_cwd", "worktree_path"):
+        if key not in record:
+            continue
+        saw_path = True
+        raw_path = record.get(key)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return False
+        candidate = raw_path.strip()
+        if not os.path.isabs(candidate):
+            return False
+        try:
+            os.path.realpath(candidate)
+            if not Path(candidate).is_dir():
+                return False
+        except (OSError, ValueError):
+            return False
+    return saw_path
 
 
 def _record_states(record: dict[str, Any]) -> list[str]:
@@ -371,6 +427,13 @@ def _record_states(record: dict[str, Any]) -> list[str]:
         if isinstance(value, str) and value:
             states.append(value)
     return states
+
+
+def _record_is_nonterminal(record: dict[str, Any]) -> bool:
+    states = _record_states(record)
+    return not states or any(
+        not goalflight_dispatch_states.is_terminal_state(state) for state in states
+    )
 
 
 def _is_liveness_verdict(record: dict[str, Any]) -> bool:
@@ -428,10 +491,7 @@ def _record_owns_path(record: dict[str, Any], path: str) -> bool:
         return True
     if live is None:
         return True
-    for state in _record_states(record):
-        if goalflight_dispatch_states.is_terminal_state(state):
-            return False
-    return True
+    return _record_is_nonterminal(record)
 
 
 def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
@@ -451,8 +511,35 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
     if unreadable:
         return _condition(
             UNKNOWN,
-            "dispatch ledger unreadable ("
+            "dispatch ledger unreadable or empty ("
             + ", ".join(unreadable)
+            + "); cannot prove no live dispatch owns this path",
+        )
+    state_unknown = [
+        str(record.get("dispatch_id") or "<unknown>")
+        for record in records
+        if not _record_states(record)
+        or any(state == "unreadable" for state in _record_states(record))
+    ]
+    if state_unknown:
+        return _condition(
+            UNKNOWN,
+            "dispatch ledger state unknown ("
+            + ", ".join(sorted(state_unknown))
+            + "); cannot prove no live dispatch owns this path",
+        )
+    incomplete = [
+        str(record.get("dispatch_id") or "<unknown>")
+        for record in records
+        if _record_is_nonterminal(record)
+        and not _record_has_usable_path(record)
+    ]
+    if incomplete:
+        return _condition(
+            UNKNOWN,
+            "non-terminal dispatch ledger row has no usable worker_cwd or "
+            "worktree_path ("
+            + ", ".join(sorted(incomplete))
             + "); cannot prove no live dispatch owns this path",
         )
     owned = [record for record in records if _record_owns_path(record, path)]
@@ -462,10 +549,7 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
         for record in owned:
             dispatch_id = str(record.get("dispatch_id") or "<unknown>")
             state = str(record.get("state") or "<none>")
-            terminal = any(
-                goalflight_dispatch_states.is_terminal_state(item)
-                for item in _record_states(record)
-            )
+            terminal = not _record_is_nonterminal(record)
             label = f"{dispatch_id} (state={state})"
             if terminal:
                 identity_live.append(label)
@@ -492,60 +576,142 @@ def check_pool_unlocked(
     repo: Path, path: str, *, held_lock=None
 ) -> dict[str, str]:
     """Include the kernel worktree lease in the ownership conjunction."""
-    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-        path, project_root=repo
+    verdict, reason, lock_path, lock_stat = (
+        goalflight_worktree_pool._registered_pool_seat_lock_info(
+            path, project_root=repo
+        )
     )
     if verdict == NO:
+        if held_lock is not None:
+            return _condition(
+                UNKNOWN,
+                "registered pool worktree lock disappeared while action lock was held",
+            )
         return _condition(YES, "path is not a registered pool worktree")
     if verdict == UNKNOWN:
         return _condition(UNKNOWN, reason)
     if held_lock is not None:
-        return _condition(YES, "registered pool worktree lock held for action")
-    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
-        return _condition(UNKNOWN, f"pool worktree lock could not be opened ({exc})")
-    handle = os.fdopen(fd, "r+", encoding="utf-8")
-    try:
         try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return _condition(NO, "registered pool worktree is held by a live lease")
-        except OSError as exc:
-            return _condition(UNKNOWN, f"pool worktree lease could not be evaluated ({exc})")
-    finally:
-        handle.close()
+            held_matches = goalflight_worktree_pool._lock_fd_matches_identity(
+                held_lock.fileno(), lock_stat
+            )
+        except (OSError, ValueError):
+            held_matches = False
+        if not held_matches:
+            return _condition(
+                UNKNOWN,
+                "registered pool worktree lock changed while action lock was held",
+            )
+        return _condition(YES, "registered pool worktree lock held for action")
+    handle, error = _open_validated_pool_lock(lock_path, lock_stat)
+    if error is not None:
+        if error == "registered pool worktree is held by a live lease":
+            return _condition(NO, error)
+        return _condition(UNKNOWN, error)
+    assert handle is not None
+    handle.close()
     return _condition(YES, "registered pool worktree has no live kernel lease")
 
 
-def _acquire_pool_action_lock(
-    repo: Path, path: str
+def _open_validated_pool_lock(
+    lock_path: Path | None,
+    expected_stat: os.stat_result | None,
 ) -> tuple[object | None, str | None]:
-    """Hold a registered pool lock across recheck, pin, and removal."""
-    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-        path, project_root=repo
-    )
-    if verdict != YES:
-        return None, None
-    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
+    """Open and hold the exact lock file used by the registration verdict."""
+    if lock_path is None or expected_stat is None:
+        return None, "pool worktree lock identity is unavailable"
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = goalflight_worktree_pool._open_lock_path_safely(
+            lock_path,
+            flags,
+            expected_stat=expected_stat,
+        )
     except OSError as exc:
+        if fd is not None:
+            os.close(fd)
         return None, f"pool worktree lock could not be opened ({exc})"
-    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+    except OSError as exc:
+        os.close(fd)
+        return None, f"pool worktree lock could not be opened ({exc})"
     try:
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
-        return None, "registered pool worktree became held before action"
+        return None, "registered pool worktree is held by a live lease"
     except OSError as exc:
         handle.close()
         return None, f"pool worktree lease could not be evaluated ({exc})"
+    return handle, None
+
+
+def _acquire_pool_action_lock(
+    repo: Path, path: str
+) -> tuple[object | None, str | None]:
+    """Hold a registered pool lock across recheck, pin, and removal."""
+    verdict, reason, lock_path, lock_stat = (
+        goalflight_worktree_pool._registered_pool_seat_lock_info(
+            path, project_root=repo
+        )
+    )
+    if verdict == NO:
+        return None, None
+    if verdict != YES:
+        return None, f"pool worktree action lock unavailable: {reason}"
+    handle, error = _open_validated_pool_lock(lock_path, lock_stat)
+    if error == "registered pool worktree is held by a live lease":
+        return None, "registered pool worktree became held before action"
+    return handle, error
+
+
+def _acquire_read_only_action_lock(
+    repo: Path,
+) -> tuple[object | None, str | None]:
+    """Hold the allocator's detached-checkout lock across GC recheck/removal."""
+    try:
+        registry_root = goalflight_worktree_pool._git_common_dir(
+            repo, timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S
+        )
+        lock_path = registry_root / "goalflight-worktree-seat-locks" / "readonly-allocation.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = goalflight_worktree_pool._open_registered_lock(
+            lock_path,
+            flags,
+            registry_root=registry_root,
+            allow_create=True,
+            allow_unregistered=True,
+        )
+    except OSError as exc:
+        return None, f"read-only allocation lock could not be opened ({exc})"
+    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        goalflight_worktree_pool._adopt_exclusive_lock(
+            lock_path,
+            handle.fileno(),
+            registry_root=registry_root,
+            deadline=time.monotonic() + goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+        )
+    except BlockingIOError:
+        handle.close()
+        return None, "read-only allocation is active; retry after it completes"
+    except OSError as exc:
+        handle.close()
+        return None, f"read-only allocation lock could not be evaluated ({exc})"
     return handle, None
 
 
@@ -561,7 +727,7 @@ def check_not_current(
             UNKNOWN,
             f"current checkout could not be determined ({current_error})",
         )
-    if current_checkout is not None and _resolve(path) == current_checkout:
+    if current_checkout is not None and _same_path(path, current_checkout):
         return _condition(NO, "this path is the currently-checked-out worktree")
     return _condition(YES, "not the currently-checked-out worktree")
 
@@ -591,10 +757,65 @@ def classify(
         "missing_on_disk": directory_state == "absent",
     }
 
-    if main_path is not None and _resolve(path) == main_path:
+    if main_path is not None and _same_path(path, main_path):
         result["decision"] = "retain"
         result["reason"] = "main worktree is never a removal candidate"
         result["conditions"] = {}
+        return result
+
+    project_root = Path(main_path) if main_path is not None else repo
+    read_only_verdict, read_only_reason = (
+        goalflight_worktree_pool.read_only_worktree_path_verdict(
+            path, project_root=project_root
+        )
+    )
+    if read_only_verdict == UNKNOWN:
+        result["decision"] = "retain"
+        result["reason"] = (
+            "read-only path classification unknown ("
+            f"{read_only_reason}); refusing removal"
+        )
+        result["conditions"] = {}
+        return result
+    if read_only_verdict == YES:
+        pool_verdict, pool_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+            path, project_root=project_root
+        )
+        if pool_verdict != NO:
+            result["decision"] = "retain"
+            result["reason"] = (
+                "read-only checkout path is also a registered pool worktree "
+                f"({pool_reason})"
+            )
+            result["conditions"] = {}
+            return result
+        usage = goalflight_worktree_pool.read_only_worktree_usage(
+            path, ledger_dir=ledger_dir
+        )
+        conditions = {
+            "clean": check_clean(path, directory_state=directory_state),
+            "grace": check_read_only_grace(path, directory_state=directory_state),
+            "unowned": usage,
+            "not_current": check_not_current(
+                path, current_checkout=current_checkout, current_error=current_error
+            ),
+        }
+        result["read_only"] = True
+        result["conditions"] = conditions
+        blockers = [
+            f"{name}: {cond['reason']}"
+            for name, cond in conditions.items()
+            if cond["verdict"] != YES
+        ]
+        if blockers:
+            result["decision"] = "retain"
+            result["reason"] = "; ".join(blockers)
+            return result
+        result["decision"] = "prune" if directory_state == "absent" else "remove"
+        result["reason"] = (
+            "read-only checkout is clean, has no live dispatch owner, and is "
+            "not the current checkout"
+        )
         return result
 
     seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
@@ -668,19 +889,7 @@ def _prune_worktrees(repo: Path) -> tuple[bool, str]:
 
 def _pin_before_remove(repo: Path, path: str) -> tuple[str | None, str | None]:
     """Keep the candidate's current commit durable before destructive removal."""
-    head = _git(Path(path), "rev-parse", "HEAD^{commit}")
-    if head.returncode != 0 or not head.stdout.strip():
-        return None, (head.stderr or head.stdout).strip() or "cannot resolve candidate HEAD"
-    stamp = str(int(time.time() * 1_000_000))
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in Path(path).name)
-    ref = f"refs/goalflight/keep/gc-{stamp}-{safe}-{head.stdout.strip()[:12]}"
-    updated = _git(repo, "update-ref", ref, head.stdout.strip(), "")
-    if updated.returncode != 0:
-        return None, (updated.stderr or updated.stdout).strip() or "cannot create keep ref"
-    verified = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
-    if verified.returncode != 0 or verified.stdout.strip() != head.stdout.strip():
-        return None, "keep ref did not verify after creation"
-    return ref, None
+    return goalflight_worktree_pool.pin_worktree_head_before_remove(repo, path)
 
 
 def apply_removals(
@@ -707,7 +916,7 @@ def apply_removals(
         # Re-list: the fresh listing is the only authority on what exists NOW.
         listed, list_error = list_worktrees(repo)
         fresh = next(
-            (item for item in listed if _resolve(item["path"]) == _resolve(path)),
+            (item for item in listed if _same_path(item["path"], path)),
             None,
         )
         if list_error is not None or fresh is None:
@@ -718,7 +927,16 @@ def apply_removals(
             )
             continue
 
-        pool_lock, lock_error = _acquire_pool_action_lock(repo, path)
+        read_only_project_root = Path(main_path) if main_path is not None else repo
+        read_only_verdict, _read_only_reason = (
+            goalflight_worktree_pool.read_only_worktree_path_verdict(
+                path, project_root=read_only_project_root
+            )
+        )
+        if read_only_verdict in {YES, UNKNOWN}:
+            pool_lock, lock_error = _acquire_read_only_action_lock(repo)
+        else:
+            pool_lock, lock_error = _acquire_pool_action_lock(repo, path)
         if lock_error is not None:
             entry["outcome"] = "retained"
             entry["reason"] = f"changed_before_remove: {lock_error}"
@@ -857,8 +1075,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Report (or with --apply, remove) git worktrees that are merged, "
             "clean, unowned by a live dispatch, and not checked out. "
             "Registered pool worktrees are evaluated by the full predicate; a directory "
-            "merely named wt-N is ordinary litter. Run after merging "
-            "a worker branch into the integration branch."
+            "merely named wt-N is ordinary litter. Shared read-only checkouts are "
+            "evaluated without a merge condition. Run after merging a worker branch "
+            "into the integration branch."
         )
     )
     parser.add_argument(

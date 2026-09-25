@@ -301,6 +301,163 @@ def test_retained_legacy_ring_seat_counts_toward_cap(holder):
     assert (collision / "payload").read_text() == "must survive\n"
 
 
+def test_unregistered_live_legacy_ring_lock_reports_holder_and_counts_toward_cap(
+    holder, monkeypatch
+):
+    repo, path, row = holder
+    row["state"] = "running"
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: True,
+    )
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+
+    with pytest.raises(pool.WorktreeSeatUnavailable) as caught:
+        pool.acquire_worktree_seat(repo, "next")
+    message = str(caught.value)
+    assert "lock holder: s-1=unknown-dispatch" not in message
+    assert "s-1=old controller=owner state=running worker_pid=34567" in message
+    assert legacy_path.is_dir()
+
+
+def test_unregistered_terminal_legacy_ring_lock_is_reused_with_free_slot(
+    holder, monkeypatch
+):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, path, _row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+    global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
+    if global_ring.exists():
+        global_ring.unlink()
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == legacy_path
+
+
+def test_unregistered_terminal_legacy_ring_lock_is_reused_when_pool_is_full(
+    holder, monkeypatch
+):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "1")
+    repo, path, _row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+    global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
+    if global_ring.exists():
+        global_ring.unlink()
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == legacy_path
+
+
+@pytest.mark.parametrize("metadata", ["live", "empty"])
+def test_unregistered_missing_checkout_requires_holder_evidence(
+    holder, monkeypatch, metadata
+):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, path, row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    _git(repo, "worktree", "remove", "--force", str(path))
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+    if metadata == "live":
+        row["state"] = "running"
+        monkeypatch.setattr(
+            pool.goalflight_compat,
+            "process_identity_matches",
+            lambda pid, token: True,
+        )
+    else:
+        global_lock.write_text("", encoding="utf-8")
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == repo / "worktrees" / "s-2"
+
+
+def test_unreadable_present_checkout_is_unknown_for_holder_validation(holder, monkeypatch):
+    repo, path, row = holder
+    _git(path, "checkout", "-q", "-b", "worktree/live")
+    records = {
+        "old": row,
+        "live": {
+            "dispatch_id": "live",
+            "state": "running",
+            "worker_pid": 45678,
+            "worker_identity": {"pid": 45678, "start_token": "live-token"},
+        },
+    }
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: token == "live-token",
+    )
+
+    parent = path.parent
+    parent.chmod(0)
+    try:
+        try:
+            os.stat(path)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("filesystem does not enforce mode 000 on parent traversal")
+        with pytest.raises(pool.WorktreeSeatUnavailable, match="could not be inspected"):
+            pool._validate_holder(path, "old")
+    finally:
+        parent.chmod(0o755)
+
+
 def test_ignored_listing_is_scoped_to_each_candidate_seat(tmp_path, monkeypatch):
     monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
     repo = _make_repo(tmp_path)

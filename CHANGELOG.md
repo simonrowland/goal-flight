@@ -6,7 +6,7 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
-## [1.7.2] - 2026-09-23
+## [1.7.2] - 2026-09-25
 
 ### Added
 
@@ -16,6 +16,9 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Read-only reviews reuse worktrees instead of duplicating them. A review first looks for a registered pooled worktree already at the review base with a clean tree and takes a shared hold on it; only when none matches does it fall back to a detached checkout, and that fallback is shared by every read-only dispatch at the same commit. A writer cannot be admitted to a tree a reviewer is holding, and reviewers still share a tree with each other.
+- Detached read-only checkouts are now reclaimed. Aged, clean, unowned checkouts beyond the four newest are removed after a one-hour grace period; a checkout still in use, still inside the grace window, or carrying any uncommitted change is left alone, and a detached HEAD is pinned to a keep ref before removal. Reclamation is triggered by the next read-only allocation in that repository, so a quiet repository is not swept until it is next used and deploying does not reclaim anything on its own.
+- Worktree locks are identified by a durable registration record (device and inode) rather than by pathname, so a lock file replaced underneath an allocator is no longer mistaken for the original. Locks created before the registry existed are adopted into it on the first exclusive open, which is the only moment at which no other holder can be present; until a lock is adopted it is treated as busy rather than reclaimable. Existing installations need no migration and no operator action.
 - Capacity is enforced per provider account as well as per engine pool (codex 30 and grok 50 sessions per account by default; configurable in the machine-local capacity profile). Existing engine-wide reservations migrate to their accounts.
 - Dispatch-ledger status reads recent records and archives old ones instead of rereading full history; liveness probing is combined and retries back off.
 - Worktree pool: writable dispatches share one repository-wide pool (default 15 worktrees) across controller labels, with safe reclaim, dirty-tree quarantine before reset, and read-only ACP dispatches never taking an exclusive worktree. Agent-facing text says worktree/account/session instead of seat; old flags remain as deprecated aliases. Downgrading to an earlier release returns to per-label worktree limits.
@@ -27,13 +30,16 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- A worktree is reclaimed only when its previous holder is in a terminal ledger state and its worker process is proven gone by process identity (pid plus start token, because pids are reused). Every indeterminate answer retains the worktree instead of reclaiming it: unreadable metadata, an unreadable or empty ledger, an unregistered lock, or a checkout whose presence cannot be confirmed. A checkout that cannot be confirmed present is no longer treated as absent.
 - Account validation runs before any dispatch side effect on every launch path.
 - Unknown liveness evidence from a failed process probe is reported as unknown (never live or dead), so pending sidecars are not settled on it.
 - Controller registration refuses volatile temporary project roots and doctor warns about existing registrations that point to them or missing roots.
 - Read-only Grok reviews on macOS now keep a shell for repository inspection
   while Seatbelt denies project writes; non-macOS retains the `--deny Bash`
-  fallback, and read-only review dispatches continue to consume no pooled
-  writer worktree.
+  fallback. Read-only review dispatches now prefer an existing pooled worktree
+  that already matches the review base and is clean, holding it shared rather
+  than exclusively, so a reviewer no longer cuts a second copy of a tree a
+  writer has just built.
 - Resume account selection uses the normal Codex resolver before creating the child ledger, so an explicit host login follows the same resolver path as a fresh dispatch and an unresolved account leaves no child claim. Explicit-account resumes build a child-owned Codex home and copy the parent's rollout while the source-home lock is held; capacity is charged to the resolver's effective account and the resolved preflight is reused by the launch handoff.
 - A resumed dispatch whose recorded pool seat was recycled now validates its resume-lineage `worktree/<dispatch-id>` (or legacy `seat/<dispatch-id>`) branch and reacquires a free seat at the recorded head or a descendant committed on that branch. Missing checkouts, foreign or divergent branches, and recovery refs recorded for that dispatch at reclaim time are refused without touching another dispatch's seat; hot and archived reclaimer rows are inspected, and the recovery ref plus one restore command are named so the operator can recover it. Deleted checkout registrations are pruned only after the path is proven absent.
 

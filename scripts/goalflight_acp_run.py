@@ -653,6 +653,18 @@ def _record_acp_ledger_state(
     """
 
     spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
+    recorded_worker_cwd = (
+        None
+        if state in {"queued", "waiting_capacity", "submitted", "claimed"}
+        else str(worker_cwd or getattr(cfg, "cwd", None) or project_root)
+    )
+    if (
+        recorded_worker_cwd is None
+        and getattr(cfg, "parent_dispatch_id", None)
+        and bool(getattr(cfg, "read_only", False))
+        and worker_cwd
+    ):
+        recorded_worker_cwd = str(worker_cwd)
 
     def _record_once() -> tuple[int, dict | None]:
         capture = io.StringIO()
@@ -678,11 +690,7 @@ def _record_acp_ledger_state(
                     ),
                     transport="acp",
                     project_root=str(project_root),
-                    worker_cwd=(
-                        None
-                        if state in {"queued", "waiting_capacity", "submitted", "claimed"}
-                        else str(worker_cwd or getattr(cfg, "cwd", None) or project_root)
-                    ),
+                    worker_cwd=recorded_worker_cwd,
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
                     controller_label=controller_label,
@@ -2881,6 +2889,7 @@ async def _run_acp_dispatch_impl(
     conn: AcpConnection | None = None
     termination_result: AcpTerminationResult | None = None
     worktree_seat: goalflight_worktree_pool.WorktreeSeatLease | None = None
+    read_only_seat_hold = None
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
@@ -4251,6 +4260,7 @@ async def _run_acp_dispatch_impl(
             # Every ACP shape binds only after account/capacity admission. The
             # central hook also handles in-place launches and occupancy locking.
             worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+            read_only_seat_hold = getattr(cfg, "_worktree_read_only_hold", None)
             occupancy_warning = getattr(cfg, "_worktree_occupancy_warning", None)
             if occupancy_warning is not None:
                 tail = getattr(cfg, "tail", None)
@@ -4274,7 +4284,14 @@ async def _run_acp_dispatch_impl(
                     worker_cwd = str(worktree_seat.path)
                     attach_worktree_to_lease(worktree_seat.path)
                 else:
-                    worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
+                    if read_only_seat_hold is not None:
+                        spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                            read_only_seat_hold.fileno()
+                        )
+                        worker_cwd = str(read_only_seat_hold.path)
+                        attach_worktree_to_lease(read_only_seat_hold.path)
+                    else:
+                        worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
                 prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
                 await update_status(
                     state="worktree_created",
@@ -4315,6 +4332,9 @@ async def _run_acp_dispatch_impl(
             if worktree_seat is not None:
                 worktree_seat.release()
                 worktree_seat = None
+            if read_only_seat_hold is not None:
+                read_only_seat_hold.release()
+                read_only_seat_hold = None
             await update_status(
                 state="failed_worktree",
                 ok=False,
@@ -4425,6 +4445,7 @@ async def _run_acp_dispatch_impl(
                             (
                                 *goalflight_worktree_pool.inherited_worktree_lock_fds(),
                                 *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+                                *((read_only_seat_hold.fileno(),) if read_only_seat_hold is not None else ()),
                             )
                         )
                     ),
@@ -5122,6 +5143,8 @@ async def _run_acp_dispatch_impl(
                 )
         if worktree_seat is not None:
             worktree_seat.release()
+        if read_only_seat_hold is not None:
+            read_only_seat_hold.release()
         if not detach_worker and (proc is None or (termination_result is not None and termination_result.confirmed)):
             goalflight_cursor.cleanup_dispatch_data(
                 dispatch_id, launcher_finished=True, prelaunch_failure=proc is None,
