@@ -672,6 +672,57 @@ def test_registered_pool_worktree_is_reclaimed_only_after_full_gate(
     assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
+@pytest.mark.parametrize("operation", ["check", "acquire"])
+def test_pool_lock_symlink_swap_is_unknown(
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink race test requires POSIX links")
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "symlink-race")
+    seat = lease.path
+    lease.release()
+    original = goalflight_worktree_pool._registered_pool_seat_lock_info
+    swapped: dict[str, Path] = {}
+
+    def race(path: str | Path, *, project_root: Path):
+        info = original(path, project_root=project_root)
+        if info[0] == goalflight_worktree_pool.YES:
+            lock_path = info[2]
+            assert lock_path is not None
+            replacement = tmp_path / "unrelated.lock"
+            replacement.touch()
+            backup = lock_path.with_name(lock_path.name + ".real")
+            lock_path.rename(backup)
+            lock_path.symlink_to(replacement)
+            swapped.update(lock_path=lock_path, backup=backup)
+        return info
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_registered_pool_seat_lock_info",
+        race,
+    )
+    try:
+        if operation == "check":
+            result = goalflight_worktree_gc.check_pool_unlocked(repo, str(seat))
+            assert result["verdict"] == goalflight_worktree_gc.UNKNOWN, result
+        else:
+            handle, error = goalflight_worktree_gc._acquire_pool_action_lock(
+                repo, str(seat)
+            )
+            if handle is not None:
+                handle.close()
+            assert handle is None
+            assert error
+    finally:
+        lock_path = swapped["lock_path"]
+        lock_path.unlink()
+        swapped["backup"].rename(lock_path)
+
+
 def test_adhoc_worktree_named_wt_n_is_reclaimable(
     tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

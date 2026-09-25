@@ -533,6 +533,127 @@ def is_reserved_seat_notes_path(relpath: str) -> bool:
     return text == SEAT_NOTES_NAMESPACE or text.startswith(SEAT_NOTES_NAMESPACE + "/")
 
 
+def _registered_pool_seat_lock_info(
+    path: str | Path,
+    *,
+    project_root: Path,
+) -> tuple[str, str, Path | None, os.stat_result | None]:
+    """Return registration plus the lock identity used for that verdict."""
+    try:
+        root = project_root.resolve()
+    except OSError as exc:
+        return "unknown", f"project root unresolvable ({exc})", None, None
+    try:
+        resolved = Path(path).resolve()
+    except OSError as exc:
+        return "unknown", f"worktree path unresolvable ({exc})", None, None
+
+    managed_root = root / "worktrees"
+    try:
+        managed_root = managed_root.resolve()
+    except OSError as exc:
+        return "unknown", f"managed worktree root unresolvable ({exc})", None, None
+
+    try:
+        rel = resolved.relative_to(managed_root)
+    except ValueError:
+        return (
+            "no",
+            f"{resolved} is not under the managed worktree root {managed_root}",
+            None,
+            None,
+        )
+    except OSError as exc:
+        return (
+            "unknown",
+            f"managed worktree path could not be compared ({exc})",
+            None,
+            None,
+        )
+
+    parts = rel.parts
+    lock_subdir: str | None = None
+    if len(parts) == 1:
+        seat_name = pool_seat_name(parts[0])
+        prefix = (
+            CAPTIVE_SEAT_PREFIX
+            if seat_name and is_captive_seat_name(seat_name)
+            else WORKTREE_SEAT_PREFIX
+        )
+        if seat_name is None or _slot_from_seat_name(seat_name, prefix) is None:
+            return "no", f"{resolved.name} is not a pool worktree name", None, None
+    elif len(parts) == 2:
+        seat_name = pool_seat_name(parts[1])
+        prefix = CAPTIVE_SEAT_PREFIX
+        if seat_name is None or _slot_from_seat_name(seat_name, prefix) is None:
+            return "no", f"{resolved.name} is not a pool worktree name", None, None
+        lock_subdir = parts[0]
+    else:
+        return (
+            "no",
+            f"{resolved} is not a managed worktree path under {managed_root}",
+            None,
+            None,
+        )
+
+    try:
+        seat_limit = configured_worktree_seats()
+    except WorktreeSeatError as exc:
+        return "unknown", f"worktree configuration unreadable ({exc})", None, None
+
+    slot = _slot_from_seat_name(seat_name, prefix)
+    if slot is None:
+        return (
+            "no",
+            f"{seat_name} is not a valid managed worktree id",
+            None,
+            None,
+        )
+
+    try:
+        lock_root = _git_common_dir(root) / "goalflight-worktree-seat-locks"
+    except WorktreeSeatError as exc:
+        return "unknown", f"worktree lock directory unreadable ({exc})", None, None
+    if lock_subdir:
+        lock_root = lock_root / lock_subdir
+
+    lock_path = lock_root / f"{seat_name}.lock"
+    try:
+        if lock_root.is_symlink():
+            return (
+                "unknown",
+                f"worktree lock root is a symlink ({lock_root})",
+                None,
+                None,
+            )
+        st = os.lstat(lock_path)
+    except FileNotFoundError:
+        return (
+            "no",
+            f"no worktree lock for {seat_name}; path is not a registered pool worktree",
+            None,
+            None,
+        )
+    except OSError as exc:
+        return (
+            "unknown",
+            f"worktree lock unreadable for {seat_name} ({exc})",
+            None,
+            None,
+        )
+
+    if stat.S_ISLNK(st.st_mode):
+        return "unknown", f"worktree lock is a symlink ({lock_path})", None, None
+    if not stat.S_ISREG(st.st_mode):
+        return (
+            "unknown",
+            f"worktree lock is not a regular file ({lock_path})",
+            None,
+            None,
+        )
+    return "yes", f"registered pool worktree {seat_name}", lock_path, st
+
+
 def registered_pool_seat_verdict(
     path: str | Path,
     *,
@@ -548,91 +669,10 @@ def registered_pool_seat_verdict(
     litter). If registration cannot be determined, the verdict is unknown so
     a deleter retains.
     """
-    try:
-        root = project_root.resolve()
-    except OSError as exc:
-        return "unknown", f"project root unresolvable ({exc})"
-    try:
-        resolved = Path(path).resolve()
-    except OSError as exc:
-        return "unknown", f"worktree path unresolvable ({exc})"
-
-    managed_root = root / "worktrees"
-    try:
-        managed_root = managed_root.resolve()
-    except OSError as exc:
-        return "unknown", f"managed worktree root unresolvable ({exc})"
-
-    try:
-        rel = resolved.relative_to(managed_root)
-    except ValueError:
-        return (
-            "no",
-            f"{resolved} is not under the managed worktree root {managed_root}",
-        )
-    except OSError as exc:
-        return "unknown", f"managed worktree path could not be compared ({exc})"
-
-    parts = rel.parts
-    lock_subdir: str | None = None
-    if len(parts) == 1:
-        seat_name = pool_seat_name(parts[0])
-        prefix = (
-            CAPTIVE_SEAT_PREFIX
-            if seat_name and is_captive_seat_name(seat_name)
-            else WORKTREE_SEAT_PREFIX
-        )
-        if seat_name is None or _slot_from_seat_name(seat_name, prefix) is None:
-            return "no", f"{resolved.name} is not a pool worktree name"
-    elif len(parts) == 2:
-        seat_name = pool_seat_name(parts[1])
-        prefix = CAPTIVE_SEAT_PREFIX
-        if seat_name is None or _slot_from_seat_name(seat_name, prefix) is None:
-            return "no", f"{resolved.name} is not a pool worktree name"
-        lock_subdir = parts[0]
-    else:
-        return (
-            "no",
-            f"{resolved} is not a managed worktree path under {managed_root}",
-        )
-
-    try:
-        seat_limit = configured_worktree_seats()
-    except WorktreeSeatError as exc:
-        return "unknown", f"worktree configuration unreadable ({exc})"
-
-    slot = _slot_from_seat_name(seat_name, prefix)
-    if slot is None:
-        return (
-            "no",
-            f"{seat_name} is not a valid managed worktree id",
-        )
-
-    try:
-        lock_root = _git_common_dir(root) / "goalflight-worktree-seat-locks"
-    except WorktreeSeatError as exc:
-        return "unknown", f"worktree lock directory unreadable ({exc})"
-    if lock_subdir:
-        lock_root = lock_root / lock_subdir
-
-    lock_path = lock_root / f"{seat_name}.lock"
-    try:
-        if lock_root.is_symlink():
-            return "unknown", f"worktree lock root is a symlink ({lock_root})"
-        st = os.lstat(lock_path)
-    except FileNotFoundError:
-        return (
-            "no",
-            f"no worktree lock for {seat_name}; path is not a registered pool worktree",
-        )
-    except OSError as exc:
-        return "unknown", f"worktree lock unreadable for {seat_name} ({exc})"
-
-    if stat.S_ISLNK(st.st_mode):
-        return "unknown", f"worktree lock is a symlink ({lock_path})"
-    if not stat.S_ISREG(st.st_mode):
-        return "unknown", f"worktree lock is not a regular file ({lock_path})"
-    return "yes", f"registered pool worktree {seat_name}"
+    verdict, reason, _lock_path, _lock_stat = _registered_pool_seat_lock_info(
+        path, project_root=project_root
+    )
+    return verdict, reason
 
 
 def _git(
@@ -668,7 +708,9 @@ def _git_nul(
     return result.stdout
 
 
-def _git_identity(cwd: Path) -> tuple[str, str, str] | None:
+def _git_identity(
+    cwd: Path, *, timeout: float | None = None
+) -> tuple[str, str, str] | None:
     """Return realpath git-dir, common-dir, and worktree top-level."""
     try:
         result = subprocess.run(
@@ -688,6 +730,7 @@ def _git_identity(cwd: Path) -> tuple[str, str, str] | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -738,7 +781,9 @@ def _git_worktree_target_args(args: tuple[str, ...]) -> tuple[str, ...] | None:
     return tuple(values[:required])
 
 
-def guard_worktree_mutation(cwd: Path, *args: str) -> str | None:
+def guard_worktree_mutation(
+    cwd: Path, *args: str, timeout: float | None = None
+) -> str | None:
     """Refuse worktree mutations whose target is the repository main checkout."""
     if not args:
         return None
@@ -758,7 +803,7 @@ def guard_worktree_mutation(cwd: Path, *args: str) -> str | None:
     else:
         return None
 
-    source = _git_identity(cwd)
+    source = _git_identity(cwd, timeout=timeout)
     if source is None:
         return f"refusing git {' '.join(args)}: cannot verify repository identity"
     if command != "worktree":
@@ -780,7 +825,11 @@ def guard_worktree_mutation(cwd: Path, *args: str) -> str | None:
                 f"refusing git {' '.join(args)}: target {target_real} is the "
                 "repository main worktree"
             )
-        target_identity = _git_identity(Path(target_real)) if Path(target_real).is_dir() else None
+        target_identity = (
+            _git_identity(Path(target_real), timeout=timeout)
+            if Path(target_real).is_dir()
+            else None
+        )
         if target_identity is None:
             if command == "worktree":
                 continue
@@ -804,7 +853,7 @@ def _git_proc(
     env: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
-    guard_error = guard_worktree_mutation(cwd, *args)
+    guard_error = guard_worktree_mutation(cwd, *args, timeout=timeout)
     if guard_error is not None:
         return subprocess.CompletedProcess(
             ["git", *args], 128, "", guard_error
@@ -856,8 +905,13 @@ def is_worktree_branch(branch: str | None) -> bool:
     )
 
 
-def _git_common_dir(cwd: Path) -> Path:
-    raw = Path(_git(cwd, "rev-parse", "--git-common-dir"))
+def _git_common_dir(cwd: Path, *, timeout: float | None = None) -> Path:
+    if timeout is None:
+        raw = Path(_git(cwd, "rev-parse", "--git-common-dir"))
+    else:
+        raw = Path(
+            _git(cwd, "rev-parse", "--git-common-dir", timeout=timeout)
+        )
     return (raw if raw.is_absolute() else cwd / raw).resolve()
 
 
@@ -1051,17 +1105,29 @@ def _verify_project_root(project_root: Path) -> None:
         raise WorktreeSeatError(f"--cwd must be the git repository root: {project_root}")
 
 
-def _verify_existing_seat(project_root: Path, worktree_path: Path) -> None:
+def _verify_existing_seat(
+    project_root: Path,
+    worktree_path: Path,
+    *,
+    timeout: float | None = None,
+) -> None:
     if worktree_path.is_symlink():
         raise WorktreeSeatError(f"managed worktree path must not be a symlink: {worktree_path}")
     if not worktree_path.is_dir():
         raise WorktreeSeatError(f"managed worktree path is not a directory: {worktree_path}")
-    top = Path(_git(worktree_path, "rev-parse", "--show-toplevel")).resolve()
+    if timeout is None:
+        top = Path(_git(worktree_path, "rev-parse", "--show-toplevel")).resolve()
+    else:
+        top = Path(
+            _git(worktree_path, "rev-parse", "--show-toplevel", timeout=timeout)
+        ).resolve()
     if top != worktree_path.resolve():
         raise WorktreeSeatError(
             f"managed worktree path is not a Git worktree root: {worktree_path}"
         )
-    if _git_common_dir(worktree_path) != _git_common_dir(project_root):
+    if _git_common_dir(worktree_path, timeout=timeout) != _git_common_dir(
+        project_root, timeout=timeout
+    ):
         raise WorktreeSeatError(f"managed worktree belongs to another repository: {worktree_path}")
 
 
@@ -3132,14 +3198,29 @@ def shared_read_only_worktree(project_root: Path, *, base: str | None = None) ->
             requested_path=path,
         )
         if not path.exists():
-            _git(project_root, "worktree", "add", "--detach", str(path), base_commit)
-        _verify_existing_seat(project_root, path)
-        actual = _git(path, "rev-parse", "HEAD^{commit}")
+            _git(
+                project_root,
+                "worktree",
+                "add",
+                "--detach",
+                str(path),
+                base_commit,
+                timeout=READ_ONLY_GIT_TIMEOUT_S,
+            )
+        _verify_existing_seat(
+            project_root, path, timeout=READ_ONLY_GIT_TIMEOUT_S
+        )
+        actual = _git(
+            path,
+            "rev-parse",
+            "HEAD^{commit}",
+            timeout=READ_ONLY_GIT_TIMEOUT_S,
+        )
         if actual != base_commit:
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is at {actual}, expected {base_commit}"
             )
-        clean = check_seat_cleanliness(path)
+        clean = check_seat_cleanliness(path, timeout=READ_ONLY_GIT_TIMEOUT_S)
         if clean["verdict"] != YES:
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is not clean: {clean['reason']}"

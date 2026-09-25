@@ -2422,12 +2422,24 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
         )
         if verdict != goalflight_worktree_pool.YES:
             return
+        clean = goalflight_worktree_pool.check_seat_cleanliness(
+            path,
+            timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+        )
+        if clean["verdict"] != goalflight_worktree_pool.YES:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"read-only resume checkout {path} is not clean: {clean['reason']}"
+            )
         args._worktree_id = path.name
         args._worktree_path = str(path)
         args._worktree_read_only = True
         with contextlib.suppress(goalflight_worktree_pool.WorktreeSeatError):
             args._worktree_base_commit = goalflight_worktree_pool._git(
-                path, "rev-parse", "--verify", "HEAD^{commit}"
+                path,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
             )
         with contextlib.suppress(OSError):
             os.utime(path, None)

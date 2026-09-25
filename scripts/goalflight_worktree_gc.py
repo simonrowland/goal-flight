@@ -70,6 +70,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -576,8 +577,10 @@ def check_pool_unlocked(
     repo: Path, path: str, *, held_lock=None
 ) -> dict[str, str]:
     """Include the kernel worktree lease in the ownership conjunction."""
-    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-        path, project_root=repo
+    verdict, reason, lock_path, lock_stat = (
+        goalflight_worktree_pool._registered_pool_seat_lock_info(
+            path, project_root=repo
+        )
     )
     if verdict == NO:
         return _condition(YES, "path is not a registered pool worktree")
@@ -585,52 +588,76 @@ def check_pool_unlocked(
         return _condition(UNKNOWN, reason)
     if held_lock is not None:
         return _condition(YES, "registered pool worktree lock held for action")
-    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
-        return _condition(UNKNOWN, f"pool worktree lock could not be opened ({exc})")
-    handle = os.fdopen(fd, "r+", encoding="utf-8")
-    try:
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return _condition(NO, "registered pool worktree is held by a live lease")
-        except OSError as exc:
-            return _condition(UNKNOWN, f"pool worktree lease could not be evaluated ({exc})")
-    finally:
-        handle.close()
+    handle, error = _open_validated_pool_lock(lock_path, lock_stat)
+    if error is not None:
+        if error == "registered pool worktree is held by a live lease":
+            return _condition(NO, error)
+        return _condition(UNKNOWN, error)
+    assert handle is not None
+    handle.close()
     return _condition(YES, "registered pool worktree has no live kernel lease")
 
 
-def _acquire_pool_action_lock(
-    repo: Path, path: str
+def _open_validated_pool_lock(
+    lock_path: Path | None,
+    expected_stat: os.stat_result | None,
 ) -> tuple[object | None, str | None]:
-    """Hold a registered pool lock across recheck, pin, and removal."""
-    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-        path, project_root=repo
-    )
-    if verdict != YES:
-        return None, None
-    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
+    """Open and hold the exact lock file used by the registration verdict."""
+    if lock_path is None or expected_stat is None:
+        return None, "pool worktree lock identity is unavailable"
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd: int | None = None
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(lock_path, flags)
+        opened_stat = os.fstat(fd)
     except OSError as exc:
+        if fd is not None:
+            os.close(fd)
         return None, f"pool worktree lock could not be opened ({exc})"
-    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    if (
+        not stat.S_ISREG(opened_stat.st_mode)
+        or opened_stat.st_dev != expected_stat.st_dev
+        or opened_stat.st_ino != expected_stat.st_ino
+    ):
+        os.close(fd)
+        return None, "pool worktree lock changed after registration was checked"
+    try:
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+    except OSError as exc:
+        os.close(fd)
+        return None, f"pool worktree lock could not be opened ({exc})"
     try:
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
-        return None, "registered pool worktree became held before action"
+        return None, "registered pool worktree is held by a live lease"
     except OSError as exc:
         handle.close()
         return None, f"pool worktree lease could not be evaluated ({exc})"
     return handle, None
+
+
+def _acquire_pool_action_lock(
+    repo: Path, path: str
+) -> tuple[object | None, str | None]:
+    """Hold a registered pool lock across recheck, pin, and removal."""
+    verdict, _reason, lock_path, lock_stat = (
+        goalflight_worktree_pool._registered_pool_seat_lock_info(
+            path, project_root=repo
+        )
+    )
+    if verdict != YES:
+        return None, None
+    handle, error = _open_validated_pool_lock(lock_path, lock_stat)
+    if error == "registered pool worktree is held by a live lease":
+        return None, "registered pool worktree became held before action"
+    return handle, error
 
 
 def _acquire_read_only_action_lock(

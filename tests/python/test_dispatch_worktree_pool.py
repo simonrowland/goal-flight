@@ -756,6 +756,35 @@ def test_read_only_resume_records_and_touches_checkout_before_waiting(
     assert goalflight_dispatch._ledger_worker_cwd(args, "waiting_capacity") == str(checkout)
 
 
+def test_read_only_resume_rejects_dirty_fallback_before_binding(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
+        repo, base=base
+    )
+    dirty_file = checkout / "resume-dirty.txt"
+    dirty_file.write_text("keep me\n", encoding="utf-8")
+    args = SimpleNamespace(
+        parent_dispatch_id="readonly-parent",
+        dispatch_id="readonly-child",
+        agent="codex",
+        shape="bash",
+        read_only=True,
+        cwd=str(checkout),
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="read-only resume checkout .* is not clean",
+    ):
+        goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+
+    assert dirty_file.read_text(encoding="utf-8") == "keep me\n"
+    assert not hasattr(args, "_worktree_path")
+
+
 def test_read_only_resume_touches_checkout_under_allocation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
