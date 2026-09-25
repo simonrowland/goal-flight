@@ -169,15 +169,13 @@ def test_process_listing_limits_ps_to_requested_pids(
     assert listing == [(17, "python one.py"), (23, "python two.py")]
 
 
-def test_supervisor_process_listing_narrows_before_ps(
+def test_supervisor_process_listing_uses_full_ps_census(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def check_output(command: list[str], **kwargs: object) -> str:
         calls.append((command, kwargs))
-        if command[0] == "pgrep":
-            return "23\n"
         return "23 python /repo/goalflight_messages.py supervise\n"
 
     monkeypatch.setattr(wake.subprocess, "check_output", check_output)
@@ -185,39 +183,37 @@ def test_supervisor_process_listing_narrows_before_ps(
     listing = wake._process_listing()
 
     assert listing == [(23, "python /repo/goalflight_messages.py supervise")]
-    assert calls[0][0] == ["pgrep", "-f", wake._SUPERVISOR_PGREP_PATTERN]
-    assert calls[1][0] == [
-        "ps",
-        "-ww",
-        "-p",
-        "23",
-        "-o",
-        "pid=,command=",
+    assert calls == [
+        (
+            ["ps", "-axww", "-o", "pid=,command="],
+            {
+                "text": True,
+                "stderr": wake.subprocess.DEVNULL,
+                "timeout": wake.SUPERVISOR_PROCESS_PROBE_TIMEOUT_S,
+            },
+        )
     ]
-    assert calls[0][1]["timeout"] == wake.SUPERVISOR_PROCESS_PROBE_TIMEOUT_S
 
 
 def test_supervisor_process_listing_retries_a_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pgrep_calls = 0
+    ps_calls = 0
 
     def check_output(command: list[str], **_kwargs: object) -> str:
-        nonlocal pgrep_calls
-        if command[0] == "pgrep":
-            pgrep_calls += 1
-            if pgrep_calls == 1:
-                raise subprocess.TimeoutExpired(command, 10.0)
-            return "23\n"
+        nonlocal ps_calls
+        ps_calls += 1
+        if ps_calls == 1:
+            raise subprocess.TimeoutExpired(command, 10.0)
         return "23 python /repo/goalflight_messages.py supervise\n"
 
     monkeypatch.setattr(wake.subprocess, "check_output", check_output)
 
     assert wake._process_listing() is not None
-    assert pgrep_calls == 2
+    assert ps_calls == 2
 
 
-def test_supervisor_process_listing_no_match_is_positive_absence(
+def test_supervisor_process_listing_ps_failure_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def check_output(command: list[str], **_kwargs: object) -> str:
@@ -225,7 +221,122 @@ def test_supervisor_process_listing_no_match_is_positive_absence(
 
     monkeypatch.setattr(wake.subprocess, "check_output", check_output)
 
-    assert wake._process_listing() == []
+    assert wake._process_listing() is None
+
+
+def test_supervisor_census_does_not_treat_prefilter_miss_as_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = (
+        "python3 /repo/goalflight_messages.py supervise "
+        "--project-root /repo --controller-label main "
+        "--lease-nonce generation-2"
+    )
+
+    def check_output(command_argv: list[str], **_kwargs: object) -> str:
+        if command_argv[0] == "pgrep":
+            raise subprocess.CalledProcessError(1, command_argv)
+        assert command_argv == ["ps", "-axww", "-o", "pid=,command="]
+        return f"101 {command}\n"
+
+    monkeypatch.setattr(wake.subprocess, "check_output", check_output)
+    listing = wake._process_listing()
+
+    assert listing == [(101, command)]
+    assert (
+        wake._supervisor_generation_state_from_listing(
+            listing,
+            project_root=Path("/repo"),
+            controller_label="main",
+            lease_nonce="generation-2",
+        )
+        == wake.SUPERVISOR_RUNNING
+    )
+
+
+def test_supervisor_census_empty_success_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wake.subprocess, "check_output", lambda *_args, **_kwargs: "")
+
+    assert wake._process_listing() is None
+
+
+def test_dead_supervisor_slot_falls_through_to_process_census(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    command = (
+        "python3 /repo/goalflight_messages.py supervise "
+        f"--project-root {root} --controller-label main "
+        "--lease-nonce generation-2"
+    )
+    record = wake.WaiterRecord(
+        kind=wake.SUPERVISOR_KIND,
+        label_hash=wake._label_hash("main"),
+        pid=43123,
+        start_hash=wake._start_hash("owner"),
+        instance_id="i" * 32,
+        path=root / "supervisor.lock",
+        generation_hash=wake._waiter_generation_hash("generation-2"),
+    )
+    census_calls = 0
+
+    monkeypatch.setattr(
+        wake,
+        "_supervisor_slot_records",
+        lambda *_args, **_kwargs: [record],
+    )
+    monkeypatch.setattr(wake.goalflight_compat, "pid_liveness", lambda _pid: False)
+    monkeypatch.setattr(wake.goalflight_compat, "pid_is_zombie", lambda _pid: False)
+
+    def process_listing(**_kwargs: object) -> list[tuple[int, str]]:
+        nonlocal census_calls
+        census_calls += 1
+        return [(101, command)]
+
+    monkeypatch.setattr(wake, "_process_listing", process_listing)
+
+    assert (
+        wake.supervisor_generation_state(
+            root,
+            controller_label="main",
+            lease_nonce="generation-2",
+        )
+        == wake.SUPERVISOR_RUNNING
+    )
+    assert census_calls == 1
+
+
+def test_module_form_supervisor_survives_process_census(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = (
+        "python3 -m goalflight_messages supervise "
+        "--project-root /repo --controller-label main "
+        "--lease-nonce generation-2"
+    )
+
+    def check_output(command_argv: list[str], **_kwargs: object) -> str:
+        if command_argv[0] == "pgrep":
+            raise subprocess.CalledProcessError(1, command_argv)
+        assert command_argv == ["ps", "-axww", "-o", "pid=,command="]
+        return f"101 {command}\n"
+
+    monkeypatch.setattr(wake.subprocess, "check_output", check_output)
+    listing = wake._process_listing()
+
+    assert (
+        wake._supervisor_generation_state_from_listing(
+            listing,
+            project_root=Path("/repo"),
+            controller_label="main",
+            lease_nonce="generation-2",
+        )
+        == wake.SUPERVISOR_RUNNING
+    )
 
 
 @pytest.mark.parametrize(
@@ -328,7 +439,7 @@ def test_supervisor_slot_requires_pid_and_start_token_proof(
     assert state == expected
 
 
-def test_dead_supervisor_slot_reclaims_aged_monitor_without_waiting(
+def test_dead_supervisor_slot_reclaims_only_after_census_absence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -371,11 +482,14 @@ def test_dead_supervisor_slot_reclaims_aged_monitor_without_waiting(
     )
     monkeypatch.setattr(wake.goalflight_compat, "pid_liveness", lambda _pid: False)
     monkeypatch.setattr(wake.goalflight_compat, "pid_is_zombie", lambda _pid: False)
-    monkeypatch.setattr(
-        wake,
-        "_process_listing",
-        lambda: pytest.fail("dead owner reclaim must not wait for aging or ps"),
-    )
+    census_calls = 0
+
+    def process_listing(**_kwargs: object) -> list[tuple[int, str]]:
+        nonlocal census_calls
+        census_calls += 1
+        return []
+
+    monkeypatch.setattr(wake, "_process_listing", process_listing)
 
     assert (
         wake.supervisor_generation_state(
@@ -385,6 +499,7 @@ def test_dead_supervisor_slot_reclaims_aged_monitor_without_waiting(
         )
         == wake.SUPERVISOR_ABSENT
     )
+    assert census_calls == 1
 
 
 def _summary_and_notice(root: Path) -> tuple[dict, str]:

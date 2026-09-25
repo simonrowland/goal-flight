@@ -323,21 +323,15 @@ def _ps_listing_env(
     shim_dir.mkdir()
     ps_shim = shim_dir / "ps"
     body = "#!/bin/sh\n"
-    body += "".join(
-        f"printf '%s\\n' {shlex.quote(row)}\n" for row in rows
-    )
+    if rows:
+        body += "".join(
+            f"printf '%s\\n' {shlex.quote(row)}\n" for row in rows
+        )
+    else:
+        body += "printf '%s\\n' '1 init'\n"
     body += "exit 0\n"
     ps_shim.write_text(body, encoding="utf-8")
     ps_shim.chmod(0o755)
-    pgrep_shim = shim_dir / "pgrep"
-    pgrep_body = "#!/bin/sh\n"
-    pgrep_body += "".join(
-        f"printf '%s\\n' {shlex.quote(row.split(maxsplit=1)[0])}\n"
-        for row in rows
-    )
-    pgrep_body += f"exit {0 if rows else 1}\n"
-    pgrep_shim.write_text(pgrep_body, encoding="utf-8")
-    pgrep_shim.chmod(0o755)
     return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
 
 
@@ -447,12 +441,6 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
             encoding="utf-8",
         )
         running_ps.chmod(0o755)
-        running_pgrep = running_shim_dir / "pgrep"
-        running_pgrep.write_text(
-            "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(str(supervisor.pid)) + "\n",
-            encoding="utf-8",
-        )
-        running_pgrep.chmod(0o755)
         running_env = {
             **env,
             "PATH": f"{running_shim_dir}:{env.get('PATH', '')}",

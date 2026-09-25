@@ -60,7 +60,6 @@ ENTRY_POLL_INTERVAL_S = 0.1
 MONITOR_PROCESS_PROBE_TIMEOUT_S = 0.2
 SUPERVISOR_PROCESS_PROBE_TIMEOUT_S = 10.0
 SUPERVISOR_PROCESS_PROBE_ATTEMPTS = 2
-_SUPERVISOR_PGREP_PATTERN = "goalflight_messages[.]py[[:space:]]+supervise"
 _FILE_VERSION = "v3"
 _LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
@@ -3134,13 +3133,11 @@ def _process_listing(
     timeout_s: float = SUPERVISOR_PROCESS_PROBE_TIMEOUT_S,
     pids: Iterable[int] | None = None,
 ) -> list[tuple[int | None, str]] | None:
-    """Relevant live process argv rows, or None when the probe is unknown.
+    """Full live process argv rows, or None when the probe is unknown.
 
     The legacy process probe is only a fallback for generations without a
     recorded supervisor slot. A missing ``ps``, a timeout, or an unreadable
-    table is UNKNOWN, never a guessed empty pool. The supervisor path first
-    narrows the process set with ``pgrep`` so a busy host does not make the
-    full argv table itself the liveness bottleneck. A timeout retries once
+    table is UNKNOWN, never a guessed empty pool. A timeout retries once
     within the same bounded probe budget.
     """
     if os.name == "nt" or fcntl is None:
@@ -3157,6 +3154,11 @@ def _process_listing(
             "-o",
             "pid=,command=",
         ]
+        attempts = 1
+    else:
+        command = ["ps", "-axww", "-o", "pid=,command="]
+        attempts = SUPERVISOR_PROCESS_PROBE_ATTEMPTS
+    for attempt in range(attempts):
         try:
             output = subprocess.check_output(
                 command,
@@ -3164,47 +3166,19 @@ def _process_listing(
                 stderr=subprocess.DEVNULL,
                 timeout=timeout_s,
             )
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < attempts:
+                continue
+            return None
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return None
         return _parse_process_listing(output)
-
-    for attempt in range(SUPERVISOR_PROCESS_PROBE_ATTEMPTS):
-        try:
-            pid_output = subprocess.check_output(
-                ["pgrep", "-f", _SUPERVISOR_PGREP_PATTERN],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout_s,
-            )
-        except subprocess.CalledProcessError as exc:
-            if exc.returncode == 1:
-                return []
-            return None
-        except subprocess.TimeoutExpired:
-            if attempt + 1 < SUPERVISOR_PROCESS_PROBE_ATTEMPTS:
-                continue
-            return None
-        except (OSError, UnicodeError):
-            return None
-
-        candidate_pids: list[int] = []
-        for raw in pid_output.splitlines():
-            value = raw.strip()
-            if not value:
-                continue
-            try:
-                candidate_pids.append(int(value))
-            except ValueError:
-                return None
-        if not candidate_pids:
-            return []
-        listed = _process_listing(timeout_s=timeout_s, pids=candidate_pids)
-        if listed is not None:
-            return listed
     return None
 
 
-def _parse_process_listing(output: str) -> list[tuple[int | None, str]]:
+def _parse_process_listing(
+    output: str,
+) -> list[tuple[int | None, str]] | None:
     rows: list[tuple[int | None, str]] = []
     for raw in output.splitlines():
         line = raw.strip()
@@ -3217,7 +3191,7 @@ def _parse_process_listing(output: str) -> list[tuple[int | None, str]]:
             rows.append((None, line))
             continue
         rows.append((pid, command.strip()))
-    return rows
+    return rows or None
 
 
 def _argv_basename(token: str) -> str:
@@ -3575,7 +3549,7 @@ def supervisor_generation_state(
 ) -> str:
     """Whether ``supervise`` is live for this controller generation.
 
-    Uses the recorded supervisor slot first, then a narrow process probe for
+    Uses the recorded supervisor slot first, then a full process probe for
     a matching ``goalflight_messages.py supervise --lease-nonce <this nonce>``
     in executable position (and matching ``--project-root`` /
     ``--controller-label`` when those flags are present). Trailing tokens
@@ -3598,12 +3572,12 @@ def supervisor_generation_state(
         return SUPERVISOR_RUNNING
     if not str(controller_label or "").strip() or not str(lease_nonce or "").strip():
         return SUPERVISOR_UNKNOWN
-    slot_state, had_slot = supervisor_slot_probe(
+    slot_state, _ = supervisor_slot_probe(
         project_root,
         controller_label=controller_label,
         generation_key=lease_nonce,
     )
-    if had_slot or slot_state == SUPERVISOR_UNKNOWN:
+    if slot_state != SUPERVISOR_ABSENT:
         return slot_state
     listing = _process_listing()
     return _supervisor_generation_state_from_listing(
@@ -3661,12 +3635,12 @@ def supervisor_generation_states(
     states: list[str | None] = [None] * len(requested)
     unresolved: list[int] = []
     for index, (project_root, controller_label, lease_nonce) in enumerate(requested):
-        slot_state, had_slot = supervisor_slot_probe(
+        slot_state, _ = supervisor_slot_probe(
             project_root,
             controller_label=controller_label,
             generation_key=lease_nonce,
         )
-        if had_slot or slot_state == SUPERVISOR_UNKNOWN:
+        if slot_state != SUPERVISOR_ABSENT:
             states[index] = slot_state
         else:
             unresolved.append(index)

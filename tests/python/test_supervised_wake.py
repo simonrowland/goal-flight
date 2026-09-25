@@ -936,11 +936,14 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         "supervisor_slot_probe",
         lambda *_args, **_kwargs: (wake.SUPERVISOR_ABSENT, True),
     )
-    monkeypatch.setattr(
-        wake,
-        "_process_listing",
-        lambda: pytest.fail("a reclaimed slot must not need a process listing"),
-    )
+    process_listing_calls = 0
+
+    def process_listing(**_kwargs: object) -> list[tuple[int, str]]:
+        nonlocal process_listing_calls
+        process_listing_calls += 1
+        return []
+
+    monkeypatch.setattr(wake, "_process_listing", process_listing)
     monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: SimpleNamespace())
     calls: list[dict[str, object]] = []
 
@@ -982,6 +985,7 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         args,
         on_startup_probe=lambda _root, _label, _nonce: None,
     ) == 0
+    assert process_listing_calls == 1
     assert calls[0]["heartbeat_s"] == 3600.0
     assert calls[0]["coverage_s"] == 3600.0
     rearm = supervise._supervisor_rearm_command(

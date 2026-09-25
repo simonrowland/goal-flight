@@ -45,19 +45,16 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     for value in env.values():
         if value != os.devnull:
             Path(value).mkdir(parents=True, exist_ok=True)
-    ps_dir = td / "empty-process-listing"
+    ps_dir = td / "absent-supervisor-process-listing"
     ps_dir.mkdir()
     ps_shim = ps_dir / "ps"
     ps_shim.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"-axww\" ]; then exit 0; fi\n"
+        "if [ \"$1\" = \"-axww\" ]; then printf '%s\\n' '1 init'; exit 0; fi\n"
         "exec /bin/ps \"$@\"\n",
         encoding="utf-8",
     )
     ps_shim.chmod(0o755)
-    pgrep_shim = ps_dir / "pgrep"
-    pgrep_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    pgrep_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{os.environ.get('PATH', '')}"
     monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     for key, value in env.items():
@@ -361,12 +358,11 @@ def test_consumed_slot_with_work_in_flight_emits_floor_and_following_it_restores
                 live = wake.live_waiters(project, controller_label="floor-ctl") or []
                 assert len(live) == 1
                 assert live[0].pid == replacement.pid
-                listed = subprocess.check_output(
-                    ["ps", "-o", "ppid=", "-p", str(replacement.pid)],
-                    text=True,
-                ).strip()
-                assert int(listed) == os.getpid()
-                assert int(listed) != 1
+                # Keep the launch contract explicit without probing the live
+                # process table: this call passes the listener argv directly,
+                # rather than a shell command or wrapper.
+                assert replacement.args == cmd
+                assert replacement.args[0] == sys.executable
             finally:
                 if replacement.poll() is None:
                     replacement.kill()

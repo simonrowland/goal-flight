@@ -70,14 +70,17 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     return env
 
 
-def _env_with_empty_process_listing(
+def _env_with_absent_supervisor_listing(
     env: dict[str, str],
     directory: Path,
 ) -> dict[str, str]:
-    shim_dir = directory / "empty-process-listing"
+    shim_dir = directory / "absent-supervisor-process-listing"
     shim_dir.mkdir(exist_ok=True)
     ps_shim = shim_dir / "ps"
-    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '1 init'\nexit 0\n",
+        encoding="utf-8",
+    )
     ps_shim.chmod(0o755)
     return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
 
@@ -1758,7 +1761,7 @@ def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
     lease_holder = _hold_claimed_lease(root, claimed.value)
     env = dict(env)
     env["GOALFLIGHT_LISTENER_STARTUP_GRACE_S"] = "0.2"
-    env = _env_with_empty_process_listing(env, tmp_path)
+    env = _env_with_absent_supervisor_listing(env, tmp_path)
     # The re-arm hint now names the ADVERTISED install rather than the running
     # copy, so that a listener started from a development checkout does not tell
     # its reader to re-arm that checkout. Pin the advertised root to the code
@@ -3036,7 +3039,7 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
     isolated: tuple[Path, dict[str, str]], tmp_path: Path
 ) -> None:
     root, env = isolated
-    env = _env_with_empty_process_listing(env, tmp_path)
+    env = _env_with_absent_supervisor_listing(env, tmp_path)
     authority = journal.open_or_create_journal(root)
     commands = _entry_commands(root, tmp_path)
     for command, _mail_bearing in commands:

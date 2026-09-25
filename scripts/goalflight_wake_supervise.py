@@ -2831,12 +2831,12 @@ def cmd_supervise(
         print(f"supervise: {refusal}", file=sys.stderr)
         return int(refusal_code or SUPERVISE_START_EXIT)
     if on_startup_probe is not None:
-        slot_state, had_slot = wake.supervisor_slot_probe(
+        slot_state, _ = wake.supervisor_slot_probe(
             project_root,
             controller_label=label,
             generation_key=live_nonce,
         )
-        if had_slot or slot_state == wake.SUPERVISOR_UNKNOWN:
+        if slot_state != wake.SUPERVISOR_ABSENT:
             existing = slot_state
         else:
             listing = wake._process_listing()
