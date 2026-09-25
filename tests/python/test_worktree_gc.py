@@ -514,6 +514,44 @@ def test_read_only_gc_holds_allocator_lock_across_remove_recheck(
     assert wt.is_dir()
 
 
+def test_read_only_gc_rejects_replaced_allocation_lock_identity(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with goalflight_worktree_pool._read_only_allocation_lock(repo):
+        pass
+    lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
+    parent = lock_path.parent
+    backup = parent.with_name(parent.name + ".real")
+    replacement = tmp_path / "replacement-lock-root"
+    original = goalflight_worktree_pool._lock_path_identity
+    swapped = False
+
+    def race(path: Path):
+        nonlocal swapped
+        identity = original(path)
+        if path == lock_path and not swapped:
+            parent.rename(backup)
+            replacement.mkdir()
+            (replacement / lock_path.name).touch()
+            parent.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return identity
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_lock_path_identity", race)
+    try:
+        handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(repo)
+        if handle is not None:
+            handle.close()
+        assert swapped
+        assert handle is None
+        assert error
+    finally:
+        parent.unlink()
+        replacement.joinpath(lock_path.name).unlink()
+        replacement.rmdir()
+        backup.rename(parent)
+
+
 def test_read_only_root_symlink_cannot_reap_pool_seat(
     tmp_path: Path, repo: Path
 ) -> None:
@@ -672,56 +710,30 @@ def test_registered_pool_worktree_is_reclaimed_only_after_full_gate(
     assert os.path.realpath(wt) not in _worktree_paths(repo)
 
 
-@pytest.mark.parametrize("operation", ["check", "acquire"])
-def test_pool_lock_symlink_swap_is_unknown(
-    tmp_path: Path,
-    repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    operation: str,
+def test_gc_revalidates_held_pool_lock_identity(
+    tmp_path: Path, repo: Path
 ) -> None:
-    if os.name == "nt":
-        pytest.skip("symlink race test requires POSIX links")
-    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "symlink-race")
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "held-lock-owner")
     seat = lease.path
     lease.release()
-    original = goalflight_worktree_pool._registered_pool_seat_lock_info
-    swapped: dict[str, Path] = {}
-
-    def race(path: str | Path, *, project_root: Path):
-        info = original(path, project_root=project_root)
-        if info[0] == goalflight_worktree_pool.YES:
-            lock_path = info[2]
-            assert lock_path is not None
-            replacement = tmp_path / "unrelated-locks"
-            replacement.mkdir()
-            (replacement / lock_path.name).touch()
-            parent = lock_path.parent
-            backup = parent.with_name(parent.name + ".real")
-            parent.rename(backup)
-            parent.symlink_to(replacement, target_is_directory=True)
-            swapped.update(parent=parent, backup=backup)
-        return info
-
-    monkeypatch.setattr(
-        goalflight_worktree_pool,
-        "_registered_pool_seat_lock_info",
-        race,
-    )
+    held, error = goalflight_worktree_gc._acquire_pool_action_lock(repo, str(seat))
+    assert held is not None, error
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, seat)
+    parent = lock_path.parent
+    backup = parent.with_name(parent.name + ".real")
+    parent.rename(backup)
+    parent.mkdir()
+    (parent / lock_path.name).touch()
     try:
-        if operation == "check":
-            result = goalflight_worktree_gc.check_pool_unlocked(repo, str(seat))
-            assert result["verdict"] == goalflight_worktree_gc.UNKNOWN, result
-        else:
-            handle, error = goalflight_worktree_gc._acquire_pool_action_lock(
-                repo, str(seat)
-            )
-            if handle is not None:
-                handle.close()
-            assert handle is None
-            assert error
+        result = goalflight_worktree_gc.check_pool_unlocked(
+            repo, str(seat), held_lock=held
+        )
+        assert result["verdict"] == goalflight_worktree_gc.UNKNOWN, result
     finally:
-        swapped["parent"].unlink()
-        swapped["backup"].rename(swapped["parent"])
+        held.close()
+        (parent / lock_path.name).unlink()
+        parent.rmdir()
+        backup.rename(parent)
 
 
 def test_adhoc_worktree_named_wt_n_is_reclaimable(

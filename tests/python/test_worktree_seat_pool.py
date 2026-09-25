@@ -715,6 +715,52 @@ def test_shared_hold_rejects_parent_lock_symlink(tmp_path: Path) -> None:
         backup.rename(parent)
 
 
+def test_shared_hold_rejects_replaced_lock_parent_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name == "nt":
+        pytest.skip("lock identity race test requires POSIX file replacement")
+    repo = make_repo(tmp_path)
+    base = add_read_only_base(repo, 0)
+    writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "writer-parent-identity-race", base=base
+    )
+    seat = writer.path
+    finish_seat_holder(writer)
+    original = goalflight_worktree_pool._registered_pool_seat_lock_info
+    swapped: dict[str, Path] = {}
+
+    def race(path: str | Path, *, project_root: Path):
+        info = original(path, project_root=project_root)
+        if info[0] == goalflight_worktree_pool.YES:
+            lock_path = info[2]
+            assert lock_path is not None
+            parent = lock_path.parent
+            backup = parent.with_name(parent.name + ".real")
+            parent.rename(backup)
+            parent.mkdir()
+            (parent / lock_path.name).touch()
+            swapped.update(parent=parent, backup=backup)
+        return info
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_registered_pool_seat_lock_info",
+        race,
+    )
+    try:
+        hold = goalflight_worktree_pool._try_acquire_shared_read_only_seat(
+            repo, seat, base, "review-parent-identity-race"
+        )
+        if hold is not None:
+            hold.release()
+        assert hold is None
+    finally:
+        swapped["parent"].joinpath(seat.name + ".lock").unlink()
+        swapped["parent"].rmdir()
+        swapped["backup"].rename(swapped["parent"])
+
+
 def test_two_read_only_reviews_share_one_seat_and_release_on_crash() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         root = Path(td)

@@ -70,7 +70,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import sys
 import time
@@ -583,10 +582,26 @@ def check_pool_unlocked(
         )
     )
     if verdict == NO:
+        if held_lock is not None:
+            return _condition(
+                UNKNOWN,
+                "registered pool worktree lock disappeared while action lock was held",
+            )
         return _condition(YES, "path is not a registered pool worktree")
     if verdict == UNKNOWN:
         return _condition(UNKNOWN, reason)
     if held_lock is not None:
+        try:
+            held_matches = goalflight_worktree_pool._lock_fd_matches_identity(
+                held_lock.fileno(), lock_stat
+            )
+        except (OSError, ValueError):
+            held_matches = False
+        if not held_matches:
+            return _condition(
+                UNKNOWN,
+                "registered pool worktree lock changed while action lock was held",
+            )
         return _condition(YES, "registered pool worktree lock held for action")
     handle, error = _open_validated_pool_lock(lock_path, lock_stat)
     if error is not None:
@@ -612,19 +627,15 @@ def _open_validated_pool_lock(
         flags |= os.O_NOFOLLOW
     fd: int | None = None
     try:
-        fd = goalflight_worktree_pool._open_lock_path_safely(lock_path, flags)
-        opened_stat = os.fstat(fd)
+        fd = goalflight_worktree_pool._open_lock_path_safely(
+            lock_path,
+            flags,
+            expected_stat=expected_stat,
+        )
     except OSError as exc:
         if fd is not None:
             os.close(fd)
         return None, f"pool worktree lock could not be opened ({exc})"
-    if (
-        not stat.S_ISREG(opened_stat.st_mode)
-        or opened_stat.st_dev != expected_stat.st_dev
-        or opened_stat.st_ino != expected_stat.st_ino
-    ):
-        os.close(fd)
-        return None, "pool worktree lock changed after registration was checked"
     try:
         handle = os.fdopen(fd, "r+", encoding="utf-8")
     except OSError as exc:
@@ -670,7 +681,11 @@ def _acquire_read_only_action_lock(
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(lock_path, flags, 0o600)
+        fd = goalflight_worktree_pool._open_lock_path_safely(
+            lock_path,
+            flags,
+            expected_stat=goalflight_worktree_pool._lock_path_identity(lock_path),
+        )
     except OSError as exc:
         return None, f"read-only allocation lock could not be opened ({exc})"
     handle = os.fdopen(fd, "r+", encoding="utf-8")

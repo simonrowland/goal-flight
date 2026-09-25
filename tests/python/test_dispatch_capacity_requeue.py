@@ -548,6 +548,7 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
         env = _env(tmp)
         dispatch_id = "spawn-failure-capacity-lifecycle"
         events: list[tuple[str, str | None]] = []
+        guard_restored = False
         original_spawning = D.goalflight_capacity.mark_lease_spawning
         original_spawn_failed = D.goalflight_capacity.mark_lease_spawn_failed
         lease_rows: list[dict] = []
@@ -560,6 +561,18 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
             events.append(("spawn_failed", lease_id))
             return original_spawn_failed(lease_id, reason=reason)
 
+        def install_guard(_lease_id: str | None):
+            def restore() -> None:
+                nonlocal guard_restored
+                guard_restored = True
+                events.append(("guard_restored", None))
+
+            return restore
+
+        def spawn_failure(*_args, **_kwargs):
+            assert guard_restored, "capacity signal guard remained active during spawn"
+            raise RuntimeError("spawn failure")
+
         old_env = os.environ.copy()
         try:
             os.environ.clear()
@@ -567,7 +580,8 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
             with (
                 patch.object(D.goalflight_capacity, "mark_lease_spawning", mark_spawning),
                 patch.object(D.goalflight_capacity, "mark_lease_spawn_failed", mark_spawn_failed),
-                patch.object(D, "_spawn_daemonized_process", side_effect=RuntimeError("spawn failure")),
+                patch.object(D, "_install_capacity_lease_signal_guard", install_guard),
+                patch.object(D, "_spawn_daemonized_process", side_effect=spawn_failure),
             ):
                 result = D.main(
                     [
@@ -600,7 +614,11 @@ def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
             os.environ.update(old_env)
 
         assert result == 1
-        assert [event[0] for event in events] == ["spawning", "spawn_failed"], events
+        assert [event[0] for event in events] == [
+            "spawning",
+            "guard_restored",
+            "spawn_failed",
+        ], events
         lease = next(row for row in lease_rows if row.get("dispatch_id") == dispatch_id)
         assert lease.get("launch_state") == "spawn_failed", lease
         assert lease.get("state") == "error", lease

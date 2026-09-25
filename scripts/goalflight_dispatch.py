@@ -2350,6 +2350,16 @@ def _revalidate_read_only_resume_worktree(
         source["record"],
         _worker_cwd(args),
     )
+    if getattr(args, "_worktree_read_only", False):
+        clean = goalflight_worktree_pool.check_seat_cleanliness(
+            _worker_cwd(args),
+            timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+        )
+        if clean["verdict"] != goalflight_worktree_pool.YES:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"read-only resume checkout {_worker_cwd(args)} is not clean: "
+                f"{clean['reason']}"
+            )
 
 
 def _emit_resume_worktree_recovery_refs(args, lease) -> None:
@@ -4283,10 +4293,12 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
 
 def _resume_holder_is_in_lineage(holder_dispatch_id: str, parent_dispatch_id: str) -> bool:
     """Return true only when a terminal seat holder links to this parent."""
-    if holder_dispatch_id == parent_dispatch_id:
-        return True
     try:
-        return parent_dispatch_id in _resume_lineage_dispatch_ids(holder_dispatch_id)
+        _record, live = goalflight_worktree_pool._holder_record(holder_dispatch_id)
+        if live is not False:
+            return False
+        lineage = _resume_lineage_dispatch_ids(holder_dispatch_id)
+        return parent_dispatch_id in lineage
     except Exception:
         return False
 
@@ -22601,6 +22613,14 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         _mark_queue_claim_worker_spawn_intent(args)
         if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
             raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
+        # From this point a child may exist before this process receives its
+        # PID. Do not let an operator signal release the lease and finalize a
+        # failure after spawn has begun; reconciliation can adopt an
+        # indeterminate handoff, but an early release can oversubscribe the
+        # account and orphan the worker.
+        if capacity_signal_guard is not None:
+            capacity_signal_guard()
+            capacity_signal_guard = None
         worker_spawn_attempted = True
         worker_pid = _spawn_daemonized_process(
             worker_argv,
@@ -22614,9 +22634,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             cwd=str(_worker_cwd(args)),
             inherit_occupancy_lock=True,
         )
-        if capacity_signal_guard is not None:
-            capacity_signal_guard()
-            capacity_signal_guard = None
         # Worker inherited the occupancy fd. Drop this process's copy so a
         # later in-process launch does not see a closed descriptor as
         # occupancy unknown. Sidecars must not keep the now-closed number.

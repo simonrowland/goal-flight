@@ -919,6 +919,47 @@ def test_read_only_resume_touches_checkout_under_allocation_lock(
     assert args._worktree_path == str(checkout)
 
 
+def test_read_only_resume_rejects_dirty_checkout_after_preparation(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    checkout, _selected = goalflight_worktree_pool.shared_read_only_worktree(
+        repo, base=base
+    )
+    record = {
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": "readonly-dirty-parent",
+        "state": "blocked",
+        "terminal_state": "blocked",
+        "project_root": str(repo),
+        "worker_cwd": str(checkout),
+        "worktree_path": str(checkout),
+        "worktree_base": base,
+    }
+    goalflight_ledger.write_record(record)
+    args = SimpleNamespace(
+        parent_dispatch_id="readonly-dirty-parent",
+        dispatch_id="readonly-dirty-child",
+        agent="codex",
+        shape="bash",
+        read_only=True,
+        cwd=str(checkout),
+    )
+
+    goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+    (checkout / "late-untracked.txt").write_text("changed after preparation\n")
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="read-only resume checkout .* is not clean",
+    ):
+        goalflight_dispatch._revalidate_read_only_resume_worktree(
+            args,
+            resume_plan={"source": {"record": record}},
+        )
+
+
 def test_occupancy_refusal_releases_bound_seat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1394,6 +1435,43 @@ def test_resume_refuses_unresolvable_terminal_holder_immediately(
     ):
         goalflight_dispatch._admit_dispatch_worktree(args)
     assert time.monotonic() - started < 1
+
+
+def test_resume_lineage_error_never_allows_same_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unresolved(_holder: str):
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            "resume refused: lineage is unreadable"
+        )
+
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_resume_lineage_dispatch_ids",
+        unresolved,
+    )
+    assert not goalflight_dispatch._resume_holder_is_in_lineage(
+        "resume-parent", "resume-parent"
+    )
+
+
+def test_resume_unresolvable_lineage_holder_never_reuses_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    repo = _make_repo(tmp_path)
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "unresolvable-holder",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+        }
+    )
+    assert not goalflight_dispatch._resume_holder_is_in_lineage(
+        "unresolvable-holder", "unresolvable-holder"
+    )
 
 
 def test_resume_never_steals_live_holder_in_same_lineage(

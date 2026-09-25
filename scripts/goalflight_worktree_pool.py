@@ -1234,9 +1234,17 @@ def _try_acquire_shared_read_only_seat(
 ) -> WorktreeReadOnlySeatLease | None:
     """Take a non-blocking shared hold, then close the HEAD/status race."""
     try:
-        lock_path = worktree_lock_path_for_path(project_root, path)
+        verdict, _reason, lock_path, expected_stat = (
+            _registered_pool_seat_lock_info(path, project_root=project_root)
+        )
+        if verdict != YES or lock_path is None or expected_stat is None:
+            return None
         flags = _lock_open_flags() & ~os.O_CREAT
-        lock_fd = _open_lock_path_safely(lock_path, flags)
+        lock_fd = _open_lock_path_safely(
+            lock_path,
+            flags,
+            expected_stat=expected_stat,
+        )
     except (OSError, WorktreeSeatError):
         return None
     lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
@@ -2813,7 +2821,11 @@ def acquire_worktree_seat(
     flags = _lock_open_flags()
     allocation_lock_path = lock_root / "allocation.lock"
     try:
-        allocation_fd = os.open(allocation_lock_path, flags, 0o600)
+        allocation_fd = _open_lock_path_safely(
+            allocation_lock_path,
+            flags,
+            expected_stat=_lock_path_identity(allocation_lock_path),
+        )
     except OSError as exc:
         raise WorktreeSeatError(
             f"cannot open worktree allocation lock {allocation_lock_path}: {exc}"
@@ -2873,7 +2885,11 @@ def acquire_worktree_seat(
                     note_capacity_occupant(candidate_path, {})
                 continue
             try:
-                probe_fd = os.open(candidate_lock, probe_flags, 0o600)
+                probe_fd = _open_lock_path_safely(
+                    candidate_lock,
+                    probe_flags,
+                    expected_stat=_lock_path_identity(candidate_lock),
+                )
             except OSError:
                 note_capacity_occupant(candidate_path, {})
                 continue
@@ -2923,7 +2939,11 @@ def acquire_worktree_seat(
                 project_root, worktree_path, managed_root=managed_root
             )
             try:
-                lock_fd = os.open(lock_path, flags, 0o600)
+                lock_fd = _open_lock_path_safely(
+                    lock_path,
+                    flags,
+                    expected_stat=_lock_path_identity(lock_path),
+                )
             except OSError as exc:
                 raise WorktreeSeatError(
                     f"cannot open worktree lock {lock_path}: {exc}"
@@ -3020,7 +3040,11 @@ def acquire_worktree_seat(
             lock_existed = lock_path.is_file()
             path_existed = worktree_path.exists()
             try:
-                lock_fd = os.open(lock_path, flags, 0o600)
+                lock_fd = _open_lock_path_safely(
+                    lock_path,
+                    flags,
+                    expected_stat=_lock_path_identity(lock_path),
+                )
             except OSError as exc:
                 raise WorktreeSeatError(
                     f"cannot open worktree lock {lock_path}: {exc}"
@@ -3195,8 +3219,43 @@ def _lock_open_flags() -> int:
     return flags
 
 
+def _lock_path_identity(lock_path: Path) -> os.stat_result | None:
+    """Read the current regular lock inode without following the leaf."""
+    try:
+        identity = os.lstat(lock_path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(identity.st_mode):
+        raise OSError(
+            errno.ELOOP,
+            f"lock path is not a regular file: {lock_path}",
+        )
+    return identity
+
+
+def _lock_fd_matches_identity(
+    fd: int, expected_stat: os.stat_result | None
+) -> bool:
+    """Require a regular fd to be the exact registered lock inode."""
+    if expected_stat is None:
+        return False
+    try:
+        opened_stat = os.fstat(fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened_stat.st_mode)
+        and opened_stat.st_dev == expected_stat.st_dev
+        and opened_stat.st_ino == expected_stat.st_ino
+    )
+
+
 def _open_lock_path_safely(
-    lock_path: Path, flags: int, mode: int = 0o600
+    lock_path: Path,
+    flags: int,
+    mode: int = 0o600,
+    *,
+    expected_stat: os.stat_result | None = None,
 ) -> int:
     """Open a lock only after safely walking every parent directory.
 
@@ -3224,7 +3283,51 @@ def _open_lock_path_safely(
             next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
             os.close(parent_fd)
             parent_fd = next_fd
-        return os.open(parts[-1], flags, mode, dir_fd=parent_fd)
+        leaf = parts[-1]
+        if expected_stat is None:
+            try:
+                expected_stat = os.stat(
+                    leaf,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not flags & os.O_CREAT:
+                    raise
+                try:
+                    fd = os.open(
+                        leaf,
+                        flags | os.O_EXCL,
+                        mode,
+                        dir_fd=parent_fd,
+                    )
+                except FileExistsError:
+                    expected_stat = os.stat(
+                        leaf,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                else:
+                    try:
+                        created_stat = os.fstat(fd)
+                    except OSError:
+                        os.close(fd)
+                        raise
+                    if stat.S_ISREG(created_stat.st_mode):
+                        return fd
+                    os.close(fd)
+                    raise OSError(
+                        errno.ELOOP,
+                        f"created lock is not a regular file: {path}",
+                    )
+        fd = os.open(leaf, flags, mode, dir_fd=parent_fd)
+        if not _lock_fd_matches_identity(fd, expected_stat):
+            os.close(fd)
+            raise OSError(
+                errno.EAGAIN,
+                f"lock identity changed while opening: {path}",
+            )
+        return fd
     finally:
         os.close(parent_fd)
 
@@ -3248,7 +3351,11 @@ def _read_only_allocation_lock(project_root: Path):
     lock_root = _seat_lock_root(project_root)
     lock_root.mkdir(parents=True, exist_ok=True)
     lock_path = read_only_allocation_lock_path(project_root)
-    fd = os.open(lock_path, _lock_open_flags(), 0o600)
+    fd = _open_lock_path_safely(
+        lock_path,
+        _lock_open_flags(),
+        expected_stat=_lock_path_identity(lock_path),
+    )
     lock_file = os.fdopen(fd, "r+", encoding="utf-8")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
@@ -3354,9 +3461,21 @@ def release_worktree_for_dispatch(
         return False, f"refusing release: worktree seat path is unresolved: {path}"
     if not is_managed_worktree_path(path, project_root=project_root):
         return False, "path is not a managed repository worktree"
-    lock_path = worktree_lock_path_for_path(project_root, path)
+    verdict, reason, registered_lock_path, expected_stat = (
+        _registered_pool_seat_lock_info(path, project_root=project_root)
+    )
+    if verdict != YES or registered_lock_path is None or expected_stat is None:
+        return False, f"worktree lock unavailable: {reason}"
     try:
-        handle = os.fdopen(os.open(lock_path, _lock_open_flags(), 0o600), "r+", encoding="utf-8")
+        handle = os.fdopen(
+            _open_lock_path_safely(
+                registered_lock_path,
+                _lock_open_flags(),
+                expected_stat=expected_stat,
+            ),
+            "r+",
+            encoding="utf-8",
+        )
     except OSError as exc:
         return False, f"worktree lock unavailable: {exc}"
     try:
@@ -3442,7 +3561,11 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
             f"cannot create occupancy lock directory {lock_path.parent} ({exc})"
         ) from exc
     try:
-        lock_fd = os.open(str(lock_path), _lock_open_flags(), 0o600)
+        lock_fd = _open_lock_path_safely(
+            lock_path,
+            _lock_open_flags(),
+            expected_stat=_lock_path_identity(lock_path),
+        )
     except OSError as exc:
         raise WorktreePathLockUnknown(
             f"cannot open worktree occupancy lock {lock_path}: {exc}"
