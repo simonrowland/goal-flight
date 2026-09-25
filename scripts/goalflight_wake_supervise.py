@@ -2831,27 +2831,49 @@ def cmd_supervise(
         print(f"supervise: {refusal}", file=sys.stderr)
         return int(refusal_code or SUPERVISE_START_EXIT)
     if on_startup_probe is not None:
-        listing = wake._process_listing()
-        if listing is not None:
-            listing = [
-                (pid, command)
-                for pid, command in listing
-                if pid != os.getpid()
-            ]
-        existing = wake._supervisor_generation_state_from_listing(
-            listing,
-            project_root=project_root,
+        slot_state, _ = wake.supervisor_slot_probe(
+            project_root,
             controller_label=label,
-            lease_nonce=live_nonce,
+            generation_key=live_nonce,
         )
-        if existing != wake.SUPERVISOR_ABSENT:
-            detail = (
-                "an existing supervisor remains live"
-                if existing == wake.SUPERVISOR_RUNNING
-                else "existing supervisor state is indeterminate"
+        if slot_state != wake.SUPERVISOR_ABSENT:
+            existing = slot_state
+        else:
+            listing = wake._process_listing()
+            if listing is not None:
+                listing = [
+                    (pid, command)
+                    for pid, command in listing
+                    if pid != os.getpid()
+                ]
+            existing = wake._supervisor_generation_state_from_listing(
+                listing,
+                project_root=project_root,
+                controller_label=label,
+                lease_nonce=live_nonce,
             )
+        if existing != wake.SUPERVISOR_ABSENT:
+            takeover = bool(getattr(args, "takeover", False))
+            if existing == wake.SUPERVISOR_RUNNING:
+                detail = (
+                    "takeover refused: an existing supervisor remains live; "
+                    "wake coverage was not verified; run --list-controllers"
+                    if takeover
+                    else "an existing supervisor remains live; wake coverage "
+                    "was not verified; run --list-controllers"
+                )
+            else:
+                detail = (
+                    "takeover refused: supervisor owner death is not proven "
+                    "by PID + start token; run --list-controllers"
+                    if takeover
+                    else "existing supervisor state is indeterminate; wake "
+                    "coverage was not verified; run --list-controllers or "
+                    "retry with --takeover only after PID + start token "
+                    "prove the owner is dead"
+                )
             print(
-                f"supervise: did-not-arm: {detail}; existing wake coverage retained",
+                f"supervise: did-not-arm: {detail}",
                 file=sys.stderr,
             )
             return SUPERVISE_START_EXIT
@@ -2904,7 +2926,21 @@ def cmd_supervise(
         controller_label=label,
         lease_nonce=live_nonce,
     )
+    supervisor_registration = None
     try:
+        try:
+            supervisor_registration = wake.register_supervisor_waiter(
+                project_root,
+                controller_label=label,
+                generation_key=live_nonce,
+            )
+        except (BlockingIOError, OSError, RuntimeError, ValueError) as exc:
+            print(
+                "supervise: did-not-arm: supervisor slot could not be claimed; "
+                f"wake coverage was not verified: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return SUPERVISE_START_EXIT
         reader = goalflight_journal.Journal.open_reader(
             project_root,
             persistent=True,
@@ -2918,6 +2954,8 @@ def cmd_supervise(
         goalflight_journal.JournalIntegrityError,
         goalflight_journal.JournalUpgradeRequired,
     ) as exc:
+        if supervisor_registration is not None:
+            supervisor_registration.close()
         print(f"supervise: journal holder unavailable: {exc}", file=sys.stderr)
         return SUPERVISE_START_EXIT
 
@@ -2948,6 +2986,8 @@ def cmd_supervise(
             on_startup_probe=on_startup_probe,
         )
     finally:
+        if supervisor_registration is not None:
+            supervisor_registration.close()
         if host._journal_holder is not None:
             host._journal_holder.close()
         connection = getattr(reader, "_reader_connection", None)

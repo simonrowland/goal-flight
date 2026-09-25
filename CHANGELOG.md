@@ -30,6 +30,7 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- `supervise` no longer treats a failed or timed-out process listing as proof that no supervisor is running. The listing budget is raised and bounded with retries, an indeterminate result stays indeterminate, and callers neither arm a second wake pool nor release a live generation's listeners on it. Previously a listing that timed out under load was read as absence, which left controllers running with no wake coverage while reporting healthy.
 - A worktree is reclaimed only when its previous holder is in a terminal ledger state and its worker process is proven gone by process identity (pid plus start token, because pids are reused). Every indeterminate answer retains the worktree instead of reclaiming it: unreadable metadata, an unreadable or empty ledger, an unregistered lock, or a checkout whose presence cannot be confirmed. A checkout that cannot be confirmed present is no longer treated as absent.
 - Account validation runs before any dispatch side effect on every launch path.
 - Unknown liveness evidence from a failed process probe is reported as unknown (never live or dead), so pending sidecars are not settled on it.

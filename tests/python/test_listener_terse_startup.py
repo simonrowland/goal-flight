@@ -119,14 +119,17 @@ def _claim(project: Path, label: str = "terse-ctl") -> journal.LeaseIdentity:
     return claimed.value
 
 
-def _env_with_empty_process_listing(
+def _env_with_absent_supervisor_listing(
     env: dict[str, str],
     directory: Path,
 ) -> dict[str, str]:
-    shim_dir = directory / "empty-process-listing"
+    shim_dir = directory / "absent-supervisor-process-listing"
     shim_dir.mkdir(exist_ok=True)
     ps_shim = shim_dir / "ps"
-    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '1 init'\nexit 0\n",
+        encoding="utf-8",
+    )
     ps_shim.chmod(0o755)
     return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
 
@@ -226,7 +229,7 @@ def test_controller_startup_stdout_is_json_without_preprocessing(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
-    env = _env_with_empty_process_listing(env, project.parent)
+    env = _env_with_absent_supervisor_listing(env, project.parent)
     authority = journal.open_or_create_journal(project)
     assert authority.prepare_attempt("terse-startup-work").committed
     host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -304,7 +307,7 @@ def test_listen_exit_still_prints_the_numbered_hint(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
-    env = _env_with_empty_process_listing(env, project.parent)
+    env = _env_with_absent_supervisor_listing(env, project.parent)
     authority = journal.open_or_create_journal(project)
     lease = _claim(project)
     assert authority.prepare_attempt("terse-exit-work").committed
@@ -629,6 +632,7 @@ def test_arming_over_pending_mail_reaches_target_depth(
     Assert on the resulting depth, not on the launches.
     """
     project, env = isolated
+    env = _env_with_absent_supervisor_listing(env, project.parent)
     lease = _claim(project)
     _post(env, project, "terse-ctl", "already waiting")
     target = wake.DEFAULT_LISTENER_SLOTS

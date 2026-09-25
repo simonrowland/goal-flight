@@ -323,9 +323,12 @@ def _ps_listing_env(
     shim_dir.mkdir()
     ps_shim = shim_dir / "ps"
     body = "#!/bin/sh\n"
-    body += "".join(
-        f"printf '%s\\n' {shlex.quote(row)}\n" for row in rows
-    )
+    if rows:
+        body += "".join(
+            f"printf '%s\\n' {shlex.quote(row)}\n" for row in rows
+        )
+    else:
+        body += "printf '%s\\n' '1 init'\n"
     body += "exit 0\n"
     ps_shim.write_text(body, encoding="utf-8")
     ps_shim.chmod(0o755)
@@ -459,9 +462,8 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
             for component_command in component_commands:
                 assert component_command not in context
 
-        # Real supervisor, real spaced root, and a ps-shaped argv with its
-        # quoting removed. The hook must carry UNKNOWN through the production
-        # detector instead of exposing a component command.
+        # A recorded supervisor slot remains authoritative even when a
+        # process-list row has a spaced root and lost its quoting.
         raw_row = f"{supervisor.pid} {' '.join(supervise_parts)}"
         spaced_env = _ps_listing_env(
             tmp_path,
@@ -472,18 +474,17 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
         for source in ("startup", "resume"):
             context = _run_session_start_hook(project, spaced_env, source=source)
             assert supervisor.poll() is None
-            assert '"supervisor": "unknown"' in context
+            assert '"wake_supervisor": "running"' in context
             assert '"live":' not in context
             assert '"target":' not in context
             assert '"missing":' not in context
-            assert "could not tell whether `supervise`" in context
-            assert "RESOLVE EVENT WAKE OWNERSHIP FIRST" in context
+            assert "could not tell whether `supervise`" not in context
+            assert "RESOLVE EVENT WAKE OWNERSHIP FIRST" not in context
             for component_command in component_commands:
                 assert component_command not in context
 
         # Keep the real supervisor alive while only the hook/status subprocess
-        # loses process-table access. This exercises UNKNOWN at the producer,
-        # not by supplying a precomputed supervisor state.
+        # loses process-table access. The recorded slot still proves ownership.
         shim_dir = tmp_path / "probe-unavailable"
         shim_dir.mkdir()
         ps_shim = shim_dir / "ps"
@@ -493,12 +494,12 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
         for source in ("startup", "resume"):
             context = _run_session_start_hook(project, unknown_env, source=source)
             assert supervisor.poll() is None
-            assert '"supervisor": "unknown"' in context
+            assert '"wake_supervisor": "running"' in context
             assert '"live":' not in context
             assert '"target":' not in context
             assert '"missing":' not in context
-            assert "could not tell whether `supervise`" in context
-            assert "RESOLVE EVENT WAKE OWNERSHIP FIRST" in context
+            assert "could not tell whether `supervise`" not in context
+            assert "RESOLVE EVENT WAKE OWNERSHIP FIRST" not in context
             assert "goalflight_messages.py listen" not in context
             assert "goalflight_messages.py follow" not in context
             for component_command in component_commands:

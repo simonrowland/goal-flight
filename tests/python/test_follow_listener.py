@@ -58,10 +58,13 @@ def isolated(
             "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
         }
     )
-    ps_dir = tmp_path / "empty-process-listing"
+    ps_dir = tmp_path / "absent-supervisor-process-listing"
     ps_dir.mkdir()
     ps_shim = ps_dir / "ps"
-    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.write_text(
+        "#!/bin/sh\nprintf '%s\\n' '1 init'\nexit 0\n",
+        encoding="utf-8",
+    )
     ps_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{env.get('PATH', '')}"
     monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])

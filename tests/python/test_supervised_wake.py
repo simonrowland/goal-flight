@@ -931,6 +931,19 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         "_renew_controller_lease_before_arm",
         lambda **kwargs: str(kwargs["nonce"]),
     )
+    monkeypatch.setattr(
+        wake,
+        "supervisor_slot_probe",
+        lambda *_args, **_kwargs: (wake.SUPERVISOR_ABSENT, True),
+    )
+    process_listing_calls = 0
+
+    def process_listing(**_kwargs: object) -> list[tuple[int, str]]:
+        nonlocal process_listing_calls
+        process_listing_calls += 1
+        return []
+
+    monkeypatch.setattr(wake, "_process_listing", process_listing)
     monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: SimpleNamespace())
     calls: list[dict[str, object]] = []
 
@@ -958,6 +971,7 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
     assert parsed.returncode == 0
     assert "default 3600" in parsed.stdout
     assert "production 60-14400" in parsed.stdout
+    assert "--takeover" in parsed.stdout
 
     args = SimpleNamespace(
         project_root=str(tmp_path),
@@ -967,7 +981,11 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         coverage_secs=0.0,
         debug=False,
     )
-    assert supervise.cmd_supervise(args) == 0
+    assert supervise.cmd_supervise(
+        args,
+        on_startup_probe=lambda _root, _label, _nonce: None,
+    ) == 0
+    assert process_listing_calls == 1
     assert calls[0]["heartbeat_s"] == 3600.0
     assert calls[0]["coverage_s"] == 3600.0
     rearm = supervise._supervisor_rearm_command(
@@ -1240,7 +1258,133 @@ def test_supervise_migration_refuses_second_live_supervisor(
     assert result == supervise.SUPERVISE_START_EXIT
     stderr = capsys.readouterr().err
     assert "existing supervisor remains live" in stderr
-    assert "existing wake coverage retained" in stderr
+    assert "wake coverage was not verified" in stderr
+    assert "existing wake coverage retained" not in stderr
+
+
+def test_supervise_unknown_probe_does_not_claim_retained_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setattr(
+        sessions,
+        "resolve_controller_label",
+        lambda *_args, **_kwargs: "bugs",
+    )
+    monkeypatch.setattr(
+        supervise,
+        "resolve_startup_lease_nonce",
+        lambda **_kwargs: ("nonce-1", None, None),
+    )
+    monkeypatch.setattr(
+        wake,
+        "supervisor_slot_probe",
+        lambda *_args, **_kwargs: (wake.SUPERVISOR_ABSENT, False),
+    )
+    monkeypatch.setattr(wake, "_process_listing", lambda: None)
+    monkeypatch.setattr(
+        supervise,
+        "RealHost",
+        lambda **_kwargs: pytest.fail("unknown probe must not arm a host"),
+    )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_secs=3600.0,
+        coverage_secs=3600.0,
+        debug=False,
+        chatty=False,
+        takeover=False,
+    )
+
+    result = supervise.cmd_supervise(
+        args,
+        on_startup_probe=lambda _root, _label, _nonce: None,
+    )
+
+    assert result == supervise.SUPERVISE_START_EXIT
+    stderr = capsys.readouterr().err
+    assert "existing supervisor state is indeterminate" in stderr
+    assert "wake coverage was not verified" in stderr
+    assert "run --list-controllers" in stderr
+    assert "existing wake coverage retained" not in stderr
+    monkeypatch.setattr(
+        wake,
+        "supervisor_generation_state",
+        lambda *_args, **_kwargs: wake.SUPERVISOR_UNKNOWN,
+    )
+    status = sessions._wake_supervisor_fields(
+        tmp_path,
+        label="bugs",
+        lease_nonce="nonce-1",
+    )
+    assert status["supervisor"] == wake.SUPERVISOR_UNKNOWN
+    assert status["wake_armed"] is None
+
+
+def test_supervise_takeover_refuses_live_recorded_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setattr(
+        sessions,
+        "resolve_controller_label",
+        lambda *_args, **_kwargs: "bugs",
+    )
+    monkeypatch.setattr(
+        supervise,
+        "resolve_startup_lease_nonce",
+        lambda **_kwargs: ("nonce-1", None, None),
+    )
+    monkeypatch.setattr(
+        wake,
+        "supervisor_slot_probe",
+        lambda *_args, **_kwargs: (wake.SUPERVISOR_RUNNING, True),
+    )
+    monkeypatch.setattr(
+        wake,
+        "_process_listing",
+        lambda: pytest.fail("a recorded live owner must not need a listing"),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "RealHost",
+        lambda **_kwargs: pytest.fail("takeover must not displace a live owner"),
+    )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_secs=3600.0,
+        coverage_secs=3600.0,
+        debug=False,
+        chatty=False,
+        takeover=True,
+    )
+
+    result = supervise.cmd_supervise(
+        args,
+        on_startup_probe=lambda _root, _label, _nonce: None,
+    )
+
+    assert result == supervise.SUPERVISE_START_EXIT
+    stderr = capsys.readouterr().err
+    assert "takeover refused" in stderr
+    assert "existing supervisor remains live" in stderr
+    assert "wake coverage was not verified" in stderr
 
 
 def test_dead_child_is_restarted() -> None:

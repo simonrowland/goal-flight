@@ -32,10 +32,12 @@ import goalflight_compat
 
 MONITOR_KIND = "monitor"
 WATCHDOG_KIND = "watchdog"
+SUPERVISOR_KIND = "supervisor"
 WAITER_KINDS = frozenset({"listener", "wait", MONITOR_KIND, WATCHDOG_KIND})
 SUPERVISOR_RUNNING = "running"
 SUPERVISOR_ABSENT = "absent"
 SUPERVISOR_UNKNOWN = "unknown"
+_WAKE_RECORD_KINDS = WAITER_KINDS | {SUPERVISOR_KIND}
 _MESSAGES_ARGV_NAMES = frozenset({"goalflight_messages.py", "goalflight_messages"})
 _SUPERVISE_FLAG_KEYS = {
     "--project-root": "project_root",
@@ -52,10 +54,12 @@ _SHELL_ARGV_NAMES = frozenset(
 _PYTHON_SHORT_PROGRAM = {"c": "command", "m": "module"}
 _PYTHON_SHORT_TAKES_ARG = frozenset({"c", "m", "W", "X", "Q"})
 LEASE_KIND = "lease"
-LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
+LOCK_KINDS = _WAKE_RECORD_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
 ENTRY_POLL_INTERVAL_S = 0.1
 MONITOR_PROCESS_PROBE_TIMEOUT_S = 0.2
+SUPERVISOR_PROCESS_PROBE_TIMEOUT_S = 10.0
+SUPERVISOR_PROCESS_PROBE_ATTEMPTS = 2
 _FILE_VERSION = "v3"
 _LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
@@ -268,7 +272,7 @@ def _parse_waiter_path(path: Path) -> WaiterRecord | None:
         generation_hash = None
     else:
         return None
-    if kind not in WAITER_KINDS:
+    if kind not in _WAKE_RECORD_KINDS:
         return None
     if len(label_hash) != 16 or len(start_hash) != 16 or len(instance_id) != 32:
         return None
@@ -1647,7 +1651,7 @@ def register_waiter(
     generation_key: str | None = None,
     generation_slots: int | None = None,
 ) -> WaiterRegistration:
-    if kind not in WAITER_KINDS:
+    if kind not in _WAKE_RECORD_KINDS:
         raise ValueError(f"unknown waiter kind: {kind}")
     return WaiterRegistration(
         project_root,
@@ -2041,6 +2045,130 @@ def register_watchdog_waiter(
         kind=WATCHDOG_KIND,
         generation_key=generation_key,
     )
+
+
+def register_supervisor_waiter(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation_key: str,
+) -> WaiterRegistration:
+    """Hold the supervisor slot and record its PID/start-token generation."""
+    return register_waiter(
+        project_root,
+        controller_label=controller_label,
+        kind=SUPERVISOR_KIND,
+        generation_key=generation_key,
+    )
+
+
+def _supervisor_slot_records(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation_key: str,
+) -> list[WaiterRecord] | None:
+    directory = ledger_dir(project_root)
+    try:
+        directory_fd = _open_ledger_directory_path(directory, create=False)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        with os.scandir(directory_fd) as entries:
+            names = [
+                entry.name
+                for entry in entries
+                if entry.name.startswith(
+                    (f"{_FILE_VERSION}.", f"{_LEGACY_FILE_VERSION}.")
+                )
+                and entry.name.endswith(".lock")
+            ]
+        wanted_label = _label_hash(controller_label)
+        wanted_generation = _waiter_generation_hash(generation_key)
+        records: list[WaiterRecord] = []
+        for name in names:
+            record = _parse_waiter_path(directory / name)
+            if record is None or record.kind != SUPERVISOR_KIND:
+                continue
+            if (
+                record.label_hash == wanted_label
+                and record.generation_hash == wanted_generation
+            ):
+                records.append(record)
+        return sorted(records, key=lambda row: (row.pid, row.instance_id))
+    except OSError:
+        return None
+    finally:
+        os.close(directory_fd)
+
+
+def _supervisor_owner_state(record: WaiterRecord) -> str:
+    """Return running, absent, or unknown using PID + start-token evidence."""
+    try:
+        liveness = goalflight_compat.pid_liveness(record.pid)
+        zombie = goalflight_compat.pid_is_zombie(record.pid)
+        if liveness is False or zombie is True:
+            return SUPERVISOR_ABSENT
+        identity = goalflight_compat.process_start_identity(record.pid)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return SUPERVISOR_UNKNOWN
+    if not isinstance(identity, dict) or not identity.get("start_token"):
+        return SUPERVISOR_UNKNOWN
+    try:
+        same_generation = _start_hash(identity["start_token"]) == record.start_hash
+    except (TypeError, ValueError):
+        return SUPERVISOR_UNKNOWN
+    if not same_generation:
+        # The PID is live, but its recorded owner is gone and the PID was
+        # recycled. It is not a live supervisor for this slot.
+        return SUPERVISOR_ABSENT
+    return (
+        SUPERVISOR_RUNNING
+        if liveness is True and zombie is False
+        else SUPERVISOR_UNKNOWN
+    )
+
+
+def supervisor_slot_probe(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation_key: str,
+    prune_dead: bool = True,
+) -> tuple[str, bool]:
+    """Probe the recorded supervisor slot and report whether a record existed.
+
+    The second value lets callers distinguish a first-ever slot (which still
+    needs the legacy process-list probe) from a recorded slot whose owner was
+    proven dead and reclaimed. Unknown never authorizes takeover.
+    """
+    records = _supervisor_slot_records(
+        project_root,
+        controller_label=controller_label,
+        generation_key=generation_key,
+    )
+    if records is None:
+        return SUPERVISOR_UNKNOWN, False
+    had_record = bool(records)
+    saw_unknown = False
+    for record in records:
+        state = _supervisor_owner_state(record)
+        if state == SUPERVISOR_RUNNING:
+            return SUPERVISOR_RUNNING, True
+        if state == SUPERVISOR_UNKNOWN:
+            saw_unknown = True
+            continue
+        if not prune_dead:
+            continue
+        try:
+            record.path.unlink(missing_ok=True)
+        except OSError:
+            saw_unknown = True
+    if saw_unknown:
+        return SUPERVISOR_UNKNOWN, had_record
+    return SUPERVISOR_ABSENT, had_record
 
 
 def listener_slot_holder_pids(
@@ -3002,19 +3130,18 @@ def coverage_supervise_command(
 
 def _process_listing(
     *,
-    timeout_s: float = 2.0,
+    timeout_s: float = SUPERVISOR_PROCESS_PROBE_TIMEOUT_S,
     pids: Iterable[int] | None = None,
 ) -> list[tuple[int | None, str]] | None:
-    """Live process argv table, or None when the listing cannot be trusted.
+    """Full live process argv rows, or None when the probe is unknown.
 
-    Detection is process identity, not a wake-ledger lock: ``supervise`` does
-    not hold a generation flock of its own, and the harmful shortfall case is
-    exactly when its children also hold none. A missing ``ps``, a timeout, or
-    an unreadable table is UNKNOWN, never a guessed empty pool.
+    The legacy process probe is only a fallback for generations without a
+    recorded supervisor slot. A missing ``ps``, a timeout, or an unreadable
+    table is UNKNOWN, never a guessed empty pool. A timeout retries once
+    within the same bounded probe budget.
     """
     if os.name == "nt" or fcntl is None:
         return None
-    command = ["ps", "-axww", "-o", "pid=,command="]
     if pids is not None:
         selected_pids = tuple(sorted(set(pids)))
         if not selected_pids:
@@ -3027,15 +3154,31 @@ def _process_listing(
             "-o",
             "pid=,command=",
         ]
-    try:
-        output = subprocess.check_output(
-            command,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_s,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
+        attempts = 1
+    else:
+        command = ["ps", "-axww", "-o", "pid=,command="]
+        attempts = SUPERVISOR_PROCESS_PROBE_ATTEMPTS
+    for attempt in range(attempts):
+        try:
+            output = subprocess.check_output(
+                command,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            if attempt + 1 < attempts:
+                continue
+            return None
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            return None
+        return _parse_process_listing(output)
+    return None
+
+
+def _parse_process_listing(
+    output: str,
+) -> list[tuple[int | None, str]] | None:
     rows: list[tuple[int | None, str]] = []
     for raw in output.splitlines():
         line = raw.strip()
@@ -3048,7 +3191,7 @@ def _process_listing(
             rows.append((None, line))
             continue
         rows.append((pid, command.strip()))
-    return rows
+    return rows or None
 
 
 def _argv_basename(token: str) -> str:
@@ -3406,9 +3549,9 @@ def supervisor_generation_state(
 ) -> str:
     """Whether ``supervise`` is live for this controller generation.
 
-    Uses process identity (``ps`` argv): a matching
-    ``goalflight_messages.py supervise --lease-nonce <this nonce>`` in
-    executable position (and matching ``--project-root`` /
+    Uses the recorded supervisor slot first, then a full process probe for
+    a matching ``goalflight_messages.py supervise --lease-nonce <this nonce>``
+    in executable position (and matching ``--project-root`` /
     ``--controller-label`` when those flags are present). Trailing tokens
     that merely contain a supervise command line are not a supervisor.
     Returns ``running``, ``absent``, or ``unknown``.
@@ -3427,6 +3570,15 @@ def supervisor_generation_state(
         ).strip():
             return SUPERVISOR_UNKNOWN
         return SUPERVISOR_RUNNING
+    if not str(controller_label or "").strip() or not str(lease_nonce or "").strip():
+        return SUPERVISOR_UNKNOWN
+    slot_state, _ = supervisor_slot_probe(
+        project_root,
+        controller_label=controller_label,
+        generation_key=lease_nonce,
+    )
+    if slot_state != SUPERVISOR_ABSENT:
+        return slot_state
     listing = _process_listing()
     return _supervisor_generation_state_from_listing(
         listing,
@@ -3446,7 +3598,7 @@ def _supervisor_generation_state_from_listing(
     """Bind one generation against one already-sampled process listing."""
     label = str(controller_label or "").strip()
     nonce = str(lease_nonce or "").strip()
-    if not label:
+    if not label or not nonce:
         return SUPERVISOR_UNKNOWN
     if listing is None:
         return SUPERVISOR_UNKNOWN
@@ -3476,19 +3628,33 @@ def _supervisor_generation_state_from_listing(
 def supervisor_generation_states(
     generations: Iterable[tuple[Path | str, str, str]],
     *,
-    process_timeout_s: float = 2.0,
+    process_timeout_s: float = SUPERVISOR_PROCESS_PROBE_TIMEOUT_S,
 ) -> list[str]:
-    """Bind many generations against one process-table snapshot."""
-    listing = _process_listing(timeout_s=process_timeout_s)
-    return [
-        _supervisor_generation_state_from_listing(
-            listing,
-            project_root=project_root,
+    """Bind many generations using the same slot/process signal as status."""
+    requested = list(generations)
+    states: list[str | None] = [None] * len(requested)
+    unresolved: list[int] = []
+    for index, (project_root, controller_label, lease_nonce) in enumerate(requested):
+        slot_state, _ = supervisor_slot_probe(
+            project_root,
             controller_label=controller_label,
-            lease_nonce=lease_nonce,
+            generation_key=lease_nonce,
         )
-        for project_root, controller_label, lease_nonce in generations
-    ]
+        if slot_state != SUPERVISOR_ABSENT:
+            states[index] = slot_state
+        else:
+            unresolved.append(index)
+    if unresolved:
+        listing = _process_listing(timeout_s=process_timeout_s)
+        for index in unresolved:
+            project_root, controller_label, lease_nonce = requested[index]
+            states[index] = _supervisor_generation_state_from_listing(
+                listing,
+                project_root=project_root,
+                controller_label=controller_label,
+                lease_nonce=lease_nonce,
+            )
+    return [state or SUPERVISOR_UNKNOWN for state in states]
 
 
 def live_monitor_lease_nonces(
@@ -3734,7 +3900,10 @@ def _unknown_supervisor_lines() -> list[str]:
         (
             "Restore process-table visibility or inspect the tracked supervisor "
             "task first; only after confirming no supervisor is running may you "
-            "use a direct component re-arm."
+            "run `--list-controllers` and use the supported reset "
+            "`supervise --takeover`. It still refuses unless the recorded PID "
+            "and start token prove the owner is dead; only then may it reclaim "
+            "the slot."
         ),
     ]
 
