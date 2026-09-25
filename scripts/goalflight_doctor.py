@@ -186,6 +186,62 @@ def version(binary: str, *args: str) -> dict:
     return out
 
 
+def _ripgrep_private_path(path: str | None) -> bool:
+    """Flag rg paths hidden under HOME unless they use a standard bin root."""
+    if not path:
+        return False
+    try:
+        home = Path.home()
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        relative = candidate.relative_to(home)
+    except (OSError, ValueError):
+        return False
+    parts = relative.parts
+    if len(parts) < 2 or not parts[0].startswith("."):
+        return False
+    return tuple(parts[:2]) not in {(".local", "bin"), (".cargo", "bin")}
+
+
+def _ripgrep_install_hint() -> str:
+    if goalflight_compat.is_macos():
+        return "brew install ripgrep"
+    for manager, command in (
+        ("apt-get", "sudo apt-get update && sudo apt-get install -y ripgrep"),
+        ("dnf", "sudo dnf install -y ripgrep"),
+        ("pacman", "sudo pacman -S --needed ripgrep"),
+    ):
+        if shutil.which(manager):
+            return command
+    if goalflight_compat.is_linux():
+        return "install ripgrep with apt, dnf, or pacman"
+    return "install ripgrep with your operating system package manager"
+
+
+def check_ripgrep() -> dict:
+    """Report the PATH-selected rg binary and flag private tool bundles."""
+    out = version("rg", "--version")
+    present = bool(out.get("present"))
+    path = out.get("path") if present else None
+    private_path = _ripgrep_private_path(path)
+    out.update(
+        {
+            "present": present,
+            "path": path,
+            "version": out.get("version") if present else None,
+            "private_path": private_path,
+            "install_hint": _ripgrep_install_hint(),
+            "ok": bool(present and out.get("ok", True) and not private_path),
+        }
+    )
+    if not present:
+        out["detail"] = "rg is absent from PATH"
+    elif private_path:
+        out["detail"] = "rg resolves inside a hidden HOME directory"
+    return out
+
+
 def check_agent_traits() -> dict:
     """Non-fatal probe for opt-in global agent-behavior traits (claude host)."""
     if goalflight_agent_traits is None:
@@ -3683,6 +3739,7 @@ def doctor(
         "schema": "goalflight.doctor.v1",
         "repo": str(repo),
         "platform": check_platform(),
+        "rg": check_ripgrep(),
         "capacity_profile": check_capacity_profile(),
         "plugin": check_plugin(repo),
         "host_goalflight_install": check_host_goalflight_install(),
@@ -3959,6 +4016,18 @@ def print_human(payload: dict, *, verbose: bool = False) -> None:
 def collect_human_lines(payload: dict) -> list[str]:
     plugin = payload["plugin"]
     controller_leases = payload.get("controller_lease_liveness") or {}
+    rg = payload.get("rg")
+    rg_lines: list[str] = []
+    if isinstance(rg, dict):
+        if rg.get("present"):
+            rg_detail = f"path={rg.get('path')} version={rg.get('version') or 'unknown'}"
+            if rg.get("private_path"):
+                rg_detail += "; private PATH directory"
+            if not rg.get("ok") and rg.get("install_hint"):
+                rg_detail += f"; install with: {rg['install_hint']}"
+        else:
+            rg_detail = f"absent; install with: {rg.get('install_hint') or 'a package manager'}"
+        rg_lines.append(status_line(rg.get("ok"), "rg", rg_detail))
     session_status = payload.get("session_status")
     session_status = session_status if isinstance(session_status, dict) else {}
     session_ok = session_status.get("ok") if "ok" in session_status else False
@@ -3979,6 +4048,7 @@ def collect_human_lines(payload: dict) -> list[str]:
         status_line(plugin.get("validate_ok"), "claude plugin validate", plugin.get("validate_first_line")),
         status_line(payload["claude"].get("present"), "claude CLI", payload["claude"].get("version")),
         status_line(payload["codex"]["cli"].get("present"), "codex CLI", payload["codex"]["cli"].get("version")),
+        *rg_lines,
         status_line(not payload["codex"].get("desktop_without_cli"), "Codex Desktop/CLI pairing", payload["codex"].get("install_hint")),
         status_line(
             payload["context_mode"].get("register_script_exists") and payload["context_mode"].get("check_returncode") == 0,

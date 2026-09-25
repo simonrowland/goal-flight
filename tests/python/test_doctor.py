@@ -101,6 +101,117 @@ def case_doctor_linux_desktop_probe_is_unknown_not_missing() -> None:
         assert goalflight_doctor.app_exists("DefinitelyMissingGoalFlightApp") is None
 
 
+def _write_fake_rg(path: Path, version: str = "ripgrep 14.1.0") -> None:
+    path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version}'\n", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def case_doctor_ripgrep_probe_reports_present_path_and_version() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-rg-present-") as td:
+        home = Path(td) / "home"
+        bin_dir = home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        fake_rg = bin_dir / "rg"
+        _write_fake_rg(fake_rg)
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "PATH": str(bin_dir)},
+            clear=False,
+        ):
+            payload = goalflight_doctor.check_ripgrep()
+    assert payload["present"] is True
+    assert payload["path"] == str(fake_rg)
+    assert payload["version"] == "ripgrep 14.1.0"
+    assert payload["private_path"] is False
+    assert payload["ok"] is True
+    assert goalflight_doctor._ripgrep_private_path("/opt/homebrew/bin/rg") is False
+
+
+def test_doctor_ripgrep_probe_reports_present_path_and_version() -> None:
+    case_doctor_ripgrep_probe_reports_present_path_and_version()
+
+
+def case_doctor_ripgrep_probe_reports_absent_with_install_hint() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-rg-absent-") as td:
+        with patch.dict(os.environ, {"PATH": td}, clear=False):
+            payload = goalflight_doctor.check_ripgrep()
+    assert payload["present"] is False
+    assert payload["path"] is None
+    assert payload["version"] is None
+    assert payload["private_path"] is False
+    assert payload["ok"] is False
+    assert payload["install_hint"]
+
+
+def test_doctor_ripgrep_probe_reports_absent_with_install_hint() -> None:
+    case_doctor_ripgrep_probe_reports_absent_with_install_hint()
+
+
+def case_doctor_ripgrep_probe_warns_for_private_home_path() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-doctor-rg-private-") as td:
+        home = Path(td) / "home"
+        private_bin = home / ".kimi-code" / "bin"
+        private_bin.mkdir(parents=True)
+        fake_rg = private_bin / "rg"
+        _write_fake_rg(fake_rg, "ripgrep 13.0.0")
+        with patch.dict(
+            os.environ,
+            {"HOME": str(home), "PATH": str(private_bin)},
+            clear=False,
+        ):
+            payload = goalflight_doctor.check_ripgrep()
+    assert payload["present"] is True
+    assert payload["path"] == str(fake_rg)
+    assert payload["version"] == "ripgrep 13.0.0"
+    assert payload["private_path"] is True
+    assert payload["ok"] is False
+    assert payload["install_hint"]
+
+
+def test_doctor_ripgrep_probe_warns_for_private_home_path() -> None:
+    case_doctor_ripgrep_probe_warns_for_private_home_path()
+
+
+def case_doctor_ripgrep_warnings_reach_human_verdict() -> None:
+    absent = _minimal_human_payload(
+        rg={
+            "present": False,
+            "path": None,
+            "version": None,
+            "private_path": False,
+            "install_hint": "brew install ripgrep",
+            "ok": False,
+        }
+    )
+    absent_lines = goalflight_doctor.collect_human_lines(absent)
+    assert any(
+        line.startswith("[WARN] rg") and "absent" in line and "brew install ripgrep" in line
+        for line in absent_lines
+    )
+
+    private = _minimal_human_payload(
+        rg={
+            "present": True,
+            "path": "/Users/example/.kimi-code/bin/rg",
+            "version": "ripgrep 13.0.0",
+            "private_path": True,
+            "install_hint": "brew install ripgrep",
+            "ok": False,
+        }
+    )
+    private_lines = goalflight_doctor.collect_human_lines(private)
+    assert any(
+        line.startswith("[WARN] rg")
+        and "private PATH directory" in line
+        and "brew install ripgrep" in line
+        for line in private_lines
+    )
+
+
+def test_doctor_ripgrep_warnings_reach_human_verdict() -> None:
+    case_doctor_ripgrep_warnings_reach_human_verdict()
+
+
 def case_doctor_reports_wsl_drvfs_warnings() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     os.environ["GOALFLIGHT_STATE_DIR"] = "/mnt/d/goal-flight-state"
@@ -280,6 +391,14 @@ def _minimal_human_payload(**overrides: object) -> dict:
             "validate_first_line": "ok",
         },
         "claude": {"present": True, "version": "1.0"},
+        "rg": {
+            "present": True,
+            "path": "/usr/local/bin/rg",
+            "version": "ripgrep 14.1.0",
+            "private_path": False,
+            "install_hint": "brew install ripgrep",
+            "ok": True,
+        },
         "codex": {
             "cli": {"present": True, "version": "1.0"},
             "desktop_without_cli": False,
@@ -781,6 +900,14 @@ def case_doctor_json_cli_attaches_verdict_alongside_probes() -> None:
         worker_currency={
             "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
         },
+        rg={
+            "present": False,
+            "path": None,
+            "version": None,
+            "private_path": False,
+            "install_hint": "brew install ripgrep",
+            "ok": False,
+        },
     )
     buf = io.StringIO()
     with patch.object(goalflight_doctor, "doctor", return_value=payload), redirect_stdout(buf):
@@ -789,6 +916,10 @@ def case_doctor_json_cli_attaches_verdict_alongside_probes() -> None:
     data = json.loads(buf.getvalue())
     assert data["verdict"] == "warn"
     assert data["plugin"]["manifest"] == "ok"
+    assert data["rg"]["present"] is False
+    assert data["rg"]["path"] is None
+    assert data["rg"]["version"] is None
+    assert any(row["probe"] == "rg" and "brew install ripgrep" in row["detail"] for row in data["warnings"])
     text_warns = _text_entries(payload, "warn")
     json_warns = [(row["probe"], row["detail"]) for row in data["warnings"]]
     assert text_warns == json_warns
@@ -908,6 +1039,10 @@ def main() -> None:
     case_doctor_reports_platform_fields_for_windows()
     case_doctor_reports_platform_fields_for_linux()
     case_doctor_linux_desktop_probe_is_unknown_not_missing()
+    case_doctor_ripgrep_probe_reports_present_path_and_version()
+    case_doctor_ripgrep_probe_reports_absent_with_install_hint()
+    case_doctor_ripgrep_probe_warns_for_private_home_path()
+    case_doctor_ripgrep_warnings_reach_human_verdict()
     case_doctor_reports_wsl_drvfs_warnings()
     case_doctor_skips_non_drvfs_mnt_mount_warning()
     case_doctor_reports_drvfs_mount_warning_from_fstype()
