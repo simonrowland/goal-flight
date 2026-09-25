@@ -242,13 +242,32 @@ def test_ignored_paths_match_tree_collisions_exactly(
 
 
 def test_ignored_tracked_file_parent_type_clash_is_collision(tmp_path, monkeypatch):
-    def fake_git_nul(_cwd, *args):
+    def fake_git_nul(_cwd, *args, **_kwargs):
         return "parent/child\0" if args[0] == "ls-files" else "parent\0"
 
     monkeypatch.setattr(pool, "_git_nul", fake_git_nul)
     with pytest.raises(pool.WorktreeSeatResetRefused, match="ignored path"):
         pool._refuse_ignored_tree_collisions(
             tmp_path, head="HEAD", target="target"
+        )
+
+
+def test_ignored_collision_config_timeout_retains_seat(tmp_path, monkeypatch):
+    def fake_git_nul(_cwd, *args, **_kwargs):
+        return "ignored\0" if args[0] == "ls-files" else "tree\0"
+
+    def fake_git_proc(_cwd, *args, **_kwargs):
+        return subprocess.CompletedProcess(
+            ["git", *args], 124, stdout="", stderr="git command timed out"
+        )
+
+    monkeypatch.setattr(pool, "_git_nul", fake_git_nul)
+    monkeypatch.setattr(pool, "_git_proc", fake_git_proc)
+    with pytest.raises(
+        pool.WorktreeSeatResetRefused, match="case-sensitivity.*timed out"
+    ):
+        pool._refuse_ignored_tree_collisions(
+            tmp_path, head="HEAD", target="target", timeout=0.5
         )
 
 
@@ -581,6 +600,20 @@ def test_quarantine_refuses_worktree_encoding(holder):
     with pytest.raises(pool.WorktreeSeatResetRefused, match="working-tree-encoding"):
         pool.acquire_worktree_seat(repo, "next")
     assert encoded.read_bytes() == b"\xff\xfe" + "secret\n".encode("utf-16le")
+
+
+def test_quarantine_refuses_dirty_eol_conversion(holder):
+    repo, path, row = holder
+    eol = path / "eol.txt"
+    eol.write_bytes(b"before\n")
+    (path / ".gitattributes").write_text("eol.txt eol=lf\n")
+    _git(path, "add", ".gitattributes", "eol.txt")
+    _git(path, "commit", "-m", "add eol attribute")
+    eol.write_bytes(b"secret\r\n")
+
+    with pytest.raises(pool.WorktreeSeatResetRefused, match="active eol"):
+        pool.acquire_worktree_seat(repo, "next")
+    assert eol.read_bytes() == b"secret\r\n"
 
 
 def test_dirty_submodule_retains_seat(holder, tmp_path):
