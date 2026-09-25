@@ -328,6 +328,35 @@ def test_unregistered_legacy_ring_lock_reports_holder_and_counts_toward_cap(hold
     assert legacy_path.is_dir()
 
 
+def test_unregistered_terminal_legacy_ring_lock_is_reused_with_free_slot(
+    holder, monkeypatch
+):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, path, _row = holder
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / "s-1"
+    legacy_path.parent.mkdir(parents=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    legacy_lock.parent.mkdir(parents=True)
+    global_lock.replace(legacy_lock)
+    global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
+    if global_ring.exists():
+        global_ring.unlink()
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    registry["locks"].pop(pool._lock_registry_key(global_lock), None)
+    registry["locks"].pop(
+        pool._lock_registry_key(pool._seat_lock_root(repo) / "allocation.lock"),
+        None,
+    )
+    registry_path.write_text(json.dumps(registry))
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == legacy_path
+
+
 def test_ignored_listing_is_scoped_to_each_candidate_seat(tmp_path, monkeypatch):
     monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
     repo = _make_repo(tmp_path)

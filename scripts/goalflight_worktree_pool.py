@@ -3042,9 +3042,9 @@ def acquire_worktree_seat(
                     registry_root=registry_root,
                 )
             except OSError:
-                # An unregistered legacy lock cannot be admitted or reclaimed.
-                # Read metadata only for the occupancy report; it still counts
-                # toward the cap and remains fail-closed.
+                # An unregistered legacy lock counts during the capacity pass;
+                # if a slot remains, the claim pass opens it compatibly and
+                # applies the normal metadata and ledger evidence.
                 note_capacity_occupant(
                     candidate_path,
                     _unregistered_lock_metadata(candidate_lock),
@@ -3101,6 +3101,7 @@ def acquire_worktree_seat(
                     flags,
                     registry_root=registry_root,
                     allow_create=True,
+                    allow_unregistered=True,
                 )
             except OSError as exc:
                 raise WorktreeSeatError(
@@ -3203,6 +3204,7 @@ def acquire_worktree_seat(
                     flags,
                     registry_root=registry_root,
                     allow_create=True,
+                    allow_unregistered=True,
                 )
             except OSError as exc:
                 raise WorktreeSeatError(
@@ -3431,8 +3433,8 @@ def _open_registered_lock(
         )
     if allow_unregistered:
         # Tolerate locks created before the registry existed. This compatibility
-        # path never writes a registration record; callers must not use it to
-        # reclaim an unregistered pooled seat.
+        # path never writes a registration record; callers apply their normal
+        # metadata and ledger evidence before reclaiming a pooled seat.
         legacy_stat = _lock_path_identity(lock_path)
         if legacy_stat is not None:
             return _open_lock_path_safely(
