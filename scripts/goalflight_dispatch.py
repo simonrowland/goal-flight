@@ -22119,16 +22119,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         expected_session_id=engine_session_id,
                         exclude_dispatch_id=args.dispatch_id,
                     )
-            _record_ledger(
-                args,
-                project_root=project_root,
-                prompt_path=prompt_path,
-                status_json=status_json,
-                tail=tail,
-                lease_id=lease_id,
-                worker_pid=None,
-                state="waiting_capacity",
-            )
+            record_worktree_wait()
             if (
                 resume_lock_kind == "codex"
                 and _CODEX_RESUME_DURABLE_CLAIM_HOOK is not None
