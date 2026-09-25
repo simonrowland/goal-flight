@@ -6007,6 +6007,13 @@ def _cmd_resume(argv: list[str]) -> int:
         source = _validate_resume_source(
             args.dispatch_id, reconcile_dead_preclaim=False
         )
+        _validate_resume_worktree_source(
+            args.dispatch_id,
+            source["record"],
+            _resume_worker_cwd(
+                source["record"], override=getattr(args, "cwd", None)
+            ),
+        )
         recorded_label = _resume_recorded_controller_label(source["record"])
         if (
             recorded_label is not None
