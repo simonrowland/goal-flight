@@ -21,6 +21,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 STATUS = ROOT / "scripts" / "goalflight_status.py"
@@ -4701,6 +4703,92 @@ def test_b065_normal_drain_restore_honors_completed_linked_task() -> None:
             assert payload["left_queued"] == 0, (branch, payload)
             assert not path.exists(), (branch, path)
             assert payload["details"][0]["state"] == "superseded", (branch, payload)
+
+
+@pytest.mark.parametrize("carrier_agent", [None, "codex"])
+def test_remote_grok_effort_refuses_before_fleet_preview(
+    monkeypatch, tmp_path, carrier_agent
+) -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    entry = {
+        "dispatch_argv": [
+            "--agent",
+            "grok-code",
+            "--reasoning-effort",
+            "xhigh",
+            "--prompt",
+            "implement",
+        ],
+        "request": {
+            "prompt": "implement",
+            "base_sha": "0123456789abcdef0123456789abcdef01234567",
+        },
+    }
+    if carrier_agent is not None:
+        entry["agent"] = carrier_agent
+    args = argparse.Namespace(
+        remote_node="test-node",
+        fleet_dir=str(tmp_path / "fleet"),
+        remote_runner=object(),
+        remote_tool_smoke="auto",
+    )
+    monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: tmp_path / "fleet")
+
+    def unexpected_preview(*_args, **_kwargs):
+        raise AssertionError("remote fleet preview reached before effort refusal")
+
+    monkeypatch.setattr(fleet_dispatch, "preview_dispatch", unexpected_preview)
+    with pytest.raises(D._RemoteDrainBlocked, match="Grok ACP") as refusal:
+        D._drain_launch_remote_claim(
+            args,
+            entry,
+            dispatch_id="remote-grok-effort",
+            launch_token="launch-token",
+            claim=tmp_path / "claim.json",
+        )
+    assert refusal.value.code == "unsupported_reasoning_effort"
+
+
+def test_remote_grok_effort_stays_queued_before_claim(monkeypatch, tmp_path) -> None:
+    old_env = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(_env(tmp_path))
+        queue = tmp_path / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        path = _write_queue_entry(queue, "remote-grok-effort", filename="remote-grok-effort")
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        entry.update(
+            {
+                "agent": "grok-code",
+                "shape": "bash",
+                "dispatch_argv": [
+                    "--agent",
+                    "grok-code",
+                    "--reasoning-effort",
+                    "xhigh",
+                    "--prompt",
+                    "implement",
+                ],
+            }
+        )
+        entry["request"].update({"agent": "grok-code", "prompt": "implement"})
+        D._write_json_atomic(path, entry)
+        args = _drain_args(queue)
+        args.remote_node = "test-node"
+        args.remote_runner = object()
+        monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: None)
+        monkeypatch.setattr(D, "_release_stale_capacity_for_drain", lambda: None)
+        monkeypatch.setattr(D, "_run_drain_prelaunch_hook", lambda _agents: None)
+
+        payload = D._drain_queue_once(args)
+        assert path.exists()
+        assert list(queue.glob("remote-grok-effort.json.claimed-*")) == []
+        assert payload["details"][0]["reason"] == "unsupported_reasoning_effort"
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
 
 
 def test_b065_carrier_mtime_poison_still_orphans() -> None:

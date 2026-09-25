@@ -232,8 +232,8 @@ it; `adapters/codex.json` `forbidden_args` forbids it. Apply P3-safe-easy
 findings inline; fix P0/P1/P2 before commit.
 
 **Reasoning effort is opt-in per dispatch.** The worker CLI config sets the
-default (medium), so ordinary implementation dispatches inherit it and nothing
-in goal-flight overrides it. Raise it where the extra thinking pays: reviews,
+default, so ordinary implementation dispatches inherit it and nothing in
+goal-flight overrides it. Raise it where the extra thinking pays: reviews,
 adversarial passes, and hard debugging. The review recipe above already pins
 `xhigh` explicitly; for a worker dispatch use the flag, which validates the
 level at the parser and checks model support before launching:
@@ -243,15 +243,18 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex \
   --reasoning-effort xhigh --prompt-file <brief>
 ```
 
-Levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Model support comes
+Levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Codex support comes
 from `models_cache.json` in the effective Codex launch home (including
 per-dispatch homes), using `--model` or the configured/catalog default.
-Missing, unreadable, or unmatched cache entries fall back to `low`, `medium`,
-`high`, `xhigh`; refusals name this fallback and list supported levels.
+Grok bash/headless support comes from the effective account's
+`~/.grok/models_cache.json`, using the requested model or Grok's catalog
+default; known model-family fallback sets apply when the cache is missing or
+unreadable. Refusals name the selected model and list supported levels.
 The flag is preserve-class, so a resumed dispatch keeps its requested level.
-The flag needs `--agent codex` on the bash route with no raw `--` command;
-every other agent, shape, `--interactive`, or raw command refuses it rather
-than silently dropping the setting.
+Use it with `--agent codex`, `grok-code`, or `grok-research` on the bash route
+with no raw `--` command. Grok ACP refuses it because the ACP runner does not
+set Grok session options, so passing the value there would silently drop it.
+Other agents, shapes, `--interactive`, or raw commands refuse it.
 
 ## Hard Invariants
 

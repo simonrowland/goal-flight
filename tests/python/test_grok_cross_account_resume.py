@@ -459,6 +459,94 @@ def test_resume_model_override_reaches_grok_admission(
     assert _option(argv, "--model") == "grok-stronger"
 
 
+def test_resume_preserves_grok_reasoning_effort(
+    tmp_path: Path,
+) -> None:
+    record = _record(tmp_path)
+    record["reasoning_effort"] = "xhigh"
+    record["dispatch_argv"].extend(["--reasoning-effort", "xhigh"])
+
+    argv = D._resume_launch_argv(
+        _source(record),
+        child_dispatch_id="grok-child",
+        prompt_path=Path(record["prompt_path"]),
+        resume_args=_resume_args(account="old"),
+    )
+
+    assert argv.count("--reasoning-effort") == 1
+    assert _option(argv, "--reasoning-effort") == "xhigh"
+
+
+def test_unsupported_effort_resume_does_not_refresh_seat_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _accounts(tmp_path, "old", "new")
+    for account in ("old", "new"):
+        home = Path.home() / ".goal-flight" / "accounts" / account / "grok"
+        (home / ".grok").mkdir(parents=True, exist_ok=True)
+        (home / ".grok" / "auth.json").write_text("token", encoding="utf-8")
+        (home / ".grok" / "config.toml").write_text(
+            '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+        )
+    new_home = Path.home() / ".goal-flight" / "accounts" / "new" / "grok"
+    (new_home / ".grok" / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": {
+                    "grok-4.5": {
+                        "info": {
+                            "supports_reasoning_effort": True,
+                            "reasoning_efforts": [{"id": "high"}],
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    seat_state = tmp_path / "grok-seat-states.json"
+    before = b"stale-state-before\n"
+    seat_state.write_bytes(before)
+    record = _record(tmp_path)
+    record.update(
+        {
+            "schema": L.SCHEMA,
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(tmp_path),
+            "engine_session_id": SESSION,
+            "model": "grok-4.5",
+            "reasoning_effort": "xhigh",
+        }
+    )
+    record["dispatch_argv"].extend(
+        ["--model", "grok-4.5", "--reasoning-effort", "xhigh"]
+    )
+    L.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the existing worker.\n", encoding="utf-8")
+    child_id = "grok-unsupported-effort-child"
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
+    monkeypatch.setattr(D, "_seat_probe_says_usable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(D, "_grok_account_admission_reason", lambda *args, **kwargs: None)
+
+    def selecting_seat(**kwargs):
+        if kwargs.get("allow_refresh", True):
+            seat_state.write_bytes(b"refreshed-by-resume\n")
+        return "new"
+
+    monkeypatch.setattr(D, "_select_healthy_grok_account", selecting_seat)
+
+    assert D._cmd_resume(
+        [record["dispatch_id"], "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 64
+    assert "not supported for Grok model" in capsys.readouterr().err
+    assert seat_state.read_bytes() == before
+
+
 def test_measured_unhealthy_owner_falls_back_without_ledger_wall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -483,6 +571,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
         dispatch_id="grok-child",
         agent="grok-code",
         model="gpt-5.6-sol",
+        reasoning_effort="xhigh",
         shape="bash",
         controller_session_id=None,
         controller_pid=None,
@@ -499,6 +588,7 @@ def test_resume_mode_is_carried_into_status_metadata_and_watcher(
     )
     metadata = D._prelaunch_status_metadata(args)
     assert metadata["model"] == "gpt-5.6-sol"
+    assert metadata["reasoning_effort"] == "xhigh"
     assert metadata["resume_mode"] == "reconstructed"
     watcher = D._watcher_spawn_argv(
         worker_pid=123,

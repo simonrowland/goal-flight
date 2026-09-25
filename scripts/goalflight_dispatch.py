@@ -520,15 +520,29 @@ OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
 CODEX_FALLBACK_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 CODEX_REASONING_EFFORTS = CODEX_FALLBACK_REASONING_EFFORTS | {"max", "ultra"}
 
+# Grok's catalog currently exposes these levels by model family. Keep the
+# fallback narrow for known families so a missing cache cannot accept an effort
+# that the selected model would ignore.
+GROK_DEFAULT_MODEL = "grok-4.7"
+GROK_REASONING_EFFORTS_BY_MODEL = {
+    "grok-4.7": frozenset({"low", "medium", "high", "xhigh"}),
+    "grok-4.7-build-fast": frozenset({"low", "medium", "high", "xhigh"}),
+    "grok-4.6": frozenset({"low", "medium", "high", "xhigh"}),
+    "grok-4.5": frozenset({"low", "medium", "high"}),
+}
+GROK_FALLBACK_REASONING_EFFORTS = frozenset().union(
+    *GROK_REASONING_EFFORTS_BY_MODEL.values()
+)
+GROK_BASH_REASONING_AGENTS = frozenset({"grok-code", "grok-research"})
+GROK_ACP_REASONING_AGENTS = GROK_BASH_REASONING_AGENTS | {"grok-acp"}
+
 
 def _parse_reasoning_effort(value: str) -> str:
     """Reject an unknown level here rather than at the worker.
 
-    Codex takes this through `-c model_reasoning_effort=...`, which is a
-    free-form config assignment: a typo is not rejected by the CLI, it just
-    silently fails to raise the effort, and the dispatch looks like it ran at
-    the level asked for. Validating at the parser is what makes the flag
-    trustworthy.
+    Codex takes this through `-c model_reasoning_effort=...`, while Grok takes
+    it through its CLI flag. Validating at the parser is what makes a typo
+    fail before either worker can run at an unintended default.
     """
     level = str(value).strip().lower()
     if level not in CODEX_REASONING_EFFORTS:
@@ -537,6 +551,41 @@ def _parse_reasoning_effort(value: str) -> str:
             + ", ".join(sorted(CODEX_REASONING_EFFORTS))
         )
     return level
+
+
+def _validate_reasoning_effort_route(args, raw_argv: list[str] | None) -> None:
+    """Refuse effort requests on routes that cannot preserve them."""
+    if getattr(args, "reasoning_effort", None) is None:
+        return
+    shape = getattr(args, "shape", "bash")
+    agent = getattr(args, "agent", "")
+    if (
+        (
+            agent == "codex"
+            or agent in GROK_BASH_REASONING_AGENTS
+        )
+        and shape == "bash"
+        and not raw_argv
+    ):
+        return
+    if agent in GROK_ACP_REASONING_AGENTS and shape == "acp":
+        raise DispatchUsageError(
+            "goalflight_dispatch: --reasoning-effort is not supported for "
+            "Grok ACP; goalflight_acp_run.py has no Grok session-options "
+            "hook for reasoning_effort, so passing it would be silently "
+            "ignored. Use --shape bash for grok-code or grok-research."
+        )
+    message = (
+        "goalflight_dispatch: --reasoning-effort requires --agent codex --shape bash "
+        "without --interactive or a raw command after --."
+    )
+    if agent in GROK_ACP_REASONING_AGENTS:
+        message = (
+            "goalflight_dispatch: --reasoning-effort requires --agent "
+            "grok-code or grok-research with --shape bash without "
+            "--interactive or a raw command after --."
+        )
+    raise DispatchUsageError(message)
 
 
 def _parse_public_worktree_ref(value: str) -> str:
@@ -4200,6 +4249,7 @@ def _guard_grok_code_research_prompt(args) -> None:
 
 
 def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
+    _validate_reasoning_effort_route(args, raw_argv)
     if (
         getattr(args, "occupied_worktree_forced", False)
         and getattr(args, "shape", "bash") != "acp"
@@ -4236,9 +4286,19 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
     _validate_agent_os_sandbox(args)
     if not getattr(args, "_defer_sandbox_boundary", False):
         _validate_os_sandbox_boundary(args)
-    # Billing refusal is a pre-write guard. Id reservation, prompt
-    # materialization, occupancy bind, and capacity leases must not land first.
-    return _resolve_launch_account_env(args)
+    # Catalog validation must not refresh Grok seat state. When the read-only
+    # lookup succeeds, _resolve_account_env memoizes that seat on args so the
+    # launch below uses the same account that was validated.
+    if getattr(args, "account", None) or _account_engine(args.agent) != "grok":
+        account_env = _resolve_launch_account_env(args)
+    else:
+        account_env = _resolve_account_env(
+            args,
+            allow_grok_refresh=False,
+            require_grok_selection=bool(getattr(args, "reasoning_effort", None)),
+        )
+    _validate_grok_reasoning_effort(args, account_env)
+    return account_env
 
 
 def _nonterminal_dispatch_reuse_reason(
@@ -6243,7 +6303,7 @@ def _cmd_resume(argv: list[str]) -> int:
         type=_parse_reasoning_effort,
         default=None,
         help=(
-            "Override the recorded Codex reasoning effort for this resumed "
+            "Override the recorded worker reasoning effort for this resumed "
             "attempt."
         ),
     )
@@ -6593,11 +6653,17 @@ def _resume_launch_argv(
             if owner_healthy:
                 target = owner_account
             else:
-                target = _select_healthy_grok_account(
-                    model=resume_model,
-                    exclude={owner_account} if owner_account else None,
-                    named_only=True,
-                )
+                selection_kwargs = {
+                    "model": resume_model,
+                    "exclude": {owner_account} if owner_account else None,
+                    "named_only": True,
+                }
+                # An effort-bearing resume must reach catalog validation
+                # before a stale-seat refresh can write state. Keep this
+                # fallback read-only until preflight accepts the effort.
+                if requested_reasoning_effort or recorded_reasoning_effort:
+                    selection_kwargs["allow_refresh"] = False
+                target = _select_healthy_grok_account(**selection_kwargs)
                 if target is None:
                     # Every configured account is walled or unmeasured. Launching
                     # anyway spends a dispatch to rediscover the same 402 or auth
@@ -6844,6 +6910,7 @@ def _preflight_resume_dispatch(
         args.shape = "acp"
         args.permission_mode = "inline"
     if args.shape == "acp":
+        _validate_reasoning_effort_route(args, raw)
         _normalize_acp_agent(args)
     parent_dispatch_id = str(args.parent_dispatch_id)
     args._defer_sandbox_boundary = True
@@ -8311,15 +8378,26 @@ def _select_healthy_grok_account(
     model: str | None = None,
     exclude: set[str] | None = None,
     named_only: bool = False,
+    allow_refresh: bool = True,
+    require_fresh_state: bool = False,
 ) -> str | None:
     """Select a measured Grok account, applying dispatch admission rules."""
     try:
         import grok_seats
 
+        if require_fresh_state and not grok_seats.states_are_fresh(
+            grok_seats.load_states()
+        ):
+            raise grok_seats.NoUsableSeat(
+                "read-only Grok seat state is missing, stale, or unusable"
+            )
         excluded = set(exclude or ())
         if named_only:
             excluded.add(grok_seats.HOST_KEY)
-        selected = grok_seats.select_seat(exclude=excluded or None)
+        select_kwargs = {"exclude": excluded or None}
+        if not allow_refresh:
+            select_kwargs["allow_refresh"] = False
+        selected = grok_seats.select_seat(**select_kwargs)
         while selected:
             if (
                 not _account_quota_blocked(selected, engine="grok")
@@ -8327,7 +8405,10 @@ def _select_healthy_grok_account(
             ):
                 return selected
             excluded.add(selected)
-            selected = grok_seats.select_seat(exclude=excluded)
+            select_kwargs = {"exclude": excluded}
+            if not allow_refresh:
+                select_kwargs["allow_refresh"] = False
+            selected = grok_seats.select_seat(**select_kwargs)
     except BaseException as exc:
         raise DispatchUsageError("no usable grok seat") from exc
     return None
@@ -8360,11 +8441,37 @@ def grok_selected_account(args) -> str | None:
     return selected
 
 
-def _resolve_account_env(args) -> dict[str, str]:
-    account = args.account or grok_selected_account(args)
+def _resolve_account_env(
+    args,
+    *,
+    allow_grok_refresh: bool = True,
+    require_grok_selection: bool = False,
+) -> dict[str, str]:
+    engine = _account_engine(getattr(args, "agent", "") or "")
+    account = getattr(args, "account", None)
+    if not account and engine == "grok":
+        if allow_grok_refresh:
+            account = grok_selected_account(args)
+        else:
+            try:
+                account = _select_healthy_grok_account(
+                    model=getattr(args, "model", None),
+                    allow_refresh=False,
+                    require_fresh_state=require_grok_selection,
+                )
+                if require_grok_selection and not account:
+                    raise DispatchUsageError("no usable grok seat")
+                if account:
+                    args._grok_selected_account = account
+            except DispatchUsageError:
+                # A read-only catalog lookup cannot refresh a missing/stale
+                # seat snapshot. Effort-bearing launches must fail closed;
+                # other launches leave selection to the real launch phase.
+                if require_grok_selection:
+                    raise
+                account = None
     if not account:
         return {}
-    engine = _account_engine(args.agent)
     if not engine:
         raise DispatchUsageError(
             f"--account is not configured for --agent {args.agent!r}; refusing to bill the wrong account"
@@ -8756,6 +8863,65 @@ def codex_context_mode_defined(env: dict[str, str]) -> bool:
     except (OSError, UnicodeError):
         return False
     return _CONTEXT_MODE_TABLE_RE.search(config) is not None
+
+
+def _grok_reasoning_catalog(
+    home: Path, model: str | None
+) -> tuple[str, frozenset[str], bool]:
+    """Return Grok's selected model, supported efforts, and fallback status."""
+    selected_model = str(model or GROK_DEFAULT_MODEL)
+    fallback_levels = GROK_REASONING_EFFORTS_BY_MODEL.get(
+        selected_model, GROK_FALLBACK_REASONING_EFFORTS
+    )
+    try:
+        cache = json.loads(
+            (home / ".grok" / "models_cache.json").read_text(encoding="utf-8")
+        )
+        models = cache["models"]
+        if not isinstance(models, dict):
+            raise TypeError("Grok models cache has no model map")
+        entry = models[selected_model]
+        info = entry["info"]
+        if not isinstance(info, dict):
+            raise TypeError("Grok model entry has no info map")
+        if info.get("supports_reasoning_effort") is False:
+            return selected_model, frozenset(), False
+        supported = info.get("reasoning_efforts")
+        levels = {
+            item.get("id")
+            for item in supported
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+            and item["id"]
+        }
+        if levels:
+            return selected_model, frozenset(levels), False
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        pass
+    return selected_model, fallback_levels, True
+
+
+def _validate_grok_reasoning_effort(args, env: dict[str, str]) -> None:
+    """Validate Grok effort against the selected account's model catalog."""
+    effort = getattr(args, "reasoning_effort", None)
+    if _account_engine(getattr(args, "agent", "")) != "grok" or not effort:
+        return
+    raw_home = env.get("HOME")
+    home = Path(raw_home).expanduser() if raw_home else Path.home()
+    model, levels, fallback = _grok_reasoning_catalog(
+        home, getattr(args, "model", None)
+    )
+    if effort not in levels:
+        source = (
+            "; using fallback static set (models cache missing, unreadable, "
+            "or no usable entry for this model)"
+            if fallback
+            else ""
+        )
+        supported = ", ".join(sorted(levels)) or "<none>"
+        raise DispatchUsageError(
+            f"reasoning effort {effort!r} is not supported for Grok model "
+            f"{model!r}; supported levels: {supported}{source}"
+        )
 
 
 def _validate_codex_reasoning_effort(args, env: dict[str, str]) -> None:
@@ -16929,7 +17095,15 @@ def _validate_remote_drain_node(args) -> Path:
 
 def _remote_drain_agent(entry: dict) -> str:
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
-    raw = str(entry.get("agent") or request.get("agent") or "codex").strip().lower()
+    dispatch_argv_agent = _option_value_before_worker_remainder(
+        _occupancy_argv_from_record(entry), "--agent", last=True
+    )
+    # dispatch_argv is the replayable carrier and can outlive stale envelope
+    # metadata. Prefer it so a Grok effort request cannot be misrouted as the
+    # default Codex ACP worker when agent fields are missing or stale.
+    raw = str(
+        dispatch_argv_agent or entry.get("agent") or request.get("agent") or "codex"
+    ).strip().lower()
     aliases = {
         "worker": "codex-acp",
         "codex": "codex-acp",
@@ -17004,6 +17178,35 @@ def _remote_drain_billing_account(entry: dict) -> str | None:
     return None
 
 
+def _remote_drain_reasoning_effort(entry: dict) -> str | None:
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    effort = entry.get("reasoning_effort") or request.get("reasoning_effort")
+    if effort is None:
+        effort = _option_value_before_worker_remainder(
+            _occupancy_argv_from_record(entry),
+            "--reasoning-effort",
+            last=True,
+        )
+    value = str(effort).strip() if effort is not None else ""
+    return value or None
+
+
+def _remote_grok_effort_refusal(entry: dict) -> str | None:
+    try:
+        agent = _remote_drain_agent(entry)
+    except _RemoteDrainBlocked:
+        return None
+    effort = _remote_drain_reasoning_effort(entry)
+    if agent != "grok-acp" or not effort:
+        return None
+    return (
+        "remote Grok ACP dispatch refused: --reasoning-effort "
+        f"{effort!r} cannot be preserved because the ACP runner has "
+        "no Grok session-options hook; use a local bash grok-code or "
+        "grok-research dispatch"
+    )
+
+
 def _drain_launch_remote_claim(
     args,
     entry: dict,
@@ -17012,6 +17215,13 @@ def _drain_launch_remote_claim(
     launch_token: str,
     claim: Path,
 ) -> subprocess.CompletedProcess[str]:
+    agent = _remote_drain_agent(entry)
+    refusal = _remote_grok_effort_refusal(entry)
+    if refusal:
+        raise _RemoteDrainBlocked(
+            refusal,
+            code="unsupported_reasoning_effort",
+        )
     node = _remote_drain_node(args)
     if not node:
         raise _RemoteDrainBlocked("--remote-node missing", code="unknown_node")
@@ -17025,7 +17235,7 @@ def _drain_launch_remote_claim(
         preview = fleet_dispatch.preview_dispatch(
             fleet_dir,
             node_id=node,
-            agent=_remote_drain_agent(entry),
+            agent=agent,
             billing_account=_remote_drain_billing_account(entry),
             prompt=_remote_drain_prompt(entry),
             dispatch_id=dispatch_id,
@@ -19412,6 +19622,19 @@ def _drain_queue_once(args) -> dict:
                 holds["pass_launch_budget"]["count"]
             ) + 1
             continue
+        if remote_node and isinstance(_scan_entry, dict):
+            remote_refusal = _remote_grok_effort_refusal(_scan_entry)
+            if remote_refusal:
+                drain_acc["left_queued"] += 1
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "queued",
+                        "reason": "unsupported_reasoning_effort",
+                        "error": remote_refusal,
+                    }
+                )
+                continue
         t_journal = time.monotonic()
         try:
             launch_token = _queue_launch_token(_scan_entry)
@@ -21122,7 +21345,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # Read the prompt from a FILE, not argv `-p` — long goal-flight prompts
         # (5-20KB) would hit E2BIG / argv truncation (grok review #5).
         # Model PER TASK — inject NO --model for either preset: grok's own CLI
-        # default applies (grok-4.5 as of 2026-07-08, per `grok models` "Default
+        # default applies (grok-4.7 as of 2026-09-25, per `grok models` "Default
         # model"), so the flagship is used without pinning a version that goes
         # stale when grok ships the next default. This retires the old explicit
         # pins — grok-build for research (now unlisted by `grok models`) and the
@@ -21180,10 +21403,13 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             # wrapper below leaves Bash available while Seatbelt fences them.
             argv += ["--deny", "Bash"]
         # Only pin a model when one is EXPLICITLY requested; otherwise omit the
-        # flag entirely and let grok's CLI default (grok-4.5) apply.
+        # flag entirely and let grok's CLI default (grok-4.7) apply.
         selected_model = str(model) if model else default_model
         if selected_model:
             argv += ["--model", selected_model]
+        effort = getattr(args, "reasoning_effort", None)
+        if effort:
+            argv += ["--reasoning-effort", str(effort)]
         if args.cwd:
             argv += ["--cwd", args.cwd]
         grok_session_id = _resolved_engine_session_id(args)
@@ -21373,15 +21599,13 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "Default = agent label's own default.")
     parser.add_argument("--reasoning-effort", type=_parse_reasoning_effort,
                         default=None,
-                        help="Codex reasoning effort for this dispatch "
+                        help="Codex or Grok bash reasoning effort for this dispatch "
                              f"({', '.join(sorted(CODEX_REASONING_EFFORTS))}). "
-                             "Requires --agent codex --shape bash without --interactive "
-                             "or a raw command after --. "
-                             "Validated against the selected model's models_cache.json; "
-                             "fallback: low, medium, high, xhigh. "
-                             "Default = whatever the worker CLI config sets, so "
-                             "the machine keeps one source of truth for the "
-                             "default; pass this to raise a single dispatch.")
+                             "Requires --agent codex|grok-code|grok-research with "
+                             "--shape bash without --interactive or a raw command. "
+                             "Validated against the selected model's catalog; "
+                             "Grok ACP refuses this flag because its runner has no "
+                             "session-options hook. Default = the worker CLI default.")
     parser.add_argument(
         "--read-only",
         "--readonly",
@@ -21714,15 +21938,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     if shape == "auto":
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
-    if (
-        args.reasoning_effort is not None
-        and not (args.agent == "codex" and shape == "bash" and not raw)
-    ):
-        print(
-            "goalflight_dispatch: --reasoning-effort requires --agent codex --shape bash "
-            "without --interactive or a raw command after --.",
-            file=sys.stderr,
-        )
+    try:
+        _validate_reasoning_effort_route(args, raw)
+    except DispatchUsageError as exc:
+        print(exc, file=sys.stderr)
         return 64
     if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
         print(
