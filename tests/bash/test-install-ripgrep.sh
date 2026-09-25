@@ -28,13 +28,13 @@ printf '#!/bin/sh\nprintf "Darwin\\n"\n' > "$FAKE_BIN/uname"
 chmod +x "$FAKE_BIN/uname"
 
 NO_DEPS=1
-skip_output="$(PATH="$FAKE_BIN:/usr/bin:/bin" ensure_ripgrep 2>&1)"
+skip_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains 'skipped (--no-deps)' "$skip_output"
 [[ ! -s "$BREW_LOG" ]] || { echo 'FAIL: --no-deps invoked brew' >&2; exit 1; }
 echo 'test1 pass: --no-deps skips package manager'
 
 NO_DEPS=0
-brew_output="$(PATH="$FAKE_BIN:/usr/bin:/bin" ensure_ripgrep 2>&1)"
+brew_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains 'brew install ripgrep' "$brew_output"
 assert_contains 'failed; continuing installer' "$brew_output"
 grep -qx 'install ripgrep' "$BREW_LOG"
@@ -42,9 +42,17 @@ echo 'test2 pass: missing macOS rg invokes brew once and continues on failure'
 
 printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN/rg"
 chmod +x "$FAKE_BIN/rg"
-present_output="$(PATH="$FAKE_BIN:/usr/bin:/bin" ensure_ripgrep 2>&1)"
+present_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains "present ($FAKE_BIN/rg)" "$present_output"
 echo 'test3 pass: existing rg is idempotent'
+
+printf '#!/bin/sh\nexit 1\n' > "$FAKE_BIN/rg"
+chmod +x "$FAKE_BIN/rg"
+: > "$BREW_LOG"
+broken_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
+assert_contains 'rg --version failed' "$broken_output"
+grep -qx 'install ripgrep' "$BREW_LOG"
+echo 'test4 pass: broken rg is not treated as usable'
 
 rm -f "$FAKE_BIN/rg"
 PKG_LOG="$TMPROOT/package-manager.log"
@@ -52,10 +60,10 @@ printf '#!/bin/sh\nprintf "invoked\\n" >> "%s"\nexit 99\n' "$PKG_LOG" > "$FAKE_B
 chmod +x "$FAKE_BIN/apt-get"
 printf '#!/bin/sh\nprintf "Linux\\n"\n' > "$FAKE_BIN/uname"
 chmod +x "$FAKE_BIN/uname"
-linux_output="$(PATH="$FAKE_BIN:/usr/bin:/bin" ensure_ripgrep 2>&1)"
+linux_output="$(PATH="$FAKE_BIN" ensure_ripgrep 2>&1)"
 assert_contains 'sudo apt-get update && sudo apt-get install -y ripgrep' "$linux_output"
 [[ ! -s "$PKG_LOG" ]] || { echo 'FAIL: Linux dependency check ran apt-get' >&2; exit 1; }
-echo 'test4 pass: Linux path prints apt command without running package manager'
+echo 'test5 pass: Linux path prints apt command without running package manager'
 
 FAKE_SETUP="$TMPROOT/setup.sh"
 SETUP_LOG="$TMPROOT/setup-args.log"
@@ -69,4 +77,4 @@ if grep -qx -- '--no-deps' "$SETUP_LOG"; then
   echo 'FAIL: --no-deps leaked into setup argv' >&2
   exit 1
 fi
-echo 'test5 pass: --no-deps is stripped before setup'
+echo 'test6 pass: --no-deps is stripped before setup'

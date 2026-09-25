@@ -41,9 +41,12 @@ ensure_ripgrep() {
   fi
 
   local rg_path=""
-  if rg_path="$(command -v rg 2>/dev/null)"; then
+  if rg_path="$(command -v rg 2>/dev/null)" && rg --version >/dev/null 2>&1; then
     printf 'DEPS rg: present (%s)\n' "$rg_path"
     return 0
+  fi
+  if [[ -n "$rg_path" ]]; then
+    printf 'WARN: rg resolves at %s but rg --version failed; treating it as unavailable.\n' "$rg_path" >&2
   fi
 
   local os=""
@@ -54,10 +57,10 @@ ensure_ripgrep() {
     if [[ -n "$brew_path" ]]; then
       printf 'DEPS rg: missing; running brew install ripgrep (%s)\n' "$brew_path"
       if "$brew_path" install ripgrep; then
-        if rg_path="$(command -v rg 2>/dev/null)"; then
+        if rg_path="$(command -v rg 2>/dev/null)" && rg --version >/dev/null 2>&1; then
           printf 'DEPS rg: installed (%s)\n' "$rg_path"
         else
-          printf 'WARN: brew install ripgrep succeeded but rg is still absent from PATH; continuing installer.\n' >&2
+          printf 'WARN: brew install ripgrep succeeded but usable rg is still absent from PATH; continuing installer.\n' >&2
         fi
       else
         printf 'WARN: brew install ripgrep failed; continuing installer without rg.\n' >&2
