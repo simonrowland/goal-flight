@@ -6498,16 +6498,11 @@ def _preflight_codex_resume_account(
     requested = str(getattr(args, "account", None) or "").strip() or None
     if requested is None:
         raise DispatchUsageError("resume refused: Codex account is missing")
-    api = _codex_seat_api()
-    resolver = getattr(api, "resolve_codex_seat", None)
-    if not callable(resolver):
-        raise DispatchUsageError(
-            "resume refused: the Codex account resolver does not support "
-            "effective-account resolution"
-        )
     try:
-        preflight_home, effective_account = resolver(
-            str(project_root), requested, dispatch_id
+        preflight_home, effective_account = resolve_codex_home(
+            project_root,
+            requested,
+            dispatch_id,
         )
         expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
             strict=False
