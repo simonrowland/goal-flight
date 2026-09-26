@@ -76,7 +76,9 @@ Rules:
   or `--apply` only after review. GC emits one JSON row per candidate, pins a
   commit before removal, re-evaluates immediately before each action, and
   keeps the four-part gate: merged, clean, unowned by a live identity, and not
-  current. Terminal dispatches trigger a dry-run report automatically.
+  current. Terminal dispatches skip GC by default; set
+  `GOALFLIGHT_WORKTREE_GC_ON_TERMINAL=dry-run` or `apply` to launch the same
+  report in the background with a bounded deadline.
 - Disjoint write ownership belongs in the prompt. Acquire capacity before
   spawn. Ledger every worker PID/session. Continue independent chunks when one
   blocks. Merge completed chunks through normal review.

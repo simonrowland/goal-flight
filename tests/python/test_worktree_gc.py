@@ -15,6 +15,7 @@ predicate answers are stubbed. Program exit codes are asserted on every run.
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 from pathlib import Path
@@ -132,6 +133,178 @@ def _worktree_paths(repo: Path) -> set[str]:
         for line in done.stdout.splitlines()
         if line.startswith("worktree ")
     }
+
+
+def test_terminal_gc_is_off_by_default_and_skips_classification(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _add_worktree(repo, tmp_path, "terminal-gc-default")
+    monkeypatch.delenv("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", raising=False)
+    classified: list[object] = []
+    monkeypatch.setattr(
+        goalflight_worktree_gc,
+        "classify",
+        lambda *args, **kwargs: classified.append((args, kwargs)) or {},
+    )
+
+    goalflight_dispatch._terminal_worktree_gc(repo, "terminal-gc-default")
+
+    assert classified == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "expects_apply"),
+    [("dry-run", False), ("apply", True)],
+)
+def test_terminal_gc_opt_in_launches_detached_report(
+    tmp_path: Path,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expects_apply: bool,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", mode)
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.setattr(
+        goalflight_worktree_gc,
+        "terminal_dry_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("parent scanned")),
+    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_popen(command: list[str], **kwargs: object) -> object:
+        calls.append((command, kwargs))
+        stream = kwargs["stdout"]
+        assert hasattr(stream, "write")
+        stream.write(json.dumps({"schema": "test", "mode": mode}))
+        stream.flush()
+        return object()
+
+    monkeypatch.setattr(goalflight_dispatch.subprocess, "Popen", fake_popen)
+
+    goalflight_dispatch._terminal_worktree_gc(repo, "terminal-gc-opt-in")
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[1].endswith("goalflight_worktree_gc.py")
+    assert "--deadline-s" in command
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    if expects_apply:
+        assert "--apply" in command
+    else:
+        assert "--apply" not in command
+    report = json.loads(
+        (tmp_path / "dispatch" / "terminal-gc-opt-in.worktree-gc.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["mode"] == mode
+
+
+def test_terminal_gc_opt_in_returns_before_detached_report(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_dir = tmp_path / "detached-gc-script"
+    script_dir.mkdir()
+    (script_dir / "goalflight_worktree_gc.py").write_text(
+        "import json, time\n"
+        "time.sleep(0.4)\n"
+        "print(json.dumps({'schema': 'test', 'mode': 'report'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(goalflight_dispatch, "SCRIPT_DIR", script_dir)
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", "dry-run")
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.setattr(
+        goalflight_worktree_gc,
+        "terminal_dry_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("parent scanned")),
+    )
+
+    started = time.monotonic()
+    goalflight_dispatch._terminal_worktree_gc(repo, "terminal-gc-detached")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    report_path = tmp_path / "dispatch" / "terminal-gc-detached.worktree-gc.json"
+    deadline = time.monotonic() + 5.0
+    report: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.02)
+            continue
+        break
+    assert report is not None, "detached GC did not produce its report"
+    assert report["mode"] == "report"
+
+
+def test_terminal_outcome_is_emitted_before_terminal_gc(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(repo)
+    dispatch_id = "terminal-outcome-order"
+    events: list[str] = []
+    real_print = builtins.print
+
+    def record_print(*args: object, **kwargs: object) -> None:
+        if args and isinstance(args[0], str) and args[0].startswith("DISPATCH-END "):
+            events.append("outcome")
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", record_print)
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_terminal_worktree_gc",
+        lambda *_args, **_kwargs: events.append("gc"),
+    )
+
+    result = goalflight_dispatch.main(
+        [
+            "--unregistered-forced",
+            "--in-place",
+            "--agent",
+            "test-dispatch",
+            "--dispatch-id",
+            dispatch_id,
+            "--tail",
+            str(tmp_path / f"{dispatch_id}.tail"),
+            "--status-json",
+            str(tmp_path / f"{dispatch_id}.status.json"),
+            "--poll-secs",
+            "0.02",
+            "--max-idle-secs",
+            "5",
+            "--foreground",
+            "--",
+            sys.executable,
+            "-c",
+            f"print('COMPLETE: {dispatch_id} — ok', flush=True)",
+        ]
+    )
+
+    assert result == 0
+    assert events == ["outcome", "gc"]
+
+
+def test_gc_apply_honors_shared_deadline(repo: Path) -> None:
+    entry = {"decision": "remove", "path": str(repo / "missing-worktree")}
+
+    goalflight_worktree_gc.apply_removals(
+        repo,
+        [entry],
+        into="main",
+        ledger_dir=goalflight_ledger.runs_dir(create=False),
+        main_path=goalflight_worktree_gc.main_worktree_path(repo),
+        current_checkout=None,
+        current_error=None,
+        deadline=0.0,
+    )
+
+    assert entry["outcome"] == "retained", entry
+    assert "deadline expired" in entry["reason"], entry
 
 
 # --------------------------------------------------------------------------

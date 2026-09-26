@@ -1500,6 +1500,7 @@ def apply_removals(
     main_path: str | None,
     current_checkout: str | None,
     current_error: str | None,
+    deadline: float | None = None,
 ) -> None:
     """Act on decided entries, re-verifying each immediately beforehand.
 
@@ -1511,10 +1512,20 @@ def apply_removals(
     targets = [e for e in entries if e["decision"] in {"remove", "prune"}]
     for entry in targets:
         path = entry["path"]
-        deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+        action_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+        )
+        if _deadline_expired(action_deadline):
+            entry["outcome"] = "retained"
+            entry["reason"] = (
+                "changed_before_remove: removal deadline expired; retaining checkout"
+            )
+            continue
 
         # Re-list: the fresh listing is the only authority on what exists NOW.
-        listed, list_error = list_worktrees(repo, deadline=deadline)
+        listed, list_error = list_worktrees(repo, deadline=action_deadline)
         fresh = next(
             (item for item in listed if _same_path(item["path"], path)),
             None,
@@ -1533,7 +1544,7 @@ def apply_removals(
                 path, project_root=read_only_project_root
             )
             )
-        if _deadline_expired(deadline):
+        if _deadline_expired(action_deadline):
             entry["outcome"] = "retained"
             entry["reason"] = (
                 "changed_before_remove: removal deadline expired; retaining checkout"
@@ -1541,11 +1552,11 @@ def apply_removals(
             continue
         if read_only_verdict in {YES, UNKNOWN}:
             pool_lock, lock_error = _acquire_read_only_action_lock(
-                repo, deadline=deadline
+                repo, deadline=action_deadline
             )
         else:
             pool_lock, lock_error = _acquire_pool_action_lock(
-                repo, path, deadline=deadline
+                repo, path, deadline=action_deadline
             )
         if lock_error is not None:
             entry["outcome"] = "retained"
@@ -1554,10 +1565,10 @@ def apply_removals(
         try:
             # Pinning is idempotent and must happen before StateLock. A stalled
             # Git process therefore cannot block unrelated ledger writers.
-            if fresh.get("path") and not _deadline_expired(deadline):
+            if fresh.get("path") and not _deadline_expired(action_deadline):
                 if entry["decision"] == "remove":
                     keep_ref, pin_error = _pin_before_remove(
-                        repo, path, deadline=deadline
+                        repo, path, deadline=action_deadline
                     )
                     if pin_error is not None:
                         entry["outcome"] = "retained"
@@ -1567,7 +1578,7 @@ def apply_removals(
                         continue
                     entry["keep_ref"] = keep_ref
 
-            if _deadline_expired(deadline):
+            if _deadline_expired(action_deadline):
                 entry["outcome"] = "retained"
                 entry["reason"] = (
                     "changed_before_remove: removal deadline expired after pinning; "
@@ -1577,7 +1588,7 @@ def apply_removals(
 
             # The ledger lock is deliberately taken only after pinning and is
             # held for the final re-check plus the destructive Git operation.
-            ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+            ledger_lock = goalflight_ledger.StateLock.try_acquire(action_deadline)
             if ledger_lock is None:
                 entry["outcome"] = "retained"
                 entry["reason"] = (
@@ -1585,7 +1596,7 @@ def apply_removals(
                 )
                 continue
             with ledger_lock:
-                if _deadline_expired(deadline):
+                if _deadline_expired(action_deadline):
                     entry["outcome"] = "retained"
                     entry["reason"] = (
                         "changed_before_remove: removal deadline expired before final re-check; "
@@ -1593,10 +1604,10 @@ def apply_removals(
                     )
                     continue
                 final_ledger_index = ledger_index_for_dir(
-                    ledger_dir, deadline=deadline
+                    ledger_dir, deadline=action_deadline
                 )
                 final_current_checkout, final_current_error = current_checkout_path(
-                    repo, deadline=deadline
+                    repo, deadline=action_deadline
                 )
                 current = classify(
                     repo,
@@ -1608,8 +1619,8 @@ def apply_removals(
                     current_error=final_current_error,
                     pool_lock=pool_lock,
                     ledger_index=final_ledger_index,
-                    identity_deadline=deadline,
-                    deadline=deadline,
+                    identity_deadline=action_deadline,
+                    deadline=action_deadline,
                 )
                 if current["decision"] not in {"remove", "prune"}:
                     entry["outcome"] = "retained"
@@ -1621,7 +1632,7 @@ def apply_removals(
                 stale: set[str] = set()
                 scan_expired = False
                 for item in listed:
-                    if _deadline_expired(deadline):
+                    if _deadline_expired(action_deadline):
                         scan_expired = True
                         break
                     if _presence(Path(item["path"])) == "absent":
@@ -1643,7 +1654,7 @@ def apply_removals(
                             "that did not pass the conjunction; skipped"
                         )
                         continue
-                    ok, detail = _prune_worktrees(repo, deadline=deadline)
+                    ok, detail = _prune_worktrees(repo, deadline=action_deadline)
                     if ok:
                         entry["outcome"] = "pruned"
                     elif "deadline expired" in detail:
@@ -1654,7 +1665,7 @@ def apply_removals(
                         entry["error"] = detail
                     continue
 
-                ok, detail = _remove_worktree(repo, path, deadline=deadline)
+                ok, detail = _remove_worktree(repo, path, deadline=action_deadline)
                 if ok:
                     entry["outcome"] = "removed"
                 elif "deadline expired" in detail:
@@ -1663,7 +1674,7 @@ def apply_removals(
                 elif _presence(Path(path)) == "absent" and prune_allowed:
                     # The directory disappeared between scan and removal; reclaim
                     # the administrative entry instead of reporting an error.
-                    ok, detail = _prune_worktrees(repo, deadline=deadline)
+                    ok, detail = _prune_worktrees(repo, deadline=action_deadline)
                     if ok:
                         entry["outcome"] = "pruned"
                     elif "deadline expired" in detail:
@@ -1778,20 +1789,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually remove reclaimable worktrees. Default is report-only.",
     )
+    parser.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        help="Bound the scan and any removals to this many seconds.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON.")
     return parser
 
 
-def terminal_dry_run(repo: Path, *, into: str = "main", ledger_dir: Path | None = None) -> dict[str, Any]:
+def terminal_dry_run(
+    repo: Path,
+    *,
+    into: str = "main",
+    ledger_dir: Path | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     """Return the same report used by the CLI, without mutating the repository."""
     repo = Path(repo).resolve()
     ledger_dir = ledger_dir or goalflight_ledger.runs_dir(create=False)
-    listed, list_error = list_worktrees(repo)
+    listed, list_error = list_worktrees(repo, deadline=deadline)
     if list_error is not None:
         return {"schema": SCHEMA, "repo": str(repo), "mode": "report", "error": list_error}
-    main_path = main_worktree_path(repo)
-    current_checkout, current_error = current_checkout_path(repo)
-    ledger_index = ledger_index_for_dir(ledger_dir)
+    main_path = main_worktree_path(repo, deadline=deadline)
+    current_checkout, current_error = current_checkout_path(repo, deadline=deadline)
+    ledger_index = ledger_index_for_dir(ledger_dir, deadline=deadline)
     entries = [
         classify(
             repo,
@@ -1802,6 +1825,7 @@ def terminal_dry_run(repo: Path, *, into: str = "main", ledger_dir: Path | None 
             current_checkout=current_checkout,
             current_error=current_error,
             ledger_index=ledger_index,
+            deadline=deadline,
         )
         for entry in listed
     ]
@@ -1820,14 +1844,19 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo = args.repo.resolve()
     ledger_dir = args.ledger_dir or goalflight_ledger.runs_dir(create=False)
+    deadline = (
+        time.monotonic() + max(0.0, args.deadline_s)
+        if args.deadline_s is not None
+        else None
+    )
 
-    listed, list_error = list_worktrees(repo)
+    listed, list_error = list_worktrees(repo, deadline=deadline)
     if list_error is not None:
         print(f"cannot list worktrees for {repo}: {list_error}", file=sys.stderr)
         return 1
-    main_path = main_worktree_path(repo)
-    current_checkout, current_error = current_checkout_path(repo)
-    ledger_index = ledger_index_for_dir(ledger_dir)
+    main_path = main_worktree_path(repo, deadline=deadline)
+    current_checkout, current_error = current_checkout_path(repo, deadline=deadline)
+    ledger_index = ledger_index_for_dir(ledger_dir, deadline=deadline)
 
     entries = [
         classify(
@@ -1839,6 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
             current_checkout=current_checkout,
             current_error=current_error,
             ledger_index=ledger_index,
+            deadline=deadline,
         )
         for entry in listed
     ]
@@ -1852,6 +1882,7 @@ def main(argv: list[str] | None = None) -> int:
             main_path=main_path,
             current_checkout=current_checkout,
             current_error=current_error,
+            deadline=deadline,
         )
 
     report = {

@@ -119,6 +119,7 @@ WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 # advertised skill root instead (see _status_reminder_lines). Re-adding a
 # SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
+TERMINAL_WORKTREE_GC_TIMEOUT_S = 30.0
 READ_ONLY_ALLOCATION_LOCK_PATH_ENV = "GOALFLIGHT_READ_ONLY_ALLOCATION_LOCK_PATH"
 # Routed by exact argv[0] match in main(). Kept beside the routes so a new
 # subcommand cannot be added without the misplacement guard learning it.
@@ -5171,47 +5172,38 @@ def _release_withdrawn_worktree(record: dict | None, dispatch_id: str) -> None:
 
 
 def _terminal_worktree_gc(project_root: Path | None, dispatch_id: str) -> None:
-    """Write a terminal-triggered dry-run report; reclaim only when opted in."""
-    mode = os.environ.get("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", "dry-run").strip().lower()
-    if mode in {"", "off", "disabled"} or project_root is None:
+    """Start an optional terminal GC report without delaying dispatch exit."""
+    mode = os.environ.get("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", "off").strip().lower()
+    if mode == "reclaim":
+        mode = "apply"
+    if mode not in {"dry-run", "apply"} or project_root is None:
         return
+    report_path = _dispatch_base_dir() / f"{dispatch_id}.worktree-gc.json"
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "goalflight_worktree_gc.py"),
+        str(project_root),
+        "--into",
+        "main",
+        "--json",
+        "--deadline-s",
+        str(TERMINAL_WORKTREE_GC_TIMEOUT_S),
+    ]
+    if mode == "apply":
+        command.append("--apply")
     try:
-        import goalflight_worktree_gc
-
-        report = goalflight_worktree_gc.terminal_dry_run(project_root)
-        if mode == "reclaim" and not report.get("error"):
-            listed, _ = goalflight_worktree_gc.list_worktrees(project_root)
-            main_path = goalflight_worktree_gc.main_worktree_path(project_root)
-            current, current_error = goalflight_worktree_gc.current_checkout_path(project_root)
-            ledger_dir = goalflight_ledger.runs_dir(create=False)
-            ledger_index = goalflight_worktree_gc.ledger_index_for_dir(ledger_dir)
-            entries = [
-                goalflight_worktree_gc.classify(
-                    project_root,
-                    item,
-                    into="main",
-                    ledger_dir=ledger_dir,
-                    main_path=main_path,
-                    current_checkout=current,
-                    current_error=current_error,
-                    ledger_index=ledger_index,
-                )
-                for item in listed
-            ]
-            goalflight_worktree_gc.apply_removals(
-                project_root,
-                entries,
-                into="main",
-                ledger_dir=ledger_dir,
-                main_path=main_path,
-                current_checkout=current,
-                current_error=current_error,
+        report_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with report_path.open("w", encoding="utf-8") as report:
+            subprocess.Popen(
+                command,
+                cwd=str(project_root),
+                stdin=subprocess.DEVNULL,
+                stdout=report,
+                stderr=subprocess.DEVNULL,
+                env=_sidecar_env(os.environ.copy()),
+                **_detached_popen_kwargs(),
             )
-            report["mode"] = "reclaim"
-            report["entries"] = entries
-        path = _dispatch_base_dir() / f"{dispatch_id}.worktree-gc.json"
-        _write_json_atomic(path, report)
-    except Exception:
+    except (OSError, ValueError):
         return
 
 
@@ -22518,6 +22510,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         or controller_claim.get("reason")
                     ),
                     file=sys.stderr,
+                    flush=True,
                 )
                 return 73
             if controller_claim.get("visible_warning"):
@@ -22525,6 +22518,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     "goalflight_dispatch: controller auto-claim unavailable: "
                     + str(controller_claim.get("reason") or "unknown"),
                     file=sys.stderr,
+                    flush=True,
                 )
         registration_warning = _prepare_attempt_controller_registration(args, project_root)
         if registration_warning is not None:
@@ -22792,7 +22786,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         try:
             _mark_queue_claim_launch_started(args)
         except DispatchUsageError as e:
-            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
             return 64
         try:
             steer_file.parent.mkdir(parents=True, exist_ok=True)
@@ -22802,6 +22796,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 f"goalflight_dispatch: could not pre-create steer mailbox {steer_file}: "
                 f"{type(exc).__name__}: {exc}; steering will start on first message",
                 file=sys.stderr,
+                flush=True,
             )
         prompt_path = None if raw else _resolve_prompt_file(args, base)
         original_prompt_path = prompt_path
@@ -22827,11 +22822,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         try:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)
         except DispatchUsageError as e:
-            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
             return 64
         if not worker_argv:
             print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X` "
-                  "or `-- <cmd...>`", file=sys.stderr)
+                  "or `-- <cmd...>`", file=sys.stderr, flush=True)
             return 64
         tail.parent.mkdir(parents=True, exist_ok=True)
         _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
@@ -23027,6 +23022,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         "goalflight_dispatch: registered "
                         f"{_project_root(args)} as grok-trusted for this worker home",
                         file=sys.stderr,
+                        flush=True,
                     )
             except BaseException as exc:
                 detail = (
@@ -23037,6 +23033,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 print(
                     f"goalflight_dispatch: WARN: grok folder trust not registered: {detail}",
                     file=sys.stderr,
+                    flush=True,
                 )
         if args.account and _account_engine(args.agent) == "cursor":
             env.pop("CURSOR_API_KEY", None)
@@ -23381,6 +23378,8 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         )
         if hint:
             end_payload["hint"] = hint
+        # Flush before returning into the finalizer: optional terminal GC is
+        # launched there and must never hide the dispatch outcome.
         print("DISPATCH-END " + json.dumps(end_payload, sort_keys=True), flush=True)
         return watch_rc
     except SystemExit:
@@ -23388,17 +23387,25 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         final_state = "failed_worktree"
         final_reason = str(e)
-        print(f"goalflight_dispatch: {e}; refusing to git worktree add", file=sys.stderr)
+        print(
+            f"goalflight_dispatch: {e}; refusing to git worktree add",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     except goalflight_worktree_pool.WorktreeSeatError as e:
         final_state = "failed_worktree"
         final_reason = str(e)
-        print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
+        print(
+            f"goalflight_dispatch: worktree allocation error: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
         return 1
     except DispatchUsageError as e:
         final_state = "failed"
         final_reason = str(e)
-        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
         return 64
     except Exception as e:
         final_state = "failed"
@@ -23511,6 +23518,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         flush=True,
                     )
         if not detached_launched and not keep_live_watcher_open and final_worker_alive is not True:
+            # This is deliberately after the flushed terminal outcome above.
             _terminal_worktree_gc(project_root, args.dispatch_id)
         # The claimant can now surrender its own lease while alive. Do not
         # surrender a worker left running for reattachment after a marker.
