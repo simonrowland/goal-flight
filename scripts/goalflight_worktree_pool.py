@@ -9,6 +9,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -70,6 +71,26 @@ READ_ONLY_WORKTREE_GRACE_S = 60 * 60
 READ_ONLY_GIT_TIMEOUT_S = 30.0
 SEAT_RESET_GIT_TIMEOUT_S = 30.0
 READ_ONLY_REAP_TIMEOUT_S = 30.0
+
+
+def _read_only_allocation_wait_s(default: float = 900.0) -> float:
+    raw = os.environ.get("GOALFLIGHT_READONLY_ALLOCATION_WAIT_S")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # inf would wait forever and NaN compares false everywhere; neither is a budget.
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+# Wait budget for the read-only allocation mutex itself, separate from the work
+# done while holding it. The mutex serialises allocation so two dispatches can
+# never be handed the same checkout, so it cannot be widened to N holders. A
+# holder was measured at 80-140 s of CPU under fleet load (b-473), so a 30 s
+# wait made concurrent dispatches fail instead of queueing; waiters now queue.
+READ_ONLY_ALLOCATION_WAIT_S = _read_only_allocation_wait_s()
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
@@ -4429,14 +4450,15 @@ def _read_only_allocation_lock(
 ):
     started = time.monotonic()
     if deadline is None:
-        budget = READ_ONLY_GIT_TIMEOUT_S if timeout_s is None else max(0.0, timeout_s)
+        budget = READ_ONLY_ALLOCATION_WAIT_S if timeout_s is None else max(0.0, timeout_s)
         deadline = time.monotonic() + budget
     else:
         budget = max(0.0, deadline - started)
     try:
         registry_root = _git_common_dir(
             project_root,
-            timeout=max(0.0, deadline - time.monotonic()),
+            # The git probe is a quick metadata read; it must not inherit the long lock wait.
+            timeout=min(READ_ONLY_GIT_TIMEOUT_S, max(0.0, deadline - time.monotonic())),
         )
     except WorktreeSeatError as exc:
         if "timed out" in str(exc).lower() or time.monotonic() >= deadline:
@@ -4511,13 +4533,13 @@ def reap_read_only_worktrees(
             return
         root.mkdir(parents=True, exist_ok=True)
         _verify_read_only_root(root)
-        deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
         import goalflight_worktree_gc
 
         # Lock order is allocation -> ledger. Resume holds the allocation
         # reservation while its child row is recorded; GC must never hold the
         # ledger lock while waiting for that reservation.
-        with _read_only_allocation_lock(project_root, deadline=deadline):
+        with _read_only_allocation_lock(project_root):
+            deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
             ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
             if ledger_lock is None:
                 return
@@ -4577,9 +4599,10 @@ def shared_read_only_worktree(
     _verify_read_only_root(root)
     ledger_index = None
     with contextlib.ExitStack() as locks:
-        locks.enter_context(
-            _read_only_allocation_lock(project_root, deadline=deadline)
-        )
+        locks.enter_context(_read_only_allocation_lock(project_root))
+        # The queue wait above has its own budget; the allocation work gets a
+        # fresh deadline once the lock is held so a long queue cannot starve it.
+        deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
         if reap:
             import goalflight_worktree_gc
 

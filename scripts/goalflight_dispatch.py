@@ -2557,14 +2557,14 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
         args._read_only_admission_prepared = True
     else:
         _prepare_read_only_admission(args, project_root)
-    deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
     if reservation is None:
-        reservation = goalflight_worktree_pool._read_only_allocation_lock(
-            project_root, deadline=deadline
-        )
+        # Queue on the allocation lock's own wait budget, then give the resume
+        # work a fresh deadline once the lock is held (same rule as allocation).
+        reservation = goalflight_worktree_pool._read_only_allocation_lock(project_root)
         lock_file = reservation.__enter__()
     else:
         lock_file = reservation
+    deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
     args._read_only_resume_reservation = reservation
     args._read_only_resume_lock_fd = (
         lock_file.fileno() if lock_file is not None else None
