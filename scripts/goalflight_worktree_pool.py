@@ -2209,6 +2209,36 @@ def _refnames(
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()], ""
 
 
+def _rev_list_unique_commits(
+    cwd: Path,
+    *,
+    start: str,
+    base_commit: str,
+    refs: list[str],
+    moving_ref: str | None,
+    oneline: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Enumerate ``start`` minus the exact reset keep-set through stdin.
+
+    The keep-set is every ref under ``refs/`` except ``moving_ref``, plus the
+    reset base. ``--stdin`` keeps the unbounded ref list out of argv; unlike
+    ``--all``, it does not add HEAD or another worktree's detached HEAD.
+    """
+    revisions = [start, "--not", base_commit]
+    revisions.extend(ref for ref in refs if not moving_ref or ref != moving_ref)
+    args = ["rev-list"]
+    if oneline:
+        args.append("--oneline")
+    args.append("--stdin")
+    return _git_proc(
+        cwd,
+        *args,
+        input_text="\n".join(revisions) + "\n",
+        timeout=timeout,
+    )
+
+
 def check_reset_preserves_commits(
     cwd: Path,
     *,
@@ -2230,18 +2260,13 @@ def check_reset_preserves_commits(
             UNKNOWN,
             f"cannot list refs ({err}); unique commits are unknown",
         )
-    exclude = [base_commit]
-    for ref in refs:
-        if moving_ref and ref == moving_ref:
-            continue
-        exclude.append(ref)
-    proc = _git_proc(
+    proc = _rev_list_unique_commits(
         cwd,
-        "rev-list",
-        "--oneline",
-        start,
-        "--not",
-        *exclude,
+        start=start,
+        base_commit=base_commit,
+        refs=refs,
+        moving_ref=moving_ref,
+        oneline=True,
         timeout=timeout,
     )
     if proc is None:
@@ -2316,13 +2341,13 @@ def pin_unique_commits(
     if head_proc is None or head_proc.returncode != 0:
         return {"verdict": UNKNOWN, "reason": "cannot resolve worktree HEAD", "keep_ref": None}
     head = head_proc.stdout.strip()
-    exclude = [base_commit]
-    for ref in refs:
-        if moving_ref and ref == moving_ref:
-            continue
-        exclude.append(ref)
-    unique = _git_proc(
-        worktree_path, "rev-list", head, "--not", *exclude, timeout=timeout
+    unique = _rev_list_unique_commits(
+        worktree_path,
+        start=head,
+        base_commit=base_commit,
+        refs=refs,
+        moving_ref=moving_ref,
+        timeout=timeout,
     )
     if unique is None or unique.returncode != 0:
         return {
@@ -3168,8 +3193,9 @@ def _quarantine_dirty_worktree(
                 worktree_path,
                 "reset",
                 "-q",
-                "--",
-                *reserved_untracked,
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+                input_text="\0".join(reserved_untracked) + "\0",
                 env=index_env,
             )
         tree = _git(worktree_path, "write-tree", env=index_env)

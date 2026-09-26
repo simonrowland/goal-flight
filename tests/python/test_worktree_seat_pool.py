@@ -219,6 +219,73 @@ def test_git_proc_uses_file_for_large_input() -> None:
     assert observed["stdin"] is not None
 
 
+def test_reset_safety_handles_refnames_larger_than_argv_limit(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    base = git(repo, "rev-parse", "main")
+
+    git(repo, "checkout", "-q", "-b", "moving-covered", "main")
+    (repo / "covered.txt").write_text("covered\n", encoding="utf-8")
+    git(repo, "add", "covered.txt")
+    git(repo, "commit", "-qm", "covered")
+    covered = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-q", "-b", "moving", "main")
+    (repo / "moving.txt").write_text("moving\n", encoding="utf-8")
+    git(repo, "add", "moving.txt")
+    git(repo, "commit", "-qm", "moving")
+    moving = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-q", "-b", "detached-source", "main")
+    (repo / "detached.txt").write_text("detached\n", encoding="utf-8")
+    git(repo, "add", "detached.txt")
+    git(repo, "commit", "-qm", "detached")
+    detached = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "branch", "-D", "detached-source")
+
+    git(repo, "pack-refs", "--all", "--prune")
+    packed_refs = Path(git(repo, "rev-parse", "--git-path", "packed-refs"))
+    if not packed_refs.is_absolute():
+        packed_refs = repo / packed_refs
+    entries = {
+        "refs/heads/main": base,
+        "refs/heads/moving": moving,
+        "refs/heads/moving-covered": covered,
+    }
+    for index in range(30_000):
+        entries[f"refs/fixture/{index:05d}-{'x' * 80}"] = covered
+    packed_refs.write_text(
+        "# pack-refs with: peeled fully-peeled sorted\n"
+        + "".join(f"{entries[ref]} {ref}\n" for ref in sorted(entries)),
+        encoding="utf-8",
+    )
+
+    moving_result = goalflight_worktree_pool.check_reset_preserves_commits(
+        repo,
+        start=moving,
+        base_commit=base,
+        moving_ref="refs/heads/moving",
+    )
+    assert moving_result["verdict"] == goalflight_worktree_pool.NO
+
+    covered_result = goalflight_worktree_pool.check_reset_preserves_commits(
+        repo,
+        start=covered,
+        base_commit=base,
+        moving_ref="refs/heads/moving-covered",
+    )
+    assert covered_result["verdict"] == goalflight_worktree_pool.YES
+
+    git(repo, "checkout", "-q", "--detach", detached)
+    detached_result = goalflight_worktree_pool.check_reset_preserves_commits(
+        repo,
+        start=detached,
+        base_commit=base,
+        moving_ref=None,
+    )
+    assert detached_result["verdict"] == goalflight_worktree_pool.NO
+
+
 @contextlib.contextmanager
 def seat_limit(limit: int):
     name = goalflight_worktree_pool.WORKTREE_SEATS_ENV
