@@ -124,6 +124,37 @@ def case_conf_operating_cap_flows_through_capacity() -> None:
         importlib.reload(cap)
 
 
+def case_worker_rss_ceiling_uses_config_env_and_ram_default() -> None:
+    path = _write_conf(json.dumps({"worker_rss_ceiling_mb": 77}))
+    old_env = os.environ.pop("GOALFLIGHT_WORKER_RSS_CEILING_MB", None)
+    try:
+        _reload_limits(path)
+        import goalflight_capacity as cap
+
+        cap = importlib.reload(cap)
+        assert cap.worker_rss_ceiling_mb() == 77
+        os.environ["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = "91"
+        assert cap.worker_rss_ceiling_mb() == 91
+        os.environ.pop("GOALFLIGHT_WORKER_RSS_CEILING_MB", None)
+        os.unlink(path)
+        _reload_limits(None)
+        cap = importlib.reload(cap)
+        cap.detect_ram_mb = lambda: 128 * 1024
+        assert cap.worker_rss_ceiling_mb() == 6 * 1024
+        cap.detect_ram_mb = lambda: 8 * 1024
+        assert cap.worker_rss_ceiling_mb() == 4 * 1024
+    finally:
+        os.environ.pop("GOALFLIGHT_WORKER_RSS_CEILING_MB", None)
+        if old_env is not None:
+            os.environ["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = old_env
+        if os.path.exists(path):
+            os.unlink(path)
+        _reload_limits(None)
+        import goalflight_capacity as cap
+
+        importlib.reload(cap)
+
+
 def case_malformed_conf_degrades_to_baseline() -> None:
     path = _write_conf("{ not valid json ]")
     try:
@@ -169,6 +200,7 @@ def main() -> None:
         case_absent_conf_keeps_committed_baseline()
         case_conf_overrides_merge_over_baseline()
         case_conf_operating_cap_flows_through_capacity()
+        case_worker_rss_ceiling_uses_config_env_and_ram_default()
         case_malformed_conf_degrades_to_baseline()
         case_non_positive_and_nonint_cap_values_ignored()
         case_retired_handle_conf_key_tunes_successor_lane()

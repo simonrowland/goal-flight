@@ -37,6 +37,7 @@ from goalflight_agent_limits import (
     account_cap,
     local_hard_cap,
     local_operating_total,
+    local_worker_rss_ceiling_mb,
     model_weight,
     normalize_agent,
 )
@@ -52,6 +53,24 @@ LEASE_SCHEMA = "goalflight.capacity.lease.v2"
 DEFAULT_STATE_DIR = goalflight_compat.resolve_state_dir()
 DEFAULT_RESERVE_MB = 2048
 DEFAULT_WORST_WORKER_MB = 1200
+# A single worker may legitimately need more than the aggregate admission
+# estimate, but it must not be able to repeat the b-451 history search. The
+# measured derivation is in docs-private/measurements/descendant-rss-2026-09-26.md:
+# on this 128 GB host, the largest legitimate per-process peak was rg=3,512 MB
+# (Chrome=2,063 MB, Claude Code=1,964 MB, python/pytest=1,666 MB, and
+# WebKit=1,273 MB); the smallest runaway was worker `git grep`=9,091 MB
+# (the other measured runaways were 11,009, 34,634, and 47,099 MB, plus the
+# earlier b-451=43 GB incident). Choose 6 GB (6,144 MB): it leaves 2,632 MB
+# above the 3,512 MB legitimate maximum and 2,947 MB below the 9,091 MB
+# runaway minimum, so it sits in that measured gap on the 128 GB host. Scale
+# down on small hosts as min(6 GB, max(4 GB, 5% of RAM)): an 8 GB host uses
+# the 4 GB floor, which is not below the measured 3.5 GB legitimate need; the
+# no-RAM fallback uses the same floor. Every measured legitimate peak is below
+# 6 GB, while every measured runaway (9.1/11/35/47 GB and 43 GB) is above it.
+DEFAULT_WORKER_RSS_FLOOR_MB = 4 * 1024
+DEFAULT_WORKER_RSS_FRACTION = 0.05
+DEFAULT_WORKER_RSS_CEILING_MB = 6 * 1024
+DEFAULT_WORKER_RSS_FALLBACK_MB = DEFAULT_WORKER_RSS_FLOOR_MB
 # DEFAULT_HARD_CAP is the committed generic baseline raw_ceiling INPUT;
 # operating_cap = min(raw_ceiling, tier|conf|env), and raw_ceiling itself =
 # min(this, headroom_mb // worst_worker_mb), so RAM and the acquire-time RSS
@@ -615,6 +634,31 @@ def detect_ram_mb() -> int:
     return 0
 
 
+def worker_rss_ceiling_mb() -> int:
+    """Return the per-worker RSS ceiling from env, config, or physical RAM."""
+    env_override = os.environ.get("GOALFLIGHT_WORKER_RSS_CEILING_MB")
+    if env_override not in (None, ""):
+        try:
+            parsed = int(env_override)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    configured = local_worker_rss_ceiling_mb()
+    if configured is not None:
+        return configured
+    ram_mb = detect_ram_mb()
+    if ram_mb > 0:
+        return min(
+            DEFAULT_WORKER_RSS_CEILING_MB,
+            max(
+                DEFAULT_WORKER_RSS_FLOOR_MB,
+                int(ram_mb * DEFAULT_WORKER_RSS_FRACTION),
+            ),
+        )
+    return DEFAULT_WORKER_RSS_FALLBACK_MB
+
+
 def detect_tools() -> dict:
     grok = shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
     cursor_agent = shutil.which("cursor-agent") or str(Path.home() / ".local/bin/cursor-agent")
@@ -696,6 +740,7 @@ def profile(args: argparse.Namespace | None = None) -> dict:
         "worst_case_worker_mb": worst_worker_mb,
         "raw_ram_ceiling": raw_ceiling,
         "operating_cap": operating_cap,
+        "worker_rss_ceiling_mb": worker_rss_ceiling_mb(),
         "hard_cap": hard_cap,
         "agent_caps": DEFAULT_AGENT_CAPS,
         "account_caps": ACCOUNT_CAPS,

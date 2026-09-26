@@ -163,6 +163,7 @@ def cap_pool(agent: str) -> str:
 #   "model_weights": {vendor: {model: number}}                                #
 #                    optional slot weights; omitted models weigh 1.0             #
 #   "agent_rss_mb": {agent: int}  merged over AGENT_RSS_MB                      #
+#   "worker_rss_ceiling_mb": int  per-worker watcher RSS ceiling                #
 #   "hard_cap":     int           raw ceiling for goalflight_capacity          #
 #   "operating_total"|"max_total": int  persistent machine operating cap       #
 #      (equivalent to $GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit  #
@@ -347,6 +348,11 @@ def local_operating_total() -> int | None:
     """Conf ``operating_total`` (or ``max_total``) as a positive int, else None."""
     value = LOCAL_OVERRIDES.get("operating_total", LOCAL_OVERRIDES.get("max_total"))
     return _positive_int_or(value, None)
+
+
+def local_worker_rss_ceiling_mb() -> int | None:
+    """Configured per-worker RSS ceiling in MB, or None when unset."""
+    return _positive_int_or(LOCAL_OVERRIDES.get("worker_rss_ceiling_mb"), None)
 
 
 # --- capacity profile seeding -------------------------------------------------

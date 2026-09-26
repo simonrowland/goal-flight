@@ -414,6 +414,338 @@ def _read_status(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _rss_ps_bindir(tmp_path: Path) -> Path:
+    bindir = tmp_path / "rss-ps-bin"
+    bindir.mkdir()
+    stub = bindir / "ps"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${GOALFLIGHT_TEST_RSS_PS_FAIL:-}\" = 1 ]; then exit 1; fi\n"
+        "while IFS='|' read -r pid rss command; do\n"
+        "  [ -n \"$pid\" ] || continue\n"
+        "  if kill -0 \"$pid\" 2>/dev/null; then\n"
+        "    printf '%s %s %s\\n' \"$pid\" \"$rss\" \"$command\"\n"
+        "  fi\n"
+        "done <<EOF\n"
+        "${GOALFLIGHT_TEST_RSS_ROWS:-}\n"
+        "EOF\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bindir
+
+
+def _spawn_memory_worker(tmp_path: Path) -> tuple[subprocess.Popen, int]:
+    child_pid_file = tmp_path / "memory-child.pid"
+    child_code = (
+        "data = bytearray(64 * 1024 * 1024)\n"
+        "for i in range(0, len(data), 4096): data[i] = 1\n"
+        "import time; time.sleep(30)\n"
+    )
+    worker_code = (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+        "try:\n"
+        "    while child.poll() is None: time.sleep(0.05)\n"
+        "    child.wait()\n"
+        "    time.sleep(30)\n"
+        "finally:\n"
+        "    if child.poll() is None:\n"
+        "        child.kill(); child.wait()\n"
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not child_pid_file.exists():
+        time.sleep(0.02)
+    assert child_pid_file.is_file(), "memory fixture never spawned its child"
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+    assert goalflight_compat.pid_alive(child_pid), child_pid
+    return worker, child_pid
+
+
+def _memory_watcher_env(
+    tmp_path: Path,
+    *,
+    rows: str,
+    ps_fail: bool = False,
+    sample_interval_s: str = "0.1",
+) -> dict[str, str]:
+    env = _watcher_env(tmp_path)
+    env["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = "16"
+    env["GOALFLIGHT_TEST_WORKER_RSS_SAMPLE_INTERVAL_S"] = sample_interval_s
+    env["GOALFLIGHT_TEST_RSS_ROWS"] = rows
+    if ps_fail:
+        env["GOALFLIGHT_TEST_RSS_PS_FAIL"] = "1"
+    else:
+        env.pop("GOALFLIGHT_TEST_RSS_PS_FAIL", None)
+    env["PATH"] = str(_rss_ps_bindir(tmp_path)) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def _wait_for_status(path: Path, predicate, timeout: float = 5.0) -> dict:
+    deadline = time.monotonic() + timeout
+    payload: dict = {}
+    while time.monotonic() < deadline:
+        payload = _read_status(path)
+        if predicate(payload):
+            return payload
+        time.sleep(0.05)
+    return payload
+
+
+def _stop_memory_worker(worker: subprocess.Popen, child_pid: int) -> None:
+    try:
+        os.kill(child_pid, signal.SIGKILL)
+    except OSError:
+        pass
+    if worker.poll() is None:
+        worker.kill()
+    worker.wait(timeout=5)
+
+
+def _run_in_process_memory_watch(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    rss_rows: list[dict[str, object]],
+    rss_sequence: list[list[dict[str, object]]] | None = None,
+    terminate_result: dict[str, object] | None = None,
+    interval_s: str = "0.2",
+    prior_status: dict[str, object] | None = None,
+) -> tuple[int, dict, int]:
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.8)"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = goalflight_ledger.process_identity(worker.pid)
+    assert identity and identity.get("start_token"), identity
+    tail = tmp_path / "in-process-worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "in-process-worker.status.json"
+    if prior_status is not None:
+        status.write_text(json.dumps(prior_status), encoding="utf-8")
+    env = _watcher_env(tmp_path)
+    env["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = "16"
+    env["GOALFLIGHT_TEST_WORKER_RSS_SAMPLE_INTERVAL_S"] = interval_s
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    calls = 0
+    rss_samples = [list(sample) for sample in (rss_sequence or [rss_rows])]
+
+    def sample(_pgid):
+        nonlocal calls
+        sample_index = min(calls, len(rss_samples) - 1)
+        calls += 1
+        return list(rss_samples[sample_index]), None
+
+    monkeypatch.setattr(goalflight_watch, "sample_process_group_rss", sample)
+    if terminate_result is not None:
+        monkeypatch.setattr(
+            goalflight_watch,
+            "terminate_rss_offender",
+            lambda *_args, **_kwargs: dict(terminate_result),
+        )
+    watcher_cmd = _watcher_cmd(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id="in-process-rss",
+            poll_secs="0.05",
+            max_idle_secs="30",
+            worker_identity=identity,
+        )
+    monkeypatch.setattr(sys, "argv", watcher_cmd[1:])
+    try:
+        rc = goalflight_watch.main()
+        payload = _read_status(status)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
+    return rc, payload, calls
+
+
+def test_failed_rss_kill_does_not_latch_and_sampling_continues(tmp_path: Path, monkeypatch) -> None:
+    offender = {
+        "pid": 99991,
+        "rss_kb": 65536,
+        "command": "runaway-child",
+        "identity": {"pid": 99991, "start_token": "child"},
+    }
+    rc, payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[offender],
+        terminate_result={
+            "scope": "descendant",
+            "verdict": "descendant_termination_failed",
+            "signals": ["SIGTERM", "SIGKILL"],
+        },
+    )
+
+    assert rc != 0
+    assert calls >= 2, calls
+    assert "worker_rss_event" not in payload, payload
+    assert payload["worker_rss_unresolved_event"]["verdict"] == (
+        "descendant_termination_failed"
+    ), payload
+
+
+def test_persisted_failed_rss_kill_remains_retryable(tmp_path: Path, monkeypatch) -> None:
+    rc, payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[
+            {
+                "pid": 99993,
+                "rss_kb": 65536,
+                "command": "runaway-child",
+                "identity": {"pid": 99993, "start_token": "child"},
+            }
+        ],
+        terminate_result={
+            "scope": "descendant",
+            "verdict": "descendant_termination_failed",
+            "signals": ["SIGTERM", "SIGKILL"],
+        },
+        prior_status={
+            "state": "running",
+            "worker_rss_event": {
+                "event": "worker_rss_ceiling",
+                "verdict": "descendant_termination_failed",
+                "pid": 99993,
+            },
+        },
+    )
+
+    assert rc != 0
+    assert calls >= 2, calls
+    assert "worker_rss_event" not in payload, payload
+    assert payload["worker_rss_unresolved_event"]["verdict"] == (
+        "descendant_termination_failed"
+    ), payload
+
+
+def test_single_sample_rss_spike_does_not_kill(tmp_path: Path, monkeypatch) -> None:
+    offender = {
+        "pid": 99994,
+        "rss_kb": 65536,
+        "command": "transient-child",
+        "identity": {"pid": 99994, "start_token": "child"},
+    }
+    rc, payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[offender],
+        rss_sequence=[[offender], []],
+        terminate_result={
+            "scope": "descendant",
+            "verdict": "descendant_terminated",
+            "signals": ["SIGTERM", "SIGKILL"],
+        },
+    )
+
+    assert rc != 0
+    assert calls >= 2, calls
+    assert "worker_rss_event" not in payload, payload
+    assert "worker_rss_unresolved_event" not in payload, payload
+
+
+def test_rss_generation_change_does_not_reach_hysteresis(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    old_generation = {
+        "pid": 99995,
+        "rss_kb": 65536,
+        "command": "reused-child",
+        "identity": {"pid": 99995, "start_token": "old-child"},
+    }
+    new_generation = {
+        **old_generation,
+        "identity": {"pid": 99995, "start_token": "new-child"},
+    }
+    rc, payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[new_generation],
+        rss_sequence=[[old_generation], [new_generation], []],
+        terminate_result={
+            "scope": "descendant",
+            "verdict": "descendant_terminated",
+            "signals": ["SIGTERM", "SIGKILL"],
+        },
+    )
+
+    assert rc != 0
+    assert calls >= 2, calls
+    assert "worker_rss_event" not in payload, payload
+    assert "worker_rss_unresolved_event" not in payload, payload
+
+
+def test_alternating_rss_offenders_each_reach_hysteresis(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first = {
+        "pid": 99996,
+        "rss_kb": 65536,
+        "command": "first-child",
+        "identity": {"pid": 99996, "start_token": "first-child"},
+    }
+    second = {
+        "pid": 99997,
+        "rss_kb": 60000,
+        "command": "second-child",
+        "identity": {"pid": 99997, "start_token": "second-child"},
+    }
+    first_lower = {**first, "rss_kb": 60000}
+    second_higher = {**second, "rss_kb": 65536}
+    rc, payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[first, second],
+        rss_sequence=[[first, second], [first_lower, second_higher], []],
+        terminate_result={
+            "scope": "descendant",
+            "verdict": "descendant_terminated",
+            "signals": ["SIGTERM", "SIGKILL"],
+        },
+    )
+
+    assert rc != 0
+    assert calls >= 2, calls
+    event = payload.get("worker_rss_event")
+    assert event and event["pid"] == second["pid"], event
+
+
+def test_rss_sampling_is_interval_bound_not_poll_bound(tmp_path: Path, monkeypatch) -> None:
+    rc, _payload, calls = _run_in_process_memory_watch(
+        tmp_path,
+        monkeypatch,
+        rss_rows=[
+            {
+                "pid": 99992,
+                "rss_kb": 1024,
+                "command": "engine-worker",
+            }
+        ],
+        interval_s="0.2",
+    )
+
+    assert rc != 0
+    assert 2 <= calls <= 6, calls
+
+
 def _auto_reap_worker(worker: subprocess.Popen) -> None:
     """Match detached production, whose worker is promptly reaped by init."""
     def reap() -> None:
@@ -421,6 +753,420 @@ def _auto_reap_worker(worker: subprocess.Popen) -> None:
             time.sleep(0.02)
 
     threading.Thread(target=reap, daemon=True).start()
+
+
+def test_sample_process_group_rss_uses_one_bounded_group_ps_call() -> None:
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "101 4096 /usr/bin/worker --task\n102 65536 memory-child --alloc\n"
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return Result()
+
+    rows, error = goalflight_watch.sample_process_group_rss(101, ps_runner=runner)
+    assert error is None
+    assert rows == [
+        {"pid": 101, "rss_kb": 4096, "command": "/usr/bin/worker --task"},
+        {"pid": 102, "rss_kb": 65536, "command": "memory-child --alloc"},
+    ]
+    assert calls == [["ps", "-o", "pid=,rss=,command=", "-g", "101"]]
+
+
+def test_sample_process_group_rss_timeout_is_probe_failure() -> None:
+    timeouts: list[float | None] = []
+
+    def runner(argv, **_kwargs):
+        timeout = _kwargs.get("timeout")
+        timeouts.append(timeout)
+        assert timeout is not None and 0 < timeout <= 1.0
+        assert timeout == goalflight_watch.WORKER_RSS_SAMPLE_TIMEOUT_SECS
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    rows, error = goalflight_watch.sample_process_group_rss(101, ps_runner=runner)
+
+    assert rows is None
+    assert error and error.startswith("TimeoutExpired:"), error
+    assert timeouts == [goalflight_watch.WORKER_RSS_SAMPLE_TIMEOUT_SECS]
+
+
+def _patch_rss_identity_probe(monkeypatch, identities: dict[int, dict], pgids: dict[int, int]):
+    monkeypatch.setattr(
+        goalflight_watch.goalflight_compat,
+        "process_start_identity",
+        lambda pid: identities.get(pid),
+    )
+    monkeypatch.setattr(
+        goalflight_watch.goalflight_compat,
+        "pid_liveness",
+        lambda pid: pid in identities,
+    )
+    monkeypatch.setattr(goalflight_watch.os, "getpgid", lambda pid: pgids[pid])
+
+
+def test_rss_signal_rechecks_worker_current_pgid(monkeypatch) -> None:
+    identities = {
+        101: {"pid": 101, "start_token": "worker"},
+        202: {"pid": 202, "start_token": "child"},
+    }
+    _patch_rss_identity_probe(monkeypatch, identities, {101: 303, 202: 202})
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(goalflight_watch.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    result = goalflight_watch.terminate_rss_offender(
+        202,
+        worker_pid=101,
+        worker_pgid=202,
+        expected_identity=identities[101],
+        offender_identity=identities[202],
+    )
+
+    assert result["verdict"] == "descendant_termination_failed", result
+    assert result["termination_reason"] == "worker_process_group_changed", result
+    assert signals == [], signals
+
+
+def test_rss_signal_rejects_pid_reuse(monkeypatch) -> None:
+    worker_identity = {"pid": 101, "start_token": "worker"}
+    old_child_identity = {"pid": 202, "start_token": "old-child"}
+    reused_child_identity = {"pid": 202, "start_token": "new-child"}
+    monkeypatch.setattr(
+        goalflight_watch.goalflight_compat,
+        "process_start_identity",
+        lambda pid: worker_identity if pid == 101 else reused_child_identity,
+    )
+    monkeypatch.setattr(goalflight_watch.goalflight_compat, "pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(goalflight_watch.os, "getpgid", lambda _pid: 101)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(goalflight_watch.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    result = goalflight_watch.terminate_rss_offender(
+        202,
+        worker_pid=101,
+        worker_pgid=101,
+        expected_identity=worker_identity,
+        offender_identity=old_child_identity,
+    )
+
+    assert result["termination_reason"] == "offender_pid_reused_start_token", result
+    assert signals == [], signals
+
+
+def test_failed_rss_termination_escalates_without_latching(monkeypatch) -> None:
+    identities = {
+        101: {"pid": 101, "start_token": "worker"},
+        202: {"pid": 202, "start_token": "child"},
+    }
+    _patch_rss_identity_probe(monkeypatch, identities, {101: 101, 202: 101})
+    monkeypatch.setattr(goalflight_watch.time, "sleep", lambda _seconds: None)
+    signals: list[str] = []
+    monkeypatch.setattr(
+        goalflight_watch.os,
+        "kill",
+        lambda _pid, sig: signals.append(goalflight_watch.signal.Signals(sig).name),
+    )
+
+    result = goalflight_watch.terminate_rss_offender(
+        202,
+        worker_pid=101,
+        worker_pgid=101,
+        expected_identity=identities[101],
+        offender_identity=identities[202],
+    )
+
+    assert result["verdict"] == "descendant_termination_failed", result
+    assert signals == ["SIGTERM", "SIGKILL", "SIGKILL", "SIGKILL"], signals
+
+
+def test_rss_signal_error_retries_with_backoff(monkeypatch) -> None:
+    identities = {
+        101: {"pid": 101, "start_token": "worker"},
+        202: {"pid": 202, "start_token": "child"},
+    }
+    _patch_rss_identity_probe(monkeypatch, identities, {101: 101, 202: 101})
+    delays: list[float] = []
+    monkeypatch.setattr(
+        goalflight_watch.time,
+        "sleep",
+        lambda seconds: delays.append(seconds),
+    )
+    signals: list[int] = []
+
+    def fail_kill(_pid: int, sig: int) -> None:
+        signals.append(sig)
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(goalflight_watch.os, "kill", fail_kill)
+
+    result = goalflight_watch.terminate_rss_offender(
+        202,
+        worker_pid=101,
+        worker_pgid=101,
+        expected_identity=identities[101],
+        offender_identity=identities[202],
+    )
+
+    assert result["verdict"] == "descendant_termination_failed", result
+    assert signals == [
+        goalflight_watch.signal.SIGTERM,
+        goalflight_watch.signal.SIGTERM,
+        goalflight_watch.signal.SIGTERM,
+        goalflight_watch.signal.SIGKILL,
+        goalflight_watch.signal.SIGKILL,
+        goalflight_watch.signal.SIGKILL,
+    ], signals
+    assert delays == [0.05, 0.1, 0.2, 0.05, 0.1, 0.2], delays
+    assert len(result["errors"]) == 6, result
+
+
+def test_failed_rss_signal_reaches_unresolved_event_and_sampling_continues(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    offender = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    original_kill = goalflight_watch.os.kill
+    original_getpgid = goalflight_watch.os.getpgid
+    try:
+        worker_identity = goalflight_ledger.process_identity(worker.pid)
+        offender_identity = goalflight_ledger.process_identity(offender.pid)
+        assert worker_identity and worker_identity.get("start_token"), worker_identity
+        assert offender_identity and offender_identity.get("start_token"), offender_identity
+        tail = tmp_path / "failed-signal-worker.tail"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp_path / "failed-signal-worker.status.json"
+        env = _watcher_env(tmp_path)
+        env["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = "16"
+        env["GOALFLIGHT_TEST_WORKER_RSS_SAMPLE_INTERVAL_S"] = "0.1"
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        calls = 0
+        signals: list[int] = []
+
+        def sample(_pgid):
+            nonlocal calls
+            calls += 1
+            return [
+                {
+                    "pid": offender.pid,
+                    "rss_kb": 65536,
+                    "command": "failed-signal-child",
+                    "identity": offender_identity,
+                }
+            ], None
+
+        def fail_offender_kill(pid: int, sig: int) -> None:
+            if pid == offender.pid:
+                signals.append(sig)
+                raise PermissionError("denied")
+            original_kill(pid, sig)
+
+        def worker_group_for_offender(pid: int) -> int:
+            if pid == offender.pid:
+                return original_getpgid(worker.pid)
+            return original_getpgid(pid)
+
+        monkeypatch.setattr(goalflight_watch, "sample_process_group_rss", sample)
+        monkeypatch.setattr(goalflight_watch.os, "kill", fail_offender_kill)
+        monkeypatch.setattr(goalflight_watch.os, "getpgid", worker_group_for_offender)
+        monkeypatch.setattr(sys, "argv", _watcher_cmd(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id="failed-signal-rss",
+            poll_secs="0.05",
+            max_idle_secs="30",
+            worker_identity=worker_identity,
+        )[1:])
+
+        rc = goalflight_watch.main()
+        payload = _read_status(status)
+        assert rc != 0
+        assert calls >= 3, calls
+        assert len(signals) >= 6, signals
+        assert "worker_rss_event" not in payload, payload
+        unresolved = payload.get("worker_rss_unresolved_event")
+        assert isinstance(unresolved, dict), payload
+        assert unresolved["verdict"] == "descendant_termination_failed", unresolved
+        assert unresolved["pid"] == offender.pid, unresolved
+    finally:
+        monkeypatch.setattr(goalflight_watch.os, "kill", original_kill)
+        monkeypatch.setattr(goalflight_watch.os, "getpgid", original_getpgid)
+        if offender.poll() is None:
+            offender.kill()
+        offender.wait(timeout=5)
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_rss_ceiling_exempts_engine_offender(monkeypatch) -> None:
+    identity = {"pid": 101, "start_token": "worker"}
+    monkeypatch.setattr(goalflight_watch, "worker_alive", lambda *_args: (True, "live", identity))
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(goalflight_watch.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+    result = goalflight_watch.terminate_rss_offender(
+        101,
+        worker_pid=101,
+        worker_pgid=101,
+        expected_identity=identity,
+    )
+
+    assert result == {"scope": "engine", "verdict": "engine_exempt", "signals": []}
+    assert signals == [], signals
+
+
+def test_worker_rss_event_posts_named_note() -> None:
+    posted: list[tuple[str, str]] = []
+    goalflight_watch.post_worker_memory_event(
+        "rss-mail",
+        {
+            "command": "memory-child --alloc",
+            "peak_rss_mb": 64.0,
+            "ceiling_mb": 16,
+            "verdict": "descendant_terminated",
+        },
+        post_func=lambda dispatch_id, text: posted.append((dispatch_id, text)),
+    )
+    assert posted == [
+        (
+            "rss-mail",
+            "worker RSS ceiling exceeded: command='memory-child --alloc' "
+            "peak_rss_mb=64.0 ceiling_mb=16; verdict=descendant_terminated",
+        )
+    ]
+
+
+def test_worker_rss_ceiling_kills_only_runaway_descendant(tmp_path: Path) -> None:
+    worker, child_pid = _spawn_memory_worker(tmp_path)
+    watcher = None
+    try:
+        env = _memory_watcher_env(
+            tmp_path,
+            rows=(
+                f"{worker.pid}|4096|engine-worker\n"
+                f"{child_pid}|65536|memory-child --alloc"
+            ),
+        )
+        tail = tmp_path / "worker.tail"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp_path / "worker.status.json"
+        watcher = subprocess.Popen(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="rss-limit-child",
+                max_idle_secs="30",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        payload = _wait_for_status(status, lambda row: "worker_rss_event" in row)
+        event = payload.get("worker_rss_event")
+        assert isinstance(event, dict), payload
+        assert event["pid"] == child_pid, event
+        assert event["scope"] == "descendant", event
+        assert event["command"] == "memory-child --alloc", event
+        assert event["peak_rss_mb"] >= 64.0, event
+        assert "SIGTERM" in event["signals"], event
+        assert worker.poll() is None, "worker engine was killed with its child"
+        assert not goalflight_compat.pid_alive(child_pid), child_pid
+        assert watcher.poll() is None, "watcher exited after child enforcement"
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.communicate(timeout=5)
+        _stop_memory_worker(worker, child_pid)
+
+
+def test_worker_rss_ceiling_does_not_kill_under_limit(tmp_path: Path) -> None:
+    worker, child_pid = _spawn_memory_worker(tmp_path)
+    watcher = None
+    try:
+        env = _memory_watcher_env(
+            tmp_path,
+            rows=f"{worker.pid}|4096|engine-worker\n{child_pid}|8192|memory-child --alloc",
+        )
+        tail = tmp_path / "worker.tail"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp_path / "worker.status.json"
+        watcher = subprocess.Popen(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="rss-limit-safe",
+                max_idle_secs="30",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        time.sleep(0.8)
+        payload = _read_status(status)
+        assert "worker_rss_event" not in payload, payload
+        assert worker.poll() is None
+        assert goalflight_compat.pid_alive(child_pid), child_pid
+        assert watcher.poll() is None
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.communicate(timeout=5)
+        _stop_memory_worker(worker, child_pid)
+
+
+def test_worker_rss_ps_failure_logs_and_does_not_kill(tmp_path: Path) -> None:
+    worker, child_pid = _spawn_memory_worker(tmp_path)
+    watcher = None
+    try:
+        env = _memory_watcher_env(
+            tmp_path,
+            rows=f"{worker.pid}|4096|engine-worker\n{child_pid}|65536|memory-child --alloc",
+            ps_fail=True,
+        )
+        tail = tmp_path / "worker.tail"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp_path / "worker.status.json"
+        watcher = subprocess.Popen(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="rss-limit-ps-failure",
+                max_idle_secs="30",
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        payload = _wait_for_status(status, lambda row: "worker_rss_probe_error" in row)
+        assert payload.get("worker_rss_probe_error") == "ps exited 1", payload
+        assert "worker_rss_event" not in payload, payload
+        assert worker.poll() is None
+        assert goalflight_compat.pid_alive(child_pid), child_pid
+        assert watcher.poll() is None
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.communicate(timeout=5)
+        _stop_memory_worker(worker, child_pid)
 
 
 def _seed_managed_detached_lease(

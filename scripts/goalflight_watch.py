@@ -11,6 +11,7 @@ import ctypes
 import io
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -338,6 +339,12 @@ TRACE_RESOLUTION_MAX_BACKOFF_S = 60.0
 TRACE_LSOF_TIMEOUT_SECS = 1.0
 TRACE_LONG_RUNNING_SECS = 12 * 60 * 60.0
 TRACE_REVIEW_SECS = 48 * 60 * 60.0
+WORKER_RSS_SAMPLE_TIMEOUT_SECS = 1.0
+WORKER_RSS_KILL_GRACE_SECS = 0.25
+WORKER_RSS_SAMPLE_INTERVAL_S = 20.0
+WORKER_RSS_RETRY_ATTEMPTS = 3
+WORKER_RSS_RETRY_BACKOFF_S = 0.05
+WORKER_RSS_COMMAND_MAX_CHARS = 512
 
 
 def classify_worker_wedge(
@@ -981,6 +988,274 @@ def _native_process_rows() -> list[tuple[int, int, str | None]] | None:
             for row in snapshot
         ]
     return None
+
+
+def sample_process_group_rss(
+    pgid: int | None,
+    *,
+    ps_runner=None,
+) -> tuple[list[dict[str, object]] | None, str | None]:
+    """Sample every process in a worker group; None means ps was unavailable."""
+    try:
+        parsed_pgid = int(pgid) if pgid is not None else 0
+    except (TypeError, ValueError):
+        parsed_pgid = 0
+    if parsed_pgid <= 0:
+        return None, "invalid process group"
+    runner = ps_runner or subprocess.run
+    try:
+        result = runner(
+            ["ps", "-o", "pid=,rss=,command=", "-g", str(parsed_pgid)],
+            stdout=subprocess.PIPE,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=WORKER_RSS_SAMPLE_TIMEOUT_SECS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if getattr(result, "returncode", 1) != 0:
+        return None, f"ps exited {getattr(result, 'returncode', 'unknown')}"
+    rows: list[dict[str, object]] = []
+    for raw_line in str(getattr(result, "stdout", "") or "").splitlines():
+        fields = raw_line.strip().split(maxsplit=2)
+        if len(fields) < 2:
+            continue
+        try:
+            pid = int(fields[0])
+            rss_kb = int(fields[1])
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or rss_kb < 0:
+            continue
+        command = (fields[2] if len(fields) >= 3 else f"pid {pid}").strip()
+        row: dict[str, object] = {
+            "pid": pid,
+            "rss_kb": rss_kb,
+            "command": command[:WORKER_RSS_COMMAND_MAX_CHARS],
+        }
+        identity = goalflight_compat.process_start_identity(pid)
+        if isinstance(identity, dict) and identity.get("start_token"):
+            row["identity"] = identity
+        rows.append(row)
+    return rows, None
+
+
+def _fine_process_identity(
+    pid: int,
+    expected_identity: dict | None,
+) -> tuple[bool, str, dict | None]:
+    """Require the fine start token before authorizing an RSS signal."""
+    if not isinstance(expected_identity, dict):
+        return False, "identity_indeterminate", None
+    expected_pid = expected_identity.get("pid")
+    expected_start_token = expected_identity.get("start_token")
+    if not expected_start_token:
+        return False, "identity_indeterminate", None
+    if expected_pid not in (None, pid):
+        return False, "pid_mismatch", None
+    try:
+        current = goalflight_compat.process_start_identity(pid)
+    except Exception:
+        current = None
+    if not isinstance(current, dict) or not current.get("start_token"):
+        return False, "identity_indeterminate", current
+    if current.get("pid") not in (None, pid):
+        return False, "pid_mismatch", current
+    if current.get("start_token") != expected_start_token:
+        return False, "pid_reused_start_token", current
+    return True, "matched", current
+
+
+def _verify_rss_signal_scope(
+    offender_pid: int,
+    *,
+    worker_pid: int,
+    worker_pgid: int,
+    expected_worker_identity: dict | None,
+    expected_offender_identity: dict | None,
+) -> tuple[bool, str, dict | None, dict | None, int | None]:
+    """Revalidate both process generations and the worker's current PGID."""
+    worker_ok, worker_reason, worker_identity = _fine_process_identity(
+        worker_pid, expected_worker_identity
+    )
+    if not worker_ok:
+        return False, f"worker_{worker_reason}", worker_identity, None, None
+    offender_ok, offender_reason, offender_identity = _fine_process_identity(
+        offender_pid, expected_offender_identity
+    )
+    if not offender_ok:
+        return False, f"offender_{offender_reason}", worker_identity, offender_identity, None
+    try:
+        current_worker_pgid = int(os.getpgid(worker_pid))
+        current_offender_pgid = int(os.getpgid(offender_pid))
+    except (OSError, TypeError, ValueError) as exc:
+        return False, f"process_group_probe_failed:{type(exc).__name__}", worker_identity, offender_identity, None
+    if current_worker_pgid <= 1:
+        return False, "invalid_current_worker_pgid", worker_identity, offender_identity, current_worker_pgid
+    if int(worker_pgid) != current_worker_pgid:
+        return False, "worker_process_group_changed", worker_identity, offender_identity, current_worker_pgid
+    if current_offender_pgid != current_worker_pgid:
+        return False, "offender_not_in_current_worker_group", worker_identity, offender_identity, current_worker_pgid
+    return True, "verified", worker_identity, offender_identity, current_worker_pgid
+
+
+def _rss_target_dead(pid: int) -> bool:
+    """Confirm that the exact target generation has exited."""
+    try:
+        current = goalflight_compat.process_start_identity(pid)
+    except Exception:
+        current = None
+    if isinstance(current, dict) and current.get("start_token"):
+        return False
+    try:
+        return goalflight_compat.pid_liveness(pid) is False
+    except Exception:
+        return False
+
+
+def terminate_rss_offender(
+    offender_pid: int,
+    *,
+    worker_pid: int,
+    worker_pgid: int,
+    expected_identity: dict | None,
+    offender_identity: dict | None = None,
+) -> dict[str, object]:
+    """Terminate one verified descendant, never a reused PID or the engine."""
+    scope = "engine" if offender_pid == worker_pid else "descendant"
+    if scope == "engine":
+        return {
+            "scope": scope,
+            "verdict": "engine_exempt",
+            "signals": [],
+        }
+    if offender_identity is None:
+        return {
+            "scope": scope,
+            "verdict": "offender_identity_missing",
+            "signals": [],
+        }
+    signals_sent: list[str] = []
+    errors: list[str] = []
+    last_reason = "termination_not_confirmed"
+    terminated = False
+    for sig, sig_name, wait_s in (
+        (signal.SIGTERM, "SIGTERM", WORKER_RSS_KILL_GRACE_SECS),
+        (signal.SIGKILL, "SIGKILL", WORKER_RSS_RETRY_BACKOFF_S),
+    ):
+        for attempt in range(WORKER_RSS_RETRY_ATTEMPTS):
+            verified, reason, _worker_current, _offender_current, _current_pgid = (
+                _verify_rss_signal_scope(
+                    offender_pid,
+                    worker_pid=worker_pid,
+                    worker_pgid=worker_pgid,
+                    expected_worker_identity=expected_identity,
+                    expected_offender_identity=offender_identity,
+                )
+            )
+            if not verified:
+                last_reason = reason
+                if reason == "offender_identity_indeterminate" and _rss_target_dead(
+                    offender_pid
+                ):
+                    terminated = True
+                break
+            signal_failed = False
+            try:
+                # The identity/PGID recheck and os.kill cannot be atomic. The
+                # remaining TOCTOU window is microseconds; PID reuse inside
+                # it is not a practical risk on macOS, but the recheck still
+                # keeps this path fail-closed before every signal.
+                os.kill(offender_pid, sig)
+                signals_sent.append(sig_name)
+            except OSError as exc:
+                signal_failed = True
+                errors.append(f"{sig_name}:{type(exc).__name__}: {exc}")
+            time.sleep(
+                WORKER_RSS_RETRY_BACKOFF_S * (2**attempt)
+                if signal_failed
+                else wait_s
+                if sig == signal.SIGTERM
+                else WORKER_RSS_RETRY_BACKOFF_S * (2**attempt)
+            )
+            if _rss_target_dead(offender_pid):
+                terminated = True
+                last_reason = "target_exited"
+                break
+            verified_after, reason_after, *_ = _verify_rss_signal_scope(
+                offender_pid,
+                worker_pid=worker_pid,
+                worker_pgid=worker_pgid,
+                expected_worker_identity=expected_identity,
+                expected_offender_identity=offender_identity,
+            )
+            if not verified_after:
+                last_reason = reason_after
+                break
+            last_reason = reason_after
+            if sig == signal.SIGTERM and not signal_failed:
+                break
+        if terminated or last_reason != "verified":
+            break
+    verdict = (
+        f"{scope}_terminated"
+        if terminated
+        else f"{scope}_termination_failed"
+    )
+    result: dict[str, object] = {
+        "scope": scope,
+        "verdict": verdict,
+        "signals": signals_sent,
+        "termination_reason": last_reason,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def _memory_sample_delay_s() -> float:
+    interval = WORKER_RSS_SAMPLE_INTERVAL_S
+    raw_interval = goalflight_compat.allowed_env_override(
+        "GOALFLIGHT_TEST_WORKER_RSS_SAMPLE_INTERVAL_S",
+        "",
+        test_mode=True,
+    )
+    try:
+        if raw_interval is not None:
+            interval = float(raw_interval)
+    except (TypeError, ValueError):
+        interval = WORKER_RSS_SAMPLE_INTERVAL_S
+    if interval <= 0 or not math.isfinite(interval):
+        interval = WORKER_RSS_SAMPLE_INTERVAL_S
+    return max(0.05, interval)
+
+
+def post_worker_memory_event(
+    dispatch_id: str,
+    event: dict[str, object],
+    *,
+    post_func=None,
+) -> None:
+    """Tell the worker and controller about one RSS breach; fail open."""
+    try:
+        if post_func is None:
+            import goalflight_messages as gm
+
+            post_func = gm.post_controller_steer
+        detail = (
+            f"command={event.get('command')!r} "
+            f"peak_rss_mb={event.get('peak_rss_mb')} "
+            f"ceiling_mb={event.get('ceiling_mb')}"
+        )
+        post_func(
+            dispatch_id,
+            f"worker RSS ceiling exceeded: {detail}; verdict={event.get('verdict')}",
+        )
+    except Exception:
+        # Status and watcher output remain authoritative if the optional mail
+        # sideband is unavailable; a monitoring failure must not kill the watcher.
+        return
 
 
 def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, ...]:
@@ -4591,6 +4866,10 @@ def main() -> int:
     atexit.register(release_worker_probe)
     task_ids = _split_task_ids(args.task_ids)
     task_project_root = goalflight_task.resolve_project_root(args.project_root)
+    if args.project_root:
+        # A detached watcher may outlive the dispatcher's cwd. Mail validation
+        # must use this dispatch target, not an unrelated launcher directory.
+        os.environ["GOALFLIGHT_PROJECT_ROOT"] = str(task_project_root)
 
     effective_account = _trace_ledger_account(args.dispatch_id)
     codex_home = (
@@ -4713,6 +4992,46 @@ def main() -> int:
     # running), but an attached quiet watcher does not rewrite an unchanged
     # sidecar merely to refresh a heartbeat timestamp.
     last_payload = dict(prior_status) if isinstance(prior_status, dict) else None
+    try:
+        worker_rss_ceiling_mb = goalflight_capacity.worker_rss_ceiling_mb()
+        worker_rss_config_error = None
+    except Exception as exc:
+        worker_rss_ceiling_mb = None
+        worker_rss_config_error = f"{type(exc).__name__}: {exc}"
+    prior_memory_event = (
+        prior_status.get("worker_rss_event")
+        if isinstance(prior_status, dict)
+        else None
+    )
+    worker_rss_event = None
+    worker_rss_unresolved_event = None
+    if isinstance(prior_memory_event, dict):
+        if str(prior_memory_event.get("verdict", "")).endswith("_terminated"):
+            worker_rss_event = dict(prior_memory_event)
+        else:
+            worker_rss_unresolved_event = dict(prior_memory_event)
+    prior_memory_unresolved_event = (
+        prior_status.get("worker_rss_unresolved_event")
+        if isinstance(prior_status, dict)
+        else None
+    )
+    if isinstance(prior_memory_unresolved_event, dict):
+        worker_rss_unresolved_event = dict(prior_memory_unresolved_event)
+    try:
+        worker_rss_peak_kb = max(
+            0,
+            int(float(prior_status.get("worker_rss_peak_mb", 0.0)) * 1024)
+            if isinstance(prior_status, dict)
+            else 0,
+        )
+    except (TypeError, ValueError, OverflowError):
+        worker_rss_peak_kb = 0
+    worker_rss_probe_error = worker_rss_config_error
+    last_worker_rss_probe_error = worker_rss_probe_error
+    # Count consecutive breaches per process generation. A single counter for
+    # the largest row lets two alternating offenders reset each other forever.
+    rss_offender_samples: dict[tuple[int, str], int] = {}
+    next_memory_sample_at = active_monotonic()
     dispatch_record = _load_dispatch_record(args.dispatch_id)
     tree_leg = resolve_wedge_tree_leg(
         dispatch_record,
@@ -5426,6 +5745,135 @@ def main() -> int:
             prev_cputime_sample = None
             prev_cputime_at_mono = None
             prev_cputime_at_epoch = None
+        if worker_is_alive and worker_rss_ceiling_mb and now_mono >= next_memory_sample_at:
+            # One bounded `ps` launch per live watcher at the fixed memory
+            # sample interval, instead of one launch per poll.
+            next_memory_sample_at = now_mono + _memory_sample_delay_s()
+            try:
+                if worker_rss_event is None:
+                    rss_rows, rss_error = sample_process_group_rss(pgid)
+                    worker_rss_probe_error = rss_error
+                    if rss_error != last_worker_rss_probe_error:
+                        if rss_error:
+                            print(
+                                "WATCHER-RSS-PROBE "
+                                + json.dumps(
+                                    {
+                                        "dispatch_id": args.dispatch_id,
+                                        "error": rss_error,
+                                    },
+                                    sort_keys=True,
+                                ),
+                                flush=True,
+                            )
+                        last_worker_rss_probe_error = rss_error
+                    if rss_rows is not None:
+                        for rss_row in rss_rows:
+                            try:
+                                row_rss_kb = int(rss_row["rss_kb"])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            worker_rss_peak_kb = max(worker_rss_peak_kb, row_rss_kb)
+                        offenders = [
+                            row
+                            for row in rss_rows
+                            if int(row.get("rss_kb", 0)) > worker_rss_ceiling_mb * 1024
+                        ]
+                        over_limit_rows: dict[tuple[int, str], dict[str, object]] = {}
+                        for row in offenders:
+                            offender_pid = int(row["pid"])
+                            offender_identity = row.get("identity")
+                            start_token = (
+                                offender_identity.get("start_token")
+                                if isinstance(offender_identity, dict)
+                                else None
+                            )
+                            if not start_token:
+                                continue
+                            current_key = (offender_pid, str(start_token))
+                            previous = over_limit_rows.get(current_key)
+                            if (
+                                previous is None
+                                or int(row["rss_kb"]) > int(previous["rss_kb"])
+                            ):
+                                over_limit_rows[current_key] = row
+                        for current_key in list(rss_offender_samples):
+                            if current_key not in over_limit_rows:
+                                del rss_offender_samples[current_key]
+                        for current_key in over_limit_rows:
+                            rss_offender_samples[current_key] = (
+                                rss_offender_samples.get(current_key, 0) + 1
+                            )
+                        eligible_offenders = [
+                            row
+                            for current_key, row in over_limit_rows.items()
+                            if rss_offender_samples[current_key] >= 2
+                        ]
+                        # Require each process generation to breach on two
+                        # consecutive fixed-interval samples before a signal
+                        # is authorized. A one-sample spike resets when that
+                        # generation is absent or below the ceiling.
+                        if eligible_offenders:
+                            offender = max(
+                                eligible_offenders,
+                                key=lambda row: int(row.get("rss_kb", 0)),
+                            )
+                            offender_pid = int(offender["pid"])
+                            offender_identity = offender.get("identity")
+                            if (
+                                isinstance(offender_identity, dict)
+                                and offender_identity.get("start_token")
+                            ):
+                                termination = terminate_rss_offender(
+                                    offender_pid,
+                                    worker_pid=args.pid,
+                                    worker_pgid=int(pgid),
+                                    expected_identity=expected_identity,
+                                    offender_identity=offender_identity,
+                                )
+                                peak_rss_mb = round(worker_rss_peak_kb / 1024.0, 1)
+                                memory_event = {
+                                    "event": "worker_rss_ceiling",
+                                    "dispatch_id": args.dispatch_id,
+                                    "pid": offender_pid,
+                                    "command": str(offender.get("command") or f"pid {offender_pid}"),
+                                    "rss_mb": round(int(offender["rss_kb"]) / 1024.0, 1),
+                                    "peak_rss_mb": peak_rss_mb,
+                                    "ceiling_mb": worker_rss_ceiling_mb,
+                                    **termination,
+                                }
+                                print(
+                                    "WATCHER-RSS-LIMIT "
+                                    + json.dumps(memory_event, sort_keys=True),
+                                    flush=True,
+                                )
+                                if str(termination.get("verdict", "")).endswith("_terminated"):
+                                    worker_rss_event = memory_event
+                                    worker_rss_unresolved_event = None
+                                else:
+                                    # A failed or identity-vetoed attempt remains
+                                    # visible, but does not suppress the next sample.
+                                    worker_rss_unresolved_event = memory_event
+                                post_worker_memory_event(args.dispatch_id, memory_event)
+                        elif not over_limit_rows:
+                            rss_offender_samples.clear()
+                    else:
+                        rss_offender_samples.clear()
+            except Exception as exc:
+                worker_rss_probe_error = f"{type(exc).__name__}: {exc}"
+                if worker_rss_probe_error != last_worker_rss_probe_error:
+                    print(
+                        "WATCHER-RSS-PROBE "
+                        + json.dumps(
+                            {
+                                "dispatch_id": args.dispatch_id,
+                                "error": worker_rss_probe_error,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    last_worker_rss_probe_error = worker_rss_probe_error
         live_descendants: int | None = None
         idle_tree_age_s: float | None = None
         tree_probe = TREE_PROBE_SKIPPED
@@ -5549,6 +5997,9 @@ def main() -> int:
             "worker_identity": _identity_token(current_identity),
             "expected_worker_identity": _identity_token(expected_identity),
             "pgroup_cpu_pct": cpu_pct,
+            "worker_rss_ceiling_mb": worker_rss_ceiling_mb,
+            "worker_rss_peak_mb": round(worker_rss_peak_kb / 1024.0, 1),
+            "worker_rss_sample_interval_s": WORKER_RSS_SAMPLE_INTERVAL_S,
             "seconds_since_event": seconds_since_event,
             "liveness_state": liveness_state,
             "live_descendants": live_descendants,
@@ -5577,6 +6028,12 @@ def main() -> int:
             ),
             "updated_at": int(now),
         }
+        if worker_rss_probe_error:
+            payload["worker_rss_probe_error"] = worker_rss_probe_error
+        if worker_rss_event:
+            payload["worker_rss_event"] = dict(worker_rss_event)
+        if worker_rss_unresolved_event:
+            payload["worker_rss_unresolved_event"] = dict(worker_rss_unresolved_event)
         if isinstance(dispatch_record, dict):
             for key in (
                 "model",
