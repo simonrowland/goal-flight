@@ -9144,6 +9144,57 @@ def grok_selected_account(args) -> str | None:
     return selected
 
 
+def _static_account_configuration_error(args, account: str) -> str | None:
+    """Pinned-account configuration refusal, or None when the home is usable.
+
+    Filesystem presence only: engine mapping, account home, and a non-empty
+    grok auth file. Health probes and unpinned seat selection stay in
+    ``_resolve_account_env``.
+    """
+    engine = _account_engine(getattr(args, "agent", "") or "")
+    if not engine:
+        return (
+            f"--account is not configured for --agent {args.agent!r}; refusing to bill the wrong account"
+        )
+    home = _account_home(account, engine)
+    if not home.exists():
+        if engine == "codex":
+            return (
+                f"--account {account} not configured (expected {home}). "
+                "Set that account's creds there, or omit --account for the host default. "
+                "Refusing to bill the wrong account."
+            )
+        return (
+            f"--account {account} not configured for {engine} (expected HOME {home}). "
+            "Refusing to bill the wrong account."
+        )
+    if engine == "grok":
+        auth = home / ".grok" / "auth.json"
+        if not auth.is_file() or auth.stat().st_size == 0:
+            return (
+                f"--account {account} lacks grok creds (expected non-empty {auth}). "
+                "Refusing to bill the wrong account."
+            )
+    if engine not in {"codex", "grok", "cursor"}:
+        return f"--account unsupported for engine {engine!r}"
+    return None
+
+
+def _refuse_static_account_configuration(args) -> None:
+    """Refuse a pinned account that is not configured, before any dispatch write.
+
+    Unpinned launches have no static home to check. When the account is also
+    aimed at an occupied worktree, this configuration refusal wins: no status
+    file, id reservation, or occupancy bind is written.
+    """
+    account = getattr(args, "account", None)
+    if not account:
+        return
+    message = _static_account_configuration_error(args, account)
+    if message:
+        raise DispatchUsageError(message)
+
+
 def _resolve_account_env(
     args,
     *,
@@ -9175,39 +9226,21 @@ def _resolve_account_env(
                 account = None
     if not account:
         return {}
-    if not engine:
-        raise DispatchUsageError(
-            f"--account is not configured for --agent {args.agent!r}; refusing to bill the wrong account"
-        )
+    message = _static_account_configuration_error(args, account)
+    if message:
+        raise DispatchUsageError(message)
     home = _account_home(account, engine)
     if engine == "codex":
-        if not home.exists():
-            raise DispatchUsageError(
-                f"--account {account} not configured (expected {home}). "
-                "Set that account's creds there, or omit --account for the host default. "
-                "Refusing to bill the wrong account."
-            )
         _refuse_walled_codex_account(
             account,
             allow_unknown=bool(getattr(args, "occupied_worktree_forced", False)),
         )
         return {"CODEX_HOME": str(home)}
-    if not home.exists():
-        raise DispatchUsageError(
-            f"--account {account} not configured for {engine} (expected HOME {home}). "
-            "Refusing to bill the wrong account."
-        )
     env = dict(os.environ)
     _apply_home_env(env, home)
     if engine == "grok":
         env.pop("GROK_API_KEY", None)
         env.pop("XAI_API_KEY", None)
-        auth = home / ".grok" / "auth.json"
-        if not auth.is_file() or auth.stat().st_size == 0:
-            raise DispatchUsageError(
-                f"--account {account} lacks grok creds (expected non-empty {auth}). "
-                "Refusing to bill the wrong account."
-            )
         return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
     if engine == "cursor":
         env.pop("CURSOR_API_KEY", None)
@@ -23353,6 +23386,12 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
+            # Billing refusal for a missing account home is a pre-write guard.
+            # ID reservation, warnings, prompt materialization, occupancy bind,
+            # and capacity leases must not land first. This check is filesystem
+            # configuration only; probe-based health refusal stays after the
+            # occupancy check below.
+            _refuse_static_account_configuration(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
@@ -23401,8 +23440,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         *getattr(args, "dispatch_warnings", []),
                         args._worktree_occupancy_warning,
                     ]
-            # Billing refusal remains a pre-launch guard, but follows the
-            # path-occupancy refusal so an occupied writer is reported first.
+            # Probe-based account health follows path occupancy, so an occupied
+            # writer is recorded before a health refusal. The occupancy
+            # override's allow_unknown semantics stay on this path. A missing
+            # account home was already refused above, with no side effects.
             try:
                 _resolve_account_env(args)
                 _pre_resolve_pinned_codex_account(
