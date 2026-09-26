@@ -9,6 +9,10 @@ Never run `find` or recursive globbing above your worktree: not from a repo root
 `$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
 For a file outside your worktree, use its known path.
 
+## Search Across Refs
+
+Use `python3 scripts/goalflight_search.py PATTERN [--tree|--refs GLOB...|--history] -- <PATH>` for bounded current-tree, other-ref, or history searches; never run `git grep $(git for-each-ref ...)`.
+
 ## North Star
 
 {{ONE_PARAGRAPH_NORTH_STAR}}
