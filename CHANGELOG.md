@@ -6,6 +6,45 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-09-26
+
+### Added
+
+- Fast search across all refs: file contents are searched once per distinct
+  blob rather than once per ref, history search is bounded, and a search that
+  hits its time limit returns the matches found so far marked as truncated.
+- A per-process memory backstop for worker process groups. The default ceiling
+  is 6 GB on large hosts (min(6 GB, max(4 GB, 5% of RAM))), derived from host
+  measurements that separate legitimate worker processes from runaway history
+  searches; only the dispatch's own descendants are ever signalled.
+- A tracked `pre-push` hook that refuses pushes whose commits add or change
+  files under `docs-private/`. It also runs the machine-local
+  `.git/hooks/pre-push`, which `core.hooksPath` previously bypassed.
+
+### Changed
+
+- `docs-private/` is no longer tracked. The files stay on disk; the directory
+  was already listed in `.gitignore`.
+- Re-dispatching the same task after a failed or withdrawn attempt reuses the
+  existing task item. A task with a live attempt needs `--force`, a completed
+  task can be reopened with `--force`, and work from an attempt that advanced
+  is pinned before the attempt is released.
+- The worker account is re-checked after a capacity wait, so an account that
+  reached its limit, went stale, or reported a future-dated probe during the
+  wait is not used. Resumes validate their account before any ledger or
+  capacity side effect.
+- The end-of-dispatch worktree report is off by default
+  (`GOALFLIGHT_WORKTREE_GC_ON_TERMINAL=off`). When enabled it runs detached with
+  a deadline, after the dispatch has printed its final outcome.
+
+### Fixed
+
+- The capacity lock stays held by the native worker process, so capacity is
+  released when the worker exits rather than when an intermediate launcher does.
+- Worktree reclamation fails closed: a dispatch's recorded working directory
+  counts as ownership, the final ownership check and removal happen under the
+  ledger lock, and repository probes are bounded by the reaper's deadline.
+
 ## [1.7.2] - 2026-09-25
 
 ### Added
