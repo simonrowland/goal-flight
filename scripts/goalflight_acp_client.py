@@ -33,6 +33,7 @@ import goalflight_acp_permits as permits
 import goalflight_dispatch_states
 import goalflight_journal
 import goalflight_ledger
+import goalflight_native_launch
 import goalflight_quota_stuck
 import goalflight_terminal
 from goalflight_adapter_readiness import validate_os_sandbox_request
@@ -3121,6 +3122,9 @@ class GoalflightAcpConnection:
     os_sandbox_metadata: dict[str, Any] | None = None
     acp_session_id: str | None = None
     cwd: str | None = None
+    pass_fds: tuple[int, ...] = ()
+    lock_holder: str | None = None
+    lock_holder_warning: str | None = None
     reusable: bool = True
     last_active: float = field(default_factory=time.time)
     session_reset: bool = False
@@ -3405,6 +3409,23 @@ def ensure_codex_acp_elicitation(command: str, acp_args: list[str]) -> list[str]
     return ensure_codex_acp_args(command, acp_args, context_mode=True)
 
 
+def _validated_pass_fds(pass_fds: tuple[int, ...] | list[int] | None) -> tuple[int, ...]:
+    """Validate and de-duplicate descriptors before handing them to asyncio."""
+
+    fds: list[int] = []
+    seen: set[int] = set()
+    for raw_fd in pass_fds or ():
+        try:
+            fd = int(raw_fd)
+            os.fstat(fd)
+        except (TypeError, ValueError, OSError) as exc:
+            raise AcpError(f"invalid inherited lock fd: {raw_fd!r}") from exc
+        if fd not in seen:
+            fds.append(fd)
+            seen.add(fd)
+    return tuple(fds)
+
+
 async def _raise_after_failed_spawn_cleanup(
     proc: asyncio.subprocess.Process,
     *,
@@ -3493,7 +3514,28 @@ async def spawn_acp_connection(
     if goalflight_compat.is_windows():
         raise AcpError(goalflight_compat.windows_dispatch_refusal())
     require_acp_sdk()
+    # codex-acp's Node wrapper historically turns a signalled child into
+    # ``process.exit(result.status || 0)``. The native path intentionally keeps
+    # asyncio's negative signal returncode: Goal Flight classifies ACP turns by
+    # protocol/status evidence and treats a signal as failure, while cleanup
+    # proves process-group death independently of the leader's exit code.
     acp_args = ensure_codex_acp_args(command, acp_args, context_mode=context_mode)
+    validated_pass_fds = _validated_pass_fds(pass_fds)
+    child_env = dict(env if env is not None else os.environ)
+    lock_holder = None
+    lock_holder_warning = None
+    native_launch = goalflight_native_launch.prepare_codex_launch_for_command(
+        command,
+        acp_args,
+        env=child_env,
+        cwd=cwd,
+    )
+    if native_launch is not None:
+        command = native_launch.argv[0]
+        acp_args = list(native_launch.argv[1:])
+        child_env = native_launch.env
+        lock_holder = native_launch.lock_holder
+        lock_holder_warning = native_launch.warning
     limit = acp_limit_from_env()
     os.makedirs(cwd, exist_ok=True)
     sandboxed = prepare_os_sandbox_command(
@@ -3511,7 +3553,6 @@ async def spawn_acp_connection(
     # environment is preserved. Done for every command (the marker is harmless on
     # non-claude-acp agents) so the guarantee can't be defeated by an agent-type
     # branch drifting out of sync.
-    child_env = dict(env if env is not None else os.environ)
     child_env[GOALFLIGHT_ACP_SHIM_OWNER_ENV] = _shim_owner_marker()
     proc = await asyncio.create_subprocess_exec(
         sandboxed.command,
@@ -3523,7 +3564,7 @@ async def spawn_acp_connection(
         start_new_session=True,
         limit=limit,
         env=child_env,
-        pass_fds=pass_fds,
+        pass_fds=validated_pass_fds,
     )
     spawned_worker_identity = goalflight_ledger.process_identity(proc.pid)
     if proc.stdin is None or proc.stdout is None:
@@ -3665,6 +3706,9 @@ async def spawn_acp_connection(
             os_sandbox=sandboxed.profile,
             os_sandbox_metadata=sandboxed.metadata(),
             cwd=cwd,
+            pass_fds=validated_pass_fds,
+            lock_holder=lock_holder,
+            lock_holder_warning=lock_holder_warning,
         )
     except Exception as exc:
         try:
@@ -3687,6 +3731,9 @@ class AcpTerminationHold:
     proc: asyncio.subprocess.Process
     verified_pgid: int
     _started_identity: dict[str, Any] | None
+    pass_fds: tuple[int, ...] = ()
+    lock_holder: str | None = None
+    lock_holder_warning: str | None = None
     reusable: bool = False
     last_active: float = field(default_factory=time.time)
     _registered: bool = False
@@ -3786,6 +3833,7 @@ class AcpProcessPool:
         cwd: str = "",
         context_mode: bool | None = None,
         os_sandbox: str | None = None,
+        pass_fds: tuple[int, ...] | None = None,
     ) -> GoalflightAcpConnection:
         # Per-dispatch context-mode override (defaults to the pool's). A reused
         # connection carries the launch posture it was spawned with, so it can
@@ -3799,6 +3847,15 @@ class AcpProcessPool:
         if not agent_cfg:
             raise AcpError(f"agent not found: {agent}")
         workdir = cwd or agent_cfg.get("working_dir", "/tmp")
+        if pass_fds is None:
+            import goalflight_worktree_pool
+
+            try:
+                effective_pass_fds = goalflight_worktree_pool.pass_worktree_lock_fds()
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise AcpError(f"invalid inherited lock fd: {exc}") from exc
+        else:
+            effective_pass_fds = _validated_pass_fds(pass_fds)
         os_sandbox_gate = validate_os_sandbox_request(agent, effective_os_sandbox)
         if os_sandbox_gate is not None:
             raise AcpError(f"os sandbox blocked: {json.dumps(os_sandbox_gate, sort_keys=True)}")
@@ -3817,6 +3874,7 @@ class AcpProcessPool:
                 and conn.context_mode == effective_context_mode
                 and conn.os_sandbox == effective_os_sandbox
                 and _same_dir(conn.cwd, workdir)
+                and tuple(getattr(conn, "pass_fds", ())) == effective_pass_fds
             ):
                 return conn
             occupied = set(self._connections) | self._reservations
@@ -3860,6 +3918,7 @@ class AcpProcessPool:
                     permission_user_timeout_s=self._permission_user_timeout_s,
                     context_mode=effective_context_mode,
                     os_sandbox=effective_os_sandbox,
+                    pass_fds=effective_pass_fds,
                 )
             except AcpTerminationUnconfirmed as exc:
                 hold = AcpTerminationHold(
@@ -3871,6 +3930,11 @@ class AcpProcessPool:
                         exc.started_identity
                         or goalflight_ledger.process_identity(exc.proc.pid)
                     ),
+                    pass_fds=effective_pass_fds,
+                    lock_holder=getattr(conn, "lock_holder", None) if conn else None,
+                    lock_holder_warning=(
+                        getattr(conn, "lock_holder_warning", None) if conn else None
+                    ),
                 )
                 async with self._admission_lock:
                     self._connections[key] = hold
@@ -3878,6 +3942,9 @@ class AcpProcessPool:
 
             if is_rebuild:
                 new_conn.session_reset = True
+            # Test doubles and older connection implementations do not carry
+            # launch metadata; set the pool-owned descriptor posture here too.
+            setattr(new_conn, "pass_fds", effective_pass_fds)
             # The reservation blocks same-key reuse until handshake completes;
             # the connection supplies process identity for cleanup and stats.
             async with self._admission_lock:
@@ -3969,10 +4036,25 @@ class AcpProcessPool:
     @property
     def stats(self) -> dict[str, Any]:
         agents: dict[str, int] = {}
+        lock_holders: dict[str, dict[str, str]] = {}
         occupied = set(self._connections) | self._reservations
         for agent, _ in occupied:
             agents[agent] = agents.get(agent, 0) + 1
-        return {"total": len(occupied), "by_agent": agents}
+        for (agent, session_id), conn in self._connections.items():
+            holder = getattr(conn, "lock_holder", None)
+            warning = getattr(conn, "lock_holder_warning", None)
+            if holder is None and warning is None:
+                continue
+            metadata: dict[str, str] = {}
+            if holder is not None:
+                metadata["lock_holder"] = str(holder)
+            if warning is not None:
+                metadata["lock_holder_warning"] = str(warning)
+            lock_holders[f"{agent}/{session_id}"] = metadata
+        result: dict[str, Any] = {"total": len(occupied), "by_agent": agents}
+        if lock_holders:
+            result["lock_holders"] = lock_holders
+        return result
 
 
 AcpConnection = GoalflightAcpConnection

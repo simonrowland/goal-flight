@@ -1984,6 +1984,7 @@ def _status_snapshot(payload: dict) -> dict:
         "engine_session_id",
         "codex_home",
         "codex_home_owner_dispatch_id",
+        "lock_holder",
         "parent_dispatch_id",
         "worktree_branch",
         "worktree_head",
@@ -4502,6 +4503,7 @@ def main() -> int:
     parser.add_argument("--engine-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--resume-mode", help=argparse.SUPPRESS)
     parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
+    parser.add_argument("--lock-holder", choices=("native", "wrapper"), help=argparse.SUPPRESS)
     parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--worker-identity-json",
                         help="Process identity token captured at spawn; prevents PID-reuse false liveness.")
@@ -4619,6 +4621,7 @@ def main() -> int:
             "controller_session_id": controller_session_id,
             "controller_pid": controller_pid,
             "controller_label": controller_label,
+            "lock_holder": args.lock_holder,
             "state": "blocked_windows_dispatch",
             "reason": goalflight_compat.windows_watcher_skip(),
             "tail_path": str(tail),
@@ -4801,6 +4804,8 @@ def main() -> int:
         payload["controller_session_id"] = controller_session_id
         payload["controller_pid"] = controller_pid
         payload["controller_label"] = controller_label
+        if args.lock_holder:
+            payload["lock_holder"] = args.lock_holder
         if codex_home is not None:
             payload["codex_home"] = str(codex_home)
             if codex_session_id is None:
@@ -5176,6 +5181,7 @@ def main() -> int:
             "schema": "goalflight.status.v1",
             "dispatch_id": args.dispatch_id,
             "agent": args.agent,
+            "lock_holder": args.lock_holder,
             "worker_pid": args.pid,
             "watcher_pid": os.getpid(),
             "detached": bool(args.detached),

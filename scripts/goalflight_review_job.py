@@ -23,7 +23,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat
 import goalflight_capacity
 import goalflight_ledger
+import goalflight_native_launch
 import goalflight_rate_pressure
+import goalflight_worktree_pool
 from goalflight_liveness import (
     active_monotonic,
     pgroup_cpu_pct,
@@ -895,6 +897,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cmd = command_for(args)
         prompt_text = Path(args.prompt).read_text()
+        launch_env = None
+        launch_pass_fds: tuple[int, ...] = ()
+        lock_holder = None
+        lock_holder_warning = None
+        if args.agent == "codex":
+            native_launch = goalflight_native_launch.prepare_codex_launch(
+                cmd[0],
+                cmd[1:],
+                env=os.environ.copy(),
+                cwd=args.repo,
+            )
+            cmd = list(native_launch.argv)
+            launch_env = native_launch.env
+            launch_pass_fds = goalflight_worktree_pool.pass_worktree_lock_fds(
+                launch_env
+            )
+            lock_holder = native_launch.lock_holder
+            lock_holder_warning = native_launch.warning
     except Exception as e:
         payload = {
             "schema": "goalflight.review-job.v1",
@@ -971,6 +991,8 @@ def main(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
                 errors="replace",
                 start_new_session=True,
+                env=launch_env,
+                pass_fds=launch_pass_fds,
             )
         except Exception as e:
             payload = {
@@ -1007,6 +1029,8 @@ def main(argv: list[str] | None = None) -> int:
             "dispatch_id": dispatch_id,
             "lease_id": lease_id,
             "agent": args.agent,
+            "lock_holder": lock_holder,
+            "lock_holder_warning": lock_holder_warning,
             "name": args.name,
             "state": "running",
             "returncode": None,

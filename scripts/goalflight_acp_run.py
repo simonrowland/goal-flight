@@ -268,6 +268,7 @@ def _ensure_acp_sdk_python() -> None:
 
 import goalflight_capacity
 import goalflight_ledger
+import goalflight_native_launch
 from goalflight_rate_pressure import RATE_LIMIT_PATTERNS
 from goalflight_adapter_readiness import (
     load_manifest,
@@ -2642,6 +2643,19 @@ async def _run_acp_dispatch_impl(
         cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
     )
     spawn_env = _worker_spawn_env(cfg, original_prompt_file)
+    native_launch = goalflight_native_launch.prepare_codex_launch_for_command(
+        command,
+        acp_args,
+        env=spawn_env,
+        cwd=worker_cwd,
+    )
+    if native_launch is not None:
+        command = native_launch.argv[0]
+        acp_args = list(native_launch.argv[1:])
+        spawn_env = native_launch.env
+        payload["lock_holder"] = native_launch.lock_holder
+        if native_launch.warning:
+            payload["lock_holder_warning"] = native_launch.warning
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
@@ -4496,7 +4510,11 @@ async def _run_acp_dispatch_impl(
             payload["session_id"] = native_session
             payload["engine_session_id"] = native_session
         refresh_user_confirm_guard()
-        await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
+        await update_status(
+            os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"],
+            lock_holder=getattr(conn, "lock_holder", None),
+            lock_holder_warning=getattr(conn, "lock_holder_warning", None),
+        )
         test_marker = goalflight_compat.allowed_env_override(
             "GOALFLIGHT_TEST_ACP_BEFORE_PID_LEDGER_UPDATE_FILE",
             "",

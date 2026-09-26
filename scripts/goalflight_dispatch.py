@@ -86,6 +86,7 @@ import goalflight_engine_sessions
 import goalflight_fleet_billing
 import goalflight_fs
 import goalflight_messages
+import goalflight_native_launch
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -9227,6 +9228,12 @@ def _prelaunch_status_metadata(
     home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
     if home_owner_dispatch_id:
         metadata["codex_home_owner_dispatch_id"] = home_owner_dispatch_id
+    lock_holder = getattr(args, "_lock_holder", None)
+    if lock_holder:
+        metadata["lock_holder"] = str(lock_holder)
+    lock_holder_warning = getattr(args, "_lock_holder_warning", None)
+    if lock_holder_warning:
+        metadata["lock_holder_warning"] = str(lock_holder_warning)
     return metadata
 
 
@@ -11133,6 +11140,7 @@ def _watcher_spawn_argv(
     controller_session_id: str | None = None,
     controller_label: str | None = None,
     prompt_path: Path | None = None,
+    lock_holder: str | None = None,
 ) -> list[str]:
     """Build the detached Python watcher's argv without spawning it.
 
@@ -11209,6 +11217,8 @@ def _watcher_spawn_argv(
             watch_cmd += ["--controller-label", controller_label]
     if prompt_path is not None:
         watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
+    if lock_holder is not None:
+        watch_cmd += ["--lock-holder", str(lock_holder)]
     return watch_cmd
 
 
@@ -23045,6 +23055,21 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         )
         if _account_engine(args.agent) == "codex":
             worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
+            if worker_argv and (
+                worker_argv[0] == "codex"
+                or Path(str(worker_argv[0])).name in {"codex", "codex.js", "codex.exe"}
+            ):
+                native_launch = goalflight_native_launch.prepare_codex_launch(
+                    worker_argv[0],
+                    worker_argv[1:],
+                    env=env,
+                    cwd=str(_worker_cwd(args)),
+                )
+                worker_argv = list(native_launch.argv)
+                env = native_launch.env
+                args._lock_holder = native_launch.lock_holder
+                args._lock_holder_warning = native_launch.warning
+                summary_head["lock_holder"] = native_launch.lock_holder
 
         # The attempt peek may busy-wait for the launch retry budget. Finish it
         # before stamping spawn intent, and keep intent immediately before
@@ -23252,6 +23277,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             controller_session_id=controller_session_id,
             controller_label=_controller_label(args),
             prompt_path=prompt_path,
+            lock_holder=getattr(args, "_lock_holder", None),
         )
 
         watch_log = base / f"{args.dispatch_id}.watcher.log"
