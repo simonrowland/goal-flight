@@ -44,6 +44,17 @@ incremented when meaningful skill behaviour changes.
 - Worktree reclamation fails closed: a dispatch's recorded working directory
   counts as ownership, the final ownership check and removal happen under the
   ledger lock, and repository probes are bounded by the reaper's deadline.
+- A pinned account that is not configured is refused before anything is
+  written: no dispatch id, status file, or ledger record is created. Account
+  health probes still run after the worktree-occupancy check, so an occupied
+  writer is still recorded as such.
+- Worktree seat resets no longer fail with "argument list too long" in
+  repositories with tens of thousands of refs. The check that a reset keeps
+  every unique commit now reads the ref list from standard input.
+- Read-only dispatches queue for the read-only allocation lock instead of
+  failing after 30 seconds. The wait defaults to 540 seconds
+  (`GOALFLIGHT_READONLY_ALLOCATION_WAIT_S`), and the work done while holding
+  the lock gets its own deadline once the lock is acquired.
 
 ## [1.7.2] - 2026-09-25
 
