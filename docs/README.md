@@ -8,6 +8,7 @@ root.
 | Document | Purpose |
 | --- | --- |
 | [architecture.md](architecture.md) | Portable core, runtime scripts, capacity, and validation boundaries |
+| [event-organization.md](event-organization.md) | Event planes (journal, mail, wake), tenancy backlog, and what not to merge |
 | [fleet.md](fleet.md) | Multi-node SSH fleet: bootstrap, dispatch, watch, reconcile |
 | [hosts/cursor.md](hosts/cursor.md) | Cursor install, MCP, and project-local setup |
 | [hosts/grok-bot.md](hosts/grok-bot.md) | Grok Bot controller wrapper, workflows-library install, dual doorbell, and journal-host mail RPC |

@@ -5,6 +5,10 @@ defects. It records what the system *is*, what is *provably broken*, and the
 invariants any fix must preserve. Iterate on it; do not let it drift from the
 code.
 
+Organization backlog (planes, tenancy, staged migration) lives in
+[event-organization.md](event-organization.md). Section 8's fleet-scoped
+delivery move has not shipped; delivery rows are still in the project journal.
+
 Every claim below is marked **measured** (observed on a live box) or
 **inferred**. That distinction is load-bearing: three confident causal stories
 were wrong in a single day, so the doc separates what we saw from what we
