@@ -73,7 +73,7 @@ SEAT_RESET_GIT_TIMEOUT_S = 30.0
 READ_ONLY_REAP_TIMEOUT_S = 30.0
 
 
-def _read_only_allocation_wait_s(default: float = 900.0) -> float:
+def _read_only_allocation_wait_s(default: float = 540.0) -> float:
     raw = os.environ.get("GOALFLIGHT_READONLY_ALLOCATION_WAIT_S")
     if raw is None:
         return default
@@ -90,6 +90,8 @@ def _read_only_allocation_wait_s(default: float = 900.0) -> float:
 # never be handed the same checkout, so it cannot be widened to N holders. A
 # holder was measured at 80-140 s of CPU under fleet load (b-473), so a 30 s
 # wait made concurrent dispatches fail instead of queueing; waiters now queue.
+# The default stays under the ACP parent's 620 s launch watch, so a parent
+# never reports failure while its child is still queued for this lock.
 READ_ONLY_ALLOCATION_WAIT_S = _read_only_allocation_wait_s()
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
