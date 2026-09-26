@@ -70,6 +70,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -93,6 +94,14 @@ UNKNOWN = "unknown"
 
 _GIT_TIMEOUT = 30
 
+# Terminal rows are kept for the same seven-day window as the dispatch ledger
+# itself.  The resume path accepts terminal states such as quota_exhausted;
+# retaining their checkout for the ledger retention horizon makes that promise
+# true without inventing a second cleanup policy.
+RESUMABLE_TERMINAL_HORIZON_S = (
+    goalflight_ledger.TERMINAL_RECORD_RETENTION_DAYS * 24.0 * 60.0 * 60.0
+)
+
 # Ledger rows whose ``state`` / ``terminal_state`` looks settled but may still
 # name a live process. ``idle_timeout`` in particular has been observed on a
 # worker that stayed identity-live and mid-gate for tens of minutes.
@@ -109,21 +118,44 @@ LIVENESS_VERDICTS = frozenset(
 )
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    guard_error = goalflight_worktree_pool.guard_worktree_mutation(repo, *args)
+def _remaining_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _git(
+    repo: Path, *args: str, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
+    effective_timeout = _GIT_TIMEOUT if timeout is None else max(0.0, timeout)
+    guard_error = goalflight_worktree_pool.guard_worktree_mutation(
+        repo, *args, timeout=effective_timeout
+    )
     if guard_error is not None:
         return subprocess.CompletedProcess(
             ["git", "-C", str(repo), *args], 128, "", guard_error
         )
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=_GIT_TIMEOUT,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=effective_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            ["git", "-C", str(repo), *args],
+            124,
+            "",
+            "git command timed out",
+        )
 
 
 def _presence(path: Path) -> str:
@@ -140,8 +172,15 @@ def _resolve(path: str) -> str:
 
 
 def _same_path(left: str, right: str) -> bool:
-    """Compare real paths conservatively across case-insensitive volumes."""
-    return _resolve(left).casefold() == _resolve(right).casefold()
+    """Compare paths without aliasing distinct case-sensitive paths."""
+    left_real = _resolve(left)
+    right_real = _resolve(right)
+    if left_real == right_real:
+        return True
+    try:
+        return os.path.samefile(left_real, right_real)
+    except (FileNotFoundError, OSError):
+        return False
 
 
 def _condition(verdict: str, reason: str) -> dict[str, str]:
@@ -152,10 +191,18 @@ def _condition(verdict: str, reason: str) -> dict[str, str]:
 # Worktree listing
 
 
-def list_worktrees(repo: Path) -> tuple[list[dict[str, Any]], str | None]:
+def list_worktrees(
+    repo: Path, *, deadline: float | None = None
+) -> tuple[list[dict[str, Any]], str | None]:
     """Parse ``git worktree list --porcelain``. (entries, error)."""
     try:
-        proc = _git(repo, "worktree", "list", "--porcelain")
+        proc = _git(
+            repo,
+            "worktree",
+            "list",
+            "--porcelain",
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return [], f"git worktree list failed ({exc.__class__.__name__})"
     if proc.returncode != 0:
@@ -182,10 +229,16 @@ def list_worktrees(repo: Path) -> tuple[list[dict[str, Any]], str | None]:
     return entries, None
 
 
-def main_worktree_path(repo: Path) -> str | None:
+def main_worktree_path(repo: Path, *, deadline: float | None = None) -> str | None:
     """Absolute path of the main worktree, via the common git dir's parent."""
     try:
-        proc = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        proc = _git(
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -196,10 +249,18 @@ def main_worktree_path(repo: Path) -> str | None:
     return _resolve(str(Path(common).parent))
 
 
-def current_checkout_path(repo: Path) -> tuple[str | None, str | None]:
+def current_checkout_path(
+    repo: Path, *, deadline: float | None = None
+) -> tuple[str | None, str | None]:
     """The checked-out path for the repo argument. (path, error)."""
     try:
-        proc = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+        proc = _git(
+            repo,
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"git rev-parse --show-toplevel failed ({exc.__class__.__name__})"
     if proc.returncode != 0:
@@ -212,15 +273,31 @@ def current_checkout_path(repo: Path) -> tuple[str | None, str | None]:
 # The four conditions. Each returns _condition(YES|NO|UNKNOWN, reason).
 
 
-def check_merged(repo: Path, branch: str | None, detached: bool, into: str) -> dict[str, str]:
+def check_merged(
+    repo: Path,
+    branch: str | None,
+    detached: bool,
+    into: str,
+    *,
+    deadline: float | None = None,
+) -> dict[str, str]:
     """Condition 1: the branch is merged into the integration branch."""
     if detached or not branch:
         return _condition(
             UNKNOWN,
             "detached HEAD: no branch to test for merge state",
         )
+    if _deadline_expired(deadline):
+        return _condition(UNKNOWN, "merge check deadline expired; retaining checkout")
     try:
-        base = _git(repo, "rev-parse", "--verify", "--quiet", f"{into}^{{commit}}")
+        base = _git(
+            repo,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{into}^{{commit}}",
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return _condition(
             UNKNOWN,
@@ -232,8 +309,17 @@ def check_merged(repo: Path, branch: str | None, detached: bool, into: str) -> d
             f"integration branch {into!r} does not exist, so merge state "
             "cannot be evaluated",
         )
+    if _deadline_expired(deadline):
+        return _condition(UNKNOWN, "merge check deadline expired; retaining checkout")
     try:
-        proc = _git(repo, "merge-base", "--is-ancestor", branch, into)
+        proc = _git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            branch,
+            into,
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return _condition(
             UNKNOWN,
@@ -253,8 +339,16 @@ def check_merged(repo: Path, branch: str | None, detached: bool, into: str) -> d
         # git cherry compares by patch-id: "+ <sha>" is a commit with no
         # equivalent upstream, "- <sha>" is one already applied. No "+" lines
         # means nothing unique is left to protect.
+        if _deadline_expired(deadline):
+            return _condition(UNKNOWN, "merge check deadline expired; retaining checkout")
         try:
-            cherry = _git(repo, "cherry", into, branch)
+            cherry = _git(
+                repo,
+                "cherry",
+                into,
+                branch,
+                timeout=_remaining_timeout(deadline),
+            )
         except (OSError, subprocess.SubprocessError) as exc:
             return _condition(
                 UNKNOWN,
@@ -288,7 +382,12 @@ def check_merged(repo: Path, branch: str | None, detached: bool, into: str) -> d
     )
 
 
-def check_clean(path: str, *, directory_state: str) -> dict[str, str]:
+def check_clean(
+    path: str,
+    *,
+    directory_state: str,
+    deadline: float | None = None,
+) -> dict[str, str]:
     """Condition 2: the worktree is clean.
 
     A missing directory is vacuously clean: there is no on-disk work left to
@@ -305,8 +404,15 @@ def check_clean(path: str, *, directory_state: str) -> dict[str, str]:
             UNKNOWN,
             "worktree directory presence unverifiable, so cleanliness is unknown",
         )
+    if _deadline_expired(deadline):
+        return _condition(UNKNOWN, "cleanliness check deadline expired; retaining checkout")
     try:
-        proc = _git(Path(path), "status", "--porcelain")
+        proc = _git(
+            Path(path),
+            "status",
+            "--porcelain",
+            timeout=_remaining_timeout(deadline),
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return _condition(
             UNKNOWN,
@@ -347,7 +453,9 @@ def check_read_only_grace(path: str, *, directory_state: str) -> dict[str, str]:
     return _condition(YES, "read-only grace window elapsed")
 
 
-def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[str]]:
+def read_ledger_records(
+    ledger_dir: Path, *, deadline: float | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Return (records, unreadable_files) from the dispatch runs directory.
 
     ``goalflight_ledger.read_records`` collapses a corrupt file into an
@@ -374,11 +482,17 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
     records: list[dict[str, Any]] = []
     unreadable: list[str] = []
     for child in sorted(children):
+        if deadline is not None and time.monotonic() >= deadline:
+            unreadable.append(f"{ledger_dir} (snapshot deadline expired)")
+            break
         try:
             payload = json.loads(child.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             unreadable.append(child.name)
             continue
+        if deadline is not None and time.monotonic() >= deadline:
+            unreadable.append(f"{ledger_dir} (snapshot deadline expired)")
+            break
         if not isinstance(payload, dict):
             unreadable.append(child.name)
             continue
@@ -386,38 +500,330 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
     return records, unreadable
 
 
-def _record_cwd_matches(record: dict[str, Any], path: str) -> bool:
-    target = _resolve(path).casefold()
-    for key in ("worker_cwd", "worktree_path"):
-        raw_path = record.get(key)
-        if not isinstance(raw_path, str) or not raw_path.strip():
+def _argv_lists_from_record(record: dict[str, Any]) -> list[list[str]]:
+    """Return every recorded dispatch argv in every ledger envelope shape."""
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    argv_lists: list[list[str]] = []
+    for blob in (
+        record.get("dispatch_argv"),
+        envelope.get("dispatch_argv"),
+        request.get("dispatch_argv"),
+        env_request.get("dispatch_argv"),
+    ):
+        if isinstance(blob, list) and blob:
+            argv_lists.append([str(part) for part in blob])
+        elif isinstance(blob, str) and blob.strip():
+            try:
+                argv_lists.append(shlex.split(blob))
+            except ValueError:
+                argv_lists.append(blob.split())
+    return argv_lists
+
+
+def _argv_option_values(argv: list[str], flag: str) -> list[str]:
+    """Read every ``--flag value`` and ``--flag=value`` from recorded argv."""
+    prefix = flag + "="
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == flag:
+            if index + 1 < len(argv):
+                value = argv[index + 1]
+                if value and not value.startswith("-"):
+                    values.append(value)
+                    index += 2
+                    continue
+            index += 1
             continue
-        candidate = _resolve(raw_path).casefold()
-        if candidate == target or candidate.startswith(target + os.sep):
-            return True
-    return False
+        if token.startswith(prefix):
+            values.append(token[len(prefix) :])
+        index += 1
+    return values
+
+
+def _looks_like_path(value: str) -> bool:
+    """Recognize path-shaped --worktree/--at values without treating refs as paths."""
+    return value.startswith((os.sep, ".", "~")) or Path(value).is_absolute()
+
+
+def _record_cwd_raw_values(record: dict[str, Any]) -> list[str]:
+    """Return every recorded source that can identify a worker checkout."""
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        values.append(text)
+
+    add(record.get("worker_cwd"))
+    add(record.get("worktree_path"))
+    for argv in _argv_lists_from_record(record):
+        for value in _argv_option_values(argv, "--cwd"):
+            add(value)
+        for flag in ("--worktree", "--at"):
+            for value in _argv_option_values(argv, flag):
+                if _looks_like_path(value):
+                    # These options are normally Git refs. A path-shaped value
+                    # is still ownership evidence when a caller recorded a
+                    # derived checkout path instead of the post-admission fields.
+                    add(value)
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    for blob in (envelope, request, env_request):
+        add(blob.get("worker_cwd"))
+        add(blob.get("worktree_path"))
+        add(blob.get("cwd"))
+    return values
+
+
+def _record_checkout_raw_values(record: dict[str, Any]) -> list[str]:
+    """Return sources that admission records as the worker's checkout cwd."""
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        values.append(text)
+
+    add(record.get("worker_cwd"))
+    add(record.get("worktree_path"))
+    for argv in _argv_lists_from_record(record):
+        for value in _argv_option_values(argv, "--cwd"):
+            add(value)
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    for blob in (envelope, request, env_request):
+        add(blob.get("worker_cwd"))
+        add(blob.get("worktree_path"))
+    return values
+
+
+def _record_cwd_paths(record: dict[str, Any]) -> tuple[str, ...]:
+    """Resolve usable recorded cwd sources using the row's project root."""
+    raw_root = record.get("project_root")
+    root: Path | None = None
+    if isinstance(raw_root, str) and raw_root.strip():
+        try:
+            root = Path(raw_root.strip()).expanduser()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            root = None
+    paths: list[str] = []
+    for raw in _record_cwd_raw_values(record):
+        try:
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                if root is None or not root.is_absolute():
+                    continue
+                candidate = root / candidate
+            paths.append(_resolve(str(candidate)))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return tuple(dict.fromkeys(paths))
+
+
+class LedgerIndex:
+    """One sweep's ledger snapshot plus reusable path and identity indexes."""
+
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        unreadable: list[str],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        self.records = tuple(records)
+        indexed_unreadable = list(unreadable)
+        self._cwd_paths: dict[int, tuple[str, ...]] = {}
+        for record in self.records:
+            if deadline is not None and time.monotonic() >= deadline:
+                indexed_unreadable.append("ledger path index deadline expired")
+                break
+            self._cwd_paths[id(record)] = _record_cwd_paths(record)
+        self.unreadable = tuple(indexed_unreadable)
+        self.repository_identities: dict[str, tuple[str, int, int] | None] = {}
+
+    def cwd_paths(self, record: dict[str, Any]) -> tuple[str, ...]:
+        return self._cwd_paths.get(id(record), ())
+
+
+def ledger_index_for_dir(
+    ledger_dir: Path, *, deadline: float | None = None
+) -> LedgerIndex:
+    """Read and index the dispatch ledger once for one reclamation sweep."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return LedgerIndex([], [f"{ledger_dir} (snapshot deadline expired)"])
+    records, unreadable = read_ledger_records(ledger_dir, deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        return LedgerIndex(
+            [], [f"{ledger_dir} (snapshot deadline expired)"]
+        )
+    return LedgerIndex(records, unreadable, deadline=deadline)
+
+
+def _record_cwd_matches(
+    record: dict[str, Any], path: str, *, ledger_index: LedgerIndex | None = None
+) -> bool:
+    target = _resolve(path)
+    candidates = (
+        ledger_index.cwd_paths(record)
+        if ledger_index is not None
+        else _record_cwd_paths(record)
+    )
+    return any(
+        _same_path(candidate, target)
+        or candidate == target
+        or candidate.startswith(target + os.sep)
+        for candidate in candidates
+    )
 
 
 def _record_has_usable_path(record: dict[str, Any]) -> bool:
-    """True when every recorded checkout path is an existing absolute directory."""
+    """True when every recorded checkout path resolves to an existing directory."""
     saw_path = False
-    for key in ("worker_cwd", "worktree_path"):
-        if key not in record:
-            continue
-        saw_path = True
-        raw_path = record.get(key)
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            return False
-        candidate = raw_path.strip()
-        if not os.path.isabs(candidate):
-            return False
+    raw_root = record.get("project_root")
+    root: Path | None = None
+    if isinstance(raw_root, str) and raw_root.strip():
         try:
-            os.path.realpath(candidate)
-            if not Path(candidate).is_dir():
+            root = Path(raw_root.strip()).expanduser()
+        except (OSError, RuntimeError, ValueError):
+            root = None
+    for raw_path in _record_checkout_raw_values(record):
+        saw_path = True
+        candidate = raw_path.strip()
+        try:
+            candidate_path = Path(candidate).expanduser()
+            if not candidate_path.is_absolute():
+                if root is None or not root.is_absolute():
+                    return False
+                candidate_path = root / candidate_path
+            os.path.realpath(str(candidate_path))
+            if not candidate_path.is_dir():
                 return False
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             return False
     return saw_path
+
+
+def _record_project_root_matches(
+    record: dict[str, Any],
+    project_root: Path | None,
+    *,
+    identity_cache: dict[str, tuple[str, int, int] | None] | None = None,
+    deadline: float | None = None,
+) -> bool | None:
+    """Return whether a pathless row can concern ``project_root``.
+
+    ``False`` is reserved for a proven different Git repository.  A missing,
+    relative, or otherwise unresolvable root stays ``None`` so ownership
+    remains fail-closed.  Comparing Git common directories also treats two
+    worktree spellings of one repository as the same project after the
+    realpath comparison has ruled out a literal spelling match.
+    """
+    if project_root is None:
+        return None
+    raw = record.get("project_root")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        recorded_path = Path(raw.strip()).expanduser()
+        target_path = Path(project_root).expanduser()
+        if not recorded_path.is_absolute() or not target_path.is_absolute():
+            return None
+        recorded_real = Path(os.path.realpath(str(recorded_path)))
+        target_real = Path(os.path.realpath(str(target_path)))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if recorded_real == target_real:
+        return True
+
+    if identity_cache is None:
+        identity_cache = {}
+
+    def cached_common_identity(path: Path) -> tuple[str, int, int] | None:
+        try:
+            # Case-folding is unsafe on case-sensitive filesystems: two
+            # repositories can have the same folded spelling.
+            key = str(Path(os.path.realpath(str(path))))
+        except (OSError, ValueError):
+            return None
+        if key in identity_cache:
+            return identity_cache[key]
+        timeout = goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+            if timeout <= 0:
+                identity_cache[key] = None
+                return None
+        try:
+            common = goalflight_worktree_pool._git_common_dir(
+                Path(os.path.realpath(str(path))), timeout=timeout
+            )
+            common_real = os.path.realpath(str(common))
+            common_stat = os.stat(common_real)
+            identity = (
+                common_real,
+                int(common_stat.st_dev),
+                int(common_stat.st_ino),
+            )
+        except (
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            subprocess.SubprocessError,
+            goalflight_worktree_pool.WorktreeSeatError,
+        ):
+            identity = None
+        identity_cache[key] = identity
+        return identity
+
+    recorded_common = cached_common_identity(recorded_real)
+    target_common = cached_common_identity(target_real)
+    if recorded_common is None or target_common is None:
+        return None
+    return recorded_common == target_common
+
+
+def _dispatch_id_summary(dispatch_ids: list[str]) -> str:
+    """Compactly name the first few blocking rows and their total count."""
+    ordered = sorted(dispatch_ids)
+    preview = ", ".join(ordered[:3])
+    remainder = len(ordered) - len(ordered[:3])
+    suffix = f" (+{remainder} more)" if remainder else ""
+    return f"blocking dispatch rows (count={len(ordered)}): {preview}{suffix}"
 
 
 def _record_states(record: dict[str, Any]) -> list[str]:
@@ -434,6 +840,55 @@ def _record_is_nonterminal(record: dict[str, Any]) -> bool:
     return not states or any(
         not goalflight_dispatch_states.is_terminal_state(state) for state in states
     )
+
+
+def _resumable_terminal_hold_reason(record: dict[str, Any]) -> str | None:
+    """Return a retention reason while a terminal row remains resumeable.
+
+    Resume accepts every structurally terminal dispatch state after proving the
+    source worker is no longer live. Only rows carrying the resume metadata the
+    resume path needs (or an explicit limit-terminal state such as
+    ``quota_exhausted``) claim the checkout; synthetic legacy terminal rows
+    without a resumable source remain ordinary cleanup candidates. Keep an
+    eligible checkout for the ledger's seven-day retention horizon.
+    """
+    states = _record_states(record)
+    if not states or not any(
+        goalflight_dispatch_states.is_terminal_state(state) for state in states
+    ):
+        return None
+    resumable_marker = any(
+        state in goalflight_dispatch_states.LIMIT_TERMINAL_STATES for state in states
+    ) or any(
+        record.get(key)
+        for key in (
+            "parent_dispatch_id",
+            "resume_mode",
+            "engine_session_id",
+            "codex_session_id",
+            "acp_session_id",
+            "worktree_base",
+            "worktree_head",
+        )
+    )
+    if not resumable_marker:
+        return None
+    terminal_at = goalflight_ledger.parse_utc(
+        record.get("ended_at") or record.get("updated_at")
+    )
+    if terminal_at is None:
+        # Legacy hand-written terminal rows predate the resume retention
+        # contract and have no bounded age.  They remain subject to the
+        # historical terminal-ownership predicate; only a real lifecycle row
+        # with a timestamp can claim the resumable horizon.
+        return None
+    age_s = time.time() - terminal_at.timestamp()
+    if age_s <= RESUMABLE_TERMINAL_HORIZON_S:
+        return (
+            "resumable terminal dispatch retains checkout for "
+            f"{RESUMABLE_TERMINAL_HORIZON_S / 86400.0:g} days"
+        )
+    return None
 
 
 def _is_liveness_verdict(record: dict[str, Any]) -> bool:
@@ -471,7 +926,9 @@ def _identity_live(record: dict[str, Any]) -> bool | None:
     return goalflight_compat.process_identity_matches(pid, start_token)
 
 
-def _record_owns_path(record: dict[str, Any], path: str) -> bool:
+def _record_owns_path(
+    record: dict[str, Any], path: str, *, ledger_index: LedgerIndex | None = None
+) -> bool:
     """True when a dispatch still owns this path as its worker cwd.
 
     A missing state is treated as non-terminal: we did not observe the record
@@ -484,17 +941,26 @@ def _record_owns_path(record: dict[str, Any], path: str) -> bool:
     start_token still match, the row owns the path. If the identity probe is
     indeterminate, the row also owns the path: unknown liveness is live for GC.
     """
-    if not _record_cwd_matches(record, path):
+    if not _record_cwd_matches(record, path, ledger_index=ledger_index):
         return False
     live = _identity_live(record)
     if live is True:
         return True
     if live is None:
         return True
+    if _resumable_terminal_hold_reason(record) is not None:
+        return True
     return _record_is_nonterminal(record)
 
 
-def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
+def check_unowned(
+    path: str,
+    ledger_dir: Path,
+    *,
+    project_root: Path | None = None,
+    ledger_index: LedgerIndex | None = None,
+    identity_deadline: float | None = None,
+) -> dict[str, str]:
     """Condition 3: no non-terminal dispatch has this path as its cwd.
 
     This is the condition that saves live work — see the module docstring. On
@@ -507,7 +973,15 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
     unreadable ledger collapse into a green light: an unreadable record may be
     exactly the live dispatch that owns this path, so UNKNOWN retains.
     """
-    records, unreadable = read_ledger_records(ledger_dir)
+    if ledger_index is None:
+        ledger_index = ledger_index_for_dir(ledger_dir)
+    if _deadline_expired(identity_deadline):
+        return _condition(
+            UNKNOWN,
+            "dispatch ownership identity deadline expired; retaining checkout",
+        )
+    records = ledger_index.records
+    unreadable = ledger_index.unreadable
     if unreadable:
         return _condition(
             UNKNOWN,
@@ -515,44 +989,86 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
             + ", ".join(unreadable)
             + "); cannot prove no live dispatch owns this path",
         )
-    state_unknown = [
-        str(record.get("dispatch_id") or "<unknown>")
-        for record in records
-        if not _record_states(record)
-        or any(state == "unreadable" for state in _record_states(record))
-    ]
+    state_unknown: list[str] = []
+    for record in records:
+        if _deadline_expired(identity_deadline):
+            return _condition(
+                UNKNOWN,
+                "dispatch ownership identity deadline expired; retaining checkout",
+            )
+        states = _record_states(record)
+        if states and not any(state == "unreadable" for state in states):
+            continue
+        project_match = _record_project_root_matches(
+            record,
+            project_root,
+            identity_cache=ledger_index.repository_identities,
+            deadline=identity_deadline,
+        )
+        if project_match is False and not _record_cwd_matches(
+            record, path, ledger_index=ledger_index
+        ):
+            continue
+        state_unknown.append(str(record.get("dispatch_id") or "<unknown>"))
     if state_unknown:
         return _condition(
             UNKNOWN,
-            "dispatch ledger state unknown ("
-            + ", ".join(sorted(state_unknown))
-            + "); cannot prove no live dispatch owns this path",
+            "dispatch ledger state unknown; "
+            + _dispatch_id_summary(state_unknown)
+            + "; cannot prove no live dispatch owns this path",
         )
-    incomplete = [
-        str(record.get("dispatch_id") or "<unknown>")
-        for record in records
-        if _record_is_nonterminal(record)
-        and not _record_has_usable_path(record)
-    ]
+    incomplete: list[str] = []
+    for record in records:
+        if _deadline_expired(identity_deadline):
+            return _condition(
+                UNKNOWN,
+                "dispatch ownership identity deadline expired; retaining checkout",
+            )
+        if (
+            not _record_is_nonterminal(record)
+            or _record_has_usable_path(record)
+            or _record_cwd_matches(record, path, ledger_index=ledger_index)
+        ):
+            continue
+        project_match = _record_project_root_matches(
+            record,
+            project_root,
+            identity_cache=ledger_index.repository_identities,
+            deadline=identity_deadline,
+        )
+        if project_match is False and not _record_cwd_matches(
+            record, path, ledger_index=ledger_index
+        ):
+            continue
+        incomplete.append(str(record.get("dispatch_id") or "<unknown>"))
     if incomplete:
         return _condition(
             UNKNOWN,
             "non-terminal dispatch ledger row has no usable worker_cwd or "
-            "worktree_path ("
-            + ", ".join(sorted(incomplete))
-            + "); cannot prove no live dispatch owns this path",
+            "worktree_path; "
+            + _dispatch_id_summary(incomplete)
+            + "; cannot prove no live dispatch owns this path",
         )
-    owned = [record for record in records if _record_owns_path(record, path)]
+    owned = [
+        record
+        for record in records
+        if _record_owns_path(record, path, ledger_index=ledger_index)
+    ]
     if owned:
         running: list[str] = []
         identity_live: list[str] = []
+        resumable: list[str] = []
         for record in owned:
             dispatch_id = str(record.get("dispatch_id") or "<unknown>")
             state = str(record.get("state") or "<none>")
             terminal = not _record_is_nonterminal(record)
             label = f"{dispatch_id} (state={state})"
             if terminal:
-                identity_live.append(label)
+                hold_reason = _resumable_terminal_hold_reason(record)
+                if hold_reason is not None:
+                    resumable.append(f"{label}: {hold_reason}")
+                else:
+                    identity_live.append(label)
             else:
                 running.append(label)
         parts: list[str] = []
@@ -568,17 +1084,23 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
                 + ", ".join(sorted(identity_live))
                 + " still owns this path"
             )
+        if resumable:
+            parts.append("; ".join(sorted(resumable)))
         return _condition(NO, "; ".join(parts))
     return _condition(YES, "no non-terminal dispatch records this path")
 
 
 def check_pool_unlocked(
-    repo: Path, path: str, *, held_lock=None
+    repo: Path,
+    path: str,
+    *,
+    held_lock=None,
+    deadline: float | None = None,
 ) -> dict[str, str]:
     """Include the kernel worktree lease in the ownership conjunction."""
     verdict, reason, lock_path, lock_stat = (
         goalflight_worktree_pool._registered_pool_seat_lock_info(
-            path, project_root=repo
+            path, project_root=repo, deadline=deadline
         )
     )
     if verdict == NO:
@@ -655,12 +1177,12 @@ def _open_validated_pool_lock(
 
 
 def _acquire_pool_action_lock(
-    repo: Path, path: str
+    repo: Path, path: str, *, deadline: float | None = None
 ) -> tuple[object | None, str | None]:
     """Hold a registered pool lock across recheck, pin, and removal."""
     verdict, reason, lock_path, lock_stat = (
         goalflight_worktree_pool._registered_pool_seat_lock_info(
-            path, project_root=repo
+            path, project_root=repo, deadline=deadline
         )
     )
     if verdict == NO:
@@ -675,11 +1197,18 @@ def _acquire_pool_action_lock(
 
 def _acquire_read_only_action_lock(
     repo: Path,
+    *,
+    deadline: float | None = None,
 ) -> tuple[object | None, str | None]:
     """Hold the allocator's detached-checkout lock across GC recheck/removal."""
+    if deadline is None:
+        deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+    timeout = _remaining_timeout(deadline)
+    if timeout is not None and timeout <= 0:
+        return None, "read-only allocation lock deadline expired; retaining checkout"
     try:
         registry_root = goalflight_worktree_pool._git_common_dir(
-            repo, timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S
+            repo, timeout=timeout
         )
         lock_path = registry_root / "goalflight-worktree-seat-locks" / "readonly-allocation.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -692,7 +1221,17 @@ def _acquire_read_only_action_lock(
             registry_root=registry_root,
             allow_create=True,
             allow_unregistered=True,
+            registration_deadline=deadline,
         )
+    except goalflight_worktree_pool.WorktreeReadOnlyLockTimeout as exc:
+        return None, f"read-only allocation lock deadline expired; retaining checkout ({exc})"
+    except goalflight_worktree_pool.WorktreeSeatError as exc:
+        if "timed out" in str(exc).lower() or _deadline_expired(deadline):
+            return None, (
+                "read-only allocation lock deadline expired; retaining checkout "
+                f"({exc})"
+            )
+        return None, f"read-only allocation lock could not be evaluated ({exc})"
     except OSError as exc:
         return None, f"read-only allocation lock could not be opened ({exc})"
     handle = os.fdopen(fd, "r+", encoding="utf-8")
@@ -704,7 +1243,7 @@ def _acquire_read_only_action_lock(
             lock_path,
             handle.fileno(),
             registry_root=registry_root,
-            deadline=time.monotonic() + goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+            deadline=deadline,
         )
     except BlockingIOError:
         handle.close()
@@ -746,9 +1285,24 @@ def classify(
     current_checkout: str | None,
     current_error: str | None,
     pool_lock=None,
+    ledger_index: LedgerIndex | None = None,
+    identity_deadline: float | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate one listed worktree against the full conjunction."""
     path = entry["path"]
+    if identity_deadline is None:
+        identity_deadline = deadline
+    if deadline is not None and _deadline_expired(deadline):
+        return {
+            "path": path,
+            "branch": entry.get("branch"),
+            "detached": bool(entry.get("detached")),
+            "missing_on_disk": False,
+            "decision": "retain",
+            "reason": "classification deadline expired; retaining checkout",
+            "conditions": {},
+        }
     directory_state = _presence(Path(path))
     result: dict[str, Any] = {
         "path": path,
@@ -779,7 +1333,7 @@ def classify(
         return result
     if read_only_verdict == YES:
         pool_verdict, pool_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-            path, project_root=project_root
+            path, project_root=project_root, deadline=deadline
         )
         if pool_verdict != NO:
             result["decision"] = "retain"
@@ -790,10 +1344,16 @@ def classify(
             result["conditions"] = {}
             return result
         usage = goalflight_worktree_pool.read_only_worktree_usage(
-            path, ledger_dir=ledger_dir
+            path,
+            ledger_dir=ledger_dir,
+            project_root=project_root,
+            ledger_index=ledger_index,
+            identity_deadline=identity_deadline,
         )
         conditions = {
-            "clean": check_clean(path, directory_state=directory_state),
+            "clean": check_clean(
+                path, directory_state=directory_state, deadline=deadline
+            ),
             "grace": check_read_only_grace(path, directory_state=directory_state),
             "unowned": usage,
             "not_current": check_not_current(
@@ -819,7 +1379,7 @@ def classify(
         return result
 
     seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
-        path, project_root=repo
+        path, project_root=repo, deadline=deadline
     )
     if seat_verdict == UNKNOWN:
         result["decision"] = "retain"
@@ -834,15 +1394,31 @@ def classify(
         return result
 
     conditions = {
-        "merged": check_merged(repo, entry.get("branch"), bool(entry.get("detached")), into),
-        "clean": check_clean(path, directory_state=directory_state),
-        "unowned": check_unowned(path, ledger_dir),
+        "merged": check_merged(
+            repo,
+            entry.get("branch"),
+            bool(entry.get("detached")),
+            into,
+            deadline=deadline,
+        ),
+        "clean": check_clean(
+            path, directory_state=directory_state, deadline=deadline
+        ),
+        "unowned": check_unowned(
+            path,
+            ledger_dir,
+            project_root=project_root,
+            ledger_index=ledger_index,
+            identity_deadline=identity_deadline,
+        ),
         "not_current": check_not_current(
             path, current_checkout=current_checkout, current_error=current_error
         ),
     }
     if seat_verdict == YES:
-        lease = check_pool_unlocked(repo, path, held_lock=pool_lock)
+        lease = check_pool_unlocked(
+            repo, path, held_lock=pool_lock, deadline=deadline
+        )
         if lease["verdict"] != YES:
             conditions["unowned"] = lease
         pool = {"verdict": seat_verdict, "reason": seat_reason}
@@ -873,23 +1449,46 @@ def classify(
 # Removal
 
 
-def _remove_worktree(repo: Path, path: str) -> tuple[bool, str]:
-    proc = _git(repo, "worktree", "remove", path)
+def _remove_worktree(
+    repo: Path, path: str, *, deadline: float | None = None
+) -> tuple[bool, str]:
+    proc = _git(
+        repo,
+        "worktree",
+        "remove",
+        path,
+        timeout=_remaining_timeout(deadline),
+    )
     if proc.returncode == 0:
         return True, ""
+    if proc.returncode == 124:
+        return False, "git worktree remove deadline expired; retaining checkout"
     return False, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
 
 
-def _prune_worktrees(repo: Path) -> tuple[bool, str]:
-    proc = _git(repo, "worktree", "prune")
+def _prune_worktrees(
+    repo: Path, *, deadline: float | None = None
+) -> tuple[bool, str]:
+    proc = _git(
+        repo,
+        "worktree",
+        "prune",
+        timeout=_remaining_timeout(deadline),
+    )
     if proc.returncode == 0:
         return True, ""
+    if proc.returncode == 124:
+        return False, "git worktree prune deadline expired; retaining checkout"
     return False, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
 
 
-def _pin_before_remove(repo: Path, path: str) -> tuple[str | None, str | None]:
+def _pin_before_remove(
+    repo: Path, path: str, *, deadline: float | None = None
+) -> tuple[str | None, str | None]:
     """Keep the candidate's current commit durable before destructive removal."""
-    return goalflight_worktree_pool.pin_worktree_head_before_remove(repo, path)
+    return goalflight_worktree_pool.pin_worktree_head_before_remove(
+        repo, path, deadline=deadline
+    )
 
 
 def apply_removals(
@@ -912,9 +1511,10 @@ def apply_removals(
     targets = [e for e in entries if e["decision"] in {"remove", "prune"}]
     for entry in targets:
         path = entry["path"]
+        deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
 
         # Re-list: the fresh listing is the only authority on what exists NOW.
-        listed, list_error = list_worktrees(repo)
+        listed, list_error = list_worktrees(repo, deadline=deadline)
         fresh = next(
             (item for item in listed if _same_path(item["path"], path)),
             None,
@@ -932,75 +1532,149 @@ def apply_removals(
             goalflight_worktree_pool.read_only_worktree_path_verdict(
                 path, project_root=read_only_project_root
             )
-        )
+            )
+        if _deadline_expired(deadline):
+            entry["outcome"] = "retained"
+            entry["reason"] = (
+                "changed_before_remove: removal deadline expired; retaining checkout"
+            )
+            continue
         if read_only_verdict in {YES, UNKNOWN}:
-            pool_lock, lock_error = _acquire_read_only_action_lock(repo)
+            pool_lock, lock_error = _acquire_read_only_action_lock(
+                repo, deadline=deadline
+            )
         else:
-            pool_lock, lock_error = _acquire_pool_action_lock(repo, path)
+            pool_lock, lock_error = _acquire_pool_action_lock(
+                repo, path, deadline=deadline
+            )
         if lock_error is not None:
             entry["outcome"] = "retained"
             entry["reason"] = f"changed_before_remove: {lock_error}"
             continue
         try:
-            current = classify(
-                repo,
-                fresh,
-                into=into,
-                ledger_dir=ledger_dir,
-                main_path=main_path,
-                current_checkout=current_checkout,
-                current_error=current_error,
-                pool_lock=pool_lock,
-            )
-            if current["decision"] not in {"remove", "prune"}:
+            # Pinning is idempotent and must happen before StateLock. A stalled
+            # Git process therefore cannot block unrelated ledger writers.
+            if fresh.get("path") and not _deadline_expired(deadline):
+                if entry["decision"] == "remove":
+                    keep_ref, pin_error = _pin_before_remove(
+                        repo, path, deadline=deadline
+                    )
+                    if pin_error is not None:
+                        entry["outcome"] = "retained"
+                        entry["reason"] = (
+                            f"changed_before_remove: keep pin retained checkout: {pin_error}"
+                        )
+                        continue
+                    entry["keep_ref"] = keep_ref
+
+            if _deadline_expired(deadline):
                 entry["outcome"] = "retained"
-                entry["reason"] = f"changed_before_remove: {current['reason']}"
+                entry["reason"] = (
+                    "changed_before_remove: removal deadline expired after pinning; "
+                    "retaining checkout"
+                )
                 continue
 
-            if current["decision"] == "remove":
-                keep_ref, pin_error = _pin_before_remove(repo, path)
-                if pin_error is not None:
-                    entry["outcome"] = "failed"
-                    entry["error"] = f"keep pin failed: {pin_error}"
-                    continue
-                entry["keep_ref"] = keep_ref
-
-            # ``git worktree prune`` clears every stale administrative entry,
-            # so only allow it when this is the sole stale path.
-            stale = {
-                item["path"]
-                for item in listed
-                if _presence(Path(item["path"])) == "absent"
-            }
-            prune_allowed = stale <= {path}
-
-            if current["decision"] == "prune":
-                if not prune_allowed:
-                    entry["outcome"] = "failed"
-                    entry["error"] = (
-                        "git worktree prune would also clear administrative entries "
-                        "that did not pass the conjunction; skipped"
+            # The ledger lock is deliberately taken only after pinning and is
+            # held for the final re-check plus the destructive Git operation.
+            ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+            if ledger_lock is None:
+                entry["outcome"] = "retained"
+                entry["reason"] = (
+                    "changed_before_remove: ledger lock deadline expired; retaining checkout"
+                )
+                continue
+            with ledger_lock:
+                if _deadline_expired(deadline):
+                    entry["outcome"] = "retained"
+                    entry["reason"] = (
+                        "changed_before_remove: removal deadline expired before final re-check; "
+                        "retaining checkout"
                     )
                     continue
-                ok, detail = _prune_worktrees(repo)
-                entry["outcome"] = "pruned" if ok else "failed"
-                if not ok:
-                    entry["error"] = detail
-                continue
+                final_ledger_index = ledger_index_for_dir(
+                    ledger_dir, deadline=deadline
+                )
+                final_current_checkout, final_current_error = current_checkout_path(
+                    repo, deadline=deadline
+                )
+                current = classify(
+                    repo,
+                    fresh,
+                    into=into,
+                    ledger_dir=ledger_dir,
+                    main_path=main_path,
+                    current_checkout=final_current_checkout,
+                    current_error=final_current_error,
+                    pool_lock=pool_lock,
+                    ledger_index=final_ledger_index,
+                    identity_deadline=deadline,
+                    deadline=deadline,
+                )
+                if current["decision"] not in {"remove", "prune"}:
+                    entry["outcome"] = "retained"
+                    entry["reason"] = f"changed_before_remove: {current['reason']}"
+                    continue
 
-            ok, detail = _remove_worktree(repo, path)
-            if ok:
-                entry["outcome"] = "removed"
-            elif _presence(Path(path)) == "absent" and prune_allowed:
-                # The directory disappeared between scan and removal; reclaim
-                # the administrative entry instead of reporting an error.
-                ok, detail = _prune_worktrees(repo)
-                entry["outcome"] = "pruned" if ok else "failed"
-                if not ok:
+                # ``git worktree prune`` clears every stale administrative entry,
+                # so only allow it when this is the sole stale path.
+                stale: set[str] = set()
+                scan_expired = False
+                for item in listed:
+                    if _deadline_expired(deadline):
+                        scan_expired = True
+                        break
+                    if _presence(Path(item["path"])) == "absent":
+                        stale.add(item["path"])
+                if scan_expired:
+                    entry["outcome"] = "retained"
+                    entry["reason"] = (
+                        "changed_before_remove: removal deadline expired while checking "
+                        "stale entries; retaining checkout"
+                    )
+                    continue
+                prune_allowed = stale <= {path}
+
+                if current["decision"] == "prune":
+                    if not prune_allowed:
+                        entry["outcome"] = "failed"
+                        entry["error"] = (
+                            "git worktree prune would also clear administrative entries "
+                            "that did not pass the conjunction; skipped"
+                        )
+                        continue
+                    ok, detail = _prune_worktrees(repo, deadline=deadline)
+                    if ok:
+                        entry["outcome"] = "pruned"
+                    elif "deadline expired" in detail:
+                        entry["outcome"] = "retained"
+                        entry["reason"] = detail
+                    else:
+                        entry["outcome"] = "failed"
+                        entry["error"] = detail
+                    continue
+
+                ok, detail = _remove_worktree(repo, path, deadline=deadline)
+                if ok:
+                    entry["outcome"] = "removed"
+                elif "deadline expired" in detail:
+                    entry["outcome"] = "retained"
+                    entry["reason"] = detail
+                elif _presence(Path(path)) == "absent" and prune_allowed:
+                    # The directory disappeared between scan and removal; reclaim
+                    # the administrative entry instead of reporting an error.
+                    ok, detail = _prune_worktrees(repo, deadline=deadline)
+                    if ok:
+                        entry["outcome"] = "pruned"
+                    elif "deadline expired" in detail:
+                        entry["outcome"] = "retained"
+                        entry["reason"] = detail
+                    else:
+                        entry["outcome"] = "failed"
+                        entry["error"] = detail
+                else:
+                    entry["outcome"] = "failed"
                     entry["error"] = detail
-            else:
-                entry["outcome"] = "failed"
-                entry["error"] = detail
         finally:
             if pool_lock is not None:
                 pool_lock.close()
@@ -1117,6 +1791,7 @@ def terminal_dry_run(repo: Path, *, into: str = "main", ledger_dir: Path | None 
         return {"schema": SCHEMA, "repo": str(repo), "mode": "report", "error": list_error}
     main_path = main_worktree_path(repo)
     current_checkout, current_error = current_checkout_path(repo)
+    ledger_index = ledger_index_for_dir(ledger_dir)
     entries = [
         classify(
             repo,
@@ -1126,6 +1801,7 @@ def terminal_dry_run(repo: Path, *, into: str = "main", ledger_dir: Path | None 
             main_path=main_path,
             current_checkout=current_checkout,
             current_error=current_error,
+            ledger_index=ledger_index,
         )
         for entry in listed
     ]
@@ -1151,6 +1827,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     main_path = main_worktree_path(repo)
     current_checkout, current_error = current_checkout_path(repo)
+    ledger_index = ledger_index_for_dir(ledger_dir)
 
     entries = [
         classify(
@@ -1161,6 +1838,7 @@ def main(argv: list[str] | None = None) -> int:
             main_path=main_path,
             current_checkout=current_checkout,
             current_error=current_error,
+            ledger_index=ledger_index,
         )
         for entry in listed
     ]

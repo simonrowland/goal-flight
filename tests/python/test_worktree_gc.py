@@ -21,6 +21,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -30,6 +32,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_compat  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_worktree_gc  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
@@ -442,6 +445,383 @@ def test_read_only_gc_retains_for_incomplete_nonterminal_ledger_row(
     assert "no usable worker_cwd" in entry["conditions"]["unowned"]["reason"]
 
 
+def test_read_only_gc_ignores_pathless_nonterminal_row_from_other_repository(
+    tmp_path: Path, repo: Path
+) -> None:
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q", "-b", "main")
+    wt = _add_read_only_checkout(repo, 8)
+    _write_ledger(
+        "foreign-project-waiting",
+        "waiting_capacity",
+        None,
+        project_root=str(other_repo),
+    )
+
+    done, report = _run(repo, "--apply", seed_terminal=False)
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["conditions"]["unowned"]["verdict"] == "yes", entry
+    assert entry["outcome"] == "removed", entry
+    assert not wt.exists()
+
+
+def test_read_only_gc_honors_argv_only_cwd_from_foreign_repository(
+    tmp_path: Path, repo: Path
+) -> None:
+    other_repo = tmp_path / "other-repo-argv"
+    other_repo.mkdir()
+    _git(other_repo, "init", "-q", "-b", "main")
+    wt = _add_read_only_checkout(repo, 81)
+    _write_ledger(
+        "foreign-project-argv-cwd",
+        "waiting_capacity",
+        None,
+        project_root=str(other_repo),
+        dispatch_argv=["--cwd", str(wt)],
+    )
+
+    done, report = _run(repo, "--apply", seed_terminal=False)
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+    assert "foreign-project-argv-cwd" in entry["conditions"]["unowned"]["reason"]
+    assert wt.is_dir()
+
+
+def test_foreign_project_identity_failure_is_fail_closed(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 82)
+    foreign_root = tmp_path / "not-a-git-repository"
+    foreign_root.mkdir()
+    _write_ledger(
+        "foreign-project-unresolvable",
+        "waiting_capacity",
+        None,
+        project_root=str(foreign_root),
+    )
+
+    _done, report = _run(repo, seed_terminal=False)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+
+    wt2 = _add_read_only_checkout(repo, 83)
+    _write_ledger(
+        "foreign-project-timeout",
+        "waiting_capacity",
+        None,
+        project_root=str(foreign_root),
+    )
+    original_common_dir = goalflight_worktree_pool._git_common_dir
+
+    def timeout_common_dir(path: Path, *, timeout: float | None = None) -> Path:
+        assert timeout is not None
+        raise goalflight_worktree_pool.WorktreeSeatError("git command timed out")
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_git_common_dir", timeout_common_dir
+    )
+    assert original_common_dir is not None
+    _done, report = _run(repo, seed_terminal=False)
+    entry = _entry(report, wt2)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+
+
+def test_case_variant_repository_identities_never_alias_on_case_sensitive_fs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct case-variant Git common dirs must not collide in the cache."""
+    upper = tmp_path / "Repo"
+    lower = tmp_path / "repo"
+    upper.mkdir()
+    if lower.exists():
+        pytest.skip("case-insensitive filesystem cannot represent case-variant roots")
+    for root in (upper, lower):
+        if root != upper:
+            root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _git(root, "config", "user.email", "test@example.invalid")
+        _git(root, "config", "user.name", "Test")
+        (root / "a.txt").write_text("hello\n")
+        _git(root, "add", "a.txt")
+        _git(root, "commit", "-qm", "init")
+
+    cache: dict[str, object] = {}
+    foreign = {"project_root": str(upper)}
+    assert goalflight_worktree_gc._record_project_root_matches(
+        foreign, lower, identity_cache=cache
+    ) is False
+
+
+def test_read_only_gc_pin_does_not_hold_ledger_lock(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 851)
+    _done, report = _run(repo)
+    current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+    pin_started = threading.Event()
+    release_pin = threading.Event()
+    writer_done = threading.Event()
+
+    def writer() -> None:
+        lock = goalflight_ledger.StateLock.try_acquire(time.monotonic() + 0.5)
+        if lock is None:
+            return
+        try:
+            _write_ledger("ledger-writer-during-pin", "running", wt, project_root=str(repo))
+            writer_done.set()
+        finally:
+            lock.release()
+
+    def pin(_repo: Path, _path: str, **_kwargs: object) -> tuple[str, None]:
+        pin_started.set()
+        assert release_pin.wait(1.0)
+        return "refs/goalflight/keep/ledger-race", None
+
+    monkeypatch.setattr(goalflight_worktree_gc, "_pin_before_remove", pin)
+    worker = threading.Thread(target=writer)
+    monkeypatch.setattr(
+        goalflight_worktree_gc,
+        "_remove_worktree",
+        lambda _repo, _path, **_kwargs: (True, ""),
+    )
+    apply_thread = threading.Thread(
+        target=goalflight_worktree_gc.apply_removals,
+        args=(repo, report["entries"]),
+        kwargs={
+            "into": "main",
+            "ledger_dir": goalflight_ledger.runs_dir(create=False),
+            "main_path": goalflight_worktree_gc.main_worktree_path(repo),
+            "current_checkout": current_checkout,
+            "current_error": current_error,
+        },
+    )
+    apply_thread.start()
+    assert pin_started.wait(1.0)
+    worker.start()
+    try:
+        assert writer_done.wait(0.5), "pinning must not block the global ledger writer"
+    finally:
+        release_pin.set()
+        apply_thread.join(2.0)
+        worker.join(2.0)
+    assert not apply_thread.is_alive()
+    assert not worker.is_alive()
+    assert _entry(report, wt)["outcome"] == "retained"
+    assert wt.exists()
+
+
+def test_resume_read_only_reservation_blocks_gc_until_child_row_exists(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 852)
+    base = _git_head(repo)
+    os.utime(wt, (1, 1))
+    monkeypatch.setattr(
+        goalflight_dispatch, "_prepare_read_only_admission", lambda *_args: None
+    )
+    args = type("Args", (), {})()
+    args.parent_dispatch_id = "readonly-resume-parent-race"
+    args.dispatch_id = "readonly-resume-child-race"
+    args.agent = "codex"
+    args.shape = "bash"
+    args.read_only = True
+    args.cwd = str(wt)
+    args._worktree_base_commit = base
+
+    goalflight_dispatch._prepare_read_only_resume_binding(args, repo)
+    try:
+        os.utime(wt, (1, 1))
+        report = goalflight_worktree_gc.terminal_dry_run(
+            repo, ledger_dir=goalflight_ledger.runs_dir(create=False)
+        )
+        current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+        goalflight_worktree_gc.apply_removals(
+            repo,
+            report["entries"],
+            into="main",
+            ledger_dir=goalflight_ledger.runs_dir(create=False),
+            main_path=goalflight_worktree_gc.main_worktree_path(repo),
+            current_checkout=current_checkout,
+            current_error=current_error,
+        )
+        entry = _entry(report, wt)
+        assert entry["decision"] == "retain", entry
+        assert wt.exists()
+    finally:
+        goalflight_dispatch._release_read_only_resume_reservation(args)
+
+
+def _git_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_quota_exhausted_resumable_terminal_row_keeps_read_only_checkout(
+    repo: Path,
+) -> None:
+    wt = _add_read_only_checkout(repo, 853)
+    _write_ledger(
+        "quota-exhausted-resumable",
+        "quota_exhausted",
+        wt,
+        project_root=str(repo),
+        terminal_state="quota_exhausted",
+        updated_at=goalflight_ledger.utc_now(),
+    )
+    os.utime(wt, (1, 1))
+
+    _done, report = _run(repo, seed_terminal=False)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert "resumable" in entry["conditions"]["unowned"]["reason"]
+    assert wt.exists()
+
+
+def test_tilde_unknown_user_project_root_is_unknown(repo: Path) -> None:
+    wt = _add_read_only_checkout(repo, 84)
+    _write_ledger(
+        "unknown-user-project-root",
+        "waiting_capacity",
+        None,
+        project_root="~goalflight-user-that-does-not-exist-91638",
+    )
+
+    _done, report = _run(repo, seed_terminal=False)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+
+
+def test_read_only_gc_serializes_ledger_writer_with_final_remove(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = _add_read_only_checkout(repo, 85)
+    _done, report = _run(repo)
+    current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
+    writer_started = threading.Event()
+    writer_before_remove = {"value": False}
+    removal_done = threading.Event()
+    writer_thread: list[threading.Thread] = []
+
+    def writer() -> None:
+        writer_started.set()
+        lock = goalflight_ledger.StateLock.try_acquire(time.monotonic() + 0.2)
+        if lock is None:
+            return
+        try:
+            _write_ledger(
+                "ledger-writer-race",
+                "running",
+                wt,
+                project_root=str(repo),
+            )
+            writer_before_remove["value"] = not removal_done.is_set()
+        finally:
+            lock.release()
+
+    def pin(_repo: Path, _path: str, **_kwargs: object) -> tuple[str, None]:
+        thread = threading.Thread(target=writer)
+        writer_thread.append(thread)
+        thread.start()
+        assert writer_started.wait(1.0)
+        thread.join(1.0)
+        assert not thread.is_alive()
+        return "refs/goalflight/keep/ledger-race", None
+
+    original_remove = goalflight_worktree_gc._remove_worktree
+
+    def remove(_repo: Path, _path: str, **_kwargs: object) -> tuple[bool, str]:
+        result = original_remove(_repo, _path, **_kwargs)
+        removal_done.set()
+        return result
+
+    monkeypatch.setattr(goalflight_worktree_gc, "_pin_before_remove", pin)
+    monkeypatch.setattr(goalflight_worktree_gc, "_remove_worktree", remove)
+    goalflight_worktree_gc.apply_removals(
+        repo,
+        report["entries"],
+        into="main",
+        ledger_dir=goalflight_ledger.runs_dir(create=False),
+        main_path=goalflight_worktree_gc.main_worktree_path(repo),
+        current_checkout=current_checkout,
+        current_error=current_error,
+    )
+    for thread in writer_thread:
+        thread.join(1.0)
+    entry = _entry(report, wt)
+    assert entry["outcome"] == "retained", entry
+    assert writer_before_remove["value"] is True
+    assert not removal_done.is_set()
+
+
+def test_read_only_gc_retains_pathless_nonterminal_row_without_project_root(
+    repo: Path,
+) -> None:
+    wt = _add_read_only_checkout(repo, 9)
+    _write_ledger("missing-project-root-waiting", "waiting_capacity", None)
+
+    done, report = _run(repo, seed_terminal=False)
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    reason = entry["conditions"]["unowned"]["reason"]
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+    assert "missing-project-root-waiting" in reason
+
+
+def test_read_only_gc_retains_metadata_only_request_cwd_row(repo: Path) -> None:
+    wt = _add_read_only_checkout(repo, 86)
+    _write_ledger(
+        "metadata-only-request-cwd",
+        "waiting_capacity",
+        None,
+        request={"cwd": str(repo)},
+    )
+
+    done, report = _run(repo, seed_terminal=False)
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+    assert "metadata-only-request-cwd" in entry["conditions"]["unowned"]["reason"]
+
+
+def test_read_only_gc_retains_same_repository_pathless_rows_and_summarizes_ids(
+    repo: Path,
+) -> None:
+    wt = _add_read_only_checkout(repo, 10)
+    row_ids = [f"same-project-waiting-{index}" for index in range(4)]
+    for dispatch_id in row_ids:
+        _write_ledger(
+            dispatch_id,
+            "waiting_capacity",
+            None,
+            project_root=str(repo),
+        )
+
+    done, report = _run(repo, seed_terminal=False)
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    reason = entry["conditions"]["unowned"]["reason"]
+    assert entry["conditions"]["unowned"]["verdict"] == "unknown", entry
+    assert "count=4" in reason
+    assert all(dispatch_id in reason for dispatch_id in row_ids[:3])
+    assert row_ids[3] not in reason
+    assert row_ids[0] in json.dumps(report)
+
+
 def test_read_only_gc_matches_case_variant_ledger_path(
     tmp_path: Path, repo: Path
 ) -> None:
@@ -483,7 +863,9 @@ def test_read_only_gc_holds_allocator_lock_across_remove_recheck(
     current_checkout, current_error = goalflight_worktree_gc.current_checkout_path(repo)
     observed: dict[str, bool] = {}
 
-    def remove_without_touching_tree(_repo: Path, _path: str) -> tuple[bool, str]:
+    def remove_without_touching_tree(
+        _repo: Path, _path: str, **_kwargs: object
+    ) -> tuple[bool, str]:
         lock_path = goalflight_worktree_pool.read_only_allocation_lock_path(repo)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         handle = os.fdopen(fd, "r+", encoding="utf-8")
@@ -535,6 +917,25 @@ def test_read_only_gc_rejects_replaced_allocation_lock_identity(
         (parent / lock_path.name).unlink()
         parent.rmdir()
         backup.rename(parent)
+
+
+def test_read_only_gc_retains_on_common_dir_timeout(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def timed_out(_repo: Path, *, timeout: float | None = None) -> Path:
+        assert timeout is not None
+        raise goalflight_worktree_pool.WorktreeSeatError(
+            "git rev-parse timed out"
+        )
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git_common_dir", timed_out)
+    handle, error = goalflight_worktree_gc._acquire_read_only_action_lock(
+        repo, deadline=time.monotonic() + 1.0
+    )
+    if handle is not None:
+        handle.close()
+    assert handle is None
+    assert error and "deadline expired" in error
 
 
 def test_read_only_gc_rejects_replaced_unregistered_allocation_lock(

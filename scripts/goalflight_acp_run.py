@@ -665,6 +665,8 @@ def _record_acp_ledger_state(
         and worker_cwd
     ):
         recorded_worker_cwd = str(worker_cwd)
+    recorded_worktree_path = getattr(cfg, "_worktree_path", None)
+    recorded_worktree_base = getattr(cfg, "_worktree_base_commit", None)
 
     def _record_once() -> tuple[int, dict | None]:
         capture = io.StringIO()
@@ -691,6 +693,8 @@ def _record_acp_ledger_state(
                     transport="acp",
                     project_root=str(project_root),
                     worker_cwd=recorded_worker_cwd,
+                    worktree_path=recorded_worktree_path,
+                    worktree_base=recorded_worktree_base,
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
                     controller_label=controller_label,
@@ -2255,6 +2259,18 @@ async def run_acp_dispatch(
         raise
     finally:
         bridge.restore()
+        reservation = getattr(cfg, "_read_only_resume_reservation", None)
+        if reservation is not None:
+            try:
+                import goalflight_dispatch
+
+                goalflight_dispatch._release_read_only_resume_reservation(cfg)
+            except BaseException as exc:
+                print(
+                    "goalflight_acp_run: read-only resume reservation cleanup warning: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
         if (
             getattr(cfg, "_codex_dispatch_home_resolved", False)
             and not (isinstance(result, dict) and result.get("worker_still_alive") is True)
@@ -2779,6 +2795,10 @@ async def _run_acp_dispatch_impl(
         state="waiting_capacity",
         worker_cwd=worker_cwd,
     )
+    if getattr(cfg, "_read_only_resume_reservation", None) is not None:
+        import goalflight_dispatch
+
+        goalflight_dispatch._release_read_only_resume_reservation(cfg)
     wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
         lane=acquire_args.priority,
         wait_s=getattr(cfg, "capacity_wait_s", None),

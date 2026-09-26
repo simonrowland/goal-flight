@@ -119,6 +119,7 @@ WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 # advertised skill root instead (see _status_reminder_lines). Re-adding a
 # SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
+READ_ONLY_ALLOCATION_LOCK_PATH_ENV = "GOALFLIGHT_READ_ONLY_ALLOCATION_LOCK_PATH"
 # Routed by exact argv[0] match in main(). Kept beside the routes so a new
 # subcommand cannot be added without the misplacement guard learning it.
 _ROUTED_SUBCOMMANDS = (
@@ -2474,6 +2475,45 @@ def _release_read_only_worktree_hold(args) -> None:
     args._worktree_read_only_hold = None
 
 
+def _release_read_only_resume_reservation(args) -> None:
+    """Release the resume allocation lock after the child row is durable."""
+    reservation = getattr(args, "_read_only_resume_reservation", None)
+    if reservation is None:
+        args._read_only_resume_lock_fd = None
+        args._read_only_resume_lock_path = None
+        return
+    args._read_only_resume_reservation = None
+    args._read_only_resume_lock_fd = None
+    args._read_only_resume_lock_path = None
+    reservation.__exit__(None, None, None)
+
+
+def _inherited_read_only_resume_reservation():
+    """Adopt the allocation lock inherited by a detached resume child."""
+    raw_fd = os.environ.pop(
+        goalflight_worktree_pool.READ_ONLY_ALLOCATION_LOCK_FD_ENV, ""
+    ).strip()
+    raw_path = os.environ.pop(READ_ONLY_ALLOCATION_LOCK_PATH_ENV, "").strip()
+    if not raw_fd or not raw_path:
+        if raw_fd:
+            with contextlib.suppress(OSError, ValueError):
+                os.close(int(raw_fd))
+        return None
+    try:
+        fd = int(raw_fd)
+        actual = os.fstat(fd)
+        expected = os.stat(raw_path)
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError, UnboundLocalError):
+            os.close(fd)
+        return None
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return None
+    return os.fdopen(fd, "r+", encoding="utf-8")
+
+
 def _prepare_read_only_admission(args, project_root: Path) -> None:
     """Finish detached-checkout cleanup before any capacity lease is held."""
     if getattr(args, "_read_only_admission_prepared", False):
@@ -2489,18 +2529,56 @@ def _prepare_read_only_admission(args, project_root: Path) -> None:
 
 def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
     """Pin and touch a resumed detached checkout before capacity waiting."""
-    _prepare_read_only_admission(args, project_root)
     if not getattr(args, "parent_dispatch_id", None) or not _effective_read_only(args):
         return
     raw_cwd = getattr(args, "cwd", None)
     if not raw_cwd:
         return
     path = Path(str(raw_cwd)).expanduser().resolve(strict=False)
-    with goalflight_worktree_pool._read_only_allocation_lock(project_root):
+    if getattr(args, "_read_only_resume_reservation", None) is not None:
+        return
+    reservation = _inherited_read_only_resume_reservation()
+    if reservation is not None:
+        args._read_only_resume_reservation = reservation
+        args._read_only_resume_lock_fd = reservation.fileno()
+        # The detached parent already completed admission/reaping while it
+        # held this allocation lock. Re-running the reaper would wait on the
+        # inherited lock before the child can validate and record its row.
+        args._read_only_admission_prepared = True
+    else:
+        _prepare_read_only_admission(args, project_root)
+    deadline = time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+    if reservation is None:
+        reservation = goalflight_worktree_pool._read_only_allocation_lock(
+            project_root, deadline=deadline
+        )
+        lock_file = reservation.__enter__()
+    else:
+        lock_file = reservation
+    args._read_only_resume_reservation = reservation
+    args._read_only_resume_lock_fd = (
+        lock_file.fileno() if lock_file is not None else None
+    )
+    args._read_only_resume_lock_path = (
+        str(
+            goalflight_worktree_pool.read_only_allocation_lock_path(
+                project_root,
+                timeout=goalflight_worktree_pool._deadline_timeout(deadline),
+            )
+        )
+        if lock_file is not None
+        else None
+    )
+    try:
+        if time.monotonic() >= deadline:
+            raise goalflight_worktree_pool.WorktreeReadOnlyLockTimeout(
+                "read-only resume allocation deadline expired"
+            )
         verdict, _reason = goalflight_worktree_pool.read_only_worktree_path_verdict(
             path, project_root=project_root
         )
         if verdict != goalflight_worktree_pool.YES:
+            _release_read_only_resume_reservation(args)
             return
         parent_record = _find_dispatch_record(str(args.parent_dispatch_id)) or {}
         recorded_ref = getattr(args, "_worktree_base_commit", None) or (
@@ -2518,14 +2596,14 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
                 "rev-parse",
                 "--verify",
                 f"{recorded_ref}^{{commit}}",
-                timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+                timeout=goalflight_worktree_pool._deadline_timeout(deadline),
             )
             current_head = goalflight_worktree_pool._git(
                 path,
                 "rev-parse",
                 "--verify",
                 "HEAD^{commit}",
-                timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+                timeout=goalflight_worktree_pool._deadline_timeout(deadline),
             )
         except goalflight_worktree_pool.WorktreeSeatError as exc:
             raise goalflight_worktree_pool.WorktreeCwdRefused(
@@ -2539,7 +2617,7 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
             )
         clean = goalflight_worktree_pool.check_seat_cleanliness(
             path,
-            timeout=goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
+            timeout=goalflight_worktree_pool._deadline_timeout(deadline),
         )
         if clean["verdict"] != goalflight_worktree_pool.YES:
             raise goalflight_worktree_pool.WorktreeCwdRefused(
@@ -2551,6 +2629,9 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
         args._worktree_base_commit = recorded_base
         with contextlib.suppress(OSError):
             os.utime(path, None)
+    except BaseException:
+        _release_read_only_resume_reservation(args)
+        raise
 
 
 def _ledger_worker_cwd(args, state: str) -> str | None:
@@ -2686,6 +2767,9 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         project_root = _project_root(args)
         cwd_raw = getattr(args, "cwd", None)
         if cwd_raw:
+            read_only_deadline = (
+                time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+            )
             parent_record = _find_dispatch_record(str(args.parent_dispatch_id)) or {}
             recorded_ref = getattr(args, "_worktree_base_commit", None) or (
                 parent_record.get("worktree_head")
@@ -2699,6 +2783,9 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                         "rev-parse",
                         "--verify",
                         f"{recorded_ref}^{{commit}}",
+                        timeout=goalflight_worktree_pool._deadline_timeout(
+                            read_only_deadline
+                        ),
                     )
             if not recorded_base:
                 raise goalflight_worktree_pool.WorktreeCwdRefused(
@@ -2721,6 +2808,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 recorded_path,
                 str(args.dispatch_id),
                 base_commit=recorded_base,
+                deadline=read_only_deadline,
             )
             if hold is not None:
                 _record_shared_read_only_worktree(
@@ -5095,15 +5183,18 @@ def _terminal_worktree_gc(project_root: Path | None, dispatch_id: str) -> None:
             listed, _ = goalflight_worktree_gc.list_worktrees(project_root)
             main_path = goalflight_worktree_gc.main_worktree_path(project_root)
             current, current_error = goalflight_worktree_gc.current_checkout_path(project_root)
+            ledger_dir = goalflight_ledger.runs_dir(create=False)
+            ledger_index = goalflight_worktree_gc.ledger_index_for_dir(ledger_dir)
             entries = [
                 goalflight_worktree_gc.classify(
                     project_root,
                     item,
                     into="main",
-                    ledger_dir=goalflight_ledger.runs_dir(create=False),
+                    ledger_dir=ledger_dir,
                     main_path=main_path,
                     current_checkout=current,
                     current_error=current_error,
+                    ledger_index=ledger_index,
                 )
                 for item in listed
             ]
@@ -5111,7 +5202,7 @@ def _terminal_worktree_gc(project_root: Path | None, dispatch_id: str) -> None:
                 project_root,
                 entries,
                 into="main",
-                ledger_dir=goalflight_ledger.runs_dir(create=False),
+                ledger_dir=ledger_dir,
                 main_path=main_path,
                 current_checkout=current,
                 current_error=current_error,
@@ -20399,7 +20490,6 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     )
 
     project_root = _project_root(args)
-    _prepare_read_only_resume_binding(args, project_root)
     requested_worktree_base = _requested_worktree_base(args)
     outer_seat_bound = (
         getattr(args, "_worktree_seat", None) is not None
@@ -20787,18 +20877,31 @@ def _run_acp_detached_launcher(
         env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
             worktree_seat.fileno()
         )
+    read_only_lock_fd = getattr(args, "_read_only_resume_lock_fd", None)
+    if read_only_lock_fd is not None:
+        env[goalflight_worktree_pool.READ_ONLY_ALLOCATION_LOCK_FD_ENV] = str(
+            read_only_lock_fd
+        )
+    read_only_lock_path = getattr(args, "_read_only_resume_lock_path", None)
+    if read_only_lock_path is not None:
+        env[READ_ONLY_ALLOCATION_LOCK_PATH_ENV] = str(read_only_lock_path)
     _apply_web_qa_env(env, args, _project_root(args))
     child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
-    child_pid = _spawn_daemonized_process(
-        child_argv,
-        env=env,
-        stdout_path=tail_path,
-        stdout_mode="ab",
-        stderr="stdout",
-        serialize_stdout=True,
-        label="acp",
-        inherit_occupancy_lock=True,
-    )
+    try:
+        child_pid = _spawn_daemonized_process(
+            child_argv,
+            env=env,
+            stdout_path=tail_path,
+            stdout_mode="ab",
+            stderr="stdout",
+            serialize_stdout=True,
+            label="acp",
+            inherit_occupancy_lock=True,
+        )
+    finally:
+        # A successful daemon spawn has its own descriptor copy; the child
+        # keeps the reservation until its bound ledger row is durable.
+        _release_read_only_resume_reservation(args)
     if worktree_seat is not None:
         # The detached ACP launcher inherited the exact outer-bound seat fd.
         # Drop this process's copy so the child/worker lifetime owns the seat.
@@ -20916,6 +21019,12 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         args.dispatch_id,
         allow_queued=getattr(args, "from_queue", False),
     )
+    if (
+        getattr(args, "parent_dispatch_id", None)
+        and _effective_read_only(args)
+        and getattr(args, "cwd", None)
+    ):
+        _prepare_read_only_resume_binding(args, _project_root(args))
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json, base=base)
     env_remove = []
@@ -20943,8 +21052,41 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             env_remove=env_remove,
             capacity_wait_s=_capacity_wait_seconds(args) + float(cfg.capacity_wait_s or 0.0),
         )
+    if (
+        getattr(args, "parent_dispatch_id", None)
+        and _effective_read_only(args)
+        and getattr(args, "cwd", None)
+    ):
+        project_root = _project_root(args)
+        try:
+            _prepare_read_only_resume_binding(args, project_root)
+            for name in (
+                "_worktree_base_commit",
+                "_worktree_id",
+                "_worktree_path",
+                "_worktree_read_only",
+            ):
+                if hasattr(args, name):
+                    setattr(cfg, name, getattr(args, name))
+            cfg._read_only_resume_reservation = getattr(
+                args, "_read_only_resume_reservation", None
+            )
+            cfg._read_only_resume_lock_fd = getattr(
+                args, "_read_only_resume_lock_fd", None
+            )
+            cfg._read_only_resume_lock_path = getattr(
+                args, "_read_only_resume_lock_path", None
+            )
+            args._read_only_resume_reservation = None
+            args._read_only_resume_lock_fd = None
+            args._read_only_resume_lock_path = None
+        except BaseException:
+            _release_read_only_resume_reservation(args)
+            raise
     test_rc = _run_test_acp_shape_if_requested(args, base=base, status_json=status_json, tail_path=tail_path)
     if test_rc is not None:
+        _release_read_only_resume_reservation(cfg)
+        _release_read_only_resume_reservation(args)
         return test_rc
     if goalflight_compat.is_windows():
         payload = asyncio.run(run_acp_dispatch(cfg))
@@ -22404,6 +22546,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 state="waiting_capacity",
             )
             ledger_recorded = True
+            _release_read_only_resume_reservation(args)
 
         record_worktree_wait()
         try:
@@ -23270,6 +23413,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             worktree_seat.release()
             worktree_seat = None
         _release_read_only_worktree_hold(args)
+        _release_read_only_resume_reservation(args)
         if (
             (
                 getattr(args, "_worktree_occupancy_refused", False)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,115 @@ def test_acp_waiting_capacity_record_has_no_worker_cwd(
         worker_cwd=tmp_path / "seat",
     )
     assert captured and captured[0].worker_cwd is None
+
+
+def test_acp_resume_record_persists_worktree_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[argparse.Namespace] = []
+    monkeypatch.setattr(acp_run.goalflight_ledger, "worker_spawn_state", lambda _pid: "none")
+    monkeypatch.setattr(
+        acp_run.goalflight_ledger,
+        "cmd_record",
+        lambda ns: captured.append(ns) or 0,
+    )
+    checkout = tmp_path / "read-only-seat"
+    cfg = argparse.Namespace(
+        prompt_id=None,
+        prompt=None,
+        task_ids=[],
+        agent="test-dispatch",
+        account=None,
+        request_envelope=None,
+        session_id="session",
+        queue_launch_token=None,
+        cwd=str(checkout),
+        _worktree_path=str(checkout),
+        _worktree_base_commit="a" * 40,
+    )
+    acp_run._record_acp_ledger_state(
+        cfg,
+        dispatch_id="resumed-acp",
+        project_root=tmp_path,
+        controller_pid=None,
+        controller_session_id=None,
+        controller_label=None,
+        status_path=tmp_path / "status.json",
+        payload={},
+        effective_account=None,
+        lease_id=None,
+        worker_pid=None,
+        state="waiting_capacity",
+        worker_cwd=checkout,
+    )
+    assert captured
+    assert captured[0].worktree_path == str(checkout)
+    assert captured[0].worktree_base == "a" * 40
+
+
+def test_detached_acp_resume_admits_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    args = argparse.Namespace(
+        agent="codex-acp",
+        billing="sub",
+        dispatch_id="detached-resume",
+        from_queue=False,
+        status_json=None,
+        tail=None,
+        launch_detached=True,
+        acp_detached_child=False,
+        parent_dispatch_id="parent",
+        read_only=True,
+        cwd=str(tmp_path / "read-only-seat"),
+        capacity_wait_s=0.0,
+    )
+
+    def prepare(resume_args, _project_root) -> None:
+        order.append("prepare")
+        resume_args._read_only_resume_reservation = object()
+
+    def build(_args, **_kwargs):
+        order.append("build")
+        return argparse.Namespace(capacity_wait_s=0.0)
+
+    def launch(resume_args, **_kwargs) -> int:
+        order.append("spawn")
+        assert resume_args._read_only_resume_reservation is not None
+        resume_args._read_only_resume_reservation = None
+        return 0
+
+    monkeypatch.setattr(dispatch, "_project_root", lambda _args: tmp_path)
+    monkeypatch.setattr(dispatch, "_refuse_reused_dispatch_id_for_launch", lambda *_a, **_k: None)
+    monkeypatch.setattr(dispatch, "_prepare_read_only_resume_binding", prepare)
+    monkeypatch.setattr(dispatch, "_build_acp_cfg", build)
+    monkeypatch.setattr(dispatch, "_run_acp_detached_launcher", launch)
+    monkeypatch.setattr(dispatch, "_emit_dispatch_warnings", lambda *_a, **_k: None)
+
+    assert dispatch._run_acp_shape(args, base=tmp_path, account_env={}) == 0
+    assert order == ["prepare", "build", "spawn"]
+
+
+def test_detached_resume_passes_and_adopts_allocation_lock_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "readonly-allocation.lock"
+    lock_file = lock_path.open("w+")
+    inherited_fd = os.dup(lock_file.fileno())
+    monkeypatch.setenv(
+        goalflight_worktree_pool.READ_ONLY_ALLOCATION_LOCK_FD_ENV,
+        str(inherited_fd),
+    )
+    monkeypatch.setenv(dispatch.READ_ONLY_ALLOCATION_LOCK_PATH_ENV, str(lock_path))
+    try:
+        assert inherited_fd in goalflight_worktree_pool.pass_worktree_lock_fds()
+        adopted = dispatch._inherited_read_only_resume_reservation()
+        assert adopted is not None
+        assert adopted.fileno() == inherited_fd
+        adopted.close()
+    finally:
+        lock_file.close()
 
 
 def test_starting_record_remains_a_worktree_incumbent(

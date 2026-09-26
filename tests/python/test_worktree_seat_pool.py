@@ -682,12 +682,12 @@ def test_read_only_reaper_honors_transaction_deadline(
     monkeypatch.setattr(
         goalflight_worktree_pool,
         "_read_only_registered_worktrees",
-        lambda _repo: paths,
+        lambda _repo, **_kwargs: paths,
     )
     monkeypatch.setattr(
         goalflight_worktree_pool,
         "read_only_worktree_usage",
-        lambda _path: {"verdict": goalflight_worktree_pool.YES},
+        lambda _path, **_kwargs: {"verdict": goalflight_worktree_pool.YES},
     )
     clock = [0.0]
     monkeypatch.setattr(goalflight_worktree_pool.time, "monotonic", lambda: clock[0])
@@ -708,6 +708,106 @@ def test_read_only_reaper_honors_transaction_deadline(
         repo, root=root, requested_path=None, deadline=2.0
     )
     assert pinned == paths[:2]
+
+
+def test_read_only_reaper_indexes_ledger_and_caches_foreign_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    foreign_parent = tmp_path / "foreign-parent"
+    foreign_parent.mkdir()
+    foreign = make_repo(foreign_parent)
+    root = goalflight_worktree_pool.read_only_worktree_root(repo)
+    root.mkdir(parents=True)
+    paths = [root / f"old-{index}" for index in range(100)]
+    for path in paths:
+        path.mkdir()
+        os.utime(path, (1, 1))
+    for index in range(20):
+        goalflight_ledger.write_record(
+            {
+                "dispatch_id": f"foreign-row-{index}",
+                "state": "waiting_capacity",
+                "project_root": str(foreign),
+            }
+        )
+
+    monkeypatch.setattr(goalflight_worktree_pool, "READ_ONLY_WORKTREE_KEEP", 0)
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_read_only_registered_worktrees",
+        lambda _repo, **_kwargs: paths,
+    )
+
+    import goalflight_worktree_gc
+
+    original_read = goalflight_worktree_gc.read_ledger_records
+    ledger_reads = {"count": 0}
+
+    def count_ledger_reads(ledger_dir: Path, **_kwargs):
+        ledger_reads["count"] += 1
+        return original_read(ledger_dir)
+
+    monkeypatch.setattr(
+        goalflight_worktree_gc, "read_ledger_records", count_ledger_reads
+    )
+    original_common_dir = goalflight_worktree_pool._git_common_dir
+    identity_calls: list[str] = []
+
+    def count_identity_calls(path: Path, *, timeout: float | None = None) -> Path:
+        identity_calls.append(os.path.realpath(str(path)))
+        return original_common_dir(path, timeout=timeout)
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_git_common_dir", count_identity_calls
+    )
+    removed: list[Path] = []
+    original_git = goalflight_worktree_pool._git
+
+    def remove_fake_checkout(
+        cwd: Path, *args: str, **kwargs: object
+    ) -> str:
+        if args[:2] == ("worktree", "remove"):
+            removed.append(Path(args[2]))
+            return ""
+        return original_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", remove_fake_checkout)
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "pin_worktree_head_before_remove",
+        lambda *_args, **_kwargs: ("refs/goalflight/keep/test", None),
+    )
+
+    goalflight_worktree_pool._reap_read_only_worktrees(
+        repo, root=root, requested_path=None, deadline=time.monotonic() + 20.0
+    )
+
+    assert removed == paths
+    assert ledger_reads["count"] == 1
+    assert len(identity_calls) <= 2
+
+
+def test_read_only_reaper_bails_when_ledger_lock_deadline_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = make_repo(tmp_path)
+    root = goalflight_worktree_pool.read_only_worktree_root(repo)
+    root.mkdir(parents=True)
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_read_only_registered_worktrees",
+        lambda _repo, **_kwargs: [],
+    )
+    started = time.monotonic()
+    with goalflight_ledger.StateLock():
+        goalflight_worktree_pool._reap_read_only_worktrees(
+            repo,
+            root=root,
+            requested_path=None,
+            deadline=started + 0.05,
+        )
+    assert time.monotonic() - started < 1.0
 
 
 def test_clean_legacy_ring_seat_is_adopted_and_reused(tmp_path: Path) -> None:
@@ -877,7 +977,7 @@ def test_read_only_review_rechecks_after_shared_hold(monkeypatch: pytest.MonkeyP
         finish_seat_holder(writer)
         calls = 0
 
-        def matches(_path: Path, _base: str) -> bool:
+        def matches(_path: Path, _base: str, **_kwargs: object) -> bool:
             nonlocal calls
             calls += 1
             return calls == 1
@@ -1219,12 +1319,12 @@ def test_read_only_reaper_stops_after_bounded_git_timeout(
         monkeypatch.setattr(
             goalflight_worktree_pool,
             "_read_only_registered_worktrees",
-            lambda _repo: paths,
+            lambda _repo, **_kwargs: paths,
         )
         monkeypatch.setattr(
             goalflight_worktree_pool,
             "read_only_worktree_usage",
-            lambda _path: {"verdict": goalflight_worktree_pool.YES},
+            lambda _path, **_kwargs: {"verdict": goalflight_worktree_pool.YES},
         )
         calls: list[dict] = []
 
@@ -1242,13 +1342,78 @@ def test_read_only_reaper_stops_after_bounded_git_timeout(
             repo, root=root, requested_path=None
         )
 
-        assert calls == [
-            {
-                "args": ("worktree", "remove", str(paths[0])),
-                "timeout": goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S,
-            }
-        ]
+        assert len(calls) == 1
+        assert calls[0]["args"] == ("worktree", "remove", str(paths[0]))
+        assert 0 < calls[0]["timeout"] <= goalflight_worktree_pool.READ_ONLY_GIT_TIMEOUT_S
         assert all(path.is_dir() for path in paths)
+
+
+def test_git_proc_subtracts_identity_guard_time_from_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, float | None]] = []
+    clock = iter((100.0, 100.4))
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "guard_worktree_mutation",
+        lambda *_args, **kwargs: calls.append(("guard", kwargs["timeout"])) or None,
+    )
+    monkeypatch.setattr(
+        goalflight_worktree_pool.time,
+        "monotonic",
+        lambda: next(clock),
+    )
+    monkeypatch.setattr(
+        goalflight_worktree_pool.subprocess,
+        "run",
+        lambda *_args, **kwargs: (
+            calls.append(("git", kwargs["timeout"]))
+            or subprocess.CompletedProcess(["git"], 0, "", "")
+        ),
+    )
+
+    result = goalflight_worktree_pool._git_proc(
+        tmp_path, "checkout", "--detach", timeout=1.0
+    )
+
+    assert result is not None and result.returncode == 0
+    assert calls[0] == ("guard", 1.0)
+    assert calls[1][0] == "git"
+    assert calls[1][1] is not None and 0.5 < calls[1][1] < 0.7
+
+
+def test_guard_identity_checks_share_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    calls: list[float | None] = []
+    clock = iter((100.0, 100.3, 100.6))
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool.time,
+        "monotonic",
+        lambda: next(clock),
+    )
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_git_identity",
+        lambda _cwd, *, timeout=None: (
+            calls.append(timeout)
+            or ("/git/worktree", "/git/common", "/git/top")
+        ),
+    )
+
+    assert (
+        goalflight_worktree_pool.guard_worktree_mutation(
+            tmp_path, "worktree", "remove", str(target), timeout=1.0
+        )
+        is None
+    )
+    assert len(calls) == 2
+    assert calls[0] is not None and 0.6 < calls[0] < 0.8
+    assert calls[1] is not None and 0.3 < calls[1] < 0.5
 
 
 @pytest.mark.parametrize("bind_step", ["create", "verify", "pin", "quarantine", "checkout"])

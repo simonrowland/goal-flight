@@ -16,6 +16,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Callable, TextIO
@@ -30,6 +31,7 @@ WORKTREES_PER_REPO_ENV = "GOALFLIGHT_WORKTREES_PER_REPO"
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
 OCCUPANCY_LOCK_FD_ENV = "GOALFLIGHT_OCCUPANCY_LOCK_FD"
+READ_ONLY_ALLOCATION_LOCK_FD_ENV = "GOALFLIGHT_READ_ONLY_ALLOCATION_LOCK_FD"
 OCCUPANCY_LOCK_NAME = "goalflight-worktree.lock"
 # Documented fallback when no --controller-label and no live lease label is
 # available. Stable across dispatches; do not invent a per-launch name.
@@ -71,6 +73,13 @@ READ_ONLY_REAP_TIMEOUT_S = 30.0
 _LOCK_REGISTRY_NAME = "goalflight-worktree-lock-registry.json"
 _LOCK_REGISTRY_MUTEX_NAME = "goalflight-worktree-lock-registry.mutex"
 _SAFE_RING_LABEL = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _deadline_timeout(deadline: float | None, *, cap: float = READ_ONLY_GIT_TIMEOUT_S) -> float | None:
+    """Return one bounded Git timeout from an absolute transaction deadline."""
+    if deadline is None:
+        return cap
+    return max(0.0, min(cap, deadline - time.monotonic()))
 
 # Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
 # retains (refuses reset). Do not collapse "could not tell" into a green light.
@@ -333,7 +342,11 @@ def inherited_worktree_lock_fds() -> tuple[int, ...]:
     """Return validated inherited worktree-lock and occupancy-lock descriptors."""
     fds: list[int] = []
     errors: list[str] = []
-    for env_name in (WORKTREE_LOCK_FD_ENV, OCCUPANCY_LOCK_FD_ENV):
+    for env_name in (
+        WORKTREE_LOCK_FD_ENV,
+        OCCUPANCY_LOCK_FD_ENV,
+        READ_ONLY_ALLOCATION_LOCK_FD_ENV,
+    ):
         raw = os.environ.get(env_name, "").strip()
         if not raw:
             continue
@@ -363,12 +376,13 @@ def pass_worktree_lock_fds(env: dict[str, str] | None = None) -> tuple[int, ...]
     """Descriptors a child must inherit to keep holding this process's locks.
 
     ``inherited_worktree_lock_fds`` reads this process's ``os.environ`` for
-    both the pooled-worktree fd and the occupancy fd. A parent that acquired a
-    *new* worktree puts the fd in the child env dict without exporting it on
-    itself; that fd still has to be in ``pass_fds`` or the helper exec closes
-    it and the seat frees while the worker runs. Occupancy is usually
-    exported on the parent; the env-dict lookup still covers a child env
-    that names an occupancy fd the parent has not exported.
+    the pooled-worktree, occupancy, and detached-read-only-allocation fds. A
+    parent that acquired a *new* worktree puts the fd in the child env dict
+    without exporting it on itself; that fd still has to be in ``pass_fds`` or
+    the helper exec closes it and the seat frees while the worker runs.
+    Occupancy and detached-resume locks are usually exported on the parent;
+    the env-dict lookup also covers a child env that names a fd the parent has
+    not exported.
 
     Callers that must not hold occupancy (watcher, caffeinate, redact
     sidecars) strip that fd after this returns; passing the combined set
@@ -383,7 +397,11 @@ def pass_worktree_lock_fds(env: dict[str, str] | None = None) -> tuple[int, ...]
             seen.add(fd)
     if env is None:
         return tuple(fds)
-    for env_name in (WORKTREE_LOCK_FD_ENV, OCCUPANCY_LOCK_FD_ENV):
+    for env_name in (
+        WORKTREE_LOCK_FD_ENV,
+        OCCUPANCY_LOCK_FD_ENV,
+        READ_ONLY_ALLOCATION_LOCK_FD_ENV,
+    ):
         raw = str(env.get(env_name) or "").strip()
         if not raw:
             continue
@@ -428,9 +446,17 @@ def default_controller_ring_label(
     return UNLABELED_CONTROLLER_RING
 
 
-def default_seat_base(project_root: Path) -> str:
+def default_seat_base(
+    project_root: Path, *, timeout: float | None = None
+) -> str:
     """Project default ref: ``origin/main`` when it exists, else ``HEAD``."""
-    proc = _git_proc(project_root, "rev-parse", "--verify", "origin/main^{commit}")
+    proc = _git_proc(
+        project_root,
+        "rev-parse",
+        "--verify",
+        "origin/main^{commit}",
+        timeout=timeout,
+    )
     if proc is not None and proc.returncode == 0:
         return "origin/main"
     return "HEAD"
@@ -481,9 +507,11 @@ def read_only_worktree_root(project_root: Path) -> Path:
     return repository_worktree_root(project_root) / READ_ONLY_WORKTREE_DIR
 
 
-def read_only_allocation_lock_path(project_root: Path) -> Path:
+def read_only_allocation_lock_path(
+    project_root: Path, *, timeout: float | None = None
+) -> Path:
     """Return the lock shared by detached-checkout allocation and GC."""
-    return _seat_lock_root(project_root) / "readonly-allocation.lock"
+    return _seat_lock_root(project_root, timeout=timeout) / "readonly-allocation.lock"
 
 
 def read_only_worktree_path_verdict(
@@ -588,6 +616,7 @@ def _registered_pool_seat_lock_info(
     path: str | Path,
     *,
     project_root: Path,
+    deadline: float | None = None,
 ) -> tuple[str, str, Path | None, os.stat_result | None]:
     """Return registration plus the lock identity used for that verdict."""
     try:
@@ -662,9 +691,25 @@ def _registered_pool_seat_lock_info(
         )
 
     try:
-        registry_root = _git_common_dir(root)
+        registry_root = _git_common_dir(
+            root,
+            timeout=(
+                None
+                if deadline is None
+                else _deadline_timeout(deadline)
+            ),
+        )
         lock_root = registry_root / "goalflight-worktree-seat-locks"
     except WorktreeSeatError as exc:
+        if deadline is not None and (
+            "timed out" in str(exc).lower() or time.monotonic() >= deadline
+        ):
+            return (
+                "unknown",
+                "worktree lock directory deadline expired; retaining checkout",
+                None,
+                None,
+            )
         return "unknown", f"worktree lock directory unreadable ({exc})", None, None
     if lock_subdir:
         lock_root = lock_root / lock_subdir
@@ -739,6 +784,7 @@ def registered_pool_seat_verdict(
     path: str | Path,
     *,
     project_root: Path,
+    deadline: float | None = None,
 ) -> tuple[str, str]:
     """Ask the pool whether ``path`` is a registered worktree.
 
@@ -751,7 +797,7 @@ def registered_pool_seat_verdict(
     a deleter retains.
     """
     verdict, reason, _lock_path, _lock_stat = _registered_pool_seat_lock_info(
-        path, project_root=project_root
+        path, project_root=project_root, deadline=deadline
     )
     return verdict, reason
 
@@ -884,7 +930,14 @@ def guard_worktree_mutation(
     else:
         return None
 
-    source = _git_identity(cwd, timeout=timeout)
+    started = time.monotonic() if timeout is not None else None
+
+    def remaining_timeout() -> float | None:
+        if started is None:
+            return None
+        return max(0.0, timeout - (time.monotonic() - started))
+
+    source = _git_identity(cwd, timeout=remaining_timeout())
     if source is None:
         return f"refusing git {' '.join(args)}: cannot verify repository identity"
     if command != "worktree":
@@ -907,7 +960,7 @@ def guard_worktree_mutation(
                 "repository main worktree"
             )
         target_identity = (
-            _git_identity(Path(target_real), timeout=timeout)
+            _git_identity(Path(target_real), timeout=remaining_timeout())
             if Path(target_real).is_dir()
             else None
         )
@@ -934,11 +987,19 @@ def _git_proc(
     env: dict[str, str] | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
+    started = time.monotonic() if timeout is not None else None
     guard_error = guard_worktree_mutation(cwd, *args, timeout=timeout)
     if guard_error is not None:
         return subprocess.CompletedProcess(
             ["git", *args], 128, "", guard_error
         )
+    command_timeout = timeout
+    if started is not None:
+        command_timeout = max(0.0, timeout - (time.monotonic() - started))
+        if command_timeout <= 0.0:
+            return subprocess.CompletedProcess(
+                ["git", *args], 124, "", "git command timed out"
+            )
     try:
         run_kwargs = {
             "cwd": str(cwd),
@@ -949,7 +1010,7 @@ def _git_proc(
             "stderr": subprocess.PIPE,
             "env": env,
             "check": False,
-            "timeout": timeout,
+            "timeout": command_timeout,
         }
         if input_text is None:
             return subprocess.run(["git", *args], **run_kwargs)
@@ -1015,8 +1076,16 @@ def is_captive_seat_name(name: str) -> bool:
     return _slot_from_seat_name(name, CAPTIVE_SEAT_PREFIX) is not None
 
 
-def _seat_lock_root(project_root: Path, *, controller_label: str | None = None) -> Path:
-    root = _git_common_dir(project_root.resolve()) / "goalflight-worktree-seat-locks"
+def _seat_lock_root(
+    project_root: Path,
+    *,
+    controller_label: str | None = None,
+    timeout: float | None = None,
+) -> Path:
+    root = (
+        _git_common_dir(project_root.resolve(), timeout=timeout)
+        / "goalflight-worktree-seat-locks"
+    )
     if controller_label is None:
         return root
     return root / sanitize_controller_ring_label(controller_label)
@@ -1362,8 +1431,16 @@ def classify_dispatch_cwd(
     return "refuse"
 
 
-def _verify_project_root(project_root: Path) -> None:
-    top = Path(_git(project_root, "rev-parse", "--show-toplevel")).resolve()
+def _verify_project_root(
+    project_root: Path, *, timeout: float | None = None
+) -> None:
+    if timeout is None:
+        raw_top = _git(project_root, "rev-parse", "--show-toplevel")
+    else:
+        raw_top = _git(
+            project_root, "rev-parse", "--show-toplevel", timeout=timeout
+        )
+    top = Path(raw_top).resolve()
     if top != project_root:
         raise WorktreeSeatError(f"--cwd must be the git repository root: {project_root}")
 
@@ -1373,24 +1450,45 @@ def _verify_existing_seat(
     worktree_path: Path,
     *,
     timeout: float | None = None,
+    deadline: float | None = None,
 ) -> None:
     if worktree_path.is_symlink():
         raise WorktreeSeatError(f"managed worktree path must not be a symlink: {worktree_path}")
     if not worktree_path.is_dir():
         raise WorktreeSeatError(f"managed worktree path is not a directory: {worktree_path}")
-    if timeout is None:
-        top = Path(_git(worktree_path, "rev-parse", "--show-toplevel")).resolve()
+    if deadline is None and timeout is None:
+        raw_top = _git(worktree_path, "rev-parse", "--show-toplevel")
     else:
-        top = Path(
-            _git(worktree_path, "rev-parse", "--show-toplevel", timeout=timeout)
-        ).resolve()
+        raw_top = _git(
+            worktree_path,
+            "rev-parse",
+            "--show-toplevel",
+            timeout=_deadline_timeout(
+                deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S
+            ),
+        )
+    top = Path(raw_top).resolve()
     if top != worktree_path.resolve():
         raise WorktreeSeatError(
             f"managed worktree path is not a Git worktree root: {worktree_path}"
         )
-    if _git_common_dir(worktree_path, timeout=timeout) != _git_common_dir(
-        project_root, timeout=timeout
-    ):
+    if deadline is None and timeout is None:
+        worktree_common = _git_common_dir(worktree_path)
+        project_common = _git_common_dir(project_root)
+    else:
+        worktree_common = _git_common_dir(
+            worktree_path,
+            timeout=_deadline_timeout(
+                deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S
+            ),
+        )
+        project_common = _git_common_dir(
+            project_root,
+            timeout=_deadline_timeout(
+                deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S
+            ),
+        )
+    if worktree_common != project_common:
         raise WorktreeSeatError(f"managed worktree belongs to another repository: {worktree_path}")
 
 
@@ -1398,6 +1496,9 @@ def read_only_worktree_usage(
     path: str | Path,
     *,
     ledger_dir: Path | None = None,
+    project_root: Path | None = None,
+    ledger_index=None,
+    identity_deadline: float | None = None,
 ) -> dict[str, str]:
     """Return the shared fail-closed in-use verdict for a detached checkout.
 
@@ -1407,17 +1508,28 @@ def read_only_worktree_usage(
     import goalflight_worktree_gc
 
     return goalflight_worktree_gc.check_unowned(
-        str(path), ledger_dir or goalflight_ledger.runs_dir(create=False)
+        str(path),
+        ledger_dir or goalflight_ledger.runs_dir(create=False),
+        project_root=project_root,
+        ledger_index=ledger_index,
+        identity_deadline=identity_deadline,
     )
 
 
-def _registered_worktree_paths(project_root: Path) -> list[Path]:
+def _registered_worktree_paths(
+    project_root: Path, *, timeout: float | None = None
+) -> list[Path]:
+    git_timeout = (
+        READ_ONLY_GIT_TIMEOUT_S
+        if timeout is None
+        else max(0.0, timeout)
+    )
     output = _git(
         project_root,
         "worktree",
         "list",
         "--porcelain",
-        timeout=READ_ONLY_GIT_TIMEOUT_S,
+        timeout=git_timeout,
     )
     paths: list[Path] = []
     for line in output.splitlines():
@@ -1431,48 +1543,84 @@ def _registered_worktree_paths(project_root: Path) -> list[Path]:
     return paths
 
 
-def _read_only_registered_worktrees(project_root: Path) -> list[Path]:
+def _read_only_registered_worktrees(
+    project_root: Path, *, deadline: float | None = None
+) -> list[Path]:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise WorktreeSeatError("read-only registration scan deadline expired")
+    timeout = _deadline_timeout(deadline)
     paths: list[Path] = []
-    for candidate in _registered_worktree_paths(project_root):
+    for candidate in _registered_worktree_paths(project_root, timeout=timeout):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorktreeSeatError("read-only registration scan deadline expired")
         verdict, _reason = read_only_worktree_path_verdict(
             candidate, project_root=project_root
         )
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorktreeSeatError("read-only registration scan deadline expired")
         if verdict == YES:
             paths.append(candidate)
     return paths
 
 
-def _registered_pool_worktrees(project_root: Path) -> list[Path]:
+def _ledger_directory_stamp(ledger_dir: Path) -> tuple[int, int, int] | None:
+    """Cheap change detector for the atomic ledger directory writers."""
+    try:
+        stat_result = ledger_dir.stat()
+    except OSError:
+        return None
+    return (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_mtime_ns),
+    )
+
+
+def _registered_pool_worktrees(
+    project_root: Path, *, deadline: float | None = None
+) -> list[Path]:
     """Return pooled seats whose lock identity can be opened or adopted."""
     paths: list[Path] = []
-    for candidate in _registered_worktree_paths(project_root):
+    for candidate in _registered_worktree_paths(
+        project_root, timeout=_deadline_timeout(deadline)
+    ):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorktreeSeatError("read-only candidate scan deadline expired")
         managed_verdict, _managed_reason = managed_worktree_path_verdict(
             candidate, project_root=project_root
         )
         if managed_verdict != YES:
             continue
         verdict, _reason, lock_path, lock_stat = _registered_pool_seat_lock_info(
-            candidate, project_root=project_root
+            candidate, project_root=project_root, deadline=deadline
         )
         if verdict == YES or (verdict == UNKNOWN and lock_path is not None and lock_stat is not None):
             paths.append(candidate)
     return paths
 
 
-def _read_only_seat_matches(path: Path, base_commit: str) -> bool:
+def _read_only_seat_matches(
+    path: Path, base_commit: str, *, deadline: float | None = None
+) -> bool:
     """Require the exact review base and an entirely clean checkout."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
     try:
         if _git(
             path,
             "rev-parse",
             "--verify",
             "HEAD^{commit}",
-            timeout=READ_ONLY_GIT_TIMEOUT_S,
+            timeout=_deadline_timeout(deadline),
         ) != base_commit:
             return False
     except WorktreeSeatError:
         return False
-    return check_seat_cleanliness(path, timeout=READ_ONLY_GIT_TIMEOUT_S)["verdict"] == YES
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
+    return check_seat_cleanliness(
+        path, timeout=_deadline_timeout(deadline)
+    )["verdict"] == YES
 
 
 def _try_acquire_shared_read_only_seat(
@@ -1480,12 +1628,20 @@ def _try_acquire_shared_read_only_seat(
     path: Path,
     base_commit: str,
     dispatch_id: str,
+    *,
+    deadline: float | None = None,
 ) -> WorktreeReadOnlySeatLease | None:
     """Take a non-blocking shared hold, then close the HEAD/status race."""
     try:
-        verdict, _reason, lock_path, expected_stat = (
-            _registered_pool_seat_lock_info(path, project_root=project_root)
-        )
+        if deadline is None:
+            lock_info = _registered_pool_seat_lock_info(
+                path, project_root=project_root
+            )
+        else:
+            lock_info = _registered_pool_seat_lock_info(
+                path, project_root=project_root, deadline=deadline
+            )
+        verdict, _reason, lock_path, expected_stat = lock_info
         if (
             verdict == NO
             or lock_path is None
@@ -1493,12 +1649,17 @@ def _try_acquire_shared_read_only_seat(
         ):
             return None
         flags = _lock_open_flags() & ~os.O_CREAT
-        registry_root = _git_common_dir(project_root)
+        registry_root = _git_common_dir(
+            project_root, timeout=_deadline_timeout(deadline)
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
         lock_fd = _open_registered_lock(
             lock_path,
             flags,
             registry_root=registry_root,
             allow_unregistered=verdict == UNKNOWN,
+            registration_deadline=deadline,
         )
     except (OSError, WorktreeSeatError):
         return None
@@ -1512,7 +1673,7 @@ def _try_acquire_shared_read_only_seat(
                     lock_path,
                     lock_file.fileno(),
                     registry_root=registry_root,
-                    deadline=time.monotonic() + READ_ONLY_GIT_TIMEOUT_S,
+                    deadline=deadline,
                 )
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
             except (BlockingIOError, OSError):
@@ -1526,7 +1687,7 @@ def _try_acquire_shared_read_only_seat(
                 return None
         try:
             path_lock = _try_acquire_worktree_path_lock(
-                path, dispatch_id, shared=True
+                path, dispatch_id, shared=True, deadline=deadline
             )
         except (WorktreePathLockBusy, WorktreePathLockUnknown):
             lock_file.close()
@@ -1538,7 +1699,10 @@ def _try_acquire_shared_read_only_seat(
             lock_file=lock_file,
             path_lock=path_lock,
         )
-        if not _read_only_seat_matches(path, base_commit):
+        if deadline is not None and time.monotonic() >= deadline:
+            lease.release()
+            return None
+        if not _read_only_seat_matches(path, base_commit, deadline=deadline):
             lease.release()
             return None
         return lease
@@ -1553,8 +1717,11 @@ def try_acquire_read_only_pool_seat(
     dispatch_id: str,
     *,
     base_commit: str | None = None,
+    deadline: float | None = None,
 ) -> WorktreeReadOnlySeatLease | None:
     """Hold a specific pooled seat when it still matches a read-only review."""
+    if deadline is None:
+        deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
     project_root = project_root.resolve()
     path = path.expanduser().resolve(strict=False)
     managed_verdict, _managed_reason = managed_worktree_path_verdict(
@@ -1564,10 +1731,10 @@ def try_acquire_read_only_pool_seat(
         return None
     if base_commit is None:
         return None
-    if not _read_only_seat_matches(path, base_commit):
+    if not _read_only_seat_matches(path, base_commit, deadline=deadline):
         return None
     return _try_acquire_shared_read_only_seat(
-        project_root, path, base_commit, dispatch_id
+        project_root, path, base_commit, dispatch_id, deadline=deadline
     )
 
 
@@ -1579,24 +1746,43 @@ def bind_read_only_worktree(
     reap: bool = True,
 ) -> tuple[Path, str, WorktreeReadOnlySeatLease | None]:
     """Prefer a clean, unoccupied pooled seat before the detached fallback."""
+    deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
     project_root = project_root.resolve()
-    _verify_project_root(project_root)
-    resolved_base = base if base is not None else default_seat_base(project_root)
-    base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
+    _verify_project_root(project_root, timeout=_deadline_timeout(deadline))
+    resolved_base = (
+        base
+        if base is not None
+        else default_seat_base(project_root, timeout=_deadline_timeout(deadline))
+    )
+    base_commit = _git(
+        project_root,
+        "rev-parse",
+        "--verify",
+        f"{resolved_base}^{{commit}}",
+        timeout=_deadline_timeout(deadline),
+    )
     try:
-        candidates = _registered_pool_worktrees(project_root)
+        candidates = _registered_pool_worktrees(project_root, deadline=deadline)
     except (OSError, subprocess.SubprocessError, WorktreeSeatError):
         candidates = []
     for path in candidates:
-        if not _read_only_seat_matches(path, base_commit):
+        if deadline <= time.monotonic():
+            raise WorktreeReadOnlyLockTimeout(
+                "read-only allocation deadline expired during candidate scan"
+            )
+        if not _read_only_seat_matches(path, base_commit, deadline=deadline):
             continue
         lease = _try_acquire_shared_read_only_seat(
-            project_root, path, base_commit, dispatch_id
+            project_root, path, base_commit, dispatch_id, deadline=deadline
         )
         if lease is not None:
             return path, base_commit, lease
+    if deadline <= time.monotonic():
+        raise WorktreeReadOnlyLockTimeout(
+            "read-only allocation deadline expired before detached checkout"
+        )
     path, base_commit = shared_read_only_worktree(
-        project_root, base=resolved_base, reap=reap
+        project_root, base=resolved_base, reap=reap, _deadline=deadline
     )
     return path, base_commit, None
 
@@ -1607,65 +1793,208 @@ def _reap_read_only_worktrees(
     root: Path,
     requested_path: Path | None,
     deadline: float | None = None,
+    ledger_index=None,
+    ledger_stamp: tuple[int, int, int] | None = None,
 ) -> None:
     """Remove only old, clean, unowned registered read-only checkouts."""
+    if deadline is None:
+        deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
+    import goalflight_worktree_gc
+
+    if ledger_index is None:
+        # Direct test/tool callers do not own the allocator lock. Snapshot the
+        # ledger under StateLock, then release it before any pin/remove Git
+        # call; final removal rechecks below reacquire it briefly.
+        ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+        if ledger_lock is None:
+            return
+        try:
+            snapshot = goalflight_worktree_gc.ledger_index_for_dir(
+                goalflight_ledger.runs_dir(create=False), deadline=deadline
+            )
+            ledger_stamp = _ledger_directory_stamp(
+                goalflight_ledger.runs_dir(create=False)
+            )
+        finally:
+            ledger_lock.release()
+        return _reap_read_only_worktrees(
+            project_root,
+            root=root,
+            requested_path=requested_path,
+            deadline=deadline,
+            ledger_index=snapshot,
+            ledger_stamp=ledger_stamp,
+        )
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        print(
+            "goalflight read-only reaper: retained checkout(s); "
+            "read-only candidate scan deadline expired; retaining checkout",
+            file=sys.stderr,
+        )
+        return
     try:
-        registered = _read_only_registered_worktrees(project_root)
-    except (OSError, subprocess.SubprocessError, WorktreeSeatError):
+        registered = _read_only_registered_worktrees(
+            project_root, deadline=deadline
+        )
+    except (OSError, subprocess.SubprocessError, WorktreeSeatError) as exc:
+        if (
+            "deadline" in str(exc).lower()
+            or "timed out" in str(exc).lower()
+            or time.monotonic() >= deadline
+        ):
+            print(
+                "goalflight read-only reaper: retained checkout(s); "
+                "read-only candidate scan deadline expired; retaining checkout",
+                file=sys.stderr,
+            )
         return
     requested = (
         requested_path.resolve(strict=False) if requested_path is not None else None
     )
     now_ns = time.time_ns()
     candidates: list[tuple[int, Path]] = []
+    blocked_reasons: list[str] = []
+    scan_expired = False
     for path in registered:
+        if time.monotonic() >= deadline:
+            blocked_reasons.append(
+                "read-only candidate scan deadline expired; retaining checkout"
+            )
+            scan_expired = True
+            break
         if requested is not None and path.resolve(strict=False) == requested:
             continue
-        usage = read_only_worktree_usage(path)
+        if time.monotonic() >= deadline:
+            blocked_reasons.append(
+                "read-only candidate scan deadline expired; retaining checkout"
+            )
+            scan_expired = True
+            break
+        usage = read_only_worktree_usage(
+            path,
+            project_root=project_root,
+            ledger_index=ledger_index,
+            identity_deadline=deadline,
+        )
         if usage["verdict"] != YES:
+            reason = usage.get("reason")
+            if reason and reason not in blocked_reasons:
+                blocked_reasons.append(reason)
             continue
+        if time.monotonic() >= deadline:
+            blocked_reasons.append(
+                "read-only candidate scan deadline expired; retaining checkout"
+            )
+            scan_expired = True
+            break
         try:
             mtime = path.stat().st_mtime_ns
         except OSError:
             continue
+        if time.monotonic() >= deadline:
+            blocked_reasons.append(
+                "read-only candidate scan deadline expired; retaining checkout"
+            )
+            scan_expired = True
+            break
         if now_ns - mtime < READ_ONLY_WORKTREE_GRACE_S * 1_000_000_000:
             continue
         candidates.append((mtime, path))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    for _mtime, path in candidates[READ_ONLY_WORKTREE_KEEP:]:
-        if deadline is not None and deadline - time.monotonic() <= 0:
-            return
-        pin_timeout = (
-            READ_ONLY_GIT_TIMEOUT_S
-            if deadline is None
-            else max(0.0, min(READ_ONLY_GIT_TIMEOUT_S, deadline - time.monotonic()))
-        )
+    if not scan_expired:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+    pinned: list[Path] = []
+    for _mtime, path in ([] if scan_expired else candidates[READ_ONLY_WORKTREE_KEEP:]):
+        if deadline - time.monotonic() <= 0:
+            blocked_reasons.append(
+                "read-only removal deadline expired; retaining checkout"
+            )
+            break
+        pin_timeout = _deadline_timeout(deadline)
         if pin_timeout <= 0:
-            return
+            blocked_reasons.append(
+                "read-only pin deadline expired; retaining checkout"
+            )
+            break
         _keep_ref, pin_error = pin_worktree_head_before_remove(
-            project_root, path, timeout=pin_timeout
+            project_root, path, timeout=pin_timeout, deadline=deadline
         )
         if pin_error is not None:
+            if "timed out" in pin_error.lower() or "deadline" in pin_error.lower():
+                blocked_reasons.append(
+                    f"read-only pin deadline expired; retaining checkout ({pin_error})"
+                )
             continue
-        try:
-            _git(
-                project_root,
-                "worktree",
-                "remove",
-                str(path),
-                timeout=(
-                    READ_ONLY_GIT_TIMEOUT_S
-                    if deadline is None
-                    else max(0.0, min(READ_ONLY_GIT_TIMEOUT_S, deadline - time.monotonic()))
-                ),
+        pinned.append(path)
+        if time.monotonic() >= deadline:
+            blocked_reasons.append(
+                "read-only removal deadline expired after pinning; retaining checkout"
             )
-        except WorktreeSeatError as exc:
-            if "timed out" in str(exc).lower():
-                return
-            # Dirty or otherwise refused trees remain registered and intact.
-            continue
-        except (OSError, subprocess.SubprocessError):
-            continue
+            break
+
+    # All keep refs are pinned before the global ledger lock is acquired. One
+    # fresh snapshot covers every candidate, so the lock is held only for the
+    # final ownership re-check and removals, not for any unbounded Git call.
+    if pinned:
+        ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+        if ledger_lock is None:
+            blocked_reasons.append(
+                "read-only final ledger re-check deadline expired; retaining checkout"
+            )
+        else:
+            with ledger_lock:
+                ledger_dir = goalflight_ledger.runs_dir(create=False)
+                if ledger_stamp == _ledger_directory_stamp(ledger_dir):
+                    fresh_index = ledger_index
+                else:
+                    fresh_index = goalflight_worktree_gc.ledger_index_for_dir(
+                        ledger_dir, deadline=deadline
+                    )
+                for path in pinned:
+                    if time.monotonic() >= deadline:
+                        blocked_reasons.append(
+                            "read-only final re-check deadline expired; retaining checkout"
+                        )
+                        break
+                    fresh_usage = read_only_worktree_usage(
+                        path,
+                        project_root=project_root,
+                        ledger_index=fresh_index,
+                        identity_deadline=deadline,
+                    )
+                    if fresh_usage["verdict"] != YES:
+                        reason = fresh_usage.get("reason") or "ownership re-check unknown"
+                        blocked_reasons.append(
+                            f"read-only final ownership re-check retained checkout: {reason}"
+                        )
+                        continue
+                    try:
+                        _git(
+                            project_root,
+                            "worktree",
+                            "remove",
+                            str(path),
+                            timeout=_deadline_timeout(deadline),
+                        )
+                    except WorktreeSeatError as exc:
+                        if "timed out" in str(exc).lower() or "deadline" in str(exc).lower():
+                            blocked_reasons.append(
+                                f"read-only removal deadline expired; retaining checkout ({exc})"
+                            )
+                            break
+                        # Dirty or otherwise refused trees remain registered and intact.
+                        continue
+                    except (OSError, subprocess.SubprocessError):
+                        continue
+    if blocked_reasons:
+        detail = "; ".join(blocked_reasons[:3])
+        if len(blocked_reasons) > 3:
+            detail += f"; and {len(blocked_reasons) - 3} more blockers"
+        print(
+            "goalflight read-only reaper: retained checkout(s); " + detail,
+            file=sys.stderr,
+        )
 
 
 def _write_occupant(
@@ -2041,28 +2370,40 @@ def pin_worktree_head_before_remove(
     worktree_path: str | Path,
     *,
     timeout: float | None = None,
+    deadline: float | None = None,
 ) -> tuple[str | None, str | None]:
     """Pin a detached worktree HEAD before its administrative entry is removed."""
     path = Path(worktree_path)
     try:
-        head = _git(path, "rev-parse", "HEAD^{commit}", timeout=timeout)
+        if deadline is not None and time.monotonic() >= deadline:
+            return None, "pin deadline expired before resolving checkout HEAD"
+        head = _git(
+            path,
+            "rev-parse",
+            "HEAD^{commit}",
+            timeout=_deadline_timeout(deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S),
+        )
         safe = re.sub(r"[^A-Za-z0-9._-]+", "-", path.name).strip(".-") or "worktree"
         stamp = str(time.time_ns())
         keep_ref = f"refs/{KEEP_REF_PREFIX}/gc-{stamp}-{safe}-{head[:12]}"
+        if deadline is not None and time.monotonic() >= deadline:
+            return None, "pin deadline expired before creating keep ref"
         _git(
             project_root,
             "update-ref",
             keep_ref,
             head,
             "",
-            timeout=timeout,
+            timeout=_deadline_timeout(deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S),
         )
+        if deadline is not None and time.monotonic() >= deadline:
+            return None, "pin deadline expired before verifying keep ref"
         if _git(
             project_root,
             "rev-parse",
             "--verify",
             f"{keep_ref}^{{commit}}",
-            timeout=timeout,
+            timeout=_deadline_timeout(deadline, cap=timeout or READ_ONLY_GIT_TIMEOUT_S),
         ) != head:
             return None, "keep ref did not verify after creation"
         return keep_ref, None
@@ -4066,10 +4407,17 @@ def _read_only_allocation_lock(
         deadline = time.monotonic() + budget
     else:
         budget = max(0.0, deadline - started)
-    registry_root = _git_common_dir(
-        project_root,
-        timeout=max(0.0, deadline - time.monotonic()),
-    )
+    try:
+        registry_root = _git_common_dir(
+            project_root,
+            timeout=max(0.0, deadline - time.monotonic()),
+        )
+    except WorktreeSeatError as exc:
+        if "timed out" in str(exc).lower() or time.monotonic() >= deadline:
+            raise WorktreeReadOnlyLockTimeout(
+                "read-only allocation deadline expired while resolving Git common dir"
+            ) from exc
+        raise
     lock_root = registry_root / "goalflight-worktree-seat-locks"
     lock_root.mkdir(parents=True, exist_ok=True)
     lock_path = lock_root / "readonly-allocation.lock"
@@ -4123,7 +4471,7 @@ def _read_only_allocation_lock(
 def reap_read_only_worktrees(
     project_root: Path, *, requested_path: Path | None = None
 ) -> None:
-    """Reap old detached checkouts under the allocator's transaction lock."""
+    """Reap old detached checkouts under the ledger/allocator transaction."""
     project_root = project_root.resolve()
     root = read_only_worktree_root(project_root)
     try:
@@ -4138,12 +4486,31 @@ def reap_read_only_worktrees(
         root.mkdir(parents=True, exist_ok=True)
         _verify_read_only_root(root)
         deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
+        import goalflight_worktree_gc
+
+        # Lock order is allocation -> ledger. Resume holds the allocation
+        # reservation while its child row is recorded; GC must never hold the
+        # ledger lock while waiting for that reservation.
         with _read_only_allocation_lock(project_root, deadline=deadline):
+            ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+            if ledger_lock is None:
+                return
+            try:
+                ledger_index = goalflight_worktree_gc.ledger_index_for_dir(
+                    goalflight_ledger.runs_dir(create=False), deadline=deadline
+                )
+                ledger_stamp = _ledger_directory_stamp(
+                    goalflight_ledger.runs_dir(create=False)
+                )
+            finally:
+                ledger_lock.release()
             _reap_read_only_worktrees(
                 project_root,
                 root=root,
                 requested_path=requested_path,
                 deadline=deadline,
+                ledger_index=ledger_index,
+                ledger_stamp=ledger_stamp,
             )
     except WorktreeReadOnlyLockTimeout:
         raise
@@ -4156,25 +4523,65 @@ def shared_read_only_worktree(
     *,
     base: str | None = None,
     reap: bool = True,
+    _deadline: float | None = None,
 ) -> tuple[Path, str]:
     """Return a checkout shared by read-only dispatches at one commit."""
+    deadline = _deadline or (time.monotonic() + READ_ONLY_REAP_TIMEOUT_S)
     project_root = project_root.resolve()
-    _verify_project_root(project_root)
-    resolved_base = base if base is not None else default_seat_base(project_root)
-    base_commit = _git(project_root, "rev-parse", "--verify", f"{resolved_base}^{{commit}}")
+    _verify_project_root(project_root, timeout=_deadline_timeout(deadline))
+    resolved_base = (
+        base
+        if base is not None
+        else default_seat_base(project_root, timeout=_deadline_timeout(deadline))
+    )
+    if time.monotonic() >= deadline:
+        raise WorktreeReadOnlyLockTimeout(
+            "read-only allocation deadline expired before resolving base"
+        )
+    base_commit = _git(
+        project_root,
+        "rev-parse",
+        "--verify",
+        f"{resolved_base}^{{commit}}",
+        timeout=_deadline_timeout(deadline),
+    )
     root = read_only_worktree_root(project_root)
     _verify_read_only_root(root)
     root.mkdir(parents=True, exist_ok=True)
     _verify_read_only_root(root)
-    deadline = time.monotonic() + READ_ONLY_REAP_TIMEOUT_S
-    with _read_only_allocation_lock(project_root, deadline=deadline):
-        path = root / base_commit[:16]
+    ledger_index = None
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(
+            _read_only_allocation_lock(project_root, deadline=deadline)
+        )
         if reap:
+            import goalflight_worktree_gc
+
+            # Keep allocation outermost so a resume can hold it while its child
+            # ledger row becomes durable without deadlocking the reaper.
+            ledger_lock = goalflight_ledger.StateLock.try_acquire(deadline)
+            if ledger_lock is None:
+                raise WorktreeReadOnlyLockTimeout(
+                    "read-only ledger lock wait expired; refusing reaping"
+                )
+            try:
+                ledger_index = goalflight_worktree_gc.ledger_index_for_dir(
+                    goalflight_ledger.runs_dir(create=False), deadline=deadline
+                )
+                ledger_stamp = _ledger_directory_stamp(
+                    goalflight_ledger.runs_dir(create=False)
+                )
+            finally:
+                ledger_lock.release()
+        path = root / base_commit[:16]
+        if reap and ledger_index is not None:
             _reap_read_only_worktrees(
                 project_root,
                 root=root,
                 requested_path=path,
                 deadline=deadline,
+                ledger_index=ledger_index,
+                ledger_stamp=ledger_stamp,
             )
         path_state = _path_presence(path)
         if path_state == "unknown":
@@ -4182,6 +4589,10 @@ def shared_read_only_worktree(
                 f"shared read-only worktree could not be inspected: {path}"
             )
         if path_state == "absent":
+            if time.monotonic() >= deadline:
+                raise WorktreeReadOnlyLockTimeout(
+                    "read-only allocation deadline expired before worktree add"
+                )
             _git(
                 project_root,
                 "worktree",
@@ -4189,22 +4600,39 @@ def shared_read_only_worktree(
                 "--detach",
                 str(path),
                 base_commit,
-                timeout=READ_ONLY_GIT_TIMEOUT_S,
+                timeout=_deadline_timeout(deadline),
+            )
+        if time.monotonic() >= deadline:
+            raise WorktreeReadOnlyLockTimeout(
+                "read-only allocation deadline expired before checkout validation"
             )
         _verify_existing_seat(
-            project_root, path, timeout=READ_ONLY_GIT_TIMEOUT_S
+            project_root,
+            path,
+            timeout=_deadline_timeout(deadline),
+            deadline=deadline,
         )
+        if time.monotonic() >= deadline:
+            raise WorktreeReadOnlyLockTimeout(
+                "read-only allocation deadline expired before HEAD validation"
+            )
         actual = _git(
             path,
             "rev-parse",
             "HEAD^{commit}",
-            timeout=READ_ONLY_GIT_TIMEOUT_S,
+            timeout=_deadline_timeout(deadline),
         )
         if actual != base_commit:
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is at {actual}, expected {base_commit}"
             )
-        clean = check_seat_cleanliness(path, timeout=READ_ONLY_GIT_TIMEOUT_S)
+        if time.monotonic() >= deadline:
+            raise WorktreeReadOnlyLockTimeout(
+                "read-only allocation deadline expired before cleanliness validation"
+            )
+        clean = check_seat_cleanliness(
+            path, timeout=_deadline_timeout(deadline)
+        )
         if clean["verdict"] != YES:
             raise WorktreeSeatError(
                 f"shared read-only worktree {path} is not clean: {clean['reason']}"
@@ -4317,6 +4745,7 @@ def _try_acquire_worktree_path_lock(
     dispatch_id: str,
     *,
     shared: bool,
+    deadline: float | None = None,
 ) -> WorktreePathLock:
     """Acquire a non-blocking shared or exclusive kernel lock on ``target``.
 
@@ -4348,7 +4777,14 @@ def _try_acquire_worktree_path_lock(
         git_metadata = resolved / ".git"
         git_backed = git_metadata.is_file() or git_metadata.is_dir()
         try:
-            registry_root = _git_common_dir(resolved)
+            registry_root = _git_common_dir(
+                resolved,
+                timeout=(
+                    None
+                    if deadline is None
+                    else _deadline_timeout(deadline)
+                ),
+            )
         except WorktreeSeatError as exc:
             if git_backed:
                 raise WorktreePathLockUnknown(
@@ -4371,6 +4807,7 @@ def _try_acquire_worktree_path_lock(
                 registry_root=registry_root,
                 allow_create=True,
                 allow_unregistered=True,
+                registration_deadline=deadline,
             )
     except OSError as exc:
         raise WorktreePathLockUnknown(
@@ -4402,7 +4839,10 @@ def _try_acquire_worktree_path_lock(
         if registry_root is not None and not shared:
             try:
                 _adopt_exclusive_lock(
-                    lock_path, lock_file.fileno(), registry_root=registry_root
+                    lock_path,
+                    lock_file.fileno(),
+                    registry_root=registry_root,
+                    deadline=deadline,
                 )
             except OSError as exc:
                 raise WorktreePathLockUnknown(
