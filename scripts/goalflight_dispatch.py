@@ -9187,7 +9187,10 @@ def _resolve_account_env(
                 "Set that account's creds there, or omit --account for the host default. "
                 "Refusing to bill the wrong account."
             )
-        _refuse_walled_codex_account(account)
+        _refuse_walled_codex_account(
+            account,
+            allow_unknown=bool(getattr(args, "occupied_worktree_forced", False)),
+        )
         return {"CODEX_HOME": str(home)}
     if not home.exists():
         raise DispatchUsageError(
@@ -9513,6 +9516,7 @@ def _refuse_walled_codex_account(
     account: str,
     *,
     usage_rows: list[dict] | None = None,
+    allow_unknown: bool = False,
 ) -> None:
     """Refuse a pinned account without current, usable quota evidence."""
     import goalflight_usage as usage
@@ -9520,6 +9524,8 @@ def _refuse_walled_codex_account(
     rows = _codex_usage_probe_rows() if usage_rows is None else usage_rows
     probe = _codex_usage_probe_says_usable(account, rows=rows)
     if probe is None:
+        if allow_unknown:
+            return
         raise DispatchUsageError(
             f"Codex account {account!r} health probe unknown or stale; "
             "refusing pinned launch; refresh the usage probe"
@@ -9567,6 +9573,7 @@ def _pre_resolve_pinned_codex_account(
         args._codex_pre_resolved_account = resume_pre_resolved.get("account")
         return
     requested = str(args.account).strip()
+    forced = bool(getattr(args, "occupied_worktree_forced", False))
     parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
     if parent_dispatch_id:
         parent_record = _find_dispatch_record(parent_dispatch_id) or {}
@@ -9586,12 +9593,14 @@ def _pre_resolve_pinned_codex_account(
             # A same-account canonical resume already has a validated shared
             # home. Health validation is still required before admission, but
             # rebuilding a per-dispatch home would change the resume source.
-            _refuse_walled_codex_account(requested)
+            _refuse_walled_codex_account(requested, allow_unknown=forced)
             home, effective_account = None, requested
         else:
             resolve_kwargs = {}
             if getattr(args, "model", None) is not None:
                 resolve_kwargs["model"] = args.model
+            if forced:
+                resolve_kwargs["allow_unknown_explicit"] = True
             home, effective_account = resolve_codex_home(
                 project_root,
                 requested,
@@ -9608,11 +9617,14 @@ def _pre_resolve_pinned_codex_account(
                     f"resume refused: Codex account {requested!r} could not be resolved"
                 )
     else:
+        resolve_kwargs = {"model": getattr(args, "model", None)}
+        if forced:
+            resolve_kwargs["allow_unknown_explicit"] = True
         home, effective_account = resolve_codex_home(
             project_root,
             requested,
             dispatch_id,
-            model=getattr(args, "model", None),
+            **resolve_kwargs,
         )
     args._codex_account_pre_resolved = True
     args._codex_pre_resolved_home = home
@@ -9668,6 +9680,7 @@ def resolve_codex_home(
     dispatch_id: str,
     *,
     model: str | None = None,
+    allow_unknown_explicit: bool = False,
 ) -> tuple[str | None, str | None]:
     """Resolve one launch snapshot, refusing invalid explicit pins.
 
@@ -9681,9 +9694,15 @@ def resolve_codex_home(
     no account lookup occurred. When it is present but no managed account is
     selectable, the launch still proceeds on the inherited host login and the
     billed account is labelled ``host`` so the ledger does not record ``None``.
+
+    ``allow_unknown_explicit`` is reserved for the explicit occupancy override;
+    it tolerates a missing probe but never bypasses a known quota wall.
     """
     if explicit_account:
-        _refuse_walled_codex_account(explicit_account)
+        _refuse_walled_codex_account(
+            explicit_account,
+            allow_unknown=allow_unknown_explicit,
+        )
     api = _codex_seat_api()
     if api is None:
         return None, None
@@ -9823,6 +9842,15 @@ def revalidate_codex_account_after_capacity(
         usage_rows=usage_rows,
     )
     if reason is None:
+        return chosen_account
+
+    if (
+        reason == "health probe unknown or stale"
+        and explicit_account
+        and getattr(args, "occupied_worktree_forced", False)
+    ):
+        # Preserve the explicit operator override when the optional probe has
+        # no row; known quota walls still fail through the normal path below.
         return chosen_account
 
     if explicit_account:
@@ -10890,6 +10918,65 @@ def _record_unsupported_sandbox_rejection(
         # terminalizes the claim from DISPATCH-REFUSED even if this audit row
         # cannot land (queued id already present, journal busy, ...).
         return 64
+    return 64
+
+
+def _record_acp_prelaunch_refusal(
+    args,
+    *,
+    error: str,
+    reason: str,
+    state: str,
+) -> int:
+    """Persist an ACP refusal that happens before the runner can write status."""
+    base = _dispatch_base_dir()
+    status_json = (
+        Path(args.status_json)
+        if args.status_json
+        else base / f"{args.dispatch_id}.status.json"
+    )
+    tail = (
+        Path(args.tail)
+        if args.tail
+        else base / f"{args.dispatch_id}.tail"
+    )
+    write_status(
+        status_json,
+        {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": args.dispatch_id,
+            "agent": args.agent,
+            "shape": "acp",
+            "state": state,
+            "ok": False,
+            "reason": reason,
+            "error": error,
+            "worker_pid": None,
+            "worker_alive": False,
+            "tail_path": str(tail),
+            "status_path": str(status_json),
+            "updated_at": int(time.time()),
+        },
+    )
+    print(f"goalflight_dispatch: {error}", file=sys.stderr)
+    print(
+        "DISPATCH-END "
+        + json.dumps(
+            {
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "shape": "acp",
+                "worker_pid": None,
+                "status_json": str(status_json),
+                "terminal_state": state,
+                "worker_still_alive": False,
+                "reason": error,
+                "elapsed_s": 0.0,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return 64
 
 
@@ -21612,6 +21699,12 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         worktree_base=requested_worktree_base or "HEAD",
         worktree_root=getattr(args, "worktree_root", None),
         worktree_pin_holder=getattr(args, "worktree_pin_holder", None),
+        _worktree_occupancy_checked=getattr(
+            args, "_worktree_occupancy_checked", False
+        ),
+        _worktree_occupancy_checked_path=getattr(
+            args, "_worktree_occupancy_checked_path", None
+        ),
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -23260,10 +23353,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
-            # Billing refusal is a pre-write guard. ID reservation, prompt
-            # materialization, occupancy bind, and capacity leases must not
-            # land first.
-            _resolve_account_env(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
@@ -23283,17 +23372,59 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             # Before any worktree bind. This gate reads the ledger and the task
             # store, not the worktree, and a refusal must not become the occupant.
             _refuse_launch_blocked_by_completion_authority(args)
-            _pre_resolve_pinned_codex_account(
-                args,
-                project_root=_project_root(args),
-                dispatch_id=args.dispatch_id,
-            )
-            # The ACP runner owns the complete account -> capacity -> worktree
-            # sequence, including explicit --cwd resumes. A refusal must not
-            # create, reset, or occupy a checkout in this parent process.
-            account_env = (
-                {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
-            )
+            # Explicit --cwd ACP launches already name their writer path. Check
+            # that path before account health/auth or capacity work so a second
+            # writer gets the same persisted occupancy refusal as the runner.
+            # Captive ACP launches without --cwd defer this check until the
+            # pooled seat is selected after capacity admission.
+            if (
+                not _occupancy_exempt_read_only(args)
+                and (getattr(args, "cwd", None) or getattr(args, "in_place", False))
+            ):
+                try:
+                    args._worktree_occupancy_warning = _prepare_attempt_worktree_occupancy(
+                        args
+                    )
+                except DispatchUsageError as exc:
+                    return _record_acp_prelaunch_refusal(
+                        args,
+                        error=str(exc),
+                        reason="worktree_occupied",
+                        state="failed_worktree",
+                    )
+                args._worktree_occupancy_checked = True
+                args._worktree_occupancy_checked_path = str(
+                    Path(str(_worker_cwd(args))).resolve(strict=False)
+                )
+                if args._worktree_occupancy_warning is not None:
+                    args.dispatch_warnings = [
+                        *getattr(args, "dispatch_warnings", []),
+                        args._worktree_occupancy_warning,
+                    ]
+            # Billing refusal remains a pre-launch guard, but follows the
+            # path-occupancy refusal so an occupied writer is reported first.
+            try:
+                _resolve_account_env(args)
+                _pre_resolve_pinned_codex_account(
+                    args,
+                    project_root=_project_root(args),
+                    dispatch_id=args.dispatch_id,
+                )
+                # The ACP runner owns the complete account -> capacity -> worktree
+                # sequence, including explicit --cwd resumes. A refusal must not
+                # create, reset, or occupy a checkout in this parent process.
+                account_env = (
+                    {}
+                    if goalflight_compat.is_windows()
+                    else _resolve_launch_account_env(args)
+                )
+            except DispatchUsageError as exc:
+                return _record_acp_prelaunch_refusal(
+                    args,
+                    error=str(exc),
+                    reason="account_refused",
+                    state="failed",
+                )
             if not goalflight_compat.is_windows():
                 _validate_claude_auth_before_attempt(args, account_env)
             if (
@@ -23330,6 +23461,8 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
+        finally:
+            _release_worktree_occupancy_lock(args)
 
     if goalflight_compat.is_windows():
         return _refuse_windows_dispatch(args)
