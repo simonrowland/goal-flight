@@ -1628,6 +1628,10 @@ def test_remote_missing_prompt_is_undetermined_and_backs_off(
     queued = json.loads(path.read_text(encoding="utf-8"))
     queued["agent"] = "codex"
     queued["request"]["agent"] = "codex"
+    # The remote drain reads the agent from the replayable dispatch_argv
+    # first, so a real codex entry carries it there too.
+    argv = queued["dispatch_argv"]
+    argv[argv.index("--agent") + 1] = "codex"
     D._write_json_atomic(path, queued)
     _write_queued_ledger(path)
     monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: None)
