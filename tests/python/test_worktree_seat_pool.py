@@ -62,6 +62,50 @@ def make_repo(root: Path) -> Path:
     return repo
 
 
+def make_large_ref_repo(root: Path) -> tuple[Path, str, str, str, str]:
+    repo = make_repo(root)
+    base = git(repo, "rev-parse", "main")
+
+    git(repo, "checkout", "-q", "-b", "moving-covered", "main")
+    (repo / "covered.txt").write_text("covered\n", encoding="utf-8")
+    git(repo, "add", "covered.txt")
+    git(repo, "commit", "-qm", "covered")
+    covered = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-q", "-b", "moving", "main")
+    (repo / "moving.txt").write_text("moving\n", encoding="utf-8")
+    git(repo, "add", "moving.txt")
+    git(repo, "commit", "-qm", "moving")
+    moving = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "checkout", "-q", "-b", "detached-source", "main")
+    (repo / "detached.txt").write_text("detached\n", encoding="utf-8")
+    git(repo, "add", "detached.txt")
+    git(repo, "commit", "-qm", "detached")
+    detached = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "branch", "-D", "detached-source")
+
+    git(repo, "pack-refs", "--all", "--prune")
+    packed_refs = Path(git(repo, "rev-parse", "--git-path", "packed-refs"))
+    if not packed_refs.is_absolute():
+        packed_refs = repo / packed_refs
+    entries = {
+        "refs/heads/main": base,
+        "refs/heads/moving": moving,
+        "refs/heads/moving-covered": covered,
+    }
+    for index in range(30_000):
+        entries[f"refs/fixture/{index:05d}-{'x' * 80}"] = covered
+    assert sum(len(ref) + 1 for ref in entries) > os.sysconf("SC_ARG_MAX")
+    packed_refs.write_text(
+        "# pack-refs with: peeled fully-peeled sorted\n"
+        + "".join(f"{entries[ref]} {ref}\n" for ref in sorted(entries)),
+        encoding="utf-8",
+    )
+    return repo, base, covered, moving, detached
+
+
 def add_read_only_base(repo: Path, index: int) -> str:
     path = repo / f"read-only-base-{index}.txt"
     path.write_text(f"base {index}\n", encoding="utf-8")
@@ -219,71 +263,49 @@ def test_git_proc_uses_file_for_large_input() -> None:
     assert observed["stdin"] is not None
 
 
-def test_reset_safety_handles_refnames_larger_than_argv_limit(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    base = git(repo, "rev-parse", "main")
+def test_reset_safety_handles_refnames_larger_than_argv_limit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo, base, covered, moving, detached = make_large_ref_repo(Path(td))
+        moving_result = goalflight_worktree_pool.check_reset_preserves_commits(
+            repo,
+            start=moving,
+            base_commit=base,
+            moving_ref="refs/heads/moving",
+        )
+        assert moving_result["verdict"] == goalflight_worktree_pool.NO
 
-    git(repo, "checkout", "-q", "-b", "moving-covered", "main")
-    (repo / "covered.txt").write_text("covered\n", encoding="utf-8")
-    git(repo, "add", "covered.txt")
-    git(repo, "commit", "-qm", "covered")
-    covered = git(repo, "rev-parse", "HEAD")
+        covered_result = goalflight_worktree_pool.check_reset_preserves_commits(
+            repo,
+            start=covered,
+            base_commit=base,
+            moving_ref="refs/heads/moving-covered",
+        )
+        assert covered_result["verdict"] == goalflight_worktree_pool.YES
 
-    git(repo, "checkout", "-q", "-b", "moving", "main")
-    (repo / "moving.txt").write_text("moving\n", encoding="utf-8")
-    git(repo, "add", "moving.txt")
-    git(repo, "commit", "-qm", "moving")
-    moving = git(repo, "rev-parse", "HEAD")
+        git(repo, "checkout", "-q", "--detach", detached)
+        detached_result = goalflight_worktree_pool.check_reset_preserves_commits(
+            repo,
+            start=detached,
+            base_commit=base,
+            moving_ref=None,
+        )
+        assert detached_result["verdict"] == goalflight_worktree_pool.NO
 
-    git(repo, "checkout", "-q", "-b", "detached-source", "main")
-    (repo / "detached.txt").write_text("detached\n", encoding="utf-8")
-    git(repo, "add", "detached.txt")
-    git(repo, "commit", "-qm", "detached")
-    detached = git(repo, "rev-parse", "HEAD")
-    git(repo, "checkout", "-q", "main")
-    git(repo, "branch", "-D", "detached-source")
 
-    git(repo, "pack-refs", "--all", "--prune")
-    packed_refs = Path(git(repo, "rev-parse", "--git-path", "packed-refs"))
-    if not packed_refs.is_absolute():
-        packed_refs = repo / packed_refs
-    entries = {
-        "refs/heads/main": base,
-        "refs/heads/moving": moving,
-        "refs/heads/moving-covered": covered,
-    }
-    for index in range(30_000):
-        entries[f"refs/fixture/{index:05d}-{'x' * 80}"] = covered
-    packed_refs.write_text(
-        "# pack-refs with: peeled fully-peeled sorted\n"
-        + "".join(f"{entries[ref]} {ref}\n" for ref in sorted(entries)),
-        encoding="utf-8",
-    )
-
-    moving_result = goalflight_worktree_pool.check_reset_preserves_commits(
-        repo,
-        start=moving,
-        base_commit=base,
-        moving_ref="refs/heads/moving",
-    )
-    assert moving_result["verdict"] == goalflight_worktree_pool.NO
-
-    covered_result = goalflight_worktree_pool.check_reset_preserves_commits(
-        repo,
-        start=covered,
-        base_commit=base,
-        moving_ref="refs/heads/moving-covered",
-    )
-    assert covered_result["verdict"] == goalflight_worktree_pool.YES
-
-    git(repo, "checkout", "-q", "--detach", detached)
-    detached_result = goalflight_worktree_pool.check_reset_preserves_commits(
-        repo,
-        start=detached,
-        base_commit=base,
-        moving_ref=None,
-    )
-    assert detached_result["verdict"] == goalflight_worktree_pool.NO
+def test_pin_unique_commits_handles_refnames_larger_than_argv_limit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        repo, base, _covered, moving, _detached = make_large_ref_repo(Path(td))
+        git(repo, "checkout", "-q", "moving")
+        result = goalflight_worktree_pool.pin_unique_commits(
+            repo,
+            base_commit=base,
+            moving_ref="refs/heads/moving",
+            worktree_id="large-ref-pin",
+        )
+        assert result["verdict"] == goalflight_worktree_pool.YES
+        keep_ref = result["keep_ref"]
+        assert keep_ref
+        assert git(repo, "rev-parse", "--verify", f"{keep_ref}^{{commit}}") == moving
 
 
 @contextlib.contextmanager
@@ -1871,6 +1893,38 @@ def _reclaim_dirty_seat(repo: Path, prepare) -> tuple[str, Path]:
     return _quarantine_branch(repo), reused.path
 
 
+def test_quarantine_handles_reserved_paths_larger_than_argv_limit() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(
+        Path(td)
+    ):
+        repo = make_repo(Path(td))
+        reserved_bytes = 0
+
+        def prepare(seat: Path) -> None:
+            nonlocal reserved_bytes
+            notes = seat / ".goal-flight" / "seat"
+            notes.mkdir(parents=True)
+            for index in range(30_000):
+                name = f"{index:05d}-{'x' * 80}.md"
+                (notes / name).write_text("private\n", encoding="utf-8")
+                reserved_bytes += len(f".goal-flight/seat/{name}") + 1
+            (seat / "tracked.txt").write_text("abandoned edit\n", encoding="utf-8")
+
+        branch, reused_path = _reclaim_dirty_seat(repo, prepare)
+        assert reserved_bytes > os.sysconf("SC_ARG_MAX")
+        names = _tree_names(repo, branch)
+        assert_true("tracked edit quarantined", "tracked.txt" in names)
+        assert_true(
+            "reserved seat notes excluded from quarantine",
+            not any(name.startswith(".goal-flight/seat/") for name in names),
+        )
+        assert_true(
+            "seat reset",
+            (reused_path / "tracked.txt").read_text(encoding="utf-8") == "base\n",
+        )
+        assert (reused_path / ".goal-flight" / "seat").is_dir()
+
+
 def test_ignored_goal_flight_dir_does_not_block_quarantine() -> None:
     """An ignored ``.goal-flight/`` must not make ``git add`` fail the reclaim."""
     with tempfile.TemporaryDirectory() as td, seat_limit(1), isolated_git_excludes(Path(td)):
@@ -2014,6 +2068,8 @@ def main() -> None:
         test_dirty_seat_is_quarantined_then_reset_on_acquire,
         test_large_reset_attribute_check_returns_blocker_under_watchdog,
         test_git_proc_uses_file_for_large_input,
+        test_reset_safety_handles_refnames_larger_than_argv_limit,
+        test_pin_unique_commits_handles_refnames_larger_than_argv_limit,
         test_sigkill_releases_kernel_lease_without_cleanup,
         test_path_lock_sigkill_releases_without_cleanup,
         test_path_locks_on_different_trees_do_not_serialize,
@@ -2025,6 +2081,7 @@ def main() -> None:
         test_skip_reset_keeps_dirty_product_files,
         test_two_controller_labels_share_repository_pool,
         test_classify_dispatch_cwd_lock,
+        test_quarantine_handles_reserved_paths_larger_than_argv_limit,
         test_ignored_goal_flight_dir_does_not_block_quarantine,
         test_empty_ignored_goal_flight_dir_does_not_block_quarantine,
         test_info_exclude_ignored_goal_flight_dir_does_not_block_quarantine,
