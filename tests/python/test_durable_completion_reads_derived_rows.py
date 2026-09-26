@@ -161,6 +161,8 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
     assert "--dispatch-id followup" not in output.err
     assert "--retry-of" not in output.err
     assert "reconcile-outbox" not in output.err
+    assert "--force" in output.err
+    assert "Do not open a new task row" in output.err
 
 
 @pytest.mark.parametrize("status_kind", ["failed", "healthy", "foreign", "unreadable"])
@@ -331,6 +333,32 @@ def test_resume_while_sibling_is_live_stays_refused(launch_authority, monkeypatc
         D._refuse_launch_blocked_by_completion_authority(args)
 
 
+@pytest.mark.parametrize("sibling_state", ["queued", "waiting_capacity", "starting"])
+def test_resume_while_prelaunch_sibling_is_live_stays_refused(
+    launch_authority, monkeypatch, sibling_state,
+):
+    """Pre-worker carriers still own the task while a dead parent resumes."""
+    args, store, row, records = launch_authority
+    _open_the_task(store, row)
+    records.append(_dead_record(args, "dead-parent"))
+    records.append(
+        {
+            "dispatch_id": f"{sibling_state}-sibling",
+            "project_root": args.project_root,
+            "task_ids": list(args.task_ids),
+            "state": sibling_state,
+            "terminal_state": "unknown",
+            "ended_at": None,
+        }
+    )
+    monkeypatch.setattr(D, "_find_dispatch_record", _find_in(records))
+    args.parent_dispatch_id = "dead-parent"
+    args.dispatch_id = "resume-child"
+
+    with pytest.raises(D.DispatchUsageError):
+        D._refuse_launch_blocked_by_completion_authority(args)
+
+
 def test_fresh_dispatch_on_a_dead_hold_stays_refused(launch_authority):
     """CONTROL: exemption is resume-only. A new --task on the same id still refuses."""
     args, store, row, records = launch_authority
@@ -371,6 +399,45 @@ def test_lineage_exemption_is_not_applied_by_the_ledger_scan(launch_authority):
     ) == (0, 1, "conclusive")
 
 
+def test_superseded_dispatch_is_not_projected_into_task_status(tmp_path, monkeypatch):
+    from test_dispatch_queue import _isolated_completion_authority
+
+    with _isolated_completion_authority(tmp_path):
+        store = D.goalflight_task.TaskStore(tmp_path)
+        item = D.goalflight_task._make_item(
+            "t-001",
+            kind="task",
+            title="superseded breadcrumb",
+            actor="test",
+        )
+        item["dispatches"] = [
+            {
+                "dispatch_id": "old-dispatch",
+                "state": "worker-finished",
+                "ts": "2026-01-02T00:00:00+00:00",
+            }
+        ]
+        store.mutate_items(lambda items: items.append(item))
+        monkeypatch.setattr(
+            D.goalflight_task.goalflight_ledger,
+            "read_records",
+            lambda: [
+                {
+                    "dispatch_id": "old-dispatch",
+                    "project_root": str(tmp_path),
+                    "task_ids": ["t-001"],
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "superseded_by": "replacement",
+                }
+            ],
+        )
+
+        row = store.derived_rows()[0]
+        assert row["derived_status"] == "pending"
+        assert row.get("dispatches") == []
+
+
 @pytest.mark.parametrize("state", ["worker_dead", "superseded", "abandoned"])
 def test_dead_hold_refusal_names_resume_not_reconcile(launch_authority, capsys, state):
     """The remedy follows the blocking row's state, not the synthetic decision state."""
@@ -402,6 +469,9 @@ def test_dead_hold_refusal_names_resume_not_reconcile(launch_authority, capsys, 
     assert "withdraw refuses if it can't prove the worker is dead" in output.err
     assert "--superseded-by" not in output.err
     assert "Then re-run this dispatch." in output.err
+    assert "resume" in output.err.lower()
+    assert "--force" in output.err
+    assert "Do not open a new task row" in output.err
 
 
 def test_live_sibling_refusal_keeps_wait_guidance(launch_authority, capsys):

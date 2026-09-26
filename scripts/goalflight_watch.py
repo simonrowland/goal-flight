@@ -819,6 +819,12 @@ def _load_dispatch_record(dispatch_id: str) -> dict | None:
         return None
 
 
+def _dispatch_is_superseded(dispatch_id: str) -> bool:
+    """Whether this dispatch has lost task ownership to a replacement."""
+    record = _load_dispatch_record(dispatch_id)
+    return isinstance(record, dict) and bool(record.get("superseded_by"))
+
+
 def _tail_mtime_age_s(path: Path, *, now: float) -> float | None:
     try:
         return max(0.0, now - path.stat().st_mtime)
@@ -5088,6 +5094,10 @@ def main() -> int:
 
     def append_task_breadcrumb(state: str, payload: dict) -> dict | None:
         if not task_ids:
+            return None
+        if _dispatch_is_superseded(args.dispatch_id):
+            # A late terminal marker from an abandoned worker is historical
+            # evidence only; do not project it into worker-finished status.
             return None
         try:
             store = goalflight_task.TaskStore(task_project_root)

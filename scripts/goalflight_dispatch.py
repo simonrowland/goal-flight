@@ -66,6 +66,7 @@ import select
 import shlex
 import signal
 import shutil
+import tempfile
 import urllib.parse
 import socket
 import subprocess
@@ -110,6 +111,7 @@ from goalflight_watch import (
     _marker_state as _marker_state_for_terminal,
     _terminal_marker_matches_dispatch,
     extract_markers,
+    worktree_work_evidence,
 )
 import grok_permission_mode
 
@@ -4513,6 +4515,8 @@ def _launch_authority_entry(args) -> dict:
         # Only the resume launch check exempts lineage. Restore, reconcile,
         # and drain call the ledger scan without this key.
         entry["resume_lineage_exempt_ids"] = _resume_lineage_dispatch_ids(parent)
+    if getattr(args, "force", False):
+        entry["redispatch_force"] = True
     return entry
 
 
@@ -4547,6 +4551,532 @@ def _blocking_rows_from_diagnostics(
         if dispatch_id:
             rows.append((str(dispatch_id), str(state or "")))
     return rows, publication_failed
+
+
+_REDISPATCH_FORCE_REASON = "explicit --force redispatch"
+_REDISPATCH_NO_WORK_DEATH_CAUSE = "no_evidence"
+_REDISPATCH_LIVE_STATES = frozenset({"queued", "waiting_capacity", "starting"})
+
+
+def _redispatch_actor(args) -> str:
+    value = getattr(args, "controller_label", None) or os.environ.get(
+        "GOALFLIGHT_CONTROLLER_LABEL"
+    )
+    if value:
+        return str(value)
+    return os.environ.get("GOALFLIGHT_TASK_ACTOR") or "controller"
+
+
+def _redispatch_record_terminal_state(record: dict) -> str:
+    return str(
+        record.get("terminal_state")
+        or goalflight_ledger.terminal_state_for(
+            record.get("state"), record.get("reason") or record.get("error")
+        )
+        or "unknown"
+    )
+
+
+def _redispatch_record_has_no_advanced_work(record: dict) -> bool:
+    """Recognize only explicit or independently verified no-work evidence."""
+    death_cause = str(record.get("death_cause") or "").strip()
+    reason = record.get("reason") or record.get("error") or ""
+    reason_text = reason.get("reason", "") if isinstance(reason, dict) else str(reason)
+    if "unharvested_work" in reason_text or record.get("unharvested_work"):
+        return False
+    if death_cause == _REDISPATCH_NO_WORK_DEATH_CAUSE or re.search(
+        r"(?:^|:)death_cause=no_evidence(?:$|:)", reason_text
+    ):
+        return True
+    marker = record.get("terminal_marker")
+    marker_kind = marker.get("kind") if isinstance(marker, dict) else None
+    if not marker_kind and isinstance(reason, dict):
+        marker_kind = reason.get("marker_kind")
+    if not marker_kind:
+        match = re.search(
+            r"attention_marker:(BLOCKED|USER-NEED|USER-CONFIRM)",
+            reason_text,
+        )
+        marker_kind = match.group(1) if match else None
+    marker_is_terminal_attention = marker_kind in {
+        "BLOCKED",
+        "USER-NEED",
+        "USER-CONFIRM",
+    }
+
+    # Older records may not carry death_cause. Only classify those as clean
+    # when the record pins a base and the worker seat independently proves it
+    # is both clean and still at that base; unknown evidence remains held.
+    worker_cwd = record.get("worker_cwd")
+    base_sha = str(
+        record.get("worktree_base_sha")
+        or record.get("base_sha")
+        or record.get("base_commit")
+        or ""
+    ).strip().lower()
+    if not worker_cwd or not base_sha:
+        return marker_is_terminal_attention
+    evidence = worktree_work_evidence(
+        worker_cwd,
+        since_epoch=_parse_timestamp_s(record.get("started_at")),
+    )
+    if evidence is not None:
+        return False
+    head = _git_head_for_cwd(Path(str(worker_cwd)))
+    return bool(head and head == base_sha)
+
+
+def _redispatch_record_kind(record: dict) -> str:
+    """Return terminal, live, advanced, or success for one prior row."""
+    state = str(record.get("state") or "")
+    terminal = _redispatch_record_terminal_state(record)
+    if state in _REDISPATCH_LIVE_STATES:
+        # These are pre-worker phases, but they still own the task claim. A
+        # retry must not race a carrier that can acquire capacity and start.
+        return "live"
+    if state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES or terminal in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES:
+        return "success"
+    if state == "worker_dead" or terminal == "worker_dead":
+        return "terminal" if _redispatch_record_has_no_advanced_work(record) else "advanced"
+    if terminal != "unknown" or goalflight_dispatch_states.is_terminal_state(state):
+        return "terminal"
+    return "live"
+
+
+def _release_redispatch_store_lock(args) -> None:
+    lock = getattr(args, "_redispatch_store_lock", None)
+    if lock is None:
+        return
+    args._redispatch_store_lock = None
+    lock.release()
+
+
+def _redispatch_supersession(dispatch_id: str) -> str | None:
+    """Read the current supersession marker for a launch/spawn fence."""
+    if not dispatch_id:
+        return None
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: dispatch {dispatch_id} ledger unreadable "
+            f"before spawn ({type(exc).__name__}: {exc})"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise DispatchUsageError(
+            f"task redispatch refused: dispatch {dispatch_id} ledger is not an object"
+        )
+    value = payload.get("superseded_by")
+    return str(value) if value else None
+
+
+def _redispatch_spawn_guard(args) -> None:
+    if not getattr(args, "task_ids", None):
+        return
+    superseded_by = _redispatch_supersession(str(args.dispatch_id))
+    if superseded_by:
+        raise DispatchUsageError(
+            f"dispatch {args.dispatch_id} was superseded by {superseded_by} "
+            "before worker spawn"
+        )
+    parent_dispatch_id = str(getattr(args, "parent_dispatch_id", None) or "")
+    if parent_dispatch_id:
+        superseded_by = _redispatch_supersession(parent_dispatch_id)
+        if superseded_by:
+            raise DispatchUsageError(
+                f"dispatch {parent_dispatch_id} resume source was superseded by "
+                f"{superseded_by} before worker spawn"
+            )
+
+
+def _redispatch_spawn_lock(args):
+    return (
+        goalflight_ledger.StateLock()
+        if getattr(args, "task_ids", None)
+        else contextlib.nullcontext()
+    )
+
+
+def _redispatch_task_store(
+    entry: dict, args=None
+) -> tuple[goalflight_task.TaskStore, dict[str, dict]]:
+    try:
+        store = goalflight_task.TaskStore(_project_root_for_entry(entry))
+        if (
+            args is not None
+            and getattr(args, "_redispatch_lock_lifetime", False)
+            and getattr(args, "_redispatch_store_lock", None) is None
+        ):
+            store._ensure_docs_dir_for_write()
+            lock = goalflight_task.FileLock(store.docs_dir / "redispatch.lock")
+            lock.__enter__()
+            args._redispatch_store_lock = lock
+        items = store.load_items()
+    except (ImportError, OSError, goalflight_task.TaskError) as exc:
+        if args is not None:
+            _release_redispatch_store_lock(args)
+        raise DispatchUsageError(
+            f"task redispatch refused: task store unavailable ({type(exc).__name__}: {exc})"
+        ) from exc
+    by_id = {str(item.get("id")): item for item in items if item.get("id")}
+    missing = [task_id for task_id in _entry_task_ids(entry) if task_id not in by_id]
+    if missing:
+        if args is not None:
+            _release_redispatch_store_lock(args)
+        raise DispatchUsageError(
+            "task redispatch refused: task item not found: " + ", ".join(missing)
+        )
+    return store, by_id
+
+
+def _redispatch_matching_records(entry: dict) -> list[dict]:
+    try:
+        records = _pass_ledger_records()
+    except Exception as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: dispatch ledger unavailable ({type(exc).__name__}: {exc})"
+        ) from exc
+    wanted = set(_entry_task_ids(entry))
+    current_id = str(entry.get("dispatch_id") or "")
+    lineage_ids = {
+        str(dispatch_id)
+        for dispatch_id in (entry.get("resume_lineage_exempt_ids") or [])
+        if str(dispatch_id).strip()
+    }
+    matched: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict) or goalflight_ledger.record_is_unreadable(record):
+            raise DispatchUsageError(
+                "task redispatch refused: dispatch ledger contains unreadable evidence"
+            )
+        dispatch_id = str(record.get("dispatch_id") or "")
+        if (
+            not dispatch_id
+            or dispatch_id == current_id
+            or dispatch_id in lineage_ids
+            or record.get("superseded_by")
+        ):
+            continue
+        if not wanted.intersection(_entry_task_ids(None, record)):
+            continue
+        if not _project_roots_match(
+            entry.get("project_root"), record.get("project_root")
+        ):
+            continue
+        sibling_ids = sorted(set(_entry_task_ids(None, record)) - wanted)
+        if sibling_ids:
+            raise DispatchUsageError(
+                f"task redispatch refused: dispatch {dispatch_id} also covers "
+                f"task id(s) {', '.join(sibling_ids)}; redispatch all of its "
+                "task ids together so sibling work is not superseded"
+            )
+        matched.append(record)
+    return matched
+
+
+def _redispatch_git_output(
+    cwd: Path, *arguments: str, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: cannot pin WIP in {cwd}: {type(exc).__name__}: {exc}"
+        ) from exc
+    return result.returncode, result.stdout.strip()
+
+
+def _pin_redispatch_wip(record: dict) -> str:
+    worker_cwd = str(record.get("worker_cwd") or "").strip()
+    if not worker_cwd:
+        raise DispatchUsageError(
+            f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
+            "has no worker cwd to pin"
+        )
+    cwd = Path(worker_cwd).expanduser()
+    try:
+        if not cwd.is_dir():
+            raise OSError("worker cwd is not a directory")
+    except OSError as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: cannot pin WIP in {cwd}: {exc}"
+        ) from exc
+    status_code, status = _redispatch_git_output(
+        cwd, "status", "--porcelain", "--untracked-files=all"
+    )
+    if status_code != 0:
+        raise DispatchUsageError(
+            f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
+            f"WIP is not in a readable git worktree ({cwd})"
+        )
+    try:
+        worktree_lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+            cwd, str(record.get("dispatch_id") or "redispatch")
+        )
+    except (
+        goalflight_worktree_pool.WorktreePathLockBusy,
+        goalflight_worktree_pool.WorktreePathLockUnknown,
+    ) as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: cannot exclusively pin WIP in {cwd}: {exc}"
+        ) from exc
+
+    with worktree_lock:
+        status_code, status = _redispatch_git_output(
+            cwd, "status", "--porcelain", "--untracked-files=all"
+        )
+        head_code, base_head = _redispatch_git_output(
+            cwd, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        if (
+            status_code != 0
+            or head_code != 0
+            or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_head)
+        ):
+            raise DispatchUsageError(
+                f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
+                f"has no readable git HEAD in {cwd}"
+            )
+        commit = base_head
+        if status:
+            # Build a snapshot with a private index. `git stash create` cannot
+            # include untracked files on all supported Git versions and
+            # mutating the caller's index would make the pin destructive.
+            with tempfile.TemporaryDirectory(
+                prefix="goalflight-redispatch-index-"
+            ) as index_dir:
+                index = str(Path(index_dir) / "index")
+                snapshot_env = os.environ.copy()
+                snapshot_env["GIT_INDEX_FILE"] = index
+                read_code, _ = _redispatch_git_output(
+                    cwd, "read-tree", "HEAD", env=snapshot_env
+                )
+                add_code, _ = _redispatch_git_output(
+                    cwd, "add", "-A", "--", ".", env=snapshot_env
+                )
+                tree_code, tree = _redispatch_git_output(
+                    cwd, "write-tree", env=snapshot_env
+                )
+                commit_env = dict(snapshot_env)
+                commit_env.update(
+                    {
+                        "GIT_AUTHOR_NAME": "goal-flight",
+                        "GIT_AUTHOR_EMAIL": "goal-flight@localhost",
+                        "GIT_COMMITTER_NAME": "goal-flight",
+                        "GIT_COMMITTER_EMAIL": "goal-flight@localhost",
+                    }
+                )
+                commit_code, commit = (
+                    _redispatch_git_output(
+                        cwd,
+                        "commit-tree",
+                        tree,
+                        "-p",
+                        "HEAD",
+                        "-m",
+                        f"Pin redispatch WIP {record.get('dispatch_id')}",
+                        env=commit_env,
+                    )
+                    if read_code == 0
+                    and add_code == 0
+                    and tree_code == 0
+                    and re.fullmatch(r"[0-9a-fA-F]{40,64}", tree)
+                    else (1, "")
+                )
+            if commit_code != 0 or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+                raise DispatchUsageError(
+                    f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
+                    "has unpinned dirty WIP; preserve it before --force"
+                )
+
+        final_status_code, final_status = _redispatch_git_output(
+            cwd, "status", "--porcelain", "--untracked-files=all"
+        )
+        final_head_code, final_head = _redispatch_git_output(
+            cwd, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        if (
+            final_status_code != 0
+            or final_head_code != 0
+            or final_status != status
+            or final_head != base_head
+        ):
+            raise DispatchUsageError(
+                f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
+                "worktree changed while pinning WIP; retry after it settles"
+            )
+        safe_id = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "-",
+            str(record.get("dispatch_id") or "dispatch"),
+        ).strip("-")
+        ref = f"refs/goalflight/keep/redispatch-{safe_id or 'dispatch'}"
+        update_code, _ = _redispatch_git_output(cwd, "update-ref", ref, commit)
+        if update_code != 0:
+            raise DispatchUsageError(
+                f"task redispatch refused: failed to pin WIP for {record.get('dispatch_id')} at {ref}"
+            )
+        return ref
+
+
+def _mark_redispatch_superseded(
+    record: dict,
+    *,
+    replacement_id: str,
+    actor: str,
+    reason: str,
+    wip_ref: str | None = None,
+) -> None:
+    dispatch_id = str(record.get("dispatch_id") or "")
+    if not dispatch_id:
+        raise DispatchUsageError("task redispatch refused: supersession record has no dispatch id")
+    path = goalflight_ledger.record_path(dispatch_id, create=False)
+    try:
+        # Keep the ledger lock across the WIP snapshot and supersession write.
+        # Resume validation must never observe an unpinned advanced row after
+        # the replacement has taken ownership of the task.
+        with goalflight_ledger.StateLock():
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(current, dict):
+                raise ValueError("supersession record is not an object")
+            current_kind = _redispatch_record_kind(current)
+            if current.get("superseded_by") or current_kind == "success":
+                raise DispatchUsageError(
+                    f"dispatch {dispatch_id} changed while preparing redispatch; retry"
+                )
+            if current_kind == "advanced":
+                # Re-pin the current tip under StateLock even when admission
+                # supplied a speculative ref. The old ref was made before the
+                # replacement row became visible and is not an atomic fence.
+                wip_ref = _pin_redispatch_wip(current)
+            current["superseded_by"] = replacement_id
+            current["superseded_at"] = goalflight_ledger.utc_now()
+            current["supersession_actor"] = actor
+            current["supersession_reason"] = reason
+            if wip_ref:
+                current["wip_ref"] = wip_ref
+            goalflight_ledger.write_record(current)
+            record.clear()
+            record.update(current)
+            return
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise DispatchUsageError(
+            f"task redispatch refused: could not record supersession for "
+            f"{record.get('dispatch_id')}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _commit_task_redispatch(args) -> None:
+    """Finalize a forced redispatch after its replacement row is visible."""
+    pending = getattr(args, "_redispatch_pending", None)
+    if not pending or pending.get("committed"):
+        return
+    records = list(pending.get("records") or [])
+    wip_refs = dict(pending.get("wip_refs") or {})
+    replacement_id = str(pending.get("replacement_id") or "")
+    actor = str(pending.get("actor") or _redispatch_actor(args))
+    reason = str(pending.get("reason") or _REDISPATCH_FORCE_REASON)
+    try:
+        for record in records:
+            dispatch_id = str(record.get("dispatch_id") or "")
+            _mark_redispatch_superseded(
+                record,
+                replacement_id=replacement_id,
+                actor=actor,
+                reason=reason,
+                wip_ref=wip_refs.get(dispatch_id),
+            )
+        completed = list(pending.get("completed") or [])
+        if completed:
+            pending["store"].reopen_for_redispatch(
+                completed,
+                actor=actor,
+                dispatch_id=replacement_id,
+                reason=reason,
+            )
+    except (OSError, goalflight_task.TaskError) as exc:
+        raise DispatchUsageError(
+            "task redispatch refused: could not finalize the forced replacement "
+            f"for {replacement_id}: {type(exc).__name__}: {exc}"
+        ) from exc
+    pending["committed"] = True
+
+
+def _commit_task_redispatch_and_release(args) -> None:
+    try:
+        _commit_task_redispatch(args)
+    finally:
+        _release_redispatch_store_lock(args)
+
+
+def _prepare_task_redispatch(args, entry: dict) -> None:
+    """Apply task-id admission rules before the general completion ladder."""
+    task_ids = _entry_task_ids(entry)
+    if not task_ids:
+        return
+    try:
+        store, rows = _redispatch_task_store(entry, args)
+        records = _redispatch_matching_records(entry)
+    except DispatchUsageError:
+        _release_redispatch_store_lock(args)
+        raise
+    force = bool(getattr(args, "force", False))
+    by_kind = {kind: [] for kind in ("live", "advanced", "success")}
+    no_work_dead_ids: set[str] = set()
+    for record in records:
+        kind = _redispatch_record_kind(record)
+        if kind in by_kind:
+            by_kind[kind].append(record)
+        if kind == "terminal" and (
+            record.get("state") == "worker_dead"
+            or _redispatch_record_terminal_state(record) == "worker_dead"
+        ):
+            no_work_dead_ids.add(str(record.get("dispatch_id") or ""))
+
+    live = by_kind["live"]
+    advanced = by_kind["advanced"]
+    completed = [
+        task_id
+        for task_id in task_ids
+        if _task_row_durably_complete(rows.get(task_id))
+    ]
+    if completed:
+        # Keep this fact on the entry so the launch gate sees completion even
+        # when its timestamp predates the fresh dispatch wall clock. Forced
+        # redispatch consumes the same fact to reopen only after admission.
+        entry["redispatch_done_ids"] = completed
+    if live and not force:
+        entry["redispatch_block_live_dispatches"] = True
+
+    if force:
+        actor = _redispatch_actor(args)
+        reason = _REDISPATCH_FORCE_REASON
+        args._redispatch_pending = {
+            "records": [*live, *advanced],
+            "wip_refs": {},
+            "store": store,
+            "completed": completed,
+            "replacement_id": str(entry.get("dispatch_id") or ""),
+            "actor": actor,
+            "reason": reason,
+            "committed": False,
+        }
+
+    if no_work_dead_ids:
+        entry["redispatch_allow_no_work_dead"] = True
+    if force and (live or advanced):
+        entry["redispatch_exempt_ids"] = [
+            str(record.get("dispatch_id"))
+            for record in [*live, *advanced]
+            if record.get("dispatch_id")
+        ]
 
 
 def _reconcile_outbox_guidance(project_root: str) -> str:
@@ -4598,7 +5128,8 @@ def _completion_refusal_guidance(
                     lines.append(
                         f"{task_text} is held by a worker that may still be running "
                         f"({state}): wait for it, or steer it to stop before withdrawing. "
-                        f"Holder: {dispatch_id}."
+                        f"Holder: {dispatch_id}. A same-task redispatch with --force "
+                        "records an explicit supersession; do not open a new task row."
                     )
                 continue
             record = _find_dispatch_record(dispatch_id) or {}
@@ -4608,7 +5139,10 @@ def _completion_refusal_guidance(
                 "If you've confirmed that worker is gone, release it with:\n"
                 f"  {_withdraw_recovery_command(dispatch_id, project_root, owner=owner, operator=owner is None)}\n"
                 "(withdraw refuses if it can't prove the worker is dead; see "
-                "protocols/dispatch-danger.md). Then re-run this dispatch."
+                "protocols/dispatch-danger.md). Then re-run this dispatch. "
+                "Resume remains available when the original engine session can be attached. "
+                "Same-task recovery may retry a dead row with no advanced work; "
+                "advanced work requires pinned WIP and --force. Do not open a new task row."
             )
         if lines:
             text = "\n".join(lines)
@@ -4625,11 +5159,83 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
 
     Drain consults this gate before the child runs.
     """
-    if not getattr(args, "task_ids", None):
+    # The detached ACP child inherits admission already performed by its
+    # parent. Re-reading the task/ledger here would either reacquire the
+    # parent's admission lock or race the first ledger publication; the child
+    # only needs to publish the row that the parent admitted.
+    if (
+        not getattr(args, "task_ids", None)
+        or getattr(args, "acp_detached_child", False)
+    ):
         return
     entry = _launch_authority_entry(args)
     diagnostics: list[str] = []
-    decision = _entry_completion_authority(entry, diagnostics=diagnostics)
+    redispatch_error = None
+    resume_task_store_missing = False
+    try:
+        try:
+            _prepare_task_redispatch(args, entry)
+        except DispatchUsageError as exc:
+            missing_task = str(exc).startswith(
+                "task redispatch refused: task item not found:"
+            )
+            if not missing_task:
+                raise
+            if getattr(args, "parent_dispatch_id", None):
+                # Older resume records may carry task ids that were never
+                # entered in the project task store. Preserve that resume
+                # path, while still applying redispatch flags when a row is
+                # present.
+                resume_task_store_missing = True
+            else:
+                # Completion authority must still explain an existing holder
+                # when the task store cannot describe a fresh dispatch's task.
+                # Preserve the task-store error when no independent completion
+                # blocker exists.
+                redispatch_error = exc
+        if redispatch_error is not None or resume_task_store_missing:
+            decision = _entry_completion_authority(
+                entry, diagnostics=diagnostics,
+            )
+        else:
+            decision = _entry_completion_authority(
+                entry,
+                diagnostics=diagnostics,
+                allow_no_work_dead=bool(entry.get("redispatch_allow_no_work_dead")),
+                block_live_dispatches=bool(entry.get("redispatch_block_live_dispatches")),
+            )
+    except Exception:
+        _release_redispatch_store_lock(args)
+        raise
+    if (
+        redispatch_error is not None
+        and not _completion_decision_blocks_restore(decision)
+    ):
+        raise redispatch_error
+    if (
+        entry.get("redispatch_done_ids")
+        and not getattr(args, "force", False)
+        and not _completion_decision_blocks_restore(decision)
+    ):
+        decision = {
+            "state": "superseded",
+            "reason": "task_store:all_complete",
+            "marker": None,
+            "source": "task_store",
+        }
+    if (
+        getattr(args, "force", False)
+        and entry.get("redispatch_done_ids")
+        and isinstance(decision, dict)
+        and (
+            str(decision.get("reason") or "").startswith("task_store:")
+            or decision.get("reason") == COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE
+        )
+    ):
+        # ``--force`` is the explicit rework authorization for a completed
+        # task. Reopen remains deferred until the replacement ledger row is
+        # visible, so an auth/capacity failure leaves the completed item intact.
+        decision = {}
     if not _completion_decision_blocks_restore(decision):
         return
     assert isinstance(decision, dict)
@@ -4660,6 +5266,7 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
         ),
         flush=True,
     )
+    _release_redispatch_store_lock(args)
     raise DispatchUsageError(message)
 
 
@@ -6073,6 +6680,11 @@ def _validate_resume_source(
     record = _find_dispatch_record(dispatch_id)
     if record is None:
         raise DispatchUsageError(f"no ledger record for dispatch {dispatch_id}")
+    if record.get("superseded_by"):
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} was superseded by {record['superseded_by']}; "
+            "resume the replacement instead"
+        )
     engine = goalflight_engine_sessions.resume_engine(
         record.get("engine") or record.get("agent")
     )
@@ -9879,24 +10491,29 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
             )
         return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
 
-    record_code, refusal = _record_once()
-    if (
-        record_code != 0
-        and spawn_state != "none"
-        and goalflight_ledger.is_retryable_startup_race(refusal)
-    ):
-        # The worker claims RUNNING asynchronously after spawn, so "not yet"
-        # becomes "yes" on its own within the worker's startup. Re-record
-        # against a bounded deadline BEFORE deciding anything else. Budget
-        # derivation: goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
-        record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
-            _record_once,
-            record_code,
-            refusal,
-            project_root=project_root,
-            dispatch_id=str(args.dispatch_id),
-            timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
-        )
+    try:
+        record_code, refusal = _record_once()
+        if (
+            record_code != 0
+            and spawn_state != "none"
+            and goalflight_ledger.is_retryable_startup_race(refusal)
+        ):
+            # The worker claims RUNNING asynchronously, so re-record against
+            # the bounded startup-race budget before deciding anything else.
+            record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
+                _record_once,
+                record_code,
+                refusal,
+                project_root=project_root,
+                dispatch_id=str(args.dispatch_id),
+                timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
+            )
+        if record_code == 0:
+            _commit_task_redispatch(args)
+    finally:
+        # The task admission lock spans the pre-record gate; once this row is
+        # visible in the ledger, later redispatches can classify it atomically.
+        _release_redispatch_store_lock(args)
     warning = None
     if record_code != 0:
         if spawn_state == "none":
@@ -10365,6 +10982,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--prompt-file": "preserve",
     "--prompt": "preserve",
     "--task": "preserve",
+    "--force": "preserve",
     "--cwd": "preserve",
     "--worktree-root": "preserve",
     "--worktree-pin-holder": "preserve",
@@ -10591,6 +11209,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--prompt", str(args.prompt)]
     if getattr(args, "task_ids", None):
         argv += ["--task", ",".join(args.task_ids)]
+    if getattr(args, "force", False):
+        argv.append("--force")
     if args.model:
         argv += ["--model", str(args.model)]
     if getattr(args, "os_sandbox", None):
@@ -13837,6 +14457,8 @@ def _ledger_task_ids_advanced(
     self_project_root: object | None = None,
     diagnostics: list[str] | None = None,
     exempt_dispatch_ids: set[str] | None = None,
+    allow_no_work_dead: bool = False,
+    block_live_dispatches: bool = False,
 ) -> tuple[int, int, str]:
     """Return counts plus the typed reason ledger authority is inconclusive.
 
@@ -13872,6 +14494,11 @@ def _ledger_task_ids_advanced(
             continue
         other_root = _entry_owner_fields(None, record)[1]
         if not _project_roots_match(self_project_root, other_root):
+            continue
+        if record.get("superseded_by"):
+            # An explicit redispatch supersession releases the old claim. The
+            # old row remains immutable evidence, but it is no longer a
+            # successor that can hold the same task.
             continue
         state = str(record.get("state") or "")
         terminal = str(
@@ -13933,6 +14560,16 @@ def _ledger_task_ids_advanced(
                     ))
                 if awaiting_ruling:
                     continue
+                if allow_no_work_dead and _redispatch_record_has_no_advanced_work(record):
+                    continue
+            advanced_tasks |= overlap
+        elif block_live_dispatches and (
+            state in _REDISPATCH_LIVE_STATES
+            or not goalflight_dispatch_states.is_terminal_state(state)
+        ):
+            # A queued/waiting carrier is still a live claim for direct task
+            # redispatch, even though recovery scans traditionally leave those
+            # states out of completion-progress accounting.
             advanced_tasks |= overlap
         elif (
             state
@@ -13981,6 +14618,8 @@ def _linked_task_truth_detail(
     *,
     task_store_locked: bool = False,
     diagnostics: list[str] | None = None,
+    allow_no_work_dead: bool = False,
+    block_live_dispatches: bool = False,
 ) -> tuple[str, str | None, tuple[str, ...]]:
     """Return task truth plus a typed indeterminate cause and its sources."""
     task_ids = _entry_task_ids(entry, record)
@@ -14046,10 +14685,13 @@ def _linked_task_truth_detail(
 
     self_id = str(entry.get("dispatch_id") or (record or {}).get("dispatch_id") or "")
     self_root = _entry_owner_fields(entry, record)[1]
-    raw_exempt = entry.get("resume_lineage_exempt_ids") if isinstance(entry, dict) else None
-    exempt_ids = None
-    if isinstance(raw_exempt, (list, tuple, set)):
-        exempt_ids = {str(item) for item in raw_exempt if str(item).strip()}
+    exempt_ids: set[str] | None = None
+    for key in ("resume_lineage_exempt_ids", "redispatch_exempt_ids"):
+        raw_exempt = entry.get(key) if isinstance(entry, dict) else None
+        if isinstance(raw_exempt, (list, tuple, set)):
+            if exempt_ids is None:
+                exempt_ids = set()
+            exempt_ids.update(str(item) for item in raw_exempt if str(item).strip())
     ledger_complete, ledger_advanced, ledger_issue = _ledger_task_ids_advanced(
         task_ids,
         self_dispatch_id=self_id,
@@ -14057,6 +14699,8 @@ def _linked_task_truth_detail(
         self_project_root=self_root,
         diagnostics=diagnostics,
         exempt_dispatch_ids=exempt_ids,
+        allow_no_work_dead=allow_no_work_dead,
+        block_live_dispatches=block_live_dispatches,
     )
 
     # Prefer explicit store truth when every linked id is present and complete.
@@ -14146,6 +14790,8 @@ def _entry_completion_authority(
     *,
     task_store_locked: bool = False,
     diagnostics: list[str] | None = None,
+    allow_no_work_dead: bool = False,
+    block_live_dispatches: bool = False,
 ) -> dict | None:
     """Full completion-authority ladder (design §Reconciliation).
 
@@ -14168,6 +14814,14 @@ def _entry_completion_authority(
                 "indeterminate_sources": ["ledger_record_unavailable"],
                 "bounded_deferral": False,
             }
+
+    if isinstance(record, dict) and record.get("superseded_by"):
+        return {
+            "state": "superseded",
+            "reason": "redispatch_superseded",
+            "marker": None,
+            "source": "ledger",
+        }
 
     # Leg 0: already-terminal ledger for this dispatch (first-terminal-wins).
     # Bind to queue_launch_token so a reused dispatch id cannot unlink the
@@ -14221,6 +14875,8 @@ def _entry_completion_authority(
         record,
         task_store_locked=task_store_locked,
         diagnostics=diagnostics,
+        allow_no_work_dead=allow_no_work_dead,
+        block_live_dispatches=block_live_dispatches,
     )
     if task_truth == "all_complete":
         return {
@@ -21019,6 +21675,13 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         in_place=bool(getattr(args, "in_place", False)),
         request_envelope=_queue_request_envelope(args),
         worktree_bind_after_capacity=deferred_worktree,
+        redispatch_lock_release=(
+            lambda: _commit_task_redispatch_and_release(args)
+            if getattr(args, "_redispatch_pending", None) is not None
+            else _release_redispatch_store_lock(args)
+        ),
+        redispatch_spawn_guard=lambda: _redispatch_spawn_guard(args),
+        redispatch_spawn_lock=lambda: _redispatch_spawn_lock(args),
         controller_session_id=_controller_session_id(args),
         controller_pid=_controller_pid(args),
         controller_label=_controller_label(args),
@@ -21304,6 +21967,16 @@ def _run_acp_detached_launcher(
     with _forward_detached_launcher_signals(child_pid) as forwarded_signals:
         while time.time() < deadline:
             record = _find_dispatch_record(args.dispatch_id)
+            if record and (
+                getattr(args, "queue_launch_token", None) is None
+                or record.get("queue_launch_token")
+                == getattr(args, "queue_launch_token", None)
+            ):
+                # The child publishes waiting_capacity before it waits for a
+                # seat. Once that row is visible, later redispatches can
+                # classify this dispatch as live; the parent no longer needs
+                # to hold the admission lock.
+                _commit_task_redispatch_and_release(args)
             if (
                 not forwarded_signals
                 and record
@@ -21336,6 +22009,7 @@ def _run_acp_detached_launcher(
                     ),
                     flush=True,
                 )
+                _release_redispatch_store_lock(args)
                 return 0
             child_alive = goalflight_compat.pid_alive(child_pid)
             with contextlib.suppress(OSError, json.JSONDecodeError):
@@ -21353,6 +22027,7 @@ def _run_acp_detached_launcher(
                     and status_payload.get("reason") == "worktree_occupied"
                 ):
                     print(f"goalflight_dispatch: {status_payload['error']}", file=sys.stderr)
+                    _release_redispatch_store_lock(args)
                     return 64
                 if str(last_state).startswith("blocked_capacity"):
                     if child_alive:
@@ -21373,6 +22048,7 @@ def _run_acp_detached_launcher(
                         ),
                         flush=True,
                     )
+                    _release_redispatch_store_lock(args)
                     return (
                         128 + forwarded_signals[-1]
                         if forwarded_signals
@@ -21382,12 +22058,14 @@ def _run_acp_detached_launcher(
                 break
             time.sleep(0.2)
     if forwarded_signals:
+        _release_redispatch_store_lock(args)
         return 128 + forwarded_signals[-1]
     print(
         "goalflight_dispatch: ACP detached launch did not publish a running ledger "
         f"for {args.dispatch_id} (last_state={last_state!r})",
         file=sys.stderr,
     )
+    _release_redispatch_store_lock(args)
     return 1
 
 
@@ -22085,6 +22763,14 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override a live or advanced prior dispatch for --task, recording "
+            "the supersession; also reopen a done item without creating a new id."
+        ),
+    )
+    parser.add_argument(
         "--cwd",
         type=str,
         help=(
@@ -22443,6 +23129,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     if resume_plan is None:
         args._original_argv = list(argv)
         _apply_fast_mode(args)  # --fast -> critical priority (skip queue)
+    args._redispatch_lock_lifetime = True
     if args.stats is not None:
         _emit_launch_wake_notice()
         try:
@@ -23483,30 +24170,35 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             worker_argv,
         )
         _revalidate_read_only_resume_worktree(args, resume_plan=resume_plan)
-        _mark_queue_claim_worker_spawn_intent(args)
-        if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
-            raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
-        # From this point a child may exist before this process receives its
-        # PID. Do not let an operator signal release the lease and finalize a
-        # failure after spawn has begun; reconciliation can adopt an
-        # indeterminate handoff, but an early release can oversubscribe the
-        # account and orphan the worker.
-        if capacity_signal_guard is not None:
-            capacity_signal_guard()
-            capacity_signal_guard = None
-        worker_spawn_attempted = True
-        worker_pid = _spawn_daemonized_process(
-            worker_argv,
-            env=env,
-            stdin_path=stdin_path,
-            stdout_path=tail,
-            stdout_mode=worker_stdout_mode,
-            stderr="stdout",
-            serialize_stdout=True,
-            label="worker",
-            cwd=str(_worker_cwd(args)),
-            inherit_occupancy_lock=True,
-        )
+        # A forced redispatch may supersede a waiting row while this process
+        # owns a capacity lease. Fence the final check and spawn with the
+        # ledger lock so a waiting carrier cannot start after supersession.
+        with goalflight_ledger.StateLock():
+            _redispatch_spawn_guard(args)
+            _mark_queue_claim_worker_spawn_intent(args)
+            if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+                raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
+            # From this point a child may exist before this process receives its
+            # PID. Do not let an operator signal release the lease and finalize a
+            # failure after spawn has begun; reconciliation can adopt an
+            # indeterminate handoff, but an early release can oversubscribe the
+            # account and orphan the worker.
+            if capacity_signal_guard is not None:
+                capacity_signal_guard()
+                capacity_signal_guard = None
+            worker_spawn_attempted = True
+            worker_pid = _spawn_daemonized_process(
+                worker_argv,
+                env=env,
+                stdin_path=stdin_path,
+                stdout_path=tail,
+                stdout_mode=worker_stdout_mode,
+                stderr="stdout",
+                serialize_stdout=True,
+                label="worker",
+                cwd=str(_worker_cwd(args)),
+                inherit_occupancy_lock=True,
+            )
         # Worker inherited the occupancy fd. Drop this process's copy so a
         # later in-process launch does not see a closed descriptor as
         # occupancy unknown. Sidecars must not keep the now-closed number.

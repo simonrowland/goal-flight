@@ -735,6 +735,10 @@ def _record_acp_ledger_state(
             dispatch_id=dispatch_id,
             timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
         )
+    if record_code == 0:
+        release_redispatch_lock = getattr(cfg, "redispatch_lock_release", None)
+        if callable(release_redispatch_lock):
+            release_redispatch_lock()
     if record_code != 0:
         if spawn_state == "none":
             # No worker process exists, so a refused transition is a genuine
@@ -4477,40 +4481,50 @@ async def _run_acp_dispatch_impl(
         try:
             async with StartupGate(cfg.agent):
                 goalflight_dispatch._revalidate_read_only_resume_worktree(cfg)
-                if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
-                    raise RuntimeError(
-                        f"capacity lease {lease_id} lost before worker spawn"
-                    )
-                proc, conn = await spawn_and_handshake_with_retry(
-                    command,
-                    acp_args,
-                    agent=cfg.agent,
-                    session_id=cfg.session_id,
-                    attempts=1,
-                    cwd=worker_cwd,
-                    activity=activity,
-                    on_attempt=mark_attempt,
-                    context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
-                    permission_mode=getattr(cfg, "permission_mode", "auto"),
-                    permission_dir=resolved_permission_dir,
-                    permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
-                    permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
-                    permission_policy=permission_policy,
-                    os_sandbox=spawn_os_sandbox_profile,
-                    session_model=getattr(cfg, "model", None),
-                    env=spawn_env,
-                    stderr_capture=agent_stderr_capture,
-                    resume_session_id=getattr(cfg, "resume_session_id", None),
-                    pass_fds=tuple(
-                        dict.fromkeys(
-                            (
-                                *goalflight_worktree_pool.inherited_worktree_lock_fds(),
-                                *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
-                                *((read_only_seat_hold.fileno(),) if read_only_seat_hold is not None else ()),
-                            )
-                        )
-                    ),
+                spawn_lock_factory = getattr(cfg, "redispatch_spawn_lock", None)
+                spawn_lock = (
+                    spawn_lock_factory()
+                    if callable(spawn_lock_factory)
+                    else contextlib.nullcontext()
                 )
+                with spawn_lock:
+                    spawn_guard = getattr(cfg, "redispatch_spawn_guard", None)
+                    if callable(spawn_guard):
+                        spawn_guard()
+                    if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+                        raise RuntimeError(
+                            f"capacity lease {lease_id} lost before worker spawn"
+                        )
+                    proc, conn = await spawn_and_handshake_with_retry(
+                        command,
+                        acp_args,
+                        agent=cfg.agent,
+                        session_id=cfg.session_id,
+                        attempts=1,
+                        cwd=worker_cwd,
+                        activity=activity,
+                        on_attempt=mark_attempt,
+                        context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
+                        permission_mode=getattr(cfg, "permission_mode", "auto"),
+                        permission_dir=resolved_permission_dir,
+                        permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
+                        permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
+                        permission_policy=permission_policy,
+                        os_sandbox=spawn_os_sandbox_profile,
+                        session_model=getattr(cfg, "model", None),
+                        env=spawn_env,
+                        stderr_capture=agent_stderr_capture,
+                        resume_session_id=getattr(cfg, "resume_session_id", None),
+                        pass_fds=tuple(
+                            dict.fromkeys(
+                                (
+                                    *goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                                    *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+                                    *((read_only_seat_hold.fileno(),) if read_only_seat_hold is not None else ()),
+                                )
+                            )
+                        ),
+                    )
         except AcpTerminationUnconfirmed as exc:
             # Pre-connection and handshake cleanup can return on a reap
             # deadline. Carry that live/unknown scope into the shared finalizer;

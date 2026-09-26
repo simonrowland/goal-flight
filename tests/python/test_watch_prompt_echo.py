@@ -1211,6 +1211,79 @@ def case_task_terminal_breadcrumb_happy_path_persists() -> None:
         assert terminal[-1]["last_worker_state"]["state"] == "complete", terminal[-1]
 
 
+def test_superseded_terminal_does_not_project_task_completion() -> None:
+    """A late COMPLETE from a replaced worker stays out of task status."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        project = tmp / "project"
+        _write_task_store(project)
+        dispatch_id = "watch-task-breadcrumb-superseded"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"work done\nCOMPLETE: {dispatch_id} — late marker\n",
+            encoding="utf-8",
+        )
+        worker = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        worker.wait()
+        state_runs = tmp / "state" / "runs.d"
+        state_runs.mkdir(parents=True, exist_ok=True)
+        status = tmp / "s.json"
+        (state_runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "task_ids": ["t-001"],
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                    "superseded_by": "replacement-dispatch",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        rc, _, term, payload = _run_watcher(
+            tail,
+            status,
+            tmp / "p.md",
+            ignore=False,
+            worker_pid=worker.pid,
+            poll_secs="0.2",
+            max_idle_secs="2",
+            dispatch_id=dispatch_id,
+            project_root=project,
+            task_ids="t-001",
+            agent="codex",
+        )
+
+        assert rc == 0, (rc, payload)
+        assert term.get("kind") == "COMPLETE", term
+        assert _read_task(project).get("dispatches", []) == []
+        env = _watcher_env(status)
+        derived = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "goalflight_task.py"),
+                "--project-root",
+                str(project),
+                "status",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert derived.returncode == 0, derived.stderr
+        assert json.loads(derived.stdout)["items"][0]["derived_status"] == "pending"
+
+
 PYNEC_OBSERVED_TAIL = """
 RESULT: W-pynec-fixes-2
 - `short_dipole`: max_gain_dbi `1.7496324917822492`, directivity/gain linear `1.4961090471558036`
@@ -2976,6 +3049,7 @@ def main() -> None:
     case_task_breadcrumb_missing_item_keeps_worker_verdict()
     case_task_terminal_breadcrumb_failure_blocks_completion()
     case_task_terminal_breadcrumb_happy_path_persists()
+    test_superseded_terminal_does_not_project_task_completion()
     case_dead_pid_fresh_output_vetoes_worker_dead()
     case_dead_pid_stale_output_bounds_worker_dead()
     test_dead_pid_network_tail_surfaces_upstream_network()

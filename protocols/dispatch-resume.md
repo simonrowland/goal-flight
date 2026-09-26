@@ -213,11 +213,17 @@ you want to keep, not by what killed the worker.
   this case, not a successful resume.
 - Never resume into a session another non-terminal child already holds.
 - `partial_task_supersession` from this attempt's own `worker_dead`,
-  `superseded`, or `abandoned` row: the hold is the ledger row. Resume
-  that dispatch; a later resume in the same chain is the same attempt.
-  A live sibling, or a fresh dispatch on the same task, is still refused.
-  `reconcile-outbox` does not clear this hold. Opening a new task row is
-  interim and leaves the old id held.
+  `superseded`, or `abandoned` row: the hold is the ledger row. A dead row
+  with no advanced work may be retried with the same `--task <id>`; a row
+  with advanced work must have its WIP pinned before the controller reruns
+  `goalflight_dispatch.py --task <id> --force`, which records the old-row
+  supersession. A live sibling refuses by default and accepts that same
+  explicit `--force` override. Resume that dispatch when the original engine
+  session can be attached; a later resume in the same chain is the same
+  attempt. `reconcile-outbox` does not clear this hold. Never open a new task
+  row for this recovery. A later resume in the same chain remains the same
+  attempt, while a fresh dispatch on the same task is subject to these
+  no-work/advanced-work checks.
 - Resume refuses honestly when it cannot attach or reconstruct:
   - no recorded engine session handle (typical of dispatches that predate
     capture — Grok/Claude now assign at launch; Kimi/cursor harvest after

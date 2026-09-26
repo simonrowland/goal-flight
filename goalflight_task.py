@@ -2980,7 +2980,9 @@ class TaskStore:
                 with contextlib.suppress(OSError):
                     path.unlink()
 
-    def project_ledger_records(self) -> list[dict[str, Any]]:
+    def project_ledger_records(
+        self, *, include_superseded: bool = False
+    ) -> list[dict[str, Any]]:
         """Machine-ledger dispatch records for this project.
 
         An empty list means the ledger was readable and contains no records
@@ -3005,6 +3007,8 @@ class TaskStore:
             if not isinstance(raw_root, str) or not raw_root:
                 continue
             if _strip_managed_worktree(Path(raw_root)) == target:
+                if not include_superseded and record.get("superseded_by"):
+                    continue
                 records.append(record)
         return records
 
@@ -3075,17 +3079,102 @@ class TaskStore:
 
         return self.mutate_items(update, allow_invalid_live_mirror=True)
 
+    def reopen_for_redispatch(
+        self,
+        task_ids: list[str],
+        *,
+        actor: str,
+        dispatch_id: str,
+        reason: str,
+    ) -> int:
+        """Reopen completed rows without allocating another task id.
+
+        Redispatch is a new dispatch attempt on the same requirement. Keep its
+        existing dispatch history and identity, but clear completion fields so
+        the task-store deriver presents the row as open again.
+        """
+        clean_ids = []
+        for task_id in task_ids:
+            if isinstance(task_id, str) and task_id and task_id not in clean_ids:
+                clean_ids.append(task_id)
+        if not clean_ids:
+            return 0
+        if not isinstance(dispatch_id, str) or not dispatch_id:
+            raise TaskError("redispatch reopen requires dispatch_id")
+
+        def update(items: list[dict[str, Any]]) -> int:
+            by_id = {item["id"]: item for item in items}
+            missing = [task_id for task_id in clean_ids if task_id not in by_id]
+            if missing:
+                raise TaskError(f"{self.tasks_path}: item not found: {', '.join(missing)}")
+            changed = 0
+            for task_id in clean_ids:
+                item = by_id[task_id]
+                if not (
+                    item.get("done") is True
+                    or item.get("done_reviewed") is True
+                ):
+                    continue
+                item["done"] = False
+                for key in (
+                    "done_at",
+                    "done_by",
+                    "done_reviewed",
+                    "done_reviewed_at",
+                    "done_reviewed_by",
+                    "reviewed_by",
+                    "closed_at",
+                    "closed_by",
+                    "resolution",
+                    "accepted_review_dispatch_id",
+                    "accepted_review_findings_ref",
+                ):
+                    item.pop(key, None)
+                _append_audit(
+                    item,
+                    "redispatch-reopen",
+                    actor,
+                    dispatch_id=dispatch_id,
+                    reason=reason,
+                )
+                changed += 1
+            return changed
+
+        return self.mutate_items(update)
+
     def derived_rows(self) -> list[dict[str, Any]]:
         return self.derived_rows_for_items(self.load_items())
 
     def derived_rows_for_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        records_by_task = self._records_by_task()
+        all_records = self.project_ledger_records(include_superseded=True)
+        superseded_dispatch_ids = {
+            str(record.get("dispatch_id"))
+            for record in all_records
+            if record.get("superseded_by") and record.get("dispatch_id")
+        }
+        records_by_task: dict[str, list[dict[str, Any]]] = {}
+        for record in all_records:
+            if record.get("superseded_by"):
+                continue
+            for task_id in _record_task_ids(record):
+                records_by_task.setdefault(task_id, []).append(record)
         by_id = {item["id"]: item for item in items}
         rows = []
         for item in items:
             item_id = item["id"]
             row = dict(item)
-            row["derived_status"] = self._derive_status(item, records_by_task.get(item_id, []), by_id)
+            dispatches = row.get("dispatches")
+            if superseded_dispatch_ids and isinstance(dispatches, LIST_TYPE):
+                row["dispatches"] = [
+                    crumb
+                    for crumb in dispatches
+                    if not (
+                        isinstance(crumb, dict)
+                        and str(crumb.get("dispatch_id") or "")
+                        in superseded_dispatch_ids
+                    )
+                ]
+            row["derived_status"] = self._derive_status(row, records_by_task.get(item_id, []), by_id)
             row["query_epoch"] = _item_query_epoch(row)
             query_time = _iso_from_epoch(row["query_epoch"])
             if query_time:

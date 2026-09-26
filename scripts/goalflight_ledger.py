@@ -1659,6 +1659,11 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "parent_dispatch_id",
                 "model",
                 "reasoning_effort",
+                "superseded_by",
+                "superseded_at",
+                "supersession_actor",
+                "supersession_reason",
+                "wip_ref",
             ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
