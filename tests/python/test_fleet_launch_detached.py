@@ -101,7 +101,14 @@ def _prompt_b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
-def _args(state_dir: Path, dispatch_id: str, prompt_text: str, *, recover: bool = False) -> SimpleNamespace:
+def _args(
+    state_dir: Path,
+    dispatch_id: str,
+    prompt_text: str,
+    *,
+    recover: bool = False,
+    account: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         repo_root=str(ROOT),
         state_dir=str(state_dir),
@@ -114,6 +121,7 @@ def _args(state_dir: Path, dispatch_id: str, prompt_text: str, *, recover: bool 
         read_only=False,
         recover_unconfirmed=recover,
         base_sha=BASE_SHA,
+        account=account,
     )
 
 
@@ -180,6 +188,22 @@ def test_clean_first_launch_creates_marker_and_spawns() -> None:
         assert_true(
             "no prebound seat env",
             fleet_launch.goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV not in spawn_kwargs["env"],
+        )
+
+
+def test_launch_forwards_billing_account_to_child_dispatch() -> None:
+    dispatch_id = "acp-account-launch"
+    prompt_text = "account-pinned prompt"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        args = _args(state_dir, dispatch_id, prompt_text, account="openai/default")
+        with patched_spawn() as calls:
+            code = fleet_launch._launch(args)
+        child_argv = calls[0]["argv"]
+        assert_true("launch ok", code == 0)
+        assert_true(
+            "child billing account",
+            child_argv[child_argv.index("--account") + 1] == "default",
         )
 
 

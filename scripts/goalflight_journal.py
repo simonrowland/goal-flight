@@ -5864,6 +5864,77 @@ class Journal:
 
         return self._domain_write(action)
 
+    def rebind_prepared_attempt_account(
+        self,
+        dispatch_id: str,
+        *,
+        expected_effective_account: str | None,
+        effective_account: str,
+        engine: str | None = None,
+    ) -> WriteResult[AttemptIdentity]:
+        """Retarget one still-prepared attempt after account failover.
+
+        Account failover happens after the waiting row is prepared. Keep the
+        journal's immutable-at-start account assertion aligned with the lease
+        before the launcher records STARTING.
+        """
+        dispatch = self._identity_token(dispatch_id, label="dispatch_id")
+        target_account = str(effective_account or "").strip()
+        if not target_account:
+            raise ValueError("effective_account must be a non-empty string")
+        asserted_engine = (
+            engine if isinstance(engine, str) and engine.strip() else None
+        )
+
+        def action(connection: sqlite3.Connection) -> AttemptIdentity:
+            existing = connection.execute(
+                """
+                SELECT attempt_id, dispatch_id, launch_token, launch_epoch,
+                       lifecycle_state, effective_account, engine
+                FROM dispatch_attempts WHERE dispatch_id = ?
+                """,
+                (dispatch,),
+            ).fetchone()
+            if existing is None:
+                raise CASMismatch("prepared dispatch attempt is missing")
+            identity = AttemptIdentity(
+                str(existing["attempt_id"]),
+                str(existing["dispatch_id"]),
+                str(existing["launch_token"]),
+                int(existing["launch_epoch"]),
+                str(existing["lifecycle_state"]),
+            )
+            if identity.lifecycle_state != ATTEMPT_PREPARED:
+                raise CASMismatch(
+                    "prepared dispatch attempt already crossed the launch boundary"
+                )
+            if existing["effective_account"] != expected_effective_account:
+                raise CASMismatch("prepared dispatch account attribution changed")
+            if asserted_engine is not None and (
+                existing["engine"] is not None
+                and existing["engine"] != asserted_engine
+            ):
+                raise CASMismatch("prepared dispatch engine changed")
+            cursor = connection.execute(
+                """
+                UPDATE dispatch_attempts
+                SET effective_account = ?, engine = COALESCE(engine, ?)
+                WHERE attempt_id = ? AND lifecycle_state = 'PREPARED'
+                  AND effective_account IS ?
+                """,
+                (
+                    target_account,
+                    asserted_engine,
+                    identity.attempt_id,
+                    expected_effective_account,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CASMismatch("prepared dispatch account retarget lost")
+            return identity
+
+        return self._domain_write(action)
+
     def start_attempt(
         self,
         attempt_id: str,

@@ -1271,6 +1271,30 @@ def attach_worker_to_capacity_lease(
             save_state(data)
 
 
+def rebind_capacity_lease_account(lease_id: str | None, account: str | None) -> bool:
+    """Transfer one still-reserved lease to a failover account.
+
+    Account failover keeps the already-acquired machine slot. Rebinding under
+    the capacity lock changes its account attribution atomically, so the old
+    and new account are never counted as two active sessions.
+    """
+    if not lease_id:
+        return False
+    account = str(account or "").strip()
+    if not account:
+        return False
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if not lease or lease.get("state") != "active":
+            return False
+        if lease.get("worker_pid") is not None or lease.get("launch_state") != "reserved":
+            return False
+        lease["account"] = account
+        save_state(data)
+        return True
+
+
 def mark_lease_spawning(lease_id: str | None) -> bool:
     """Record the irreversible handoff from reservation to worker spawn."""
     if not lease_id:

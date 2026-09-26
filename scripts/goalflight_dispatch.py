@@ -277,6 +277,12 @@ _DASHBOARD_REFRESH_DISABLE_FLAG = (
 CODE_WRITER_MAX_IDLE_SECS = 3600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "moonshot", "cursor", "cursor-agent"}
 
+# Usage-reader health is launch admission evidence, not a durable account
+# property. Keep the bound explicit so a cached healthy row cannot silently
+# become permission to bill an unpinned launch forever.
+CODEX_USAGE_PROBE_MAX_AGE_S = 5 * 60.0
+CODEX_USAGE_PROBE_FUTURE_SKEW_S = 5.0
+
 
 class PreAdmitClass(Enum):
     LIVE = "live"
@@ -6945,6 +6951,7 @@ def _preflight_codex_resume_account(
     requested = str(getattr(args, "account", None) or "").strip() or None
     if requested is None:
         raise DispatchUsageError("resume refused: Codex account is missing")
+    _refuse_walled_codex_account(requested)
     try:
         preflight_home, effective_account = resolve_codex_home(
             project_root,
@@ -8568,6 +8575,7 @@ def _resolve_account_env(
                 "Set that account's creds there, or omit --account for the host default. "
                 "Refusing to bill the wrong account."
             )
+        _refuse_walled_codex_account(account)
         return {"CODEX_HOME": str(home)}
     if not home.exists():
         raise DispatchUsageError(
@@ -8688,6 +8696,8 @@ def _call_resolve_codex_seat(
     project_root: Path | str,
     explicit_account: str | None,
     dispatch_id: str,
+    *,
+    propagate_errors: bool = False,
 ) -> tuple[str | None, str | None]:
     try:
         resolved = api.resolve_codex_seat(
@@ -8696,6 +8706,8 @@ def _call_resolve_codex_seat(
             dispatch_id,
         )
     except BaseException:
+        if propagate_errors:
+            raise
         return None, None
     if not isinstance(resolved, tuple) or len(resolved) != 2:
         return None, None
@@ -8723,6 +8735,9 @@ def _codex_account_admission_reason(
         return "walled or quota-blocked"
     if probe is not True:
         return "health probe unknown"
+    weekly_reason = _codex_weekly_resume_reserve_reason(account, usage_rows)
+    if weekly_reason is not None:
+        return weekly_reason
     try:
         budget = goalflight_capacity.launch_slot_budget(
             "codex",
@@ -8764,11 +8779,13 @@ def _codex_usage_probe_says_usable(
     account: str,
     *,
     rows: list[dict] | None = None,
+    now: float | None = None,
 ) -> bool | None:
     """Return usage-reader health for one account, without seat-state fallback."""
     import goalflight_usage as usage
 
     account_key = usage._label(account) or ""
+    current_time = time.time() if now is None else float(now)
     candidates = _codex_usage_probe_rows() if rows is None else rows
     for row in candidates:
         if str(row.get("provider") or "") != "codex":
@@ -8782,6 +8799,17 @@ def _codex_usage_probe_says_usable(
             if isinstance(probe, dict)
             else usage._probe_state(row)
         )
+        observed_at = (
+            usage.parse_reset(probe.get("observed_at"))
+            if isinstance(probe, dict)
+            else None
+        )
+        if (
+            observed_at is None
+            or observed_at > current_time + CODEX_USAGE_PROBE_FUTURE_SKEW_S
+            or current_time - observed_at > CODEX_USAGE_PROBE_MAX_AGE_S
+        ):
+            return None
         if state == "walled" or "walled" in (row.get("flags") or ()):
             return False
         if state != "reported":
@@ -8793,10 +8821,202 @@ def _codex_usage_probe_says_usable(
     return None
 
 
+def _codex_account_usage_rows(
+    account: str,
+    rows: list[dict],
+) -> list[dict]:
+    import goalflight_usage as usage
+
+    account_key = usage._label(account) or ""
+    return [
+        row
+        for row in rows
+        if (
+            isinstance(row, dict)
+            and str(row.get("provider") or "") == "codex"
+            and (usage._label(row.get("account")) or "") == account_key
+        )
+    ]
+
+
+def _codex_weekly_resume_reserve_reason(
+    account: str,
+    rows: list[dict] | None,
+) -> str | None:
+    """Reject an account whose measured weekly budget is reserved for resumes."""
+    if rows is None:
+        return None
+    import goalflight_usage as usage
+
+    weekly_keys = (
+        "weekly_used_percent",
+        "weekly_remaining_percent",
+    )
+    account_rows = _codex_account_usage_rows(account, rows)
+    for row in account_rows:
+        weekly = row.get("weekly")
+        mappings = [row]
+        if isinstance(weekly, dict):
+            mappings.append(weekly)
+        observed = False
+        used_values: list[float] = []
+        for mapping in mappings:
+            for key in weekly_keys:
+                if key not in mapping:
+                    continue
+                observed = True
+                value = usage._number(mapping.get(key))
+                if value is None:
+                    return "weekly headroom unknown"
+                if key == "weekly_used_percent":
+                    used_values.append(value)
+                else:
+                    used_values.append(100.0 - value)
+        if observed and any(value >= 90.0 for value in used_values):
+            return "weekly resume reserve"
+    return None
+
+
+def _codex_account_headroom(
+    account: str,
+    rows: list[dict],
+) -> float | None:
+    """Return measured provider headroom for a healthy account."""
+    import goalflight_usage as usage
+
+    if _codex_usage_probe_says_usable(account, rows=rows) is not True:
+        return None
+    for row in _codex_account_usage_rows(account, rows):
+        remaining = usage._number(row.get("remaining"))
+        if remaining is None:
+            used = usage._number(row.get("used"))
+            if used is not None:
+                remaining = 100.0 - used
+        if remaining is not None and math.isfinite(remaining):
+            return max(0.0, min(100.0, remaining))
+    return None
+
+
+def _refuse_walled_codex_account(
+    account: str,
+    *,
+    usage_rows: list[dict] | None = None,
+) -> None:
+    """Refuse a pinned account without current, usable quota evidence."""
+    import goalflight_usage as usage
+
+    rows = _codex_usage_probe_rows() if usage_rows is None else usage_rows
+    probe = _codex_usage_probe_says_usable(account, rows=rows)
+    if probe is None:
+        raise DispatchUsageError(
+            f"Codex account {account!r} health probe unknown or stale; "
+            "refusing pinned launch; refresh the usage probe"
+        )
+    if probe is not False and not (
+        probe is not True and _account_quota_blocked(account, engine="codex")
+    ):
+        return
+    account_rows = _codex_account_usage_rows(account, rows)
+    soonest = usage.soonest_reset(account_rows)
+    reset_at = usage.parse_reset(soonest.get("reset_at")) if soonest else None
+    if reset_at is None:
+        cooldown = _effective_account_cooldown(account)
+        reset_at = _parse_timestamp_s(cooldown) if cooldown else None
+    reset_text = (
+        dt.datetime.fromtimestamp(reset_at, tz=dt.timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        if reset_at is not None and math.isfinite(reset_at)
+        else "unknown"
+    )
+    raise DispatchUsageError(
+        f"Codex account {account!r} is quota-walled; refusing launch; "
+        f"wait for its soonest reset at {reset_text}"
+    )
+
+
+def _pre_resolve_pinned_codex_account(
+    args,
+    *,
+    project_root: Path | str,
+    dispatch_id: str,
+) -> None:
+    """Resolve an explicit Codex pin before capacity or ledger admission."""
+    if (
+        _account_engine(getattr(args, "agent", "")) != "codex"
+        or not getattr(args, "account", None)
+        or getattr(args, "_codex_account_pre_resolved", False)
+    ):
+        return
+    resume_pre_resolved = getattr(args, "_codex_resume_pre_resolved", None)
+    if isinstance(resume_pre_resolved, dict):
+        args._codex_account_pre_resolved = True
+        args._codex_pre_resolved_home = resume_pre_resolved.get("home")
+        args._codex_pre_resolved_account = resume_pre_resolved.get("account")
+        return
+    requested = str(args.account).strip()
+    parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
+    if parent_dispatch_id:
+        parent_record = _find_dispatch_record(parent_dispatch_id) or {}
+        parent_account = parent_record.get("effective_account") or parent_record.get(
+            "account"
+        )
+        canonical_home = goalflight_codex_sessions.canonical_account_home(
+            parent_account
+        )
+        recorded_parent_home = parent_record.get("codex_home")
+        source_is_canonical = (
+            canonical_home is not None
+            and isinstance(recorded_parent_home, str)
+            and Path(recorded_parent_home).expanduser() == canonical_home
+        )
+        if source_is_canonical and requested == parent_account:
+            # A same-account canonical resume already has a validated shared
+            # home. Health validation is still required before admission, but
+            # rebuilding a per-dispatch home would change the resume source.
+            _refuse_walled_codex_account(requested)
+            home, effective_account = None, requested
+        else:
+            resolve_kwargs = {}
+            if getattr(args, "model", None) is not None:
+                resolve_kwargs["model"] = args.model
+            home, effective_account = resolve_codex_home(
+                project_root,
+                requested,
+                dispatch_id,
+                **resolve_kwargs,
+            )
+            if not (
+                isinstance(home, str)
+                and home
+                and isinstance(effective_account, str)
+                and effective_account
+            ):
+                raise DispatchUsageError(
+                    f"resume refused: Codex account {requested!r} could not be resolved"
+                )
+    else:
+        home, effective_account = resolve_codex_home(
+            project_root,
+            requested,
+            dispatch_id,
+            model=getattr(args, "model", None),
+        )
+    args._codex_account_pre_resolved = True
+    args._codex_pre_resolved_home = home
+    args._codex_pre_resolved_account = effective_account
+    if parent_dispatch_id:
+        args._codex_resume_pre_resolved = {
+            "home": home,
+            "account": effective_account,
+        }
+
+
 def select_codex_account(
     *,
     model: str | None = None,
     explicit_account: str | None = None,
+    exclude_accounts: set[str] | None = None,
 ) -> tuple[str | None, list[dict[str, str]]]:
     """Pick a healthy Codex account with capacity headroom.
 
@@ -8808,15 +9028,26 @@ def select_codex_account(
     if explicit_account:
         return explicit_account.strip() or None, []
     rejected: list[dict[str, str]] = []
+    excluded = {str(account).strip() for account in (exclude_accounts or set())}
     usage_rows = _codex_usage_probe_rows()
+    candidates: list[tuple[float, str]] = []
     for account in _configured_account_names("codex"):
+        if account in excluded:
+            continue
         reason = _codex_account_admission_reason(
             account, model=model, usage_rows=usage_rows
         )
-        if reason is None:
-            return account, rejected
-        rejected.append({"account": account, "reason": reason})
-    return None, rejected
+        if reason is not None:
+            rejected.append({"account": account, "reason": reason})
+            continue
+        headroom = _codex_account_headroom(account, usage_rows)
+        if headroom is None:
+            rejected.append({"account": account, "reason": "headroom unknown"})
+            continue
+        candidates.append((headroom, account))
+    if not candidates:
+        return None, rejected
+    return min(candidates, key=lambda item: (-item[0], item[1]))[1], rejected
 
 
 def resolve_codex_home(
@@ -8826,7 +9057,7 @@ def resolve_codex_home(
     *,
     model: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Resolve one launch snapshot without ever failing the dispatch.
+    """Resolve one launch snapshot, refusing invalid explicit pins.
 
     An explicit ``--account`` is honored as a pin. Unpinned selection first
     chooses a measured healthy account with per-account capacity headroom,
@@ -8839,12 +9070,18 @@ def resolve_codex_home(
     selectable, the launch still proceeds on the inherited host login and the
     billed account is labelled ``host`` so the ledger does not record ``None``.
     """
+    if explicit_account:
+        _refuse_walled_codex_account(explicit_account)
     api = _codex_seat_api()
     if api is None:
         return None, None
     if explicit_account:
         return _call_resolve_codex_seat(
-            api, project_root, explicit_account, dispatch_id
+            api,
+            project_root,
+            explicit_account,
+            dispatch_id,
+            propagate_errors=True,
         )
     selected, rejected = select_codex_account(model=model)
     if selected:
@@ -8861,7 +9098,14 @@ def resolve_codex_home(
     # it is accepted; it cannot mask a healthy configured sibling.
     home, account = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
     if account:
-        reason = _codex_account_admission_reason(account)
+        usage_rows = _codex_usage_probe_rows()
+        reason = _codex_account_admission_reason(
+            account,
+            model=model,
+            usage_rows=usage_rows,
+        )
+        if reason is None and _codex_account_headroom(account, usage_rows) is None:
+            reason = "headroom unknown"
         if reason is None:
             return home, account
         rejected.append({"account": account, "reason": reason})
@@ -8894,6 +9138,8 @@ def _prepare_codex_account_for_capacity(
     admission and retain the result for the launch phase. Otherwise capacity
     would be charged to ``default`` before the resolver-selected account starts.
     """
+    if _codex_seat_api() is None:
+        return None, [], None, None, True
     selected, rejected = select_codex_account(model=model)
     if selected:
         return selected, rejected, None, None, False
@@ -8911,6 +9157,133 @@ def _prepare_codex_account_for_capacity(
         None if effective_account in {None, "host"} else effective_account
     )
     return capacity_account, rejected, home, effective_account, True
+
+
+def _codex_post_capacity_admission_reason(
+    account: str,
+    *,
+    usage_rows: list[dict],
+) -> str | None:
+    """Return an account's post-wait health/wall failure, excluding capacity."""
+    probe = _codex_usage_probe_says_usable(account, rows=usage_rows)
+    if probe is False:
+        return "walled or quota-blocked"
+    if probe is not True:
+        return "health probe unknown or stale"
+    return _codex_weekly_resume_reserve_reason(account, usage_rows)
+
+
+def revalidate_codex_account_after_capacity(
+    args,
+    *,
+    project_root: Path | str,
+    dispatch_id: str,
+    lease_id: str | None = None,
+) -> str | None:
+    """Recheck the selected Codex account after admission and fail over once.
+
+    The capacity lease already held by this dispatch is transferred to an
+    alternate account; this function never acquires a second lease.
+    """
+    if _account_engine(getattr(args, "agent", "")) != "codex":
+        return None
+
+    explicit_account = str(getattr(args, "account", None) or "").strip() or None
+    pre_resolved = getattr(args, "_codex_resume_pre_resolved", None)
+    pre_resolved_account = (
+        pre_resolved.get("account")
+        if isinstance(pre_resolved, dict)
+        else getattr(args, "_codex_pre_resolved_account", None)
+    )
+    chosen_account = (
+        explicit_account
+        or (str(pre_resolved_account).strip() if pre_resolved_account else None)
+        or getattr(args, "_codex_selected_account", None)
+        or getattr(args, "_capacity_account", None)
+    )
+    chosen_account = str(chosen_account).strip() if chosen_account else None
+    if not chosen_account or chosen_account == "host":
+        return chosen_account
+
+    usage_rows = _codex_usage_probe_rows()
+    reason = _codex_post_capacity_admission_reason(
+        chosen_account,
+        usage_rows=usage_rows,
+    )
+    if reason is None:
+        return chosen_account
+
+    if explicit_account:
+        # Preserve the detailed reset/health diagnostic used by pre-admission
+        # pin checks, while marking this as the no-spawn refusal path.
+        setattr(args, "_codex_post_capacity_pinned_refusal", True)
+        _refuse_walled_codex_account(explicit_account, usage_rows=usage_rows)
+        raise DispatchUsageError(
+            f"Codex account {explicit_account!r} is no longer eligible after "
+            f"capacity admission: {reason}"
+        )
+
+    alternate, rejections = select_codex_account(
+        model=getattr(args, "model", None),
+        exclude_accounts={chosen_account},
+    )
+    if not alternate:
+        raise DispatchUsageError(
+            f"Codex account {chosen_account!r} became unusable after capacity "
+            "admission; no eligible failover account is available"
+        )
+
+    if lease_id and not goalflight_capacity.rebind_capacity_lease_account(
+        lease_id, alternate
+    ):
+        raise DispatchUsageError(
+            f"Codex account failover {chosen_account!r} -> {alternate!r} "
+            "lost the reserved capacity lease"
+        )
+
+    args._codex_selected_account = alternate
+    args._capacity_account = alternate
+    args._codex_account_rejections = rejections
+    target_effective_account = alternate
+    if getattr(args, "_codex_account_pre_resolved", False) or isinstance(
+        pre_resolved, dict
+    ):
+        home, effective_account = resolve_codex_home(
+            project_root,
+            alternate,
+            dispatch_id,
+            model=getattr(args, "model", None),
+        )
+        if not (
+            isinstance(home, str)
+            and home
+            and isinstance(effective_account, str)
+            and effective_account
+        ):
+            raise DispatchUsageError(
+                f"Codex account failover {chosen_account!r} -> {alternate!r} "
+                "could not be resolved"
+            )
+        args._codex_account_pre_resolved = True
+        args._codex_pre_resolved_home = home
+        args._codex_pre_resolved_account = effective_account
+        args._codex_resume_pre_resolved = {
+            "home": home,
+            "account": effective_account,
+        }
+        target_effective_account = effective_account
+    retarget = goalflight_journal.Journal(project_root).rebind_prepared_attempt_account(
+        dispatch_id,
+        expected_effective_account=chosen_account,
+        effective_account=target_effective_account,
+        engine="codex",
+    )
+    if not retarget.committed:
+        raise DispatchUsageError(
+            f"Codex account failover {chosen_account!r} -> {alternate!r} "
+            f"could not retarget the prepared ledger attempt: {retarget.reason}"
+        )
+    return target_effective_account
 
 
 def cleanup_codex_dispatch_home(dispatch_id: str) -> None:
@@ -9424,6 +9797,12 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
     it into their own warnings. Only when no worker was spawned does a
     refusal raise, unchanged.
     """
+    if effective_account is None:
+        effective_account = (
+            getattr(args, "_capacity_account", None)
+            or getattr(args, "effective_account", None)
+            or getattr(args, "_codex_selected_account", None)
+        )
     spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
 
     def _record_once() -> tuple[int, dict | None]:
@@ -20564,6 +20943,13 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         account=getattr(args, "account", None),
         _grok_selected_account=getattr(args, "_grok_selected_account", None),
         _grok_selection_complete=hasattr(args, "_grok_selected_account"),
+        _codex_account_pre_resolved=getattr(
+            args, "_codex_account_pre_resolved", False
+        ),
+        _codex_pre_resolved_home=getattr(args, "_codex_pre_resolved_home", None),
+        _codex_pre_resolved_account=getattr(
+            args, "_codex_pre_resolved_account", None
+        ),
         project_root=str(project_root),
         cwd=str(acp_cwd) if acp_cwd is not None else None,
         worktree=acp_worktree,
@@ -22210,6 +22596,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             # Before any worktree bind. This gate reads the ledger and the task
             # store, not the worktree, and a refusal must not become the occupant.
             _refuse_launch_blocked_by_completion_authority(args)
+            _pre_resolve_pinned_codex_account(
+                args,
+                project_root=_project_root(args),
+                dispatch_id=args.dispatch_id,
+            )
             # The ACP runner owns the complete account -> capacity -> worktree
             # sequence, including explicit --cwd resumes. A refusal must not
             # create, reset, or occupy a checkout in this parent process.
@@ -22462,6 +22853,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             args._codex_pre_resolved_account = pre_resolved_account
             codex_dispatch_home = pre_resolved_home
             effective_account = pre_resolved_account
+        _pre_resolve_pinned_codex_account(
+            args,
+            project_root=project_root,
+            dispatch_id=args.dispatch_id,
+        )
         if _account_engine(args.agent) == "grok" and not getattr(args, "account", None):
             args._capacity_account = grok_selected_account(args)
         if resume_plan is not None:
@@ -22560,6 +22956,15 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 )
             if capacity_signal_guard is None:
                 capacity_signal_guard = _install_capacity_lease_signal_guard(lease_id)
+            if _account_engine(args.agent) == "codex":
+                post_capacity_account = revalidate_codex_account_after_capacity(
+                    args,
+                    project_root=project_root,
+                    dispatch_id=args.dispatch_id,
+                    lease_id=lease_id,
+                )
+                if post_capacity_account is not None:
+                    effective_account = post_capacity_account
         except (SystemExit, KeyboardInterrupt) as exc:
             # Queue exhausted or interrupted: the status file already says
             # blocked_capacity; make the ledger finish agree instead of the
@@ -22769,16 +23174,13 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         args, "_codex_pre_resolved_account", None
                     )
                 else:
-                    try:
-                        codex_dispatch_home, effective_account = resolve_codex_home(
-                            project_root,
-                            getattr(args, "_codex_selected_account", None)
-                            or args.account,
-                            args.dispatch_id,
-                            model=getattr(args, "model", None),
-                        )
-                    except BaseException:
-                        codex_dispatch_home, effective_account = None, None
+                    codex_dispatch_home, effective_account = resolve_codex_home(
+                        project_root,
+                        getattr(args, "_codex_selected_account", None)
+                        or args.account,
+                        args.dispatch_id,
+                        model=getattr(args, "model", None),
+                    )
                 if codex_dispatch_home is None and effective_account is None:
                     canonical_home = goalflight_codex_sessions.canonical_account_home(
                         getattr(args, "account", None)
@@ -23451,6 +23853,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             (
                 getattr(args, "_worktree_occupancy_refused", False)
                 or getattr(args, "_worktree_seat_refused", False)
+                or getattr(args, "_codex_post_capacity_pinned_refusal", False)
             )
             and not worker_spawn_attempted
         ):

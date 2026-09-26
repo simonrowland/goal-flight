@@ -478,6 +478,7 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         )
         status_json = str(params.get("status_json") or "").strip()
         base_sha = str(params.get("base_sha") or "").strip()
+        account = str(params.get("account") or "").strip()
         if not dispatch_id or not agent or not node_id or not status_json:
             raise SshAllowlistError("launch_detached requires dispatch_id, node_id, agent, and status_json")
         if not base_sha:
@@ -517,6 +518,8 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if bool(params.get("recover_unconfirmed")):
             argv.append("--recover-unconfirmed")
         argv.extend(["--base-sha", base_sha])
+        if account:
+            argv.extend(["--account", account])
     elif command_class == "ferry_preflight":
         python = _validate_remote_interpreter(python, repo_root=repo_root, field="ferry_preflight python")
         allowed_roots = [_remote_norm(root) for root in list(params.get("allowed_roots") or []) if str(root or "").strip()]

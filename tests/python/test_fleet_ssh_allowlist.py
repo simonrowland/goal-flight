@@ -247,6 +247,7 @@ def test_launch_detached_uses_helper_and_prompt_b64() -> None:
         status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
         python="python3",
         base_sha=BASE_SHA,
+        account="openai/default",
     )
     assert_true("helper", argv[1].endswith("goalflight_fleet_launch_detached.py"))
     assert_true("subcommand", "launch" in argv)
@@ -256,6 +257,7 @@ def test_launch_detached_uses_helper_and_prompt_b64() -> None:
     assert_true("node id", argv[argv.index("--node-id") + 1] == "build-1")
     assert_true("status json", argv[argv.index("--status-json") + 1].endswith("status.json"))
     assert_true("base sha", argv[argv.index("--base-sha") + 1] == BASE_SHA)
+    assert_true("billing account", argv[argv.index("--account") + 1] == "openai/default")
 
 
 def test_launch_detached_recovery_flag_is_allowlisted() -> None:

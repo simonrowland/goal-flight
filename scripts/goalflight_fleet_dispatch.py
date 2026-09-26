@@ -435,6 +435,7 @@ def build_remote_command_plan(
     agent: str,
     prompt: str,
     base_sha: str,
+    billing_account: str | None = None,
     recover_unconfirmed: bool = False,
 ) -> list[dict[str, Any]]:
     import goalflight_fleet_ssh as fleet_ssh
@@ -459,6 +460,7 @@ def build_remote_command_plan(
                 "python": str(node_entry.get("python") or "python3"),
                 "recover_unconfirmed": recover_unconfirmed,
                 "base_sha": base_sha,
+                "account": billing_account,
             },
         ),
     ):
@@ -530,6 +532,7 @@ def preview_dispatch(
             agent=resolved_agent,
             prompt=prompt,
             base_sha=resolved_base_sha,
+            billing_account=resolved_billing,
             recover_unconfirmed=recover_unconfirmed,
         ),
     )

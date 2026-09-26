@@ -206,6 +206,11 @@ def test_explicit_dry_run_preview() -> None:
             "/tmp/goal-flight-dispatch-test/dispatches/acp-dispatch-explicit/status.json"
             in launch["argv"],
         )
+        assert_true(
+            "launch billing account",
+            launch["argv"][launch["argv"].index("--account") + 1]
+            == "openai/default",
+        )
 
 
 def test_red_auth_blocks_exec() -> None:

@@ -10,6 +10,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +58,15 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_DISABLE_NUDGES", "1")
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CODEX_CONTEXT_MODE", raising=False)
+    # Resume tests exercise rollout/home ownership. Give their explicitly
+    # named accounts the same fresh health evidence a real probe supplies so
+    # they do not accidentally test the routing refusal path.
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda _account, **_kwargs: True,
+    )
+    monkeypatch.setattr(D, "_codex_usage_probe_rows", lambda: [])
     for key in (
         "GOALFLIGHT_CONTROLLER_LABEL",
         "GOALFLIGHT_CONTROLLER_PID",
@@ -3255,6 +3265,26 @@ def test_unpinned_codex_selection_skips_recently_exhausted_seat(
         D,
         "_codex_usage_probe_says_usable",
         lambda account, **kwargs: account == "25ca6b",
+    )
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_rows",
+        lambda: [
+            {
+                "provider": "codex",
+                "account": account,
+                "remaining": "80%",
+                "reset_at": "2030-01-02T03:04:05Z",
+                "flags": [],
+                "evidence": {
+                    "probe": {
+                        "state": "reported",
+                        "observed_at": time.time(),
+                    }
+                },
+            }
+            for account in ("4c9435", "25ca6b")
+        ],
     )
 
     home, account = D.resolve_codex_home(tmp_path, None, "fresh-dispatch")

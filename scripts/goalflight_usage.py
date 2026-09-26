@@ -519,25 +519,29 @@ def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]
     failure = _failed_record(record)
     if failure is not None:
         remaining, flag = failure
-        return _row(
+        row = _row(
             "codex",
             account=account,
             remaining=remaining,
             reset_at=reset_at,
             flags=(flag,),
         )
+        _preserve_codex_weekly_fields(row, record)
+        return row
 
     used = _number(record.get("used_percent"))
     if used is None:
-        return _row(
+        row = _row(
             "codex",
             account=account,
             remaining="unknown",
             reset_at=reset_at,
         )
+        _preserve_codex_weekly_fields(row, record)
+        return row
     remaining_value = _percent_remaining(used)
     flags = ("walled",) if used >= 100 or remaining_value <= 0 else ()
-    return _row(
+    row = _row(
         "codex",
         account=account,
         remaining=f"{_format_number(remaining_value)}%",
@@ -545,6 +549,36 @@ def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]
         reset_at=reset_at,
         flags=flags,
     )
+    _preserve_codex_weekly_fields(row, record)
+    return row
+
+
+def _preserve_codex_weekly_fields(
+    row: dict[str, object], record: Mapping[str, Any]
+) -> None:
+    """Carry optional weekly quota evidence through the normalized row."""
+    usage_mapping = record.get("usage")
+    sources = [record]
+    if isinstance(usage_mapping, Mapping):
+        sources.append(usage_mapping)
+    weekly_mapping = record.get("weekly")
+    if isinstance(weekly_mapping, Mapping):
+        sources.append(weekly_mapping)
+    weekly: dict[str, object] = {}
+    for normalized_key in (
+        "weekly_used_percent",
+        "weekly_remaining_percent",
+    ):
+        for source in sources:
+            if normalized_key in source:
+                weekly[normalized_key] = source[normalized_key]
+                break
+        if normalized_key not in weekly and isinstance(weekly_mapping, Mapping):
+            short_key = normalized_key.removeprefix("weekly_")
+            if short_key in weekly_mapping:
+                weekly[normalized_key] = weekly_mapping[short_key]
+    if weekly:
+        row.update(weekly)
 
 
 _STALE_HOST_TOKEN_NOTE = "stale host token"

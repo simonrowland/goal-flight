@@ -136,6 +136,22 @@ def _ensure_local_bin_on_path(env: dict[str, str]) -> None:
     env["PATH"] = f"{local_bin}{os.pathsep}{path}" if path else local_bin
 
 
+def _local_account_name(account: object) -> str | None:
+    """Translate a fleet billing key into the node-local account name."""
+    value = str(account or "").strip()
+    if not value:
+        return None
+    if "/" not in value:
+        return value
+    provider, separator, local_name = value.partition("/")
+    if provider == "openai" and separator and local_name and "/" not in local_name:
+        return local_name
+    raise ValueError(
+        f"fleet account {value!r} cannot be forwarded as a local account; "
+        "expected a bare account name or openai/<name>"
+    )
+
+
 def _dispatch_dir(state_dir: Path, dispatch_id: str) -> Path:
     return state_dir / "dispatches" / dispatch_id
 
@@ -541,6 +557,11 @@ def _existing_receipt(args: argparse.Namespace, status_json: Path, state_dir: Pa
 
 
 def _launch(args: argparse.Namespace) -> int:
+    try:
+        local_account = _local_account_name(getattr(args, "account", None))
+    except ValueError as exc:
+        print(f"goalflight_fleet_launch_detached: {exc}", file=sys.stderr)
+        return 64
     repo_root = Path(args.repo_root).expanduser()
     state_dir = Path(args.state_dir).expanduser()
     dispatch_dir = _dispatch_dir(state_dir, args.dispatch_id)
@@ -667,6 +688,8 @@ def _launch(args: argparse.Namespace) -> int:
         "--status-json",
         str(status_json),
     ]
+    if local_account:
+        cmd.extend(["--account", local_account])
     if args.read_only:
         cmd.append("--read-only")
 
@@ -848,6 +871,7 @@ def main(argv: list[str] | None = None) -> int:
     launch.add_argument("--prompt-b64", required=True)
     launch.add_argument("--state-dir", required=True)
     launch.add_argument("--status-json", required=True)
+    launch.add_argument("--account")
     launch.add_argument("--read-only", action="store_true")
     launch.add_argument("--recover-unconfirmed", action="store_true")
     launch.add_argument("--base-sha", required=True)

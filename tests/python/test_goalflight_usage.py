@@ -86,6 +86,24 @@ def test_normalizes_codex_epoch_and_walled_state():
     assert rows[1]["flags"] == ["walled"]
 
 
+def test_normalizes_codex_weekly_reserve_fields():
+    spec = usage.ReaderSpec("codex", "codex", "codex_usage.py")
+    row = usage.normalize_payload(
+        spec,
+        [
+            {
+                "seat": "seat-a",
+                "used_percent": 20,
+                "weekly_used_percent": 95,
+                "reset_at": 2_000_000_000,
+                "ok": True,
+            }
+        ],
+    )[0]
+
+    assert row["weekly_used_percent"] == 95
+
+
 def test_normalizes_kimi_nested_usage_and_iso_reset():
     # The ext reader's payload contract (key/label/source) keeps the kimi
     # product names; the DISPLAY provider maps to the moonshot handle.

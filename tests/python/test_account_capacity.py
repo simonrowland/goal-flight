@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import json
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,23 @@ def _acquire(
             _args(account=account, model=model, max_total=max_total, agent=agent)
         )
     return rc, json.loads(out.getvalue())
+
+
+def test_reserved_lease_rebind_moves_one_account_attribution(isolated_capacity):
+    rc, payload = _acquire("alpha")
+    assert rc == 0, payload
+    lease_id = payload["lease"]["lease_id"]
+
+    assert cap.rebind_capacity_lease_account(lease_id, "beta") is True
+
+    lease = cap.load_state()["leases"][lease_id]
+    assert lease["account"] == "beta"
+    rows = cap.account_capacity_rows(cap.active_leases(cap.load_state()))
+    assert rows["codex/alpha"]["active_weight"] == 0.0
+    assert rows["codex/beta"]["active_weight"] == 1.0
+
+    assert cap.mark_lease_spawning(lease_id) is True
+    assert cap.rebind_capacity_lease_account(lease_id, "alpha") is False
 
 
 def test_accounts_fill_independently_and_machine_ceiling_still_binds(isolated_capacity):
@@ -206,6 +224,14 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["walled", "healthy"])
     monkeypatch.setattr(
         dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [
+            _codex_probe_row("walled", "0%", state="walled"),
+            _codex_probe_row("healthy", "80%"),
+        ],
+    )
+    monkeypatch.setattr(
+        dispatch,
         "_codex_usage_probe_says_usable",
         lambda account, **kwargs: account == "healthy",
     )
@@ -222,6 +248,140 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     selected, rejected = dispatch.select_codex_account()
     assert selected == "healthy"
     assert rejected == [{"account": "walled", "reason": "walled or quota-blocked"}]
+
+
+def _codex_probe_row(
+    account: str,
+    remaining: str,
+    *,
+    state: str = "reported",
+    weekly_used_percent: float | None = None,
+    observed_at: float | None = None,
+) -> dict:
+    row = {
+        "provider": "codex",
+        "account": account,
+        "remaining": remaining,
+        "reset_at": "2030-01-02T03:04:05Z",
+        "flags": ["walled"] if state == "walled" else [],
+        "evidence": {"probe": {"state": state}},
+    }
+    row["evidence"]["probe"]["observed_at"] = (
+        time.time() if observed_at is None else observed_at
+    )
+    if weekly_used_percent is not None:
+        row["weekly_used_percent"] = weekly_used_percent
+    return row
+
+
+def test_stale_codex_probe_is_unknown_and_not_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 2_000_000_000.0
+    stale = _codex_probe_row(
+        "stale", "95%", observed_at=now - dispatch.CODEX_USAGE_PROBE_MAX_AGE_S - 1
+    )
+    future = _codex_probe_row(
+        "future", "90%", observed_at=now + dispatch.CODEX_USAGE_PROBE_FUTURE_SKEW_S + 1
+    )
+    fresh = _codex_probe_row("fresh", "40%", observed_at=now)
+    monkeypatch.setattr(dispatch.time, "time", lambda: now)
+    monkeypatch.setattr(
+        dispatch, "_configured_account_names", lambda engine: ["stale", "future", "fresh"]
+    )
+    monkeypatch.setattr(dispatch, "_codex_usage_probe_rows", lambda: [stale, future, fresh])
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda _agent, *, account, **_kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {f"codex/{account}": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    assert dispatch._codex_usage_probe_says_usable("stale", rows=[stale], now=now) is None
+    assert dispatch._codex_usage_probe_says_usable("future", rows=[future], now=now) is None
+    selected, rejected = dispatch.select_codex_account()
+
+    assert selected == "fresh"
+    assert rejected == [
+        {"account": "stale", "reason": "health probe unknown"},
+        {"account": "future", "reason": "health probe unknown"},
+    ]
+
+
+def test_pinned_codex_dispatch_refuses_walled_account_with_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    account_home = tmp_path / ".goal-flight" / "accounts" / "walled" / "codex"
+    account_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [_codex_probe_row("walled", "0%", state="walled")],
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+
+    with pytest.raises(
+        dispatch.DispatchUsageError,
+        match=r"walled.*walled.*2030-01-02T03:04:05",
+    ):
+        dispatch._resolve_account_env(
+            SimpleNamespace(agent="codex", account="walled", model=None)
+        )
+
+
+def test_pinned_codex_dispatch_refuses_unknown_health(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    account_home = tmp_path / ".goal-flight" / "accounts" / "unknown" / "codex"
+    account_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [_codex_probe_row("unknown", "unknown")],
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+
+    with pytest.raises(
+        dispatch.DispatchUsageError,
+        match=r"unknown.*health probe unknown or stale",
+    ):
+        dispatch._resolve_account_env(
+            SimpleNamespace(agent="codex", account="unknown", model=None)
+        )
+
+
+def test_pinned_codex_resume_refuses_walled_account_with_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [_codex_probe_row("walled", "0%", state="walled")],
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch,
+        "resolve_codex_home",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("walled resume must refuse before home resolution")
+        ),
+    )
+
+    with pytest.raises(
+        dispatch.DispatchUsageError,
+        match=r"walled.*walled.*2030-01-02T03:04:05",
+    ):
+        dispatch._preflight_codex_resume_account(
+            SimpleNamespace(account="walled"),
+            project_root=tmp_path,
+            dispatch_id="resume-walled",
+        )
 
 
 def test_walled_grok_account_does_not_block_healthy_account(monkeypatch):
@@ -261,6 +421,14 @@ def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monk
     home.mkdir()
     (home / "sessions").mkdir()
     monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["walled", "healthy"])
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [
+            _codex_probe_row("walled", "0%", state="walled"),
+            _codex_probe_row("healthy", "80%"),
+        ],
+    )
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_says_usable",
@@ -304,7 +472,9 @@ def test_selection_uses_usage_health_over_seat_state(monkeypatch):
                 "account": "alpha",
                 "remaining": "80%",
                 "flags": [],
-                "evidence": {"probe": {"state": "reported"}},
+                "evidence": {
+                    "probe": {"state": "reported", "observed_at": time.time()}
+                },
             }
         ],
     )
@@ -323,6 +493,71 @@ def test_selection_uses_usage_health_over_seat_state(monkeypatch):
     assert rejected == []
 
 
+def test_codex_selection_uses_most_measured_headroom(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        dispatch,
+        "_configured_account_names",
+        lambda engine: ["unknown", "alpha", "beta"],
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [
+            _codex_probe_row("unknown", "unknown"),
+            _codex_probe_row("alpha", "20%"),
+            _codex_probe_row("beta", "80%"),
+        ],
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda *args, **kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {f"codex/{kwargs['account']}": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    selected, rejected = dispatch.select_codex_account()
+
+    assert selected == "beta"
+    assert rejected == [{"account": "unknown", "reason": "health probe unknown"}]
+
+
+def test_codex_selection_preserves_weekly_resume_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        dispatch,
+        "_configured_account_names",
+        lambda engine: ["reserved", "available"],
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda: [
+            _codex_probe_row("reserved", "95%", weekly_used_percent=95),
+            _codex_probe_row("available", "80%", weekly_used_percent=40),
+        ],
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda *args, **kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {f"codex/{kwargs['account']}": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    selected, rejected = dispatch.select_codex_account()
+
+    assert selected == "available"
+    assert rejected == [{"account": "reserved", "reason": "weekly resume reserve"}]
+
+
 def test_unverified_resolver_account_is_not_promoted(monkeypatch, tmp_path):
     home = tmp_path / "unverified-home"
     monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: [])
@@ -332,6 +567,39 @@ def test_unverified_resolver_account_is_not_promoted(monkeypatch, tmp_path):
     monkeypatch.setattr(usage, "collect_usage", lambda **kwargs: [])
 
     assert dispatch.resolve_codex_home(tmp_path, None, "unknown-health") == (
+        None,
+        "host",
+    )
+
+
+def test_resolver_only_account_without_numeric_headroom_is_not_promoted(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "unmeasured-home"
+    monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: [])
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(
+            resolve_codex_seat=lambda *_args: (str(home), "mystery")
+        ),
+    )
+    monkeypatch.setattr(dispatch, "_codex_usage_probe_rows", lambda: [])
+    monkeypatch.setattr(
+        dispatch, "_codex_usage_probe_says_usable", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda *args, **kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {"codex/mystery": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    assert dispatch.resolve_codex_home(tmp_path, None, "unmeasured-health") == (
         None,
         "host",
     )

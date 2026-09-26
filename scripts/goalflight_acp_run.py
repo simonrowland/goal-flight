@@ -2708,6 +2708,18 @@ async def _run_acp_dispatch_impl(
             # Linux / unsupported platform: defer to spawn-time check.
             pass
 
+    # Explicit Codex pins must resolve before capacity and ledger admission. The
+    # dispatcher performs this preflight for normal launches; keep the runner
+    # boundary equally safe for direct ACP callers and detached children.
+    if goalflight_ledger.infer_engine(cfg.agent) == "codex":
+        import goalflight_dispatch
+
+        goalflight_dispatch._pre_resolve_pinned_codex_account(
+            cfg,
+            project_root=project_root,
+            dispatch_id=dispatch_id,
+        )
+
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
     lease_ttl_s = max(int(cfg.idle_timeout or (36000 if cfg.mode == "goal" else 300)) * 4, 3600)
     codex_selected_account = getattr(cfg, "_codex_selected_account", None)
@@ -2790,6 +2802,12 @@ async def _run_acp_dispatch_impl(
     preserve_capacity_refusal_attempt = bool(
         getattr(cfg, "preserve_capacity_refusal_attempt", False)
     )
+    if (
+        effective_account is None
+        and goalflight_ledger.infer_engine(cfg.agent) == "codex"
+        and not getattr(cfg, "account", None)
+    ):
+        effective_account = capacity_account
     # Publish ownership before waiting so duplicate dispatch-id guards can see
     # direct launches as well as claimed backlog entries. Only the latter keep
     # their journal attempt PREPARED after a refusal; the queue claim is their
@@ -4243,7 +4261,11 @@ async def _run_acp_dispatch_impl(
         and goalflight_ledger.infer_engine(cfg.agent) == "codex"
     )
     if is_local_codex:
-        setattr(cfg, "_codex_dispatch_home_resolved", False)
+        setattr(
+            cfg,
+            "_codex_dispatch_home_resolved",
+            bool(getattr(cfg, "_codex_pre_resolved_home", None)),
+        )
         # The adapter spawn consumes this captured dict, so re-finalize the
         # Codex environment only after capacity succeeds and immediately before
         # the starting-ledger/spawn block.
@@ -4254,39 +4276,44 @@ async def _run_acp_dispatch_impl(
         except BaseException:
             dispatch_module = None
         codex_home = None
-        if dispatch_module is not None:
+
+    try:
+        if is_local_codex and dispatch_module is not None:
+            post_capacity_account = (
+                dispatch_module.revalidate_codex_account_after_capacity(
+                    cfg,
+                    project_root=project_root,
+                    dispatch_id=dispatch_id,
+                    lease_id=lease_id,
+                )
+            )
+            if post_capacity_account is not None:
+                effective_account = post_capacity_account
             if getattr(cfg, "_codex_account_pre_resolved", False):
                 codex_home = getattr(cfg, "_codex_pre_resolved_home", None)
                 effective_account = getattr(
                     cfg, "_codex_pre_resolved_account", None
-                )
+                ) or effective_account
             else:
+                codex_home, effective_account = dispatch_module.resolve_codex_home(
+                    project_root,
+                    getattr(cfg, "_codex_selected_account", None)
+                    or getattr(cfg, "account", None),
+                    dispatch_id,
+                    model=getattr(cfg, "model", None),
+                )
+            if codex_home is not None:
+                spawn_env["CODEX_HOME"] = codex_home
+                setattr(cfg, "_codex_dispatch_home_resolved", True)
+            if getattr(cfg, "context_mode", "enabled") == "disabled":
                 try:
-                    codex_home, effective_account = dispatch_module.resolve_codex_home(
-                        project_root,
-                        getattr(cfg, "_codex_selected_account", None)
-                        or getattr(cfg, "account", None),
-                        dispatch_id,
-                        model=getattr(cfg, "model", None),
+                    context_mode_defined = dispatch_module.codex_context_mode_defined(
+                        spawn_env
                     )
                 except BaseException:
-                    codex_home, effective_account = None, None
-        if codex_home is not None:
-            spawn_env["CODEX_HOME"] = codex_home
-            setattr(cfg, "_codex_dispatch_home_resolved", True)
-        if getattr(cfg, "context_mode", "enabled") == "disabled":
-            try:
-                context_mode_defined = (
-                    dispatch_module.codex_context_mode_defined(spawn_env)
-                    if dispatch_module is not None
-                    else _codex_context_mode_defined(spawn_env)
-                )
-            except BaseException:
-                context_mode_defined = _codex_context_mode_defined(spawn_env)
-            if not context_mode_defined:
-                cfg.context_mode = "enabled"
-
-    try:
+                    context_mode_defined = _codex_context_mode_defined(spawn_env)
+                if not context_mode_defined:
+                    cfg.context_mode = "enabled"
         cleanup_ghosts()
         try:
             import goalflight_dispatch
@@ -5079,6 +5106,10 @@ async def _run_acp_dispatch_impl(
                 }
             )
     except Exception as e:
+        if getattr(cfg, "_codex_post_capacity_pinned_refusal", False):
+            with contextlib.suppress(Exception):
+                if dispatch_module is not None:
+                    dispatch_module._discard_preworker_ledger(cfg)
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or (getattr(conn, "heartbeat_outcome", None) if conn else None)
             terminal_error = heartbeat_error
