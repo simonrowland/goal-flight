@@ -52,6 +52,7 @@ import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
 import errno
+import fnmatch
 import hashlib
 try:
     import fcntl
@@ -96,7 +97,12 @@ import goalflight_session_status
 import goalflight_task
 import goalflight_terminal
 import goalflight_worktree_pool
-from goalflight_agent_limits import moonshot_family
+from goalflight_agent_limits import (
+    agent_model_allowlist,
+    model_refusal,
+    moonshot_family,
+    normalize_agent,
+)
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import (
     active_monotonic,
@@ -4399,6 +4405,38 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
     return account_env
 
 
+def _refuse_configured_model(model: object, agent: object) -> None:
+    refusal = model_refusal(model)
+    if refusal is None:
+        label = normalize_agent(str(agent or ""))
+        policy_agent = "cursor" if _account_engine(label) == "cursor" else label
+        patterns = agent_model_allowlist(policy_agent)
+        if patterns is None:
+            return
+        if isinstance(model, str) and any(
+            fnmatch.fnmatchcase(model.casefold(), pattern.casefold())
+            for pattern in patterns
+        ):
+            return
+        model_name = model if isinstance(model, str) else "<missing>"
+        allowed = ", ".join(patterns) if patterns else "(none)"
+        message = (
+            f"agent {policy_agent} model {model_name} is refused by operator "
+            f"policy (capacity config agent_model_allow); allowed patterns: {allowed}; "
+            "pass an explicit --model matching an allowed pattern"
+        )
+        raise DispatchUsageError(message)
+    model_name = str(model)
+    message = (
+        f"model {model_name} is refused by operator policy "
+        "(capacity config refused_models)"
+    )
+    replacement = refusal[1]
+    if replacement is not None:
+        message += f"; use --model {replacement}"
+    raise DispatchUsageError(message)
+
+
 def _nonterminal_dispatch_reuse_reason(
     dispatch_id: str,
     *,
@@ -7052,6 +7090,22 @@ def _cmd_resume(argv: list[str]) -> int:
         ),
     )
     args = parser.parse_args(argv)
+
+    parent_record = _find_dispatch_record(args.dispatch_id)
+    if isinstance(parent_record, dict):
+        effective_model = (
+            args.model
+            if args.model is not None
+            else _resume_model_from_record(parent_record)
+        )
+        try:
+            _refuse_configured_model(
+                effective_model,
+                parent_record.get("agent") or parent_record.get("engine"),
+            )
+        except DispatchUsageError as exc:
+            print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+            return 64
 
     prompt_path = Path(args.prompt_file).expanduser()
     if not prompt_path.is_file():
@@ -23282,9 +23336,13 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
     try:
+        if resume_plan is None:
+            _refuse_configured_model(
+                getattr(args, "model", None), getattr(args, "agent", None)
+            )
         _validate_reasoning_effort_route(args, raw)
     except DispatchUsageError as exc:
-        print(exc, file=sys.stderr)
+        print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
     if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
         print(

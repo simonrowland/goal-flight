@@ -164,6 +164,8 @@ def cap_pool(agent: str) -> str:
 #                    optional slot weights; omitted models weigh 1.0             #
 #   "agent_rss_mb": {agent: int}  merged over AGENT_RSS_MB                      #
 #   "worker_rss_ceiling_mb": int  per-worker watcher RSS ceiling                #
+#   "refused_models": {model: replacement|null}  operator launch policy         #
+#   "agent_model_allow": {agent: [glob, ...]}  optional model allowlists        #
 #   "hard_cap":     int           raw ceiling for goalflight_capacity          #
 #   "operating_total"|"max_total": int  persistent machine operating cap       #
 #      (equivalent to $GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit  #
@@ -211,6 +213,41 @@ def _merge_int_map(target: dict, override: object) -> None:
 
 
 LOCAL_OVERRIDES = load_local_overrides()
+
+
+def model_refusal(model: object) -> tuple[str, str | None] | None:
+    """Return the configured refused model and replacement, if any."""
+    if not isinstance(model, str):
+        return None
+    refused_models = LOCAL_OVERRIDES.get("refused_models")
+    if not isinstance(refused_models, dict):
+        return None
+    for refused, replacement in refused_models.items():
+        if not isinstance(refused, str) or refused.casefold() != model.casefold():
+            continue
+        suggestion = replacement.strip() if isinstance(replacement, str) else ""
+        return refused, suggestion or None
+    return None
+
+
+def agent_model_allowlist(agent: object) -> tuple[str, ...] | None:
+    """Return configured model globs for an agent, or None when unrestricted."""
+    allowlists = LOCAL_OVERRIDES.get("agent_model_allow")
+    if not isinstance(allowlists, dict):
+        return None
+    label = normalize_agent(str(agent or ""))
+    if label not in allowlists:
+        return None
+    configured = allowlists[label]
+    if not isinstance(configured, list):
+        return ()
+    return tuple(
+        pattern.strip()
+        for pattern in configured
+        if isinstance(pattern, str) and pattern.strip()
+    )
+
+
 # Snapshot the committed baseline BEFORE local overrides are merged in place:
 # seeding a fresh machine must plant the shipped defaults, not whatever this
 # particular box happens to have been hand-tuned to.
@@ -428,6 +465,8 @@ def seed_capacity_conf(path: Path | None = None, *, force: bool = False) -> dict
         "agent_caps": dict(COMMITTED_AGENT_CAPS),
         "account_caps": {},
         "model_weights": {},
+        "refused_models": {},
+        "agent_model_allow": {},
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

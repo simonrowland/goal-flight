@@ -518,6 +518,23 @@ Capacity checks apply default per-agent caps. Per-machine overrides come from
 `$GOALFLIGHT_CAPACITY_CONF` else `~/.goal-flight/capacity.local.json`;
 `agent_caps` merge over defaults. Hard caps are placeholders, not laws;
 provider budgets may be shared by labels.
+`refused_models` is an optional operator policy map from exact model ids to a
+suggested replacement (or `null`); matching ignores case. `agent_model_allow`
+is an optional map from agent family to case-insensitive model glob patterns;
+the `cursor` family key covers `cursor`, `cursor-agent`, and Cursor ACP. An
+absent key adds no restriction. Example:
+
+```json
+{
+  "refused_models": {"gpt-5.6-luna": "gpt-6-luna"},
+  "agent_model_allow": {
+    "cursor": ["grok-*", "cursor-grok-*", "kimi-k3-*"]
+  }
+}
+```
+
+For this example, `--agent cursor --model grok-4.7-high` is allowed. A Cursor
+dispatch with no explicit model, or one outside these patterns, is refused.
 
 ### Adaptive walkback
 
