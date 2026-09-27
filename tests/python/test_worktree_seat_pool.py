@@ -352,6 +352,16 @@ def make_sparse_repo(root: Path) -> tuple[Path, str, Path]:
     return repo, git(repo, "rev-parse", "HEAD"), pattern
 
 
+def make_sparse_quarantine_repo(root: Path) -> tuple[Path, str, Path]:
+    repo, _base, pattern = make_sparse_repo(root)
+    excluded = repo / "docs-private" / "build" / "remote-pytest"
+    (excluded / "other.txt").write_text("untouched evidence\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("* text=auto eol=lf\n", encoding="utf-8")
+    git(repo, "add", "--", ".")
+    git(repo, "commit", "-m", "sparse quarantine fixture")
+    return repo, git(repo, "rev-parse", "HEAD"), pattern
+
+
 def write_pool_config(
     root: Path, repo: Path, pattern: Path | None = None
 ) -> Path:
@@ -412,6 +422,190 @@ def test_dirty_sparse_seat_is_quarantined_and_stays_sparse(
         ).splitlines()
         assert len(branches) == 1
         assert git(repo, "show", f"{branches[0]}:included.txt") == "abandoned edit"
+
+
+def test_sparse_excluded_tracked_edit_is_preserved_in_quarantine(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, base, pattern = make_sparse_quarantine_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-hidden")
+    hidden = abandoned.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt"
+    hidden.parent.mkdir(parents=True, exist_ok=True)
+    hidden.write_text("hidden edit\n", encoding="utf-8")
+    (abandoned.path / "included.txt").write_text("ordinary edit\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+
+    with goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-hidden-next") as reused:
+        assert_clean_seat(reused.path, base)
+        assert not hidden.exists()
+        branches = git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/goalflight/quarantine/",
+        ).splitlines()
+        assert len(branches) == 1
+        branch = branches[0]
+        assert git(repo, "show", f"{branch}:docs-private/build/remote-pytest/evidence.txt") == (
+            "hidden edit"
+        )
+        assert git(repo, "show", f"{branch}:docs-private/build/remote-pytest/other.txt") == (
+            "untouched evidence"
+        )
+        assert git(repo, "show", f"{branch}:included.txt") == "ordinary edit"
+
+
+def test_sparse_excluded_untracked_file_is_quarantined(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, base, pattern = make_sparse_quarantine_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-untracked")
+    artifact = abandoned.path / "docs-private" / "build" / "remote-pytest" / "new-artifact.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("new artifact\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+
+    with goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-untracked-next") as reused:
+        assert_clean_seat(reused.path, base)
+        assert not artifact.exists()
+        branches = git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/goalflight/quarantine/",
+        ).splitlines()
+        assert len(branches) == 1
+        assert git(repo, "show", f"{branches[0]}:docs-private/build/remote-pytest/new-artifact.txt") == (
+            "new artifact"
+        )
+
+
+def test_sparse_quarantine_content_mismatch_retains_seat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _base, pattern = make_sparse_quarantine_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-mismatch")
+    edited = abandoned.path / "included.txt"
+    edited.write_text("before staging\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+    real_git = goalflight_worktree_pool._git
+
+    def inject_mismatch(cwd: Path, *args: str, **kwargs: object) -> str:
+        result = real_git(cwd, *args, **kwargs)
+        if cwd.resolve() == abandoned.path.resolve() and args == (
+            "add",
+            "--sparse",
+            "-A",
+            "--",
+            ".",
+        ):
+            edited.write_text("after staging\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", inject_mismatch)
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatResetRefused,
+        match="does not match worktree path",
+    ):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-mismatch-next")
+    assert edited.read_text(encoding="utf-8") == "after staging\n"
+    assert git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads/goalflight/quarantine/",
+    ) == ""
+
+
+def test_sparse_quarantine_recreated_deleted_path_retains_seat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _base, pattern = make_sparse_quarantine_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-recreated")
+    edited = abandoned.path / "included.txt"
+    edited.unlink()
+    finish_seat_holder(abandoned)
+    real_git = goalflight_worktree_pool._git
+
+    def inject_recreated_path(cwd: Path, *args: str, **kwargs: object) -> str:
+        result = real_git(cwd, *args, **kwargs)
+        if cwd.resolve() == abandoned.path.resolve() and args == (
+            "add",
+            "--sparse",
+            "-A",
+            "--",
+            ".",
+        ):
+            edited.write_text("recreated edit\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", inject_recreated_path)
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatResetRefused,
+        match="does not match worktree path",
+    ):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-recreated-next")
+    assert edited.read_text(encoding="utf-8") == "recreated edit\n"
+    assert git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads/goalflight/quarantine/",
+    ) == ""
+
+
+def test_sparse_quarantine_recreated_rename_source_retains_seat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _base, pattern = make_sparse_quarantine_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-rename")
+    original = abandoned.path / "included.txt"
+    renamed = abandoned.path / "renamed.txt"
+    git(abandoned.path, "mv", "included.txt", "renamed.txt")
+    finish_seat_holder(abandoned)
+    real_git = goalflight_worktree_pool._git
+
+    def inject_rename_source(cwd: Path, *args: str, **kwargs: object) -> str:
+        result = real_git(cwd, *args, **kwargs)
+        if cwd.resolve() == abandoned.path.resolve() and args == (
+            "add",
+            "--sparse",
+            "-A",
+            "--",
+            ".",
+        ):
+            original.write_text("recreated source\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", inject_rename_source)
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatResetRefused,
+        match="does not match worktree path",
+    ):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-rename-next")
+    assert original.read_text(encoding="utf-8") == "recreated source\n"
+    assert renamed.read_text(encoding="utf-8") == "keep me\n"
+    assert git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads/goalflight/quarantine/",
+    ) == ""
 
 
 def test_sparse_skip_worktree_path_present_retains_seat(

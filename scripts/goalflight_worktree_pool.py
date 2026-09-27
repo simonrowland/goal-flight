@@ -3300,11 +3300,26 @@ def _precheck_quarantine_worktree(
     *,
     seat_name: str,
     timeout: float | None = None,
-) -> tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]]:
+) -> tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str], bool]:
     hidden_entries = _nul_paths(
         _git_nul(worktree_path, "ls-files", "-v", "-z", timeout=timeout)
     )
-    sparse_checkout_enabled: bool | None = None
+    sparse_config = _git_proc(
+        worktree_path,
+        "config",
+        "--worktree",
+        "--bool",
+        "--get",
+        "core.sparseCheckout",
+        timeout=timeout,
+    )
+    sparse_config_error = sparse_config is None or sparse_config.returncode not in (0, 1)
+    sparse_checkout_enabled = bool(
+        not sparse_config_error
+        and sparse_config is not None
+        and sparse_config.returncode == 0
+        and sparse_config.stdout.strip().lower() == "true"
+    )
     for entry in hidden_entries:
         if len(entry) < 3 or entry[1] != " ":
             raise WorktreeSeatResetRefused(
@@ -3319,21 +3334,6 @@ def _precheck_quarantine_worktree(
             )
         if tag != "S":
             continue
-        if sparse_checkout_enabled is None:
-            sparse_config = _git_proc(
-                worktree_path,
-                "config",
-                "--worktree",
-                "--bool",
-                "--get",
-                "core.sparseCheckout",
-                timeout=timeout,
-            )
-            sparse_checkout_enabled = bool(
-                sparse_config is not None
-                and sparse_config.returncode == 0
-                and sparse_config.stdout.strip().lower() == "true"
-            )
         if not sparse_checkout_enabled:
             raise WorktreeSeatResetRefused(
                 f"dirty worktree {seat_name} has hidden index entry {path!r}; "
@@ -3477,7 +3477,7 @@ def _precheck_quarantine_worktree(
             )
         if lfs_paths:
             _prove_lfs_objects(worktree_path, lfs_paths, timeout=timeout)
-    return reserved_untracked, product, dirty_paths
+    return reserved_untracked, product, dirty_paths, sparse_checkout_enabled
 
 
 def _quarantine_dirty_worktree(
@@ -3485,20 +3485,23 @@ def _quarantine_dirty_worktree(
     *,
     seat_name: str,
     abandoned_dispatch_id: str,
-    precheck: tuple[list[str], list[tuple[str, tuple[str, ...]]], list[str]] | None = None,
+    precheck: tuple[
+        list[str], list[tuple[str, tuple[str, ...]]], list[str], bool
+    ]
+    | None = None,
 ) -> str | None:
     if precheck is None:
         precheck = _precheck_quarantine_worktree(
             worktree_path,
             seat_name=seat_name,
         )
-    reserved_untracked, product, dirty_paths = precheck
+    reserved_untracked, product, dirty_paths, sparse_checkout_enabled = precheck
     if not product:
         return None
 
     # Seed the temporary index from the real index so staged content, including
-    # force-added ignored files, is preserved. `git add -A` adds other dirty
-    # paths; ignored untracked notes are intentionally left out of the tree.
+    # force-added ignored files, is preserved. Sparse seats need --sparse so
+    # edits and untracked files under excluded paths are included.
     with tempfile.TemporaryDirectory(prefix="goalflight-quarantine-") as temporary:
         temporary_index = Path(temporary) / "index"
         real_index = Path(_git(worktree_path, "rev-parse", "--git-path", "index"))
@@ -3511,7 +3514,65 @@ def _quarantine_dirty_worktree(
                 f"cannot copy real index for quarantine: {exc}; refusing reset"
             ) from exc
         index_env = {**os.environ, "GIT_INDEX_FILE": str(temporary_index)}
-        _git(worktree_path, "add", "-A", "--", ".", env=index_env)
+        add_args = ["add"]
+        if sparse_checkout_enabled:
+            add_args.append("--sparse")
+        add_args.extend(["-A", "--", "."])
+        _git(worktree_path, *add_args, env=index_env)
+        staged_status = _parse_porcelain_z(
+            _git_nul(
+                worktree_path,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+                env=index_env,
+            )
+        )
+        worktree_changes = [
+            record
+            for record in staged_status
+            if _status_is_product(record)
+            and (record[0] == "??" or record[0][1] not in {" ", "?"})
+        ]
+        if worktree_changes:
+            changed_paths = list(
+                dict.fromkeys(
+                    path for _status, paths in worktree_changes for path in paths
+                )
+            )
+            raise WorktreeSeatResetRefused(
+                f"temporary quarantine index does not match worktree path(s) "
+                f"{changed_paths!r}; refusing reset"
+            )
+        verification_paths = tuple(
+            dict.fromkeys(path for _status, paths in product for path in paths)
+        )
+        for path in verification_paths:
+            verified = _git_proc(
+                worktree_path,
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--",
+                path,
+                env=index_env,
+            )
+            if verified is None or verified.returncode not in (0, 1):
+                detail = "git diff could not verify worktree content"
+                if verified is not None:
+                    detail = (verified.stderr or verified.stdout or "").strip() or detail
+                raise WorktreeSeatResetRefused(
+                    f"cannot verify quarantined path {path!r} ({detail}); "
+                    "refusing reset"
+                )
+            if verified.returncode != 0:
+                raise WorktreeSeatResetRefused(
+                    f"temporary quarantine index does not match worktree path "
+                    f"{path!r}; refusing reset"
+                )
         if reserved_untracked:
             _git(
                 worktree_path,
