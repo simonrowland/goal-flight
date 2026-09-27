@@ -2687,7 +2687,7 @@ def _create_seat_worktree(
     branch: str,
     base_commit: str,
     keep_id: str,
-) -> None:
+) -> bool:
     # A deleted checkout can remain in Git's worktree admin list. The path is
     # proven absent at this point, so prune stale registration before the
     # replacement add; never prune an occupied or merely unreadable path.
@@ -2712,6 +2712,15 @@ def _create_seat_worktree(
     sparse_pattern = _configured_seat_sparse_pattern(project_root)
     sparse_reason: str | None = None
     sparse_core_worktree = False
+    if sparse_pattern is not None and not any(
+        line.strip() == "/*" for line in sparse_pattern.splitlines()
+    ):
+        print(
+            f"goalflight seat sparse: {project_root}: pattern must include '/*'; "
+            "creating a full seat",
+            file=sys.stderr,
+        )
+        sparse_pattern = None
     if sparse_pattern is not None:
         try:
             common_config = _git_common_dir(project_root) / "config"
@@ -2732,12 +2741,13 @@ def _create_seat_worktree(
                 sparse_reason = "common Git config does not enable extensions.worktreeConfig"
             else:
                 for setting in ("core.worktree", "core.bare"):
+                    config_args = ("--bool", "--get") if setting == "core.bare" else ("--get",)
                     configured = _git_proc(
                         project_root,
                         "config",
                         "--file",
                         str(common_config),
-                        "--get",
+                        *config_args,
                         setting,
                     )
                     if configured is None or configured.returncode not in (0, 1):
@@ -2748,9 +2758,14 @@ def _create_seat_worktree(
                             ).strip() or detail
                         sparse_reason = detail
                         break
-                    if configured.returncode == 0:
+                    if configured.returncode != 0:
+                        continue
+                    if setting == "core.worktree":
                         sparse_reason = f"common Git config sets {setting}"
-                        sparse_core_worktree = setting == "core.worktree"
+                        sparse_core_worktree = True
+                        break
+                    if configured.stdout.strip().lower() == "true":
+                        sparse_reason = f"common Git config sets {setting}=true"
                         break
         except (OSError, WorktreeSeatError) as exc:
             sparse_reason = f"cannot inspect common Git config: {exc}"
@@ -2797,7 +2812,7 @@ def _create_seat_worktree(
                 "core.worktree",
                 str(worktree_path),
             )
-        return
+        return False
 
     add_args = ["worktree", "add", "--no-checkout"]
     if exists.returncode == 0:
@@ -2840,20 +2855,46 @@ def _create_seat_worktree(
             raise WorktreeSeatError(
                 f"sparse seat is dirty after checkout: {status.splitlines()[0]}"
             )
-        skipped = next(
-            (
-                entry[2:]
-                for entry in _git_nul(worktree_path, "ls-files", "-t", "-z").split("\0")
-                if entry.startswith("S ")
-            ),
-            None,
-        )
-        if skipped is None:
+        tagged_entries = [
+            entry
+            for entry in _git_nul(worktree_path, "ls-files", "-t", "-z").split("\0")
+            if entry
+        ]
+        if any(len(entry) < 3 or entry[1] != " " for entry in tagged_entries):
+            raise WorktreeSeatError("sparse seat has malformed tracked path tags")
+        skipped = [entry[2:] for entry in tagged_entries if entry.startswith("S ")]
+        populated = [entry[2:] for entry in tagged_entries if not entry.startswith("S ")]
+        expected_populated_count = len(tagged_entries) - len(skipped)
+        if len(populated) != expected_populated_count:
+            raise WorktreeSeatError("sparse seat tracked path count did not verify")
+        if not skipped:
             raise WorktreeSeatError("sparse pattern excluded no tracked path")
-        if (worktree_path / skipped).exists():
-            raise WorktreeSeatError(
-                f"sparse path {skipped!r} is still present on disk"
-            )
+        if not populated:
+            raise WorktreeSeatError("sparse pattern excluded every tracked path")
+        for path in skipped[:1]:
+            try:
+                (worktree_path / path).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise WorktreeSeatError(
+                    f"cannot inspect sparse path {path!r}: {exc}"
+                ) from exc
+            raise WorktreeSeatError(f"sparse path {path!r} is still present on disk")
+        populated_on_disk = False
+        for path in populated:
+            try:
+                (worktree_path / path).lstat()
+                populated_on_disk = True
+                break
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise WorktreeSeatError(
+                    f"included sparse path {path!r} is missing: {exc}"
+                ) from exc
+        if not populated_on_disk:
+            raise WorktreeSeatError("sparse pattern populated no tracked path on disk")
     except (OSError, UnicodeError, WorktreeSeatError) as exc:
         rollback_error: str | None = None
         disabled = _git_proc(worktree_path, "sparse-checkout", "disable")
@@ -2895,6 +2936,8 @@ def _create_seat_worktree(
                 raise WorktreeSeatError("full-seat rollback left sparse paths enabled")
         except (OSError, UnicodeError, WorktreeSeatError) as rollback_exc:
             rollback_error = str(rollback_exc)
+        else:
+            rollback_error = None
         if rollback_error is not None:
             print(
                 f"goalflight seat sparse: setup failed for {worktree_path}: {exc}; "
@@ -2909,6 +2952,8 @@ def _create_seat_worktree(
             "restored full seat",
             file=sys.stderr,
         )
+        return False
+    return True
 
 
 def _seat_head_from_metadata(worktree_path: Path) -> str | None:
@@ -3259,6 +3304,7 @@ def _precheck_quarantine_worktree(
     hidden_entries = _nul_paths(
         _git_nul(worktree_path, "ls-files", "-v", "-z", timeout=timeout)
     )
+    sparse_checkout_enabled: bool | None = None
     for entry in hidden_entries:
         if len(entry) < 3 or entry[1] != " ":
             raise WorktreeSeatResetRefused(
@@ -3266,11 +3312,46 @@ def _precheck_quarantine_worktree(
                 "refusing reset"
             )
         tag, path = entry[0], entry[2:]
-        if tag.islower() or tag == "S":
+        if tag.islower():
             raise WorktreeSeatResetRefused(
                 f"dirty worktree {seat_name} has hidden index entry {path!r}; "
                 "refusing reset"
             )
+        if tag != "S":
+            continue
+        if sparse_checkout_enabled is None:
+            sparse_config = _git_proc(
+                worktree_path,
+                "config",
+                "--worktree",
+                "--bool",
+                "--get",
+                "core.sparseCheckout",
+                timeout=timeout,
+            )
+            sparse_checkout_enabled = bool(
+                sparse_config is not None
+                and sparse_config.returncode == 0
+                and sparse_config.stdout.strip().lower() == "true"
+            )
+        if not sparse_checkout_enabled:
+            raise WorktreeSeatResetRefused(
+                f"dirty worktree {seat_name} has hidden index entry {path!r}; "
+                "refusing reset"
+            )
+        try:
+            (worktree_path / path).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise WorktreeSeatResetRefused(
+                f"cannot inspect sparse path {path!r} in dirty worktree "
+                f"{seat_name}; refusing reset"
+            ) from exc
+        raise WorktreeSeatResetRefused(
+            f"dirty worktree {seat_name} has hidden index entry {path!r}; "
+            "refusing reset"
+        )
 
     records = _status_records(worktree_path, timeout=timeout)
     submodule_paths = set()
@@ -3577,7 +3658,7 @@ def _prepare_claimed_seat_locked(
     # reset fails, the old owner (or an unknown owner) must remain visible so
     # a later allocator cannot mistake a partial checkout for a free seat.
     if not existing:
-        _create_seat_worktree(
+        sparse_applied = _create_seat_worktree(
             project_root,
             worktree_path,
             branch=branch,
@@ -3585,9 +3666,10 @@ def _prepare_claimed_seat_locked(
             keep_id=dispatch_id,
         )
         _verify_existing_seat(project_root, worktree_path)
-        # A newly created seat has no prior bytes to protect; in particular,
-        # sparse checkout marks excluded index entries as skip-worktree.
-        reset = False
+        # A sparse seat has no prior bytes to protect; its excluded index
+        # entries are skip-worktree. Full seats retain the old cleanup path.
+        if sparse_applied:
+            reset = False
     if not reset:
         actual = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
         try:

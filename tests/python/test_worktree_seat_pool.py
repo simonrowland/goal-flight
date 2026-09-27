@@ -346,7 +346,6 @@ def make_sparse_repo(root: Path) -> tuple[Path, str, Path]:
     (repo / "included.txt").write_text("keep me\n", encoding="utf-8")
     git(repo, "add", "--", ".")
     git(repo, "commit", "-m", "sparse fixture")
-    git(repo, "config", "--unset", "core.bare")
     git(repo, "config", "extensions.worktreeConfig", "true")
     pattern = root / "seat-sparse.pattern"
     pattern.write_text("/*\n!/docs-private/build/remote-pytest/\n", encoding="utf-8")
@@ -380,8 +379,100 @@ def test_configured_new_seat_uses_sparse_checkout(tmp_path: Path, monkeypatch) -
         assert (lease.path / "included.txt").is_file()
         assert not (lease.path / "docs-private" / "build" / "remote-pytest").exists()
         assert (repo / "docs-private" / "build" / "remote-pytest").is_dir()
+        assert git(repo, "config", "--get", "core.bare") == "false"
     finally:
         lease.release()
+
+
+def test_dirty_sparse_seat_is_quarantined_and_stays_sparse(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-old")
+    (abandoned.path / "included.txt").write_text("abandoned edit\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+
+    with goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-next") as reused:
+        assert reused.path.name == "s-1"
+        assert_clean_seat(reused.path, base)
+        assert (reused.path / "included.txt").read_text(encoding="utf-8") == "keep me\n"
+        assert not (reused.path / "docs-private" / "build" / "remote-pytest").exists()
+        assert (
+            git(reused.path, "config", "--worktree", "--bool", "--get", "core.sparseCheckout")
+            == "true"
+        )
+        branches = git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/goalflight/quarantine/",
+        ).splitlines()
+        assert len(branches) == 1
+        assert git(repo, "show", f"{branches[0]}:included.txt") == "abandoned edit"
+
+
+def test_sparse_skip_worktree_path_present_retains_seat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-present")
+    hidden = abandoned.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt"
+    hidden.parent.mkdir(parents=True, exist_ok=True)
+    hidden.write_text("hidden edit\n", encoding="utf-8")
+    (abandoned.path / "included.txt").write_text("ordinary edit\n", encoding="utf-8")
+    real_git_nul = goalflight_worktree_pool._git_nul
+
+    def preserve_present_skip_worktree(cwd: Path, *args: str, **kwargs: object) -> str:
+        listing = real_git_nul(cwd, *args, **kwargs)
+        if args[:3] != ("ls-files", "-v", "-z"):
+            return listing
+        normal = "H docs-private/build/remote-pytest/evidence.txt\0"
+        assert normal in listing
+        return listing.replace(normal, "S docs-private/build/remote-pytest/evidence.txt\0", 1)
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git_nul", preserve_present_skip_worktree)
+    finish_seat_holder(abandoned)
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatResetRefused, match="hidden index entry"):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-present-next")
+    assert hidden.read_text(encoding="utf-8") == "hidden edit\n"
+
+
+def test_sparse_lowercase_index_tag_retains_seat(tmp_path: Path, monkeypatch) -> None:
+    repo, _base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-lowercase")
+    (abandoned.path / "included.txt").write_text("hidden edit\n", encoding="utf-8")
+    git(abandoned.path, "update-index", "--assume-unchanged", "included.txt")
+    (abandoned.path / "tracked.txt").write_text("ordinary edit\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatResetRefused, match="hidden index entry"):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-lowercase-next")
+
+
+def test_sparse_skip_worktree_without_sparse_config_retains_seat(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, _base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    abandoned = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-disabled")
+    git(abandoned.path, "config", "--worktree", "core.sparseCheckout", "false")
+    (abandoned.path / "included.txt").write_text("ordinary edit\n", encoding="utf-8")
+    finish_seat_holder(abandoned)
+
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatResetRefused, match="hidden index entry"):
+        goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-disabled-next")
 
 
 def test_unconfigured_repo_keeps_full_new_seat(tmp_path: Path, monkeypatch) -> None:
@@ -397,20 +488,40 @@ def test_unconfigured_repo_keeps_full_new_seat(tmp_path: Path, monkeypatch) -> N
         lease.release()
 
 
-@pytest.mark.parametrize("precondition", ["worktree_config_false", "core_worktree"])
+@pytest.mark.parametrize(
+    "precondition", ["worktree_config_false", "core_worktree", "core_bare_true"]
+)
 def test_sparse_precondition_falls_back_without_shared_config_change(
     tmp_path: Path, monkeypatch, precondition: str
 ) -> None:
     repo, base, pattern = make_sparse_repo(tmp_path)
     if precondition == "worktree_config_false":
         git(repo, "config", "extensions.worktreeConfig", "false")
-    else:
+    elif precondition == "core_worktree":
         git(repo, "config", "core.worktree", str(repo))
     common_dir = Path(git(repo, "rev-parse", "--git-common-dir"))
     common_config = (common_dir if common_dir.is_absolute() else repo / common_dir) / "config"
     before = common_config.read_bytes()
     config = write_pool_config(tmp_path, repo, pattern)
     configure_pool_test_environment(monkeypatch, tmp_path, config)
+    if precondition == "core_bare_true":
+        real_git_proc = goalflight_worktree_pool._git_proc
+
+        def report_bare_true(
+            cwd: Path, *args: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str] | None:
+            if args == (
+                "config",
+                "--file",
+                str(common_config),
+                "--bool",
+                "--get",
+                "core.bare",
+            ):
+                return subprocess.CompletedProcess(["git", *args], 0, "true\n", "")
+            return real_git_proc(cwd, *args, **kwargs)
+
+        monkeypatch.setattr(goalflight_worktree_pool, "_git_proc", report_bare_true)
 
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, f"precondition-{precondition}")
     try:
@@ -436,6 +547,95 @@ def test_sparse_setup_failure_restores_full_clean_seat(
 
     monkeypatch.setattr(goalflight_worktree_pool, "_git", fail_sparse_setup)
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-failure")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+    assert "restored full seat" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "pattern_text",
+    [
+        "",
+        "/*\n!tracked.txt\n!included.txt\n!/docs-private/\n",
+    ],
+)
+def test_sparse_degenerate_pattern_falls_back_to_full_seat(
+    tmp_path: Path, monkeypatch, pattern_text: str
+) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    pattern.write_text(pattern_text, encoding="utf-8")
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-degenerate")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "tracked.txt").is_file()
+        assert (lease.path / "included.txt").is_file()
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+
+
+def test_full_seat_runs_post_create_cleanup(tmp_path: Path, monkeypatch) -> None:
+    repo, base, _pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+    real_git = goalflight_worktree_pool._git
+
+    def leave_full_seat_dirty(cwd: Path, *args: str, **kwargs: object) -> str:
+        result = real_git(cwd, *args, **kwargs)
+        if cwd.resolve() == repo.resolve() and args[:2] == ("worktree", "add"):
+            Path(args[-2]).joinpath("leftover.txt").write_text("leftover\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", leave_full_seat_dirty)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "full-cleanup")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert not (lease.path / "leftover.txt").exists()
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+
+
+def test_sparse_rollback_ignores_stale_cleanup_error_after_full_verification(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+    real_git = goalflight_worktree_pool._git
+    real_git_proc = goalflight_worktree_pool._git_proc
+    failed_sparse_checkout = False
+
+    def fail_sparse_checkout(cwd: Path, *args: str, **kwargs: object) -> str:
+        nonlocal failed_sparse_checkout
+        if (
+            not failed_sparse_checkout
+            and args[:3] == ("-c", "submodule.recurse=false", "checkout")
+        ):
+            failed_sparse_checkout = True
+            disabled = real_git_proc(cwd, "sparse-checkout", "disable")
+            assert disabled is not None and disabled.returncode == 0
+            raise goalflight_worktree_pool.WorktreeSeatError("injected checkout failure")
+        return real_git(cwd, *args, **kwargs)
+
+    def fail_sparse_cleanup(
+        cwd: Path, *args: str, **kwargs: object
+    ) -> subprocess.CompletedProcess[str] | None:
+        if args[:2] == ("sparse-checkout", "disable"):
+            return subprocess.CompletedProcess(["git", *args], 1, "", "disable failed")
+        if args[:4] == ("config", "--worktree", "--unset", "core.sparseCheckout"):
+            return subprocess.CompletedProcess(["git", *args], 1, "", "unset failed")
+        return real_git_proc(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", fail_sparse_checkout)
+    monkeypatch.setattr(goalflight_worktree_pool, "_git_proc", fail_sparse_cleanup)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-rollback")
     try:
         assert_clean_seat(lease.path, base)
         assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
