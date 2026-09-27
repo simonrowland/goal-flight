@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -637,6 +638,29 @@ def test_absent_refused_models_key_keeps_model_allowed(
     assert marker.read_text(encoding="utf-8") == "spawned"
 
 
+def test_stale_dispatch_model_before_effective_model_does_not_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    dispatch_id = "effective-dispatch-model"
+    marker = tmp_path / "effective-dispatch-worker-spawned"
+    argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model=REFUSED_MODEL,
+        marker=marker,
+    )
+    model_index = argv.index("--model")
+    argv[model_index + 2 : model_index + 2] = ["--model", REPLACEMENT_MODEL]
+
+    result = _run_dispatch(project, env, argv)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert marker.read_text(encoding="utf-8") == "spawned"
+
+
 @pytest.mark.parametrize(
     "dispatch_argv",
     [
@@ -785,8 +809,21 @@ def test_resume_policy_refuses_before_preflight_is_called(
         ["codex", "exec", f"--model={REFUSED_MODEL}"],
         ["codex", "exec", "-m", REFUSED_MODEL],
         ["codex", "exec", "-c", f"model={REFUSED_MODEL}"],
+        ["codex", "exec", "-c", f'model="{REFUSED_MODEL}"'],
+        ["codex", "exec", "-c", f"model='{REFUSED_MODEL}'"],
+        ["codex", "exec", "--config", f"model={REFUSED_MODEL}"],
+        ["codex", "exec", f"--config=model={REFUSED_MODEL}"],
     ],
-    ids=["every-occurrence", "equals-form", "short-form", "codex-config-form"],
+    ids=[
+        "every-occurrence",
+        "equals-form",
+        "short-form",
+        "codex-config-form",
+        "double-quoted-config",
+        "single-quoted-config",
+        "long-config",
+        "long-config-equals-form",
+    ],
 )
 def test_raw_worker_model_occurrences_are_checked(
     tmp_path: Path,
@@ -859,6 +896,128 @@ def test_cursor_raw_command_without_its_own_model_is_refused(
     _assert_cursor_allowlist_refusal(result, None)
     _assert_no_launch_effects(state, env, dispatch_id, marker)
     assert not (tmp_path / "cursor-spawned").exists()
+
+
+@pytest.mark.parametrize(
+    "worker_argv",
+    [
+        ["cursor-agent", "-p", "--force", "--trust"],
+        ["bash", "-lc", "cursor-agent -p --force --trust"],
+    ],
+    ids=["raw-binary", "shell-command"],
+)
+def test_cursor_allowlist_follows_effective_raw_binary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_argv: list[str],
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    dispatch_id = "cursor-binary-under-codex-label"
+    marker = tmp_path / "cursor-binary-under-other-agent-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=None,
+            marker=marker,
+            agent="codex",
+            worker_argv=worker_argv,
+        ),
+    )
+
+    _assert_cursor_allowlist_refusal(result, None)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert not (tmp_path / "cursor-spawned").exists()
+
+
+def test_refused_model_inside_shell_command_is_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    dispatch_id = "refused-model-shell-command"
+    marker = tmp_path / "shell-command-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=REPLACEMENT_MODEL,
+            marker=marker,
+            agent="codex",
+            worker_argv=[
+                "bash",
+                "-lc",
+                f"codex exec --model {REFUSED_MODEL}",
+            ],
+        ),
+    )
+
+    _assert_refusal(result)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert not (tmp_path / "codex-spawned").exists()
+
+
+def test_unparseable_capacity_config_fails_closed_for_model_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(tmp_path, monkeypatch)
+    config = Path(env["GOALFLIGHT_CAPACITY_CONF"])
+    config.write_text(
+        f'{{"refused_models":{{"{REFUSED_MODEL}":"{REPLACEMENT_MODEL}",}}}}',
+        encoding="utf-8",
+    )
+    dispatch_id = "unparseable-capacity-policy"
+    marker = tmp_path / "unparseable-policy-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=REFUSED_MODEL,
+            marker=marker,
+        ),
+    )
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert result.stderr.count("capacity config error:") == 1, result.stderr
+    _assert_permanent_refusal(result, "capacity config error:")
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+
+
+def test_unparseable_capacity_config_does_not_block_model_free_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(tmp_path, monkeypatch)
+    Path(env["GOALFLIGHT_CAPACITY_CONF"]).write_text("{broken", encoding="utf-8")
+    dispatch_id = "unparseable-capacity-model-free"
+    marker = tmp_path / "model-free-policy-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=None,
+            marker=marker,
+        ),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert marker.read_text(encoding="utf-8") == "spawned"
 
 
 @pytest.mark.parametrize(
@@ -1126,4 +1285,111 @@ def test_refused_queue_drain_terminalizes_permanent_refusal(
         for lease in capacity.get("leases", {}).values()
     )
     assert not Path(env["GOALFLIGHT_JOURNAL_DIR"]).exists()
+    assert not marker.exists()
+
+
+def test_remote_queue_drain_refuses_before_fleet_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, state, _env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    import goalflight_agent_limits as limits
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    monkeypatch.setattr(
+        limits,
+        "LOCAL_OVERRIDES",
+        {"refused_models": {REFUSED_MODEL: REPLACEMENT_MODEL}},
+    )
+    monkeypatch.setattr(limits, "LOCAL_OVERRIDES_LOAD_ERROR", None)
+    monkeypatch.setenv("GOALFLIGHT_LIVE_SSH", "1")
+    dispatch_id = "remote-drain-refused-model"
+    queue_dir = state / "dispatch-queue"
+    queue_dir.mkdir(parents=True)
+    marker = tmp_path / "remote-drain-worker-spawned"
+    dispatch_argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model=REFUSED_MODEL,
+        marker=marker,
+        agent="codex",
+    )
+    request = {
+        "dispatch_id": dispatch_id,
+        "cwd": str(project),
+        "prompt": "queued remote prompt",
+        "base_sha": "a" * 40,
+    }
+    entry = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "created_at": D.goalflight_ledger.utc_now(),
+        "updated_at": D.goalflight_ledger.utc_now(),
+        "agent": "codex",
+        "shape": "acp",
+        "project_root": str(project),
+        "process_cwd": str(project),
+        "transport": "dispatch",
+        "dispatch_argv": dispatch_argv,
+        "request": request,
+    }
+    queue_entry = queue_dir / f"{dispatch_id}.json"
+    queue_entry.write_text(json.dumps(entry), encoding="utf-8")
+    D.goalflight_ledger.write_record(
+        {
+            "schema": D.goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "model": REFUSED_MODEL,
+            "state": "queued",
+            "reason": "dispatch_queue",
+            "project_root": str(project),
+            "worker_cwd": str(project),
+            "task_ids": [],
+        }
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(exist_ok=True)
+    preview_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: fleet_dir)
+    monkeypatch.setattr(
+        fleet_dispatch,
+        "preview_dispatch",
+        lambda *_args, **kwargs: preview_calls.append(kwargs) or Namespace(),
+    )
+    monkeypatch.setattr(fleet_dispatch, "assert_live_ssh_opt_in", lambda: None)
+    monkeypatch.setattr(
+        fleet_dispatch,
+        "execute_dispatch",
+        lambda *_args, **_kwargs: {"launch_unconfirmed": False},
+    )
+
+    result = D._cmd_drain(
+        [
+            "--queue-dir",
+            str(queue_dir),
+            "--cross-project",
+            "--dispatch-id",
+            dispatch_id,
+            "--remote-node",
+            "fixture-node",
+            "--json",
+        ]
+    )
+
+    assert result == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failed"] == 1, payload
+    assert preview_calls == []
+    assert not queue_entry.exists()
+    failed_claims = list(queue_dir.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert len(failed_claims) == 1
+    failed_payload = json.loads(failed_claims[0].read_text(encoding="utf-8"))
+    assert "refused by operator policy" in failed_payload["reason"]
+    assert not (state / "capacity.json").exists()
     assert not marker.exists()

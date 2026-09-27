@@ -100,6 +100,7 @@ import goalflight_worktree_pool
 from goalflight_agent_limits import (
     CapacityPolicyConfigError,
     agent_model_allowlist,
+    local_overrides_load_error,
     model_refusal,
     moonshot_family,
     normalize_agent,
@@ -4419,6 +4420,12 @@ def _refuse_configured_models(
 ) -> None:
     label = normalize_agent(str(agent or "").strip())
     policy_agent = "cursor" if _account_engine(label) == "cursor" else label
+    load_error = local_overrides_load_error()
+    if load_error and (
+        any(isinstance(model, str) and model.strip() for model in models)
+        or policy_agent == "cursor"
+    ):
+        raise DispatchUsageError(load_error)
     try:
         patterns = agent_model_allowlist(policy_agent)
         # Validate the refused_models container even when this invocation has
@@ -4471,6 +4478,19 @@ def _refuse_configured_models(
         raise DispatchUsageError(message)
 
 
+def _config_model_values(setting: str) -> list[str]:
+    try:
+        tokens = shlex.split(setting)
+    except ValueError:
+        return []
+    values: list[str] = []
+    for token in tokens:
+        key, separator, value = token.partition("=")
+        if separator and key.strip().casefold() == "model":
+            values.append(value.strip())
+    return values
+
+
 def _model_option_values(argv: list[str], *, raw: bool = False) -> list[str]:
     values: list[str] = []
     index = 0
@@ -4485,15 +4505,72 @@ def _model_option_values(argv: list[str], *, raw: bool = False) -> list[str]:
             values.append(token.partition("=")[2])
         elif raw and token.startswith("-m="):
             values.append(token.partition("=")[2])
-        elif raw and token == "-c" and index + 1 < len(argv):
-            setting = argv[index + 1]
-            key, separator, value = setting.partition("=")
-            if separator and key.strip().casefold() == "model":
-                values.append(value)
-                index += 2
-                continue
+        elif raw and token in {"-c", "--config"} and index + 1 < len(argv):
+            values.extend(_config_model_values(argv[index + 1]))
+            index += 1
+        elif raw and token.startswith("--config="):
+            values.extend(_config_model_values(token.partition("=")[2]))
         index += 1
     return values
+
+
+def _shell_command_segments(argv: list[str]) -> list[list[str]]:
+    separators = {";", "&&", "||", "|", "&"}
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in argv:
+        if token in separators:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _command_executable(argv: list[str]) -> str | None:
+    index = 0
+    while index < len(argv) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[index]):
+        index += 1
+    if index < len(argv) and Path(argv[index]).name.casefold() == "env":
+        index += 1
+        while index < len(argv) and (
+            argv[index].startswith("-")
+            or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[index])
+        ):
+            index += 1
+    return Path(argv[index]).name.casefold() if index < len(argv) else None
+
+
+def _raw_worker_policy_details(argv: list[str]) -> tuple[list[str], bool]:
+    models: list[str] = []
+    cursor_worker = False
+    pending = [argv]
+    while pending:
+        current = pending.pop()
+        if not current:
+            continue
+        models.extend(_model_option_values(current, raw=True))
+        executable = _command_executable(current)
+        if executable in {"cursor", "cursor-agent"}:
+            cursor_worker = True
+        if executable not in {"bash", "sh"}:
+            continue
+        script = None
+        for index, token in enumerate(current[:-1]):
+            if token in {"-c", "-lc", "-cl", "--command"}:
+                script = current[index + 1]
+                break
+        if script is None:
+            continue
+        try:
+            script_argv = shlex.split(script)
+        except ValueError:
+            continue
+        pending.extend(_shell_command_segments(script_argv))
+    return models, cursor_worker
 
 
 def _refuse_launch_model_policy(args, argv: list[str]) -> None:
@@ -4501,16 +4578,16 @@ def _refuse_launch_model_policy(args, argv: list[str]) -> None:
         separator = argv.index("--")
     except ValueError:
         separator = len(argv)
-    dispatch_models = _model_option_values(argv[:separator])
     raw = argv[separator + 1 :] if separator < len(argv) else None
-    raw_models = _model_option_values(raw or [], raw=True)
-    models: list[object] = [*dispatch_models, *raw_models]
+    raw_models, raw_cursor_worker = _raw_worker_policy_details(raw or [])
+    models: list[object] = list(raw_models)
     effective_model = getattr(args, "model", None)
     if effective_model is not None:
-        models.append(effective_model)
+        models.insert(0, effective_model)
+    policy_agent = "cursor" if raw_cursor_worker else getattr(args, "agent", None)
     _refuse_configured_models(
         models,
-        getattr(args, "agent", None),
+        policy_agent,
         raw_present=raw is not None,
         raw_models=raw_models,
     )
@@ -10850,19 +10927,22 @@ DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
 PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
 
 
-def _emit_permanent_dispatch_refusal(
+def _permanent_dispatch_refusal_line(
     dispatch_id: str | None, error: BaseException | str
-) -> None:
+) -> str:
     payload = {
         "dispatch_id": dispatch_id,
         "permanent": True,
         "reason": str(error),
         "state": "refused",
     }
-    print(
-        DISPATCH_REFUSED_PREFIX + json.dumps(payload, sort_keys=True),
-        flush=True,
-    )
+    return DISPATCH_REFUSED_PREFIX + json.dumps(payload, sort_keys=True) + "\n"
+
+
+def _emit_permanent_dispatch_refusal(
+    dispatch_id: str | None, error: BaseException | str
+) -> None:
+    print(_permanent_dispatch_refusal_line(dispatch_id, error), end="", flush=True)
 
 
 def _emit_proven_pre_worker_refusal(error: ProvenPreWorkerRefusal) -> None:
@@ -18641,6 +18721,20 @@ def _drain_launch_remote_claim(
     launch_token: str,
     claim: Path,
 ) -> subprocess.CompletedProcess[str]:
+    dispatch_argv = _occupancy_argv_from_record(entry)
+    if dispatch_argv:
+        policy_args = _launch_policy_args(dispatch_argv)
+        try:
+            _refuse_launch_model_policy(policy_args, dispatch_argv)
+        except DispatchUsageError as exc:
+            reason = str(exc)
+            return subprocess.CompletedProcess(
+                ["remote-drain", dispatch_id],
+                64,
+                stdout=_permanent_dispatch_refusal_line(dispatch_id, reason),
+                stderr=f"goalflight_dispatch: {reason}\n",
+            )
+
     agent = _remote_drain_agent(entry)
     refusal = _remote_grok_effort_refusal(entry)
     if refusal:

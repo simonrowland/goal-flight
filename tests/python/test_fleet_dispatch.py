@@ -27,6 +27,7 @@ import goalflight_fleet_launch_detached as fleet_launch
 import goalflight_fleet_preflight as fleet_preflight
 import goalflight_fleet_status as status
 import goalflight_ledger as ledger
+import goalflight_agent_limits as agent_limits
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -211,6 +212,38 @@ def test_explicit_dry_run_preview() -> None:
             launch["argv"][launch["argv"].index("--account") + 1]
             == "openai/default",
         )
+
+
+def test_fleet_cursor_without_model_refuses_before_fleet_bootstrap() -> None:
+    old_overrides = agent_limits.LOCAL_OVERRIDES
+    old_load_error = agent_limits.LOCAL_OVERRIDES_LOAD_ERROR
+    agent_limits.LOCAL_OVERRIDES = {
+        "agent_model_allow": {
+            "cursor": ["grok-*", "cursor-grok-*", "kimi-k3-*"],
+        }
+    }
+    agent_limits.LOCAL_OVERRIDES_LOAD_ERROR = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="fleet-cursor-policy-") as raw:
+            fleet_dir = Path(raw) / "fleet"
+            try:
+                fleet_dispatch.preview_dispatch(
+                    fleet_dir,
+                    node_id="localhost",
+                    agent="cursor",
+                    billing_account="cursor/default",
+                    prompt="cursor prompt",
+                    base_sha=BASE_SHA,
+                    thin_mode=True,
+                )
+            except fleet_dispatch.DispatchError as exc:
+                assert_true("missing cursor model refused", "model <missing>" in str(exc))
+            else:
+                raise AssertionError("cursor fleet launch accepted no model")
+            assert_true("policy runs before fleet bootstrap", not fleet_dir.exists())
+    finally:
+        agent_limits.LOCAL_OVERRIDES = old_overrides
+        agent_limits.LOCAL_OVERRIDES_LOAD_ERROR = old_load_error
 
 
 def test_red_auth_blocks_exec() -> None:
@@ -1355,6 +1388,7 @@ def test_lock_chain_never_removes_pooled_seat_on_midchain_failure() -> None:
 
 def main() -> None:
     test_explicit_dry_run_preview()
+    test_fleet_cursor_without_model_refuses_before_fleet_bootstrap()
     test_red_auth_blocks_exec()
     test_exec_without_live_ssh_env_refuses_before_runner()
     test_goal_exec_reports_tool_smoke_before_live_ssh_refusal()

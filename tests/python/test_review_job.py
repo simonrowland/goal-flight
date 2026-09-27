@@ -312,6 +312,121 @@ def release_capacity(state_dir: Path, lease_id: str) -> None:
         assert goalflight_capacity.main(["release", "--lease-id", lease_id]) == 0
 
 
+def test_model_policy_refusal_precedes_review_job_side_effects() -> None:
+    with tempfile.TemporaryDirectory(prefix="review-model-policy-") as raw:
+        tmp = Path(raw)
+        state = tmp / "state"
+        config = tmp / "capacity.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "refused_models": {"gpt-5.6-luna": "gpt-6-luna"},
+                    "agent_model_allow": {
+                        "cursor": ["grok-*", "cursor-grok-*", "kimi-k3-*"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        prompt = tmp / "policy-review.md"
+        prompt.write_text("review without editing\n", encoding="utf-8")
+        fake_claude = tmp / "claude"
+        claude_marker = tmp / "claude-spawned"
+        fake_claude.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"Path({str(claude_marker)!r}).write_text('spawned')\n",
+            encoding="utf-8",
+        )
+        fake_claude.chmod(0o755)
+        fake_cursor = tmp / "cursor-agent"
+        cursor_marker = tmp / "cursor-spawned"
+        fake_cursor.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"Path({str(cursor_marker)!r}).write_text('spawned')\n",
+            encoding="utf-8",
+        )
+        fake_cursor.chmod(0o755)
+
+        common = [
+            sys.executable,
+            "scripts/goalflight_review_job.py",
+            "--repo",
+            str(ROOT),
+            "--prompt",
+            str(prompt),
+            "--timeout-s",
+            "2",
+            "--max-quiet-s",
+            "2",
+        ]
+        isolated = {
+            "GOALFLIGHT_CAPACITY_CONF": str(config),
+            "GOALFLIGHT_CAPACITY_WAIT_S": "0",
+        }
+        claude_out = tmp / "claude-out"
+        claude_result = run(
+            [
+                *common,
+                "--agent",
+                "claude",
+                "--model",
+                "gpt-5.6-luna",
+                "--claude-bin",
+                str(fake_claude),
+                "--name",
+                "refused-claude",
+                "--output-dir",
+                str(claude_out),
+            ],
+            state_dir=state,
+            env=isolated,
+            check=False,
+            timeout=10,
+        )
+        assert claude_result.returncode == 64, (
+            claude_result.returncode,
+            claude_result.stdout,
+            claude_result.stderr,
+        )
+        assert "refused by operator policy" in claude_result.stderr
+        assert not claude_out.exists()
+        assert not claude_marker.exists()
+        assert not (tmp / "journal").exists()
+
+        cursor_out = tmp / "cursor-out"
+        cursor_result = run(
+            [
+                *common,
+                "--agent",
+                "custom",
+                "--name",
+                "refused-custom-cursor",
+                "--output-dir",
+                str(cursor_out),
+                "--command",
+                str(fake_cursor),
+                "-p",
+                "--model",
+                "composer-1",
+            ],
+            state_dir=state,
+            env=isolated,
+            check=False,
+            timeout=10,
+        )
+        assert cursor_result.returncode == 64, (
+            cursor_result.returncode,
+            cursor_result.stdout,
+            cursor_result.stderr,
+        )
+        assert "allowed patterns" in cursor_result.stderr
+        assert not cursor_out.exists()
+        assert not cursor_marker.exists()
+        assert not (state / "capacity.json").exists()
+
+
 def test_review_finalizer_only_surrenders_finished_worker() -> None:
     monitor = goalflight_review_job._monitor_process
     for worker_alive, group_drained, expected_releases in (
@@ -903,6 +1018,7 @@ def test_missing_prompt_after_capacity_commits_terminal_outbox() -> None:
 def main() -> None:
     tests = [
         test_review_finalizer_only_surrenders_finished_worker,
+        test_model_policy_refusal_precedes_review_job_side_effects,
         test_review_job_capacity_wait_queues_until_slot_frees,
         test_review_job_capacity_wait_deadline_blocks,
         test_review_job_capacity_wait_zero_single_shot,

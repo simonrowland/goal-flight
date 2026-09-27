@@ -180,22 +180,39 @@ def _local_conf_path() -> Path:
     return Path.home() / ".goal-flight" / "capacity.local.json"
 
 
-def load_local_overrides(path: Path | None = None) -> dict:
-    """Return machine-local capacity overrides, or {} if absent/malformed.
+LOCAL_OVERRIDES_LOAD_ERROR: str | None = None
 
-    Never raises: a missing or unparseable conf must degrade to the committed
-    baseline, never break dispatch.
-    """
+
+def load_local_overrides(path: Path | None = None) -> dict:
+    """Return machine-local capacity overrides, retaining model-policy errors."""
+    global LOCAL_OVERRIDES_LOAD_ERROR
+    LOCAL_OVERRIDES_LOAD_ERROR = None
     conf_path = path if path is not None else _local_conf_path()
+    if conf_path == Path(os.devnull):
+        return {}
     try:
         raw = conf_path.read_text()
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        LOCAL_OVERRIDES_LOAD_ERROR = (
+            f"capacity config error: local capacity config could not be read "
+            f"({type(exc).__name__})"
+        )
         return {}
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        LOCAL_OVERRIDES_LOAD_ERROR = "capacity config error: local capacity config is invalid JSON"
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        LOCAL_OVERRIDES_LOAD_ERROR = "capacity config error: local capacity config root must be an object"
+        return {}
+    return data
+
+
+def local_overrides_load_error() -> str | None:
+    return LOCAL_OVERRIDES_LOAD_ERROR
 
 
 def _merge_int_map(target: dict, override: object) -> None:
