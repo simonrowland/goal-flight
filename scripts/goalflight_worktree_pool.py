@@ -3950,6 +3950,55 @@ def worktree_lock_path_for_path(project_root: Path, worktree_path: Path) -> Path
     )
 
 
+def _probe_worktree_seat_flock(
+    project_root: Path,
+    worktree_path: Path,
+    *,
+    managed_root: Path | None = None,
+) -> tuple[bool | None, str | None]:
+    """Probe a seat lock without creating it; unreadable identity means unknown."""
+    lock_file = None
+    lock_fd = None
+    try:
+        root = project_root.resolve()
+        path = worktree_path.expanduser().resolve(strict=False)
+        lock_path = _candidate_lock_path(
+            root,
+            path,
+            managed_root=managed_root or repository_worktree_root(root),
+        )
+        lock_fd = _open_registered_lock(
+            lock_path,
+            _lock_open_flags() & ~os.O_CREAT,
+            registry_root=_git_common_dir(root),
+            allow_create=False,
+            allow_unregistered=True,
+        )
+        lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+        lock_fd = None
+    except (OSError, ValueError):
+        if lock_fd is not None:
+            os.close(lock_fd)
+        return None, None
+
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held = True
+        except OSError:
+            return None, None
+        else:
+            held = False
+        try:
+            holder = _known_lock_dispatch_id(lock_file)
+        except (OSError, ValueError, UnicodeError):
+            holder = None
+        return held, holder
+    finally:
+        lock_file.close()
+
+
 def _busy_worktree_message(
     project_root: Path,
     limit: int,
