@@ -108,7 +108,7 @@ AGENT_CAP_POOL: dict[str, str] = {
 
 
 def normalize_agent(agent: str) -> str:
-    return agent.strip().lower()
+    return agent.strip().casefold()
 
 
 # Retired dispatch handles -> successor handle. Ledgers, leases, and status
@@ -215,37 +215,68 @@ def _merge_int_map(target: dict, override: object) -> None:
 LOCAL_OVERRIDES = load_local_overrides()
 
 
+class CapacityPolicyConfigError(ValueError):
+    """A present operator model policy has an invalid shape."""
+
+
 def model_refusal(model: object) -> tuple[str, str | None] | None:
     """Return the configured refused model and replacement, if any."""
-    if not isinstance(model, str):
+    if "refused_models" not in LOCAL_OVERRIDES:
         return None
     refused_models = LOCAL_OVERRIDES.get("refused_models")
     if not isinstance(refused_models, dict):
+        raise CapacityPolicyConfigError(
+            "capacity config error: refused_models must be an object"
+        )
+    if not isinstance(model, str):
         return None
+    model_id = model.strip().casefold()
     for refused, replacement in refused_models.items():
-        if not isinstance(refused, str) or refused.casefold() != model.casefold():
+        if not isinstance(refused, str) or not refused.strip():
+            raise CapacityPolicyConfigError(
+                "capacity config error: refused_models keys must be non-empty strings"
+            )
+        if refused.strip().casefold() != model_id:
             continue
+        if replacement is not None and not isinstance(replacement, str):
+            raise CapacityPolicyConfigError(
+                "capacity config error: replacement must be a string or null"
+            )
         suggestion = replacement.strip() if isinstance(replacement, str) else ""
-        return refused, suggestion or None
+        return refused.strip().casefold(), suggestion or None
     return None
 
 
 def agent_model_allowlist(agent: object) -> tuple[str, ...] | None:
     """Return configured model globs for an agent, or None when unrestricted."""
+    if "agent_model_allow" not in LOCAL_OVERRIDES:
+        return None
     allowlists = LOCAL_OVERRIDES.get("agent_model_allow")
     if not isinstance(allowlists, dict):
-        return None
-    label = normalize_agent(str(agent or ""))
-    if label not in allowlists:
-        return None
-    configured = allowlists[label]
-    if not isinstance(configured, list):
-        return ()
-    return tuple(
-        pattern.strip()
-        for pattern in configured
-        if isinstance(pattern, str) and pattern.strip()
-    )
+        raise CapacityPolicyConfigError(
+            "capacity config error: agent_model_allow must be an object"
+        )
+    label = normalize_agent(str(agent or "").strip())
+    for configured_agent, configured in allowlists.items():
+        if not isinstance(configured_agent, str) or not configured_agent.strip():
+            raise CapacityPolicyConfigError(
+                "capacity config error: agent_model_allow keys must be non-empty strings"
+            )
+        if normalize_agent(configured_agent) != label:
+            continue
+        if not isinstance(configured, list):
+            raise CapacityPolicyConfigError(
+                f"capacity config error: agent_model_allow[{label}] must be a list"
+            )
+        patterns: list[str] = []
+        for pattern in configured:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise CapacityPolicyConfigError(
+                    f"capacity config error: agent_model_allow[{label}] entries must be non-empty strings"
+                )
+            patterns.append(pattern.strip())
+        return tuple(patterns)
+    return None
 
 
 # Snapshot the committed baseline BEFORE local overrides are merged in place:

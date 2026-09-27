@@ -519,9 +519,12 @@ Capacity checks apply default per-agent caps. Per-machine overrides come from
 `agent_caps` merge over defaults. Hard caps are placeholders, not laws;
 provider budgets may be shared by labels.
 `refused_models` is an optional operator policy map from exact model ids to a
-suggested replacement (or `null`); matching ignores case. `agent_model_allow`
-is an optional map from agent family to case-insensitive model glob patterns;
-the `cursor` family key covers `cursor`, `cursor-agent`, and Cursor ACP. An
+suggested replacement (or `null`); matching strips surrounding whitespace and
+ignores case. `agent_model_allow` is an optional map from agent family to
+case-insensitive model glob patterns; surrounding whitespace is stripped from
+agent keys and patterns. These keys are enforced only by dispatchers at this
+version or later; upgrade all launch entry points before enabling them. The
+`cursor` family key covers `cursor`, `cursor-agent`, and Cursor ACP. An
 absent key adds no restriction. Example:
 
 ```json

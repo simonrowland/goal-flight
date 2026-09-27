@@ -5621,6 +5621,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        from goalflight_dispatch import (
+            DispatchUsageError,
+            _emit_permanent_dispatch_refusal,
+            _refuse_configured_model,
+        )
+
+        _refuse_configured_model(args.model, args.agent)
+    except DispatchUsageError as exc:
+        _emit_permanent_dispatch_refusal(args.dispatch_id, exc)
+        message = str(exc).strip()
+        while message.startswith("goalflight_dispatch:"):
+            message = message[len("goalflight_dispatch:") :].lstrip()
+        print(f"goalflight_acp_run: {message}", file=sys.stderr)
+        return 64
+    if __name__ == "__main__":
+        _ensure_acp_sdk_python()
     args._original_argv = list(argv)
     args._controller_registration_script = "goalflight_acp_run.py"
     # Derive idle-timeout from mode when not explicitly set. Goal-mode loops
@@ -5637,5 +5654,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    _ensure_acp_sdk_python()
     raise SystemExit(main())

@@ -27,8 +27,8 @@ def _runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    refused_models: dict | None = None,
-    agent_model_allow: dict | None = None,
+    refused_models: object = None,
+    agent_model_allow: object = None,
 ) -> tuple[Path, Path, dict[str, str]]:
     project = tmp_path / "project"
     project.mkdir()
@@ -117,6 +117,7 @@ def _raw_launch_argv(
     model: str | None,
     marker: Path,
     agent: str = "test-dispatch",
+    worker_argv: list[str] | None = None,
 ) -> list[str]:
     worker = (
         "from pathlib import Path; "
@@ -139,16 +140,8 @@ def _raw_launch_argv(
     ]
     if model is not None:
         argv += ["--model", model]
-    argv += [
-        "--dispatch-id",
-        dispatch_id,
-        "--unregistered-forced",
-        "--foreground",
-        "--",
-        sys.executable,
-        "-c",
-        worker,
-    ]
+    argv += ["--dispatch-id", dispatch_id, "--unregistered-forced", "--foreground", "--"]
+    argv += worker_argv if worker_argv is not None else [sys.executable, "-c", worker]
     return argv
 
 
@@ -184,6 +177,23 @@ def _assert_cursor_allowlist_refusal(
         "policy (capacity config agent_model_allow); allowed patterns: grok-*, "
         "cursor-grok-*, kimi-k3-*; pass an explicit --model matching an allowed pattern"
     ) in result.stderr
+
+
+def _assert_permanent_refusal(
+    result: subprocess.CompletedProcess[str], expected_reason: str | None = None
+) -> None:
+    markers = [
+        line.removeprefix(D.DISPATCH_REFUSED_PREFIX)
+        for line in result.stdout.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    ]
+    assert len(markers) == 1, result.stdout
+    payload = json.loads(markers[0])
+    assert payload["permanent"] is True
+    assert isinstance(payload.get("reason"), str) and payload["reason"]
+    if expected_reason is not None:
+        assert expected_reason in payload["reason"]
+    assert D._permanent_pre_spawn_refusal_reason(result) == payload["reason"]
 
 
 def _assert_no_launch_effects(
@@ -225,6 +235,7 @@ def test_refused_fresh_launch_has_no_side_effects(
     )
 
     _assert_refusal(result)
+    _assert_permanent_refusal(result, REFUSED_MODEL)
     _assert_no_launch_effects(state, env, dispatch_id, marker)
 
 
@@ -278,6 +289,7 @@ def test_refused_queue_replay_has_no_launch_side_effects(
     result = _run_dispatch(project, env, replay_argv)
 
     _assert_refusal(result)
+    _assert_permanent_refusal(result, REFUSED_MODEL)
     _assert_no_launch_effects(
         state, env, dispatch_id, marker, existing_record=True
     )
@@ -477,7 +489,13 @@ def test_cursor_model_allowlist_globs_are_case_insensitive_for_family_aliases(
 
 
 def _write_codex_parent(
-    project: Path, state: Path, *, dispatch_id: str, model: str
+    project: Path,
+    state: Path,
+    *,
+    dispatch_id: str,
+    model: str | None,
+    agent: str = "codex",
+    dispatch_argv: list[str] | None = None,
 ) -> Path:
     session_id = "12345678-1234-4abc-8def-1234567890ab"
     home = state / "dispatch-homes" / dispatch_id
@@ -495,8 +513,8 @@ def _write_codex_parent(
         {
             "schema": D.goalflight_ledger.SCHEMA,
             "dispatch_id": dispatch_id,
-            "agent": "codex",
-            "engine": "codex",
+            "agent": agent,
+            "engine": agent,
             "shape": "bash",
             "transport": "dispatch",
             "project_root": str(project),
@@ -507,6 +525,7 @@ def _write_codex_parent(
             "started_at": D.goalflight_ledger.utc_now(),
             "task_ids": [],
             "model": model,
+            **({"dispatch_argv": dispatch_argv} if dispatch_argv is not None else {}),
             "codex_session_id": session_id,
             "codex_home": str(home),
             "codex_home_owner_dispatch_id": dispatch_id,
@@ -535,6 +554,12 @@ def test_refused_codex_resume_has_no_side_effects(
     )
     before_records = sorted(path.name for path in (state / "runs.d").iterdir())
     before_homes = sorted(path.name for path in (state / "dispatch-homes").iterdir())
+    resume_lock_dir = state / "dispatch-homes" / ".resume-locks"
+    before_resume_locks = (
+        sorted(path.name for path in resume_lock_dir.iterdir())
+        if resume_lock_dir.exists()
+        else []
+    )
     argv = [
         "resume",
         parent_id,
@@ -550,6 +575,11 @@ def test_refused_codex_resume_has_no_side_effects(
     _assert_refusal(result)
     assert sorted(path.name for path in (state / "runs.d").iterdir()) == before_records
     assert sorted(path.name for path in (state / "dispatch-homes").iterdir()) == before_homes
+    assert (
+        sorted(path.name for path in resume_lock_dir.iterdir())
+        if resume_lock_dir.exists()
+        else []
+    ) == before_resume_locks
     assert not (state / "capacity.json").exists()
     assert not Path(env["GOALFLIGHT_JOURNAL_DIR"]).exists()
     assert not (tmp_path / "codex-spawned").exists()
@@ -605,3 +635,495 @@ def test_absent_refused_models_key_keeps_model_allowed(
 
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert marker.read_text(encoding="utf-8") == "spawned"
+
+
+@pytest.mark.parametrize(
+    "dispatch_argv",
+    [
+        lambda project: [
+            "--agent", "codex", "--shape", "bash", "--cwd", str(project),
+            "--model", REPLACEMENT_MODEL, f"--model={REFUSED_MODEL}",
+        ],
+        lambda project: [
+            "--agent", "cursor", "--shape", "bash", "--cwd", str(project),
+        ],
+    ],
+    ids=["last-duplicate-model-equals-form", "child-agent-cursor-with-missing-model"],
+)
+def test_resume_policy_uses_child_launch_argv_before_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch_argv,
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        refused_models={REFUSED_MODEL: REPLACEMENT_MODEL},
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    parent_id = "resume-child-policy-parent"
+    child_prompt = tmp_path / "resume-prompt.md"
+    child_prompt.write_text("resume\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "git", "-C", str(project), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "--allow-empty",
+            "--quiet", "-m", "initial",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _write_codex_parent(
+        project,
+        state,
+        dispatch_id=parent_id,
+        model=None,
+        dispatch_argv=dispatch_argv(project),
+    )
+    before_records = sorted(path.name for path in (state / "runs.d").iterdir())
+    before_homes = sorted(path.name for path in (state / "dispatch-homes").iterdir())
+    resume_lock_dir = state / "dispatch-homes" / ".resume-locks"
+    before_resume_locks = (
+        sorted(path.name for path in resume_lock_dir.iterdir())
+        if resume_lock_dir.exists()
+        else []
+    )
+
+    result = _run_dispatch(
+        project,
+        env,
+        [
+            "resume", parent_id, "--prompt-file", str(child_prompt),
+            "--unregistered-forced",
+        ],
+    )
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert "refused by operator policy" in result.stderr
+    if "cursor" in dispatch_argv(project):
+        assert "agent cursor model <missing>" in result.stderr
+    else:
+        assert f"model {REFUSED_MODEL} is refused" in result.stderr
+    assert sorted(path.name for path in (state / "runs.d").iterdir()) == before_records
+    assert sorted(path.name for path in (state / "dispatch-homes").iterdir()) == before_homes
+    assert (
+        sorted(path.name for path in resume_lock_dir.iterdir())
+        if resume_lock_dir.exists()
+        else []
+    ) == before_resume_locks
+    assert not (state / "capacity.json").exists()
+    assert not Path(env["GOALFLIGHT_JOURNAL_DIR"]).exists()
+    assert not (tmp_path / "codex-spawned").exists()
+    _assert_permanent_refusal(result)
+
+
+def test_resume_policy_refuses_before_preflight_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _state, _env = _runtime(tmp_path, monkeypatch)
+    prompt = tmp_path / "resume-preflight-prompt.md"
+    prompt.write_text("resume\n", encoding="utf-8")
+    parent_id = "resume-preflight-policy-parent"
+    record = {
+        "dispatch_id": parent_id,
+        "agent": "codex",
+        "engine": "codex",
+        "model": None,
+        "project_root": str(project),
+        "worker_cwd": str(project),
+        "dispatch_argv": [
+            "--agent", "codex", "--shape", "bash", "--cwd", str(project),
+            "--model", REPLACEMENT_MODEL, f"--model={REFUSED_MODEL}",
+        ],
+    }
+    source = {
+        "record": record,
+        "engine": "codex",
+        "agent": "codex",
+        "shape": "bash",
+        "session_id": "resume-session",
+        "codex_home": project / "codex-home",
+        "codex_home_owner_dispatch_id": parent_id,
+    }
+    monkeypatch.setattr(D, "_find_dispatch_record", lambda _dispatch_id: record)
+    monkeypatch.setattr(
+        D,
+        "model_refusal",
+        lambda model: (REFUSED_MODEL, REPLACEMENT_MODEL)
+        if isinstance(model, str) and model.strip().casefold() == REFUSED_MODEL
+        else None,
+    )
+    monkeypatch.setattr(D, "agent_model_allowlist", lambda _agent: None)
+    monkeypatch.setattr(D, "_validate_resume_source", lambda *_a, **_k: source)
+    monkeypatch.setattr(D, "_validate_resume_worktree_source", lambda *_a, **_k: None)
+    monkeypatch.setattr(D, "_resume_worker_cwd", lambda *_a, **_k: project)
+    monkeypatch.setattr(D, "_default_dispatch_id", lambda *_a, **_k: "resume-child")
+    monkeypatch.setattr(D, "_refuse_existing_dispatch_id_for_resume", lambda *_a, **_k: None)
+    preflight_calls: list[bool] = []
+
+    def fail_if_preflight_called(*_args, **_kwargs):
+        preflight_calls.append(True)
+        raise AssertionError("resume preflight ran before the refusal")
+
+    monkeypatch.setattr(D, "_preflight_resume_dispatch", fail_if_preflight_called)
+
+    result = D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    )
+
+    assert result == 64
+    assert preflight_calls == []
+    assert f"model {REFUSED_MODEL} is refused" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw_worker",
+    [
+        ["codex", "exec", "--model", REPLACEMENT_MODEL, "--model", REFUSED_MODEL],
+        ["codex", "exec", f"--model={REFUSED_MODEL}"],
+        ["codex", "exec", "-m", REFUSED_MODEL],
+        ["codex", "exec", "-c", f"model={REFUSED_MODEL}"],
+    ],
+    ids=["every-occurrence", "equals-form", "short-form", "codex-config-form"],
+)
+def test_raw_worker_model_occurrences_are_checked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_worker: list[str],
+) -> None:
+    project, state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    dispatch_id = "refused-raw-worker-model"
+    marker = tmp_path / "raw-worker-spawned"
+    argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model=REPLACEMENT_MODEL,
+        marker=marker,
+        worker_argv=raw_worker,
+    )
+
+    result = _run_dispatch(project, env, argv)
+
+    _assert_refusal(result)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert not (tmp_path / "codex-spawned").exists()
+
+
+def test_refused_dispatch_model_is_checked_even_with_raw_allowed_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    dispatch_id = "refused-dispatch-model-with-raw"
+    marker = tmp_path / "raw-allowed-worker-spawned"
+    argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model=REFUSED_MODEL,
+        marker=marker,
+        worker_argv=["codex", "exec", "--model", REPLACEMENT_MODEL],
+    )
+
+    result = _run_dispatch(project, env, argv)
+
+    _assert_refusal(result)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+
+
+def test_cursor_raw_command_without_its_own_model_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    dispatch_id = "cursor-raw-missing-model"
+    marker = tmp_path / "cursor-raw-worker-spawned"
+    argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model="grok-4.7-high",
+        marker=marker,
+        agent="cursor",
+        worker_argv=["cursor-agent", "-p", "--force", "--trust"],
+    )
+
+    result = _run_dispatch(project, env, argv)
+
+    _assert_cursor_allowlist_refusal(result, None)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert not (tmp_path / "cursor-spawned").exists()
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.6-luna ", " GpT-5.6-LuNa"],
+    ids=["trailing-live-whitespace", "leading-live-whitespace-and-case"],
+)
+def test_refused_model_matching_strips_and_casefolds_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        refused_models={" GpT-5.6-LuNa ": REPLACEMENT_MODEL},
+    )
+    dispatch_id = "refused-normalized-model"
+    marker = tmp_path / "normalized-model-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=model,
+            marker=marker,
+        ),
+    )
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert "model gpt-5.6-luna is refused" in result.stderr.casefold()
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+
+
+def test_agent_allowlist_normalizes_agent_keys_and_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import goalflight_agent_limits as limits
+
+    monkeypatch.setattr(
+        limits,
+        "LOCAL_OVERRIDES",
+        {
+            "refused_models": {" GpT-5.6-LuNa ": " gpt-6-luna "},
+            "agent_model_allow": {
+                " Cursor ": [" grok-* "],
+                " Straße ": [" gpt-* "],
+            },
+        },
+    )
+
+    assert D.model_refusal(" gPt-5.6-lUnA ") == ("gpt-5.6-luna", "gpt-6-luna")
+    assert D.agent_model_allowlist("cursor") == ("grok-*",)
+    assert D.agent_model_allowlist("STRASSE") == ("gpt-*",)
+    D._refuse_configured_model(" GROK-4.7-HIGH ", "cursor-agent")
+
+
+@pytest.mark.parametrize(
+    ("refused_models", "agent_model_allow", "agent", "model", "detail"),
+    [
+        ([], None, "test-dispatch", REPLACEMENT_MODEL, "refused_models must be an object"),
+        ({REFUSED_MODEL: []}, None, "test-dispatch", REFUSED_MODEL, "replacement must be a string or null"),
+        (None, {"cursor": "grok-*"}, "cursor", "grok-4.7-high", "agent_model_allow[cursor] must be a list"),
+    ],
+    ids=["refused-root-type", "refused-replacement-type", "allowlist-type"],
+)
+def test_mistyped_present_policy_fails_closed_with_config_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refused_models: object,
+    agent_model_allow: object,
+    agent: str,
+    model: str,
+    detail: str,
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        refused_models=refused_models,
+        agent_model_allow=agent_model_allow,
+    )
+    dispatch_id = "mistyped-policy"
+    marker = tmp_path / "mistyped-policy-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=model,
+            marker=marker,
+            agent=agent,
+        ),
+    )
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert f"capacity config error: {detail}" in result.stderr
+    assert "(none)" not in result.stderr
+    assert result.stderr.count("goalflight_dispatch:") == 1
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+
+
+def test_cursor_allowlist_takes_precedence_over_disallowed_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        refused_models={REFUSED_MODEL: REPLACEMENT_MODEL},
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    dispatch_id = "cursor-refused-model-replacement"
+    marker = tmp_path / "cursor-refused-replacement-worker-spawned"
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=REFUSED_MODEL,
+            marker=marker,
+            agent="cursor",
+        ),
+    )
+
+    _assert_cursor_allowlist_refusal(result, REFUSED_MODEL)
+    assert REPLACEMENT_MODEL not in result.stderr
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+
+
+def test_acp_runner_checks_model_policy_before_status_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    status_path = tmp_path / "acp-status.json"
+    dispatch_id = "acp-policy-refusal"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "goalflight_acp_run.py"),
+            "--agent", "cursor",
+            "--model", "gpt-6-luna",
+            "--cwd", str(project),
+            "--dispatch-id", dispatch_id,
+            "--status-json", str(status_path),
+            "--prompt-text", "test prompt",
+            "--unregistered-forced",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert "agent cursor model gpt-6-luna is refused" in result.stderr
+    assert not status_path.exists()
+    assert not (tmp_path / "cursor-spawned").exists()
+
+
+def test_reasoning_effort_error_has_one_dispatch_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(tmp_path, monkeypatch)
+    argv = _raw_launch_argv(
+        project=project,
+        dispatch_id="reasoning-effort-error-prefix",
+        model="grok-4.7-high",
+        marker=tmp_path / "reasoning-effort-worker-spawned",
+        agent="cursor",
+    )
+    argv[argv.index("--"):argv.index("--")] = ["--reasoning-effort", "high"]
+
+    result = _run_dispatch(project, env, argv)
+
+    assert result.returncode == 64, (result.returncode, result.stdout, result.stderr)
+    assert "reasoning-effort" in result.stderr
+    assert "goalflight_dispatch: goalflight_dispatch:" not in result.stderr
+    assert result.stderr.count("goalflight_dispatch:") == 1
+
+
+def test_refused_queue_drain_terminalizes_permanent_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    dispatch_id = "refused-real-drain"
+    queue_dir = state / "dispatch-queue"
+    queue_dir.mkdir(parents=True)
+    marker = tmp_path / "drained-worker-spawned"
+    dispatch_argv = _raw_launch_argv(
+        project=project,
+        dispatch_id=dispatch_id,
+        model=REFUSED_MODEL,
+        marker=marker,
+    )
+    request = {
+        "dispatch_id": dispatch_id,
+        "cwd": str(project),
+        "tail": str(tmp_path / "drain.tail"),
+        "status_json": str(tmp_path / "drain.status.json"),
+    }
+    entry = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "created_at": D.goalflight_ledger.utc_now(),
+        "updated_at": D.goalflight_ledger.utc_now(),
+        "agent": "test-dispatch",
+        "shape": "bash",
+        "project_root": str(project),
+        "process_cwd": str(project),
+        "transport": "dispatch",
+        "dispatch_argv": dispatch_argv,
+        "request": request,
+    }
+    queue_entry = queue_dir / f"{dispatch_id}.json"
+    queue_entry.write_text(json.dumps(entry), encoding="utf-8")
+    D.goalflight_ledger.write_record(
+        {
+            "schema": D.goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "test-dispatch",
+            "model": REFUSED_MODEL,
+            "state": "queued",
+            "reason": "dispatch_queue",
+            "project_root": str(project),
+            "worker_cwd": str(project),
+            "task_ids": [],
+        }
+    )
+
+    result = _run_dispatch(
+        project,
+        env,
+        ["drain", "--cross-project", "--dispatch-id", dispatch_id, "--json"],
+    )
+
+    assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["failed"] == 1, {
+        key: payload.get(key)
+        for key in ("failed", "launched", "left_queued", "remaining", "details", "recovered_claims", "holds")
+    }
+    assert payload["remaining"] == 0, payload
+    assert not queue_entry.exists()
+    failed_claims = list(queue_dir.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert len(failed_claims) == 1
+    failed_payload = json.loads(failed_claims[0].read_text(encoding="utf-8"))
+    assert failed_payload["state"] == "failed"
+    assert "refused by operator policy" in failed_payload["reason"]
+    capacity = json.loads((state / "capacity.json").read_text(encoding="utf-8"))
+    assert not any(
+        lease.get("dispatch_id") == dispatch_id
+        for lease in capacity.get("leases", {}).values()
+    )
+    assert not Path(env["GOALFLIGHT_JOURNAL_DIR"]).exists()
+    assert not marker.exists()

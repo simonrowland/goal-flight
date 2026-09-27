@@ -98,6 +98,7 @@ import goalflight_task
 import goalflight_terminal
 import goalflight_worktree_pool
 from goalflight_agent_limits import (
+    CapacityPolicyConfigError,
     agent_model_allowlist,
     model_refusal,
     moonshot_family,
@@ -4406,35 +4407,131 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
 
 
 def _refuse_configured_model(model: object, agent: object) -> None:
-    refusal = model_refusal(model)
-    if refusal is None:
-        label = normalize_agent(str(agent or ""))
-        policy_agent = "cursor" if _account_engine(label) == "cursor" else label
+    _refuse_configured_models([model], agent)
+
+
+def _refuse_configured_models(
+    models: list[object],
+    agent: object,
+    *,
+    raw_present: bool = False,
+    raw_models: list[str] | None = None,
+) -> None:
+    label = normalize_agent(str(agent or "").strip())
+    policy_agent = "cursor" if _account_engine(label) == "cursor" else label
+    try:
         patterns = agent_model_allowlist(policy_agent)
-        if patterns is None:
-            return
-        if isinstance(model, str) and any(
-            fnmatch.fnmatchcase(model.casefold(), pattern.casefold())
-            for pattern in patterns
-        ):
-            return
-        model_name = model if isinstance(model, str) else "<missing>"
+        # Validate the refused_models container even when this invocation has
+        # no explicit model. A malformed present policy is never unrestricted.
+        refusals = [(model, model_refusal(model)) for model in (models or [None])]
+    except CapacityPolicyConfigError as exc:
+        raise DispatchUsageError(str(exc)) from exc
+
+    allowed_models = list(models or [None])
+    if patterns is not None and raw_present and not raw_models:
+        # A raw command overrides the preset model. Its own implicit default
+        # cannot be checked by the dispatcher, so an allowlisted agent must
+        # name a model on the command that will actually run.
+        allowed_models.append(None)
+    if patterns is not None:
         allowed = ", ".join(patterns) if patterns else "(none)"
+        for model in allowed_models:
+            normalized = model.strip() if isinstance(model, str) else None
+            if normalized is not None and any(
+                fnmatch.fnmatchcase(normalized.casefold(), pattern.casefold())
+                for pattern in patterns
+            ):
+                continue
+            model_name = normalized if normalized is not None else "<missing>"
+            raise DispatchUsageError(
+                f"agent {policy_agent} model {model_name} is refused by operator "
+                f"policy (capacity config agent_model_allow); allowed patterns: {allowed}; "
+                "pass an explicit --model matching an allowed pattern"
+            )
+
+    for model, refusal in refusals:
+        if refusal is None:
+            continue
+        model_name = model.strip() if isinstance(model, str) else "<missing>"
         message = (
-            f"agent {policy_agent} model {model_name} is refused by operator "
-            f"policy (capacity config agent_model_allow); allowed patterns: {allowed}; "
-            "pass an explicit --model matching an allowed pattern"
+            f"model {model_name} is refused by operator policy "
+            "(capacity config refused_models)"
         )
+        replacement = refusal[1]
+        if patterns is not None:
+            allowed = ", ".join(patterns) if patterns else "(none)"
+            message += f"; agent {policy_agent} allowed patterns: {allowed}"
+            if replacement and not any(
+                fnmatch.fnmatchcase(replacement.casefold(), pattern.casefold())
+                for pattern in patterns
+            ):
+                replacement = None
+        if replacement is not None:
+            message += f"; use --model {replacement}"
         raise DispatchUsageError(message)
-    model_name = str(model)
-    message = (
-        f"model {model_name} is refused by operator policy "
-        "(capacity config refused_models)"
+
+
+def _model_option_values(argv: list[str], *, raw: bool = False) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--model" or (raw and token == "-m"):
+            if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                values.append(argv[index + 1])
+                index += 2
+                continue
+        elif token.startswith("--model="):
+            values.append(token.partition("=")[2])
+        elif raw and token.startswith("-m="):
+            values.append(token.partition("=")[2])
+        elif raw and token == "-c" and index + 1 < len(argv):
+            setting = argv[index + 1]
+            key, separator, value = setting.partition("=")
+            if separator and key.strip().casefold() == "model":
+                values.append(value)
+                index += 2
+                continue
+        index += 1
+    return values
+
+
+def _refuse_launch_model_policy(args, argv: list[str]) -> None:
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        separator = len(argv)
+    dispatch_models = _model_option_values(argv[:separator])
+    raw = argv[separator + 1 :] if separator < len(argv) else None
+    raw_models = _model_option_values(raw or [], raw=True)
+    models: list[object] = [*dispatch_models, *raw_models]
+    effective_model = getattr(args, "model", None)
+    if effective_model is not None:
+        models.append(effective_model)
+    _refuse_configured_models(
+        models,
+        getattr(args, "agent", None),
+        raw_present=raw is not None,
+        raw_models=raw_models,
     )
-    replacement = refusal[1]
-    if replacement is not None:
-        message += f"; use --model {replacement}"
-    raise DispatchUsageError(message)
+
+
+def _launch_policy_args(argv: list[str]):
+    parser = _build_launch_parser()
+    agent = _option_value_before_worker_remainder(argv, "--agent", last=True)
+    model = _option_value_before_worker_remainder(argv, "--model", last=True)
+    return argparse.Namespace(
+        agent=agent if agent is not None else parser.get_default("agent"),
+        model=model,
+    )
+
+
+def _dispatch_usage_error_message(error: BaseException) -> str:
+    prefix = "goalflight_dispatch:"
+    message = str(error).strip()
+    while message.startswith(prefix):
+        message = message[len(prefix) :].lstrip()
+    return f"{prefix} {message}"
 
 
 def _nonterminal_dispatch_reuse_reason(
@@ -7093,18 +7190,13 @@ def _cmd_resume(argv: list[str]) -> int:
 
     parent_record = _find_dispatch_record(args.dispatch_id)
     if isinstance(parent_record, dict):
-        effective_model = (
-            args.model
-            if args.model is not None
-            else _resume_model_from_record(parent_record)
-        )
+        policy_argv = _resume_policy_argv(parent_record, args)
+        policy_args = _launch_policy_args(policy_argv)
         try:
-            _refuse_configured_model(
-                effective_model,
-                parent_record.get("agent") or parent_record.get("engine"),
-            )
+            _refuse_launch_model_policy(policy_args, policy_argv)
         except DispatchUsageError as exc:
-            print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+            _emit_permanent_dispatch_refusal(args.dispatch_id, exc)
+            print(_dispatch_usage_error_message(exc), file=sys.stderr)
             return 64
 
     prompt_path = Path(args.prompt_file).expanduser()
@@ -7147,13 +7239,19 @@ def _cmd_resume(argv: list[str]) -> int:
             prompt_path=prompt_path,
             resume_args=args,
         )
+        policy_args = _launch_policy_args(candidate_argv)
+        try:
+            _refuse_launch_model_policy(policy_args, candidate_argv)
+        except DispatchUsageError as exc:
+            _emit_permanent_dispatch_refusal(candidate_dispatch_id, exc)
+            raise
         preflight = _preflight_resume_dispatch(
             source,
             candidate_argv=candidate_argv,
             dispatch_id=candidate_dispatch_id,
         )
     except (DispatchUsageError, goalflight_worktree_pool.WorktreeSeatError) as exc:
-        print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
     child_dispatch_id = preflight["dispatch_id"]
     result = None
@@ -7189,8 +7287,21 @@ def _resume_model_from_record(record: dict) -> str | None:
     if isinstance(recorded, str) and recorded.strip():
         return recorded.strip()
     return _option_value_before_worker_remainder(
-        _dispatch_argv_from_record(record), "--model"
+        _dispatch_argv_from_record(record), "--model", last=True
     )
+
+
+def _resume_policy_argv(record: dict, resume_args) -> list[str]:
+    """Preview model and agent options using the same resume override rules."""
+    argv = _dispatch_argv_from_record(record)
+    if not argv:
+        argv = ["--agent", str(record.get("agent") or record.get("engine") or "codex")]
+    model = getattr(resume_args, "model", None)
+    if model is None:
+        model = _resume_model_from_record(record)
+    if model is not None:
+        argv = _set_option_before_worker_remainder(argv, "--model", str(model))
+    return argv
 
 
 def _resume_cwd_from_record(record: dict) -> Path | None:
@@ -7327,9 +7438,7 @@ def _resume_launch_argv(
         "--engine-session-id": source["session_id"],
         "--cwd": str(cwd),
     }
-    recorded_model = record.get("model") or _option_value_before_worker_remainder(
-        recorded, "--model", last=True
-    )
+    recorded_model = _resume_model_from_record(record)
     requested_model = getattr(resume_args, "model", None)
     if requested_model is not None:
         replace["--model"] = str(requested_model)
@@ -10739,6 +10848,21 @@ def _attempt_claiming_worker_argv(
 
 DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
 PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
+
+
+def _emit_permanent_dispatch_refusal(
+    dispatch_id: str | None, error: BaseException | str
+) -> None:
+    payload = {
+        "dispatch_id": dispatch_id,
+        "permanent": True,
+        "reason": str(error),
+        "state": "refused",
+    }
+    print(
+        DISPATCH_REFUSED_PREFIX + json.dumps(payload, sort_keys=True),
+        flush=True,
+    )
 
 
 def _emit_proven_pre_worker_refusal(error: ProvenPreWorkerRefusal) -> None:
@@ -23336,13 +23460,17 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
     try:
-        if resume_plan is None:
-            _refuse_configured_model(
-                getattr(args, "model", None), getattr(args, "agent", None)
-            )
+        _refuse_launch_model_policy(args, argv)
+    except DispatchUsageError as exc:
+        _emit_permanent_dispatch_refusal(
+            getattr(args, "dispatch_id", None), exc
+        )
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
+        return 64
+    try:
         _validate_reasoning_effort_route(args, raw)
     except DispatchUsageError as exc:
-        print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
     if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
         print(
