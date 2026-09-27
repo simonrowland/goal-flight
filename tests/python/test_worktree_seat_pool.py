@@ -322,6 +322,128 @@ def seat_limit(limit: int):
             os.environ[name] = prior
 
 
+def configure_pool_test_environment(monkeypatch, root: Path, config: Path) -> None:
+    values = {
+        "GOALFLIGHT_CAPACITY_CONF": str(config),
+        "GOALFLIGHT_STATE_DIR": str(root / "state"),
+        "GOALFLIGHT_JOURNAL_DIR": str(root / "journal"),
+        "GOALFLIGHT_WAKE_LEDGER": str(root / "wake-ledger"),
+        "GOALFLIGHT_MESSAGES_DIR": str(root / "messages"),
+        "GOALFLIGHT_TASK_STORE": str(root / "task-store"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(root / "task-store"),
+        "GOALFLIGHT_PIDFILE_DIR": str(root / "pids"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(root / "pids"),
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def make_sparse_repo(root: Path) -> tuple[Path, str, Path]:
+    repo = make_repo(root)
+    excluded = repo / "docs-private" / "build" / "remote-pytest"
+    excluded.mkdir(parents=True)
+    (excluded / "evidence.txt").write_text("heavy evidence\n", encoding="utf-8")
+    (repo / "included.txt").write_text("keep me\n", encoding="utf-8")
+    git(repo, "add", "--", ".")
+    git(repo, "commit", "-m", "sparse fixture")
+    git(repo, "config", "--unset", "core.bare")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    pattern = root / "seat-sparse.pattern"
+    pattern.write_text("/*\n!/docs-private/build/remote-pytest/\n", encoding="utf-8")
+    return repo, git(repo, "rev-parse", "HEAD"), pattern
+
+
+def write_pool_config(
+    root: Path, repo: Path, pattern: Path | None = None
+) -> Path:
+    payload = {"worktrees_per_repo": 1}
+    if pattern is not None:
+        payload["seat_sparse_pattern_files"] = {str(repo): str(pattern)}
+    config = root / "capacity.local.json"
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    return config
+
+
+def assert_clean_seat(seat: Path, base: str) -> None:
+    assert git(seat, "rev-parse", "HEAD") == base
+    assert git(seat, "status", "--porcelain") == ""
+
+
+def test_configured_new_seat_uses_sparse_checkout(tmp_path: Path, monkeypatch) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-create")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "included.txt").is_file()
+        assert not (lease.path / "docs-private" / "build" / "remote-pytest").exists()
+        assert (repo / "docs-private" / "build" / "remote-pytest").is_dir()
+    finally:
+        lease.release()
+
+
+def test_unconfigured_repo_keeps_full_new_seat(tmp_path: Path, monkeypatch) -> None:
+    repo, base, _pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "full-create")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("precondition", ["worktree_config_false", "core_worktree"])
+def test_sparse_precondition_falls_back_without_shared_config_change(
+    tmp_path: Path, monkeypatch, precondition: str
+) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    if precondition == "worktree_config_false":
+        git(repo, "config", "extensions.worktreeConfig", "false")
+    else:
+        git(repo, "config", "core.worktree", str(repo))
+    common_dir = Path(git(repo, "rev-parse", "--git-common-dir"))
+    common_config = (common_dir if common_dir.is_absolute() else repo / common_dir) / "config"
+    before = common_config.read_bytes()
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, f"precondition-{precondition}")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+    assert common_config.read_bytes() == before
+
+
+def test_sparse_setup_failure_restores_full_clean_seat(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo, base, pattern = make_sparse_repo(tmp_path)
+    config = write_pool_config(tmp_path, repo, pattern)
+    configure_pool_test_environment(monkeypatch, tmp_path, config)
+    real_git = goalflight_worktree_pool._git
+
+    def fail_sparse_setup(cwd: Path, *args: str, **kwargs):
+        if args[:3] == ("sparse-checkout", "set", "--no-cone"):
+            raise goalflight_worktree_pool.WorktreeSeatError("injected sparse failure")
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(goalflight_worktree_pool, "_git", fail_sparse_setup)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "sparse-failure")
+    try:
+        assert_clean_seat(lease.path, base)
+        assert (lease.path / "docs-private" / "build" / "remote-pytest" / "evidence.txt").is_file()
+    finally:
+        lease.release()
+    assert "restored full seat" in capsys.readouterr().err
+
+
 def pooled_worktrees(repo: Path) -> list[Path]:
     root = repo.resolve() / "worktrees"
     if not root.is_dir():
