@@ -49,7 +49,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import errno
 import hashlib
@@ -9407,14 +9407,19 @@ def _codex_account_admission_reason(
     return None
 
 
-def _codex_usage_probe_rows() -> list[dict]:
+def _codex_usage_probe_rows(account: str | None = None) -> list[dict]:
     """Read Codex health through the same usage reader shown to operators."""
     try:
         import goalflight_usage as usage
 
         specs = tuple(spec for spec in usage.READERS if spec.provider == "codex")
+        if account:
+            specs = tuple(
+                replace(spec, extra_args=(*spec.extra_args, "--seat", account))
+                for spec in specs
+            )
         rows = usage.collect_usage(
-            timeout_s=min(usage.DEFAULT_TIMEOUT_S, 8.0),
+            timeout_s=usage.DEFAULT_TIMEOUT_S,
             reader_specs=specs,
             ledger_records=[],
         )
@@ -9549,18 +9554,70 @@ def _refuse_walled_codex_account(
     account: str,
     *,
     usage_rows: list[dict] | None = None,
+    probe_elapsed_s: float | None = None,
     allow_unknown: bool = False,
 ) -> None:
     """Refuse a pinned account without current, usable quota evidence."""
     import goalflight_usage as usage
 
-    rows = _codex_usage_probe_rows() if usage_rows is None else usage_rows
+    probe_started = time.monotonic()
+    rows = _codex_usage_probe_rows(account) if usage_rows is None else usage_rows
+    elapsed_s = (
+        time.monotonic() - probe_started
+        if probe_elapsed_s is None and usage_rows is None
+        else float(probe_elapsed_s or 0.0)
+    )
+    budget_s = float(usage.DEFAULT_TIMEOUT_S)
     probe = _codex_usage_probe_says_usable(account, rows=rows)
     if probe is None:
         if allow_unknown:
             return
+        timed_out = any(
+            "timeout" in (row.get("flags") or ())
+            for row in rows
+            if isinstance(row, dict)
+        )
+        account_rows = _codex_account_usage_rows(account, rows)
+        if timed_out:
+            condition = "timeout"
+        elif not account_rows:
+            condition = "no row"
+        else:
+            row = account_rows[0]
+            evidence = row.get("evidence")
+            probe_evidence = (
+                evidence.get("probe") if isinstance(evidence, dict) else None
+            )
+            observed_at = (
+                usage.parse_reset(probe_evidence.get("observed_at"))
+                if isinstance(probe_evidence, dict)
+                else None
+            )
+            if observed_at is None:
+                condition = "stale row (age unknown)"
+            else:
+                now = time.time()
+                age_s = now - observed_at
+                if (
+                    observed_at > now + CODEX_USAGE_PROBE_FUTURE_SKEW_S
+                    or age_s > CODEX_USAGE_PROBE_MAX_AGE_S
+                ):
+                    condition = f"stale row (age {age_s:.1f}s)"
+                else:
+                    state = (
+                        probe_evidence.get("state")
+                        if isinstance(probe_evidence, dict)
+                        else usage._probe_state(row)
+                    )
+                    remaining = str(row.get("remaining") or "").strip().casefold()
+                    if state != "reported":
+                        condition = f"unusable row (state={state or 'unknown'})"
+                    else:
+                        condition = f"unusable row (remaining={remaining or 'unknown'})"
         raise DispatchUsageError(
-            f"Codex account {account!r} health probe unknown or stale; "
+            f"Codex account {account!r} health probe unknown or stale "
+            f"(condition={condition}; elapsed={elapsed_s:.2f}s, "
+            f"budget={budget_s:.2f}s); "
             "refusing pinned launch; refresh the usage probe"
         )
     if probe is not False and not (
@@ -9581,7 +9638,9 @@ def _refuse_walled_codex_account(
         else "unknown"
     )
     raise DispatchUsageError(
-        f"Codex account {account!r} is quota-walled; refusing launch; "
+        f"Codex account {account!r} is quota-walled "
+        f"(condition=walled; elapsed={elapsed_s:.2f}s, "
+        f"budget={budget_s:.2f}s); refusing launch; "
         f"wait for its soonest reset at {reset_text}"
     )
 
@@ -9869,7 +9928,9 @@ def revalidate_codex_account_after_capacity(
     if not chosen_account or chosen_account == "host":
         return chosen_account
 
-    usage_rows = _codex_usage_probe_rows()
+    probe_started = time.monotonic()
+    usage_rows = _codex_usage_probe_rows(chosen_account)
+    probe_elapsed_s = time.monotonic() - probe_started
     reason = _codex_post_capacity_admission_reason(
         chosen_account,
         usage_rows=usage_rows,
@@ -9890,7 +9951,11 @@ def revalidate_codex_account_after_capacity(
         # Preserve the detailed reset/health diagnostic used by pre-admission
         # pin checks, while marking this as the no-spawn refusal path.
         setattr(args, "_codex_post_capacity_pinned_refusal", True)
-        _refuse_walled_codex_account(explicit_account, usage_rows=usage_rows)
+        _refuse_walled_codex_account(
+            explicit_account,
+            usage_rows=usage_rows,
+            probe_elapsed_s=probe_elapsed_s,
+        )
         raise DispatchUsageError(
             f"Codex account {explicit_account!r} is no longer eligible after "
             f"capacity admission: {reason}"

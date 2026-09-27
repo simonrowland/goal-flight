@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import json
 import sys
+import textwrap
 import time
 from types import SimpleNamespace
 
@@ -225,7 +226,7 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             _codex_probe_row("walled", "0%", state="walled"),
             _codex_probe_row("healthy", "80%"),
         ],
@@ -274,6 +275,72 @@ def _codex_probe_row(
     return row
 
 
+def test_pinned_codex_probe_uses_seat_reader_and_usage_timeout(
+    isolated_capacity, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args_path = tmp_path / "reader-args.json"
+    reader = tmp_path / "codex_usage.py"
+    reader.write_text(
+        textwrap.dedent(
+            """\
+            import argparse
+            import json
+            import os
+            import sys
+            import time
+
+            seats = ["target-seat", "seat-b", "seat-c", "seat-d", "seat-e"]
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--json", action="store_true")
+            parser.add_argument("--seat")
+            args = parser.parse_args()
+            with open(os.environ["FAKE_CODEX_ARGS_PATH"], "w", encoding="utf-8") as out:
+                json.dump(sys.argv[1:], out)
+            selected = [args.seat] if args.seat else seats
+            records = []
+            for seat in selected:
+                time.sleep(2)
+                records.append({
+                    "seat": seat,
+                    "used_percent": 57,
+                    "reset_at": "2030-01-02T03:04:05Z",
+                    "source": "fake",
+                    "ok": True,
+                })
+            print(json.dumps(records))
+            """
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_CODEX_ARGS_PATH", str(args_path))
+
+    real_collect_usage = usage.collect_usage
+    timeouts: list[float] = []
+
+    def collect_from_fake_reader(*, timeout_s, reader_specs, ledger_records):
+        timeouts.append(timeout_s)
+        return real_collect_usage(
+            readers_dir=tmp_path,
+            timeout_s=timeout_s,
+            reader_specs=reader_specs,
+            ledger_records=ledger_records,
+        )
+
+    monkeypatch.setattr(usage, "collect_usage", collect_from_fake_reader)
+    started = time.monotonic()
+    dispatch._refuse_walled_codex_account("target-seat")
+    elapsed = time.monotonic() - started
+
+    assert timeouts == [usage.DEFAULT_TIMEOUT_S]
+    assert timeouts[0] == 20.0
+    assert json.loads(args_path.read_text(encoding="utf-8")) == [
+        "--json",
+        "--seat",
+        "target-seat",
+    ]
+    assert elapsed < usage.DEFAULT_TIMEOUT_S
+
+
 def test_stale_codex_probe_is_unknown_and_not_selected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -289,7 +356,11 @@ def test_stale_codex_probe_is_unknown_and_not_selected(
     monkeypatch.setattr(
         dispatch, "_configured_account_names", lambda engine: ["stale", "future", "fresh"]
     )
-    monkeypatch.setattr(dispatch, "_codex_usage_probe_rows", lambda: [stale, future, fresh])
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_rows",
+        lambda *_args, **_kwargs: [stale, future, fresh],
+    )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
         dispatch.goalflight_capacity,
@@ -321,13 +392,18 @@ def test_pinned_codex_dispatch_refuses_walled_account_with_reset(
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [_codex_probe_row("walled", "0%", state="walled")],
+        lambda *_args, **_kwargs: [
+            _codex_probe_row("walled", "0%", state="walled")
+        ],
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
 
     with pytest.raises(
         dispatch.DispatchUsageError,
-        match=r"walled.*walled.*2030-01-02T03:04:05",
+        match=(
+            r"walled.*condition=walled; elapsed=0\.00s, budget=20\.00s"
+            r".*2030-01-02T03:04:05"
+        ),
     ):
         dispatch._resolve_account_env(
             SimpleNamespace(agent="codex", account="walled", model=None)
@@ -343,17 +419,49 @@ def test_pinned_codex_dispatch_refuses_unknown_health(
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [_codex_probe_row("unknown", "unknown")],
+        lambda *_args, **_kwargs: [_codex_probe_row("unknown", "unknown")],
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
 
     with pytest.raises(
         dispatch.DispatchUsageError,
-        match=r"unknown.*health probe unknown or stale",
+        match=(
+            r"unknown.*health probe unknown or stale "
+            r"\(condition=unusable row \(remaining=unknown\); "
+            r"elapsed=0\.00s, budget=20\.00s\)"
+        ),
     ):
         dispatch._resolve_account_env(
             SimpleNamespace(agent="codex", account="unknown", model=None)
         )
+
+
+def test_pinned_codex_probe_diagnostic_conditions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 2_000_000_000.0
+    monkeypatch.setattr(dispatch.time, "time", lambda: now)
+    timeout_row = {
+        "provider": "codex",
+        "account": None,
+        "remaining": "timed out",
+        "flags": ["timeout"],
+        "evidence": {"probe": {"state": "timed_out"}},
+    }
+    stale_row = _codex_probe_row(
+        "target-seat",
+        "43%",
+        observed_at=now - dispatch.CODEX_USAGE_PROBE_MAX_AGE_S - 12.5,
+    )
+    for expected, rows in (
+        ("timeout", [timeout_row]),
+        ("no row", []),
+        ("stale row (age 312.5s)", [stale_row]),
+    ):
+        with pytest.raises(dispatch.DispatchUsageError) as exc:
+            dispatch._refuse_walled_codex_account("target-seat", usage_rows=rows)
+        assert f"condition={expected}" in str(exc.value)
+        assert "elapsed=0.00s, budget=20.00s" in str(exc.value)
 
 
 def test_pinned_codex_resume_refuses_walled_account_with_reset(
@@ -362,7 +470,7 @@ def test_pinned_codex_resume_refuses_walled_account_with_reset(
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [_codex_probe_row("walled", "0%", state="walled")],
+        lambda *_args, **_kwargs: [_codex_probe_row("walled", "0%", state="walled")],
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
@@ -424,7 +532,7 @@ def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monk
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             _codex_probe_row("walled", "0%", state="walled"),
             _codex_probe_row("healthy", "80%"),
         ],
@@ -502,7 +610,7 @@ def test_codex_selection_uses_most_measured_headroom(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             _codex_probe_row("unknown", "unknown"),
             _codex_probe_row("alpha", "20%"),
             _codex_probe_row("beta", "80%"),
@@ -536,7 +644,7 @@ def test_codex_selection_preserves_weekly_resume_reserve(
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             _codex_probe_row("reserved", "95%", weekly_used_percent=95),
             _codex_probe_row("available", "80%", weekly_used_percent=40),
         ],
@@ -584,7 +692,9 @@ def test_resolver_only_account_without_numeric_headroom_is_not_promoted(
             resolve_codex_seat=lambda *_args: (str(home), "mystery")
         ),
     )
-    monkeypatch.setattr(dispatch, "_codex_usage_probe_rows", lambda: [])
+    monkeypatch.setattr(
+        dispatch, "_codex_usage_probe_rows", lambda *_args, **_kwargs: []
+    )
     monkeypatch.setattr(
         dispatch, "_codex_usage_probe_says_usable", lambda *_args, **_kwargs: True
     )

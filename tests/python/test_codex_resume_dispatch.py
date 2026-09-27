@@ -66,7 +66,9 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "_codex_usage_probe_says_usable",
         lambda _account, **_kwargs: True,
     )
-    monkeypatch.setattr(D, "_codex_usage_probe_rows", lambda: [])
+    monkeypatch.setattr(
+        D, "_codex_usage_probe_rows", lambda *_args, **_kwargs: []
+    )
     for key in (
         "GOALFLIGHT_CONTROLLER_LABEL",
         "GOALFLIGHT_CONTROLLER_PID",
@@ -3269,7 +3271,7 @@ def test_unpinned_codex_selection_skips_recently_exhausted_seat(
     monkeypatch.setattr(
         D,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             {
                 "provider": "codex",
                 "account": account,

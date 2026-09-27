@@ -101,7 +101,7 @@ def _stub_bash_launch(
     monkeypatch.setattr(
         D,
         "_codex_usage_probe_rows",
-        lambda: (
+        lambda *_args, **_kwargs: (
             [
                 {
                     "provider": "codex",
@@ -901,7 +901,11 @@ def _run_acp_to_spawn_failure(
         if probe_account
         else []
     )
-    monkeypatch.setattr(D, "_codex_usage_probe_rows", lambda: list(probe_rows))
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_rows",
+        lambda *_args, **_kwargs: list(probe_rows),
+    )
     monkeypatch.setattr(A, "agent_command", lambda *_args, **_kwargs: ("fake", []))
     monkeypatch.setattr(
         A, "_codex_workspace_write_acp_args", lambda _agent, args, **_kwargs: args
@@ -1137,7 +1141,9 @@ def test_post_capacity_failover_rebinds_pre_resolved_account_without_reacquire(
         },
     ]
     monkeypatch.setattr(D, "_configured_account_names", lambda _engine: ["old-seat", "new-seat"])
-    monkeypatch.setattr(D, "_codex_usage_probe_rows", lambda: list(rows))
+    monkeypatch.setattr(
+        D, "_codex_usage_probe_rows", lambda *_args, **_kwargs: list(rows)
+    )
     monkeypatch.setattr(D, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
         D.goalflight_capacity,
@@ -1481,7 +1487,7 @@ def _install_stub_seat_api(
     monkeypatch.setattr(
         D,
         "_codex_usage_probe_rows",
-        lambda: [
+        lambda *_args, **_kwargs: [
             {
                 "provider": "codex",
                 "account": "seat-e2e",
