@@ -141,6 +141,19 @@ class WorktreeSeatError(RuntimeError):
 class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured worktree is held."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        seat_name: str | None = None,
+        current_holder: str | None = None,
+        flock_held: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.seat_name = seat_name
+        self.current_holder = current_holder
+        self.flock_held = flock_held
+
 
 class WorktreeReadOnlyLockTimeout(WorktreeSeatUnavailable):
     """Raised when the detached-checkout allocation lock cannot be acquired."""
@@ -153,12 +166,18 @@ class WorktreeSeatReclaimed(WorktreeSeatUnavailable):
         self,
         message: str,
         *,
+        seat_name: str | None = None,
         current_holder: str | None = None,
         expected_holder: str | None = None,
         terminal_reclaimed: bool = False,
+        flock_held: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.current_holder = current_holder
+        super().__init__(
+            message,
+            seat_name=seat_name,
+            current_holder=current_holder,
+            flock_held=flock_held,
+        )
         self.expected_holder = expected_holder
         self.terminal_reclaimed = terminal_reclaimed
 
@@ -3667,10 +3686,17 @@ def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
                     f"resume refused: worktree {path.name} was reclaimed by "
                     f"{occupant}; expected recorded holder {expected}; "
                     "refusing to reset or recreate it",
+                    seat_name=path.name,
                     current_holder=occupant,
                     expected_holder=expected,
+                    flock_held=isinstance(exc, WorktreePathLockBusy),
                 ) from exc
-            raise WorktreeSeatUnavailable(str(exc)) from exc
+            raise WorktreeSeatUnavailable(
+                str(exc),
+                seat_name=path.name,
+                current_holder=occupant,
+                flock_held=isinstance(exc, WorktreePathLockBusy),
+            ) from exc
         with occupancy:
             return _prepare_claimed_seat_locked(**kwargs)
     return _prepare_claimed_seat_locked(**kwargs)
@@ -3688,7 +3714,7 @@ def _prepare_claimed_seat_locked(
     base_commit: str,
     reset: bool,
     controller_label: str | None = None,
-    before_reset: Callable[[Path], None] | None = None,
+    before_reset: Callable[[Path, str | None], None] | None = None,
 ) -> WorktreeSeatLease:
     presence = _path_presence(worktree_path)
     if presence == "unknown":
@@ -3700,7 +3726,7 @@ def _prepare_claimed_seat_locked(
     if existing:
         _verify_existing_seat(project_root, worktree_path)
         if before_reset is not None:
-            before_reset(worktree_path)
+            before_reset(worktree_path, prior_dispatch_id)
         if reset:
             prior_dispatch_id = _validate_holder(worktree_path, prior_dispatch_id)
             safety = evaluate_seat_reset_safety(
@@ -3987,7 +4013,7 @@ def acquire_worktree_seat(
     expected_prior_dispatch_id: str | None = None,
     allowed_prior_dispatch_ids: frozenset[str] | set[str] | None = None,
     capacity_deadline: float | None = None,
-    before_reset: Callable[[Path], None] | None = None,
+    before_reset: Callable[[Path, str | None], None] | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -4251,12 +4277,17 @@ def acquire_worktree_seat(
                         f"resume refused: worktree {seat_name} was reclaimed by "
                         f"{current_holder}; expected recorded holder "
                         f"{expected_prior_dispatch_id}; refusing to reset or recreate it",
+                        seat_name=seat_name,
                         current_holder=current_holder,
                         expected_holder=expected_prior_dispatch_id,
+                        flock_held=True,
                     )
                 raise WorktreeSeatUnavailable(
                     f"worktree {seat_name} is held: {occupant}; "
-                    "refusing to git worktree add a new unmanaged path"
+                    "refusing to git worktree add a new unmanaged path",
+                    seat_name=seat_name,
+                    current_holder=current_holder,
+                    flock_held=True,
                 )
             try:
                 try:
