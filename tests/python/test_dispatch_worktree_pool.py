@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -149,6 +150,292 @@ def _dispatch_cmd(tmp: Path, repo: Path, dispatch_id: str, *worker: str) -> list
         "--",
         *worker,
     ]
+
+
+def _start_flock_holder(
+    tmp_path: Path,
+    repo: Path,
+    seat: Path,
+    dispatch_id: str,
+    *,
+    occupancy: bool = False,
+    record_ledger: bool = True,
+) -> tuple[subprocess.Popen[str], Path, Path]:
+    mode = "occupancy" if occupancy else "seat"
+    ready = tmp_path / f"{dispatch_id}.ready"
+    release = tmp_path / f"{dispatch_id}.release"
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    code = r"""
+import fcntl, os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import goalflight_compat, goalflight_ledger, goalflight_worktree_pool
+scripts, repo, seat, dispatch_id, mode, lock_path, ready, release, record_ledger = sys.argv[1:]
+repo, seat = Path(repo), Path(seat)
+def publish_holder():
+    pid = os.getpid()
+    identity = goalflight_compat.process_start_identity(pid)
+    goalflight_ledger.write_record({
+        "schema": goalflight_ledger.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "project_root": str(repo),
+        "worker_pid": pid,
+        "worker_identity": identity,
+        "worker_cwd": str(seat),
+        "worktree_id": seat.name,
+        "worktree_path": str(seat),
+        "worktree_branch": goalflight_worktree_pool._git(seat, "rev-parse", "--abbrev-ref", "HEAD"),
+        "worktree_head": goalflight_worktree_pool._git(seat, "rev-parse", "HEAD"),
+    })
+if mode == "seat":
+    with open(lock_path, "r+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        goalflight_worktree_pool._write_occupant(
+            lock_file, seat_name=seat.name, dispatch_id=dispatch_id, controller_label=None
+        )
+        if record_ledger == "1":
+            publish_holder()
+        Path(ready).touch()
+        while not Path(release).exists():
+            time.sleep(0.01)
+else:
+    lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(seat, dispatch_id)
+    try:
+        if record_ledger == "1":
+            publish_holder()
+        Path(ready).touch()
+        while not Path(release).exists():
+            time.sleep(0.01)
+    finally:
+        lock.release()
+"""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(SCRIPTS),
+            str(repo),
+            str(seat),
+            dispatch_id,
+            mode,
+            str(lock_path),
+            str(ready),
+            str(release),
+            "1" if record_ledger else "0",
+        ],
+        cwd=str(repo),
+        env=_env(tmp_path, seats=2),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if ready.exists():
+            return proc, release, lock_path
+        if proc.poll() is not None:
+            _stdout, stderr = proc.communicate()
+            raise AssertionError(f"flock holder exited early: {stderr}")
+        time.sleep(0.01)
+    release.touch()
+    try:
+        _stdout, stderr = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout, stderr = proc.communicate()
+    raise AssertionError(f"flock holder did not become ready: {stderr}")
+
+
+def _start_allocation_flock_holder(
+    tmp_path: Path, repo: Path
+) -> tuple[subprocess.Popen[str], Path, Path]:
+    ready = tmp_path / "allocation-lock.ready"
+    release = tmp_path / "allocation-lock.release"
+    lock_path = goalflight_worktree_pool._seat_lock_root(repo) / "allocation.lock"
+    code = r"""
+import fcntl, sys, time
+from pathlib import Path
+lock_path, ready, release = map(Path, sys.argv[1:])
+with open(lock_path, "r+", encoding="utf-8") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    ready.touch()
+    while not release.exists():
+        time.sleep(0.01)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(lock_path), str(ready), str(release)],
+        cwd=str(repo),
+        env=_env(tmp_path, seats=2),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if ready.exists():
+            return proc, release, lock_path
+        if proc.poll() is not None:
+            _stdout, stderr = proc.communicate()
+            raise AssertionError(f"allocation flock holder exited early: {stderr}")
+        time.sleep(0.01)
+    release.touch()
+    try:
+        _stdout, stderr = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _stdout, stderr = proc.communicate()
+    raise AssertionError(f"allocation flock holder did not become ready: {stderr}")
+
+
+def _record_bind_probe_durations(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    durations: list[float] = []
+    original = goalflight_dispatch._bind_dispatch_worktree
+
+    def timed_bind(args):
+        started = time.monotonic()
+        try:
+            return original(args)
+        finally:
+            durations.append(time.monotonic() - started)
+
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", timed_bind)
+    return durations
+
+
+def _record_path_probe_durations(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    durations: list[float] = []
+    original = goalflight_worktree_pool.try_acquire_worktree_path_lock
+
+    def timed_probe(*args, **kwargs):
+        started = time.monotonic()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            durations.append(time.monotonic() - started)
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "try_acquire_worktree_path_lock", timed_probe
+    )
+    return durations
+
+
+class _AdvancingDeadlineClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.elapsed += max(0.0, seconds)
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+def _drive_dispatch_deadline(monkeypatch: pytest.MonkeyPatch) -> _AdvancingDeadlineClock:
+    clock = _AdvancingDeadlineClock()
+    monkeypatch.setattr(goalflight_dispatch, "time", clock)
+    return clock
+
+
+def _assert_wait_includes_one_probe(
+    elapsed: float, wait_s: float, probes: list[float]
+) -> None:
+    assert probes, "timed no lock probe"
+    limit = wait_s + max(probes)
+    assert elapsed < limit, f"wait took {elapsed:.3f}s, budget plus one probe is {limit:.3f}s"
+
+
+def _queue_retry_args(
+    tmp_path: Path,
+    repo: Path,
+    seat: Path,
+    holder_id: str,
+    *,
+    wait_s: float,
+) -> tuple[SimpleNamespace, Path, bytes]:
+    dispatch_id = "queue-retry"
+    claim = tmp_path / "queue-retry.claimed"
+    goalflight_dispatch._write_json_atomic(
+        claim,
+        {
+            "dispatch_id": dispatch_id,
+            "queue_launch_token": "queue-token",
+            "worktree_path": str(seat),
+            "worktree_seat": seat.name,
+            "dispatch_argv": [
+                "--agent",
+                "test-dispatch",
+                "--dispatch-id",
+                dispatch_id,
+                "--worktree",
+                "HEAD",
+                "--skip-seat-reset",
+                "--cwd",
+                str(seat),
+            ],
+        },
+    )
+    args = SimpleNamespace(
+        agent="test-dispatch",
+        worktree="HEAD",
+        parent_dispatch_id=None,
+        dispatch_id=dispatch_id,
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        from_queue=True,
+        queue_claim_path=str(claim),
+        queue_launch_token="queue-token",
+        worktree_pin_holder=holder_id,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=wait_s,
+    )
+    return args, claim, claim.read_bytes()
+
+
+def _set_pinned_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.delenv("GOALFLIGHT_WORKTREE_LOCK_FD", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_OCCUPANCY_LOCK_FD", raising=False)
+
+
+def _assert_pinned_resume_refusal(
+    args: SimpleNamespace,
+    repo: Path,
+    seat: Path,
+    holder_id: str,
+) -> None:
+    args.capacity_wait_s = 0.05
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    lock_before = lock_path.read_bytes()
+    branch_before = _git(seat, "rev-parse", "--abbrev-ref", "HEAD")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    started = time.monotonic()
+    with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert time.monotonic() - started < 1
+    message = str(exc_info.value)
+    assert f"worktree seat {seat.name}; wait for a seat: holder={holder_id}" in message
+    assert "flock_liveness=held" in message
+    assert message.count(holder_id) == 1
+    assert args.cwd == str(seat)
+    assert _git(seat, "rev-parse", "--abbrev-ref", "HEAD") == branch_before
+    assert _git(seat, "rev-parse", "HEAD") == head_before
+    assert lock_path.read_bytes() == lock_before
+    assert _lock_dispatch_id(lock_path) == holder_id
+    assert not (seat.parent / "s-2").exists()
 
 
 def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
@@ -495,6 +782,10 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
     parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
     seat = parent.path
     parent.release()
+    _write_terminal_seat_record("resume-parent", repo, seat)
+    head_before = _git(seat, "rev-parse", "HEAD")
+    dirty_file = seat / "resume-dirty.txt"
+    dirty_file.write_text("keep this checkout\n", encoding="utf-8")
 
     args = SimpleNamespace(
         worktree="HEAD",
@@ -511,6 +802,8 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
     try:
         assert resumed.path == seat
         assert args.cwd == str(seat)
+        assert _git(seat, "rev-parse", "HEAD") == head_before
+        assert dirty_file.read_text(encoding="utf-8") == "keep this checkout\n"
         with pytest.raises(
             goalflight_worktree_pool.WorktreeSeatUnavailable,
             match="resume-child",
@@ -1180,8 +1473,8 @@ def test_read_only_resume_revalidates_after_capacity_wait_before_launch(
     prompt = tmp_path / "resume.md"
     prompt.write_text("Continue the worker.\n", encoding="utf-8")
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
-    queue_dir = tmp_path / "dispatch-queue"
-    queue_dir.mkdir()
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True)
     claim = queue_dir / f"{child_id}.json.claimed-1"
     queue_token = "readonly-capacity-queue-token"
     claim.write_text(
@@ -1394,17 +1687,14 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
         }
     )
     try:
-        args.capacity_wait_s = 600
+        args.capacity_wait_s = 0.05
         started = time.monotonic()
         with pytest.raises(
-            goalflight_worktree_pool.WorktreeSeatReclaimed,
-            match=(
-                r"resume refused: worktree s-1 was reclaimed by reclaimer; "
-                r"expected recorded holder resume-parent"
-            ),
+            goalflight_dispatch.DispatchUsageError,
+            match=r"worktree seat s-1; wait for a seat: holder=reclaimer;.*holder_liveness=unknown",
         ):
             goalflight_dispatch._admit_dispatch_worktree(args)
-        assert time.monotonic() - started < 1
+        assert time.monotonic() - started < 0.6
     finally:
         reclaimer.release()
 
@@ -1421,7 +1711,7 @@ def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
     assert time.monotonic() - started < 1
 
 
-def test_resume_reuses_terminal_prior_resume_in_same_lineage(
+def test_resume_does_not_adopt_terminal_non_parent_from_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
@@ -1430,7 +1720,22 @@ def test_resume_reuses_terminal_prior_resume_in_same_lineage(
     parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
     seat = parent.path
     finish_seat_holder(parent)
-    _write_terminal_seat_record("resume-parent", repo, seat)
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "state": "running",
+            "terminal_state": "unknown",
+            "worker_pid": os.getpid(),
+            "worker_identity": goalflight_ledger.process_identity(os.getpid()),
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": "worktree/resume-parent",
+            "worktree_head": _git(seat, "rev-parse", "HEAD"),
+        }
+    )
 
     first_resume = goalflight_worktree_pool.acquire_worktree_seat(
         repo,
@@ -1443,27 +1748,51 @@ def test_resume_reuses_terminal_prior_resume_in_same_lineage(
     _write_terminal_seat_record(
         "resume-one", repo, seat, parent_dispatch_id="resume-parent"
     )
+    dirty_file = seat / "non-parent-terminal-dirty.txt"
+    dirty_file.write_text("leave the unrelated terminal checkout intact\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    claim = tmp_path / "resume-two.claimed"
+    claim.write_text(
+        json.dumps(
+            {
+                "dispatch_id": "resume-two",
+                "queue_launch_token": "resume-two-token",
+                "state": "claimed",
+                "dispatch_argv": ["--agent", "test-dispatch"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    claim_before = claim.read_bytes()
 
     args = SimpleNamespace(
         worktree="HEAD",
         parent_dispatch_id="resume-parent",
         dispatch_id="resume-two",
-        cwd=str(seat),
+        cwd=str(seat.relative_to(repo)),
         skip_seat_reset=True,
         in_place=False,
         controller_label=None,
         _worktree_seat=None,
-        capacity_wait_s=600,
+        worktree_pin_holder="resume-parent",
+        from_queue=True,
+        queue_claim_path=str(claim),
+        queue_launch_token="resume-two-token",
+        capacity_wait_s=0.2,
     )
-    started = time.monotonic()
-    resumed = goalflight_dispatch._admit_dispatch_worktree(args)
-    try:
-        assert resumed is not None
-        assert resumed.path == seat
-        assert time.monotonic() - started < 1
-    finally:
-        if resumed is not None:
-            resumed.release()
+    cwd_before = args.cwd
+    pin_before = args.worktree_pin_holder
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    with pytest.raises(goalflight_worktree_pool.WorktreeSeatReclaimed):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert args.cwd == cwd_before
+    assert args.worktree_pin_holder == pin_before
+    assert claim.read_bytes() == claim_before
+    assert _lock_dispatch_id(lock_path) == "resume-one"
+    assert _git(seat, "rev-parse", "HEAD") == head_before
+    assert dirty_file.read_text(encoding="utf-8") == "leave the unrelated terminal checkout intact\n"
 
 
 def test_resume_refuses_unresolvable_terminal_holder_immediately(
@@ -1494,26 +1823,21 @@ def test_resume_refuses_unresolvable_terminal_holder_immediately(
     with pytest.raises(
         goalflight_worktree_pool.WorktreeSeatReclaimed,
         match=r"reclaimed by missing-row; expected recorded holder resume-parent",
-    ):
+    ) as exc_info:
         goalflight_dispatch._admit_dispatch_worktree(args)
     assert time.monotonic() - started < 1
+    assert exc_info.value.flock_held is False
 
 
-def test_resume_lineage_error_never_allows_same_holder(
+def test_resume_parent_validation_rejects_unreadable_record(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unresolved(_holder: str):
-        raise goalflight_worktree_pool.WorktreeCwdRefused(
-            "resume refused: lineage is unreadable"
-        )
+    def unreadable(_parent: str):
+        return {"state": "unreadable"}
 
-    monkeypatch.setattr(
-        goalflight_dispatch,
-        "_resume_lineage_dispatch_ids",
-        unresolved,
-    )
-    assert not goalflight_dispatch._resume_holder_is_in_lineage(
-        "resume-parent", "resume-parent"
+    monkeypatch.setattr(goalflight_ledger, "read_record", unreadable)
+    assert not goalflight_dispatch._resume_parent_is_terminal_and_exited(
+        "resume-parent"
     )
 
 
@@ -1531,8 +1855,8 @@ def test_resume_unresolvable_lineage_holder_never_reuses_seat(
             "project_root": str(repo),
         }
     )
-    assert not goalflight_dispatch._resume_holder_is_in_lineage(
-        "unresolvable-holder", "unresolvable-holder"
+    assert not goalflight_dispatch._resume_parent_is_terminal_and_exited(
+        "unresolvable-holder"
     )
 
 
@@ -1583,16 +1907,16 @@ def test_resume_never_steals_live_holder_in_same_lineage(
         in_place=False,
         controller_label=None,
         _worktree_seat=None,
-        capacity_wait_s=600,
+        capacity_wait_s=0.05,
     )
     try:
         started = time.monotonic()
         with pytest.raises(
-            goalflight_worktree_pool.WorktreeSeatReclaimed,
-            match=r"reclaimed by resume-one; expected recorded holder resume-parent",
+            goalflight_dispatch.DispatchUsageError,
+            match=r"worktree seat s-1; wait for a seat: holder=resume-one;.*holder_liveness=live",
         ):
             goalflight_dispatch._admit_dispatch_worktree(args)
-        assert time.monotonic() - started < 1
+        assert time.monotonic() - started < 0.6
     finally:
         live.release()
 
@@ -1803,21 +2127,8 @@ def test_resume_reseats_a_recycled_worktree_on_the_parent_branch(
     )
 
     try:
-        resumed = goalflight_dispatch._bind_dispatch_worktree(args)
-        try:
-            assert resumed.path != old_seat
-            assert resumed.path.name == "s-2"
-            assert _git(resumed.path, "rev-parse", "--abbrev-ref", "HEAD") == (
-                "worktree/resume-parent"
-            )
-            assert _git(resumed.path, "rev-parse", "HEAD") == committed_head
-            assert args._worktree_branch == "worktree/resume-parent"
-            assert args._worktree_head == committed_head
-        finally:
-            resumed.release()
-        assert _git(old_seat, "rev-parse", "--abbrev-ref", "HEAD") == (
-            "worktree/resume-parent-other"
-        )
+        _assert_pinned_resume_refusal(args, repo, old_seat, "resume-parent-other")
+        assert _git(old_seat, "rev-parse", "HEAD") != committed_head
     finally:
         reclaimer.release()
 
@@ -1892,12 +2203,7 @@ def test_resume_recycled_branch_divergence_is_refused_before_new_seat(
     )
 
     try:
-        with pytest.raises(
-            goalflight_worktree_pool.WorktreeCwdRefused,
-            match=r"worktree/resume-parent.*diverged.*recorded head",
-        ):
-            goalflight_dispatch._bind_dispatch_worktree(args)
-        assert not (repo / "worktrees" / "s-2").exists()
+        _assert_pinned_resume_refusal(args, repo, old_seat, "reclaimer")
     finally:
         reclaimer.release()
 
@@ -1958,12 +2264,7 @@ def test_resume_recycled_branch_accepts_root_resume_lineage(
         _worktree_seat=None,
     )
     try:
-        resumed = goalflight_dispatch._bind_dispatch_worktree(args)
-        try:
-            assert resumed.path.name == "s-2"
-            assert resumed.branch == "worktree/resume-root"
-        finally:
-            resumed.release()
+        _assert_pinned_resume_refusal(args, repo, old_seat, "reclaimer")
     finally:
         reclaimer.release()
 
@@ -2176,21 +2477,8 @@ def test_resume_recycled_dirty_state_uses_reclaim_owner(
     )
 
     try:
-        if reclaimed_for == "resume-parent":
-            with pytest.raises(
-                goalflight_worktree_pool.WorktreeCwdRefused,
-                match=reclaimer.quarantine_branch,
-            ) as exc_info:
-                goalflight_dispatch._bind_dispatch_worktree(args)
-            assert "git worktree add <recovery-path>" in str(exc_info.value)
-            assert not (repo / "worktrees" / "s-2").exists()
-        else:
-            resumed = goalflight_dispatch._bind_dispatch_worktree(args)
-            try:
-                assert resumed.path.name == "s-2"
-                assert resumed.branch == "worktree/resume-parent"
-            finally:
-                resumed.release()
+        _assert_pinned_resume_refusal(args, repo, old_seat, "reclaimer")
+        assert (old_seat / "unfinished.txt").exists() is False
     finally:
         reclaimer.release()
 
@@ -2306,6 +2594,75 @@ def test_resume_reseats_when_recorded_worktree_checkout_is_missing(
         resumed.release()
 
 
+def test_pinned_resume_missing_checkout_never_relocates_while_flock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "missing-seat-parent"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    recorded_head = _git(repo, "rev-parse", f"worktree/{parent_id}")
+    initial.release()
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "codex",
+            "engine": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": f"worktree/{parent_id}",
+            "worktree_head": recorded_head,
+        }
+    )
+    shutil.rmtree(seat)
+
+    args, claim, claim_before = _queue_retry_args(
+        tmp_path, repo, seat, parent_id, wait_s=0.12
+    )
+    args.parent_dispatch_id = parent_id
+    args.cwd = str(seat.relative_to(repo))
+    cwd_before = args.cwd
+    pin_before = args.worktree_pin_holder
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_resume_replacement_worktree",
+        lambda *_args, **_kwargs: pytest.fail(
+            "pinned resume attempted replacement-seat recovery"
+        ),
+    )
+    proc, release, lock_path = _start_flock_holder(
+        tmp_path, repo, seat, "missing-seat-holder", record_ledger=False
+    )
+    lock_before = lock_path.read_bytes()
+    clock = _drive_dispatch_deadline(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        message = str(exc_info.value)
+        assert clock.elapsed == pytest.approx(0.12)
+        assert message.count("missing-seat-holder") == 1
+        assert "flock_liveness=held" in message
+        assert "holder_liveness=unknown" in message
+        assert args.cwd == cwd_before
+        assert args.worktree_pin_holder == pin_before
+        assert claim.read_bytes() == claim_before
+        assert lock_path.read_bytes() == lock_before
+        assert _lock_dispatch_id(lock_path) == "missing-seat-holder"
+        assert not seat.exists()
+        assert not (seat.parent / "s-2").exists()
+        assert not getattr(args, "_resume_relocated_worktree", False)
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+
+
 def test_resume_refuses_recorded_branch_owned_by_another_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2348,12 +2705,7 @@ def test_resume_refuses_recorded_branch_owned_by_another_dispatch(
     )
 
     try:
-        with pytest.raises(
-            goalflight_worktree_pool.WorktreeCwdRefused,
-            match=r"worktree/other-dispatch.*resume-parent",
-        ):
-            goalflight_dispatch._bind_dispatch_worktree(args)
-        assert not (repo / "worktrees" / "s-2").exists()
+        _assert_pinned_resume_refusal(args, repo, old_seat, "reclaimer")
     finally:
         reclaimer.release()
 
@@ -3189,6 +3541,753 @@ def test_queue_retry_carrier_pins_exact_seat_without_reset(
         assert calls[-1]["reset"] is False
     finally:
         retry.release()
+
+
+def test_pinned_queue_free_flock_does_not_treat_lock_json_as_live_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder_id = "released-queue-pin-holder"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    assert _lock_dispatch_id(lock_path) == holder_id
+    args, _claim, _claim_before = _queue_retry_args(
+        tmp_path, repo, seat, holder_id, wait_s=0.2
+    )
+
+    lease = goalflight_dispatch._admit_dispatch_worktree(args)
+    try:
+        assert lease is not None
+        assert lease.path == seat
+        assert _lock_dispatch_id(lock_path) == args.dispatch_id
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        if lease is not None:
+            lease.release()
+        goalflight_dispatch._release_worktree_occupancy_lock(args)
+
+
+def test_pinned_queue_seat_live_flock_refuses_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder_id = "queue-parent-live"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "keep-me.txt"
+    dirty_file.write_text("dirty checkout\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    proc, release, lock_path = _start_flock_holder(
+        tmp_path, repo, seat, holder_id
+    )
+    args, claim, claim_before = _queue_retry_args(
+        tmp_path, repo, seat, holder_id, wait_s=0.12
+    )
+    lock_before = lock_path.read_bytes()
+    clock = _drive_dispatch_deadline(monkeypatch)
+    probe_durations = _record_bind_probe_durations(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        message = str(exc_info.value)
+        assert clock.elapsed == pytest.approx(args.capacity_wait_s)
+        assert len(probe_durations) > 1
+        assert message.count(holder_id) == 1
+        assert "flock_liveness=held" in message
+        assert "holder_liveness=live" in message
+        assert args.cwd == str(seat)
+        assert args.worktree_pin_holder == holder_id
+        assert args.from_queue is True
+        assert args.queue_claim_path == str(claim)
+        assert claim.read_bytes() == claim_before
+        assert lock_path.read_bytes() == lock_before
+        assert _git(seat, "rev-parse", "HEAD") == head_before
+        assert dirty_file.read_text(encoding="utf-8") == "dirty checkout\n"
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+
+
+def test_pinned_worktree_inspection_refusal_uses_pinned_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder_id = "queue-parent-unobserved"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "keep-me.txt"
+    dirty_file.write_text("dirty checkout\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    args, claim, claim_before = _queue_retry_args(
+        tmp_path, repo, seat, holder_id, wait_s=0.2
+    )
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    lock_before = lock_path.read_bytes()
+    clock = _drive_dispatch_deadline(monkeypatch)
+    inspections = 0
+    real_prepare = goalflight_worktree_pool._prepare_claimed_seat_locked
+
+    def refuse_uninspectable_claim(**kwargs):
+        nonlocal inspections
+        real_path_presence = goalflight_worktree_pool._path_presence
+
+        def unknown_presence(_path: Path) -> str:
+            nonlocal inspections
+            inspections += 1
+            return "unknown"
+
+        goalflight_worktree_pool._path_presence = unknown_presence
+        try:
+            return real_prepare(**kwargs)
+        finally:
+            goalflight_worktree_pool._path_presence = real_path_presence
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool,
+        "_prepare_claimed_seat_locked",
+        refuse_uninspectable_claim,
+    )
+    with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+    message = str(exc_info.value)
+    assert clock.elapsed == pytest.approx(args.capacity_wait_s)
+    assert inspections > 1
+    assert message.count(holder_id) == 1
+    assert "flock_liveness=unknown" in message
+    assert args.cwd == str(seat)
+    assert args.worktree_pin_holder == holder_id
+    assert args.from_queue is True
+    assert args.queue_claim_path == str(claim)
+    assert claim.read_bytes() == claim_before
+    assert lock_path.read_bytes() == lock_before
+    assert _git(seat, "rev-parse", "HEAD") == head_before
+    assert dirty_file.read_text(encoding="utf-8") == "dirty checkout\n"
+    assert not (seat.parent / "s-2").exists()
+
+
+def test_pinned_queue_seat_proceeds_when_flock_frees_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder_id = "queue-parent-live"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    proc, release, _lock_path = _start_flock_holder(
+        tmp_path, repo, seat, holder_id
+    )
+    args, _claim, _claim_before = _queue_retry_args(
+        tmp_path, repo, seat, holder_id, wait_s=0.8
+    )
+    probe_durations = _record_bind_probe_durations(monkeypatch)
+    timer = threading.Timer(0.08, release.touch)
+    timer.start()
+    lease = None
+    try:
+        started = time.monotonic()
+        lease = goalflight_dispatch._admit_dispatch_worktree(args)
+        assert lease is not None
+        assert lease.path == seat
+        _assert_wait_includes_one_probe(
+            time.monotonic() - started, args.capacity_wait_s, probe_durations
+        )
+    finally:
+        timer.cancel()
+        release.touch()
+        proc.wait(timeout=5)
+        if lease is not None:
+            lease.release()
+
+
+def test_pinned_resume_retries_allocation_lock_without_relocating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-allocation-parent"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "allocation-parent-dirty.txt"
+    dirty_file.write_text("keep the recorded checkout\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    _write_terminal_seat_record(parent_id, repo, seat)
+    proc, release, _lock_path = _start_allocation_flock_holder(tmp_path, repo)
+    real_acquire_allocation_lock = goalflight_worktree_pool._acquire_allocation_lock
+    released_after_miss = False
+
+    def acquire_allocation_lock(*args, **kwargs):
+        nonlocal released_after_miss
+        try:
+            return real_acquire_allocation_lock(*args, **kwargs)
+        except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+            if not released_after_miss and "worktree allocation lock" in str(exc):
+                released_after_miss = True
+                release.touch()
+                proc.wait(timeout=5)
+            raise
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "_acquire_allocation_lock", acquire_allocation_lock
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=parent_id,
+        dispatch_id="resume-allocation-child",
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=0.6,
+    )
+    lease = None
+    try:
+        lease = goalflight_dispatch._admit_dispatch_worktree(args)
+        assert lease is not None
+        assert lease.path == seat
+        assert not getattr(args, "_resume_relocated_worktree", False)
+        assert args.cwd == str(seat)
+        assert _git(seat, "rev-parse", "HEAD") == head_before
+        assert dirty_file.read_text(encoding="utf-8") == "keep the recorded checkout\n"
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        release.touch()
+        if proc.poll() is None:
+            proc.wait(timeout=5)
+        if lease is not None:
+            lease.release()
+
+
+def test_pinned_allocation_lock_misses_use_cap_and_report_unobserved_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    assert goalflight_dispatch.PINNED_SEAT_WAIT_MAX_S == 120.0
+    monkeypatch.setattr(goalflight_dispatch, "PINNED_SEAT_WAIT_MAX_S", 0.12)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder_id = "allocation-blocked-seat-holder"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "allocation-held-dirty.txt"
+    dirty_file.write_text("do not reset\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    seat_proc, seat_release, seat_lock = _start_flock_holder(
+        tmp_path, repo, seat, holder_id
+    )
+    allocation_proc, allocation_release, _allocation_lock = (
+        _start_allocation_flock_holder(tmp_path, repo)
+    )
+    args, claim, claim_before = _queue_retry_args(
+        tmp_path, repo, seat, holder_id, wait_s=1800.0
+    )
+    seat_lock_before = seat_lock.read_bytes()
+    clock = _drive_dispatch_deadline(monkeypatch)
+    probe_durations = _record_bind_probe_durations(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        message = str(exc_info.value)
+        assert clock.elapsed == pytest.approx(0.12)
+        assert len(probe_durations) > 1
+        assert message.count(holder_id) == 1
+        assert "flock_liveness=unknown" in message
+        assert "wait for a seat" in message
+        assert args.cwd == str(seat)
+        assert args.worktree_pin_holder == holder_id
+        assert args.from_queue is True
+        assert args.queue_claim_path == str(claim)
+        assert claim.read_bytes() == claim_before
+        assert seat_lock.read_bytes() == seat_lock_before
+        assert _git(seat, "rev-parse", "HEAD") == head_before
+        assert dirty_file.read_text(encoding="utf-8") == "do not reset\n"
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        allocation_release.touch()
+        seat_release.touch()
+        allocation_proc.wait(timeout=5)
+        seat_proc.wait(timeout=5)
+
+
+def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    dispatch_id = "drain-pinned-seat-retry"
+    holder_id = "drain-pinned-seat-holder"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, holder_id)
+    seat = initial.path
+    initial.release()
+    proc, release, _lock_path = _start_flock_holder(
+        tmp_path, repo, seat, holder_id, record_ledger=False
+    )
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True)
+    queue_path = queue_dir / f"{dispatch_id}.json"
+    marker = tmp_path / "drain-pinned-worker-ran"
+    tail = tmp_path / f"{dispatch_id}.tail"
+    status = tmp_path / f"{dispatch_id}.status.json"
+    entry = {
+        "schema": goalflight_dispatch.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "agent": "test-dispatch",
+        "shape": "bash",
+        "project_root": str(repo),
+        "process_cwd": str(repo),
+        "created_at": goalflight_ledger.utc_now(),
+        "updated_at": goalflight_ledger.utc_now(),
+        "queue_path": str(queue_path),
+        "worktree_seat": seat.name,
+        "worktree_path": str(seat),
+        "worktree_pin_holder": holder_id,
+        "dispatch_argv": [
+            "--agent",
+            "test-dispatch",
+            "--unregistered-forced",
+            "--dispatch-id",
+            dispatch_id,
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--poll-secs",
+            "0.1",
+            "--max-idle-secs",
+            "10",
+            "--worktree",
+            "HEAD",
+            "--cwd",
+            str(seat),
+            "--skip-seat-reset",
+            "--worktree-pin-holder",
+            holder_id,
+            "--capacity-wait-s",
+            "0.12",
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"Path({str(marker)!r}).write_text('ran'); "
+                f"print('COMPLETE: {dispatch_id} — retry ran')"
+            ),
+        ],
+        "request": {"cwd": str(seat), "tail": str(tail), "status_json": str(status)},
+    }
+    goalflight_dispatch._write_json_atomic(queue_path, entry)
+    env = _env(tmp_path, seats=2)
+
+    def drain() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "drain",
+                "--capacity-wait-s",
+                "0.12",
+                "--json",
+            ],
+            cwd=str(repo),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+
+    try:
+        refused = drain()
+        assert refused.returncode == 0, (refused.stdout, refused.stderr)
+        first_payload = json.loads(refused.stdout)
+        assert first_payload["launched"] == 0, first_payload
+        assert first_payload["left_queued"] == 1, json.dumps(
+            first_payload, sort_keys=True
+        )[:5000]
+        first_detail = first_payload["details"][0]
+        assert "launch_attempt_class" in first_detail, (
+            first_payload,
+            refused.stderr,
+        )
+        assert first_detail["launch_attempt_class"] == (
+            goalflight_dispatch.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+        ), first_detail
+        assert "launch_backoff_until" not in first_detail, first_detail
+        assert queue_path.is_file()
+        queued = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert queued["worktree_path"] == str(seat)
+        assert queued["worktree_seat"] == seat.name
+        assert queued["worktree_pin_holder"] == holder_id
+        assert "launch_backoff_until" not in queued
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+    _write_terminal_seat_record(holder_id, repo, seat)
+
+    retried = drain()
+    assert retried.returncode == 0, (retried.stdout, retried.stderr)
+    second_payload = json.loads(retried.stdout)
+    assert second_payload["launched"] == 1, second_payload
+    assert not queue_path.exists()
+    deadline = time.monotonic() + 15
+    final_status: dict = {}
+    while time.monotonic() < deadline:
+        if marker.exists() and marker.read_text(encoding="utf-8") == "ran":
+            try:
+                final_status = json.loads(status.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                final_status = {}
+            if final_status.get("state") == "complete" and final_status.get("worker_alive") is not True:
+                break
+        time.sleep(0.05)
+    assert marker.exists() and marker.read_text(encoding="utf-8") == "ran"
+    assert final_status.get("state") == "complete", final_status
+
+
+def test_pinned_resume_with_live_parent_flock_uses_bounded_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent-live"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "resume-live-dirty.txt"
+    dirty_file.write_text("leave intact\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    proc, release, lock_path = _start_flock_holder(
+        tmp_path, repo, seat, parent_id
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=parent_id,
+        dispatch_id="resume-child",
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=0.12,
+    )
+    lock_before = lock_path.read_bytes()
+    clock = _drive_dispatch_deadline(monkeypatch)
+    probe_durations = _record_bind_probe_durations(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        message = str(exc_info.value)
+        assert clock.elapsed == pytest.approx(args.capacity_wait_s)
+        assert len(probe_durations) > 1
+        assert message.count(parent_id) == 1
+        assert "holder_liveness=live" in message
+        assert args.cwd == str(seat)
+        assert lock_path.read_bytes() == lock_before
+        assert _git(seat, "rev-parse", "HEAD") == head_before
+        assert dirty_file.read_text(encoding="utf-8") == "leave intact\n"
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+
+
+def test_rejected_resume_preserves_relative_cwd_pin_and_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent-terminal"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    initial.release()
+    _write_terminal_seat_record(parent_id, repo, seat)
+    proc, release, _lock_path = _start_flock_holder(
+        tmp_path, repo, seat, "resume-occupancy-holder", occupancy=True
+    )
+    args, claim, claim_before = _queue_retry_args(
+        tmp_path, repo, seat, parent_id, wait_s=0.12
+    )
+    args.parent_dispatch_id = parent_id
+    args.cwd = str(seat.relative_to(repo))
+    cwd_before = args.cwd
+    pin_before = args.worktree_pin_holder
+    clock = _drive_dispatch_deadline(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._admit_dispatch_worktree(args)
+        assert clock.elapsed == pytest.approx(0.12)
+        assert "resume-occupancy-holder" in str(exc_info.value)
+        assert args.cwd == cwd_before
+        assert args.worktree_pin_holder == pin_before
+        assert claim.read_bytes() == claim_before
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+
+
+def test_pinned_parent_with_unknown_worker_liveness_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent-unknown"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    initial.release()
+    dirty_file = seat / "unknown-parent-dirty.txt"
+    dirty_file.write_text("leave intact\n", encoding="utf-8")
+    head_before = _git(seat, "rev-parse", "HEAD")
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "state": "complete",
+            "terminal_state": "complete",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": _git(seat, "rev-parse", "--abbrev-ref", "HEAD"),
+            "worktree_head": head_before,
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=parent_id,
+        dispatch_id="resume-child",
+        project_root=str(repo),
+        cwd=str(seat.relative_to(repo)),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        worktree_pin_holder=parent_id,
+        from_queue=True,
+        queue_claim_path=str(tmp_path / "resume-unknown.claimed"),
+        queue_launch_token="resume-unknown-token",
+        capacity_wait_s=0.2,
+    )
+    claim = Path(args.queue_claim_path)
+    claim.write_bytes(b'{"dispatch_id":"resume-child","state":"claimed"}\n')
+    claim_before = claim.read_bytes()
+    cwd_before = args.cwd
+    pin_before = args.worktree_pin_holder
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError,
+        match="terminal ledger record with proven-exited worker liveness",
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert args.cwd == cwd_before
+    assert args.worktree_pin_holder == pin_before
+    assert claim.read_bytes() == claim_before
+    assert _lock_dispatch_id(lock_path) == parent_id
+    assert _git(seat, "rev-parse", "HEAD") == head_before
+    assert dirty_file.read_text(encoding="utf-8") == "leave intact\n"
+    assert not (seat.parent / "s-2").exists()
+
+
+def test_pinned_parent_with_exited_worker_but_nonterminal_state_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent_id = "resume-parent-running"
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, parent_id)
+    seat = initial.path
+    initial.release()
+    head_before = _git(seat, "rev-parse", "HEAD")
+    dirty_file = seat / "nonterminal-parent-dirty.txt"
+    dirty_file.write_text("leave intact\n", encoding="utf-8")
+    status_path = tmp_path / "parent-status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": parent_id,
+                "state": "complete",
+                "worker_pid": 2147483647,
+                "expected_worker_identity": {
+                    "pid": 2147483647,
+                    "start_token": "exited-test-worker",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "state": "running",
+            "terminal_state": "unknown",
+            "worker_pid": 2147483647,
+            "worker_identity": {
+                "pid": 2147483647,
+                "start_token": "exited-test-worker",
+            },
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": _git(seat, "rev-parse", "--abbrev-ref", "HEAD"),
+            "worktree_head": head_before,
+            "status_path": str(status_path),
+        }
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id=parent_id,
+        dispatch_id="resume-child",
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=0.2,
+    )
+    lock_path = goalflight_worktree_pool._candidate_lock_path(
+        repo, seat, managed_root=seat.parent
+    )
+    with pytest.raises(
+        goalflight_dispatch.DispatchUsageError,
+        match="terminal ledger record with proven-exited worker liveness",
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+    assert _lock_dispatch_id(lock_path) == parent_id
+    assert _git(seat, "rev-parse", "HEAD") == head_before
+    assert dirty_file.read_text(encoding="utf-8") == "leave intact\n"
+    assert not (seat.parent / "s-2").exists()
+
+
+def test_pinned_occupancy_flock_refuses_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, "seat-owner")
+    seat = initial.path
+    initial.release()
+    proc, release, _lock_path = _start_flock_holder(
+        tmp_path, repo, seat, "occupancy-holder", occupancy=True
+    )
+    args = SimpleNamespace(
+        agent="codex-acp",
+        shape="acp",
+        read_only=False,
+        worktree="HEAD",
+        parent_dispatch_id=None,
+        dispatch_id="pinned-occupancy",
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        from_queue=True,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=0.12,
+    )
+    clock = _drive_dispatch_deadline(monkeypatch)
+    probe_durations = _record_path_probe_durations(monkeypatch)
+    try:
+        with pytest.raises(goalflight_dispatch.DispatchUsageError) as exc_info:
+            goalflight_dispatch._prepare_attempt_worktree_occupancy(args)
+        message = str(exc_info.value)
+        assert clock.elapsed == pytest.approx(args.capacity_wait_s)
+        assert probe_durations
+        assert message.count("occupancy-holder") == 1
+        assert "holder_liveness=live" in message
+        assert args.cwd == str(seat)
+    finally:
+        release.touch()
+        proc.wait(timeout=5)
+
+
+def test_pinned_occupancy_flock_proceeds_when_released_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    initial = goalflight_worktree_pool.acquire_worktree_seat(repo, "seat-owner")
+    seat = initial.path
+    initial.release()
+    proc, release, _lock_path = _start_flock_holder(
+        tmp_path, repo, seat, "occupancy-holder", occupancy=True
+    )
+    args = SimpleNamespace(
+        agent="codex-acp",
+        shape="acp",
+        read_only=False,
+        worktree="HEAD",
+        parent_dispatch_id=None,
+        dispatch_id="pinned-occupancy",
+        project_root=str(repo),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        from_queue=True,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        capacity_wait_s=0.8,
+    )
+    timer = threading.Timer(0.08, release.touch)
+    timer.start()
+    probe_durations = _record_path_probe_durations(monkeypatch)
+    try:
+        started = time.monotonic()
+        assert goalflight_dispatch._prepare_attempt_worktree_occupancy(args) is None
+        _assert_wait_includes_one_probe(
+            time.monotonic() - started, args.capacity_wait_s, probe_durations
+        )
+    finally:
+        timer.cancel()
+        release.touch()
+        proc.wait(timeout=5)
+        goalflight_dispatch._release_worktree_occupancy_lock(args)
 
 
 def _completion_refusal_env(tmp_path: Path) -> dict[str, str]:

@@ -131,6 +131,7 @@ WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 # SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 TERMINAL_WORKTREE_GC_TIMEOUT_S = 30.0
+PINNED_SEAT_WAIT_MAX_S = 120.0
 READ_ONLY_ALLOCATION_LOCK_PATH_ENV = "GOALFLIGHT_READ_ONLY_ALLOCATION_LOCK_PATH"
 # Routed by exact argv[0] match in main(). Kept beside the routes so a new
 # subcommand cannot be added without the misplacement guard learning it.
@@ -2258,17 +2259,93 @@ def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id
     return lease
 
 
+def _pinned_worktree_seat_name(args, path: Path | None = None) -> str | None:
+    if getattr(args, "in_place", False):
+        return None
+    raw_path = path or getattr(args, "cwd", None)
+    if not raw_path:
+        return None
+    try:
+        target = Path(str(raw_path)).expanduser().resolve(strict=False)
+        kind = goalflight_worktree_pool.classify_dispatch_cwd(
+            target,
+            project_root=_project_root(args),
+            controller_label=getattr(args, "controller_label", None),
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
+        )
+    except Exception:
+        return None
+    return target.name if kind == "ring-seat" else None
+
+
+def _pinned_seat_wait_budget(args) -> float:
+    requested_wait = getattr(args, "capacity_wait_s", None)
+    if requested_wait is None:
+        return 0.0
+    try:
+        requested_wait = float(requested_wait)
+    except (TypeError, ValueError) as exc:
+        raise DispatchUsageError("--capacity-wait-s must be a finite number") from exc
+    if not math.isfinite(requested_wait):
+        raise DispatchUsageError("--capacity-wait-s must be finite")
+    return min(max(0.0, requested_wait), PINNED_SEAT_WAIT_MAX_S)
+
+
+def _pinned_seat_refusal(
+    seat_name: str,
+    holder_id: str | None,
+    elapsed: float,
+    *,
+    flock_liveness: str = "held",
+) -> DispatchUsageError:
+    holder = str(holder_id or "unknown")
+    holder_liveness = "unknown"
+    if holder != "unknown":
+        try:
+            _record, live = goalflight_worktree_pool._holder_record(holder)
+            holder_liveness = (
+                "live" if live is True else "exited" if live is False else "unknown"
+            )
+        except Exception:
+            holder_liveness = "unknown"
+    return DispatchUsageError(
+        f"worktree seat {seat_name}; wait for a seat: holder={holder}; "
+        f"flock_liveness={flock_liveness} holder_liveness={holder_liveness}; "
+        f"refusing after {elapsed:.2f}s"
+    )
+
+
 def _worktree_occupancy_before_reset(args):
     """Check a selected existing seat before the pool mutates it."""
-    def check(path: Path) -> None:
+    def check(path: Path, prior_dispatch_id: str | None = None) -> None:
         checked_path = str(path.resolve(strict=False))
+        parent_dispatch_id = str(getattr(args, "parent_dispatch_id", None) or "")
+        if (
+            getattr(args, "skip_seat_reset", False)
+            and parent_dispatch_id
+            and prior_dispatch_id == parent_dispatch_id
+            and _pinned_worktree_seat_name(args, path) == path.name
+            and not _resume_parent_is_terminal_and_exited(parent_dispatch_id)
+        ):
+            raise DispatchUsageError(
+                f"resume refused: parent {parent_dispatch_id} does not have a "
+                "terminal ledger record with proven-exited worker liveness"
+            )
         previous_path = getattr(args, "_worktree_occupancy_checked_path", None)
         if previous_path and previous_path != checked_path:
             _release_worktree_occupancy_lock(args)
+        previous_cwd = getattr(args, "cwd", None)
         args.cwd = str(path)
-        args._worktree_occupancy_warning = _prepare_attempt_worktree_occupancy(
-            args
-        )
+        try:
+            warning = _prepare_attempt_worktree_occupancy(args)
+        except BaseException:
+            args.cwd = previous_cwd
+            raise
+        args._worktree_occupancy_warning = warning
         args._worktree_occupancy_checked = True
         args._worktree_occupancy_checked_path = checked_path
 
@@ -2852,6 +2929,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     base = _requested_worktree_base(args)
     force_captive = getattr(args, "worktree", None) == "create"
     capacity_deadline = getattr(args, "_worktree_capacity_deadline", None)
+    if _pinned_worktree_seat_name(args):
+        # The admission loop owns the pinned-seat wait budget. The pool's
+        # allocation-lock deadline must not expire during setup before it can
+        # probe the requested seat flock.
+        capacity_deadline = 0.0
 
     if getattr(args, "worktree", None) == "shared-read-only":
         shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
@@ -2948,21 +3030,15 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             try:
                 lease = acquire_ring_seat()
             except goalflight_worktree_pool.WorktreeSeatReclaimed as reclaimed:
+                if getattr(reclaimed, "flock_held", False):
+                    raise
                 if not skip_reset or not parent_dispatch_id:
                     raise
                 if reclaimed.terminal_reclaimed:
-                    holder = reclaimed.current_holder
-                    if not holder or not _resume_holder_is_in_lineage(
-                        holder, str(parent_dispatch_id)
-                    ):
-                        raise
-                    try:
-                        lease = acquire_ring_seat({holder})
-                    except (
-                        goalflight_worktree_pool.WorktreeSeatUnavailable,
-                        goalflight_worktree_pool.WorktreeSeatResetRefused,
-                    ) as exc:
-                        raise reclaimed from exc
+                    # The pool raised this only because the recorded id differs
+                    # from the exact expected parent. A different terminal
+                    # ancestor is not this resume's seat to adopt.
+                    raise
                 else:
                     try:
                         lease = _resume_replacement_worktree(
@@ -2976,6 +3052,10 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     ):
                         raise reclaimed
             except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
+                if getattr(exc, "flock_held", False):
+                    raise
+                if _pinned_worktree_seat_name(args):
+                    raise
                 if not skip_reset or not parent_dispatch_id:
                     raise
                 message = str(exc)
@@ -2999,6 +3079,28 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     and not cwd.exists()
                 ):
                     raise
+                seat_name = _pinned_worktree_seat_name(args, cwd)
+                if seat_name:
+                    flock_held, holder = (
+                        goalflight_worktree_pool._probe_worktree_seat_flock(
+                            project_root,
+                            cwd,
+                            managed_root=(
+                                Path(str(args.worktree_root)).expanduser()
+                                if getattr(args, "worktree_root", None)
+                                else None
+                            ),
+                        )
+                    )
+                    if flock_held is not False:
+                        liveness = "held" if flock_held else "unknown"
+                        raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                            f"pinned worktree seat {seat_name} flock state is "
+                            f"{liveness}",
+                            seat_name=seat_name,
+                            current_holder=holder,
+                            flock_held=flock_held is True,
+                        )
                 lease = _resume_replacement_worktree(
                     args,
                     project_root=project_root,
@@ -3075,7 +3177,11 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
         if not math.isfinite(requested_wait):
             raise DispatchUsageError("--capacity-wait-s must be finite")
         wait_s = max(0.0, requested_wait)
-    deadline = time.monotonic() + wait_s
+    admission_started = time.monotonic()
+    deadline = admission_started + wait_s
+    pinned_seat_name = _pinned_worktree_seat_name(args)
+    pinned_wait_s = min(wait_s, PINNED_SEAT_WAIT_MAX_S)
+    pinned_deadline = admission_started + pinned_wait_s
     previous_deadline = getattr(args, "_worktree_capacity_deadline", None)
     previous_lease_active = getattr(args, "_worktree_capacity_lease_active", False)
     # Zero is an immediate non-blocking lock budget; positive deadlines poll.
@@ -3092,6 +3198,48 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 goalflight_worktree_pool.WorktreeSeatUnavailable,
                 goalflight_worktree_pool.WorktreeSeatResetRefused,
             ) as exc:
+                current_holder = getattr(exc, "current_holder", None)
+                flock_held = bool(getattr(exc, "flock_held", False))
+                non_live_reclaim = isinstance(
+                    exc, goalflight_worktree_pool.WorktreeSeatReclaimed
+                ) and not flock_held
+                unknown_seat_owner = "unknown ownership" in str(exc).lower()
+                if (
+                    pinned_seat_name
+                    and (
+                        flock_held
+                        or (
+                            isinstance(
+                                exc,
+                                goalflight_worktree_pool.WorktreeSeatResetRefused,
+                            )
+                            and getattr(args, "skip_seat_reset", False)
+                        )
+                        or (
+                            isinstance(
+                                exc, goalflight_worktree_pool.WorktreeSeatUnavailable
+                            )
+                            and not non_live_reclaim
+                            and not unknown_seat_owner
+                        )
+                    )
+                ):
+                    holder = (
+                        current_holder
+                        or getattr(args, "worktree_pin_holder", None)
+                        or getattr(args, "parent_dispatch_id", None)
+                    )
+                    remaining = pinned_deadline - time.monotonic()
+                    if remaining <= 0:
+                        args._worktree_seat_refused = True
+                        raise _pinned_seat_refusal(
+                            pinned_seat_name,
+                            holder,
+                            min(pinned_wait_s, max(0.0, time.monotonic() - admission_started)),
+                            flock_liveness="held" if flock_held else "unknown",
+                        ) from exc
+                    time.sleep(min(0.05, remaining))
+                    continue
                 if isinstance(exc, goalflight_worktree_pool.WorktreeSeatReclaimed):
                     raise
                 remaining = deadline - time.monotonic()
@@ -4717,14 +4865,29 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
     return exempt
 
 
-def _resume_holder_is_in_lineage(holder_dispatch_id: str, parent_dispatch_id: str) -> bool:
-    """Return true only when a terminal seat holder links to this parent."""
+def _resume_parent_is_terminal_and_exited(parent_dispatch_id: str) -> bool:
+    """Return true only when this resume's exact parent is terminal and exited."""
     try:
-        _record, live = goalflight_worktree_pool._holder_record(holder_dispatch_id)
+        ledger_record = goalflight_ledger.read_record(parent_dispatch_id)
+        if (
+            not isinstance(ledger_record, dict)
+            or goalflight_ledger.record_is_unreadable(ledger_record)
+        ):
+            return False
+        _worker_record, live = goalflight_worktree_pool._holder_record(parent_dispatch_id)
         if live is not False:
             return False
-        lineage = _resume_lineage_dispatch_ids(holder_dispatch_id)
-        return parent_dispatch_id in lineage
+        state = str(
+            ledger_record.get("terminal_state")
+            or ledger_record.get("state")
+            or ""
+        )
+        terminal = goalflight_ledger.terminal_state_for(
+            state, ledger_record.get("reason") or ledger_record.get("error")
+        )
+        if state != "cancelled" and terminal in {"", "unknown", "watcher_stopped"}:
+            return False
+        return True
     except Exception:
         return False
 
@@ -6141,7 +6304,45 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
                 # Same dispatch already occupies the tree (duplicate replay or
                 # backlog drain). Not a second writer.
                 return None
-            lock_busy = str(exc)
+            pinned_seat_name = _pinned_worktree_seat_name(args, target)
+            if pinned_seat_name:
+                if getattr(args, "_worktree_capacity_lease_active", False):
+                    raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                        str(exc),
+                        seat_name=pinned_seat_name,
+                        current_holder=getattr(exc, "occupant_id", None),
+                        flock_held=True,
+                    ) from exc
+                wait_budget = _pinned_seat_wait_budget(args)
+                wait_started = time.monotonic()
+                wait_deadline = wait_started + wait_budget
+                while True:
+                    remaining = wait_deadline - time.monotonic()
+                    if remaining <= 0:
+                        args._worktree_seat_refused = True
+                        raise _pinned_seat_refusal(
+                            pinned_seat_name,
+                            getattr(exc, "occupant_id", None),
+                            min(wait_budget, max(0.0, time.monotonic() - wait_started)),
+                        ) from exc
+                    time.sleep(min(0.05, remaining))
+                    try:
+                        lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                            target, dispatch_id
+                        )
+                        break
+                    except goalflight_worktree_pool.WorktreePathLockBusy as retry_exc:
+                        if own and getattr(retry_exc, "occupant_id", None) == own:
+                            return None
+                        exc = retry_exc
+                    except goalflight_worktree_pool.WorktreePathLockUnknown as retry_exc:
+                        lock_unknown = str(retry_exc)
+                        break
+                    except OSError as retry_exc:
+                        lock_unknown = f"{type(retry_exc).__name__}: {retry_exc}"
+                        break
+            else:
+                lock_busy = str(exc)
         except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
             lock_unknown = str(exc)
         except OSError as exc:

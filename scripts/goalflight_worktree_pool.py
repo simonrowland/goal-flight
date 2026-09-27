@@ -141,6 +141,19 @@ class WorktreeSeatError(RuntimeError):
 class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured worktree is held."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        seat_name: str | None = None,
+        current_holder: str | None = None,
+        flock_held: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.seat_name = seat_name
+        self.current_holder = current_holder
+        self.flock_held = flock_held
+
 
 class WorktreeReadOnlyLockTimeout(WorktreeSeatUnavailable):
     """Raised when the detached-checkout allocation lock cannot be acquired."""
@@ -153,12 +166,18 @@ class WorktreeSeatReclaimed(WorktreeSeatUnavailable):
         self,
         message: str,
         *,
+        seat_name: str | None = None,
         current_holder: str | None = None,
         expected_holder: str | None = None,
         terminal_reclaimed: bool = False,
+        flock_held: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.current_holder = current_holder
+        super().__init__(
+            message,
+            seat_name=seat_name,
+            current_holder=current_holder,
+            flock_held=flock_held,
+        )
         self.expected_holder = expected_holder
         self.terminal_reclaimed = terminal_reclaimed
 
@@ -3667,10 +3686,17 @@ def _prepare_claimed_seat(**kwargs) -> WorktreeSeatLease:
                     f"resume refused: worktree {path.name} was reclaimed by "
                     f"{occupant}; expected recorded holder {expected}; "
                     "refusing to reset or recreate it",
+                    seat_name=path.name,
                     current_holder=occupant,
                     expected_holder=expected,
+                    flock_held=isinstance(exc, WorktreePathLockBusy),
                 ) from exc
-            raise WorktreeSeatUnavailable(str(exc)) from exc
+            raise WorktreeSeatUnavailable(
+                str(exc),
+                seat_name=path.name,
+                current_holder=occupant,
+                flock_held=isinstance(exc, WorktreePathLockBusy),
+            ) from exc
         with occupancy:
             return _prepare_claimed_seat_locked(**kwargs)
     return _prepare_claimed_seat_locked(**kwargs)
@@ -3688,7 +3714,7 @@ def _prepare_claimed_seat_locked(
     base_commit: str,
     reset: bool,
     controller_label: str | None = None,
-    before_reset: Callable[[Path], None] | None = None,
+    before_reset: Callable[[Path, str | None], None] | None = None,
 ) -> WorktreeSeatLease:
     presence = _path_presence(worktree_path)
     if presence == "unknown":
@@ -3700,7 +3726,7 @@ def _prepare_claimed_seat_locked(
     if existing:
         _verify_existing_seat(project_root, worktree_path)
         if before_reset is not None:
-            before_reset(worktree_path)
+            before_reset(worktree_path, prior_dispatch_id)
         if reset:
             prior_dispatch_id = _validate_holder(worktree_path, prior_dispatch_id)
             safety = evaluate_seat_reset_safety(
@@ -3924,6 +3950,55 @@ def worktree_lock_path_for_path(project_root: Path, worktree_path: Path) -> Path
     )
 
 
+def _probe_worktree_seat_flock(
+    project_root: Path,
+    worktree_path: Path,
+    *,
+    managed_root: Path | None = None,
+) -> tuple[bool | None, str | None]:
+    """Probe a seat lock without creating it; unreadable identity means unknown."""
+    lock_file = None
+    lock_fd = None
+    try:
+        root = project_root.resolve()
+        path = worktree_path.expanduser().resolve(strict=False)
+        lock_path = _candidate_lock_path(
+            root,
+            path,
+            managed_root=managed_root or repository_worktree_root(root),
+        )
+        lock_fd = _open_registered_lock(
+            lock_path,
+            _lock_open_flags() & ~os.O_CREAT,
+            registry_root=_git_common_dir(root),
+            allow_create=False,
+            allow_unregistered=True,
+        )
+        lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+        lock_fd = None
+    except (OSError, ValueError):
+        if lock_fd is not None:
+            os.close(lock_fd)
+        return None, None
+
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            held = True
+        except OSError:
+            return None, None
+        else:
+            held = False
+        try:
+            holder = _known_lock_dispatch_id(lock_file)
+        except (OSError, ValueError, UnicodeError):
+            holder = None
+        return held, holder
+    finally:
+        lock_file.close()
+
+
 def _busy_worktree_message(
     project_root: Path,
     limit: int,
@@ -3987,7 +4062,7 @@ def acquire_worktree_seat(
     expected_prior_dispatch_id: str | None = None,
     allowed_prior_dispatch_ids: frozenset[str] | set[str] | None = None,
     capacity_deadline: float | None = None,
-    before_reset: Callable[[Path], None] | None = None,
+    before_reset: Callable[[Path, str | None], None] | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one repository-wide managed ``s-N`` worktree.
 
@@ -4251,12 +4326,17 @@ def acquire_worktree_seat(
                         f"resume refused: worktree {seat_name} was reclaimed by "
                         f"{current_holder}; expected recorded holder "
                         f"{expected_prior_dispatch_id}; refusing to reset or recreate it",
+                        seat_name=seat_name,
                         current_holder=current_holder,
                         expected_holder=expected_prior_dispatch_id,
+                        flock_held=True,
                     )
                 raise WorktreeSeatUnavailable(
                     f"worktree {seat_name} is held: {occupant}; "
-                    "refusing to git worktree add a new unmanaged path"
+                    "refusing to git worktree add a new unmanaged path",
+                    seat_name=seat_name,
+                    current_holder=current_holder,
+                    flock_held=True,
                 )
             try:
                 try:
