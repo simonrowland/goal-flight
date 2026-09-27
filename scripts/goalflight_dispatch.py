@@ -4495,24 +4495,26 @@ def _config_model_values(setting: str) -> list[str]:
     return [value]
 
 
-def _model_option_values(argv: list[str], *, raw: bool = False) -> list[str]:
+def _model_option_values(
+    argv: list[str], *, short_model: bool = False, codex_config: bool = False
+) -> list[str]:
     values: list[str] = []
     index = 0
     while index < len(argv):
         token = argv[index]
-        if token == "--model" or (raw and token == "-m"):
+        if token == "--model" or (short_model and token == "-m"):
             if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
                 values.append(argv[index + 1])
                 index += 2
                 continue
         elif token.startswith("--model="):
             values.append(token.partition("=")[2])
-        elif raw and token.startswith("-m="):
+        elif short_model and token.startswith("-m="):
             values.append(token.partition("=")[2])
-        elif raw and token in {"-c", "--config"} and index + 1 < len(argv):
+        elif codex_config and token in {"-c", "--config"} and index + 1 < len(argv):
             values.extend(_config_model_values(argv[index + 1]))
             index += 1
-        elif raw and token.startswith("--config="):
+        elif codex_config and token.startswith("--config="):
             values.extend(_config_model_values(token.partition("=")[2]))
         index += 1
     return values
@@ -4556,10 +4558,18 @@ def _raw_worker_policy_details(argv: list[str]) -> tuple[list[str], bool]:
         current = pending.pop()
         if not current:
             continue
-        models.extend(_model_option_values(current, raw=True))
         executable = _command_executable(current)
-        if executable in {"cursor", "cursor-agent"}:
-            cursor_worker = True
+        is_cursor_worker = executable in {"cursor", "cursor-agent"}
+        cursor_worker = cursor_worker or is_cursor_worker
+        explicit_models = _model_option_values(
+            current, short_model=not is_cursor_worker
+        )
+        if explicit_models:
+            models.extend(explicit_models)
+        elif executable == "codex":
+            # Codex CLI --model/-m populates ConfigOverrides.model and always
+            # takes precedence over model values supplied through -c.
+            models.extend(_model_option_values(current, codex_config=True))
         if executable not in {"bash", "sh"}:
             continue
         script = None

@@ -808,6 +808,14 @@ def test_resume_policy_refuses_before_preflight_is_called(
         ["codex", "exec", "--model", REPLACEMENT_MODEL, "--model", REFUSED_MODEL],
         ["codex", "exec", f"--model={REFUSED_MODEL}"],
         ["codex", "exec", "-m", REFUSED_MODEL],
+        [
+            "codex",
+            "exec",
+            "--model",
+            REFUSED_MODEL,
+            "-c",
+            f"model={REPLACEMENT_MODEL}",
+        ],
         ["codex", "exec", "-c", f"model={REFUSED_MODEL}"],
         ["codex", "exec", "-c", f'model="{REFUSED_MODEL}"'],
         ["codex", "exec", "-c", f"model='{REFUSED_MODEL}'"],
@@ -821,6 +829,7 @@ def test_resume_policy_refuses_before_preflight_is_called(
         "last-occurrence-refused",
         "equals-form",
         "short-form",
+        "explicit-model-beats-later-config",
         "codex-config-form",
         "double-quoted-config",
         "single-quoted-config",
@@ -890,9 +899,9 @@ def test_raw_allowed_model_overrides_unused_refused_dispatch_model(
             "-c",
             f'model="{REPLACEMENT_MODEL}"',
         ],
-        ["codex", "exec", "--model", REFUSED_MODEL, "-c", f'model = "{REPLACEMENT_MODEL}"'],
+        ["codex", "exec", "-c", f'model = "{REFUSED_MODEL}"', "--model", REPLACEMENT_MODEL],
     ],
-    ids=["repeated-model", "repeated-config", "later-config"],
+    ids=["repeated-model", "repeated-config", "explicit-model-after-config"],
 )
 def test_raw_worker_checks_only_last_model_override(
     tmp_path: Path,
@@ -968,6 +977,86 @@ def test_cursor_raw_command_without_its_own_model_is_refused(
     _assert_cursor_allowlist_refusal(result, None)
     _assert_no_launch_effects(state, env, dispatch_id, marker)
     assert not (tmp_path / "cursor-spawned").exists()
+
+
+@pytest.mark.parametrize(
+    ("dispatcher_model", "worker_argv", "refused_model"),
+    [
+        (
+            "composer-1",
+            ["cursor-agent", "--model", "composer-1", "-c", "model=grok-4.7-high"],
+            "composer-1",
+        ),
+        (
+            None,
+            ["cursor-agent", "-p", "--force", "--trust", "-c", "model=grok-4.7-high"],
+            None,
+        ),
+    ],
+    ids=["cloud-flag-does-not-override-model", "cloud-flag-does-not-supply-model"],
+)
+def test_cursor_config_tokens_do_not_supply_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatcher_model: str | None,
+    worker_argv: list[str],
+    refused_model: str | None,
+) -> None:
+    project, state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    dispatch_id = "cursor-config-token-is-not-model"
+    marker = tmp_path / "cursor-config-token-spawned"
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id=dispatch_id,
+            model=dispatcher_model,
+            marker=marker,
+            agent="cursor",
+            worker_argv=worker_argv,
+        ),
+    )
+
+    _assert_cursor_allowlist_refusal(result, refused_model)
+    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert not (tmp_path / "cursor-spawned").exists()
+
+
+def test_other_raw_binary_does_not_parse_config_as_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    binary = Path(env["PATH"].split(os.pathsep)[0]) / "other-agent"
+    marker = tmp_path / "other-agent-spawned"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('spawned')\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id="other-binary-config-is-not-model",
+            model=None,
+            marker=tmp_path / "other-worker-marker",
+            worker_argv=["other-agent", "-c", f"model={REFUSED_MODEL}"],
+        ),
+    )
+
+    assert result.returncode != 64, (result.returncode, result.stdout, result.stderr)
+    assert marker.exists()
 
 
 @pytest.mark.parametrize(
