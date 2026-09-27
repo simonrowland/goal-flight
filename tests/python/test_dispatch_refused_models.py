@@ -813,9 +813,12 @@ def test_resume_policy_refuses_before_preflight_is_called(
         ["codex", "exec", "-c", f"model='{REFUSED_MODEL}'"],
         ["codex", "exec", "--config", f"model={REFUSED_MODEL}"],
         ["codex", "exec", f"--config=model={REFUSED_MODEL}"],
+        ["codex", "exec", "-c", f'model = "{REFUSED_MODEL}"'],
+        ["codex", "exec", "-c", f'model="{REFUSED_MODEL}'],
+        ["codex", "exec", f'--config=model="{REFUSED_MODEL}"'],
     ],
     ids=[
-        "every-occurrence",
+        "last-occurrence-refused",
         "equals-form",
         "short-form",
         "codex-config-form",
@@ -823,9 +826,12 @@ def test_resume_policy_refuses_before_preflight_is_called(
         "single-quoted-config",
         "long-config",
         "long-config-equals-form",
+        "spaced-key-value",
+        "unclosed-quote",
+        "config-equals-quoted-value",
     ],
 )
-def test_raw_worker_model_occurrences_are_checked(
+def test_effective_raw_worker_model_is_checked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     raw_worker: list[str],
@@ -850,10 +856,10 @@ def test_raw_worker_model_occurrences_are_checked(
     assert not (tmp_path / "codex-spawned").exists()
 
 
-def test_refused_dispatch_model_is_checked_even_with_raw_allowed_model(
+def test_raw_allowed_model_overrides_unused_refused_dispatch_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project, state, env = _runtime(
+    project, _state, env = _runtime(
         tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
     )
     dispatch_id = "refused-dispatch-model-with-raw"
@@ -868,8 +874,74 @@ def test_refused_dispatch_model_is_checked_even_with_raw_allowed_model(
 
     result = _run_dispatch(project, env, argv)
 
-    _assert_refusal(result)
-    _assert_no_launch_effects(state, env, dispatch_id, marker)
+    assert result.returncode != 64, (result.returncode, result.stdout, result.stderr)
+    assert (tmp_path / "codex-spawned").exists()
+
+
+@pytest.mark.parametrize(
+    "worker_argv",
+    [
+        ["codex", "exec", "--model", REFUSED_MODEL, "--model", REPLACEMENT_MODEL],
+        [
+            "codex",
+            "exec",
+            "-c",
+            f'model="{REFUSED_MODEL}"',
+            "-c",
+            f'model="{REPLACEMENT_MODEL}"',
+        ],
+        ["codex", "exec", "--model", REFUSED_MODEL, "-c", f'model = "{REPLACEMENT_MODEL}"'],
+    ],
+    ids=["repeated-model", "repeated-config", "later-config"],
+)
+def test_raw_worker_checks_only_last_model_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_argv: list[str],
+) -> None:
+    project, _state, env = _runtime(
+        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+    )
+    marker = tmp_path / "last-model-worker-spawned"
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id="raw-last-model-override",
+            model=REFUSED_MODEL,
+            marker=marker,
+            worker_argv=worker_argv,
+        ),
+    )
+
+    assert result.returncode != 64, (result.returncode, result.stdout, result.stderr)
+    assert (tmp_path / "codex-spawned").exists()
+
+
+def test_cursor_raw_model_overrides_unused_dispatch_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _state, env = _runtime(
+        tmp_path,
+        monkeypatch,
+        agent_model_allow={"cursor": list(CURSOR_ALLOW_PATTERNS)},
+    )
+    result = _run_dispatch(
+        project,
+        env,
+        _raw_launch_argv(
+            project=project,
+            dispatch_id="cursor-raw-model-override",
+            model="composer-1",
+            marker=tmp_path / "cursor-raw-model-marker",
+            agent="cursor",
+            worker_argv=["cursor-agent", "--model", "grok-4.7-high"],
+        ),
+    )
+
+    assert result.returncode != 64, (result.returncode, result.stdout, result.stderr)
+    assert (tmp_path / "cursor-spawned").exists()
 
 
 def test_cursor_raw_command_without_its_own_model_is_refused(
@@ -1288,13 +1360,38 @@ def test_refused_queue_drain_terminalizes_permanent_refusal(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    ("agent", "model", "policy", "expected_reason"),
+    [
+        (
+            "codex",
+            REFUSED_MODEL,
+            {"refused_models": {REFUSED_MODEL: REPLACEMENT_MODEL}},
+            "refused by operator policy",
+        ),
+        (
+            "cursor",
+            "grok-4.7-high",
+            {"agent_model_allow": {"cursor": list(CURSOR_ALLOW_PATTERNS)}},
+            "fleet launch cannot preserve the agent_model_allow model",
+        ),
+    ],
+    ids=["refused-model", "allowed-cursor-model-not-carried"],
+)
 def test_remote_queue_drain_refuses_before_fleet_preview(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    agent: str,
+    model: str,
+    policy: dict[str, object],
+    expected_reason: str,
 ) -> None:
     project, state, _env = _runtime(
-        tmp_path, monkeypatch, refused_models={REFUSED_MODEL: REPLACEMENT_MODEL}
+        tmp_path,
+        monkeypatch,
+        refused_models=policy.get("refused_models"),
+        agent_model_allow=policy.get("agent_model_allow"),
     )
     import goalflight_agent_limits as limits
     import goalflight_fleet_dispatch as fleet_dispatch
@@ -1302,7 +1399,7 @@ def test_remote_queue_drain_refuses_before_fleet_preview(
     monkeypatch.setattr(
         limits,
         "LOCAL_OVERRIDES",
-        {"refused_models": {REFUSED_MODEL: REPLACEMENT_MODEL}},
+        policy,
     )
     monkeypatch.setattr(limits, "LOCAL_OVERRIDES_LOAD_ERROR", None)
     monkeypatch.setenv("GOALFLIGHT_LIVE_SSH", "1")
@@ -1310,13 +1407,18 @@ def test_remote_queue_drain_refuses_before_fleet_preview(
     queue_dir = state / "dispatch-queue"
     queue_dir.mkdir(parents=True)
     marker = tmp_path / "remote-drain-worker-spawned"
-    dispatch_argv = _raw_launch_argv(
-        project=project,
-        dispatch_id=dispatch_id,
-        model=REFUSED_MODEL,
-        marker=marker,
-        agent="codex",
-    )
+    dispatch_argv = [
+        "--agent",
+        agent,
+        "--shape",
+        "acp",
+        "--cwd",
+        str(project),
+        "--model",
+        model,
+        "--dispatch-id",
+        dispatch_id,
+    ]
     request = {
         "dispatch_id": dispatch_id,
         "cwd": str(project),
@@ -1329,7 +1431,7 @@ def test_remote_queue_drain_refuses_before_fleet_preview(
         "dispatch_id": dispatch_id,
         "created_at": D.goalflight_ledger.utc_now(),
         "updated_at": D.goalflight_ledger.utc_now(),
-        "agent": "codex",
+        "agent": agent,
         "shape": "acp",
         "project_root": str(project),
         "process_cwd": str(project),
@@ -1343,8 +1445,8 @@ def test_remote_queue_drain_refuses_before_fleet_preview(
         {
             "schema": D.goalflight_ledger.SCHEMA,
             "dispatch_id": dispatch_id,
-            "agent": "codex",
-            "model": REFUSED_MODEL,
+            "agent": agent,
+            "model": model,
             "state": "queued",
             "reason": "dispatch_queue",
             "project_root": str(project),
@@ -1390,6 +1492,7 @@ def test_remote_queue_drain_refuses_before_fleet_preview(
     failed_claims = list(queue_dir.glob(f"{dispatch_id}.json.claimed-*.failed"))
     assert len(failed_claims) == 1
     failed_payload = json.loads(failed_claims[0].read_text(encoding="utf-8"))
-    assert "refused by operator policy" in failed_payload["reason"]
+    assert failed_payload["state"] == "failed"
+    assert expected_reason in failed_payload["reason"]
     assert not (state / "capacity.json").exists()
     assert not marker.exists()

@@ -4479,16 +4479,20 @@ def _refuse_configured_models(
 
 
 def _config_model_values(setting: str) -> list[str]:
-    try:
-        tokens = shlex.split(setting)
-    except ValueError:
+    key, separator, raw_value = setting.partition("=")
+    if not separator or key.strip().casefold() != "model":
         return []
-    values: list[str] = []
-    for token in tokens:
-        key, separator, value = token.partition("=")
-        if separator and key.strip().casefold() == "model":
-            values.append(value.strip())
-    return values
+    raw_value = raw_value.strip()
+    try:
+        import tomllib
+
+        value = tomllib.loads(f"model = {raw_value}")["model"]
+        if not isinstance(value, str):
+            raise ValueError("Codex model override is not a TOML string")
+    except (ImportError, ValueError):
+        # Codex accepts bare values and repairs an unmatched boundary quote.
+        value = raw_value.strip("\"'")
+    return [value]
 
 
 def _model_option_values(argv: list[str], *, raw: bool = False) -> list[str]:
@@ -4580,10 +4584,11 @@ def _refuse_launch_model_policy(args, argv: list[str]) -> None:
         separator = len(argv)
     raw = argv[separator + 1 :] if separator < len(argv) else None
     raw_models, raw_cursor_worker = _raw_worker_policy_details(raw or [])
-    models: list[object] = list(raw_models)
     effective_model = getattr(args, "model", None)
-    if effective_model is not None:
-        models.insert(0, effective_model)
+    if raw_models:
+        models: list[object] = [raw_models[-1]]
+    else:
+        models = [effective_model] if effective_model is not None else []
     policy_agent = "cursor" if raw_cursor_worker else getattr(args, "agent", None)
     _refuse_configured_models(
         models,
@@ -18722,20 +18727,32 @@ def _drain_launch_remote_claim(
     claim: Path,
 ) -> subprocess.CompletedProcess[str]:
     dispatch_argv = _occupancy_argv_from_record(entry)
+    refusal = None
     if dispatch_argv:
         policy_args = _launch_policy_args(dispatch_argv)
         try:
             _refuse_launch_model_policy(policy_args, dispatch_argv)
         except DispatchUsageError as exc:
-            reason = str(exc)
-            return subprocess.CompletedProcess(
-                ["remote-drain", dispatch_id],
-                64,
-                stdout=_permanent_dispatch_refusal_line(dispatch_id, reason),
-                stderr=f"goalflight_dispatch: {reason}\n",
-            )
+            refusal = str(exc)
 
     agent = _remote_drain_agent(entry)
+    if refusal is None:
+        try:
+            if agent_model_allowlist(agent) is not None:
+                refusal = (
+                    f"fleet launch cannot preserve the agent_model_allow model for "
+                    f"agent {agent}; use a local launch"
+                )
+        except CapacityPolicyConfigError as exc:
+            refusal = str(exc)
+    if refusal is not None:
+        return subprocess.CompletedProcess(
+            ["remote-drain", dispatch_id],
+            64,
+            stdout=_permanent_dispatch_refusal_line(dispatch_id, refusal),
+            stderr=f"goalflight_dispatch: {refusal}\n",
+        )
+
     refusal = _remote_grok_effort_refusal(entry)
     if refusal:
         raise _RemoteDrainBlocked(
