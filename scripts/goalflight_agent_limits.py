@@ -108,7 +108,7 @@ AGENT_CAP_POOL: dict[str, str] = {
 
 
 def normalize_agent(agent: str) -> str:
-    return agent.strip().lower()
+    return agent.strip().casefold()
 
 
 # Retired dispatch handles -> successor handle. Ledgers, leases, and status
@@ -164,6 +164,8 @@ def cap_pool(agent: str) -> str:
 #                    optional slot weights; omitted models weigh 1.0             #
 #   "agent_rss_mb": {agent: int}  merged over AGENT_RSS_MB                      #
 #   "worker_rss_ceiling_mb": int  per-worker watcher RSS ceiling                #
+#   "refused_models": {model: replacement|null}  operator launch policy         #
+#   "agent_model_allow": {agent: [glob, ...]}  optional model allowlists        #
 #   "hard_cap":     int           raw ceiling for goalflight_capacity          #
 #   "operating_total"|"max_total": int  persistent machine operating cap       #
 #      (equivalent to $GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit  #
@@ -178,22 +180,39 @@ def _local_conf_path() -> Path:
     return Path.home() / ".goal-flight" / "capacity.local.json"
 
 
-def load_local_overrides(path: Path | None = None) -> dict:
-    """Return machine-local capacity overrides, or {} if absent/malformed.
+LOCAL_OVERRIDES_LOAD_ERROR: str | None = None
 
-    Never raises: a missing or unparseable conf must degrade to the committed
-    baseline, never break dispatch.
-    """
+
+def load_local_overrides(path: Path | None = None) -> dict:
+    """Return machine-local capacity overrides, retaining model-policy errors."""
+    global LOCAL_OVERRIDES_LOAD_ERROR
+    LOCAL_OVERRIDES_LOAD_ERROR = None
     conf_path = path if path is not None else _local_conf_path()
+    if conf_path == Path(os.devnull):
+        return {}
     try:
         raw = conf_path.read_text()
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        LOCAL_OVERRIDES_LOAD_ERROR = (
+            f"capacity config error: local capacity config could not be read "
+            f"({type(exc).__name__})"
+        )
         return {}
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        LOCAL_OVERRIDES_LOAD_ERROR = "capacity config error: local capacity config is invalid JSON"
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        LOCAL_OVERRIDES_LOAD_ERROR = "capacity config error: local capacity config root must be an object"
+        return {}
+    return data
+
+
+def local_overrides_load_error() -> str | None:
+    return LOCAL_OVERRIDES_LOAD_ERROR
 
 
 def _merge_int_map(target: dict, override: object) -> None:
@@ -211,6 +230,72 @@ def _merge_int_map(target: dict, override: object) -> None:
 
 
 LOCAL_OVERRIDES = load_local_overrides()
+
+
+class CapacityPolicyConfigError(ValueError):
+    """A present operator model policy has an invalid shape."""
+
+
+def model_refusal(model: object) -> tuple[str, str | None] | None:
+    """Return the configured refused model and replacement, if any."""
+    if "refused_models" not in LOCAL_OVERRIDES:
+        return None
+    refused_models = LOCAL_OVERRIDES.get("refused_models")
+    if not isinstance(refused_models, dict):
+        raise CapacityPolicyConfigError(
+            "capacity config error: refused_models must be an object"
+        )
+    if not isinstance(model, str):
+        return None
+    model_id = model.strip().casefold()
+    for refused, replacement in refused_models.items():
+        if not isinstance(refused, str) or not refused.strip():
+            raise CapacityPolicyConfigError(
+                "capacity config error: refused_models keys must be non-empty strings"
+            )
+        if refused.strip().casefold() != model_id:
+            continue
+        if replacement is not None and not isinstance(replacement, str):
+            raise CapacityPolicyConfigError(
+                "capacity config error: replacement must be a string or null"
+            )
+        suggestion = replacement.strip() if isinstance(replacement, str) else ""
+        return refused.strip().casefold(), suggestion or None
+    return None
+
+
+def agent_model_allowlist(agent: object) -> tuple[str, ...] | None:
+    """Return configured model globs for an agent, or None when unrestricted."""
+    if "agent_model_allow" not in LOCAL_OVERRIDES:
+        return None
+    allowlists = LOCAL_OVERRIDES.get("agent_model_allow")
+    if not isinstance(allowlists, dict):
+        raise CapacityPolicyConfigError(
+            "capacity config error: agent_model_allow must be an object"
+        )
+    label = normalize_agent(str(agent or "").strip())
+    for configured_agent, configured in allowlists.items():
+        if not isinstance(configured_agent, str) or not configured_agent.strip():
+            raise CapacityPolicyConfigError(
+                "capacity config error: agent_model_allow keys must be non-empty strings"
+            )
+        if normalize_agent(configured_agent) != label:
+            continue
+        if not isinstance(configured, list):
+            raise CapacityPolicyConfigError(
+                f"capacity config error: agent_model_allow[{label}] must be a list"
+            )
+        patterns: list[str] = []
+        for pattern in configured:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise CapacityPolicyConfigError(
+                    f"capacity config error: agent_model_allow[{label}] entries must be non-empty strings"
+                )
+            patterns.append(pattern.strip())
+        return tuple(patterns)
+    return None
+
+
 # Snapshot the committed baseline BEFORE local overrides are merged in place:
 # seeding a fresh machine must plant the shipped defaults, not whatever this
 # particular box happens to have been hand-tuned to.
@@ -428,6 +513,8 @@ def seed_capacity_conf(path: Path | None = None, *, force: bool = False) -> dict
         "agent_caps": dict(COMMITTED_AGENT_CAPS),
         "account_caps": {},
         "model_weights": {},
+        "refused_models": {},
+        "agent_model_allow": {},
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

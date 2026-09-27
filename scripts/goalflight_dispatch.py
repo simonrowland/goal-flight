@@ -52,6 +52,7 @@ import datetime as dt
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import errno
+import fnmatch
 import hashlib
 try:
     import fcntl
@@ -96,7 +97,14 @@ import goalflight_session_status
 import goalflight_task
 import goalflight_terminal
 import goalflight_worktree_pool
-from goalflight_agent_limits import moonshot_family
+from goalflight_agent_limits import (
+    CapacityPolicyConfigError,
+    agent_model_allowlist,
+    local_overrides_load_error,
+    model_refusal,
+    moonshot_family,
+    normalize_agent,
+)
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import (
     active_monotonic,
@@ -4399,6 +4407,225 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
     return account_env
 
 
+def _refuse_configured_model(model: object, agent: object) -> None:
+    _refuse_configured_models([model], agent)
+
+
+def _refuse_configured_models(
+    models: list[object],
+    agent: object,
+    *,
+    raw_present: bool = False,
+    raw_models: list[str] | None = None,
+) -> None:
+    label = normalize_agent(str(agent or "").strip())
+    policy_agent = "cursor" if _account_engine(label) == "cursor" else label
+    load_error = local_overrides_load_error()
+    if load_error and (
+        any(isinstance(model, str) and model.strip() for model in models)
+        or policy_agent == "cursor"
+    ):
+        raise DispatchUsageError(load_error)
+    try:
+        patterns = agent_model_allowlist(policy_agent)
+        # Validate the refused_models container even when this invocation has
+        # no explicit model. A malformed present policy is never unrestricted.
+        refusals = [(model, model_refusal(model)) for model in (models or [None])]
+    except CapacityPolicyConfigError as exc:
+        raise DispatchUsageError(str(exc)) from exc
+
+    allowed_models = list(models or [None])
+    if patterns is not None and raw_present and not raw_models:
+        # A raw command overrides the preset model. Its own implicit default
+        # cannot be checked by the dispatcher, so an allowlisted agent must
+        # name a model on the command that will actually run.
+        allowed_models.append(None)
+    if patterns is not None:
+        allowed = ", ".join(patterns) if patterns else "(none)"
+        for model in allowed_models:
+            normalized = model.strip() if isinstance(model, str) else None
+            if normalized is not None and any(
+                fnmatch.fnmatchcase(normalized.casefold(), pattern.casefold())
+                for pattern in patterns
+            ):
+                continue
+            model_name = normalized if normalized is not None else "<missing>"
+            raise DispatchUsageError(
+                f"agent {policy_agent} model {model_name} is refused by operator "
+                f"policy (capacity config agent_model_allow); allowed patterns: {allowed}; "
+                "pass an explicit --model matching an allowed pattern"
+            )
+
+    for model, refusal in refusals:
+        if refusal is None:
+            continue
+        model_name = model.strip() if isinstance(model, str) else "<missing>"
+        message = (
+            f"model {model_name} is refused by operator policy "
+            "(capacity config refused_models)"
+        )
+        replacement = refusal[1]
+        if patterns is not None:
+            allowed = ", ".join(patterns) if patterns else "(none)"
+            message += f"; agent {policy_agent} allowed patterns: {allowed}"
+            if replacement and not any(
+                fnmatch.fnmatchcase(replacement.casefold(), pattern.casefold())
+                for pattern in patterns
+            ):
+                replacement = None
+        if replacement is not None:
+            message += f"; use --model {replacement}"
+        raise DispatchUsageError(message)
+
+
+def _config_model_values(setting: str) -> list[str]:
+    key, separator, raw_value = setting.partition("=")
+    if not separator or key.strip().casefold() != "model":
+        return []
+    raw_value = raw_value.strip()
+    try:
+        import tomllib
+
+        value = tomllib.loads(f"model = {raw_value}")["model"]
+        if not isinstance(value, str):
+            raise ValueError("Codex model override is not a TOML string")
+    except (ImportError, ValueError):
+        # Codex accepts bare values and repairs an unmatched boundary quote.
+        value = raw_value.strip("\"'")
+    return [value]
+
+
+def _model_option_values(
+    argv: list[str], *, short_model: bool = False, codex_config: bool = False
+) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--model" or (short_model and token == "-m"):
+            if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                values.append(argv[index + 1])
+                index += 2
+                continue
+        elif token.startswith("--model="):
+            values.append(token.partition("=")[2])
+        elif short_model and token.startswith("-m="):
+            values.append(token.partition("=")[2])
+        elif codex_config and token in {"-c", "--config"} and index + 1 < len(argv):
+            values.extend(_config_model_values(argv[index + 1]))
+            index += 1
+        elif codex_config and token.startswith("--config="):
+            values.extend(_config_model_values(token.partition("=")[2]))
+        index += 1
+    return values
+
+
+def _shell_command_segments(argv: list[str]) -> list[list[str]]:
+    separators = {";", "&&", "||", "|", "&"}
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in argv:
+        if token in separators:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _command_executable(argv: list[str]) -> str | None:
+    index = 0
+    while index < len(argv) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[index]):
+        index += 1
+    if index < len(argv) and Path(argv[index]).name.casefold() == "env":
+        index += 1
+        while index < len(argv) and (
+            argv[index].startswith("-")
+            or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[index])
+        ):
+            index += 1
+    return Path(argv[index]).name.casefold() if index < len(argv) else None
+
+
+def _raw_worker_policy_details(argv: list[str]) -> tuple[list[str], bool]:
+    models: list[str] = []
+    cursor_worker = False
+    pending = [argv]
+    while pending:
+        current = pending.pop()
+        if not current:
+            continue
+        executable = _command_executable(current)
+        is_cursor_worker = executable in {"cursor", "cursor-agent"}
+        cursor_worker = cursor_worker or is_cursor_worker
+        explicit_models = _model_option_values(
+            current, short_model=not is_cursor_worker
+        )
+        if explicit_models:
+            models.extend(explicit_models)
+        elif executable == "codex":
+            # Codex CLI --model/-m populates ConfigOverrides.model and always
+            # takes precedence over model values supplied through -c.
+            models.extend(_model_option_values(current, codex_config=True))
+        if executable not in {"bash", "sh"}:
+            continue
+        script = None
+        for index, token in enumerate(current[:-1]):
+            if token in {"-c", "-lc", "-cl", "--command"}:
+                script = current[index + 1]
+                break
+        if script is None:
+            continue
+        try:
+            script_argv = shlex.split(script)
+        except ValueError:
+            continue
+        pending.extend(_shell_command_segments(script_argv))
+    return models, cursor_worker
+
+
+def _refuse_launch_model_policy(args, argv: list[str]) -> None:
+    try:
+        separator = argv.index("--")
+    except ValueError:
+        separator = len(argv)
+    raw = argv[separator + 1 :] if separator < len(argv) else None
+    raw_models, raw_cursor_worker = _raw_worker_policy_details(raw or [])
+    effective_model = getattr(args, "model", None)
+    if raw_models:
+        models: list[object] = [raw_models[-1]]
+    else:
+        models = [effective_model] if effective_model is not None else []
+    policy_agent = "cursor" if raw_cursor_worker else getattr(args, "agent", None)
+    _refuse_configured_models(
+        models,
+        policy_agent,
+        raw_present=raw is not None,
+        raw_models=raw_models,
+    )
+
+
+def _launch_policy_args(argv: list[str]):
+    parser = _build_launch_parser()
+    agent = _option_value_before_worker_remainder(argv, "--agent", last=True)
+    model = _option_value_before_worker_remainder(argv, "--model", last=True)
+    return argparse.Namespace(
+        agent=agent if agent is not None else parser.get_default("agent"),
+        model=model,
+    )
+
+
+def _dispatch_usage_error_message(error: BaseException) -> str:
+    prefix = "goalflight_dispatch:"
+    message = str(error).strip()
+    while message.startswith(prefix):
+        message = message[len(prefix) :].lstrip()
+    return f"{prefix} {message}"
+
+
 def _nonterminal_dispatch_reuse_reason(
     dispatch_id: str,
     *,
@@ -7053,6 +7280,17 @@ def _cmd_resume(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
+    parent_record = _find_dispatch_record(args.dispatch_id)
+    if isinstance(parent_record, dict):
+        policy_argv = _resume_policy_argv(parent_record, args)
+        policy_args = _launch_policy_args(policy_argv)
+        try:
+            _refuse_launch_model_policy(policy_args, policy_argv)
+        except DispatchUsageError as exc:
+            _emit_permanent_dispatch_refusal(args.dispatch_id, exc)
+            print(_dispatch_usage_error_message(exc), file=sys.stderr)
+            return 64
+
     prompt_path = Path(args.prompt_file).expanduser()
     if not prompt_path.is_file():
         print(
@@ -7093,13 +7331,19 @@ def _cmd_resume(argv: list[str]) -> int:
             prompt_path=prompt_path,
             resume_args=args,
         )
+        policy_args = _launch_policy_args(candidate_argv)
+        try:
+            _refuse_launch_model_policy(policy_args, candidate_argv)
+        except DispatchUsageError as exc:
+            _emit_permanent_dispatch_refusal(candidate_dispatch_id, exc)
+            raise
         preflight = _preflight_resume_dispatch(
             source,
             candidate_argv=candidate_argv,
             dispatch_id=candidate_dispatch_id,
         )
     except (DispatchUsageError, goalflight_worktree_pool.WorktreeSeatError) as exc:
-        print(f"goalflight_dispatch: {exc}", file=sys.stderr)
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
     child_dispatch_id = preflight["dispatch_id"]
     result = None
@@ -7135,8 +7379,21 @@ def _resume_model_from_record(record: dict) -> str | None:
     if isinstance(recorded, str) and recorded.strip():
         return recorded.strip()
     return _option_value_before_worker_remainder(
-        _dispatch_argv_from_record(record), "--model"
+        _dispatch_argv_from_record(record), "--model", last=True
     )
+
+
+def _resume_policy_argv(record: dict, resume_args) -> list[str]:
+    """Preview model and agent options using the same resume override rules."""
+    argv = _dispatch_argv_from_record(record)
+    if not argv:
+        argv = ["--agent", str(record.get("agent") or record.get("engine") or "codex")]
+    model = getattr(resume_args, "model", None)
+    if model is None:
+        model = _resume_model_from_record(record)
+    if model is not None:
+        argv = _set_option_before_worker_remainder(argv, "--model", str(model))
+    return argv
 
 
 def _resume_cwd_from_record(record: dict) -> Path | None:
@@ -7273,9 +7530,7 @@ def _resume_launch_argv(
         "--engine-session-id": source["session_id"],
         "--cwd": str(cwd),
     }
-    recorded_model = record.get("model") or _option_value_before_worker_remainder(
-        recorded, "--model", last=True
-    )
+    recorded_model = _resume_model_from_record(record)
     requested_model = getattr(resume_args, "model", None)
     if requested_model is not None:
         replace["--model"] = str(requested_model)
@@ -10750,6 +11005,24 @@ def _attempt_claiming_worker_argv(
 
 DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
 PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
+
+
+def _permanent_dispatch_refusal_line(
+    dispatch_id: str | None, error: BaseException | str
+) -> str:
+    payload = {
+        "dispatch_id": dispatch_id,
+        "permanent": True,
+        "reason": str(error),
+        "state": "refused",
+    }
+    return DISPATCH_REFUSED_PREFIX + json.dumps(payload, sort_keys=True) + "\n"
+
+
+def _emit_permanent_dispatch_refusal(
+    dispatch_id: str | None, error: BaseException | str
+) -> None:
+    print(_permanent_dispatch_refusal_line(dispatch_id, error), end="", flush=True)
 
 
 def _emit_proven_pre_worker_refusal(error: ProvenPreWorkerRefusal) -> None:
@@ -18528,7 +18801,33 @@ def _drain_launch_remote_claim(
     launch_token: str,
     claim: Path,
 ) -> subprocess.CompletedProcess[str]:
+    dispatch_argv = _occupancy_argv_from_record(entry)
+    refusal = None
+    if dispatch_argv:
+        policy_args = _launch_policy_args(dispatch_argv)
+        try:
+            _refuse_launch_model_policy(policy_args, dispatch_argv)
+        except DispatchUsageError as exc:
+            refusal = str(exc)
+
     agent = _remote_drain_agent(entry)
+    if refusal is None:
+        try:
+            if agent_model_allowlist(agent) is not None:
+                refusal = (
+                    f"fleet launch cannot preserve the agent_model_allow model for "
+                    f"agent {agent}; use a local launch"
+                )
+        except CapacityPolicyConfigError as exc:
+            refusal = str(exc)
+    if refusal is not None:
+        return subprocess.CompletedProcess(
+            ["remote-drain", dispatch_id],
+            64,
+            stdout=_permanent_dispatch_refusal_line(dispatch_id, refusal),
+            stderr=f"goalflight_dispatch: {refusal}\n",
+        )
+
     refusal = _remote_grok_effort_refusal(entry)
     if refusal:
         raise _RemoteDrainBlocked(
@@ -23347,9 +23646,17 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
     try:
+        _refuse_launch_model_policy(args, argv)
+    except DispatchUsageError as exc:
+        _emit_permanent_dispatch_refusal(
+            getattr(args, "dispatch_id", None), exc
+        )
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
+        return 64
+    try:
         _validate_reasoning_effort_route(args, raw)
     except DispatchUsageError as exc:
-        print(exc, file=sys.stderr)
+        print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
     if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
         print(

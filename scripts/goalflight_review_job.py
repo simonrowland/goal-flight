@@ -745,6 +745,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
+    from goalflight_dispatch import DispatchUsageError, _refuse_launch_model_policy
+
+    try:
+        worker_argv = command_for(args) if args.agent != "custom" or args.command else []
+        _refuse_launch_model_policy(
+            argparse.Namespace(agent=args.agent, model=None),
+            ["--agent", args.agent, "--", *worker_argv],
+        )
+    except DispatchUsageError as exc:
+        print(f"goalflight_review_job: {exc}", file=sys.stderr, flush=True)
+        return 64
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = out_dir / f"{args.name}.stdout.jsonl"

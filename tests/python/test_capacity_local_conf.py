@@ -99,6 +99,51 @@ def case_conf_overrides_merge_over_baseline() -> None:
         os.unlink(path)
 
 
+def case_refused_models_are_optional_and_case_insensitive() -> None:
+    mod = _reload_limits(None)
+    assert mod.model_refusal("gpt-5.6-luna") is None
+
+    path = _write_conf(
+        json.dumps({"refused_models": {"gpt-5.6-luna": "gpt-6-luna"}})
+    )
+    try:
+        mod = _reload_limits(path)
+        assert mod.model_refusal("GPT-5.6-LUNA") == (
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+        )
+        assert mod.model_refusal("gpt-5.6-luna-high") is None
+    finally:
+        os.unlink(path)
+        _reload_limits(None)
+
+
+def case_agent_model_allowlist_is_optional() -> None:
+    mod = _reload_limits(None)
+    assert mod.agent_model_allowlist("cursor") is None
+
+    path = _write_conf(
+        json.dumps(
+            {
+                "agent_model_allow": {
+                    "cursor": ["grok-*", "cursor-grok-*", "kimi-k3-*"]
+                }
+            }
+        )
+    )
+    try:
+        mod = _reload_limits(path)
+        assert mod.agent_model_allowlist("cursor") == (
+            "grok-*",
+            "cursor-grok-*",
+            "kimi-k3-*",
+        )
+        assert mod.agent_model_allowlist("codex") is None
+    finally:
+        os.unlink(path)
+        _reload_limits(None)
+
+
 def case_conf_operating_cap_flows_through_capacity() -> None:
     path = _write_conf(json.dumps({"hard_cap": 75, "operating_total": 75}))
     old_env = os.environ.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
@@ -199,6 +244,8 @@ def main() -> None:
     try:
         case_absent_conf_keeps_committed_baseline()
         case_conf_overrides_merge_over_baseline()
+        case_refused_models_are_optional_and_case_insensitive()
+        case_agent_model_allowlist_is_optional()
         case_conf_operating_cap_flows_through_capacity()
         case_worker_rss_ceiling_uses_config_env_and_ram_default()
         case_malformed_conf_degrades_to_baseline()

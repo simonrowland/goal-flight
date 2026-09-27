@@ -491,6 +491,13 @@ def preview_dispatch(
     base_sha: str | None = None,
     thin_mode: bool = False,
 ) -> DispatchPreview:
+    import goalflight_dispatch as dispatch
+
+    try:
+        dispatch._refuse_configured_models([], agent)
+    except dispatch.DispatchUsageError as exc:
+        raise DispatchError(str(exc)) from exc
+
     import goalflight_fleet_store as fleet
 
     fleet.bootstrap(fleet_dir)

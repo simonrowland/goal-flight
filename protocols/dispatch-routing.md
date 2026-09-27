@@ -797,7 +797,7 @@ routing decision rather than a strength claim. The two wanted on this lane:
 
 ```shell
 --agent cursor --model kimi-k3-high            # Kimi K3
---agent cursor --model cursor-grok-4.5-high    # Grok 4.5
+--agent cursor --model grok-4.7-high           # Grok 4.7
 ```
 
 Pass the id explicitly. goal-flight deliberately pins no default model for any
