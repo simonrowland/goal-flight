@@ -92,6 +92,44 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
     return mapping
 
 
+def make_test_git_repo(root: Path, name: str = "project") -> Path:
+    """Create a committed temporary checkout for isolated worktree tests."""
+    repo = root / name
+    repo.mkdir(parents=True, exist_ok=True)
+    if not (repo / ".git").exists():
+        for args in (
+            ("init", "-b", "main"),
+            ("config", "user.email", "goalflight-test@example.invalid"),
+            ("config", "user.name", "Goal Flight Test"),
+        ):
+            subprocess.run(
+                ["git", *args],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "tracked.txt"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    return repo
+
+
 @contextmanager
 def registered_child_environment(
     project_root: Path | str,

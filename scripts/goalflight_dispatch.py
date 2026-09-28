@@ -2854,12 +2854,22 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
         return existing
-    if _inherited_seat_lock_present():
+    inherited_ring_seat_mismatch = False
+    inherited_read_only_ring_seat = False
+    inherited_seat_lock = False
+    if not getattr(args, "in_place", False):
+        try:
+            inherited_seat_lock = _inherited_seat_lock_present()
+        except goalflight_worktree_pool.WorktreeSeatError as exc:
+            _raise_worktree_admission_refusal(
+                args,
+                "cannot verify the inherited worktree lock fd: "
+                f"{exc}",
+            )
+    if inherited_seat_lock:
         # Fleet / parent already leased a worktree and passed the fd. Re-acquire
-        # would LOCK_EX-succeed in this process (flock is per-process) and
-        # reset a tree the worker is already in.
-        if getattr(args, "in_place", False):
-            return None
+        # through the inherited open-file description can succeed and reset a
+        # tree the worker is already in.
         cwd = _worker_cwd(args)
         label = _controller_ring_label(args, project_root)
         kind = goalflight_worktree_pool.classify_dispatch_cwd(
@@ -2873,24 +2883,81 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             ),
         )
         if kind == "ring-seat":
-            return None
-        if not _effective_read_only(args):
-            if cwd.resolve(strict=False) == project_root.resolve(strict=False):
-                message = (
-                    "writer dispatch has an inherited worktree lock fd but its "
-                    f"effective cwd is the project root {project_root}; pass "
-                    "--in-place explicitly to run there"
+            try:
+                inherited_fd = int(
+                    os.environ[
+                        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV
+                    ].strip()
                 )
+                managed_root = (
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
+                    else goalflight_worktree_pool.repository_worktree_root(
+                        project_root
+                    )
+                )
+                lock_path = goalflight_worktree_pool._candidate_lock_path(
+                    project_root,
+                    cwd,
+                    managed_root=managed_root,
+                )
+                lock_identity = goalflight_worktree_pool._registered_lock_identity(
+                    lock_path,
+                    registry_root=goalflight_worktree_pool._git_common_dir(
+                        project_root
+                    ),
+                )
+                if lock_identity is None:
+                    lock_identity = goalflight_worktree_pool._lock_path_identity(
+                        lock_path
+                    )
+                    if lock_identity is None:
+                        raise goalflight_worktree_pool.WorktreeSeatError(
+                            f"worktree lock path has no on-disk identity: {lock_path}"
+                        )
+                fd_matches_seat = goalflight_worktree_pool._lock_fd_matches_identity(
+                    inherited_fd, lock_identity
+                )
+                if fd_matches_seat and _effective_read_only(args):
+                    # A read-only caller may inherit a shared lock. Do not
+                    # inspect it by requesting LOCK_EX; continue through the
+                    # existing shared-read-only admission to acquire our own
+                    # hold before the child starts.
+                    inherited_read_only_ring_seat = True
+            except (OSError, ValueError, goalflight_worktree_pool.WorktreeSeatError) as exc:
+                _raise_worktree_admission_refusal(
+                    args,
+                    "cannot verify that the inherited worktree lock fd owns "
+                    f"effective seat {cwd}: {exc}",
+                )
+            if inherited_read_only_ring_seat:
+                pass
+            elif fd_matches_seat:
+                return None
             else:
-                message = (
-                    "inherited worktree lock fd is only valid when the effective "
-                    "cwd is a managed worktree seat of this project; got "
-                    f"{cwd}"
-                )
-            _raise_worktree_admission_refusal(args, message)
+                inherited_ring_seat_mismatch = True
+                inherited_read_only_ring_seat = _effective_read_only(args)
+        elif _effective_read_only(args):
+            # A leaked writer fd does not make a read-only project-root launch
+            # an attempt to reuse that seat. Let ordinary read-only admission
+            # handle its cwd without acquiring a writer seat.
+            pass
+        else:
+            cwd_label = (
+                f"project root {project_root}"
+                if cwd.resolve(strict=False) == project_root.resolve(strict=False)
+                else str(cwd)
+            )
+            _raise_worktree_admission_refusal(
+                args,
+                "inherited worktree lock fd is only valid with its matching "
+                "managed worktree seat; got "
+                f"{cwd_label}",
+            )
     if (
         getattr(args, "parent_dispatch_id", None)
         and _occupancy_exempt_read_only(args)
+        and not inherited_ring_seat_mismatch
     ):
         # A read-only resume reuses its recorded cwd. It has no writer seat to
         # reset or occupy. A recorded pooled seat still needs a shared hold so
@@ -3006,7 +3073,11 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 )
         return None
 
-    if getattr(args, "worktree", None) == "off":
+    if (
+        getattr(args, "worktree", None) == "off"
+        and not inherited_ring_seat_mismatch
+        and not inherited_read_only_ring_seat
+    ):
         # ACP direct configs do not request a post-capacity pool bind. This
         # check follows --in-place validation so nested ACP cwds are refused.
         return None
@@ -3031,7 +3102,57 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 f"--cwd {cwd} is the project root; pass --in-place explicitly "
                 "to run a writer there",
             )
-        if kind == "ring-seat":
+        if (
+            kind == "ring-seat"
+            and inherited_read_only_ring_seat
+            and _occupancy_exempt_read_only(args)
+        ):
+            read_only_deadline = (
+                time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
+            )
+            parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
+            base_ref = getattr(args, "_worktree_base_commit", None)
+            if parent_dispatch_id:
+                parent_record = _find_dispatch_record(str(parent_dispatch_id)) or {}
+                base_ref = base_ref or parent_record.get("worktree_head") or parent_record.get(
+                    "worktree_base"
+                )
+                if not base_ref:
+                    raise goalflight_worktree_pool.WorktreeCwdRefused(
+                        "read-only resume recorded a worktree without a resolvable "
+                        "review base; refusing to review its current HEAD"
+                    )
+            else:
+                base_ref = base_ref or base
+            try:
+                base_commit = goalflight_worktree_pool._git(
+                    project_root if base_ref else cwd,
+                    "rev-parse",
+                    "--verify",
+                    f"{base_ref or 'HEAD'}^{{commit}}",
+                    timeout=goalflight_worktree_pool._deadline_timeout(
+                        read_only_deadline
+                    ),
+                )
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"cannot resolve the read-only base for seat {cwd}: {exc}"
+                ) from exc
+            hold = goalflight_worktree_pool.try_acquire_read_only_pool_seat(
+                project_root,
+                cwd,
+                str(args.dispatch_id),
+                base_commit=base_commit,
+                deadline=read_only_deadline,
+            )
+            if hold is None:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"read-only seat {cwd} is unavailable or does not match "
+                    f"base {base_commit}; refusing to switch checkouts"
+                )
+            _record_shared_read_only_worktree(args, hold.path, base_commit, hold)
+            return None
+        elif kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
             expected_prior_dispatch_id = (
                 str(parent_dispatch_id) if parent_dispatch_id else None
@@ -3151,7 +3272,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             _record_dispatch_worktree(args, lease)
             _emit_resume_worktree_recovery_refs(args, lease)
             return lease
-        if kind == "in-place" and force_captive:
+        elif kind == "in-place" and force_captive:
             # ``--worktree create --cwd <project-root>`` is the explicit
             # captive-seat request used by ACP. Continue through the default
             # allocator; the project root is only the source repo.
@@ -3170,7 +3291,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 "create that path or git worktree add."
             )
 
-    if _occupancy_exempt_read_only(args):
+    if _occupancy_exempt_read_only(args) and not inherited_ring_seat_mismatch:
         shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
             project_root,
             str(args.dispatch_id),
@@ -3337,7 +3458,7 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 pass
         else:
             args._worktree_capacity_deadline = previous_deadline
-    args._worktree_capacity_lease_active = previous_lease_active
+        args._worktree_capacity_lease_active = previous_lease_active
     try:
         if (
             not _effective_read_only(args)
@@ -3347,15 +3468,33 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 project_root = _project_root(args).resolve(strict=False)
             except goalflight_task.TaskError:
                 project_root = None
-            if (
-                project_root is not None
-                and _worker_cwd(args).resolve(strict=False) == project_root
-            ):
-                _raise_worktree_admission_refusal(
-                    args,
-                    "writer dispatch resolved to the project root "
-                    f"{project_root} without explicit --in-place",
+            if project_root is not None:
+                worker_cwd = _worker_cwd(args).resolve(strict=False)
+                inside_project = (
+                    worker_cwd == project_root
+                    or project_root in worker_cwd.parents
                 )
+                if inside_project:
+                    seat_kind = goalflight_worktree_pool.classify_dispatch_cwd(
+                        worker_cwd,
+                        project_root=project_root,
+                        controller_label=_controller_ring_label(
+                            args, project_root
+                        ),
+                        managed_root=(
+                            Path(str(args.worktree_root)).expanduser()
+                            if getattr(args, "worktree_root", None)
+                            else None
+                        ),
+                    )
+                    if seat_kind != "ring-seat":
+                        _raise_worktree_admission_refusal(
+                            args,
+                            "writer dispatch resolved inside the project "
+                            f"checkout rooted at project root {project_root} "
+                            f"at {worker_cwd} without "
+                            "explicit --in-place",
+                        )
         warning = getattr(args, "_worktree_occupancy_warning", None)
         checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
         current_path = str(Path(str(_worker_cwd(args))).resolve(strict=False))
@@ -23007,7 +23146,6 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         )
         _emit_permanent_dispatch_refusal(cfg.dispatch_id, reason)
         print(f"goalflight_dispatch: {reason}", file=sys.stderr, flush=True)
-        status_json.unlink(missing_ok=True)
         return 64
     if getattr(cfg, "_worktree_seat_refused", False):
         print(f"goalflight_dispatch: {payload.get('error')}", file=sys.stderr)

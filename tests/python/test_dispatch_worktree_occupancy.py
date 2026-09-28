@@ -682,6 +682,35 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
             with patch.dict(os.environ, env, clear=True):
                 _authority, holder, _nonce = _register_controller(tree, env)
                 with contextlib.closing(holder):
+                    root_refused = _run(
+                        _prompt_writer_cmd(
+                            tmp,
+                            tree,
+                            "acp-root-refused",
+                            agent="codex-acp",
+                            extra=[
+                                "--shape", "acp", "--account", "occupancy-test",
+                                "--occupied-worktree-forced", "--foreground",
+                            ],
+                        ),
+                        env,
+                    )
+                    assert root_refused.returncode == 64, (
+                        root_refused.stdout,
+                        root_refused.stderr,
+                    )
+                    assert "DISPATCH-REFUSED " in root_refused.stdout
+                    root_refusal_status = json.loads(
+                        (tmp / "acp-root-refused.status.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    assert root_refusal_status["state"] == "failed_worktree", (
+                        root_refusal_status
+                    )
+                    assert "project checkout" in root_refusal_status["error"], (
+                        root_refusal_status
+                    )
                     forced = _run(
                         _prompt_writer_cmd(
                             tmp,
@@ -690,7 +719,8 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
                             agent="codex-acp",
                             extra=[
                                 "--shape", "acp", "--account", "occupancy-test",
-                                "--occupied-worktree-forced", "--foreground",
+                                "--occupied-worktree-forced", "--in-place",
+                                "--foreground",
                             ],
                         ),
                         env,

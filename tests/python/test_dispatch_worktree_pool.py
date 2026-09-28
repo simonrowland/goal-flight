@@ -831,6 +831,17 @@ def test_writer_with_inherited_lock_fd_keeps_its_managed_seat(
         f"Path({str(marker)!r}).write_text(os.getcwd())"
     )
     try:
+        lock_path = goalflight_worktree_pool._candidate_lock_path(
+            repo,
+            parent.path,
+            managed_root=goalflight_worktree_pool.repository_worktree_root(repo),
+        )
+        registry_path = goalflight_worktree_pool._lock_registry_path(
+            goalflight_worktree_pool._git_common_dir(repo)
+        )
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        registry["locks"].pop(goalflight_worktree_pool._lock_registry_key(lock_path))
+        registry_path.write_text(json.dumps(registry) + "\n", encoding="utf-8")
         env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(parent.fileno())
         command = _dispatch_cmd(
             tmp_path,
@@ -863,6 +874,254 @@ def test_writer_with_inherited_lock_fd_keeps_its_managed_seat(
         assert Path(marker.read_text(encoding="utf-8")).resolve() == parent.path.resolve()
     finally:
         parent.release()
+
+
+def test_inherited_lock_fd_must_match_effective_ring_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    first = goalflight_worktree_pool.acquire_worktree_seat(repo, "fd-seat-first")
+    second = goalflight_worktree_pool.acquire_worktree_seat(repo, "fd-seat-second")
+    second_path = second.path
+    args = SimpleNamespace(
+        agent="test-dispatch",
+        shape="bash",
+        worker=["python"],
+        worktree="HEAD",
+        project_root=str(repo),
+        cwd=str(second_path),
+        read_only=False,
+        in_place=False,
+        dispatch_id="fd-seat-mismatch",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+    try:
+        assert first.path != second.path
+        second.release()
+        _write_terminal_seat_record("fd-seat-second", repo, second_path)
+        monkeypatch.setenv(
+            goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+            str(first.fileno()),
+        )
+        rebound = goalflight_dispatch._bind_dispatch_worktree(args)
+        assert rebound is not None
+        try:
+            assert rebound.path == second_path
+            assert rebound.seat_name == second_path.name
+        finally:
+            rebound.release()
+    finally:
+        second.release()
+        first.release()
+
+
+def test_read_only_mismatched_inherited_fd_gets_target_shared_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    first_writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "seed-read-only-inherited-first", base=base
+    )
+    second_writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "seed-read-only-inherited-second", base=base
+    )
+    seat = second_writer.path
+    finish_seat_holder(second_writer)
+    args = SimpleNamespace(
+        agent="claude-acp",
+        shape="acp",
+        worker=[],
+        worktree="off",
+        project_root=str(repo),
+        cwd=str(seat),
+        read_only=True,
+        in_place=False,
+        dispatch_id="read-only-inherited-lock",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    def refuse_writer_acquire(*_args, **_kwargs):
+        raise AssertionError("read-only admission attempted writer seat acquisition")
+
+    monkeypatch.setattr(
+        goalflight_worktree_pool, "acquire_worktree_seat", refuse_writer_acquire
+    )
+    monkeypatch.setenv(
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+        str(first_writer.fileno()),
+    )
+    try:
+        assert goalflight_dispatch._effective_read_only(args)
+        assert goalflight_dispatch._occupancy_exempt_read_only(args)
+        assert goalflight_worktree_pool.classify_dispatch_cwd(
+            seat,
+            project_root=repo,
+            controller_label=None,
+        ) == "ring-seat"
+        assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+        dispatch_hold = args._worktree_read_only_hold
+        assert dispatch_hold is not None
+        assert Path(args.cwd).resolve() == seat.resolve()
+        assert goalflight_worktree_pool._probe_worktree_seat_flock(
+            repo, seat
+        )[0] is True
+        second_hold = goalflight_worktree_pool.try_acquire_read_only_pool_seat(
+            repo, seat, "second-read-only-inherited", base_commit=base
+        )
+        assert second_hold is not None
+        second_hold.release()
+    finally:
+        goalflight_dispatch._release_read_only_worktree_hold(args)
+        first_writer.release()
+
+
+def test_read_only_resume_mismatched_fd_uses_parent_recorded_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    parent_base = _git(repo, "rev-parse", "HEAD")
+    (repo / "new-head.txt").write_text("later head\n", encoding="utf-8")
+    _git(repo, "add", "new-head.txt")
+    _git(repo, "commit", "-m", "later head")
+    current_base = _git(repo, "rev-parse", "HEAD")
+
+    mismatch_writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "seed-read-only-resume-mismatch", base=current_base
+    )
+    target_writer = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "seed-read-only-resume-target", base=parent_base
+    )
+    seat = target_writer.path
+    finish_seat_holder(target_writer)
+    goalflight_ledger.write_record(
+        {
+            "dispatch_id": "read-only-resume-parent",
+            "state": "complete",
+            "terminal_state": "complete",
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_path": str(seat),
+            "worktree_head": parent_base,
+        }
+    )
+    args = SimpleNamespace(
+        agent="claude-acp",
+        shape="acp",
+        worker=[],
+        worktree="HEAD",
+        project_root=str(repo),
+        cwd=str(seat),
+        read_only=True,
+        in_place=False,
+        dispatch_id="read-only-resume-child",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=True,
+        parent_dispatch_id="read-only-resume-parent",
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    monkeypatch.setenv(
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+        str(mismatch_writer.fileno()),
+    )
+    try:
+        assert _git(seat, "rev-parse", "HEAD") == parent_base
+        assert current_base != parent_base
+        assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+        hold = args._worktree_read_only_hold
+        assert hold is not None
+        assert hold.path == seat
+        assert _git(seat, "rev-parse", "HEAD") == parent_base
+    finally:
+        goalflight_dispatch._release_read_only_worktree_hold(args)
+        mismatch_writer.release()
+
+
+def test_unreadable_inherited_lock_state_refuses_cannot_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    args = SimpleNamespace(
+        worktree="off",
+        project_root=str(repo),
+        cwd=None,
+        read_only=False,
+        in_place=False,
+        dispatch_id="unreadable-lock-fd",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+    monkeypatch.setenv(
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+        "2147483647",
+    )
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="cannot verify the inherited worktree lock fd",
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+
+
+def test_unreadable_inherited_lock_registry_refuses_cannot_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_pinned_test_env(monkeypatch)
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "bad-registry-seat")
+    registry_path = goalflight_worktree_pool._lock_registry_path(
+        goalflight_worktree_pool._git_common_dir(repo)
+    )
+    registry_path.write_text("invalid json\n", encoding="utf-8")
+    args = SimpleNamespace(
+        worktree="HEAD",
+        project_root=str(repo),
+        cwd=str(holder.path),
+        read_only=False,
+        in_place=False,
+        dispatch_id="unreadable-lock-registry",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+    monkeypatch.setenv(
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+        str(holder.fileno()),
+    )
+    try:
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeCwdRefused,
+            match="cannot verify that the inherited worktree lock fd owns",
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
+    finally:
+        holder.release()
 
 
 def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
@@ -1272,7 +1531,119 @@ def test_bind_inherited_lock_fd_outside_managed_seat_refuses_writer(
             goalflight_dispatch._bind_dispatch_worktree(args)
 
 
-def test_acp_in_place_nested_cwd_is_rejected_during_admission(tmp_path: Path) -> None:
+def test_admit_refuses_writer_subdirectory_inside_checkout_with_worktree_off(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    source_dir = repo / "src"
+    source_dir.mkdir()
+    alias = tmp_path / "src-alias"
+    alias.symlink_to(source_dir, target_is_directory=True)
+    args = SimpleNamespace(
+        agent="codex-acp",
+        shape="acp",
+        worker=[],
+        project_root=str(repo),
+        cwd=str(alias),
+        worktree="off",
+        read_only=False,
+        in_place=False,
+        dispatch_id="acp-checkout-subdir",
+        capacity_wait_s=0,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        dispatch_warnings=[],
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="inside the project checkout",
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+
+def test_admit_restores_capacity_lease_flag_when_bind_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = SimpleNamespace(
+        capacity_wait_s=0,
+        _worktree_capacity_lease_active=False,
+    )
+
+    def refuse(_args):
+        raise goalflight_worktree_pool.WorktreeCwdRefused("test refusal")
+
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", refuse)
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused,
+        match="test refusal",
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert args._worktree_capacity_lease_active is False
+    assert not hasattr(args, "_worktree_capacity_deadline")
+
+
+def test_direct_acp_runner_emits_permanent_worktree_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import io
+    import goalflight_acp_run
+
+    repo = _make_repo(tmp_path)
+    source_dir = repo / "src"
+    source_dir.mkdir()
+
+    async def refuse_from_admission(cfg):
+        try:
+            goalflight_dispatch._admit_dispatch_worktree(cfg)
+        except goalflight_worktree_pool.WorktreeCwdRefused as exc:
+            return {
+                "dispatch_id": cfg.dispatch_id,
+                "state": "failed_worktree",
+                "error": str(exc),
+            }
+        raise AssertionError("worktree-off writer inside checkout was admitted")
+
+    def run_immediately(coro):
+        try:
+            coro.send(None)
+        except StopIteration as result:
+            return result.value
+        raise AssertionError("refusal path unexpectedly awaited ACP work")
+
+    monkeypatch.setattr(goalflight_acp_run, "run_acp_dispatch", refuse_from_admission)
+    monkeypatch.setattr(asyncio, "run", run_immediately)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        result = goalflight_acp_run.main(
+            [
+                "--agent",
+                "codex",
+                "--cwd",
+                str(source_dir),
+                "--dispatch-id",
+                "direct-acp-subdir-refused",
+                "--prompt-text",
+                "test",
+                "--json",
+            ]
+        )
+
+    stdout = output.getvalue()
+    assert result == 64, stdout
+    refusal = next(
+        line for line in stdout.splitlines() if line.startswith("DISPATCH-REFUSED ")
+    )
+    assert '"permanent": true' in refusal, refusal
+    assert "inside the project checkout" in refusal, refusal
+
+
+def test_acp_in_place_nested_cwd_is_rejected_with_inherited_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = _make_repo(tmp_path)
     nested = repo / "nested"
     nested.mkdir()
@@ -1295,8 +1666,17 @@ def test_acp_in_place_nested_cwd_is_rejected_during_admission(tmp_path: Path) ->
         _worktree_seat=None,
     )
 
-    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused, match="--in-place"):
-        goalflight_dispatch._admit_dispatch_worktree(args)
+    inherited_path = tmp_path / "inherited-lock-fd"
+    with inherited_path.open("w+", encoding="utf-8") as inherited_fd:
+        monkeypatch.setenv(
+            goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+            str(inherited_fd.fileno()),
+        )
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeCwdRefused,
+            match="--in-place",
+        ):
+            goalflight_dispatch._admit_dispatch_worktree(args)
 
 
 def test_read_only_resume_records_and_touches_checkout_before_waiting(
@@ -3048,37 +3428,55 @@ def test_explicit_in_place_writer_runs_in_project_root(
     assert not (repo / "worktrees").exists()
 
 
-def test_admit_read_only_project_root_is_not_refused(
+def test_admit_read_only_at_root_with_leaked_seat_fd_is_allowed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _set_pinned_test_env(monkeypatch)
     repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "readonly-inherited-seat"
+    )
+    dirty_file = holder.path / "tracked.txt"
+    dirty_file.write_text("preserve this edit\n", encoding="utf-8")
+    head_before = _git(holder.path, "rev-parse", "HEAD")
     args = SimpleNamespace(
-        agent="codex",
+        agent="codex-acp",
+        shape="acp",
+        worker=[],
         project_root=str(repo),
         cwd=str(repo),
-        worktree="HEAD",
+        worktree="off",
         read_only=True,
         in_place=False,
-        dispatch_id="read-only-root",
+        dispatch_id="read-only-inherited-seat",
         capacity_wait_s=0,
         controller_label=None,
         worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
         _worktree_seat=None,
         dispatch_warnings=[],
     )
-    monkeypatch.setattr(
-        goalflight_dispatch,
-        "_prepare_attempt_worktree_occupancy",
-        lambda _args: None,
-    )
+    acquired: list[bool] = []
 
-    inherited_fd_path = tmp_path / "read-only-inherited-fd"
-    with inherited_fd_path.open("w", encoding="utf-8") as inherited_fd:
-        monkeypatch.setenv(
-            goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
-            str(inherited_fd.fileno()),
-        )
+    def refuse_reset(*_args, **kwargs):
+        acquired.append(bool(kwargs.get("reset")))
+        raise AssertionError("inherited lock reached seat acquisition")
+
+    monkeypatch.setattr(goalflight_worktree_pool, "acquire_worktree_seat", refuse_reset)
+    monkeypatch.setenv(
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+        str(holder.fileno()),
+    )
+    try:
         assert goalflight_dispatch._admit_dispatch_worktree(args) is None
+        assert acquired == []
+        assert dirty_file.read_text(encoding="utf-8") == "preserve this edit\n"
+        assert _git(holder.path, "rev-parse", "HEAD") == head_before
+    finally:
+        holder.release()
 
 
 def test_waiting_capacity_replay_does_not_insert_project_root_cwd(
@@ -4214,6 +4612,10 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
     proc, release, _lock_path = _start_flock_holder(
         tmp_path, repo, seat, holder_id, record_ledger=False
     )
+    held, _holder = goalflight_worktree_pool._probe_worktree_seat_flock(
+        repo, seat
+    )
+    assert held is True
     queue_dir = tmp_path / "state" / "dispatch-queue"
     queue_dir.mkdir(parents=True)
     queue_path = queue_dir / f"{dispatch_id}.json"
@@ -4256,7 +4658,7 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
             "--worktree-pin-holder",
             holder_id,
             "--capacity-wait-s",
-            "0.12",
+            "0",
             "--",
             sys.executable,
             "-c",
@@ -4278,7 +4680,7 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
                 str(DISPATCH),
                 "drain",
                 "--capacity-wait-s",
-                "0.12",
+                "0",
                 "--json",
             ],
             cwd=str(repo),
@@ -4286,7 +4688,7 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            timeout=60,
             check=False,
         )
 
@@ -4315,7 +4717,11 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
         assert "launch_backoff_until" not in queued
     finally:
         release.touch()
-        proc.wait(timeout=5)
+        proc.wait(timeout=15)
+    held, _holder = goalflight_worktree_pool._probe_worktree_seat_flock(
+        repo, seat
+    )
+    assert held is False
     _write_terminal_seat_record(holder_id, repo, seat)
 
     retried = drain()
@@ -4323,7 +4729,7 @@ def test_pinned_queue_refusal_is_retryable_by_drain_after_holder_exits(
     second_payload = json.loads(retried.stdout)
     assert second_payload["launched"] == 1, second_payload
     assert not queue_path.exists()
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 30
     final_status: dict = {}
     while time.monotonic() < deadline:
         if marker.exists() and marker.read_text(encoding="utf-8") == "ran":

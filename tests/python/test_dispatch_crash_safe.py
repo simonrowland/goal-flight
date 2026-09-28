@@ -297,6 +297,7 @@ def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: st
         proc = subprocess.run(
             [
                 sys.executable, str(DISPATCH), "--unregistered-forced",
+                "--in-place",
                 "--cwd", str(tmp_path),
                 "--agent", "codex",
                 "--dispatch-id", dispatch_id,
