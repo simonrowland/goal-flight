@@ -320,7 +320,7 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
         assert not (seat.parent / "s-2").exists()
 
 
-def test_standalone_acp_worktree_creation_remains_enabled() -> None:
+def _assert_acp_runner_hands_off_admitted_seat(worktree_mode: str) -> None:
     class FakeSeat:
         def __init__(self, root: Path) -> None:
             self.path = root / "standalone-seat"
@@ -339,20 +339,32 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
-        status_json = tmp / "standalone-acp-create.status.json"
+        status_json = tmp / f"acp-admitted-seat-{worktree_mode}.status.json"
         cfg = _acp_cfg(
             tmp,
-            dispatch_id="standalone-acp-create",
+            dispatch_id=f"acp-admitted-seat-{worktree_mode}",
             status_json=status_json,
             capacity_wait_s=0.0,
         )
-        cfg.worktree = "create"
-        cfg.worktree_base = "HEAD"
+        cfg.worktree = worktree_mode
+        cfg.worktree_base = "HEAD" if worktree_mode == "create" else None
+        cfg.in_place = False
         fake_seat = FakeSeat(tmp)
+        seat_fd = fake_seat.fileno()
+        spawn_details: dict[str, object] = {}
         env = _capacity_env(state_dir)
         env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
         env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
         saved = _install_fake_acp_after_capacity()
+        fake_spawn = goalflight_acp_run.spawn_and_handshake_with_retry
+
+        async def capture_spawn(*spawn_args, **spawn_kwargs):
+            spawn_details["cwd"] = spawn_kwargs["cwd"]
+            spawn_details["pass_fds"] = spawn_kwargs["pass_fds"]
+            spawn_details["env"] = spawn_kwargs["env"]
+            return await fake_spawn(*spawn_args, **spawn_kwargs)
+
+        goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
         try:
             with (
                 patch.dict(os.environ, env, clear=True),
@@ -372,7 +384,17 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
         assert payload["state"] == "complete"
         assert central_admit.call_count == 1
         assert payload["worker_cwd"] == str(fake_seat.path)
+        assert spawn_details["cwd"] == str(fake_seat.path)
+        assert seat_fd in spawn_details["pass_fds"]
+        assert spawn_details["env"][goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] == str(
+            seat_fd
+        )
         assert ledger["worker_cwd"] == str(fake_seat.path)
+
+
+def test_acp_runner_hands_off_any_admitted_seat() -> None:
+    for worktree_mode in ("create", "off"):
+        _assert_acp_runner_hands_off_admitted_seat(worktree_mode)
 
 
 def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
@@ -1077,13 +1099,16 @@ def _wait_for_status(path: Path, state: str, *, timeout_s: float = 5.0) -> dict:
 
 
 def _acp_cfg(tmp: Path, *, dispatch_id: str, status_json: Path, capacity_wait_s: float | None) -> SimpleNamespace:
+    project_root = str(_make_repo(tmp))
     return goalflight_acp_run.normalized_acp_dispatch_cfg(
         SimpleNamespace(
             agent="fake-acp",
             model=None,
             install_slot=None,
-            cwd=str(ROOT),
+            project_root=project_root,
+            cwd=project_root,
             worktree="off",
+            in_place=True,
             session_id=None,
             dispatch_id=dispatch_id,
             priority="normal",
@@ -1319,9 +1344,9 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
                     )
                 )
                 assert ledger["state"] == "waiting_capacity", ledger
-                attempt = goalflight_journal.open_or_create_journal(ROOT).attempt_for_dispatch(
-                    "queued-acp"
-                )
+                attempt = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                ).attempt_for_dispatch("queued-acp")
                 assert attempt is not None
                 assert attempt.lifecycle_state not in goalflight_journal.ATTEMPT_FINAL_STATES
                 _release_capacity(state_dir, lease_id)
@@ -1414,7 +1439,7 @@ def test_acp_capacity_acquire_error_keeps_queue_attempt_prepared() -> None:
                     )
                 )
                 attempt = goalflight_journal.open_or_create_journal(
-                    ROOT
+                    Path(cfg.project_root)
                 ).attempt_for_dispatch(dispatch_id)
         finally:
             _restore_fake_acp(saved)

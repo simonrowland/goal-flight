@@ -4673,13 +4673,10 @@ def _lock_path_identity(lock_path: Path) -> os.stat_result | None:
 def _lock_fd_matches_identity(
     fd: int, expected_stat: os.stat_result | None
 ) -> bool:
-    """Require a regular fd to be the exact registered lock inode."""
+    """Require a regular fd to be the exact expected lock inode."""
     if expected_stat is None:
         return False
-    try:
-        opened_stat = os.fstat(fd)
-    except OSError:
-        return False
+    opened_stat = os.fstat(fd)
     return (
         stat.S_ISREG(opened_stat.st_mode)
         and opened_stat.st_dev == expected_stat.st_dev

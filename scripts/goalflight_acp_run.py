@@ -4332,31 +4332,35 @@ async def _run_acp_dispatch_impl(
                 goalflight_dispatch._emit_dispatch_warnings(
                     [occupancy_warning], tail_path=Path(tail) if tail else None,
                 )
-            if worktree_mode in {"create", "shared-read-only"}:
-                if worktree_mode == "create":
-                    if worktree_seat is None:
-                        raise goalflight_worktree_pool.WorktreeSeatError(
-                            "central admission did not return a worktree seat"
-                        )
-                    spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
-                        worktree_seat.fileno()
-                    )
-                    occupancy_fd = os.environ.get(
-                        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
-                    )
-                    if occupancy_fd:
-                        spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
-                    worker_cwd = str(worktree_seat.path)
-                    attach_worktree_to_lease(worktree_seat.path)
-                else:
-                    if read_only_seat_hold is not None:
-                        spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
-                            read_only_seat_hold.fileno()
-                        )
-                        worker_cwd = str(read_only_seat_hold.path)
-                        attach_worktree_to_lease(read_only_seat_hold.path)
-                    else:
-                        worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
+            if worktree_mode == "create" and worktree_seat is None:
+                raise goalflight_worktree_pool.WorktreeSeatError(
+                    "central admission did not return a worktree seat"
+                )
+            if worktree_seat is not None:
+                spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                    worktree_seat.fileno()
+                )
+                occupancy_fd = os.environ.get(
+                    goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                )
+                if occupancy_fd:
+                    spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
+                worker_cwd = str(worktree_seat.path)
+                attach_worktree_to_lease(worktree_seat.path)
+            elif read_only_seat_hold is not None:
+                spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                    read_only_seat_hold.fileno()
+                )
+                worker_cwd = str(read_only_seat_hold.path)
+                attach_worktree_to_lease(read_only_seat_hold.path)
+            elif worktree_mode == "shared-read-only":
+                worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
+
+            if (
+                worktree_seat is not None
+                or read_only_seat_hold is not None
+                or worktree_mode in {"create", "shared-read-only"}
+            ):
                 prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
                 await update_status(
                     state="worktree_created",
@@ -4380,6 +4384,7 @@ async def _run_acp_dispatch_impl(
                     ),
                     worktree_base=(
                         getattr(cfg, "worktree_base", None)
+                        or getattr(cfg, "_worktree_base_commit", None)
                         if worktree_seat is not None
                         else getattr(cfg, "_worktree_base_commit", None)
                     ),
