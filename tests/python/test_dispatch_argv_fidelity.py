@@ -223,6 +223,133 @@ def test_cursor_read_only_acp_is_permanently_refused(
 
 
 @pytest.mark.parametrize(
+    ("agent", "shape_args"),
+    [
+        ("Cursor", ["--shape", "acp"]),
+        (" cursor ", ["--shape", "acp"]),
+        ("Cursor-Agent", ["--shape", "acp"]),
+        ("Cursor-Agent", ["--interactive"]),
+    ],
+    ids=["uppercase", "whitespace", "cursor-agent-alias", "interactive"],
+)
+def test_cursor_acp_alias_read_only_is_permanently_refused_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    agent: str,
+    shape_args: list[str],
+) -> None:
+    later_policy_checks: list[str] = []
+    acp_launches: list[str] = []
+
+    def stop_after_read_only_guard(*_args, **_kwargs):
+        later_policy_checks.append("reached")
+        raise D.DispatchUsageError("test stop after Cursor read-only guard")
+
+    monkeypatch.setattr(D, "_refuse_launch_model_policy", stop_after_read_only_guard)
+    monkeypatch.setattr(
+        D,
+        "_run_acp_shape",
+        lambda args, **_kwargs: acp_launches.append(args.agent),
+    )
+    dispatch_id = "cursor-acp-alias-refused"
+    code = D.main(
+        [
+            "--agent", agent, *shape_args, "--read-only", "--dispatch-id",
+            dispatch_id, "--prompt", "read only",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == dispatch_id
+    assert payload["permanent"] is True
+    assert payload["state"] == "refused"
+    assert "ACP" in payload["reason"]
+    assert later_policy_checks == []
+    assert acp_launches == []
+
+
+@pytest.mark.parametrize("agent", ["Cursor", " cursor ", "Cursor-Agent"])
+def test_cursor_acp_alias_respects_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    agent: str,
+) -> None:
+    later_launch_steps: list[str] = []
+    monkeypatch.setattr(D, "_cursor_acp_enabled", lambda: False)
+    monkeypatch.setattr(D, "_refuse_launch_model_policy", lambda *_args: None)
+
+    def stop_if_kill_switch_is_missed(_args):
+        later_launch_steps.append("engine session")
+        raise AssertionError("Cursor ACP kill switch did not stop launch")
+
+    monkeypatch.setattr(
+        D, "_ensure_assigned_engine_session", stop_if_kill_switch_is_missed
+    )
+    code = D.main(
+        [
+            "--agent", agent, "--shape", "acp", "--dispatch-id",
+            "cursor-acp-kill-switch", "--prompt", "read only",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 64
+    assert "cursor over acp is blocked pending a fix" in captured.err
+    assert later_launch_steps == []
+
+
+def test_read_only_worker_label_refuses_raw_cursor_executable() -> None:
+    args = _cursor_worker_args(read_only=True)
+    args.agent = "worker"
+    raw = ["cursor-agent", "-p", "--force", "--trust", "write a marker"]
+
+    with pytest.raises(D.DispatchUsageError, match="raw cursor argv is not allowed"):
+        D.build_worker(args, None, raw)
+
+
+def test_read_only_worker_label_cursor_refusal_is_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    later_policy_checks: list[str] = []
+
+    def stop_after_cursor_guard(*_args, **_kwargs):
+        later_policy_checks.append("reached")
+        raise D.DispatchUsageError("test stop after raw Cursor guard")
+
+    monkeypatch.setattr(D, "_refuse_launch_model_policy", stop_after_cursor_guard)
+    dispatch_id = "worker-raw-cursor-refused"
+    code = D.main(
+        [
+            "--agent", "worker", "--read-only", "--dispatch-id", dispatch_id,
+            "--prompt", "read only", "--", "cursor-agent", "-p", "--force",
+            "--trust", "write a marker",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == dispatch_id
+    assert payload["permanent"] is True
+    assert payload["state"] == "refused"
+    assert payload["reason"] == (
+        "raw cursor argv is not allowed for read-only; use the preset"
+    )
+    assert later_policy_checks == []
+
+
+@pytest.mark.parametrize(
     "failure", ["missing-binary", "nonzero", "timeout", "oserror", "file-not-found"]
 )
 def test_cursor_read_only_refuses_when_help_probe_fails(
@@ -349,11 +476,46 @@ def test_cursor_read_only_probe_failure_emits_retryable_refusal(
     assert len(calls) == 2
 
 
-def test_cursor_read_only_missing_mode_choice_is_permanent(
+@pytest.mark.parametrize(
+    ("dispatch_id", "help_text", "expected_reason"),
+    [
+        (
+            "cursor-missing-mode",
+            CURSOR_HELP_FIXTURE.replace(
+                'choices: "plan", "ask"', 'choices: "edit"'
+            ),
+            "must advertise --mode ask or --mode plan",
+        ),
+        (
+            "cursor-disabled-sandbox",
+            CURSOR_HELP_FIXTURE.replace(
+                '"enabled",\n                               "disabled")', '"disabled")'
+            ),
+            "--sandbox enabled",
+        ),
+    ],
+    ids=["no-supported-mode", "sandbox-disabled-only"],
+)
+def test_cursor_read_only_refuses_without_required_help_choice(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    dispatch_id: str,
+    help_text: str,
+    expected_reason: str,
 ) -> None:
     D._probe_cursor_read_only_mode.cache_clear()
+    for name, path in {
+        "GOALFLIGHT_STATE_DIR": tmp_path / "state",
+        "GOALFLIGHT_DISPATCH_DIR": tmp_path / "dispatch",
+        "GOALFLIGHT_JOURNAL_DIR": tmp_path / "journal",
+        "GOALFLIGHT_WAKE_LEDGER": tmp_path / "wake-ledger.jsonl",
+        "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
+        "GOALFLIGHT_TASK_STORE": tmp_path / "task-store",
+        "GOALFLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
+    }.items():
+        monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     real_run = subprocess.run
     real_which = shutil.which
     binary = sys.executable
@@ -367,33 +529,45 @@ def test_cursor_read_only_missing_mode_choice_is_permanent(
     def fake_help(argv, *args, **kwargs):
         if argv == [binary, "--help"]:
             calls.append(argv)
-            help_text = CURSOR_HELP_FIXTURE.replace(
-                'choices: "plan", "ask"', 'choices: "edit"'
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=help_text, stderr=""
             )
-            return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(D.subprocess, "run", fake_help)
+    original_build_worker = D.build_worker
+    built_argv: list[list[str]] = []
+
+    def stop_if_read_only_check_accepts_unsafe_help(args, prompt_path, raw_argv):
+        worker_argv, _stdin_path = original_build_worker(args, prompt_path, raw_argv)
+        built_argv.append(worker_argv)
+        raise D.DispatchUsageError("test stop after unsafe Cursor argv construction")
+
+    monkeypatch.setattr(D, "build_worker", stop_if_read_only_check_accepts_unsafe_help)
     code = D.main(
         [
             "--agent", "cursor", "--read-only", "--dispatch-id",
-            "cursor-missing-mode", "--model", "grok-4.7-high",
+            dispatch_id, "--model", "grok-4.7-high",
             "--unregistered-forced", "--in-place", "--prompt", "read only",
         ]
     )
+
     captured = capsys.readouterr()
     assert code == 64
     refusal = next(
-        line for line in captured.out.splitlines()
-        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+        (
+            line for line in captured.out.splitlines()
+            if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+        ),
+        None,
     )
+    assert refusal is not None, f"stdout={captured.out!r}; stderr={captured.err!r}"
     payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
-    assert payload["dispatch_id"] == "cursor-missing-mode"
+    assert payload["dispatch_id"] == dispatch_id
     assert payload["permanent"] is True
     assert payload["state"] == "refused"
-    assert "must advertise --mode ask or --mode plan" in payload["reason"]
-    with pytest.raises(D.DispatchUsageError):
-        D._cursor_read_only_mode()
+    assert expected_reason in payload["reason"]
+    assert built_argv == []
     assert len(calls) == 1
 
 

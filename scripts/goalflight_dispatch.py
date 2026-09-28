@@ -22168,8 +22168,8 @@ def _temporary_env(updates: dict[str, str], *, remove: list[str] | None = None):
                 os.environ[key] = value
 
 
-def _normalize_acp_agent(args) -> None:
-    agent = str(args.agent or "").strip().lower()
+def _normalized_acp_agent_name(agent: object) -> str:
+    normalized = str(agent or "").strip().lower()
     aliases = {
         "worker": "codex-acp",
         "codex": "codex-acp",
@@ -22181,11 +22181,23 @@ def _normalize_acp_agent(args) -> None:
         "claude-acp": "claude",
         "claude-code-cli-acp": "claude",
     }
-    args.agent = aliases.get(agent, agent)
+    return aliases.get(normalized, normalized)
+
+
+def _is_cursor_agent(args, *, shape: str | None = None) -> bool:
+    resolved_shape = shape or getattr(args, "shape", "bash") or "bash"
+    agent = getattr(args, "agent", "")
+    if resolved_shape == "acp":
+        agent = _normalized_acp_agent_name(agent)
+    return str(agent or "") in CURSOR_AGENTS
+
+
+def _normalize_acp_agent(args) -> None:
+    args.agent = _normalized_acp_agent_name(args.agent)
     if args.agent not in {"codex-acp", "grok-acp", "cursor", "claude"}:
         raise ProvenPreWorkerRefusal(
             "--shape acp v1 supports --agent codex-acp, grok-acp, cursor, or "
-            f"claude-acp; got {agent!r}"
+            f"claude-acp; got {args.agent!r}"
         )
 
 
@@ -23312,15 +23324,19 @@ def _cursor_read_only_mode() -> str:
 def _validate_cursor_read_only_launch(
     args, raw_argv: list[str] | None, *, shape: str | None = None
 ) -> None:
-    if str(getattr(args, "agent", "") or "") not in CURSOR_AGENTS:
-        return
     if not _effective_read_only(args):
+        return
+    resolved_shape = shape or getattr(args, "shape", "bash") or "bash"
+    if raw_argv and _command_executable(raw_argv) in CURSOR_AGENTS:
+        raise DispatchUsageError(
+            "raw cursor argv is not allowed for read-only; use the preset"
+        )
+    if not _is_cursor_agent(args, shape=resolved_shape):
         return
     if raw_argv:
         raise DispatchUsageError(
             "raw cursor argv is not allowed for read-only; use the preset"
         )
-    resolved_shape = shape or getattr(args, "shape", "bash") or "bash"
     if resolved_shape == "acp":
         raise DispatchUsageError(
             "cursor --read-only refused on ACP: no enforced Cursor read-only mode is applied"
@@ -24071,7 +24087,11 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     except DispatchUsageError as exc:
         print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
-    if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
+    if (
+        _is_cursor_agent(args, shape=shape)
+        and shape == "acp"
+        and not _cursor_acp_enabled()
+    ):
         print(
             "goalflight_dispatch: cursor over acp is blocked pending a fix; use the "
             "bash shape, which is now the default for cursor. Measured 2026-08-24: "
@@ -24882,7 +24902,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         except DispatchUsageError as e:
             if isinstance(e, _TransientCursorReadOnlyProbeError):
                 _emit_transient_dispatch_refusal(args.dispatch_id, e)
-            elif args.agent in CURSOR_AGENTS and _effective_read_only(args):
+            elif _is_cursor_agent(args, shape=shape) and _effective_read_only(args):
                 _emit_permanent_dispatch_refusal(args.dispatch_id, e)
             print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
             return 64
