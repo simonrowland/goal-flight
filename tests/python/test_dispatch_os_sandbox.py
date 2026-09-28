@@ -25,7 +25,6 @@ import goalflight_dispatch as d  # noqa: E402
 import goalflight_os_sandbox as sandbox  # noqa: E402
 
 _CURSOR_REFUSED_SANDBOX_FLAGS = (
-    "--sandbox",
     "--os-sandbox",
     "--no-sandbox",
     "--disable-sandbox",
@@ -198,7 +197,9 @@ def _cursor_agent_tail(argv: list[str]) -> list[str]:
 
 def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
     """Preset read-only uses Cursor flags; explicit OS profiles still use the runner."""
-    with _force_darwin_sandbox_exec():
+    with mock.patch.object(
+        d, "_cursor_read_only_mode", return_value="ask"
+    ), _force_darwin_sandbox_exec():
         for agent, model in (
             ("cursor", None),
             ("cursor", "kimi-k3-high"),
@@ -221,6 +222,9 @@ def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
             for flag in _CURSOR_REFUSED_SANDBOX_FLAGS:
                 assert flag not in tail, (agent, model, flag, tail)
             assert not any("dangerously" in part for part in tail), (agent, model, tail)
+            assert tail[tail.index("--mode") + 1] == "ask", tail
+            assert tail[tail.index("--sandbox") + 1] == "enabled", tail
+            assert not {"--force", "-f", "--yolo"}.intersection(tail), tail
             if model:
                 assert tail[tail.index("--model") + 1] == model, (agent, model, tail)
             assert stdin_path == "/tmp/p.md", stdin_path
@@ -241,12 +245,11 @@ def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
         assert off_argv[0] == "cursor-agent", off_argv
         assert "sandbox-exec" not in off_argv[0], off_argv
 
-        with mock.patch.object(d, "_cursor_read_only_mode", return_value="ask"):
-            read_only_alias, _ = d.build_worker(
-                _args(agent="cursor", read_only=True, os_sandbox=None, cwd=str(REPO_ROOT)),
-                "/tmp/p.md",
-                [],
-            )
+        read_only_alias, _ = d.build_worker(
+            _args(agent="cursor", read_only=True, os_sandbox=None, cwd=str(REPO_ROOT)),
+            "/tmp/p.md",
+            [],
+        )
         assert Path(read_only_alias[0]).name == "sandbox-exec", read_only_alias
         read_only_tail = _cursor_agent_tail(read_only_alias)
         assert read_only_tail[read_only_tail.index("--mode") + 1] == "ask", read_only_alias
@@ -257,27 +260,35 @@ def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
         )
 
         raw = ["cursor-agent", "-p", "--force", "--trust", "--output-format", "text"]
-        raw_wrapped, raw_stdin = d.build_worker(
-            _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT)),
-            "/tmp/p.md",
-            raw,
-        )
-        assert Path(raw_wrapped[0]).name == "sandbox-exec", raw_wrapped
-        assert raw_stdin is None, raw_stdin
-        assert "--sandbox" not in _cursor_agent_tail(raw_wrapped), raw_wrapped
+        try:
+            d.build_worker(
+                _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT)),
+                "/tmp/p.md",
+                raw,
+            )
+        except d.DispatchUsageError as exc:
+            assert str(exc) == (
+                "raw cursor argv is not allowed for read-only; use the preset"
+            ), exc
+        else:
+            raise AssertionError("raw Cursor argv must be refused for effective read-only")
 
 
 def case_cursor_read_only_argv_stays_unwrapped_off_darwin() -> None:
-    """Linux/other hosts keep documented off-only behavior; no invented CLI flag."""
+    """Native Cursor read-only flags stay distinct from host OS sandbox support."""
     if sandbox.os_sandbox_platform_key() == "darwin":
         return
-    argv, _ = d.build_worker(
-        _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT), model="kimi-k3-high"),
-        "/tmp/p.md",
-        [],
-    )
+    with mock.patch.object(d, "_cursor_read_only_mode", return_value="ask"):
+        argv, _ = d.build_worker(
+            _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT), model="kimi-k3-high"),
+            "/tmp/p.md",
+            [],
+        )
     assert argv[0] == "cursor-agent", argv
     assert Path(argv[0]).name != "sandbox-exec", argv
+    assert argv[argv.index("--mode") + 1] == "ask", argv
+    assert argv[argv.index("--sandbox") + 1] == "enabled", argv
+    assert not {"--force", "-f", "--yolo"}.intersection(argv), argv
     for flag in _CURSOR_REFUSED_SANDBOX_FLAGS:
         assert flag not in argv, (flag, argv)
     assert argv[argv.index("--model") + 1] == "kimi-k3-high", argv

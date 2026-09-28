@@ -154,33 +154,25 @@ def test_cursor_writer_argv_keeps_justified_force_flag() -> None:
     assert stdin_path == "/tmp/prompt.md"
 
 
-@pytest.mark.parametrize("force_flag", ["--force", "-f", "--yolo"])
-def test_cursor_read_only_raw_argv_refuses_force_aliases(force_flag: str) -> None:
-    raw = ["cursor-agent", "-p", force_flag, "--mode", "ask", "--sandbox", "enabled"]
-    with pytest.raises(D.DispatchUsageError, match="raw argv refused.*forbidden"):
-        D.build_worker(_cursor_worker_args(read_only=True), None, raw)
-
-
 @pytest.mark.parametrize(
     "raw",
     [
-        ["cursor-agent", "-p", "--sandbox", "enabled"],
-        ["cursor-agent", "-p", "--mode", "ask"],
-        ["cursor-agent", "-p", "--mode", "edit", "--sandbox", "enabled"],
-        ["cursor-agent", "-p", "--mode", "ask", "--sandbox", "disabled"],
+        ["cursor-agent", "-p", "--mode", "plan", "--sandbox", "enabled"],
+        [
+            "/bin/sh",
+            "-c",
+            "cursor-agent -p --force --trust",
+            "--mode",
+            "ask",
+            "--sandbox",
+            "enabled",
+        ],
     ],
-    ids=["missing-mode", "missing-sandbox", "unsafe-mode", "disabled-sandbox"],
+    ids=["native-flags", "shell-wrapped-bypass"],
 )
-def test_cursor_read_only_raw_argv_refuses_without_required_posture(raw: list[str]) -> None:
-    with pytest.raises(D.DispatchUsageError, match="raw argv refused"):
+def test_cursor_read_only_raw_argv_is_always_refused(raw: list[str]) -> None:
+    with pytest.raises(D.DispatchUsageError, match="raw cursor argv is not allowed"):
         D.build_worker(_cursor_worker_args(read_only=True), None, raw)
-
-
-def test_cursor_read_only_raw_argv_with_enforced_flags_is_preserved() -> None:
-    raw = ["cursor-agent", "-p", "--mode=plan", "--sandbox=enabled", "--trust"]
-    argv, stdin_path = D.build_worker(_cursor_worker_args(read_only=True), None, raw)
-    assert argv == raw
-    assert stdin_path is None
 
 
 def test_cursor_read_only_raw_refusal_is_permanent_and_exits_64(
@@ -189,7 +181,8 @@ def test_cursor_read_only_raw_refusal_is_permanent_and_exits_64(
     code = D.main(
         [
             "--agent", "cursor", "--read-only", "--dispatch-id", "cursor-raw-refused",
-            "--prompt", "read only", "--", "cursor-agent", "-p", "--force", "--trust",
+            "--prompt", "read only", "--", "/bin/sh", "-c",
+            "cursor-agent -p --force --trust", "--mode", "ask", "--sandbox", "enabled",
         ]
     )
     captured = capsys.readouterr()
@@ -202,7 +195,9 @@ def test_cursor_read_only_raw_refusal_is_permanent_and_exits_64(
     assert payload["dispatch_id"] == "cursor-raw-refused"
     assert payload["permanent"] is True
     assert payload["state"] == "refused"
-    assert "--force/-f/--yolo" in payload["reason"]
+    assert payload["reason"] == (
+        "raw cursor argv is not allowed for read-only; use the preset"
+    )
 
 
 def test_cursor_read_only_acp_is_permanently_refused(
@@ -227,7 +222,9 @@ def test_cursor_read_only_acp_is_permanently_refused(
     assert "ACP" in payload["reason"]
 
 
-@pytest.mark.parametrize("failure", ["missing-binary", "nonzero", "timeout"])
+@pytest.mark.parametrize(
+    "failure", ["missing-binary", "nonzero", "timeout", "oserror", "file-not-found"]
+)
 def test_cursor_read_only_refuses_when_help_probe_fails(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -243,20 +240,42 @@ def test_cursor_read_only_refuses_when_help_probe_fails(
             assert kwargs["timeout"] == 3
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if failure == "oserror":
+                raise OSError("probe failed")
+            if failure == "file-not-found":
+                raise FileNotFoundError("cursor-agent disappeared")
             return subprocess.CompletedProcess(argv, 2, stdout="", stderr="failed")
 
         monkeypatch.setattr(D.subprocess, "run", fake_help)
 
-    with pytest.raises(D.DispatchUsageError, match="cursor --read-only refused"):
+    with pytest.raises(D.DispatchUsageError, match="cursor --read-only"):
         D.build_worker(_cursor_worker_args(read_only=True), "/tmp/prompt.md", [])
     assert len(calls) == (0 if failure == "missing-binary" else 1)
+    if failure in {"missing-binary", "timeout", "oserror", "file-not-found"}:
+        with pytest.raises(D.DispatchUsageError):
+            D.build_worker(_cursor_worker_args(read_only=True), "/tmp/prompt.md", [])
+        assert len(calls) == (0 if failure == "missing-binary" else 2)
+        assert D._probe_cursor_read_only_mode.cache_info().currsize == 0
+    else:
+        with pytest.raises(D.DispatchUsageError):
+            D.build_worker(_cursor_worker_args(read_only=True), "/tmp/prompt.md", [])
+        assert len(calls) == 1
+        assert D._probe_cursor_read_only_mode.cache_info().currsize == 1
 
 
-def test_cursor_read_only_help_probe_result_is_cached_per_binary(
+def test_cursor_read_only_help_probe_cache_tracks_binary_mtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     D._probe_cursor_read_only_mode.cache_clear()
-    monkeypatch.setattr(D.shutil, "which", lambda _name: sys.executable)
+    monkeypatch.setattr(D.shutil, "which", lambda _name: "/fake/cursor-agent")
+    mtime_ns = [100]
+
+    class _FakeStat:
+        @property
+        def st_mtime_ns(self) -> int:
+            return mtime_ns[0]
+
+    monkeypatch.setattr(D.Path, "stat", lambda _path: _FakeStat())
     calls: list[list[str]] = []
 
     def fake_help(argv, **kwargs):
@@ -267,6 +286,114 @@ def test_cursor_read_only_help_probe_result_is_cached_per_binary(
     monkeypatch.setattr(D.subprocess, "run", fake_help)
     assert D._cursor_read_only_mode() in {"ask", "plan"}
     assert D._cursor_read_only_mode() in {"ask", "plan"}
+    assert len(calls) == 1
+    mtime_ns[0] = 101
+    assert D._cursor_read_only_mode() in {"ask", "plan"}
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure", ["timeout", "oserror", "file-not-found"])
+def test_cursor_read_only_probe_failure_emits_retryable_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
+    real_run = subprocess.run
+    real_which = shutil.which
+    binary = sys.executable
+    monkeypatch.setattr(
+        D.shutil,
+        "which",
+        lambda name: binary if name == "cursor-agent" else real_which(name),
+    )
+    calls: list[list[str]] = []
+
+    def fake_help(argv, *args, **kwargs):
+        if argv == [binary, "--help"]:
+            calls.append(argv)
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if failure == "file-not-found":
+                raise FileNotFoundError("cursor-agent disappeared")
+            raise OSError("cursor-agent could not be executed")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, "run", fake_help)
+    code = D.main(
+        [
+            "--agent", "cursor", "--read-only", "--dispatch-id",
+            f"cursor-probe-{failure}", "--model", "grok-4.7-high",
+            "--unregistered-forced", "--in-place", "--prompt", "read only",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == f"cursor-probe-{failure}"
+    assert payload["permanent"] is False
+    assert payload["state"] == "refused"
+    assert "cursor --read-only transient:" in payload["reason"]
+    attempt = subprocess.CompletedProcess(
+        ["goalflight_dispatch.py"], code, stdout=captured.out, stderr=captured.err
+    )
+    assert D._classify_local_pre_spawn_attempt(attempt) == (
+        D.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    )
+    with pytest.raises(D.DispatchUsageError):
+        D._cursor_read_only_mode()
+    assert len(calls) == 2
+
+
+def test_cursor_read_only_missing_mode_choice_is_permanent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
+    real_run = subprocess.run
+    real_which = shutil.which
+    binary = sys.executable
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        D.shutil,
+        "which",
+        lambda name: binary if name == "cursor-agent" else real_which(name),
+    )
+
+    def fake_help(argv, *args, **kwargs):
+        if argv == [binary, "--help"]:
+            calls.append(argv)
+            help_text = CURSOR_HELP_FIXTURE.replace(
+                'choices: "plan", "ask"', 'choices: "edit"'
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, "run", fake_help)
+    code = D.main(
+        [
+            "--agent", "cursor", "--read-only", "--dispatch-id",
+            "cursor-missing-mode", "--model", "grok-4.7-high",
+            "--unregistered-forced", "--in-place", "--prompt", "read only",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == "cursor-missing-mode"
+    assert payload["permanent"] is True
+    assert payload["state"] == "refused"
+    assert "must advertise --mode ask or --mode plan" in payload["reason"]
+    with pytest.raises(D.DispatchUsageError):
+        D._cursor_read_only_mode()
     assert len(calls) == 1
 
 

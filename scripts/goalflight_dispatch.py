@@ -11270,9 +11270,18 @@ PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
 def _permanent_dispatch_refusal_line(
     dispatch_id: str | None, error: BaseException | str
 ) -> str:
+    return _dispatch_refusal_line(dispatch_id, error, permanent=True)
+
+
+def _dispatch_refusal_line(
+    dispatch_id: str | None,
+    error: BaseException | str,
+    *,
+    permanent: bool,
+) -> str:
     payload = {
         "dispatch_id": dispatch_id,
-        "permanent": True,
+        "permanent": permanent,
         "reason": str(error),
         "state": "refused",
     }
@@ -11283,6 +11292,16 @@ def _emit_permanent_dispatch_refusal(
     dispatch_id: str | None, error: BaseException | str
 ) -> None:
     print(_permanent_dispatch_refusal_line(dispatch_id, error), end="", flush=True)
+
+
+def _emit_transient_dispatch_refusal(
+    dispatch_id: str | None, error: BaseException | str
+) -> None:
+    print(
+        _dispatch_refusal_line(dispatch_id, error, permanent=False),
+        end="",
+        flush=True,
+    )
 
 
 def _emit_proven_pre_worker_refusal(error: ProvenPreWorkerRefusal) -> None:
@@ -11391,6 +11410,8 @@ def _proven_transient_local_pre_spawn(proc: subprocess.CompletedProcess) -> bool
     Absence of DISPATCH-PRE-WORKER-REFUSED is not proof of transience.
     """
     blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    if "cursor --read-only transient:" in blob:
+        return True
     if "wait for a worktree" in blob or "wait for a seat" in blob:
         return True
     if "label in use" in blob:
@@ -23208,13 +23229,19 @@ def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
     return [prepared.command, *prepared.args]
 
 
+class _TransientCursorReadOnlyProbeError(DispatchUsageError):
+    """The CLI probe could not establish whether Cursor supports read-only."""
+
+
 @functools.lru_cache(maxsize=8)
 def _probe_cursor_read_only_mode(
     binary: str | None, mtime_ns: int | None
 ) -> tuple[str | None, str | None]:
     """Cache each Cursor help probe by binary path and modification time."""
     if binary is None:
-        return None, "cursor-agent was not found on PATH"
+        raise _TransientCursorReadOnlyProbeError(
+            "cursor --read-only transient: cursor-agent was not found on PATH"
+        )
     try:
         help_result = subprocess.run(
             [binary, "--help"],
@@ -23224,7 +23251,10 @@ def _probe_cursor_read_only_mode(
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return None, f"could not verify cursor-agent --help ({type(exc).__name__}: {exc})"
+        raise _TransientCursorReadOnlyProbeError(
+            "cursor --read-only transient: could not verify cursor-agent --help "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
 
     if help_result.returncode != 0:
         return None, f"cursor-agent --help exited {help_result.returncode}"
@@ -23279,52 +23309,22 @@ def _cursor_read_only_mode() -> str:
     return mode
 
 
-def _cursor_option_values(argv: list[str], option: str) -> list[str | None]:
-    values: list[str | None] = []
-    for index, value in enumerate(argv):
-        if value == option:
-            values.append(argv[index + 1] if index + 1 < len(argv) else None)
-        elif value.startswith(option + "="):
-            values.append(value[len(option) + 1 :])
-    return values
-
-
-def _validate_raw_cursor_read_only_argv(argv: list[str]) -> None:
-    if any(
-        value in {"--force", "-f", "--yolo"}
-        or value.startswith("--force=")
-        or value.startswith("--yolo=")
-        for value in argv
-    ):
-        raise DispatchUsageError(
-            "cursor --read-only raw argv refused: --force/-f/--yolo is forbidden"
-        )
-    modes = _cursor_option_values(argv, "--mode")
-    sandboxes = _cursor_option_values(argv, "--sandbox")
-    if len(modes) != 1 or modes[0] not in {"ask", "plan"}:
-        raise DispatchUsageError(
-            "cursor --read-only raw argv refused: specify exactly one --mode ask or --mode plan"
-        )
-    if len(sandboxes) != 1 or sandboxes[0] != "enabled":
-        raise DispatchUsageError(
-            "cursor --read-only raw argv refused: specify exactly one --sandbox enabled"
-        )
-
-
 def _validate_cursor_read_only_launch(
     args, raw_argv: list[str] | None, *, shape: str | None = None
 ) -> None:
     if str(getattr(args, "agent", "") or "") not in CURSOR_AGENTS:
         return
-    if not getattr(args, "read_only", False):
+    if not _effective_read_only(args):
         return
+    if raw_argv:
+        raise DispatchUsageError(
+            "raw cursor argv is not allowed for read-only; use the preset"
+        )
     resolved_shape = shape or getattr(args, "shape", "bash") or "bash"
     if resolved_shape == "acp":
         raise DispatchUsageError(
             "cursor --read-only refused on ACP: no enforced Cursor read-only mode is applied"
         )
-    if raw_argv:
-        _validate_raw_cursor_read_only_argv(raw_argv)
 
 
 def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
@@ -23400,12 +23400,6 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # Raw `--` still honours --os-sandbox for cursor: the flag is a
         # dispatch-level claim, not a preset-only wrap.
         if str(getattr(args, "agent", "") or "") in CURSOR_AGENTS:
-            if getattr(args, "read_only", False) and not getattr(
-                args, "os_sandbox", None
-            ):
-                # The raw command already supplied and passed validation for
-                # Cursor's native read-only flags; preserve its argv verbatim.
-                return raw_argv, None
             return _wrap_cursor_os_sandbox(list(raw_argv), args), None
         return raw_argv, None  # raw escape hatch; stdin = DEVNULL
     # codex's own --sandbox value for the effective OS sandbox profile.
@@ -23554,7 +23548,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         if not prompt_path:
             raise DispatchUsageError("cursor resume/launch requires a prompt file")
         argv = ["cursor-agent", "-p"]
-        if getattr(args, "read_only", False):
+        if _effective_read_only(args):
             argv.extend(
                 ["--mode", _cursor_read_only_mode(), "--sandbox", "enabled"]
             )
@@ -24886,7 +24880,9 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         try:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)
         except DispatchUsageError as e:
-            if args.agent in CURSOR_AGENTS and getattr(args, "read_only", False):
+            if isinstance(e, _TransientCursorReadOnlyProbeError):
+                _emit_transient_dispatch_refusal(args.dispatch_id, e)
+            elif args.agent in CURSOR_AGENTS and _effective_read_only(args):
                 _emit_permanent_dispatch_refusal(args.dispatch_id, e)
             print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
             return 64
