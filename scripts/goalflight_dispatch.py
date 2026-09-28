@@ -2872,21 +2872,61 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             ),
         )
         if kind == "ring-seat":
+            try:
+                inherited_fd = int(
+                    os.environ[
+                        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV
+                    ].strip()
+                )
+                managed_root = (
+                    Path(str(args.worktree_root)).expanduser()
+                    if getattr(args, "worktree_root", None)
+                    else goalflight_worktree_pool.repository_worktree_root(
+                        project_root
+                    )
+                )
+                lock_path = goalflight_worktree_pool._candidate_lock_path(
+                    project_root,
+                    cwd,
+                    managed_root=managed_root,
+                )
+                registered_identity = (
+                    goalflight_worktree_pool._registered_lock_identity(
+                        lock_path,
+                        registry_root=goalflight_worktree_pool._git_common_dir(
+                            project_root
+                        ),
+                    )
+                )
+                fd_matches_seat = (
+                    goalflight_worktree_pool._lock_fd_matches_identity(
+                        inherited_fd, registered_identity
+                    )
+                )
+            except (OSError, ValueError, goalflight_worktree_pool.WorktreeSeatError) as exc:
+                _raise_worktree_admission_refusal(
+                    args,
+                    "cannot verify that the inherited worktree lock fd owns "
+                    f"effective seat {cwd}: {exc}",
+                )
+            if not fd_matches_seat:
+                _raise_worktree_admission_refusal(
+                    args,
+                    "inherited worktree lock fd does not lock the effective "
+                    f"seat {cwd}; refusing to use an unowned seat",
+                )
             return None
-        if not _effective_read_only(args):
-            if cwd.resolve(strict=False) == project_root.resolve(strict=False):
-                message = (
-                    "writer dispatch has an inherited worktree lock fd but its "
-                    f"effective cwd is the project root {project_root}; pass "
-                    "--in-place explicitly to run there"
-                )
-            else:
-                message = (
-                    "inherited worktree lock fd is only valid when the effective "
-                    "cwd is a managed worktree seat of this project; got "
-                    f"{cwd}"
-                )
-            _raise_worktree_admission_refusal(args, message)
+        cwd_label = (
+            f"project root {project_root}"
+            if cwd.resolve(strict=False) == project_root.resolve(strict=False)
+            else str(cwd)
+        )
+        _raise_worktree_admission_refusal(
+            args,
+            "inherited worktree lock fd is only valid with its matching "
+            "managed worktree seat; got "
+            f"{cwd_label}",
+        )
     if (
         getattr(args, "parent_dispatch_id", None)
         and _occupancy_exempt_read_only(args)
@@ -3336,7 +3376,7 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 pass
         else:
             args._worktree_capacity_deadline = previous_deadline
-    args._worktree_capacity_lease_active = previous_lease_active
+        args._worktree_capacity_lease_active = previous_lease_active
     try:
         if (
             not _effective_read_only(args)
@@ -3346,15 +3386,33 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 project_root = _project_root(args).resolve(strict=False)
             except goalflight_task.TaskError:
                 project_root = None
-            if (
-                project_root is not None
-                and _worker_cwd(args).resolve(strict=False) == project_root
-            ):
-                _raise_worktree_admission_refusal(
-                    args,
-                    "writer dispatch resolved to the project root "
-                    f"{project_root} without explicit --in-place",
+            if project_root is not None:
+                worker_cwd = _worker_cwd(args).resolve(strict=False)
+                inside_project = (
+                    worker_cwd == project_root
+                    or project_root in worker_cwd.parents
                 )
+                if inside_project:
+                    seat_kind = goalflight_worktree_pool.classify_dispatch_cwd(
+                        worker_cwd,
+                        project_root=project_root,
+                        controller_label=_controller_ring_label(
+                            args, project_root
+                        ),
+                        managed_root=(
+                            Path(str(args.worktree_root)).expanduser()
+                            if getattr(args, "worktree_root", None)
+                            else None
+                        ),
+                    )
+                    if seat_kind != "ring-seat":
+                        _raise_worktree_admission_refusal(
+                            args,
+                            "writer dispatch resolved inside the project "
+                            f"checkout rooted at project root {project_root} "
+                            f"at {worker_cwd} without "
+                            "explicit --in-place",
+                        )
         warning = getattr(args, "_worktree_occupancy_warning", None)
         checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
         current_path = str(Path(str(_worker_cwd(args))).resolve(strict=False))
@@ -22973,7 +23031,6 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         )
         _emit_permanent_dispatch_refusal(cfg.dispatch_id, reason)
         print(f"goalflight_dispatch: {reason}", file=sys.stderr, flush=True)
-        status_json.unlink(missing_ok=True)
         return 64
     if getattr(cfg, "_worktree_seat_refused", False):
         print(f"goalflight_dispatch: {payload.get('error')}", file=sys.stderr)

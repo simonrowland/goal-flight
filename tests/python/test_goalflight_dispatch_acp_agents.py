@@ -164,7 +164,7 @@ def test_macos_codex_acp_read_only_in_place_uses_project_root() -> None:
                 args, status_json=tmp / "codex-ro-in-place.json"
             )
         assert cfg.worktree == "off"
-        assert cfg.cwd == str(tmp)
+        assert Path(cfg.cwd).resolve() == tmp.resolve()
 
 
 def test_read_only_acp_resume_rejects_rebound_checkout_before_spawn() -> None:
@@ -378,15 +378,19 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
 def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        seat = tmp / "worktrees" / "controller" / "s-1"
-        seat.mkdir(parents=True)
-        lock = (tmp / "s-1.lock").open("w+")
-        lock_fd = lock.fileno()
+        repo = _make_repo(tmp)
+        parent_lease = goalflight_worktree_pool.acquire_worktree_seat(
+            repo,
+            "detached-acp-seat",
+            controller_label="controller",
+        )
+        seat = parent_lease.path
+        lock_fd = parent_lease.fileno()
         released = False
 
         def release() -> None:
             nonlocal released
-            lock.close()
+            parent_lease.release()
             released = True
 
         lease = SimpleNamespace(path=seat, fileno=lambda: lock_fd, release=release)
@@ -405,6 +409,7 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
             agent="fake-acp",
             background_default_notice=False,
             cwd=str(seat),
+            project_root=str(repo),
             dispatch_id="detached-acp-seat",
             queue_launch_token=None,
             unregistered_forced=True,
@@ -420,10 +425,12 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
                 kwargs["env"]
             )
             child_args = _base_acp_args(
-                seat,
+                repo,
                 agent="fake-acp",
                 dispatch_id="detached-acp-seat-child",
             )
+            child_args.cwd = str(seat)
+            child_args.project_root = str(repo)
             child_args.worktree = "HEAD"
             child_args._worktree_seat = None
             child_args.unregistered_forced = True
@@ -465,6 +472,8 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
                 )
         finally:
             _restore_fake_acp(saved)
+            if not released:
+                lease.release()
 
         child_argv = captured["argv"]
         assert rc == 0
@@ -1247,6 +1256,7 @@ def test_acp_occupancy_override_reaches_admission_and_warns() -> None:
                         args = _base_acp_args(tmp, agent="fake-acp", dispatch_id=dispatch_id)
                         args.unregistered_forced = True
                         args.occupied_worktree_forced = forced
+                        args.in_place = True
                         args.tail = str(tmp / f"{dispatch_id}.tail")
                         cfg = dispatch_mod._build_acp_cfg(
                             args, status_json=tmp / f"{dispatch_id}.json", base=tmp,

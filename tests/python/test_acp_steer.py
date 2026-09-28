@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from support import skip_posix_on_native_windows
+from support import make_test_git_repo, skip_posix_on_native_windows
 
 skip_posix_on_native_windows("uses POSIX subprocess liveness for ACP fake worker")
 
@@ -125,9 +125,7 @@ def _env(tmp: Path) -> dict[str, str]:
 
 
 def _project(tmp: Path) -> Path:
-    project = tmp / "project"
-    project.mkdir(exist_ok=True)
-    return project
+    return make_test_git_repo(tmp)
 
 
 def _wait_for(
@@ -227,6 +225,7 @@ def _run_confirmation_scenario(
             "codex-acp",
             "--dispatch-id",
             dispatch_id,
+            "--in-place",
             "--cwd",
             str(_project(tmp)),
             "--prompt",
@@ -286,6 +285,7 @@ def _run_answered_confirmation(
             "codex-acp",
             "--dispatch-id",
             dispatch_id,
+            "--in-place",
             "--cwd",
             str(_project(tmp)),
             "--prompt",
@@ -445,6 +445,7 @@ def _start_confirmation_runner(
             "codex-acp",
             "--dispatch-id",
             dispatch_id,
+            "--in-place",
             "--cwd",
             str(_project(tmp)),
             "--prompt",
@@ -484,6 +485,7 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -583,6 +585,7 @@ def case_mid_turn_steer_does_not_extend_wedge_deadline() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -646,6 +649,7 @@ def case_nonterminal_steer_turn_continues_to_real_terminal() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -723,6 +727,7 @@ def case_user_confirm_midrun_yes_records_consent_without_authorizing_action() ->
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -851,6 +856,8 @@ def case_midturn_mailbox_yes_is_reconciled_before_timeout_denial() -> None:
                 sys.executable,
                 str(ROOT / "scripts" / "goalflight_acp_run.py"),
                 "--unregistered-forced",
+                "--worktree",
+                "create",
                 "--agent",
                 "codex-acp",
                 "--dispatch-id",
@@ -999,6 +1006,7 @@ def case_uncorrelated_user_confirm_yes_is_not_authorization() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -1089,6 +1097,7 @@ def case_same_turn_guarded_action_is_denied_without_answer() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 "acp-user-confirm-same-turn-guard",
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -1175,6 +1184,7 @@ def case_user_confirm_timeout_is_fail_closed_then_continues() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",
@@ -1471,6 +1481,7 @@ def case_crossed_dual_user_confirm_answers_never_emit_authorization() -> None:
                 "codex-acp",
                 "--dispatch-id",
                 dispatch_id,
+                "--in-place",
                 "--cwd",
                 str(_project(tmp)),
                 "--prompt",

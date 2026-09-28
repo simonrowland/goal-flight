@@ -7,6 +7,7 @@ REQUIRES_ACP_SDK = True
 
 from support import (
     ensure_acp_test_interpreter,
+    make_test_git_repo,
     registered_child_environment,
     skip_posix_on_native_windows,
 )
@@ -493,6 +494,7 @@ def _run_fake_runner(
 ) -> tuple[int, dict, str, str]:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        repo = make_test_git_repo(tmp)
         state_dir = tmp / "state"
         status = tmp / f"{scenario}.status.json"
         wrapper = _make_fake_agent_wrapper(tmp)
@@ -522,10 +524,12 @@ def _run_fake_runner(
             sys.executable,
             "scripts/goalflight_acp_run.py",
             "--unregistered-forced",
+            "--worktree",
+            "create",
             "--agent",
             str(wrapper),
             "--cwd",
-            str(ROOT),
+            str(repo),
             "--prompt-text",
             "hello",
             "--status-json",
@@ -2183,6 +2187,7 @@ def case_later_denial_preserves_finalized_question_history_and_closes_future() -
 def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        repo = make_test_git_repo(tmp)
         state_dir = tmp / "state"
         status_path = tmp / "confirm-wait.status.json"
         wrapper = _make_fake_agent_wrapper(tmp)
@@ -2209,10 +2214,12 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
                 sys.executable,
                 "scripts/goalflight_acp_run.py",
                 "--unregistered-forced",
+                "--worktree",
+                "create",
                 "--agent",
                 str(wrapper),
                 "--cwd",
-                str(ROOT),
+                str(repo),
                 "--prompt-text",
                 "hello",
                 "--status-json",
@@ -2904,6 +2911,7 @@ def case_test_mode_hooks_require_gate() -> None:
 def case_acp_missing_prompt_commits_terminal_outbox() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        repo = make_test_git_repo(tmp)
         status = tmp / "missing-prompt.status.json"
         missing_prompt = tmp / "missing.prompt.md"
         wrapper = _make_fake_agent_wrapper(tmp)
@@ -2926,12 +2934,14 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
                 sys.executable,
                 str(ROOT / "scripts/goalflight_acp_run.py"),
                 "--unregistered-forced",
+                "--worktree",
+                "create",
                 "--agent",
                 str(wrapper),
                 "--dispatch-id",
                 "acp-missing-prompt",
                 "--cwd",
-                str(ROOT),
+                str(repo),
                 "--prompt",
                 str(missing_prompt),
                 "--status-json",

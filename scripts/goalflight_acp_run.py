@@ -4394,6 +4394,8 @@ async def _run_acp_dispatch_impl(
                 goalflight_dispatch._discard_preworker_ledger(cfg)
                 payload["reason"] = "worktree_occupied"
                 print(f"goalflight_acp_run: {e}", file=sys.stderr, flush=True)
+            if getattr(cfg, "_worktree_admission_refused", False):
+                payload["dispatch_refused"] = True
             if worktree_seat is not None:
                 worktree_seat.release()
                 worktree_seat = None
@@ -5288,6 +5290,8 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
 
 
 def acp_dispatch_exit_code(payload: dict) -> int:
+    if payload.get("dispatch_refused"):
+        return 64
     if payload.get("state") == "failed_worktree" and payload.get("reason") == "worktree_occupied":
         return 64
     if payload.get("state") == "blocked_windows_dispatch":
@@ -5646,6 +5650,17 @@ def main(argv: list[str] | None = None) -> int:
     # safe wedge-detector ceiling (10h of TOTAL silence = genuinely stuck).
     cfg = normalized_acp_dispatch_cfg(args)
     payload = asyncio.run(run_acp_dispatch(cfg))
+    if getattr(cfg, "_worktree_admission_refused", False) or payload.get(
+        "dispatch_refused"
+    ):
+        reason = payload.get("error") or payload.get("reason") or (
+            "worktree admission refused"
+        )
+        _emit_permanent_dispatch_refusal(
+            payload.get("dispatch_id") or cfg.dispatch_id,
+            reason,
+        )
+        return 64
     if cfg.json:
         print(json.dumps(payload, sort_keys=True))
     else:
