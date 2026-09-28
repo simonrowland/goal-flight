@@ -32,6 +32,42 @@ import goalflight_ledger as L  # noqa: E402
 
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
+CURSOR_HELP_FIXTURE = """                               including write and shell. (default: false)
+  --output-format <format>     Output format (only works with --print): text |
+                               json | stream-json (default: "text")
+  --stream-partial-output      Stream partial output as individual text deltas
+                               (only works with --print and stream-json format)
+                               (default: false)
+  --mode <mode>                Start in the given execution mode. plan:
+                               read-only/planning (analyze, propose plans, no
+                               edits). ask: Q&A style for explanations and
+                               questions (read-only). (choices: "plan", "ask")
+  --plan                       Start in plan mode (shorthand for --mode=plan).
+                               (default: false)
+  --resume [chatId]            Select a session to resume (default: false)
+  --continue                   Continue previous session (default: false)
+  --model <model>              Model to use (e.g., gpt-5, sonnet-4-thinking).
+                               Parameterized models accept quoted bracket
+                               overrides, e.g.
+                               'claude-opus-4-8[context=1m,effort=high,fast=false]'
+  --list-models                List available models and exit (default: false)
+  -f, --force                  Force allow commands unless explicitly denied
+                               (default: false)
+  --yolo                       Alias for --force (Run Everything) (default:
+                               false)
+  --auto-review                Use Auto-review (Smart Auto): a server classifier
+                               auto-runs safe tool calls and prompts for the
+                               rest (default: false)
+  --sandbox <mode>             Explicitly enable or disable sandbox mode
+                               (overrides config) (choices: "enabled",
+                               "disabled")
+  --approve-mcps               Automatically approve all MCP servers (default: false)
+  --trust                      Trust the current workspace without prompting
+                               (default: false)
+  --workspace <path-or-name>   Workspace directory or saved workspace name to
+                               use (defaults to current working directory)
+  --add-dir <path>             Add an additional workspace root directory
+"""
 
 
 def _grok_read_only_account_env() -> dict[str, str]:
@@ -79,16 +115,13 @@ def _cursor_worker_args(*, read_only: bool) -> argparse.Namespace:
 def test_cursor_read_only_argv_uses_native_read_only_mode_and_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    help_text = (
-        "Options:\n"
-        '  --mode <mode> choices: "plan", "ask")\n'
-        '  --sandbox <mode> choices: "enabled", "disabled")\n'
-    )
+    D._probe_cursor_read_only_mode.cache_clear()
+    monkeypatch.setattr(D.shutil, "which", lambda _name: sys.executable)
 
     def fake_help(argv, **kwargs):
-        assert argv == ["cursor-agent", "--help"]
-        assert kwargs["timeout"] == 10
-        return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
+        assert argv == [sys.executable, "--help"]
+        assert kwargs["timeout"] == 3
+        return subprocess.CompletedProcess(argv, 0, stdout=CURSOR_HELP_FIXTURE, stderr="")
 
     monkeypatch.setattr(D.subprocess, "run", fake_help)
     monkeypatch.setattr(D, "_wrap_cursor_os_sandbox", lambda argv, _args: argv)
@@ -121,17 +154,147 @@ def test_cursor_writer_argv_keeps_justified_force_flag() -> None:
     assert stdin_path == "/tmp/prompt.md"
 
 
+@pytest.mark.parametrize("force_flag", ["--force", "-f", "--yolo"])
+def test_cursor_read_only_raw_argv_refuses_force_aliases(force_flag: str) -> None:
+    raw = ["cursor-agent", "-p", force_flag, "--mode", "ask", "--sandbox", "enabled"]
+    with pytest.raises(D.DispatchUsageError, match="raw argv refused.*forbidden"):
+        D.build_worker(_cursor_worker_args(read_only=True), None, raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ["cursor-agent", "-p", "--sandbox", "enabled"],
+        ["cursor-agent", "-p", "--mode", "ask"],
+        ["cursor-agent", "-p", "--mode", "edit", "--sandbox", "enabled"],
+        ["cursor-agent", "-p", "--mode", "ask", "--sandbox", "disabled"],
+    ],
+    ids=["missing-mode", "missing-sandbox", "unsafe-mode", "disabled-sandbox"],
+)
+def test_cursor_read_only_raw_argv_refuses_without_required_posture(raw: list[str]) -> None:
+    with pytest.raises(D.DispatchUsageError, match="raw argv refused"):
+        D.build_worker(_cursor_worker_args(read_only=True), None, raw)
+
+
+def test_cursor_read_only_raw_argv_with_enforced_flags_is_preserved() -> None:
+    raw = ["cursor-agent", "-p", "--mode=plan", "--sandbox=enabled", "--trust"]
+    argv, stdin_path = D.build_worker(_cursor_worker_args(read_only=True), None, raw)
+    assert argv == raw
+    assert stdin_path is None
+
+
+def test_cursor_read_only_raw_refusal_is_permanent_and_exits_64(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = D.main(
+        [
+            "--agent", "cursor", "--read-only", "--dispatch-id", "cursor-raw-refused",
+            "--prompt", "read only", "--", "cursor-agent", "-p", "--force", "--trust",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == "cursor-raw-refused"
+    assert payload["permanent"] is True
+    assert payload["state"] == "refused"
+    assert "--force/-f/--yolo" in payload["reason"]
+
+
+def test_cursor_read_only_acp_is_permanently_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = D.main(
+        [
+            "--agent", "cursor", "--shape", "acp", "--read-only",
+            "--dispatch-id", "cursor-acp-refused", "--prompt", "read only",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 64
+    refusal = next(
+        line for line in captured.out.splitlines()
+        if line.startswith(D.DISPATCH_REFUSED_PREFIX)
+    )
+    payload = json.loads(refusal[len(D.DISPATCH_REFUSED_PREFIX) :])
+    assert payload["dispatch_id"] == "cursor-acp-refused"
+    assert payload["permanent"] is True
+    assert payload["state"] == "refused"
+    assert "ACP" in payload["reason"]
+
+
+@pytest.mark.parametrize("failure", ["missing-binary", "nonzero", "timeout"])
+def test_cursor_read_only_refuses_when_help_probe_fails(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
+    calls: list[list[str]] = []
+    if failure == "missing-binary":
+        monkeypatch.setattr(D.shutil, "which", lambda _name: None)
+    else:
+        monkeypatch.setattr(D.shutil, "which", lambda _name: sys.executable)
+
+        def fake_help(argv, **kwargs):
+            calls.append(argv)
+            assert kwargs["timeout"] == 3
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="failed")
+
+        monkeypatch.setattr(D.subprocess, "run", fake_help)
+
+    with pytest.raises(D.DispatchUsageError, match="cursor --read-only refused"):
+        D.build_worker(_cursor_worker_args(read_only=True), "/tmp/prompt.md", [])
+    assert len(calls) == (0 if failure == "missing-binary" else 1)
+
+
+def test_cursor_read_only_help_probe_result_is_cached_per_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
+    monkeypatch.setattr(D.shutil, "which", lambda _name: sys.executable)
+    calls: list[list[str]] = []
+
+    def fake_help(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["timeout"] == 3
+        return subprocess.CompletedProcess(argv, 0, stdout=CURSOR_HELP_FIXTURE, stderr="")
+
+    monkeypatch.setattr(D.subprocess, "run", fake_help)
+    assert D._cursor_read_only_mode() in {"ask", "plan"}
+    assert D._cursor_read_only_mode() in {"ask", "plan"}
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "help_text",
     [
-        'Options:\n  --mode <mode> choices: "ask")\n',
-        'Options:\n  --sandbox <mode> choices: "enabled")\n',
+        CURSOR_HELP_FIXTURE.replace(
+            '  --mode <mode>                Start in the given execution mode. plan:\n'
+            '                               read-only/planning (analyze, propose plans, no\n'
+            '                               edits). ask: Q&A style for explanations and\n'
+            '                               questions (read-only). (choices: "plan", "ask")\n',
+            "",
+        ),
+        CURSOR_HELP_FIXTURE.replace(
+            '  --sandbox <mode>             Explicitly enable or disable sandbox mode\n'
+            '                               (overrides config) (choices: "enabled",\n'
+            '                               "disabled")\n',
+            "",
+        ),
     ],
     ids=["missing-sandbox-flag", "missing-mode-flag"],
 )
 def test_cursor_read_only_refuses_when_required_cli_flag_is_missing(
     monkeypatch: pytest.MonkeyPatch, help_text: str
 ) -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
+    monkeypatch.setattr(D.shutil, "which", lambda _name: sys.executable)
+
     def fake_help(argv, **_kwargs):
         return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
 
@@ -142,6 +305,7 @@ def test_cursor_read_only_refuses_when_required_cli_flag_is_missing(
 
 
 def test_installed_cursor_help_advertises_read_only_flags_when_available() -> None:
+    D._probe_cursor_read_only_mode.cache_clear()
     binary = shutil.which("cursor-agent")
     if binary is None:
         pytest.skip("cursor-agent is not installed")
@@ -150,7 +314,7 @@ def test_installed_cursor_help_advertises_read_only_flags_when_available() -> No
         [binary, "--help"],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=3,
         check=False,
     )
 

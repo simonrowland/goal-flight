@@ -197,7 +197,7 @@ def _cursor_agent_tail(argv: list[str]) -> list[str]:
 
 
 def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
-    """Controllers keep --os-sandbox read-only; runner wraps, cursor-cli does not."""
+    """Preset read-only uses Cursor flags; explicit OS profiles still use the runner."""
     with _force_darwin_sandbox_exec():
         for agent, model in (
             ("cursor", None),
@@ -241,13 +241,16 @@ def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
         assert off_argv[0] == "cursor-agent", off_argv
         assert "sandbox-exec" not in off_argv[0], off_argv
 
-        read_only_alias, _ = d.build_worker(
-            _args(agent="cursor", read_only=True, os_sandbox=None, cwd=str(REPO_ROOT)),
-            "/tmp/p.md",
-            [],
-        )
+        with mock.patch.object(d, "_cursor_read_only_mode", return_value="ask"):
+            read_only_alias, _ = d.build_worker(
+                _args(agent="cursor", read_only=True, os_sandbox=None, cwd=str(REPO_ROOT)),
+                "/tmp/p.md",
+                [],
+            )
         assert Path(read_only_alias[0]).name == "sandbox-exec", read_only_alias
-        assert "--sandbox" not in _cursor_agent_tail(read_only_alias), read_only_alias
+        read_only_tail = _cursor_agent_tail(read_only_alias)
+        assert read_only_tail[read_only_tail.index("--mode") + 1] == "ask", read_only_alias
+        assert read_only_tail[read_only_tail.index("--sandbox") + 1] == "enabled", read_only_alias
 
         d._validate_agent_os_sandbox(
             _args(agent="cursor", shape="bash", os_sandbox="read-only", cwd=str(REPO_ROOT))
@@ -401,4 +404,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    main()
+
+
+def test_all_cases() -> None:
     main()
