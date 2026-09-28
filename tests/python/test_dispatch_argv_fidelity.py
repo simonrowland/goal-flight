@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -59,6 +60,109 @@ def test_read_only_help_names_worker_limits() -> None:
     help_text = " ".join(D._build_launch_parser().format_help().split())
     assert "Bash/Write/Edit" in help_text
     assert "cannot commit or write a review artifact" in help_text
+
+
+def _cursor_worker_args(*, read_only: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        agent="cursor",
+        cwd="/repo/worktrees/s-1",
+        model="grok-4.7-high",
+        os_sandbox=None,
+        read_only=read_only,
+        parent_dispatch_id=None,
+        cursor_session_id=None,
+        dispatch_id="cursor-argv-test",
+        resume_reconstruction=False,
+    )
+
+
+def test_cursor_read_only_argv_uses_native_read_only_mode_and_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    help_text = (
+        "Options:\n"
+        '  --mode <mode> choices: "plan", "ask")\n'
+        '  --sandbox <mode> choices: "enabled", "disabled")\n'
+    )
+
+    def fake_help(argv, **kwargs):
+        assert argv == ["cursor-agent", "--help"]
+        assert kwargs["timeout"] == 10
+        return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
+
+    monkeypatch.setattr(D.subprocess, "run", fake_help)
+    monkeypatch.setattr(D, "_wrap_cursor_os_sandbox", lambda argv, _args: argv)
+    argv, stdin_path = D.build_worker(
+        _cursor_worker_args(read_only=True), "/tmp/prompt.md", []
+    )
+
+    assert argv[:2] == ["cursor-agent", "-p"]
+    assert argv[argv.index("--mode") + 1] in {"ask", "plan"}
+    assert argv[argv.index("--sandbox") + 1] == "enabled"
+    assert not {"--force", "-f", "--yolo"}.intersection(argv)
+    assert stdin_path == "/tmp/prompt.md"
+
+
+def test_cursor_writer_argv_keeps_justified_force_flag() -> None:
+    argv, stdin_path = D.build_worker(
+        _cursor_worker_args(read_only=False), "/tmp/prompt.md", []
+    )
+
+    assert argv[:6] == [
+        "cursor-agent",
+        "-p",
+        "--force",
+        "--trust",
+        "--output-format",
+        "text",
+    ]
+    assert "--mode" not in argv
+    assert "--sandbox" not in argv
+    assert stdin_path == "/tmp/prompt.md"
+
+
+@pytest.mark.parametrize(
+    "help_text",
+    [
+        'Options:\n  --mode <mode> choices: "ask")\n',
+        'Options:\n  --sandbox <mode> choices: "enabled")\n',
+    ],
+    ids=["missing-sandbox-flag", "missing-mode-flag"],
+)
+def test_cursor_read_only_refuses_when_required_cli_flag_is_missing(
+    monkeypatch: pytest.MonkeyPatch, help_text: str
+) -> None:
+    def fake_help(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=help_text, stderr="")
+
+    monkeypatch.setattr(D.subprocess, "run", fake_help)
+
+    with pytest.raises(D.DispatchUsageError, match="cursor --read-only refused"):
+        D.build_worker(_cursor_worker_args(read_only=True), "/tmp/prompt.md", [])
+
+
+def test_installed_cursor_help_advertises_read_only_flags_when_available() -> None:
+    binary = shutil.which("cursor-agent")
+    if binary is None:
+        pytest.skip("cursor-agent is not installed")
+    assert D._cursor_read_only_mode() in {"ask", "plan"}
+    result = subprocess.run(
+        [binary, "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    help_text = " ".join((result.stdout + "\n" + result.stderr).split())
+    mode_start = help_text.find("--mode <mode>")
+    sandbox_start = help_text.find("--sandbox <mode>")
+    assert mode_start >= 0, help_text
+    assert sandbox_start > mode_start, help_text
+    mode_help = help_text[mode_start:sandbox_start]
+    assert '"ask"' in mode_help or '"plan"' in mode_help
+    assert '"enabled"' in help_text[sandbox_start : sandbox_start + 300]
 
 
 def test_removed_bulk_dispatch_commands_are_rejected_and_absent_from_help() -> None:

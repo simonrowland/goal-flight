@@ -1179,13 +1179,14 @@ def test_dispatch_admission_reaps_read_only_checkouts(
     assert calls == [repo.resolve()]
 
 
+@pytest.mark.parametrize("agent", ["codex", "cursor"])
 def test_admit_backstop_refuses_project_root_after_bind_returns_none(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agent: str
 ) -> None:
     repo = _make_repo(tmp_path)
     monkeypatch.chdir(repo)
     args = SimpleNamespace(
-        agent="codex",
+        agent=agent,
         project_root=str(repo),
         cwd=None,
         worktree="HEAD",

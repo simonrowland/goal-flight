@@ -816,10 +816,10 @@ def _os_sandbox_enforced_by_launch(args) -> bool:
     """True when an explicit --os-sandbox actually constrains this launch path.
 
     Bash-shape grok/claude ignore the flag (no CLI/OS mapping). Cursor bash
-    uses the same runner:sandbox-exec wrap as ACP (macOS Seatbelt; no
-    cursor-cli sandbox flag). ACP honours the flag only when the adapter
-    and platform can wrap the worker. An accepted-but-inert safety flag is
-    worse than a refusal.
+    uses runner:sandbox-exec for explicit --os-sandbox requests; its
+    --read-only preset uses native --mode ask/plan and --sandbox enabled.
+    ACP honours the flag only when the adapter and platform can wrap the
+    worker. An accepted-but-inert safety flag is worse than a refusal.
     """
     explicit = getattr(args, "os_sandbox", None)
     if explicit not in OS_SANDBOX_PROFILES:
@@ -23174,13 +23174,13 @@ def _apply_fast_mode(args) -> None:
 
 
 def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
-    """Wrap cursor-agent with sandbox-exec when the adapter+platform can enforce.
+    """Apply explicit runner-level sandbox requests to cursor-agent.
 
-    cursor-cli has no read-only/workspace-write primitive. Enforcement is the
-    same runner:sandbox-exec Seatbelt wrap ACP already uses for cursor/grok/
-    codex. Do not invent a cursor-cli --sandbox flag — the CLI refuses it.
+    The cursor read-only preset also sets the CLI's native ``--mode`` and
+    ``--sandbox`` flags in ``build_worker``. This wrapper handles the separate
+    ``--os-sandbox`` profile when the adapter and platform support it.
     Linux/other hosts: validate_os_sandbox_request fails closed, so this is a
-    no-op and dispatch refuses an explicit --os-sandbox as today.
+    no-op and dispatch refuses an explicit unsupported ``--os-sandbox``.
     """
     if not argv:
         return argv
@@ -23205,6 +23205,63 @@ def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
         agent=agent,
     )
     return [prepared.command, *prepared.args]
+
+
+def _cursor_read_only_mode() -> str:
+    """Return a supported read-only Cursor mode, refusing unverifiable CLIs."""
+    try:
+        help_result = subprocess.run(
+            ["cursor-agent", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DispatchUsageError(
+            "cursor --read-only refused: could not verify cursor-agent support "
+            "for --mode ask|plan and --sandbox enabled via --help "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+
+    if help_result.returncode != 0:
+        raise DispatchUsageError(
+            "cursor --read-only refused: cursor-agent --help exited "
+            f"{help_result.returncode}; required --mode ask|plan and "
+            "--sandbox enabled support could not be verified"
+        )
+
+    help_text = (help_result.stdout or "") + "\n" + (help_result.stderr or "")
+
+    def option_choices(option: str) -> set[str]:
+        section = re.search(
+            rf"(?ms)^\s*{re.escape(option)}(?:\s|$)(.*?)(?=^\s*--\S+|\Z)",
+            help_text,
+        )
+        if section is None:
+            return set()
+        choices = re.search(
+            r"\bchoices:\s*([^)]*)\)", section.group(1), re.IGNORECASE
+        )
+        if choices is None:
+            return set()
+        return {
+            value.lower()
+            for value in re.findall(r"[\"']([^\"']+)[\"']", choices.group(1))
+        }
+
+    mode_choices = option_choices("--mode")
+    sandbox_choices = option_choices("--sandbox")
+    mode = next(
+        (candidate for candidate in ("ask", "plan") if candidate in mode_choices),
+        None,
+    )
+    if mode is None or "enabled" not in sandbox_choices:
+        raise DispatchUsageError(
+            "cursor --read-only refused: installed cursor-agent --help must "
+            "advertise --mode ask or --mode plan and --sandbox enabled"
+        )
+    return mode
 
 
 def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
@@ -23426,14 +23483,16 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     if args.agent in CURSOR_AGENTS:
         if not prompt_path:
             raise DispatchUsageError("cursor resume/launch requires a prompt file")
-        argv = [
-            "cursor-agent",
-            "-p",
-            "--force",
-            "--trust",
-            "--output-format",
-            "text",
-        ]
+        argv = ["cursor-agent", "-p"]
+        if _effective_read_only(args):
+            argv.extend(
+                ["--mode", _cursor_read_only_mode(), "--sandbox", "enabled"]
+            )
+        else:
+            # Cursor's adapter marks --force as requiring an explicit task
+            # justification. Keep it for requested writer work only.
+            argv.append("--force")
+        argv.extend(["--trust", "--output-format", "text"])
         cursor_session_id = _resolved_engine_session_id(args)
         if cursor_session_id and getattr(args, "parent_dispatch_id", None) and not getattr(args, "resume_reconstruction", False):
             argv += goalflight_engine_sessions.session_argv(
@@ -23611,18 +23670,18 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
                         metavar="{workspace-write,read-only,off}",
                         help="OS sandbox profile. Honoured by bash-shape codex (maps to "
-                             "codex --sandbox), bash-shape cursor (macOS sandbox-exec wrap; "
-                             "cursor-cli has no read-only flag), and by ACP shapes whose "
-                             "adapter and platform can wrap the worker (macOS sandbox-exec). "
-                             "Unset = workspace-write for bash-shape codex. An accepted-but-inert "
+                             "codex --sandbox), explicit bash-shape cursor profiles (macOS "
+                             "sandbox-exec), and ACP shapes whose adapter and platform can "
+                             "wrap the worker (macOS sandbox-exec). Preset --read-only uses "
+                             "cursor --mode ask/plan plus --sandbox enabled. Unset = "
+                             "workspace-write for bash-shape codex. An accepted-but-inert "
                              "request is refused; grok bash should pass --read-only instead "
                              "(--sandbox-exec write fencing on macOS, --deny Bash elsewhere). "
                              "The read-only profile denies worktree writes, so the worker cannot "
-                             "commit or write its review artifact. "
-                             "'off' disables codex's Seatbelt sandbox (codex --sandbox "
-                             "danger-full-access) for TRUSTED LOCAL GPU/perf work. Sanctioned "
-                             "adapter profile, DISTINCT from the always-forbidden "
-                             "--dangerously-*/--no-sandbox bypass flags.")
+                             "commit or write its review artifact. 'off' disables codex's "
+                             "Seatbelt sandbox (codex --sandbox danger-full-access) for TRUSTED "
+                             "LOCAL GPU/perf work. Sanctioned adapter profile, DISTINCT from "
+                             "the always-forbidden --dangerously-*/--no-sandbox bypass flags.")
     parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "

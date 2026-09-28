@@ -219,7 +219,7 @@
         "goal_mode_eligible": true
       }
     },
-    "model_notes": "Pass the model id explicitly; no default is pinned (a pinned id goes stale and stops tracking the CLI's own default - the reason the grok ACP pin was retired). Kimi: --model kimi-k3-high. Grok: --model cursor-grok-4.5-high. Kimi via cursor is a HOSTING choice, not a strength claim - Kimi's own CLI sends prompts and repo contents to its vendor's service, while cursor serves the same model family from US infrastructure. Ids are volatile: confirm against `cursor-agent --list-models`. In an untrusted directory `cursor-agent -p` stops for a trust decision and exits 0 with no result, so dispatched runs need -f."
+    "model_notes": "Pass the model id explicitly; no default is pinned (a pinned id goes stale and stops tracking the CLI's own default - the reason the grok ACP pin was retired). Kimi: --model kimi-k3-high. Grok: --model cursor-grok-4.5-high. Kimi via cursor is a HOSTING choice, not a strength claim - Kimi's own CLI sends prompts and repo contents to its vendor's service, while cursor serves the same model family from US infrastructure. Ids are volatile: confirm against `cursor-agent --list-models`. In an untrusted directory `cursor-agent -p` stops for a trust decision and exits 0 with no result, so preset launches pass --trust. Read-only presets use --mode ask (or plan if ask is unavailable) with --sandbox enabled. --force is reserved for writer dispatches with explicit task justification."
   },
   "permission_surface": {
     "file_reads": [
@@ -284,7 +284,7 @@
           "off"
         ]
       },
-      "notes": "cursor-cli has no read-only/workspace-write primitive. Enforcement is runner:sandbox-exec (macOS Seatbelt wrap of the worker subprocess), not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile. Linux/WSL/Windows keep off-only."
+      "notes": "Cursor preset --read-only uses --mode ask (or plan) with --sandbox enabled. This is separate from explicit --os-sandbox profiles, which use runner:sandbox-exec on macOS and remain off-only on Linux/WSL/Windows."
     },
     "auto_approve_detection": {
       "probes": [
