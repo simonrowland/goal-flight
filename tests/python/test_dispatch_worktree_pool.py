@@ -773,6 +773,98 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             pass
 
 
+def test_writer_with_inherited_lock_fd_does_not_spawn_in_project_root(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    marker = tmp_path / "inherited-root-worker-cwd"
+    inherited_fd_path = tmp_path / "unrelated-open-fd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    with inherited_fd_path.open("w", encoding="utf-8") as inherited_fd:
+        env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+            inherited_fd.fileno()
+        )
+        command = _dispatch_cmd(
+            tmp_path,
+            repo,
+            "inherited-root-writer",
+            sys.executable,
+            "-c",
+            worker,
+        )
+        command[command.index("--") : command.index("--")] = [
+            "--worktree",
+            "HEAD",
+        ]
+        proc = subprocess.run(
+            command,
+            cwd=str(repo),
+            env=env,
+            pass_fds=(inherited_fd.fileno(),),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 64, combined
+    assert "project root" in combined.lower(), combined
+    assert "WorktreeSeatUnavailable" not in combined
+    assert "DISPATCH-REFUSED " in proc.stdout
+    assert not marker.exists()
+
+
+def test_writer_with_inherited_lock_fd_keeps_its_managed_seat(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "seat-parent")
+    marker = tmp_path / "inherited-seat-worker-cwd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    try:
+        env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(parent.fileno())
+        command = _dispatch_cmd(
+            tmp_path,
+            repo,
+            "inherited-seat-writer",
+            sys.executable,
+            "-c",
+            worker,
+        )
+        command[command.index("--") : command.index("--")] = [
+            "--worktree",
+            "HEAD",
+        ]
+        proc = subprocess.run(
+            command,
+            cwd=str(parent.path),
+            env=env,
+            pass_fds=(parent.fileno(),),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 0, combined
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.05)
+        assert marker.exists(), combined
+        assert Path(marker.read_text(encoding="utf-8")).resolve() == parent.path.resolve()
+    finally:
+        parent.release()
+
+
 def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1085,6 +1177,98 @@ def test_dispatch_admission_reaps_read_only_checkouts(
 
     assert goalflight_dispatch._bind_dispatch_worktree(args) is None
     assert calls == [repo.resolve()]
+
+
+def test_admit_backstop_refuses_project_root_after_bind_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    args = SimpleNamespace(
+        agent="codex",
+        project_root=str(repo),
+        cwd=None,
+        worktree="HEAD",
+        read_only=False,
+        in_place=False,
+        dispatch_id="root-backstop",
+        capacity_wait_s=0,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        dispatch_warnings=[],
+    )
+    monkeypatch.setattr(goalflight_dispatch, "_bind_dispatch_worktree", lambda _args: None)
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_worktree_occupancy",
+        lambda _args: None,
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused, match="project root"
+    ):
+        goalflight_dispatch._admit_dispatch_worktree(args)
+
+    assert args._worktree_seat_refused is True
+    assert args._worktree_admission_refused is True
+    assert not (repo / "worktrees").exists()
+
+
+def test_bind_project_root_cwd_without_in_place_refuses_writer(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    args = SimpleNamespace(
+        worktree="HEAD",
+        project_root=str(repo),
+        cwd=str(repo),
+        read_only=False,
+        in_place=False,
+        dispatch_id="root-cwd-without-in-place",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeCwdRefused, match="project root"
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+
+
+def test_bind_inherited_lock_fd_outside_managed_seat_refuses_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    args = SimpleNamespace(
+        worktree="HEAD",
+        project_root=str(repo),
+        cwd=None,
+        read_only=False,
+        in_place=False,
+        dispatch_id="inherited-root-bind",
+        controller_label=None,
+        worktree_root=None,
+        skip_seat_reset=False,
+        parent_dispatch_id=None,
+        from_queue=False,
+        _worktree_seat=None,
+    )
+    inherited_fd_path = tmp_path / "unrelated-open-fd"
+    with inherited_fd_path.open("w", encoding="utf-8") as inherited_fd:
+        monkeypatch.setenv(
+            goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+            str(inherited_fd.fileno()),
+        )
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeCwdRefused, match="project root"
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
 
 
 def test_acp_in_place_nested_cwd_is_rejected_during_admission(tmp_path: Path) -> None:
@@ -2802,27 +2986,14 @@ def test_cwd_without_worktree_does_not_acquire_a_seat(
     repo = _make_repo(tmp_path)
     env = _env(tmp_path, seats=1)
     marker = tmp_path / "cwd-only"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    command = _dispatch_cmd(tmp_path, repo, "cwd-only", sys.executable, "-c", worker)
+    command[command.index("--") : command.index("--")] = ["--cwd", str(repo)]
     proc = subprocess.run(
-        [
-            sys.executable,
-            str(DISPATCH),
-            "--unregistered-forced",
-            "--agent",
-            "test-dispatch",
-            "--dispatch-id",
-            "cwd-only",
-            "--cwd",
-            str(repo),
-            "--launch-detached",
-            "--tail",
-            str(tmp_path / "cwd-only.tail"),
-            "--status-json",
-            str(tmp_path / "cwd-only.status.json"),
-            "--",
-            sys.executable,
-            "-c",
-            f"from pathlib import Path; Path({str(marker)!r}).write_text('ok')",
-        ],
+        command,
         cwd=str(repo),
         env=env,
         text=True,
@@ -2830,12 +3001,205 @@ def test_cwd_without_worktree_does_not_acquire_a_seat(
         stderr=subprocess.PIPE,
         timeout=30,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 64, combined
+    assert "project root" in combined.lower(), combined
+    assert "DISPATCH-REFUSED " in proc.stdout
+    assert not marker.exists()
+    assert not (repo / "worktrees").exists()
+
+
+def test_explicit_in_place_writer_runs_in_project_root(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    marker = tmp_path / "explicit-in-place-worker-cwd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    command = _dispatch_cmd(
+        tmp_path,
+        repo,
+        "explicit-in-place-writer",
+        sys.executable,
+        "-c",
+        worker,
+    )
+    command.insert(command.index("--"), "--in-place")
+    proc = subprocess.run(
+        command,
+        cwd=str(repo),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)
-    assert marker.exists()
+    assert marker.exists(), combined
+    assert Path(marker.read_text(encoding="utf-8")).resolve() == repo.resolve()
     assert not (repo / "worktrees").exists()
+
+
+def test_admit_read_only_project_root_is_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    args = SimpleNamespace(
+        agent="codex",
+        project_root=str(repo),
+        cwd=str(repo),
+        worktree="HEAD",
+        read_only=True,
+        in_place=False,
+        dispatch_id="read-only-root",
+        capacity_wait_s=0,
+        controller_label=None,
+        worktree_root=None,
+        _worktree_seat=None,
+        dispatch_warnings=[],
+    )
+    monkeypatch.setattr(
+        goalflight_dispatch,
+        "_prepare_attempt_worktree_occupancy",
+        lambda _args: None,
+    )
+
+    inherited_fd_path = tmp_path / "read-only-inherited-fd"
+    with inherited_fd_path.open("w", encoding="utf-8") as inherited_fd:
+        monkeypatch.setenv(
+            goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV,
+            str(inherited_fd.fileno()),
+        )
+        assert goalflight_dispatch._admit_dispatch_worktree(args) is None
+
+
+def test_waiting_capacity_replay_does_not_insert_project_root_cwd(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    holder = goalflight_worktree_pool.acquire_worktree_seat(repo, "wait-row-holder")
+    dispatch_id = "waiting-row-replay-cwd"
+    marker = tmp_path / "waiting-row-worker-cwd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    command = _dispatch_cmd(
+        tmp_path,
+        repo,
+        dispatch_id,
+        sys.executable,
+        "-c",
+        worker,
+    )
+    command[command.index("--") : command.index("--")] = [
+        "--worktree",
+        "HEAD",
+        "--capacity-wait-s",
+        "10",
+    ]
+    proc = subprocess.Popen(
+        command,
+        cwd=str(repo),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    record_path = goalflight_ledger.record_path(dispatch_id)
+    record = None
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and proc.poll() is None:
+            if record_path.exists():
+                candidate = json.loads(record_path.read_text(encoding="utf-8"))
+                if candidate.get("state") == "waiting_capacity":
+                    record = candidate
+                    break
+            time.sleep(0.02)
+        assert record is not None, "dispatch did not write its pre-admit waiting row"
+        assert "--cwd" not in record.get("dispatch_argv", []), record
+    finally:
+        finish_seat_holder(holder)
+        stdout, stderr = proc.communicate(timeout=30)
+
+    combined = stdout + stderr
+    assert proc.returncode == 0, combined
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+    assert Path(marker.read_text(encoding="utf-8")).resolve() != repo.resolve()
+
+
+def test_replay_without_admitted_cwd_does_not_use_process_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    args = SimpleNamespace(
+        _original_argv=None,
+        agent="codex",
+        dispatch_id="fallback-replay-cwd",
+        shape="bash",
+        priority="normal",
+        billing="sub",
+        poll_secs=1.0,
+        max_idle_secs=30.0,
+        cwd=None,
+        _worktree_path=None,
+        prompt_file=None,
+        prompt=None,
+        task_ids=[],
+        force=False,
+        model=None,
+        os_sandbox=None,
+        read_only=False,
+        fast=False,
+        web_research_ok=False,
+        web_qa=False,
+        ignore_git_warn=False,
+        no_orientation=False,
+        worktree="HEAD",
+        worktree_base=None,
+        worktree_root=None,
+        in_place=False,
+        skip_seat_reset=False,
+        worktree_pin_holder=None,
+        capacity_wait_s=None,
+        account=None,
+        interactive=False,
+        permission_mode=None,
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        permission_allow_tool_title_pattern=[],
+        controller_label=None,
+        controller_session_id=None,
+        _controller_beacon_pid=None,
+        engine_session_id=None,
+        codex_session_id=None,
+        parent_dispatch_id=None,
+        unregistered_forced=True,
+        occupied_worktree_forced=False,
+    )
+
+    argv = goalflight_dispatch._canonical_replay_argv(
+        args,
+        [],
+        tail=tmp_path / "fallback.tail",
+        status_json=tmp_path / "fallback.status.json",
+    )
+
+    assert "--cwd" not in argv
 
 
 def test_sidecar_env_drops_closed_worktree_lock_fd() -> None:

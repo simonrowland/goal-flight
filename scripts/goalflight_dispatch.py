@@ -2818,13 +2818,19 @@ def _persist_queue_worktree_pin(
         ) from exc
 
 
+def _raise_worktree_admission_refusal(args, message: str) -> None:
+    args._worktree_seat_refused = True
+    args._worktree_admission_refused = True
+    raise goalflight_worktree_pool.WorktreeCwdRefused(message)
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
     """Acquire a captive worktree. Isolation is not a mode.
 
     Default dispatch (no ``--cwd``, no ``--in-place``) takes one worktree from
-    the repository pool. ``--cwd`` is a lock: project root (in-place), a worktree
-    in this ring, or resume's recorded tree. Anything else is refused and
-    never created. Never falls back to unmanaged ``git worktree add``.
+    the repository pool. A writer's ``--cwd`` must be a managed worktree seat
+    unless ``--in-place`` is explicit. Anything else is refused and never
+    created. Never falls back to unmanaged ``git worktree add``.
 
     The worktree lock fd is left open on the returned lease. The caller must put
     ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
@@ -2851,7 +2857,36 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         # Fleet / parent already leased a worktree and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
         # reset a tree the worker is already in.
-        return None
+        if getattr(args, "in_place", False):
+            return None
+        cwd = _worker_cwd(args)
+        label = _controller_ring_label(args, project_root)
+        kind = goalflight_worktree_pool.classify_dispatch_cwd(
+            cwd,
+            project_root=project_root,
+            controller_label=label,
+            managed_root=(
+                Path(str(args.worktree_root)).expanduser()
+                if getattr(args, "worktree_root", None)
+                else None
+            ),
+        )
+        if kind == "ring-seat":
+            return None
+        if not _effective_read_only(args):
+            if cwd.resolve(strict=False) == project_root.resolve(strict=False):
+                message = (
+                    "writer dispatch has an inherited worktree lock fd but its "
+                    f"effective cwd is the project root {project_root}; pass "
+                    "--in-place explicitly to run there"
+                )
+            else:
+                message = (
+                    "inherited worktree lock fd is only valid when the effective "
+                    "cwd is a managed worktree seat of this project; got "
+                    f"{cwd}"
+                )
+            _raise_worktree_admission_refusal(args, message)
     if (
         getattr(args, "parent_dispatch_id", None)
         and _occupancy_exempt_read_only(args)
@@ -2988,7 +3023,13 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             ),
         )
         if kind == "in-place" and not force_captive:
-            return None
+            if _effective_read_only(args):
+                return None
+            _raise_worktree_admission_refusal(
+                args,
+                f"--cwd {cwd} is the project root; pass --in-place explicitly "
+                "to run a writer there",
+            )
         if kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
             expected_prior_dispatch_id = (
@@ -3295,8 +3336,25 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 pass
         else:
             args._worktree_capacity_deadline = previous_deadline
-        args._worktree_capacity_lease_active = previous_lease_active
+    args._worktree_capacity_lease_active = previous_lease_active
     try:
+        if (
+            not _effective_read_only(args)
+            and not getattr(args, "in_place", False)
+        ):
+            try:
+                project_root = _project_root(args).resolve(strict=False)
+            except goalflight_task.TaskError:
+                project_root = None
+            if (
+                project_root is not None
+                and _worker_cwd(args).resolve(strict=False) == project_root
+            ):
+                _raise_worktree_admission_refusal(
+                    args,
+                    "writer dispatch resolved to the project root "
+                    f"{project_root} without explicit --in-place",
+                )
         warning = getattr(args, "_worktree_occupancy_warning", None)
         checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
         current_path = str(Path(str(_worker_cwd(args))).resolve(strict=False))
@@ -11796,6 +11854,16 @@ def _replay_strip_flags() -> tuple[str, ...]:
     )
 
 
+def _admitted_replay_worker_cwd(args) -> Path | None:
+    cwd_raw = getattr(args, "cwd", None)
+    admitted_raw = getattr(args, "_worktree_path", None)
+    if not cwd_raw or not admitted_raw:
+        return None
+    cwd = Path(str(cwd_raw)).expanduser().resolve(strict=False)
+    admitted = Path(str(admitted_raw)).expanduser().resolve(strict=False)
+    return cwd if cwd == admitted else None
+
+
 def _canonical_replay_argv_from_original(
     args,
     raw_argv: list[str],
@@ -11806,10 +11874,12 @@ def _canonical_replay_argv_from_original(
     source = list(getattr(args, "_original_argv", None) or [])
     replace = {
         "--dispatch-id": str(args.dispatch_id),
-        "--cwd": str(_worker_cwd(args)),
         "--tail": str(tail),
         "--status-json": str(status_json),
     }
+    admitted_cwd = _admitted_replay_worker_cwd(args)
+    if admitted_cwd is not None:
+        replace["--cwd"] = str(admitted_cwd)
     if args.prompt_file:
         replace["--prompt-file"] = str(Path(args.prompt_file).expanduser())
     if getattr(args, "shape", None) and args.shape != "auto":
@@ -11853,7 +11923,6 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
     argv = [
         "--agent", str(args.agent),
         "--dispatch-id", str(args.dispatch_id),
-        "--cwd", str(_worker_cwd(args)),
         "--shape", str(args.shape),
         "--priority", str(args.priority),
         "--billing", str(args.billing),
@@ -11862,6 +11931,9 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         "--tail", str(tail),
         "--status-json", str(status_json),
     ]
+    admitted_cwd = _admitted_replay_worker_cwd(args)
+    if admitted_cwd is not None:
+        argv += ["--cwd", str(admitted_cwd)]
     if args.prompt_file:
         argv += ["--prompt-file", str(Path(args.prompt_file).expanduser())]
     if args.prompt is not None:
@@ -22895,6 +22967,14 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         if worktree_seat is not None:
             worktree_seat.release()
             args._worktree_seat = None
+    if getattr(cfg, "_worktree_admission_refused", False):
+        reason = payload.get("error") or payload.get("reason") or (
+            "writer dispatch refused project-root worker cwd"
+        )
+        _emit_permanent_dispatch_refusal(cfg.dispatch_id, reason)
+        print(f"goalflight_dispatch: {reason}", file=sys.stderr, flush=True)
+        status_json.unlink(missing_ok=True)
+        return 64
     if getattr(cfg, "_worktree_seat_refused", False):
         print(f"goalflight_dispatch: {payload.get('error')}", file=sys.stderr)
         status_json.unlink(missing_ok=True)
@@ -23483,8 +23563,9 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         type=_parse_public_worktree_ref,
         help=(
             "Prepare the pooled worktree at git ref REF (HEAD, main, a commit). "
-            "This is not an opt-in to the pool: every dispatch acquires a "
-            "worktree unless --in-place or --cwd names the project root. "
+            "Writers acquire a worktree unless --in-place is explicit; --cwd "
+            "for writers must name a managed seat. The project root requires "
+            "--in-place. "
             "Default ref is origin/main when it exists, else HEAD. "
             "Exhaustion names occupants and never falls back to "
             "`git worktree add`."
@@ -25260,6 +25341,12 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             flush=True,
         )
         return 2
+    except goalflight_worktree_pool.WorktreeCwdRefused as e:
+        final_state = "failed"
+        final_reason = str(e)
+        _emit_permanent_dispatch_refusal(args.dispatch_id, e)
+        print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
+        return 64
     except goalflight_worktree_pool.WorktreeSeatError as e:
         final_state = "failed_worktree"
         final_reason = str(e)

@@ -154,6 +154,7 @@ def _dispatch_cmd(
     *,
     extra: list[str] | None = None,
     foreground: bool = False,
+    in_place: bool | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -174,6 +175,11 @@ def _dispatch_cmd(
         "--max-idle-secs",
         "20",
     ]
+    if in_place is None:
+        project_root = dispatch._project_root(SimpleNamespace(cwd=str(tree)))
+        in_place = project_root.resolve() == tree.resolve()
+    if in_place:
+        cmd.append("--in-place")
     if foreground:
         cmd.append("--foreground")
     if extra:
@@ -597,7 +603,7 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
                     tree,
                     "preset-second",
                     agent="grok-code",
-                    extra=["--account", "occupancy-test"],
+                    extra=["--account", "occupancy-test", "--in-place"],
                 ),
                 env,
             )
@@ -870,13 +876,8 @@ def test_cwdless_dead_identity_does_not_block() -> None:
         assert "names no worker cwd" in launched.stderr, launched.stderr
 
 
-def test_matching_project_root_without_cwd_does_not_occupy() -> None:
-    """Live identity + matching project_root + no cwd is occupancy UNKNOWN.
-
-    project_root is not a path claim, but this is write-capable admission:
-    a live nameless row in this repo must not be rendered as "does not
-    occupy this path". --occupied-worktree-forced remains the hatch.
-    """
+def test_matching_project_root_writer_without_in_place_is_refused() -> None:
+    """A matching project root without explicit in-place is refused early."""
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -894,32 +895,18 @@ def test_matching_project_root_without_cwd_does_not_occupy() -> None:
         )
         refused = _run(
             _dispatch_cmd(
-                tmp, tree, "root-only-writer", _quick_writer("root-only-writer")
-            ),
-            env,
-        )
-        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-        assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
-        assert "root-only" in refused.stderr, refused.stderr
-        assert "names no worker cwd" in refused.stderr, refused.stderr
-        assert "project_root" in refused.stderr, refused.stderr
-        assert "--occupied-worktree-forced" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "root-only-writer"), refused.stderr
-
-        forced = _run(
-            _dispatch_cmd(
                 tmp,
                 tree,
                 "root-only-writer",
                 _quick_writer("root-only-writer"),
-                extra=["--occupied-worktree-forced"],
-                foreground=True,
+                in_place=False,
             ),
             env,
         )
-        assert forced.returncode == 64, (forced.stdout, forced.stderr)
-        assert "deprecated and rejected for ordinary dispatch" in forced.stderr
-        assert not _ledger_record(tmp, "root-only-writer"), forced.stderr
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "project root" in refused.stderr, refused.stderr
+        assert "--in-place explicitly" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "root-only-writer"), refused.stderr
 
 
 def test_matching_project_root_without_cwd_skips_when_identity_not_live() -> None:
@@ -1115,13 +1102,17 @@ def test_live_cwdless_matching_project_root_second_writer_is_refused() -> None:
         )
         refused = _run(
             _dispatch_cmd(
-                tmp, tree, "after-live-cwdless", _quick_writer("after-live-cwdless")
+                tmp,
+                tree,
+                "after-live-cwdless",
+                _quick_writer("after-live-cwdless"),
+                in_place=False,
             ),
             env,
         )
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-        assert "live-cwdless" in refused.stderr, refused.stderr
-        assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
+        assert "project root" in refused.stderr, refused.stderr
+        assert "--in-place explicitly" in refused.stderr, refused.stderr
         assert not _ledger_record(tmp, "after-live-cwdless"), refused.stderr
 
 

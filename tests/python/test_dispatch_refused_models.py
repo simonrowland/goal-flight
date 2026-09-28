@@ -132,6 +132,7 @@ def _raw_launch_argv(
         "bash",
         "--cwd",
         str(project),
+        "--in-place",
         "--tail",
         str(marker.with_suffix(".tail")),
         "--poll-secs",
