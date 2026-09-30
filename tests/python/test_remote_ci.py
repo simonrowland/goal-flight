@@ -206,12 +206,32 @@ class ScriptedExecutor:
         self.remote_scripts = []
         self.load1 = 0
         self.before = None
+        self._short_command_window = None
+
+    def use_short_command_window(self, seconds=0.3):
+        """Install a test copy with a short command window for expiry cases."""
+        # The executor launches another interpreter and forks its holder, so seed a hash-matched test copy.
+        source = (ROOT / "scripts" / "goalflight_remote_ci_node.py").read_bytes()
+        window = b"    return max(30.0, 2.0 * controller_poll_seconds + 10.0)\n"
+        assert source.count(window) == 1
+        source = source.replace(window, f"    return {seconds!r}\n".encode())
+        digest = hashlib.sha256(source).hexdigest()
+        helper_dir = self.root / "helpers" / "remote-ci"
+        helper_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        helper = helper_dir / f"goalflight_remote_ci_node-{digest}.py"
+        helper.write_bytes(source)
+        helper.chmod(0o600)
+        self._short_command_window = (digest, len(source))
 
     def __call__(self, argv, env, timeout):
         assert argv[:2] == ["scripted-remote", "ci-worker.example.invalid"]
         self.remote_scripts.append(argv[2])
         shell = shlex.split(argv[2])
         payload = json.loads(base64.b64decode(shell[3]))
+        if self._short_command_window is not None:
+            payload["helper_sha256"], payload["helper_size_bytes"] = self._short_command_window
+            shell[3] = base64.b64encode(json.dumps(
+                payload, separators=(",", ":"), sort_keys=True).encode()).decode()
         expected = payload["helper_sha256"]
         helper = (Path(payload["managed_root"]) / "helpers" / "remote-ci" /
                   f"goalflight_remote_ci_node-{expected}.py")
@@ -657,6 +677,7 @@ def test_reattach_rejects_queued_holder_without_token(node_env):
 
 def test_lost_launch_response_cancels_proven_run_before_freeing_token(node_env):
     config, executor, _, node = node_env
+    executor.use_short_command_window()
     config = replace(config, runner=replace(config.runner,
         command=(sys.executable, "-c", "import time;time.sleep(20)")))
     def losing_executor(argv, env, timeout):
@@ -778,6 +799,7 @@ def _free_tokens(node):
 
 def test_dropped_enqueue_response_does_not_stick_the_token(node_env):
     config, executor, _, node = node_env
+    executor.use_short_command_window()
     config = _green_config(config)
 
     def transport(argv, env, timeout):
@@ -849,10 +871,11 @@ def test_next_arm_recovers_a_forgotten_token(node_env):
 
 
 def test_admitted_holder_releases_when_the_command_never_arrives(node_env):
-    _, _, _, node = node_env
+    _, executor, _, node = node_env
+    executor.use_short_command_window()
     forgotten = node.call(
         "enqueue", request_id="forgotten", arm="candidate",
-        owner=RemoteRunner._owner(), command_wait_seconds=0.3,
+        owner=RemoteRunner._owner(),
     )
     other = enqueue(node, "other")
     admitted = wait_state(node, other, {"admitted"})
@@ -3089,19 +3112,22 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
     monkeypatch.setattr(node, "_remove_job", lambda label: True)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    # dispatch() forks this holder from pytest, so it inherits this test seam.
+    monkeypatch.setattr(node, "admission_command_window_seconds", lambda _: 0.3)
     managed = tmp_path / "managed"
     owner = {"owner_host": "h", "owner_pid": 1, "owner_start_token": "st",
              "owner_identity": "t"}
     record = node.dispatch({
         "operation": "enqueue", "managed_root": str(managed), "box": "b",
         "p_cores": 100000, "token_pool_size": 1, "poll_seconds": 0.01,
+        "controller_poll_seconds": 0.01,
         "request_id": "leader-unknown", "arm": "candidate", "owner": owner,
-        "command_wait_seconds": 5,
     })
     holder = None
     key = {
         "operation": "status", "managed_root": str(managed), "box": "b",
         "p_cores": 100000, "token_pool_size": 1,
+        "controller_poll_seconds": 0.01,
         "run_dir": record["run_directory"], "lease_token": record["lease_token"],
     }
     try:
@@ -3146,3 +3172,20 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
                 os.waitpid(holder, 0)
             except ChildProcessError:
                 pass
+
+
+def test_enqueue_without_controller_poll_seconds_is_rejected(tmp_path, monkeypatch):
+    import builtins
+    import goalflight_remote_ci_node as node
+
+    monkeypatch.setattr(
+        builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
+        str(tmp_path / "auth.json"), raising=False)
+    with pytest.raises(ValueError, match="controller_poll_seconds must be a positive finite number"):
+        node.dispatch({
+            "operation": "enqueue", "managed_root": str(tmp_path / "managed"), "box": "b",
+            "p_cores": 1, "token_pool_size": 1, "poll_seconds": 0.01,
+            "request_id": "missing-poll", "arm": "candidate",
+            "owner": {"owner_host": "h", "owner_pid": 1,
+                      "owner_start_token": "st", "owner_identity": "t"},
+        })
