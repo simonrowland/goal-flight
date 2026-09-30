@@ -218,8 +218,46 @@ via `check_router` in `goalflight_doctor.py`.
 one envelope (explicit src/dst node+path, direction, purpose label recorded to the
 receipt); `goalflight_fleet.py salvage` recovers a crashed worker's dirty worktree
 by listing `git status --porcelain` over SSH, rsyncing only the dirty files into a
-local quarantine, and re-listing before each pass until the file set converges
-(divergence is reported as a liveness signal, not an error).
+local quarantine, and re-listing before each pass until the transferable file set
+converges (divergence is reported as a liveness signal, not an error).
+
+Both commands use a 100 MiB per-file refusal cap by default. Set
+`--max-file-bytes <bytes>` to change it for that operation; a larger product file
+must be explicitly allowed instead of being silently truncated. The default
+leaves room for ordinary source and resource files while refusing accidental
+multi-gigabyte artifacts, which otherwise dominate a cellular transfer.
+
+The ferry excludes these regenerable paths and reports each one in the
+versioned result's `excluded_files` array:
+
+- `pytest-of-*/pytest-<N>` trees and each relative `--pytest-basetemp <path>`
+  target passed to ferry/salvage: pytest creates these temporary test fixtures.
+- `.pytest_cache`: pytest recreates this cache metadata.
+- `__pycache__` and `*.pyc`: Python regenerates bytecode from source.
+- `node_modules`: package managers recreate dependency installs from manifests
+  and lockfiles.
+- The existing append-only patterns (`*.log`, `logs/*`, `tails/*`,
+  `dispatcher.log`, and stdout/stderr log names): ferrying their full history is
+  not needed to recover source changes.
+
+Each report has `path`, `size`, and `rule`; a size refusal also has
+`limit_bytes`. Files above the cap are omitted whole. Result schemas are
+`goalflight.fleet.ferry.receipt.v2` and
+`goalflight.fleet.salvage.manifest.v2`, and carry `incomplete: true` whenever
+files were omitted or salvage did not converge. The CLI prints the result and
+returns status 3 for incomplete transfers. `salvage-complete` refuses to release
+the held account lock from an incomplete manifest until the omitted files are
+reviewed.
+
+For an arbitrary pytest `--basetemp` location inside the worktree, pass the same
+relative path with `--pytest-basetemp`; repeat the option for multiple targets.
+This avoids guessing from a product directory's name. The conventional
+`pytest-of-*/pytest-<N>` layout is recognized automatically.
+
+Rsync uses `-z` to compress source and text bytes on the wire. It retains
+`--checksum`: salvage seeds each quarantine pass from the prior destination and
+uses rsync itemized changes to decide convergence, so size and mtime alone could
+miss a same-size rewrite with a preserved or rounded mtime.
 
 Pass `--dispatch-id` when salvaging a `salvage_needed` dispatch so the written
 `salvage-manifest.json` records `dispatch_id`, `account_key`, and `fencing_token`

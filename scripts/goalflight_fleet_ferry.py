@@ -72,6 +72,7 @@ PROVIDER_AUTH_TOKEN_JSON_KEYS = frozenset(
     }
 )
 CONTENT_SIGNATURE_SCAN_BYTES = 1024 * 1024
+DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024
 PRIVATE_KEY_HEADER_RE = re.compile(
     rb"\A(?:\xef\xbb\xbf)?[ \t\r\n]*-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY-----"
 )
@@ -300,7 +301,7 @@ def _audit_path(fleet_dir: Path) -> Path:
 
 def append_ferry_audit(fleet_dir: Path, receipt: dict[str, Any]) -> None:
     payload = dict(receipt)
-    payload.setdefault("schema", "goalflight.fleet.ferry.receipt.v1")
+    payload.setdefault("schema", "goalflight.fleet.ferry.receipt.v2")
     payload.setdefault("ts", _utc_iso())
     with _audit_path(fleet_dir).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -390,8 +391,19 @@ def _build_rsync_argv(
     dst_root: str,
     files_from: Path,
     itemize: bool,
+    max_file_bytes: int,
 ) -> list[str]:
-    argv = ["rsync", "-a", "--checksum", "--files-from", str(files_from)]
+    # Salvage reuses its quarantine across passes; checksum detects same-size,
+    # same-mtime rewrites that would otherwise look quiet to convergence.
+    argv = [
+        "rsync",
+        "-a",
+        "-z",
+        "--checksum",
+        f"--max-size={max_file_bytes}",
+        "--files-from",
+        str(files_from),
+    ]
     if itemize:
         argv.append("--itemize-changes")
     argv.extend(["-e", _rsync_ssh_arg(host)])
@@ -446,8 +458,15 @@ def _make_push_staging(fleet_dir: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=".goalflight-ferry-push-", dir=str(base)))
 
 
-def _copy_checked_push_files(src_root: Path, staging_root: Path, transfer_files: Iterable[str]) -> None:
+def _copy_checked_push_files(
+    src_root: Path,
+    staging_root: Path,
+    transfer_files: Iterable[str],
+    *,
+    max_file_bytes: int,
+) -> list[dict[str, Any]]:
     root_real = src_root.expanduser().resolve(strict=True)
+    excluded: list[dict[str, Any]] = []
     for rel in transfer_files:
         checked_rel = _checked_local_file(root_real, root_real / rel)
         if checked_rel != rel:
@@ -469,13 +488,46 @@ def _copy_checked_push_files(src_root: Path, staging_root: Path, transfer_files:
                         nlink=st.st_nlink,
                         where="push staging",
                     )
+                if st.st_size > max_file_bytes:
+                    excluded.append(
+                        {
+                            "path": rel,
+                            "size": st.st_size,
+                            "rule": "max-file-bytes",
+                            "limit_bytes": max_file_bytes,
+                        }
+                    )
+                    continue
                 with target.open("wb") as target_handle:
-                    shutil.copyfileobj(source_handle, target_handle)
+                    copied = 0
+                    observed_size: int | None = None
+                    while True:
+                        block = source_handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        if copied + len(block) > max_file_bytes:
+                            observed_size = max(os.fstat(source_handle.fileno()).st_size, copied + len(block))
+                            break
+                        target_handle.write(block)
+                        copied += len(block)
+                if observed_size is not None:
+                    with suppress(FileNotFoundError):
+                        target.unlink()
+                    excluded.append(
+                        {
+                            "path": rel,
+                            "size": observed_size,
+                            "rule": "max-file-bytes",
+                            "limit_bytes": max_file_bytes,
+                        }
+                    )
+                    continue
             os.chmod(target, stat.S_IMODE(st.st_mode) & 0o777)
         except FerryDenyError:
             raise
         except OSError as exc:
             raise FerryError(f"push staging copy failed for {rel}: {exc}") from exc
+    return excluded
 
 
 def _make_pull_quarantine(dst_root: str) -> Path:
@@ -589,7 +641,13 @@ def _remote_preflight_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise FerryError(f"remote root realpath resolves outside declared roots: {root_real}")
 
     checked: list[dict[str, Any]] = []
-    for rel in files:
+    seen: set[str] = set()
+
+    def check_path(rel: str) -> None:
+        if rel in seen:
+            return
+        seen.add(rel)
+        assert_no_credential_paths([rel], where="remote requested")
         candidate = os.path.normpath(os.path.join(root_real, rel.replace("/", os.sep)))
         if not _same_or_under_norm(candidate, root_real):
             raise FerryError(f"remote path escapes declared root: {rel}")
@@ -600,23 +658,62 @@ def _remote_preflight_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if not _same_or_under_text(real, root_real):
             raise FerryError(f"remote path realpath escapes declared root: {rel} -> {real}")
         try:
-            st = os.stat(candidate)
+            st = os.lstat(candidate)
         except FileNotFoundError:
             checked.append({"path": rel, "realpath": real, "exists": False})
-            continue
+            return
         except OSError as exc:
             raise FerryError(f"remote stat failed for {rel}: {exc}") from exc
 
-        if st.st_nlink > 1:
+        if stat.S_ISDIR(st.st_mode):
+            try:
+                children = sorted(os.scandir(candidate), key=lambda child: child.name)
+            except OSError as exc:
+                raise FerryError(f"remote directory scan failed for {rel}: {exc}") from exc
+            if not children:
+                checked.append(
+                    {
+                        "path": rel,
+                        "realpath": real,
+                        "exists": True,
+                        "size": st.st_size,
+                        "ctime_ns": st.st_ctime_ns,
+                        "is_regular_file": False,
+                    }
+                )
+                return
+            for child in children:
+                child_rel = normalize_rel_path(f"{rel}/{child.name}")
+                check_path(child_rel)
+            return
+
+        try:
+            target_st = os.stat(candidate)
+        except OSError as exc:
+            raise FerryError(f"remote stat failed for {rel}: {exc}") from exc
+        if target_st.st_nlink > 1:
             _deny_same_inode_aliases(
                 root_real,
                 rel,
-                dev=st.st_dev,
-                ino=st.st_ino,
-                nlink=st.st_nlink,
+                dev=target_st.st_dev,
+                ino=target_st.st_ino,
+                nlink=target_st.st_nlink,
                 where="remote",
             )
-        checked.append({"path": rel, "realpath": real, "exists": True, "nlink": st.st_nlink})
+        checked.append(
+            {
+                "path": rel,
+                "realpath": real,
+                "exists": True,
+                "nlink": st.st_nlink,
+                "size": st.st_size,
+                "ctime_ns": st.st_ctime_ns,
+                "is_regular_file": stat.S_ISREG(st.st_mode),
+            }
+        )
+
+    for rel in files:
+        check_path(rel)
     return {"ok": True, "checked": checked}
 
 
@@ -628,7 +725,7 @@ def _run_remote_preflight(
     remote_root: str,
     files: Iterable[str],
     runner: Callable[[list[str]], tuple[int, str, str]] | None,
-) -> None:
+) -> dict[str, dict[str, Any]]:
     transfer_files = [normalize_rel_path(path) for path in files]
     assert_no_credential_paths(transfer_files, where="remote requested")
     repo_root = str(node_entry.get("repo_root") or "").strip()
@@ -646,12 +743,43 @@ def _run_remote_preflight(
     ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class="ferry_preflight")
     with fleet_ssh.node_ssh_lock(node_id, fleet_dir=fleet_dir):
         code, stdout, stderr = _run(ssh_argv, runner)
-    if code == 0:
-        return
     try:
         payload = json.loads(stdout or stderr or "{}")
     except json.JSONDecodeError:
         payload = {}
+    if code == 0 and payload.get("ok") is True and isinstance(payload.get("checked"), list):
+        checked: dict[str, dict[str, Any]] = {}
+        for item in payload["checked"]:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise FerryError("remote ferry preflight returned a malformed checked path")
+            rel = normalize_rel_path(item["path"])
+            if rel != item["path"] or rel in checked or not isinstance(item.get("exists"), bool):
+                raise FerryError(f"remote ferry preflight returned an invalid checked path: {item['path']!r}")
+            if item["exists"]:
+                size = item.get("size")
+                if (
+                    not isinstance(item.get("is_regular_file"), bool)
+                    or not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size < 0
+                    or not isinstance(item.get("ctime_ns"), int)
+                    or isinstance(item.get("ctime_ns"), bool)
+                ):
+                    raise FerryError(f"remote ferry preflight returned invalid file metadata for {rel}")
+            checked[rel] = item
+        for requested_path in transfer_files:
+            if not any(
+                checked_path == requested_path or checked_path.startswith(requested_path.rstrip("/") + "/")
+                for checked_path in checked
+            ):
+                raise FerryError(f"remote ferry preflight omitted requested path: {requested_path}")
+        for checked_path in checked:
+            if not any(
+                checked_path == requested_path or checked_path.startswith(requested_path.rstrip("/") + "/")
+                for requested_path in transfer_files
+            ):
+                raise FerryError(f"remote ferry preflight returned an unrequested path: {checked_path}")
+        return checked
     if payload.get("error_type") == "deny":
         raise FerryDenyError(str(payload.get("error") or "remote credential deny preflight failed"))
     raise FerryError(
@@ -682,21 +810,28 @@ def execute_ferry(
     dry_run: bool = False,
     itemize: bool = False,
     expanded_files: Iterable[str] | None = None,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    append_only_paths: Iterable[str] | None = None,
+    pytest_basetemp_paths: Iterable[str] | None = None,
+    _preflight_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> FerryReceipt:
     if not purpose.strip():
         raise FerryError("ferry purpose label is required")
+    if not isinstance(max_file_bytes, int) or isinstance(max_file_bytes, bool) or max_file_bytes < 1:
+        raise FerryError("max_file_bytes must be a positive integer")
+    if direction not in {"pull", "push"}:
+        raise FerryError("direction must be 'pull' or 'push'")
     requested = [normalize_rel_path(path) for path in files]
     assert_no_credential_paths(requested, where="requested")
     if expanded_files is not None:
-        transfer_files = [normalize_rel_path(path) for path in expanded_files]
-        assert_no_credential_paths(transfer_files, where="expanded")
+        candidate_files = [normalize_rel_path(path) for path in expanded_files]
+        assert_no_credential_paths(candidate_files, where="expanded")
     elif direction == "push":
-        transfer_files = expand_local_files(Path(src_root), requested)
+        candidate_files = expand_local_files(Path(src_root), requested)
     else:
-        transfer_files = requested
-        assert_no_credential_paths(transfer_files, where="expanded")
+        candidate_files = requested
     if direction == "push" and expanded_files is not None:
-        _scan_local_files(Path(src_root), transfer_files, where="expanded")
+        _scan_local_files(Path(src_root), candidate_files, where="expanded")
 
     node_entry = _load_node_entry(fleet_dir, node_id)
     remote_root = dst_root if direction == "push" else src_root
@@ -704,8 +839,36 @@ def execute_ferry(
     if direction == "pull":
         assert_controller_staging_root_allowed(fleet_dir, dst_root)
     host = fleet_ssh.host_from_node_entry(node_id, node_entry)
+    append_only_patterns = _merge_append_only_patterns(append_only_paths)
+    basetemp_paths = _normalize_pytest_basetemp_paths(pytest_basetemp_paths)
+    if direction == "push":
+        source_metadata = _source_file_metadata(Path(src_root), candidate_files)
+    elif not dry_run:
+        assert_live_ssh_opt_in()
+        # Salvage reuses its cap-aware convergence scan instead of walking the remote tree twice.
+        source_metadata = _preflight_metadata
+        if source_metadata is None:
+            source_metadata = _run_remote_preflight(
+                fleet_dir,
+                node_id=node_id,
+                node_entry=node_entry,
+                remote_root=src_root,
+                files=candidate_files,
+                runner=runner,
+            )
+        candidate_files = list(source_metadata)
+    else:
+        source_metadata = {}
+    transfer_files, excluded_files = _classify_transfer_files(
+        candidate_files,
+        metadata=source_metadata,
+        max_file_bytes=max_file_bytes,
+        append_only_patterns=append_only_patterns,
+        pytest_basetemp_paths=basetemp_paths,
+        require_sizes=not dry_run,
+    )
     receipt: dict[str, Any] = {
-        "schema": "goalflight.fleet.ferry.receipt.v1",
+        "schema": "goalflight.fleet.ferry.receipt.v2",
         "ts": _utc_iso(),
         "node_id": node_id,
         "direction": direction,
@@ -721,6 +884,9 @@ def execute_ferry(
         "requested_files": requested,
         "files": transfer_files,
         "file_count": len(transfer_files),
+        "max_file_bytes": max_file_bytes,
+        "excluded_files": excluded_files,
+        "incomplete": bool(excluded_files),
         "itemize": itemize,
         "dry_run": dry_run,
     }
@@ -737,10 +903,37 @@ def execute_ferry(
     if not dry_run:
         assert_live_ssh_opt_in()
         if direction == "push":
-            _scan_local_files(Path(src_root), transfer_files, where="pre-stage push")
+            _scan_local_files(Path(src_root), candidate_files, where="pre-stage push")
             try:
                 push_staging_root = _make_push_staging(fleet_dir)
-                _copy_checked_push_files(Path(src_root), push_staging_root, transfer_files)
+                stage_excluded = _copy_checked_push_files(
+                    Path(src_root),
+                    push_staging_root,
+                    transfer_files,
+                    max_file_bytes=max_file_bytes,
+                )
+                if stage_excluded:
+                    excluded_files.extend(stage_excluded)
+                    excluded_paths = {entry["path"] for entry in stage_excluded}
+                    transfer_files = [path for path in transfer_files if path not in excluded_paths]
+                    receipt["files"] = transfer_files
+                    receipt["file_count"] = len(transfer_files)
+                    receipt["excluded_files"] = excluded_files
+                    receipt["incomplete"] = True
+                    if not transfer_files:
+                        receipt.update(
+                            {
+                                "ok": True,
+                                "skipped": "empty transfer set",
+                                "exit_code": 0,
+                                "stdout": "",
+                                "stderr": "",
+                            }
+                        )
+                        append_ferry_audit(fleet_dir, receipt)
+                        shutil.rmtree(push_staging_root, ignore_errors=True)
+                        push_staging_root = None
+                        return FerryReceipt(receipt)
                 _scan_local_files(push_staging_root, transfer_files, where="staged push")
             except Exception:
                 if push_staging_root is not None:
@@ -749,20 +942,21 @@ def execute_ferry(
                 raise
             rsync_src_root = str(push_staging_root)
             receipt["push_staging_root"] = rsync_src_root
-        try:
-            _run_remote_preflight(
-                fleet_dir,
-                node_id=node_id,
-                node_entry=node_entry,
-                remote_root=remote_root,
-                files=transfer_files,
-                runner=runner,
-            )
-        except Exception:
-            if push_staging_root is not None:
-                shutil.rmtree(push_staging_root, ignore_errors=True)
-                push_staging_root = None
-            raise
+        if direction == "push":
+            try:
+                _run_remote_preflight(
+                    fleet_dir,
+                    node_id=node_id,
+                    node_entry=node_entry,
+                    remote_root=remote_root,
+                    files=transfer_files,
+                    runner=runner,
+                )
+            except Exception:
+                if push_staging_root is not None:
+                    shutil.rmtree(push_staging_root, ignore_errors=True)
+                    push_staging_root = None
+                raise
     if direction == "pull":
         Path(dst_root).expanduser().mkdir(parents=True, exist_ok=True, mode=0o700)
         if not dry_run:
@@ -782,6 +976,7 @@ def execute_ferry(
             dst_root=rsync_dst_root,
             files_from=files_from,
             itemize=itemize,
+            max_file_bytes=max_file_bytes,
         )
         receipt["rsync_argv"] = argv
         if dry_run:
@@ -801,13 +996,69 @@ def execute_ferry(
             if direction == "pull":
                 if pull_quarantine is None:
                     raise FerryError("pull quarantine missing after live transfer")
-                _scan_local_files(pull_quarantine, transfer_files, where="post-receive quarantine")
+                postflight = _run_remote_preflight(
+                    fleet_dir,
+                    node_id=node_id,
+                    node_entry=node_entry,
+                    remote_root=src_root,
+                    files=transfer_files,
+                    runner=runner,
+                )
+                refused_after_read: list[dict[str, Any]] = []
+                received_files: list[str] = []
+                for rel in transfer_files:
+                    info = postflight.get(rel) or {}
+                    size = info.get("size") if isinstance(info.get("size"), int) else None
+                    if info.get("exists") is not True:
+                        refused_after_read.append(
+                            {
+                                "path": rel,
+                                "size": None,
+                                "rule": "source-disappeared-after-rsync",
+                            }
+                        )
+                        continue
+                    if info.get("exists") is True and info.get("is_regular_file") is True and size is None:
+                        raise FerryError(f"file size missing from ferry postflight for {rel}; refusing promotion")
+                    if info.get("is_regular_file") is True and size is not None and size > max_file_bytes:
+                        refused_after_read.append(
+                            {
+                                "path": rel,
+                                "size": size,
+                                "rule": "max-file-bytes",
+                                "limit_bytes": max_file_bytes,
+                            }
+                        )
+                        continue
+                    before = source_metadata.get(rel) or {}
+                    # Also check symlinks: ctime and size describe the link itself.
+                    if (
+                        before.get("size") != size
+                        or before.get("ctime_ns") != info.get("ctime_ns")
+                        or before.get("is_regular_file") != info.get("is_regular_file")
+                    ):
+                        refused_after_read.append(
+                            {
+                                "path": rel,
+                                "size": size,
+                                "rule": "source-changed-during-rsync",
+                            }
+                        )
+                        continue
+                    received_files.append(rel)
+                if refused_after_read:
+                    excluded_files.extend(refused_after_read)
+                    receipt["files"] = received_files
+                    receipt["file_count"] = len(received_files)
+                    receipt["excluded_files"] = excluded_files
+                    receipt["incomplete"] = True
+                _scan_local_files(pull_quarantine, received_files, where="post-receive quarantine")
                 assert_no_credential_content(
                     pull_quarantine,
-                    transfer_files,
+                    received_files,
                     where="post-receive quarantine",
                 )
-                _promote_pull_quarantine(pull_quarantine, dst_root, transfer_files)
+                _promote_pull_quarantine(pull_quarantine, dst_root, received_files)
             elif direction == "push":
                 _run_remote_preflight(
                     fleet_dir,
@@ -870,10 +1121,21 @@ def filter_salvage_denied(paths: Iterable[str]) -> tuple[list[str], list[dict[st
     return allowed, skipped
 
 
-def _salvage_targets_from_porcelain(stdout: str) -> tuple[list[str], list[str], list[dict[str, str]]]:
+def _salvage_targets_from_porcelain(
+    stdout: str,
+    *,
+    append_only_patterns: Iterable[str],
+    pytest_basetemp_paths: Iterable[str],
+) -> tuple[list[str], list[str], list[dict[str, str]]]:
     parsed_paths, parse_skipped = parse_porcelain_paths(stdout)
-    target_files, deny_skipped = filter_salvage_denied(parsed_paths)
-    return parsed_paths, target_files, parse_skipped + deny_skipped
+    candidate_files, deny_skipped = filter_salvage_denied(parsed_paths)
+    convergence_files = [
+        path
+        for path in parsed_paths
+        if _scratch_exclusion_rule(path, pytest_basetemp_paths) is None
+        and _append_only_exclusion_rule(path, append_only_patterns) is None
+    ]
+    return convergence_files, candidate_files, parse_skipped + deny_skipped
 
 
 def _assert_salvage_targets_unchanged(
@@ -959,6 +1221,101 @@ def _merge_append_only_patterns(extra: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(merged)
 
 
+def _normalize_pytest_basetemp_paths(paths: Iterable[str] | None) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for path in paths or ():
+        rel = normalize_rel_path(path)
+        if rel not in seen:
+            seen.add(rel)
+            normalized.append(rel)
+    return tuple(normalized)
+
+
+def _scratch_exclusion_rule(path: str, pytest_basetemp_paths: Iterable[str]) -> str | None:
+    rel = normalize_rel_path(path)
+    parts = PurePosixPath(rel).parts
+    for root in pytest_basetemp_paths:
+        if rel == root or rel.startswith(root.rstrip("/") + "/"):
+            return f"explicit pytest --basetemp target {root} (pytest recreates its contents)"
+    if any(part == ".pytest_cache" for part in parts):
+        return ".pytest_cache directory (pytest regenerates cache metadata)"
+    if any(part == "__pycache__" for part in parts):
+        return "__pycache__ directory (Python regenerates bytecode from source)"
+    if PurePosixPath(rel).name.endswith(".pyc"):
+        return "*.pyc file (compiled Python bytecode regenerated from source)"
+    if any(part == "node_modules" for part in parts):
+        return "node_modules directory (dependencies are restored from package manifests and lockfiles)"
+    for index, part in enumerate(parts[:-1]):
+        if part.startswith("pytest-of-") and re.fullmatch(r"pytest-[0-9]+", parts[index + 1]):
+            return "pytest basetemp tree pytest-of-*/pytest-<N> (pytest creates disposable test data)"
+    return None
+
+
+def _append_only_exclusion_rule(path: str, patterns: Iterable[str]) -> str | None:
+    rel = normalize_rel_path(path)
+    basename = PurePosixPath(rel).name
+    for pattern in patterns:
+        normalized = str(pattern).strip().replace("\\", "/")
+        if normalized and (fnmatch.fnmatch(rel, normalized) or fnmatch.fnmatch(basename, normalized)):
+            return f"append-only log pattern {normalized}"
+    return None
+
+
+def _source_file_metadata(root: Path, files: Iterable[str]) -> dict[str, dict[str, Any]]:
+    root_real = root.expanduser().resolve(strict=True)
+    result: dict[str, dict[str, Any]] = {}
+    for rel in files:
+        source = root_real / rel
+        try:
+            st = os.stat(source)
+        except OSError as exc:
+            raise FerryError(f"local stat failed for {rel}: {exc}") from exc
+        result[rel] = {
+            "path": rel,
+            "exists": True,
+            "size": st.st_size,
+            "is_regular_file": stat.S_ISREG(st.st_mode),
+        }
+    return result
+
+
+def _classify_transfer_files(
+    files: Iterable[str],
+    *,
+    metadata: dict[str, dict[str, Any]],
+    max_file_bytes: int,
+    append_only_patterns: Iterable[str],
+    pytest_basetemp_paths: Iterable[str],
+    require_sizes: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    transfer_files: list[str] = []
+    excluded: list[dict[str, Any]] = []
+    for rel in files:
+        info = metadata.get(rel) or {}
+        size = info.get("size") if isinstance(info.get("size"), int) else None
+        rule = _scratch_exclusion_rule(rel, pytest_basetemp_paths)
+        if rule is None:
+            rule = _append_only_exclusion_rule(rel, append_only_patterns)
+        if rule is not None:
+            excluded.append({"path": rel, "size": size, "rule": rule})
+            continue
+        if require_sizes and info.get("exists") is True and info.get("is_regular_file") is True and size is None:
+            raise FerryError(f"file size missing from ferry preflight for {rel}; refusing uncapped transfer")
+        if info.get("is_regular_file") is True and size is not None and size > max_file_bytes:
+            excluded.append(
+                {
+                    "path": rel,
+                    "size": size,
+                    "rule": "max-file-bytes",
+                    "limit_bytes": max_file_bytes,
+                }
+            )
+            continue
+        transfer_files.append(rel)
+    return transfer_files, excluded
+
+
 def _salvage_lock_identity(fleet_dir: Path, dispatch_id: str | None) -> dict[str, str]:
     """Resolve dispatch + account lock fields for post-salvage release."""
     if not dispatch_id:
@@ -991,52 +1348,128 @@ def salvage_worktree(
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     max_iterations: int = 10,
     append_only_paths: Iterable[str] | None = None,
+    pytest_basetemp_paths: Iterable[str] | None = None,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
     sleep_s: float = 1.0,
 ) -> dict[str, Any]:
     assert_live_ssh_opt_in()
     if max_iterations < 1:
         raise FerryError("max_iterations must be >= 1")
+    if not isinstance(max_file_bytes, int) or isinstance(max_file_bytes, bool) or max_file_bytes < 1:
+        raise FerryError("max_file_bytes must be a positive integer")
     out_dir = out_dir.expanduser()
     assert_controller_staging_root_allowed(fleet_dir, out_dir)
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     append_only_patterns = _merge_append_only_patterns(append_only_paths)
+    basetemp_paths = _normalize_pytest_basetemp_paths(pytest_basetemp_paths)
     porcelain = _run_remote_git_status(
         fleet_dir,
         node_id=node_id,
         worktree_path=worktree_path,
         runner=runner,
     )
-    parsed_paths, target_files, skipped = _salvage_targets_from_porcelain(porcelain)
+    convergence_files, target_files, skipped = _salvage_targets_from_porcelain(
+        porcelain,
+        append_only_patterns=append_only_patterns,
+        pytest_basetemp_paths=basetemp_paths,
+    )
 
     initial_receipt: dict[str, Any] | None = None
+    excluded_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    transferred_paths: set[str] = set()
+    known_capped_paths: set[str] = set()
+    node_entry = _load_node_entry(fleet_dir, node_id)
+
+    def preflight_candidates(paths: Iterable[str]) -> dict[str, dict[str, Any]]:
+        candidates = list(paths)
+        if not candidates:
+            return {}
+        return _run_remote_preflight(
+            fleet_dir,
+            node_id=node_id,
+            node_entry=node_entry,
+            remote_root=worktree_path,
+            files=candidates,
+            runner=runner,
+        )
+
+    def record_capped_paths(metadata: dict[str, dict[str, Any]]) -> None:
+        for path, info in metadata.items():
+            if info.get("exists") is not True or info.get("is_regular_file") is not True:
+                continue
+            size = info.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size <= max_file_bytes:
+                continue
+            if (
+                _scratch_exclusion_rule(path, basetemp_paths) is not None
+                or _append_only_exclusion_rule(path, append_only_patterns) is not None
+            ):
+                continue
+            known_capped_paths.add(path)
+            excluded_by_key[(path, "max-file-bytes")] = {
+                "path": path,
+                "size": size,
+                "rule": "max-file-bytes",
+                "limit_bytes": max_file_bytes,
+            }
+
+    def without_known_capped(paths: Iterable[str]) -> list[str]:
+        return [path for path in paths if path not in known_capped_paths]
+
     if target_files:
-        current_paths, current_targets, current_skipped = _salvage_targets_from_porcelain(
+        first_metadata = preflight_candidates(target_files)
+        record_capped_paths(first_metadata)
+        current_convergence_files, current_candidates, current_skipped = _salvage_targets_from_porcelain(
             _run_remote_git_status(
                 fleet_dir,
                 node_id=node_id,
                 worktree_path=worktree_path,
                 runner=runner,
-            )
+            ),
+            append_only_patterns=append_only_patterns,
+            pytest_basetemp_paths=basetemp_paths,
         )
+        current_metadata = (
+            first_metadata
+            if current_candidates == target_files
+            else preflight_candidates(current_candidates)
+        )
+        record_capped_paths(current_metadata)
+        current_convergence_files = without_known_capped(current_convergence_files)
+        previous_convergence_files = without_known_capped(convergence_files)
         _assert_salvage_targets_unchanged(
-            current_paths=current_paths,
-            previous_paths=parsed_paths,
-            current_targets=current_targets,
-            previous_targets=target_files,
+            current_paths=current_convergence_files,
+            previous_paths=previous_convergence_files,
+            current_targets=current_convergence_files,
+            previous_targets=previous_convergence_files,
             phase="initial rsync",
         )
         skipped = current_skipped
+        initial_candidates = list(dict.fromkeys([*target_files, *current_candidates]))
+        initial_metadata = dict(first_metadata)
+        initial_metadata.update(current_metadata)
         initial_receipt = execute_ferry(
             fleet_dir,
             node_id=node_id,
             direction="pull",
             src_root=worktree_path,
             dst_root=str(out_dir),
-            files=target_files,
-            expanded_files=target_files,
+            files=initial_candidates,
+            expanded_files=initial_candidates,
             purpose=f"{purpose}:initial",
             runner=runner,
+            max_file_bytes=max_file_bytes,
+            append_only_paths=append_only_patterns,
+            pytest_basetemp_paths=basetemp_paths,
+            _preflight_metadata=initial_metadata,
         ).to_dict()
+        transferred_paths.update(str(path) for path in initial_receipt.get("files") or [])
+        for path in initial_receipt.get("files") or []:
+            for key in [key for key in excluded_by_key if key[0] == path]:
+                excluded_by_key.pop(key, None)
+        for entry in initial_receipt.get("excluded_files") or []:
+            key = (str(entry.get("path") or ""), str(entry.get("rule") or ""))
+            excluded_by_key[key] = entry
 
     iterations: list[dict[str, Any]] = []
     consecutive_zero = 0
@@ -1044,19 +1477,25 @@ def salvage_worktree(
     for idx in range(1, max_iterations + 1):
         if not target_files:
             break
-        current_paths, current_targets, current_skipped = _salvage_targets_from_porcelain(
+        current_convergence_files, current_candidates, current_skipped = _salvage_targets_from_porcelain(
             _run_remote_git_status(
                 fleet_dir,
                 node_id=node_id,
                 worktree_path=worktree_path,
                 runner=runner,
-            )
+            ),
+            append_only_patterns=append_only_patterns,
+            pytest_basetemp_paths=basetemp_paths,
         )
+        current_metadata = preflight_candidates(current_candidates)
+        record_capped_paths(current_metadata)
+        current_convergence_files = without_known_capped(current_convergence_files)
+        previous_convergence_files = without_known_capped(convergence_files)
         _assert_salvage_targets_unchanged(
-            current_paths=current_paths,
-            previous_paths=parsed_paths,
-            current_targets=current_targets,
-            previous_targets=target_files,
+            current_paths=current_convergence_files,
+            previous_paths=previous_convergence_files,
+            current_targets=current_convergence_files,
+            previous_targets=previous_convergence_files,
             phase=f"convergence rsync {idx}",
         )
         skipped = current_skipped
@@ -1066,12 +1505,23 @@ def salvage_worktree(
             direction="pull",
             src_root=worktree_path,
             dst_root=str(out_dir),
-            files=target_files,
-            expanded_files=target_files,
+            files=current_candidates,
+            expanded_files=current_candidates,
             purpose=f"{purpose}:convergence-{idx}",
             runner=runner,
             itemize=True,
+            max_file_bytes=max_file_bytes,
+            append_only_paths=append_only_patterns,
+            pytest_basetemp_paths=basetemp_paths,
+            _preflight_metadata=current_metadata,
         ).to_dict()
+        transferred_paths.update(str(path) for path in receipt.get("files") or [])
+        for path in receipt.get("files") or []:
+            for key in [key for key in excluded_by_key if key[0] == path]:
+                excluded_by_key.pop(key, None)
+        for entry in receipt.get("excluded_files") or []:
+            key = (str(entry.get("path") or ""), str(entry.get("rule") or ""))
+            excluded_by_key[key] = entry
         changed = parse_rsync_itemized_paths(str(receipt.get("stdout") or ""))
         checked_changed = [path for path in changed if not _matches_append_only(path, append_only_patterns)]
         zero_delta = not checked_changed
@@ -1091,15 +1541,20 @@ def salvage_worktree(
         if idx < max_iterations:
             time.sleep(sleep_s)
 
-    files = [_file_entry(out_dir, rel) for rel in target_files]
+    excluded_files = sorted(excluded_by_key.values(), key=lambda entry: (entry["path"], entry["rule"]))
+    files = [_file_entry(out_dir, rel) for rel in sorted(transferred_paths)]
+    incomplete = bool(skipped or excluded_files or not converged)
     lock_identity = _salvage_lock_identity(fleet_dir, dispatch_id)
     manifest: dict[str, Any] = {
-        "schema": "goalflight.fleet.salvage.manifest.v1",
+        "schema": "goalflight.fleet.salvage.manifest.v2",
         "ts": _utc_iso(),
         "node_id": node_id,
         "worktree_path": worktree_path,
         "salvage_dir": str(out_dir),
         "target_files": target_files,
+        "max_file_bytes": max_file_bytes,
+        "excluded_files": excluded_files,
+        "incomplete": incomplete,
         "skipped": skipped,
         "files": files,
         "iterations": iterations,
@@ -1134,12 +1589,14 @@ def cmd_ferry(args) -> int:
             files=args.path,
             purpose=args.purpose,
             dry_run=not args.exec,
+            max_file_bytes=args.max_file_bytes,
+            pytest_basetemp_paths=args.pytest_basetemp,
         ).to_dict()
     except FerryError as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 2
     print(json.dumps(receipt, indent=2, sort_keys=True))
-    return 0
+    return 3 if receipt.get("incomplete") else 0
 
 
 def cmd_salvage(args) -> int:
@@ -1152,6 +1609,10 @@ def cmd_salvage(args) -> int:
                     "worktree_path": args.worktree_path,
                     "out_dir": str(args.out_dir),
                     "max_iterations": args.max_iterations,
+                    "max_file_bytes": args.max_file_bytes,
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "incomplete": False,
+                    "excluded_files": [],
                 },
                 indent=2,
                 sort_keys=True,
@@ -1168,13 +1629,15 @@ def cmd_salvage(args) -> int:
             dispatch_id=getattr(args, "dispatch_id", None),
             max_iterations=args.max_iterations,
             append_only_paths=args.append_only,
+            pytest_basetemp_paths=args.pytest_basetemp,
+            max_file_bytes=args.max_file_bytes,
             sleep_s=args.sleep_s,
         )
     except FerryError as exc:
         print(str(exc), file=__import__("sys").stderr)
         return 2
     print(json.dumps(manifest, indent=2, sort_keys=True))
-    return 0
+    return 3 if manifest.get("incomplete") else 0
 
 
 def _cmd_remote_preflight(argv: list[str]) -> int:

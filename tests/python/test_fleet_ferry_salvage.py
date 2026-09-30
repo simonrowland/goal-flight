@@ -8,11 +8,13 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("fleet ferry fixtures use POSIX paths and symlinks")
 
 import json
+import base64
 import os
+import re
 import sys
 import tempfile
 import io
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,6 +68,36 @@ def _files_from(argv: list[str]) -> list[str]:
     return path.read_text().splitlines()
 
 
+def _remote_preflight_reply(
+    argv: list[str],
+    *,
+    sizes: dict[str, int] | None = None,
+    ctimes: dict[str, int] | None = None,
+    symlink_paths: set[str] | None = None,
+) -> tuple[int, str, str]:
+    joined = " ".join(argv)
+    match = re.search(r"--payload-b64\s+'?([A-Za-z0-9+/=]+)'?", joined)
+    assert_true("remote preflight payload present", match is not None)
+    payload = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+    root = payload["root"]
+    sizes = sizes or {}
+    ctimes = ctimes or {}
+    symlink_paths = symlink_paths or set()
+    checked = [
+        {
+            "path": rel,
+            "realpath": str(Path(root) / rel),
+            "exists": True,
+            "nlink": 1,
+            "size": sizes.get(rel, 1),
+            "ctime_ns": ctimes.get(rel, 1),
+            "is_regular_file": rel not in symlink_paths,
+        }
+        for rel in payload["files"]
+    ]
+    return 0, json.dumps({"ok": True, "checked": checked}), ""
+
+
 def _write_dest_files(argv: list[str], files: list[str], prefix: str = "data") -> None:
     dest = Path(argv[-1])
     for rel in files:
@@ -92,6 +124,8 @@ def test_ferry_happy_path_both_directions_and_receipt() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 captured.append(list(argv))
+                if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync" and argv[-1].endswith("/"):
                     files = _files_from(argv)
                     if argv[-1].startswith(str(dst)):
@@ -121,9 +155,15 @@ def test_ferry_happy_path_both_directions_and_receipt() -> None:
             assert_true("push ok", push["ok"] is True)
             assert_true("pull ok", pull["ok"] is True)
             assert_true("purpose", pull["purpose"] == "unit-pull")
+            assert_true("receipt schema bumped", pull["schema"] == "goalflight.fleet.ferry.receipt.v2")
+            assert_true("complete receipt marked", pull["incomplete"] is False)
             assert_true("explicit src node", pull["src"]["node"] == "localhost")
             assert_true("explicit dst node", pull["dst"]["node"] == "controller")
             assert_true("two rsyncs", len([argv for argv in captured if argv[0] == "rsync"]) == 2)
+            rsync_argv = next(argv for argv in captured if argv[0] == "rsync")
+            assert_true("rsync compression enabled", "-z" in rsync_argv)
+            assert_true("rsync checksum retained for convergence correctness", "--checksum" in rsync_argv)
+            assert_true("configured rsync size cap", f"--max-size={ferry.DEFAULT_MAX_FILE_BYTES}" in rsync_argv)
             audit = (fleet_dir / "audit" / "ferry.jsonl").read_text().splitlines()
             assert_true("audit rows", len(audit) == 2)
             assert_true("audit purpose", json.loads(audit[-1])["purpose"] == "unit-pull")
@@ -410,7 +450,7 @@ def test_push_stages_scanned_bytes_before_rsync_source_swap() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 if argv[0] == "ssh":
-                    return 0, '{"ok":true}\n', ""
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync":
                     assert_true("one safe transfer", _files_from(argv) == ["safe.txt"])
                     live_safe.unlink()
@@ -542,7 +582,7 @@ def test_partial_pull_cleanup_on_rsync_failure() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
-                    return 0, '{"ok":true}\n', ""
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync":
                     _write_dest_files(argv, _files_from(argv), prefix="partial")
                     return 23, "", "mid-transfer failure"
@@ -574,7 +614,7 @@ def test_pull_quarantine_denies_private_key_content_before_promotion() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
-                    return 0, '{"ok":true}\n', ""
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync":
                     path = Path(argv[-1]) / "safe.txt"
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,7 +648,7 @@ def test_pull_quarantine_denies_provider_token_json_before_promotion() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
-                    return 0, '{"ok":true}\n', ""
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync":
                     path = Path(argv[-1]) / "safe.txt"
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,7 +682,7 @@ def test_pull_quarantine_allows_non_provider_token_json() -> None:
 
             def runner(argv: list[str]) -> tuple[int, str, str]:
                 if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
-                    return 0, '{"ok":true}\n', ""
+                    return _remote_preflight_reply(argv)
                 if argv[0] == "rsync":
                     path = Path(argv[-1]) / "safe.txt"
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -664,10 +704,107 @@ def test_pull_quarantine_allows_non_provider_token_json() -> None:
             assert_true("non-provider token promoted", (dst / "safe.txt").exists())
 
 
+def test_pull_refuses_source_changed_during_rsync() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            dst = _staging(fleet_dir, "pull-source-race")
+            dst.mkdir(parents=True)
+            (dst / "safe.txt").write_text("previous local bytes\n")
+            preflight_calls = 0
+
+            def runner(argv: list[str]) -> tuple[int, str, str]:
+                nonlocal preflight_calls
+                joined = " ".join(argv)
+                if argv[0] == "ssh" and "remote-preflight" in joined:
+                    preflight_calls += 1
+                    return _remote_preflight_reply(
+                        argv,
+                        sizes={"safe.txt": 10},
+                        ctimes={"safe.txt": preflight_calls},
+                    )
+                if argv[0] == "rsync":
+                    assert_true("rsync uses cap refusal", "--max-size=20" in argv)
+                    return 0, "", ""
+                return 1, "", f"unexpected argv: {joined}"
+
+            receipt = ferry.execute_ferry(
+                fleet_dir,
+                node_id="localhost",
+                direction="pull",
+                src_root="/remote/worktree",
+                dst_root=str(dst),
+                files=["safe.txt"],
+                purpose="source-race-test",
+                runner=runner,
+                max_file_bytes=20,
+            ).to_dict()
+
+            assert_true("postflight ran", preflight_calls == 2)
+            assert_true("source race marks receipt incomplete", receipt["incomplete"] is True)
+            assert_true("stale seeded copy is not reported as received", receipt["files"] == [])
+            refusal = next(entry for entry in receipt["excluded_files"] if entry["path"] == "safe.txt")
+            assert_true("source race rule reported", refusal["rule"] == "source-changed-during-rsync")
+            assert_true("previous destination bytes remain", (dst / "safe.txt").read_text() == "previous local bytes\n")
+
+
+def test_pull_refuses_symlink_changed_during_rsync() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            dst = _staging(fleet_dir, "pull-symlink-race")
+            dst.mkdir(parents=True)
+            (dst / "safe-link").symlink_to("old-target")
+            preflight_calls = 0
+
+            def runner(argv: list[str]) -> tuple[int, str, str]:
+                nonlocal preflight_calls
+                joined = " ".join(argv)
+                if argv[0] == "ssh" and "remote-preflight" in joined:
+                    preflight_calls += 1
+                    return _remote_preflight_reply(
+                        argv,
+                        sizes={"safe-link": 10},
+                        ctimes={"safe-link": preflight_calls},
+                        symlink_paths={"safe-link"},
+                    )
+                if argv[0] == "rsync":
+                    return 0, "", ""
+                return 1, "", f"unexpected argv: {joined}"
+
+            receipt = ferry.execute_ferry(
+                fleet_dir,
+                node_id="localhost",
+                direction="pull",
+                src_root="/remote/worktree",
+                dst_root=str(dst),
+                files=["safe-link"],
+                purpose="symlink-source-race-test",
+                runner=runner,
+                max_file_bytes=20,
+            ).to_dict()
+
+            assert_true("symlink postflight ran", preflight_calls == 2)
+            assert_true("symlink race marks receipt incomplete", receipt["incomplete"] is True)
+            assert_true("stale seeded symlink is not reported as received", receipt["files"] == [])
+            refusal = next(entry for entry in receipt["excluded_files"] if entry["path"] == "safe-link")
+            assert_true("symlink race rule reported", refusal["rule"] == "source-changed-during-rsync")
+            assert_true("previous destination symlink remains", (dst / "safe-link").is_symlink())
+
+
 class SalvageRunner:
-    def __init__(self, porcelain: str | list[str], diffs: list[str]) -> None:
+    def __init__(
+        self,
+        porcelain: str | list[str],
+        diffs: list[str],
+        *,
+        remote_sizes: dict[str, int | list[int]] | None = None,
+    ) -> None:
         self.porcelains = [porcelain] if isinstance(porcelain, str) else list(porcelain)
         self.diffs = list(diffs)
+        self.remote_sizes = remote_sizes or {}
         self.rsync_files: list[list[str]] = []
         self.status_calls = 0
         self.preflight_calls = 0
@@ -676,7 +813,13 @@ class SalvageRunner:
         joined = " ".join(argv)
         if argv[0] == "ssh" and "remote-preflight" in joined:
             self.preflight_calls += 1
-            return 0, '{"ok":true}\n', ""
+            sizes: dict[str, int] = {}
+            for path, values in self.remote_sizes.items():
+                if isinstance(values, list):
+                    sizes[path] = values[min(self.preflight_calls - 1, len(values) - 1)]
+                else:
+                    sizes[path] = values
+            return _remote_preflight_reply(argv, sizes=sizes)
         if argv[0] == "ssh" and " status " in f" {joined} ":
             idx = min(self.status_calls, len(self.porcelains) - 1)
             self.status_calls += 1
@@ -741,7 +884,16 @@ def test_salvage_append_only_exclusion_converges() -> None:
         with tempfile.TemporaryDirectory() as td:
             fleet_dir = Path(td) / "fleet"
             _fixture_fleet(fleet_dir)
-            runner = SalvageRunner(" M dispatcher.log\n", [">fcs....... dispatcher.log\n"] * 10)
+            runner = SalvageRunner(
+                [
+                    " M dispatcher.log\n",
+                    " M dispatcher.log\n",
+                    " M dispatcher.log\n?? tails/active-tail\n",
+                    " M dispatcher.log\n",
+                ],
+                [">fcs....... dispatcher.log\n"] * 10,
+                remote_sizes={"dispatcher.log": [1, 100, 10000], "tails/active-tail": 17},
+            )
             manifest = ferry.salvage_worktree(
                 fleet_dir,
                 node_id="localhost",
@@ -753,7 +905,12 @@ def test_salvage_append_only_exclusion_converges() -> None:
             )
             assert_true("converged", manifest["converged"] is True)
             assert_true("two zero passes", len(manifest["iterations"]) == 2)
-            assert_true("append only excluded", manifest["iterations"][0]["checked_changed"] == [])
+            assert_true("append-only log never ferried", all("dispatcher.log" not in files for files in runner.rsync_files))
+            assert_true(
+                "changing log size reported",
+                any(entry["path"] == "dispatcher.log" and entry["size"] == 10000 for entry in manifest["excluded_files"]),
+            )
+            assert_true("new excluded tail reported", any(entry["path"] == "tails/active-tail" for entry in manifest["excluded_files"]))
 
 
 def test_salvage_default_append_only_exclusion_converges() -> None:
@@ -775,9 +932,214 @@ def test_salvage_default_append_only_exclusion_converges() -> None:
             )
             assert_true("converged via defaults", manifest["converged"] is True)
             assert_true("two default zero passes", len(manifest["iterations"]) == 2)
-            assert_true("default append-only excluded", manifest["iterations"][0]["checked_changed"] == [])
-            assert_true("dispatcher observed", "dispatcher.log" in manifest["iterations"][0]["changed"])
-            assert_true("tail observed", "tails/stdout.log" in manifest["iterations"][0]["changed"])
+            assert_true("default append-only excluded", all(not files for files in runner.rsync_files))
+            assert_true(
+                "default logs reported",
+                {entry["path"] for entry in manifest["excluded_files"]}
+                == {"dispatcher.log", "tails/stdout.log"},
+            )
+
+
+def test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            scratch_paths = [
+                ".pytest_cache/v/cache/nodeids",
+                "pytest-of-worker/pytest-3/test_render0/output.bin",
+                "tmp/custom-test-run/test_output.bin",
+                "pkg/__pycache__/module.cpython-313.pyc",
+                "pkg/module.pyc",
+                "vendor/node_modules/library/index.js",
+                "dispatcher.log",
+            ]
+            porcelain = "".join(f"?? {path}\n" for path in scratch_paths)
+            porcelain += "?? src/pytest_fixture.py\n M src/app.py\n"
+            runner = SalvageRunner(porcelain, ["", ""])
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "scratch-salvage"),
+                runner=runner,
+                pytest_basetemp_paths=("tmp/custom-test-run",),
+                sleep_s=0,
+            )
+
+            first_transfer = runner.rsync_files[0]
+            assert_true("pytest cache excluded", ".pytest_cache/v/cache/nodeids" not in first_transfer)
+            assert_true("pytest basetemp excluded", "pytest-of-worker/pytest-3/test_render0/output.bin" not in first_transfer)
+            assert_true("explicit --basetemp target excluded", "tmp/custom-test-run/test_output.bin" not in first_transfer)
+            assert_true("bytecode caches excluded", "pkg/__pycache__/module.cpython-313.pyc" not in first_transfer)
+            assert_true("standalone bytecode excluded", "pkg/module.pyc" not in first_transfer)
+            assert_true("node_modules excluded", "vendor/node_modules/library/index.js" not in first_transfer)
+            assert_true("append-only log excluded", "dispatcher.log" not in first_transfer)
+            assert_true("scratch-like product source retained", "src/pytest_fixture.py" in first_transfer)
+            excluded_by_path = {entry["path"]: entry for entry in manifest["excluded_files"]}
+            reported = set(excluded_by_path)
+            assert_true("every scratch path reported", set(scratch_paths) <= reported)
+            for path in scratch_paths:
+                entry = excluded_by_path[path]
+                assert_true(
+                    f"exclusion report has path, size, and rule for {path}",
+                    entry.get("path") == path and isinstance(entry.get("size"), int) and bool(entry.get("rule")),
+                )
+            assert_true(
+                "append-only report identifies log rule",
+                excluded_by_path["dispatcher.log"]["rule"].startswith("append-only log pattern"),
+            )
+
+
+def test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            runner = SalvageRunner(
+                "?? artifacts/large.bin\n",
+                ["", ""],
+                remote_sizes={"artifacts/large.bin": 65},
+            )
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "over-cap-salvage"),
+                runner=runner,
+                max_file_bytes=64,
+                sleep_s=0,
+            )
+
+            assert_true("over-cap file never sent", runner.rsync_files == [])
+            assert_true("quiet rounds still converge", manifest["converged"] is True)
+            assert_true("over-cap marks result incomplete", manifest["incomplete"] is True)
+            refused = next(entry for entry in manifest["excluded_files"] if entry["path"] == "artifacts/large.bin")
+            assert_true("exact capped size reported", refused["size"] == 65)
+            assert_true("cap rule reported", refused["rule"] == "max-file-bytes")
+            assert_true("configured cap reported", refused["limit_bytes"] == 64)
+
+
+def test_salvage_capped_path_churn_does_not_block_convergence() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            porcelain = [
+                " M src/app.py\n?? artifacts/large.bin\n",
+                " M src/app.py\n?? artifacts/large.bin\n",
+                " M src/app.py\n",
+                " M src/app.py\n?? artifacts/large.bin\n",
+            ]
+            runner = SalvageRunner(
+                porcelain,
+                ["", ""],
+                remote_sizes={"artifacts/large.bin": 65},
+            )
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "capped-churn-salvage"),
+                runner=runner,
+                max_file_bytes=64,
+                sleep_s=0,
+            )
+
+            assert_true("changing capped path does not abort", manifest["converged"] is True)
+            assert_true(
+                "two quiet rounds recorded",
+                len(manifest["iterations"]) == 2 and manifest["iterations"][-1]["consecutive_zero"] == 2,
+            )
+            assert_true("capped path never reaches rsync", all("artifacts/large.bin" not in files for files in runner.rsync_files))
+            refusal = next(entry for entry in manifest["excluded_files"] if entry["path"] == "artifacts/large.bin")
+            assert_true("churning capped path remains reported", refusal["size"] == 65 and refusal["rule"] == "max-file-bytes")
+
+
+def test_push_refuses_over_cap_file_in_ferry_receipt() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            fleet_dir = base / "fleet"
+            src = base / "src"
+            src.mkdir()
+            (src / "large.bin").write_bytes(b"0123456789")
+            _fixture_fleet(fleet_dir)
+            called = False
+
+            def runner(_argv: list[str]) -> tuple[int, str, str]:
+                nonlocal called
+                called = True
+                return 0, "", ""
+
+            receipt = ferry.execute_ferry(
+                fleet_dir,
+                node_id="localhost",
+                direction="push",
+                src_root=str(src),
+                dst_root="/remote/worktree",
+                files=["large.bin"],
+                purpose="size-cap-test",
+                runner=runner,
+                max_file_bytes=9,
+            ).to_dict()
+
+            assert_true("over-cap push never reaches transport", called is False)
+            assert_true("receipt schema bumped", receipt["schema"] == "goalflight.fleet.ferry.receipt.v2")
+            assert_true("receipt incomplete", receipt["incomplete"] is True)
+            assert_true("receipt has no transferred file", receipt["files"] == [])
+            refused = receipt["excluded_files"][0]
+            assert_true("receipt reports path and size", refused["path"] == "large.bin" and refused["size"] == 10)
+
+
+def test_synthetic_basetemp_exclusion_byte_reduction() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            fleet_dir = base / "fleet"
+            src = base / "source"
+            product = src / "src" / "app.py"
+            basetemp = src / "pytest-of-worker" / "pytest-4" / "test_big0" / "output.bin"
+            product.parent.mkdir(parents=True)
+            basetemp.parent.mkdir(parents=True)
+            product_payload = b"product diff\n"
+            product.write_bytes(product_payload)
+            with basetemp.open("wb") as handle:
+                handle.truncate(10_000_000_000)
+            _fixture_fleet(fleet_dir)
+            captured: list[list[str]] = []
+
+            def runner(argv: list[str]) -> tuple[int, str, str]:
+                if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
+                    return _remote_preflight_reply(argv)
+                if argv[0] == "rsync":
+                    captured.append(_files_from(argv))
+                    return 0, "", ""
+                return 1, "", f"unexpected argv: {' '.join(argv)}"
+
+            receipt = ferry.execute_ferry(
+                fleet_dir,
+                node_id="localhost",
+                direction="push",
+                src_root=str(src),
+                dst_root="/remote/worktree",
+                files=["src", "pytest-of-worker"],
+                purpose="synthetic-byte-reduction",
+                runner=runner,
+            ).to_dict()
+            before_bytes = product.stat().st_size + basetemp.stat().st_size
+            selected_bytes = sum((src / rel).stat().st_size for rel in receipt["files"])
+            removed_bytes = before_bytes - selected_bytes
+            percent = 100 * removed_bytes / before_bytes
+
+            assert_true("only small product change selected", receipt["files"] == ["src/app.py"])
+            assert_true("rsync list matches receipt", captured == [["src/app.py"]])
+            assert_true("synthetic byte reduction is basetemp size", removed_bytes == 10_000_000_000)
+            assert_true("product bytes retained", selected_bytes == len(product_payload))
+            print(
+                "SYNTHETIC byte reduction: "
+                f"before={before_bytes} selected={selected_bytes} removed={removed_bytes} ({percent:.9f}%)"
+            )
 
 
 def test_salvage_skips_denied_dirty_file_visible_note() -> None:
@@ -830,13 +1192,17 @@ def test_cli_salvage_default_append_only_patterns_merge() -> None:
         def fake_salvage(*_args, append_only_paths=None, **_kwargs):
             merged = ferry._merge_append_only_patterns(append_only_paths)
             captured["append_only"] = merged
+            captured["max_file_bytes"] = _kwargs.get("max_file_bytes")
+            captured["pytest_basetemp_paths"] = _kwargs.get("pytest_basetemp_paths")
             return {
-                "schema": "goalflight.fleet.salvage.manifest.v1",
+                "schema": "goalflight.fleet.salvage.manifest.v2",
                 "target_files": [],
                 "skipped": [],
+                "excluded_files": [],
                 "files": [],
                 "iterations": [],
                 "converged": True,
+                "incomplete": False,
             }
 
         ferry.salvage_worktree = fake_salvage
@@ -854,6 +1220,10 @@ def test_cli_salvage_default_append_only_patterns_merge() -> None:
                         "/remote/worktree",
                         "--out-dir",
                         str(_staging(fleet_dir, "cli-default")),
+                        "--max-file-bytes",
+                        "1234",
+                        "--pytest-basetemp",
+                        "tmp/worker-test-output",
                         "--exec",
                     ]
                 )
@@ -861,7 +1231,82 @@ def test_cli_salvage_default_append_only_patterns_merge() -> None:
             ferry.salvage_worktree = original
         assert_true("cli rc", rc == 0)
         assert_true("default append-only present", "dispatcher.log" in captured["append_only"])
+        assert_true("CLI cap override passed", captured["max_file_bytes"] == 1234)
+        assert_true("explicit basetemp passed", captured["pytest_basetemp_paths"] == ["tmp/worker-test-output"])
         assert_true("json printed", "converged" in stdout.getvalue())
+
+
+def test_cli_ferry_returns_incomplete_status() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        original = ferry.execute_ferry
+        captured: dict[str, object] = {}
+
+        def fake_ferry(*_args, max_file_bytes=None, **_kwargs):
+            captured["max_file_bytes"] = max_file_bytes
+            return ferry.FerryReceipt({"schema": "goalflight.fleet.ferry.receipt.v2", "incomplete": True})
+
+        ferry.execute_ferry = fake_ferry
+        try:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = fleet.main(
+                    [
+                        "--fleet-dir",
+                        str(fleet_dir),
+                        "ferry",
+                        "--node",
+                        "localhost",
+                        "--direction",
+                        "push",
+                        "--src-root",
+                        str(Path(td) / "src"),
+                        "--dst-root",
+                        "/remote/worktree",
+                        "--path",
+                        "large.bin",
+                        "--purpose",
+                        "incomplete-test",
+                    ]
+                )
+        finally:
+            ferry.execute_ferry = original
+        assert_true("ferry CLI rejects incomplete result", rc == 3)
+        assert_true("CLI uses default cap", captured["max_file_bytes"] == ferry.DEFAULT_MAX_FILE_BYTES)
+        assert_true("incomplete JSON printed", '"incomplete": true' in stdout.getvalue())
+
+
+def test_cli_salvage_returns_incomplete_status() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        original = ferry.salvage_worktree
+        ferry.salvage_worktree = lambda *_args, **_kwargs: {
+            "schema": "goalflight.fleet.salvage.manifest.v2",
+            "incomplete": True,
+            "converged": True,
+            "excluded_files": [{"path": "large.bin", "size": 1000, "rule": "max-file-bytes"}],
+        }
+        try:
+            with redirect_stdout(io.StringIO()):
+                rc = fleet.main(
+                    [
+                        "--fleet-dir",
+                        str(fleet_dir),
+                        "salvage",
+                        "--node",
+                        "localhost",
+                        "--worktree-path",
+                        "/remote/worktree",
+                        "--out-dir",
+                        str(_staging(fleet_dir, "incomplete-cli")),
+                        "--exec",
+                    ]
+                )
+        finally:
+            ferry.salvage_worktree = original
+        assert_true("salvage CLI rejects incomplete result", rc == 3)
 
 
 def test_ferry_preflight_allowlist_shape_is_narrow() -> None:
@@ -960,6 +1405,46 @@ def test_salvage_complete_releases_exact_lock() -> None:
         assert_true("other fencing", held.get("fencing_token") == other.get("fencing_token"))
 
 
+def test_salvage_complete_refuses_incomplete_manifest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id="incomplete-salvage",
+        )
+        manifest_path = _staging(fleet_dir, "incomplete-salvage", "salvage-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "incomplete": True,
+                    "excluded_files": [{"path": "large.bin", "size": 1000, "rule": "max-file-bytes"}],
+                    "account_key": "openai/default",
+                    "fencing_token": lock.get("fencing_token"),
+                }
+            )
+            + "\n"
+        )
+        error = io.StringIO()
+        with redirect_stderr(error):
+            rc = fleet.main(
+                [
+                    "--fleet-dir",
+                    str(fleet_dir),
+                    "salvage-complete",
+                    "--manifest",
+                    str(manifest_path),
+                ]
+            )
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("incomplete manifest rejected", rc == 1)
+        assert_true("reason printed", "manifest is incomplete" in error.getvalue())
+        assert_true("account lock remains active", held is not None and held.get("state") == "active")
+
+
 def test_git_status_porcelain_allowlist_shape_is_narrow() -> None:
     argv = fleet_ssh.build_remote_command(
         "git_status_porcelain",
@@ -1010,15 +1495,25 @@ def main() -> None:
         test_pull_quarantine_denies_private_key_content_before_promotion,
         test_pull_quarantine_denies_provider_token_json_before_promotion,
         test_pull_quarantine_allows_non_provider_token_json,
+        test_pull_refuses_source_changed_during_rsync,
+        test_pull_refuses_symlink_changed_during_rsync,
         test_salvage_porcelain_file_list_transfer_and_convergence,
         test_salvage_bounds_at_ten_with_liveness_signal,
         test_salvage_append_only_exclusion_converges,
         test_salvage_default_append_only_exclusion_converges,
+        test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source,
+        test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete,
+        test_salvage_capped_path_churn_does_not_block_convergence,
+        test_push_refuses_over_cap_file_in_ferry_receipt,
+        test_synthetic_basetemp_exclusion_byte_reduction,
         test_salvage_skips_denied_dirty_file_visible_note,
         test_salvage_relists_before_rsync_and_aborts_on_changed_set,
         test_cli_salvage_default_append_only_patterns_merge,
+        test_cli_ferry_returns_incomplete_status,
+        test_cli_salvage_returns_incomplete_status,
         test_salvage_manifest_records_lock_identity,
         test_salvage_complete_releases_exact_lock,
+        test_salvage_complete_refuses_incomplete_manifest,
         test_ferry_preflight_allowlist_shape_is_narrow,
         test_git_status_porcelain_allowlist_shape_is_narrow,
     )

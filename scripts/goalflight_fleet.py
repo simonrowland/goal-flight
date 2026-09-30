@@ -227,6 +227,12 @@ def cmd_salvage_complete(args: argparse.Namespace) -> int:
         print(f"missing manifest: {manifest_path}", file=sys.stderr)
         return 1
     manifest = read_json(manifest_path)
+    if manifest.get("incomplete") is True:
+        print(
+            "manifest is incomplete; refusing account-lock release until excluded/refused files are reviewed",
+            file=sys.stderr,
+        )
+        return 1
     account_key = manifest.get("account_key")
     fencing_token = manifest.get("fencing_token")
     if not account_key or not fencing_token:
@@ -457,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     watch.add_argument("--json", action="store_true")
     watch.set_defaults(func=cmd_watch)
 
+    import goalflight_fleet_ferry as ferry_options
+
     ferry = sub.add_parser("ferry", help="Fixed-envelope rsync ferry between controller and node")
     ferry.add_argument("--node", required=True)
     ferry.add_argument("--direction", choices=("pull", "push"), required=True)
@@ -464,6 +472,18 @@ def main(argv: list[str] | None = None) -> int:
     ferry.add_argument("--dst-root", required=True)
     ferry.add_argument("--path", action="append", required=True, help="Relative file path under src root")
     ferry.add_argument("--purpose", required=True, help="Receipt purpose label")
+    ferry.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=ferry_options.DEFAULT_MAX_FILE_BYTES,
+        help="Refuse larger regular files (default: 104857600 bytes)",
+    )
+    ferry.add_argument(
+        "--pytest-basetemp",
+        action="append",
+        default=None,
+        help="Relative pytest --basetemp target under src root; repeat as needed",
+    )
     ferry.add_argument("--exec", action="store_true", help="Run rsync (default preview)")
     ferry.add_argument("--json", action="store_true")
     ferry.set_defaults(func=cmd_ferry)
@@ -474,7 +494,24 @@ def main(argv: list[str] | None = None) -> int:
     salvage.add_argument("--out-dir", type=Path, required=True)
     salvage.add_argument("--dispatch-id", help="Owning dispatch id (records lock identity in manifest)")
     salvage.add_argument("--purpose", default="salvage")
-    salvage.add_argument("--append-only", action="append", default=None, help="Path/pattern excluded from convergence")
+    salvage.add_argument(
+        "--append-only",
+        action="append",
+        default=None,
+        help="Additional append-only log path/pattern excluded from transfer and convergence",
+    )
+    salvage.add_argument(
+        "--max-file-bytes",
+        type=int,
+        default=ferry_options.DEFAULT_MAX_FILE_BYTES,
+        help="Refuse larger regular files (default: 104857600 bytes)",
+    )
+    salvage.add_argument(
+        "--pytest-basetemp",
+        action="append",
+        default=None,
+        help="Relative pytest --basetemp target under the worktree; repeat as needed",
+    )
     salvage.add_argument("--max-iterations", type=int, default=10)
     salvage.add_argument("--sleep-s", type=float, default=1.0)
     salvage.add_argument("--exec", action="store_true", help="Run SSH/rsync (default preview)")
