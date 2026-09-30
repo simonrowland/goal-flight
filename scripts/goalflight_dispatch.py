@@ -23861,8 +23861,8 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         type=str,
         help=(
             "Lock an existing tree: a managed worktree, the "
-            "project root (in-place), or resume's recorded worker_cwd. "
-            "Refuses any other path and never creates it."
+            "project root (writers also need --in-place), or resume's "
+            "recorded worker_cwd. Refuses any other path and never creates it."
         ),
     )
     parser.add_argument(

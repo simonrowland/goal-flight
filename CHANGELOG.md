@@ -6,6 +6,84 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-09-30
+
+### Added
+
+- Operator model policy in the machine-local capacity profile.
+  `refused_models` maps a model id to a suggested replacement (or `null`), and
+  `agent_model_allow` maps an agent family to allowed model glob patterns; a
+  model outside the patterns, or no explicit model, is refused. Matching ignores
+  case, and an absent key adds no restriction. The check uses the model the
+  launch will actually run (a model named in raw `--` argv wins over `--model`)
+  and covers dispatch, resume, ACP, review-job and fleet launches, before any
+  dispatch record is written. A malformed profile now refuses these launches
+  instead of being ignored. Fleet launches of an agent with an allow list are
+  refused; use a local launch.
+- Pooled worktrees can be sparse checkouts. `seat_sparse_pattern_files` in the
+  machine-local capacity profile maps a project root to an absolute non-cone
+  sparse-checkout pattern file, which must include `/*`; the repository must
+  enable `extensions.worktreeConfig`. Only newly created worktrees become
+  sparse, and any setup problem falls back to a full worktree with a warning.
+  Reclamation does not count skipped paths as dirty, and quarantine saves
+  changes under skipped paths before a reset.
+
+### Changed
+
+- Writer dispatches no longer run in the project root unless `--in-place` is
+  given. `--cwd <project root>` previously implied in-place; for writers it is
+  now refused, as is any directory in the main checkout that is not a pooled
+  worktree. The refusal is permanent and happens before a worker or worktree is
+  created. Resume replays the recorded arguments and follows the same rule.
+- Cursor read-only dispatches use the CLI's native read-only mode: `--mode ask`
+  (or `plan`) with `--sandbox enabled`. `--force` is now passed only to writers.
+  The dispatcher checks that the installed `cursor-agent` offers those options
+  and refuses the launch if it cannot confirm them. Raw `cursor`/`cursor-agent`
+  argv and Cursor over ACP are refused for read-only dispatches.
+- Workers share one uv package cache (the user's `~/.cache/uv`) instead of
+  filling one per worktree; the dispatcher sets `UV_CACHE_DIR` on every launch
+  path. Only writable worker profiles can write to it. Read-only workers keep
+  their read-only sandbox, and no write access is granted when the cache path
+  is a symlink.
+- Remote CI installs its node helper once, under a name derived from its
+  SHA-256, and reuses it instead of sending it with every call; a missing or
+  changed copy is reinstalled atomically. SSH connections to a node are reused
+  for up to five idle minutes. The controller-to-node protocol is now version 3.
+- Remote CI polls queued and running jobs every `daemon.poll_seconds` (default
+  5) instead of once a second. A completed status returns the size, SHA-256 and
+  a bounded tail of stdout and stderr rather than the full output; the tail is
+  16 KiB by default (`daemon.result_tail_kib`, at most 64). After admission the
+  node waits `max(30, 2 × poll_seconds + 10)` seconds for the controller's
+  command instead of a fixed 30, so the admission outlasts the controller's next
+  poll.
+- Fleet ferry and salvage transfers are bounded. Files over a per-file cap
+  (default 100 MiB, `--max-file-bytes`) are refused whole and reported, never
+  truncated. Salvage skips untracked pytest temp trees, `.pytest_cache` and
+  `.pyc` files under `__pycache__`, but always transfers tracked files,
+  including dirty ones; `--include` forces a path through. Direct ferry sends
+  exactly the requested paths, subject only to the cap. rsync compresses on the
+  wire. Receipts and manifests are now v2 with an `incomplete` flag, incomplete
+  transfers exit with status 3, and `salvage-complete` does not release its
+  lock from an incomplete manifest.
+- The ferry sends its node-side preflight code over SSH with each call instead
+  of running the copy checked out on the node, so the local machine and remote
+  nodes can no longer disagree about the preflight contract.
+
+### Fixed
+
+- Admission to a pinned pool worktree is bounded. A writer whose `--cwd` names
+  a held worktree waits up to `--capacity-wait-s` (at most 120 seconds; no wait
+  by default), then is refused with the holder and its liveness and leaves no
+  ledger entry. Queue and fleet retries treat that refusal as temporary. A
+  resume whose pinned worktree is held no longer switches to a different one.
+- An inherited worktree lock is verified before it is trusted, read-only runs on
+  a pooled worktree take their own shared lock at the review base, and ACP runs
+  pinned to a worktree now run inside it. ACP admission refusals are reported as
+  permanent and keep the status file.
+- The usage check for a pinned or re-checked Codex account probes only that
+  account and uses the full 20-second probe timeout instead of 8 seconds. A
+  refusal names the condition it hit and the time spent.
+
 ## [1.7.3] - 2026-09-26
 
 ### Added

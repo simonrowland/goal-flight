@@ -104,8 +104,10 @@ Admission requires a free token **and** node-measured `load1 <= p_cores`.
 Unknown load/caps do not admit. The node retries its local token check at
 `min(queue_wait_seconds, daemon.poll_seconds, 1)` so a freed token is not
 parked for minutes. The controller checks queued-run status at the configured
-`daemon.poll_seconds`. After admission, the holder waits up to 30
-seconds for `command.json` or `release.json`, then releases the token itself.
+`daemon.poll_seconds`. After admission, the holder waits up to
+`max(30, 2 × daemon.poll_seconds + 10)` seconds for `command.json` or
+`release.json`, then releases the token itself, so the wait always outlasts
+the controller's next poll.
 That bounds a dropped enqueue or release reply. Tokens precede command
 expansion, checkout, object movement, rendering, and test execution.
 

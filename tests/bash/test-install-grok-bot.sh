@@ -474,8 +474,8 @@ echo "test13 pass: grok-bot helper defaults, Mac install caveat, and dispatch st
 # Do not grow a parallel grok-bot pytest suite here.
 wrapper="$REPO_ROOT/configs/grok-bot/skills/goal-flight/SKILL.md"
 head_block="$(sed -n '1,8p' "$wrapper")"
-printf '%s\n' "$head_block" | grep -q 'version: 1.7.3' \
-  || fail "wrapper frontmatter must pin version 1.7.3 when VERSION is 1.7.3"
+printf '%s\n' "$head_block" | grep -q 'version: 1.7.4' \
+  || fail "wrapper frontmatter must pin version 1.7.4 when VERSION is 1.7.4"
 printf '%s\n' "$head_block" | grep -q '/goal-flight' \
   || fail "wrapper description must name /goal-flight"
 printf '%s\n' "$head_block" | grep -qi 'long-running grok-bot' \
