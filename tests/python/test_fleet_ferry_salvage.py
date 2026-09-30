@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_fleet as fleet
 import goalflight_fleet_ferry as ferry
+import goalflight_fleet_ferry_preflight as ferry_preflight
 import goalflight_fleet_ssh as fleet_ssh
 
 
@@ -1713,9 +1714,53 @@ def test_ferry_preflight_allowlist_shape_is_narrow() -> None:
         files=["safe.txt"],
         allowed_roots=["/remote"],
     )
-    assert_true("helper script", argv[1].endswith("goalflight_fleet_ferry.py"))
+    assert_true("helper from stdin", argv[:2] == ["python", "-"])
     assert_true("remote preflight subcommand", "remote-preflight" in argv)
     assert_true("payload flag", "--payload-b64" in argv)
+
+
+def test_shipped_ferry_preflight_bytes_match_imported_module() -> None:
+    module_path = ROOT / "scripts" / "goalflight_fleet_ferry_preflight.py"
+    source = ferry._remote_preflight_source()
+    assert_true("laptop imports the shipped module", Path(ferry_preflight.__file__).resolve() == module_path.resolve())
+    assert_true("shipped source bytes match module", source == module_path.read_bytes())
+    assert_true("preflight source stays bounded", len(source) <= 16 * 1024)
+
+
+def test_shipped_ferry_preflight_runs_from_stdin() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "remote"
+        root.mkdir()
+        (root / "safe.txt").write_text("ferry preflight\n")
+        remote_argv = fleet_ssh.build_remote_command(
+            "ferry_preflight",
+            repo_root=str(ROOT),
+            root=str(root),
+            files=["safe.txt"],
+            allowed_roots=[str(root)],
+            python="python3",
+        )
+        source = ferry._remote_preflight_source()
+        code, stdout, stderr = ferry._run(
+            [sys.executable, *remote_argv[1:]],
+            None,
+            stdin_bytes=source,
+        )
+        assert_true("stdin helper argv", remote_argv[1] == "-")
+        assert_true("node-style helper exits cleanly", code == 0)
+        assert_true("node-style helper has no stderr", not stderr)
+        reply = json.loads(stdout)
+        assert_true("node-style preflight accepted", reply.get("ok") is True)
+        checked = next(item for item in reply["checked"] if item["path"] == "safe.txt")
+        assert_true("node-style path exists", checked.get("exists") is True)
+        size = checked.get("size")
+        ctime_ns = checked.get("ctime_ns")
+        assert_true("node-style metadata size", isinstance(size, int) and not isinstance(size, bool) and size >= 0)
+        assert_true(
+            "node-style metadata ctime",
+            isinstance(ctime_ns, int) and not isinstance(ctime_ns, bool),
+        )
+        assert_true("node-style metadata file kind", checked.get("is_regular_file") is True)
 
 
 def test_salvage_manifest_records_lock_identity() -> None:
@@ -2119,6 +2164,8 @@ def main() -> None:
         test_lock_release_refuses_manifest_without_complete_state,
         test_pytest_basetemp_rejects_traversal_and_absolute_paths,
         test_ferry_preflight_allowlist_shape_is_narrow,
+        test_shipped_ferry_preflight_bytes_match_imported_module,
+        test_shipped_ferry_preflight_runs_from_stdin,
         test_git_status_porcelain_allowlist_shape_is_narrow,
     )
     for test in tests:

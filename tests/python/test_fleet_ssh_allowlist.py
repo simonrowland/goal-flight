@@ -403,6 +403,20 @@ def test_probe_ferry_and_interpreter_paths_fail_closed() -> None:
     assert_true("trusted interpreter accepted", ferry[0] == "/usr/bin/python3")
 
 
+def test_ferry_remote_argv_never_uses_repo_checkout_script() -> None:
+    repo_root = "/srv/goal-flight"
+    argv = ssh.build_remote_command(
+        "ferry_preflight",
+        repo_root=repo_root,
+        root="/remote/worktree",
+        files=["safe.txt"],
+        allowed_roots=["/remote"],
+    )
+    checkout_script = f"{repo_root}/scripts/goalflight_fleet_ferry.py"
+    assert_true("ferry code is read from stdin", len(argv) > 1 and argv[1] == "-")
+    assert_true("ferry argv excludes checkout script", all(checkout_script not in part for part in argv))
+
+
 def test_interpreter_allowlist_rejects_shells_and_accepts_python() -> None:
     state_dir = "/Users/dev/.goal-flight"
 
@@ -538,6 +552,7 @@ def main() -> None:
         test_state_dir_rejects_parent_traversal_and_accepts_in_scope,
         test_git_verify_commit_is_allowlisted,
         test_pid_identity_uses_helper,
+        test_ferry_remote_argv_never_uses_repo_checkout_script,
     ):
         test()
         print(f"PASS {test.__name__}")

@@ -545,7 +545,7 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         payload_b64 = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
         argv = [
             python,
-            f"{repo_root}/scripts/goalflight_fleet_ferry.py",
+            "-",
             "remote-preflight",
             "--payload-b64",
             payload_b64,
