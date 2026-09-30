@@ -514,18 +514,6 @@ def main(argv: list[str] | None = None) -> int:
         default=ferry_options.DEFAULT_MAX_FILE_BYTES,
         help="Refuse larger regular files (default: 104857600 bytes)",
     )
-    ferry.add_argument(
-        "--pytest-basetemp",
-        action="append",
-        default=None,
-        help="Relative pytest --basetemp target under src root; repeat as needed",
-    )
-    ferry.add_argument(
-        "--include",
-        action="append",
-        default=None,
-        help="Force include a relative path past scratch exclusions; repeat as needed",
-    )
     ferry.add_argument("--exec", action="store_true", help="Run rsync (default preview)")
     ferry.add_argument("--json", action="store_true")
     ferry.set_defaults(func=cmd_ferry)

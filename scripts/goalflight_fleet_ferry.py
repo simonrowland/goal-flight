@@ -811,8 +811,6 @@ def execute_ferry(
     itemize: bool = False,
     expanded_files: Iterable[str] | None = None,
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
-    pytest_basetemp_paths: Iterable[str] | None = None,
-    include_paths: Iterable[str] | None = None,
     _preflight_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> FerryReceipt:
     if not purpose.strip():
@@ -839,8 +837,6 @@ def execute_ferry(
     if direction == "pull":
         assert_controller_staging_root_allowed(fleet_dir, dst_root)
     host = fleet_ssh.host_from_node_entry(node_id, node_entry)
-    basetemp_paths = _normalize_pytest_basetemp_paths(pytest_basetemp_paths)
-    included_paths = _normalize_include_paths(include_paths)
     if direction == "push":
         source_metadata = _source_file_metadata(Path(src_root), candidate_files)
     elif not dry_run:
@@ -863,8 +859,6 @@ def execute_ferry(
         candidate_files,
         metadata=source_metadata,
         max_file_bytes=max_file_bytes,
-        pytest_basetemp_paths=basetemp_paths,
-        include_paths=included_paths,
         require_sizes=not dry_run,
     )
     receipt: dict[str, Any] = {
@@ -1285,8 +1279,6 @@ def _classify_transfer_files(
     *,
     metadata: dict[str, dict[str, Any]],
     max_file_bytes: int,
-    pytest_basetemp_paths: Iterable[str],
-    include_paths: Iterable[str],
     require_sizes: bool,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     transfer_files: list[str] = []
@@ -1294,10 +1286,6 @@ def _classify_transfer_files(
     for rel in files:
         info = metadata.get(rel) or {}
         size = info.get("size") if isinstance(info.get("size"), int) else None
-        rule = None if _path_is_included(rel, include_paths) else _scratch_exclusion_rule(rel, pytest_basetemp_paths)
-        if rule is not None:
-            excluded.append({"path": rel, "size": size, "rule": rule})
-            continue
         if require_sizes and info.get("exists") is True and info.get("is_regular_file") is True and size is None:
             raise FerryError(f"file size missing from ferry preflight for {rel}; refusing uncapped transfer")
         if info.get("is_regular_file") is True and size is not None and size > max_file_bytes:
@@ -1454,7 +1442,7 @@ def salvage_worktree(
         itemize: bool = False,
     ) -> dict[str, Any]:
         if not files:
-            return {"files": [], "excluded_files": [], "stdout": ""}
+            return {"ok": True, "files": [], "excluded_files": [], "incomplete": False, "stdout": ""}
         return execute_ferry(
             fleet_dir,
             node_id=node_id,
@@ -1467,8 +1455,6 @@ def salvage_worktree(
             runner=runner,
             itemize=itemize,
             max_file_bytes=max_file_bytes,
-            pytest_basetemp_paths=basetemp_paths,
-            include_paths=files,
             _preflight_metadata={path: metadata[path] for path in files},
         ).to_dict()
 
@@ -1545,7 +1531,15 @@ def salvage_worktree(
             excluded_by_key[key] = entry
         changed = parse_rsync_itemized_paths(str(receipt.get("stdout") or ""))
         checked_changed = [path for path in changed if not _matches_append_only(path, append_only_patterns)]
-        zero_delta = not checked_changed
+        received_files = {str(path) for path in receipt.get("files") or []}
+        expected_files = set(current["transfer_files"])
+        transfer_complete = (
+            receipt.get("ok") is True
+            and not receipt.get("incomplete")
+            and not receipt.get("excluded_files")
+            and expected_files.issubset(received_files)
+        )
+        zero_delta = not checked_changed and transfer_complete
         consecutive_zero = consecutive_zero + 1 if zero_delta else 0
         iterations.append(
             {
@@ -1612,8 +1606,6 @@ def cmd_ferry(args) -> int:
             purpose=args.purpose,
             dry_run=not args.exec,
             max_file_bytes=args.max_file_bytes,
-            pytest_basetemp_paths=args.pytest_basetemp,
-            include_paths=args.include,
         ).to_dict()
     except FerryError as exc:
         print(str(exc), file=__import__("sys").stderr)

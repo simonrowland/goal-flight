@@ -246,8 +246,9 @@ per-file cap is refused and reported. Append-only patterns such as `*.log`,
 `--include <relpath>` to force a path through a scratch exclusion; the size cap
 still refuses an oversized file.
 
-Direct ferry applies these scratch rules to the explicitly requested paths;
-use `--include` when the requested path should cross regardless of its name.
+Direct ferry transfers the explicitly requested paths, subject only to the
+per-file size cap. The scratch rules, `--pytest-basetemp`, and `--include`
+options apply to salvage.
 
 Each report has `path`, `size`, and `rule`; a size refusal also has
 `limit_bytes`. Files above the cap are omitted whole. Result schemas are
@@ -259,7 +260,7 @@ the held account lock from an incomplete manifest until the omitted files are
 reviewed.
 
 For an arbitrary pytest `--basetemp` location inside the worktree, pass the same
-relative path with `--pytest-basetemp`; repeat the option for multiple targets.
+relative path to salvage with `--pytest-basetemp`; repeat the option for multiple targets.
 This avoids guessing from a product directory's name. Only a pytest temp tree at
 the worktree root is recognized automatically.
 
@@ -291,7 +292,8 @@ v2 schema and explicit `incomplete: false` status, verifies its lock identity,
 and refuses release otherwise.
 
 Salvage-held locks are not TTL-reaped; they stay active until this post-salvage
-release (or an operator `lock-release` with the matching fencing token).
+release. An operator may explicitly override the manifest checks with
+`lock-release --reason released` and the matching fencing token.
 
 **Credential safety.** Ferry refuses to transfer credential-shaped paths in either
 direction — auth state, private keys, token/secret files — matched on the path, its

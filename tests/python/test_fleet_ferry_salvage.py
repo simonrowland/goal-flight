@@ -14,6 +14,7 @@ import re
 import sys
 import tempfile
 import io
+import subprocess
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -220,6 +221,39 @@ def test_ferry_deny_requested_and_expanded_paths() -> None:
             except ferry.FerryDenyError as exc:
                 assert_true("expanded path named", "bundle/auth.json" in str(exc))
             assert_true("runner never called", called is False)
+
+
+def test_direct_ferry_transfers_explicit_scratch_named_paths() -> None:
+    paths = ["tests/.pytest_cache/fixture.txt", "pkg/__pycache__/m.pyc"]
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            fleet_dir = base / "fleet"
+            dst = _staging(fleet_dir, "scratch-named-direct-pull")
+            _fixture_fleet(fleet_dir)
+
+            def runner(argv: list[str]) -> tuple[int, str, str]:
+                if argv[0] == "ssh" and "remote-preflight" in " ".join(argv):
+                    return _remote_preflight_reply(argv)
+                if argv[0] == "rsync":
+                    _write_dest_files(argv, _files_from(argv), prefix="direct")
+                    return 0, "", ""
+                return 1, "", f"unexpected argv: {' '.join(argv)}"
+
+            receipt = ferry.execute_ferry(
+                fleet_dir,
+                node_id="localhost",
+                direction="pull",
+                src_root="/remote/worktree",
+                dst_root=str(dst),
+                files=paths,
+                purpose="scratch-named-direct-pull",
+                runner=runner,
+            ).to_dict()
+
+            assert_true("direct ferry transfers requested scratch-shaped paths", receipt["files"] == paths)
+            assert_true("direct ferry has no scratch exclusions", receipt["excluded_files"] == [])
+            assert_true("direct ferry remains complete", receipt["incomplete"] is False)
 
 
 def test_ferry_rejects_path_tricks_and_symlink_escape() -> None:
@@ -1187,6 +1221,59 @@ def test_salvage_capped_path_churn_does_not_block_convergence() -> None:
             assert_true("churning capped path remains reported", refusal["size"] == 65 and refusal["rule"] == "max-file-bytes")
 
 
+def test_salvage_refused_transfer_pass_is_not_quiet() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            runner = SalvageRunner(" M src/app.py\n", ["", ""], remote_sizes={"src/app.py": 12})
+            original_execute = ferry.execute_ferry
+
+            def execute_with_disappearing_source(*args, **kwargs):
+                files = list(kwargs["files"])
+                if kwargs["purpose"].endswith(":initial"):
+                    destination = Path(kwargs["dst_root"])
+                    for rel in files:
+                        path = destination / rel
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(b"product bytes")
+                    return ferry.FerryReceipt(
+                        {"ok": True, "files": files, "excluded_files": [], "incomplete": False, "stdout": ""}
+                    )
+                return ferry.FerryReceipt(
+                    {
+                        "ok": True,
+                        "files": [],
+                        "excluded_files": [
+                            {"path": "src/app.py", "size": 12, "rule": "source-disappeared-after-rsync"}
+                        ],
+                        "incomplete": True,
+                        "stdout": "",
+                    }
+                )
+
+            ferry.execute_ferry = execute_with_disappearing_source
+            try:
+                manifest = ferry.salvage_worktree(
+                    fleet_dir,
+                    node_id="localhost",
+                    worktree_path="/remote/worktree",
+                    out_dir=_staging(fleet_dir, "missing-transfer-pass"),
+                    runner=runner,
+                    max_iterations=2,
+                    sleep_s=0,
+                )
+            finally:
+                ferry.execute_ferry = original_execute
+
+            assert_true("incomplete transfer pass cannot converge", manifest["converged"] is False)
+            assert_true("refused transfer passes are not quiet", all(not row["zero_delta"] for row in manifest["iterations"]))
+            assert_true(
+                "missing leaf is reported",
+                any(row["rule"] == "source-disappeared-after-rsync" for row in manifest["excluded_files"]),
+            )
+
+
 def test_push_refuses_over_cap_file_in_ferry_receipt() -> None:
     with live_ssh_env("1"):
         with tempfile.TemporaryDirectory() as td:
@@ -1270,6 +1357,141 @@ def test_synthetic_basetemp_exclusion_byte_reduction() -> None:
             print(
                 "SYNTHETIC byte reduction: "
                 f"before={before_bytes} selected={selected_bytes} removed={removed_bytes} ({percent:.9f}%)"
+            )
+
+
+def test_real_git_salvage_selects_product_and_reports_sparse_pytest_tree() -> None:
+    product_rel = "src/product.py"
+    scratch_rel = "pytest-of-x/pytest-0/large.bin"
+    scratch_bytes = 10_000_000_000
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "worker"
+            repo.mkdir()
+
+            def git(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["git", "-C", str(repo), "-c", "core.excludesFile=/dev/null", *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git("init", "--template=/dev/null")
+            git("config", "user.name", "Ferry Test")
+            git("config", "user.email", "ferry-test@example.invalid")
+            product = repo / product_rel
+            product.parent.mkdir(parents=True)
+            product.write_bytes(b"tracked product change\n")
+            git("add", product_rel)
+            git(
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "baseline",
+            )
+            product.write_bytes(b"worker product edit\n")
+            scratch = repo / scratch_rel
+            scratch.parent.mkdir(parents=True)
+            with scratch.open("wb") as handle:
+                handle.truncate(scratch_bytes)
+
+            fleet_dir = base / "fleet"
+            _fixture_fleet(fleet_dir)
+            fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+            fleet_doc["nodes"]["localhost"]["repo_root"] = str(repo)
+            fleet_doc["nodes"]["localhost"]["state_dir"] = str(repo)
+            fleet._atomic_write_json(fleet_dir / "fleet.json", fleet_doc)
+
+            dispatch_id = "real-filesystem-salvage-measurement"
+            lock = fleet.acquire_account_lock(
+                fleet_dir,
+                account_key="openai/default",
+                owner_dispatch_id=dispatch_id,
+            )
+            dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+            dispatch_dir.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                dispatch_dir / "meta.json",
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "lease_active": True,
+                    "row_state": "salvage_needed",
+                },
+            )
+
+            class FilesystemRunner:
+                def __init__(self) -> None:
+                    self.rsync_files: list[list[str]] = []
+                    self.status_outputs: list[str] = []
+
+                def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+                    joined = " ".join(argv)
+                    if argv[0] == "ssh" and "remote-preflight" in joined:
+                        match = re.search(r"--payload-b64\s+'?([A-Za-z0-9+/=]+)'?", joined)
+                        assert_true("preflight payload present", match is not None)
+                        payload = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+                        try:
+                            reply = ferry._remote_preflight_payload(payload)
+                        except Exception as exc:
+                            return 2, json.dumps(ferry._remote_preflight_error(exc)), ""
+                        return 0, json.dumps(reply), ""
+                    if argv[0] == "ssh" and " status " in f" {joined} ":
+                        result = git("status", "--porcelain", "--untracked-files=all")
+                        self.status_outputs.append(result.stdout)
+                        return 0, result.stdout, ""
+                    if argv[0] == "rsync":
+                        files = _files_from(argv)
+                        self.rsync_files.append(files)
+                        if "--itemize-changes" not in argv:
+                            destination = Path(argv[-1])
+                            for rel in files:
+                                target = destination / rel
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                target.write_bytes((repo / rel).read_bytes())
+                        return 0, "", ""
+                    return 1, "", f"unexpected argv: {joined}"
+
+            runner = FilesystemRunner()
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path=str(repo),
+                out_dir=_staging(fleet_dir, "real-filesystem-salvage"),
+                dispatch_id=dispatch_id,
+                runner=runner,
+                sleep_s=0,
+            )
+
+            assert_true("git status saw tracked product edit", f" M {product_rel}" in runner.status_outputs[0])
+            assert_true("git status saw untracked pytest leaf", f"?? {scratch_rel}" in runner.status_outputs[0])
+            assert_true(
+                "only product path selected",
+                bool(runner.rsync_files) and all(files == [product_rel] for files in runner.rsync_files),
+            )
+            assert_true(
+                "manifest lists only product file",
+                [entry["path"] for entry in manifest["files"]] == [product_rel],
+            )
+            selected_paths = {rel for files in runner.rsync_files for rel in files}
+            selected_bytes = sum((repo / rel).stat().st_size for rel in selected_paths)
+            excluded = {entry["path"]: entry for entry in manifest["excluded_files"]}
+            assert_true("pytest leaf excluded and reported", scratch_rel in excluded)
+            assert_true("reported sparse leaf size", excluded[scratch_rel]["size"] == scratch_bytes)
+            assert_true("salvage result is incomplete", manifest["incomplete"] is True)
+            assert_true("incomplete salvage has no release command", "lock_release_command" not in manifest)
+            assert_true("salvage records lock token", manifest.get("fencing_token") == lock.get("fencing_token"))
+            active_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+            assert_true("incomplete salvage leaves lock active", active_lock is not None and active_lock.get("state") == "active")
+            omitted_bytes = sum(entry["size"] for entry in excluded.values())
+            print(
+                "REAL filesystem salvage byte selection: "
+                f"selected={selected_bytes} omitted={omitted_bytes}"
             )
 
 
@@ -1374,9 +1596,8 @@ def test_cli_ferry_returns_incomplete_status() -> None:
         original = ferry.execute_ferry
         captured: dict[str, object] = {}
 
-        def fake_ferry(*_args, max_file_bytes=None, include_paths=None, **_kwargs):
+        def fake_ferry(*_args, max_file_bytes=None, **_kwargs):
             captured["max_file_bytes"] = max_file_bytes
-            captured["include_paths"] = include_paths
             return ferry.FerryReceipt({"schema": "goalflight.fleet.ferry.receipt.v2", "incomplete": True})
 
         ferry.execute_ferry = fake_ferry
@@ -1400,15 +1621,12 @@ def test_cli_ferry_returns_incomplete_status() -> None:
                         "large.bin",
                         "--purpose",
                         "incomplete-test",
-                        "--include",
-                        ".pytest_cache/x",
                     ]
                 )
         finally:
             ferry.execute_ferry = original
         assert_true("ferry CLI rejects incomplete result", rc == 3)
         assert_true("CLI uses default cap", captured["max_file_bytes"] == ferry.DEFAULT_MAX_FILE_BYTES)
-        assert_true("ferry include option passed", captured["include_paths"] == [".pytest_cache/x"])
         assert_true("incomplete JSON printed", '"incomplete": true' in stdout.getvalue())
 
 
@@ -1855,6 +2073,7 @@ def main() -> None:
     tests = (
         test_ferry_happy_path_both_directions_and_receipt,
         test_ferry_deny_requested_and_expanded_paths,
+        test_direct_ferry_transfers_explicit_scratch_named_paths,
         test_ferry_rejects_path_tricks_and_symlink_escape,
         test_credential_deny_patterns_cover_case_variants_and_common_secret_names,
         test_ferry_rejects_newline_split_and_pull_key_before_runner,
@@ -1882,8 +2101,10 @@ def main() -> None:
         test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete,
         test_salvage_directory_and_expanded_cap_leaf_converge,
         test_salvage_capped_path_churn_does_not_block_convergence,
+        test_salvage_refused_transfer_pass_is_not_quiet,
         test_push_refuses_over_cap_file_in_ferry_receipt,
         test_synthetic_basetemp_exclusion_byte_reduction,
+        test_real_git_salvage_selects_product_and_reports_sparse_pytest_tree,
         test_salvage_skips_denied_dirty_file_visible_note,
         test_salvage_relists_before_rsync_and_aborts_on_changed_set,
         test_cli_salvage_default_append_only_patterns_merge,
