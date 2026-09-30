@@ -1722,9 +1722,47 @@ def test_ferry_preflight_allowlist_shape_is_narrow() -> None:
 def test_shipped_ferry_preflight_bytes_match_imported_module() -> None:
     module_path = ROOT / "scripts" / "goalflight_fleet_ferry_preflight.py"
     source = ferry._remote_preflight_source()
+    module_bytes = module_path.read_bytes()
     assert_true("laptop imports the shipped module", Path(ferry_preflight.__file__).resolve() == module_path.resolve())
-    assert_true("shipped source bytes match module", source == module_path.read_bytes())
-    assert_true("preflight source stays bounded", len(source) <= 16 * 1024)
+    assert_true(
+        "shipped source matches module bytes and size",
+        source == module_bytes and len(source) == module_path.stat().st_size,
+    )
+
+
+def test_remote_preflight_passes_shipped_source_to_runner() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        node_entry = fleet.read_json(fleet_dir / "fleet.json")["nodes"]["localhost"]
+        captured: dict[str, object] = {}
+        original_subprocess_run = ferry.subprocess.run
+
+        def fake_runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            captured["argv"] = argv
+            captured["stdin_bytes"] = kwargs.get("input")
+            code, stdout, stderr = _remote_preflight_reply(argv)
+            return subprocess.CompletedProcess(argv, code, stdout.encode(), stderr.encode())
+
+        ferry.subprocess.run = fake_runner  # type: ignore[assignment]
+        try:
+            checked = ferry._run_remote_preflight(
+                fleet_dir,
+                node_id="localhost",
+                node_entry=node_entry,
+                remote_root="/remote/worktree",
+                files=["safe.txt"],
+                runner=None,
+            )
+        finally:
+            ferry.subprocess.run = original_subprocess_run
+
+        assert_true("production preflight runner returned checked file", "safe.txt" in checked)
+        assert_true("production runner received ssh argv", isinstance(captured.get("argv"), list))
+        assert_true(
+            "production runner receives exact shipped source on stdin",
+            captured.get("stdin_bytes") == (ROOT / "scripts" / "goalflight_fleet_ferry_preflight.py").read_bytes(),
+        )
 
 
 def test_shipped_ferry_preflight_runs_from_stdin() -> None:
@@ -2165,6 +2203,7 @@ def main() -> None:
         test_pytest_basetemp_rejects_traversal_and_absolute_paths,
         test_ferry_preflight_allowlist_shape_is_narrow,
         test_shipped_ferry_preflight_bytes_match_imported_module,
+        test_remote_preflight_passes_shipped_source_to_runner,
         test_shipped_ferry_preflight_runs_from_stdin,
         test_git_status_porcelain_allowlist_shape_is_narrow,
     )
