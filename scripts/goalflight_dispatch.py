@@ -23600,8 +23600,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     model = getattr(args, "model", None)
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
-                "-c", "approval_policy=never",
-                "-c", "features.remote_plugin=false"]
+                "-c", "approval_policy=never"]
         argv += codex_workspace_write_args(args.cwd, _effective_os_sandbox(args))
         if not _codex_context_mode_enabled():
             # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);

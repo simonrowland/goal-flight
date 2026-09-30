@@ -509,10 +509,10 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         try:
             _wait_for(Path(env["GOALFLIGHT_FAKE_ACP_TURN1_FILE"]), proc=proc)
             _wait_for(fake_argv_path, proc=proc)
-            assert json.loads(fake_argv_path.read_text(encoding="utf-8")) == [
-                "-c",
-                "features.remote_plugin=false",
-            ]
+            # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+            assert "features.remote_plugin=false" not in json.loads(
+                fake_argv_path.read_text(encoding="utf-8")
+            )
             watcher_prompt = tmp / "status.assembled.prompt"
             _wait_for(watcher_prompt, proc=proc)
             assert watcher_prompt.read_text(encoding="utf-8") == (

@@ -1747,8 +1747,6 @@ def agent_command(
         binary, args = "claude-code-cli-acp", []
     else:
         binary, args = agent, []
-    if agent_key in {"codex", "codex-acp"}:
-        args = ["-c", "features.remote_plugin=false", *args]
     if model is None:
         model = _DEFAULT_STRONG_MODEL.get(agent_key)
     if model:

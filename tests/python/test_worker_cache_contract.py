@@ -36,7 +36,7 @@ def _shared_cache(home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return resolved
 
 
-def test_codex_worker_disables_remote_plugin_catalog_and_grants_shared_cache(
+def test_codex_worker_grants_shared_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     home = tmp_path / "controller-home"
@@ -57,7 +57,8 @@ def test_codex_worker_disables_remote_plugin_catalog_and_grants_shared_cache(
     argv, _stdin = dispatch.build_worker(args, "/tmp/worker.md", [])
     configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-c"]
 
-    assert "features.remote_plugin=false" in configs, argv
+    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+    assert "features.remote_plugin=false" not in configs, argv
     assert "features.plugins=false" not in configs, configs
     writable_config = next(
         value
@@ -106,10 +107,11 @@ def test_native_codex_read_only_keeps_sandbox_and_shared_cache_env(
     assert env["UV_CACHE_DIR"] == str(cache), env["UV_CACHE_DIR"]
 
 
-def test_codex_acp_worker_disables_remote_plugin_catalog() -> None:
+def test_codex_acp_worker_keeps_default_args() -> None:
     _binary, argv = acp_run.agent_command("codex-acp")
 
-    assert "features.remote_plugin=false" in argv, argv
+    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+    assert "features.remote_plugin=false" not in argv, argv
 
 
 @pytest.mark.parametrize("agent", ["codex", "grok-code", "cursor"])

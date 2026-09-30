@@ -312,7 +312,8 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
-    assert args == ["-c", "features.remote_plugin=false"]
+    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+    assert "features.remote_plugin=false" not in args, args
 
     binary, args = agent_command("claude-acp")
     assert Path(binary).name == "claude-code-cli-acp"
