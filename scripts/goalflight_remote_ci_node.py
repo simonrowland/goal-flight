@@ -11,6 +11,8 @@ import base64
 import builtins
 import ctypes
 import fcntl
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -32,6 +34,10 @@ SUCCESS_KEEP = 20
 SUCCESS_AGE_SECONDS = 7 * 24 * 3600
 FAILURE_KEEP = 50
 FAILURE_AGE_SECONDS = 14 * 24 * 3600
+PROTOCOL_VERSION = 2
+DEFAULT_RESULT_TAIL_BYTES = 16 * 1024
+MAX_RESULT_TAIL_BYTES = 64 * 1024
+MAX_FETCH_BYTES = 256 * 1024
 TREE_GRACE_SECONDS = 0.3
 # Distinct from a dead workload. 75 is the retryable capacity refusal.
 # 77 is not used: callers were treating 77 as remote death.
@@ -163,6 +169,97 @@ def record(run):
     value = read_json(run / 'lease.json')
     value.update(read_json(run / 'owner.json'))
     return value
+
+
+def stream_receipt(path, tail_bytes):
+    """Hash a completed capture in bounded memory and retain only its tail."""
+    digest = hashlib.sha256()
+    tail = bytearray()
+    try:
+        stream = path.open('rb')
+    except FileNotFoundError:
+        return {
+            'available': False,
+            'size_bytes': 0,
+            'sha256': hashlib.sha256(b'').hexdigest(),
+            'tail': {
+                'text': '', 'bytes_base64': '', 'truncated': False,
+                'omitted_bytes': 0,
+            },
+        }
+    with stream:
+        before = os.fstat(stream.fileno())
+        size = before.st_size
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f'{path.name} capture changed while its receipt was read')
+            digest.update(chunk)
+            tail.extend(chunk)
+            if len(tail) > tail_bytes:
+                del tail[:-tail_bytes]
+            remaining -= len(chunk)
+        after = os.fstat(stream.fileno())
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            raise OSError(f'{path.name} capture changed while its receipt was read')
+    tail_bytes_value = bytes(tail)
+    omitted = size - len(tail_bytes_value)
+    return {
+        'available': True,
+        'size_bytes': size,
+        'sha256': digest.hexdigest(),
+        'tail': {
+            'text': tail_bytes_value.decode('utf-8', errors='replace'),
+            'bytes_base64': base64.b64encode(tail_bytes_value).decode('ascii'),
+            'truncated': omitted > 0,
+            'omitted_bytes': omitted,
+        },
+    }
+
+
+def fetch_stream(run, request):
+    name = request.get('stream')
+    if name not in ('stdout', 'stderr'):
+        raise ValueError('stream must be stdout or stderr')
+    last_kb = request.get('last_kb')
+    if isinstance(last_kb, bool) or not isinstance(last_kb, int) or last_kb < 1:
+        raise ValueError('last_kb must be a positive integer')
+    requested = last_kb * 1024
+    path = run / name
+    stream_size = path.stat().st_size
+    if requested > MAX_FETCH_BYTES:
+        return {
+            'status': 'refused',
+            'stream': name,
+            'stream_size_bytes': stream_size,
+            'requested_bytes': requested,
+            'cap_bytes': MAX_FETCH_BYTES,
+            'error': (
+                f'{name} stream is {stream_size} bytes; requested tail is {requested} '
+                f'bytes, above fetch cap {MAX_FETCH_BYTES} bytes'
+            ),
+        }
+    returned = min(stream_size, requested)
+    with path.open('rb') as stream:
+        stream.seek(stream_size - returned)
+        body = stream.read(returned)
+    if len(body) != returned:
+        raise OSError(f'{name} capture changed while its tail was fetched')
+    compressed = gzip.compress(body, mtime=0)
+    omitted = stream_size - len(body)
+    return {
+        'status': 'ok',
+        'stream': name,
+        'compression': 'gzip',
+        'stream_size_bytes': stream_size,
+        'requested_bytes': requested,
+        'size_bytes': len(body),
+        'truncated': omitted > 0,
+        'omitted_bytes': omitted,
+        'sha256': hashlib.sha256(body).hexdigest(),
+        'body_gzip_base64': base64.b64encode(compressed).decode('ascii'),
+    }
 
 
 def identity_matches(run, identity):
@@ -2133,6 +2230,8 @@ def dispatch(request):
             gc_run_bodies(managed, request, True)
             run = managed / 'runs' / lease_id
             run.mkdir(mode=0o700)
+            (run / 'stdout').touch()
+            (run / 'stderr').touch()
             ticket = root / 'tickets' / f'{sequence:020d}'
             ticket_lock = try_lock(ticket)
             holder_lock = try_lock(run / 'holder.lock')
@@ -2216,11 +2315,27 @@ def dispatch(request):
         raise ValueError('lease token does not match')
     if operation == 'status':
         state['holder_alive'] = locked(run / 'holder.lock')
-        if (run / 'result.json').exists():
-            state['result'] = read_json(run / 'result.json')
-            state['result']['stdout'] = (run / 'stdout').read_text() if (run / 'stdout').exists() else ''
-            state['result']['stderr'] = (run / 'stderr').read_text() if (run / 'stderr').exists() else ''
+        result_path = run / 'result.json'
+        if result_path.exists():
+            tail_bytes = request.get('result_tail_bytes', DEFAULT_RESULT_TAIL_BYTES)
+            if (isinstance(tail_bytes, bool) or not isinstance(tail_bytes, int)
+                    or tail_bytes < 1):
+                raise ValueError('result_tail_bytes must be a positive integer')
+            if tail_bytes > MAX_RESULT_TAIL_BYTES:
+                raise ValueError(
+                    f'result tail request {tail_bytes} bytes exceeds cap '
+                    f'{MAX_RESULT_TAIL_BYTES} bytes'
+                )
+            state['result'] = read_json(result_path)
+            state['result']['streams'] = {
+                name: stream_receipt(run / name, tail_bytes)
+                for name in ('stdout', 'stderr')
+            }
         return state
+    if operation == 'fetch':
+        if not (run / 'result.json').is_file():
+            raise ValueError('stream fetch is available only after result.json exists')
+        return fetch_stream(run, request)
     if operation == 'start':
         # Serialized existence checks prevent a second command for one lease.
         with (run / 'command.lock').open('a+') as guard:
@@ -2322,7 +2437,16 @@ def dispatch(request):
 
 if __name__ == '__main__':
     try:
-        print(json.dumps(dispatch(json.loads(base64.b64decode(sys.argv[1])))))
+        request = json.loads(base64.b64decode(sys.argv[1]))
+        version = request.get('protocol_version')
+        if version != PROTOCOL_VERSION:
+            raise ValueError(
+                f'remote CI protocol mismatch: expected {PROTOCOL_VERSION}, received {version!r}'
+            )
+        print(json.dumps({
+            'protocol_version': PROTOCOL_VERSION,
+            'result': dispatch(request),
+        }))
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(2)

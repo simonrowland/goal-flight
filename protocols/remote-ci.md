@@ -31,6 +31,57 @@ execution, and receipt creation on the node. The single configured
 test files, selection, and configured test command through argv placeholders and
 `GOALFLIGHT_REMOTE_CI_*` environment variables.
 
+### Controller-to-node protocol
+
+The controller uses node protocol version 2. Before each operation it hashes
+the local `goalflight_remote_ci_node.py`; the node launcher hashes the
+content-addressed copy under `<managed-root>/helpers/remote-ci/` and executes
+only the bytes that match that expected hash. A missing, mismatched, unreadable,
+or unverifiable copy is unknown and triggers an atomic reinstall through a
+same-directory temporary file, file `fsync`, and `os.replace`. Concurrent
+installers write the same digest-specific target; only a complete, re-verified
+file is executed. This prevents derived helper state from outliving a changed
+source file and silently running stale code.
+
+Every operation response emitted by the installed node helper carries
+`protocol_version: 2`. The controller rejects a
+version mismatch or an unversioned legacy response with a protocol error. It
+never falls back to shipping the helper inline or accepting full stdout/stderr
+bodies. The node rejects requests that do not name version 2. Direct SSH
+transports use `ControlMaster=auto` and `ControlPersist=5m`. Each configured box
+gets a socket key derived from its name and exact `remote_exec` argv template;
+the box configuration defines connection identity. SSH setup edits during a
+session may reuse the existing master until it expires after five idle minutes.
+Socket files live in the current user's mode-0700 `/tmp/gf-ssh-<uid>` directory
+and use a 16-hex digest name. If the directory is unsafe or the path reaches the
+104-byte macOS socket limit, the controller logs the reason and runs SSH without
+multiplexing.
+
+Controller status checks for queued runs and active workloads honor
+`daemon.poll_seconds`. The node's local token-file retry remains capped at one
+second because it does not cross SSH and keeps a freed token responsive.
+
+### Bounded result streams
+
+When `result.json` exists, `status` returns the normal exit/result fields plus
+`streams.stdout` and `streams.stderr`. Each stream receipt contains
+`available`, `size_bytes`, `sha256`, and
+`tail: {text, bytes_base64, truncated, omitted_bytes}`. The text view is
+UTF-8-decoded with replacement; `bytes_base64` preserves the exact tail bytes.
+Legacy retained runs without a capture report `available: false` and the
+SHA-256 receipt for an empty stream.
+The configurable `daemon.result_tail_kib` defaults to 16 KiB and is capped at 64
+KiB. The node hashes each file in bounded memory and retains only the requested
+tail in the status reply.
+
+The explicit node operation `fetch` accepts `stream: "stdout" | "stderr"`
+and `last_kb`. Successful replies contain a gzip-compressed, base64-encoded
+tail plus `truncated` and `omitted_bytes`. Requests above 256 KiB return
+`status: "refused"` with the stream size, requested byte count, and cap; the
+node does not silently clamp the request.
+Fetch reads the existing retained body. It does not change the success/failure
+count or age retention.
+
 ## Request and result flow
 
 The worker writes a request JSON file, validates and submits it, then returns a

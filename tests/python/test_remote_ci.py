@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -202,26 +203,38 @@ class ScriptedExecutor:
     def __init__(self, root):
         self.root = root
         self.calls = []
+        self.remote_scripts = []
         self.load1 = 0
         self.before = None
 
     def __call__(self, argv, env, timeout):
         assert argv[:2] == ["scripted-remote", "ci-worker.example.invalid"]
+        self.remote_scripts.append(argv[2])
         shell = shlex.split(argv[2])
-        payload = json.loads(base64.b64decode(shell[-1]))
-        self.calls.append(payload["operation"])
-        if self.before:
+        payload = json.loads(base64.b64decode(shell[3]))
+        expected = payload["helper_sha256"]
+        helper = (Path(payload["managed_root"]) / "helpers" / "remote-ci" /
+                  f"goalflight_remote_ci_node-{expected}.py")
+        try:
+            installed = hashlib.sha256(helper.read_bytes()).hexdigest() == expected
+        except OSError:
+            installed = False
+        uploading = len(shell) > 4
+        runs_helper = installed or uploading
+        if runs_helper:
+            self.calls.append(payload["operation"])
+        if self.before and runs_helper:
             self.before(payload)
-        # Honour the managed root in the payload. Rewriting it hid two projects
-        # on one box creating two token pools.
-        shell[-1] = base64.b64encode(json.dumps(payload).encode()).decode()
+        shell[3] = base64.b64encode(json.dumps(payload, separators=(",", ":"),
+                                               sort_keys=True).encode()).decode()
         shell[0] = sys.executable
         authority = str(self.root / "authority.json")
         shell[2] = (
             "import builtins,os,socket;"
             "builtins._GOALFLIGHT_REMOTE_CI_AUTHORITY = " + repr(authority) + ";"
             "os.getloadavg=lambda:(" + repr(self.load1) + ",0,0);"
-            "socket.gethostname=lambda:'measured-node';" + shell[2]
+            "socket.gethostname=lambda:'measured-node';"
+            "exec(compile(" + repr(shell[2]) + ",' <remote-ci-launcher>','exec'))"
         )
         return run_command(shell, timeout=timeout)
 
@@ -781,15 +794,16 @@ def test_dropped_enqueue_response_does_not_stick_the_token(node_env):
 def test_live_owner_reaps_admission_whose_release_never_landed(node_env):
     config, executor, _, node = node_env
     config = _green_config(config)
+    node.call("health")  # Exercise lost calls after the first install handshake.
     drop = {"on": True}
 
     def transport(argv, env, timeout):
-        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[3]))
         if drop["on"] and payload["operation"] in {"status", "release", "cancel"}:
             return CommandResult(255, stderr="no route to host")
         result = executor(argv, env, timeout)
         if drop["on"] and payload["operation"] == "enqueue":
-            wait_state(node, json.loads(result.stdout), {"admitted"})
+            wait_state(node, json.loads(result.stdout)["result"], {"admitted"})
         return result
 
     runner = RemoteRunner(config, executor=transport)
@@ -804,15 +818,16 @@ def test_live_owner_reaps_admission_whose_release_never_landed(node_env):
 def test_next_arm_recovers_a_forgotten_token(node_env):
     config, executor, _, node = node_env
     config = _green_config(config)
+    node.call("health")  # Exercise lost calls after the first install handshake.
     drop = {"on": True}
 
     def transport(argv, env, timeout):
-        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[3]))
         if drop["on"] and payload["operation"] in {"status", "release", "cancel"}:
             return CommandResult(255, stderr="no route to host")
         result = executor(argv, env, timeout)
         if drop["on"] and payload["operation"] == "enqueue":
-            wait_state(node, json.loads(result.stdout), {"admitted"})
+            wait_state(node, json.loads(result.stdout)["result"], {"admitted"})
         return result
 
     sleeps = []
@@ -998,6 +1013,7 @@ def test_two_managed_roots_do_not_create_two_pools(tmp_path):
             enqueue(node_b)
         assert node_a.call("health")["tokens"]["in_use"] == 1
         assert not (root_b / "admission").exists()
+        assert not (root_b / "helpers").exists()
         assert str(root_a) in held["run_directory"]
     finally:
         executor.close(config_a)
@@ -1013,6 +1029,7 @@ def test_cancel_requires_expected_owner(node_env):
 
 def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
     config, executor, _, node = node_env
+    node.call("health")  # Keep this recovery test on the steady-state path.
     pidfile = tmp_path / "stale.pid"
     config = replace(config, runner=replace(config.runner, command=(
         sys.executable, "-c",
@@ -1025,7 +1042,7 @@ def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
     phase = {"watch": False}
 
     def transport(argv, env, timeout):
-        payload = json.loads(base64.b64decode(shlex.split(argv[2])[-1]))
+        payload = json.loads(base64.b64decode(shlex.split(argv[2])[3]))
         operation = payload["operation"]
         if operation == "start":
             result = executor(argv, env, timeout)
@@ -1034,7 +1051,7 @@ def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
         if operation == "status" and phase["watch"]:
             result = executor(argv, env, timeout)
             if result.returncode == 0 and result.stdout.strip():
-                record = json.loads(result.stdout)
+                record = json.loads(result.stdout)["result"]
                 if record.get("state") == "running":
                     phase["watch"] = False
                     node.call("attach", **key(record), identity=record["remote_run"], owner=owner_b)
@@ -1044,7 +1061,7 @@ def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
         result = executor(argv, env, timeout)
         if operation == "cancel" and result.returncode == 0 and result.stdout.strip():
             seen["cancel_owner"] = payload.get("expected_owner")
-            seen["cancel_status"] = json.loads(result.stdout).get("status")
+            seen["cancel_status"] = json.loads(result.stdout)["result"].get("status")
         return result
 
     runner = RemoteRunner(config, executor=transport)
@@ -1574,6 +1591,12 @@ def test_capacity_refusal_is_not_reported_as_death(node_env):
     final = json.loads((Path(outcome.lease["run_directory"]) / "result.json").read_text(encoding="utf-8"))
     assert final["status"] == "capacity-refused"
     assert final["returncode"] != 77
+    status = RemoteRunner(config, executor=executor).nodes["box-a"].call(
+        "status", **key(outcome.lease)
+    )
+    for stream in status["result"]["streams"].values():
+        assert stream["size_bytes"] == 0
+        assert stream["sha256"] == hashlib.sha256(b"").hexdigest()
     _free_tokens(RemoteRunner(config, executor=executor).nodes["box-a"])
 
 

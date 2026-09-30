@@ -9,8 +9,17 @@ The node needs Python 3, flock, and `launchctl submit` for a per-run coalition.
 Commands are argv arrays. `remote_exec` is the sole transport primitive: execute
 its `{script}` argument on the named box and return stdout, stderr, and exit
 code. For SSH, use `["ssh", "{host}", "{script}"]`; SSH passes the snippet to the
-remote shell. The helper is shipped inside the quoted snippet, so no helper
-installation on the node is needed.
+remote shell. The controller installs the node helper under
+`<managed-root>/helpers/remote-ci/` at a content-addressed path, verifies its
+SHA-256 before every operation, and atomically reinstalls missing, mismatched,
+or unreadable copies. Direct SSH commands use a private control socket under
+`/tmp/gf-ssh-<uid>` with `ControlMaster=auto` and `ControlPersist=5m`. Its
+content-derived key hashes the configured box name and exact `remote_exec` argv
+template. The box configuration defines the connection identity; two boxes with
+different SSH setup use separate sockets. SSH configuration edits during a
+session can reuse the existing master until it expires after five idle minutes.
+An unsafe socket directory or a path at or above the 104-byte macOS socket
+limit disables multiplexing with a warning.
 
 `runner.command` is a **node-local foreground argv**, not an SSH command. It
 performs checkout/object fetching, BASE overlay, tests, and receipt generation
@@ -27,7 +36,8 @@ inside the admission token. Keep credentials out of configuration and logs.
   "daemon": {
     "lock_file": "<controller-state>/remote-ci/daemon.lock",
     "pid_file": "<controller-state>/remote-ci/daemon.pid",
-    "poll_seconds": 5
+    "poll_seconds": 5,
+    "result_tail_kib": 16
   },
   "boxes": {
     "<box-id>": {
@@ -91,13 +101,18 @@ project request names and controller clocks do not determine cross-project
 order. Abandoned tickets are removed only when their holder lock is free.
 
 Admission requires a free token **and** node-measured `load1 <= p_cores`.
-Unknown load/caps do not admit. The node and the controller retry a free token
-at `min(queue_wait_seconds, daemon.poll_seconds, 1)`, not at the raw queue
-wait, so a freed token is not parked for minutes. Cancellation stays
-responsive during that retry. After admission, the holder waits up to 30
+Unknown load/caps do not admit. The node retries its local token check at
+`min(queue_wait_seconds, daemon.poll_seconds, 1)` so a freed token is not
+parked for minutes. The controller checks queued-run status at the configured
+`daemon.poll_seconds`. After admission, the holder waits up to 30
 seconds for `command.json` or `release.json`, then releases the token itself.
 That bounds a dropped enqueue or release reply. Tokens precede command
 expansion, checkout, object movement, rendering, and test execution.
+
+The controller's queued-run checks and active status watch sleep for the
+configured `daemon.poll_seconds`. `result_tail_kib` controls the per-stream
+tail in a completed status receipt; it defaults to 16 KiB and accepts 1–64
+KiB. A receipt marks legacy retained runs with missing captures as unavailable.
 
 One managed root per box holds the whole lifecycle:
 
@@ -143,6 +158,15 @@ bodies are kept for 7 days and the newest 20. Other terminal bodies are kept
 for 14 days and the newest 50. Unknown, unreadable, or live bodies stay.
 `gc` prints `class`, `bytes`, and `path`; `gc --apply` deletes eligible
 bodies. `tokens/` is never deleted.
+
+Completed `status` replies keep `returncode` and add `streams.stdout` and
+`streams.stderr` receipts: byte size, SHA-256, and a bounded tail. The text
+view uses UTF-8 replacement decoding; `bytes_base64` preserves the exact tail.
+Each tail reports `truncated` and `omitted_bytes`. Use the node `fetch` operation
+with `stream: "stdout" | "stderr"` and `last_kb` to retrieve a compressed
+tail on demand. Requests above 256 KiB are refused with the stream size,
+requested bytes, and cap in the response. Fetch reads the retained run body;
+the normal count and age retention rules are unchanged.
 
 Operators may lower shared caps through
 `<managed-root>/admission/caps.json`:

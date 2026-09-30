@@ -16,13 +16,16 @@ import contextlib
 import datetime as _datetime
 import errno
 import fcntl
+import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import re
 import socket
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -36,6 +39,81 @@ CONFIG_SCHEMA = "goalflight.remote-ci.config.v2"
 REQUEST_SCHEMA = "goalflight.remote-ci.request.v1"
 RECEIPT_SCHEMA = "goalflight.remote-ci.receipt.v1"
 RESULT_SCHEMA = "goalflight.remote-ci.result.v1"
+NODE_PROTOCOL_VERSION = 2
+NODE_HELPER_INSTALL_REQUIRED = 73
+DEFAULT_RESULT_TAIL_KIB = 16
+MAX_RESULT_TAIL_KIB = 64
+SSH_CONTROL_PATH_LIMIT = 104
+_LOG = logging.getLogger(__name__)
+
+_REMOTE_NODE_LAUNCHER = r'''import base64,hashlib,json,os,stat,sys,tempfile
+request64=sys.argv[1]
+request=json.loads(base64.b64decode(request64,validate=True))
+expected=request.get("helper_sha256")
+expected_size=request.get("helper_size_bytes")
+if (not isinstance(expected,str) or len(expected)!=64 or any(c not in "0123456789abcdef" for c in expected)
+        or isinstance(expected_size,bool) or not isinstance(expected_size,int) or expected_size<1):
+    raise ValueError("invalid remote CI helper hash")
+root=__import__("pathlib").Path(request["managed_root"])
+directory=root/"helpers"/"remote-ci"
+helper=directory/("goalflight_remote_ci_node-"+expected+".py")
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+def installed_bytes():
+    descriptor=-1
+    try:
+        flags=os.O_RDONLY|getattr(os,"O_NONBLOCK",0)|getattr(os,"O_NOFOLLOW",0)
+        descriptor=os.open(str(helper),flags)
+        info=os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size!=expected_size:
+            return None
+        with os.fdopen(descriptor,"rb") as stream:
+            descriptor=-1
+            data=stream.read(expected_size+1)
+        return data if len(data)==expected_size else None
+    except OSError:
+        return None
+    finally:
+        if descriptor>=0:
+            os.close(descriptor)
+program=installed_bytes()
+if program is None or digest(program)!=expected:
+    if len(sys.argv)<3:
+        print(json.dumps({"bootstrap":"install-required","expected_sha256":expected,
+                          "observed_sha256":digest(program) if program is not None else None}))
+        sys.exit(73)
+    source=base64.b64decode(sys.argv[2],validate=True)
+    if digest(source)!=expected:
+        raise ValueError("remote CI helper upload hash mismatch")
+    validation={"__name__":"_goalflight_remote_ci_install_check","__file__":str(helper)}
+    exec(compile(source,str(helper),"exec"),validation)
+    validation["pin_managed_root"](root)
+    directory.mkdir(mode=0o700,parents=True,exist_ok=True)
+    os.chmod(directory,0o700)
+    fd,temp_name=tempfile.mkstemp(prefix="."+helper.name+".",suffix=".tmp",dir=str(directory))
+    try:
+        with os.fdopen(fd,"wb") as output:
+            output.write(source)
+            output.flush()
+            os.fchmod(output.fileno(),0o600)
+            os.fsync(output.fileno())
+        os.replace(temp_name,helper)
+        dir_fd=os.open(str(directory),os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+    program=installed_bytes()
+    if program is None or digest(program)!=expected:
+        raise RuntimeError("remote CI helper install could not be verified")
+sys.argv=[str(helper),request64]
+exec(compile(program,str(helper),"exec"),{"__name__":"__main__","__file__":str(helper)})
+'''
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -207,6 +285,7 @@ class DaemonConfig:
     lock_file: Path
     pid_file: Path | None
     poll_seconds: float
+    result_tail_kib: int
     boxes: dict[str, BoxConfig]
     admission: AdmissionConfig
     runner: RunnerConfig
@@ -237,6 +316,14 @@ class DaemonConfig:
         poll_seconds = _positive_number(daemon.get("poll_seconds", 5), "daemon.poll_seconds")
         if poll_seconds > 60:
             raise ConfigError("daemon.poll_seconds must be at most 60 seconds")
+        result_tail_kib = _positive_int(
+            daemon.get("result_tail_kib", DEFAULT_RESULT_TAIL_KIB),
+            "daemon.result_tail_kib",
+        )
+        if result_tail_kib > MAX_RESULT_TAIL_KIB:
+            raise ConfigError(
+                f"daemon.result_tail_kib must be at most {MAX_RESULT_TAIL_KIB} KiB"
+            )
 
         raw_boxes = _mapping(required("boxes"), "boxes")
         if not raw_boxes:
@@ -337,6 +424,7 @@ class DaemonConfig:
             lock_file=lock_file,
             pid_file=pid_file,
             poll_seconds=poll_seconds,
+            result_tail_kib=result_tail_kib,
             boxes=boxes,
             admission=admission_config,
             runner=runner_config,
@@ -366,15 +454,106 @@ def admission_poll_interval(queue_wait_seconds: float, poll_seconds: float) -> f
     return min(queue_wait_seconds, poll_seconds, 1.0)
 
 
+def _ssh_control_path(box_name: str, remote_exec: Sequence[str],
+                      control_dir: Path) -> Path | None:
+    identity = json.dumps(
+        (box_name, tuple(remote_exec)), separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    name = hashlib.sha256(identity).hexdigest()[:16]
+    path = control_dir / name
+    return path if len(os.fsencode(path)) < SSH_CONTROL_PATH_LIMIT else None
+
+
+def _ssh_control_directory_problem(info: Any, expected_uid: int) -> str | None:
+    if stat.S_ISLNK(info.st_mode):
+        return "directory is a symlink"
+    if not stat.S_ISDIR(info.st_mode):
+        return "path is not a directory"
+    if info.st_uid != expected_uid:
+        return f"directory owner uid {info.st_uid} is not {expected_uid}"
+    permissions = stat.S_IMODE(info.st_mode)
+    if permissions != 0o700:
+        return f"directory permissions {permissions:04o} are not private mode 0700"
+    return None
+
+
 class RemoteNode:
     """One transport primitive; all admission operations execute on the node."""
 
     def __init__(self, box: BoxConfig, admission: AdmissionConfig, executor: Any,
-                 *, poll_seconds: float) -> None:
+                 *, poll_seconds: float, result_tail_bytes: int,
+                 control_dir: Path) -> None:
         self.box, self.admission, self.executor = box, admission, executor
         self.poll_seconds = poll_seconds
+        self.result_tail_bytes = result_tail_bytes
+        self.control_dir = control_dir
+
+    def _command_template(self) -> tuple[str, ...]:
+        command = self.box.remote_exec
+        if Path(command[0]).name != "ssh":
+            return command
+        no_multiplexing = (
+            command[0],
+            "-oControlMaster=no",
+            "-oControlPersist=no",
+            "-oControlPath=none",
+            *command[1:],
+        )
+        control_path = _ssh_control_path(self.box.name, command, self.control_dir)
+        if control_path is None:
+            _LOG.warning(
+                "SSH ControlPath exceeds %s bytes; disabling SSH multiplexing",
+                SSH_CONTROL_PATH_LIMIT - 1,
+            )
+            return no_multiplexing
+        try:
+            try:
+                self.control_dir.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(self.control_dir)
+            problem = _ssh_control_directory_problem(info, os.geteuid())
+            if problem:
+                raise ValueError(problem)
+        except OSError as exc:
+            _LOG.warning(
+                "cannot prepare SSH control directory %s (%s); disabling SSH multiplexing",
+                self.control_dir, exc,
+            )
+            return no_multiplexing
+        except ValueError as exc:
+            _LOG.warning(
+                "SSH control directory %s is unsafe (%s); disabling SSH multiplexing",
+                self.control_dir, exc,
+            )
+            return no_multiplexing
+        options = (
+            "-oControlMaster=auto",
+            "-oControlPersist=5m",
+            f"-oControlPath={control_path}",
+        )
+        return (command[0], *options, *command[1:])
+
+    def _invoke(self, payload: Mapping[str, Any], source: bytes | None = None) -> CommandResult:
+        encoded = base64.b64encode(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        ).decode("ascii")
+        script = "python3 -c " + shlex.quote(_REMOTE_NODE_LAUNCHER) + " " + shlex.quote(encoded)
+        if source is not None:
+            program = base64.b64encode(source).decode("ascii")
+            script += " " + shlex.quote(program)
+        argv = expand_command(
+            self._command_template(), {"box": self.box.name, "host": self.box.host},
+            script=[script],
+        )
+        return self.executor(argv, {**os.environ, **self.box.env}, 30)
 
     def call(self, operation: str, **values: Any) -> Any:
+        source_path = Path(__file__).with_name("goalflight_remote_ci_node.py")
+        try:
+            source = source_path.read_bytes()
+        except OSError as exc:
+            raise RemoteCIError(f"cannot read local remote-CI node helper: {exc}") from exc
         payload = {
             "operation": operation, "box": self.box.name,
             "managed_root": str(self.box.managed_run_directory),
@@ -382,29 +561,53 @@ class RemoteNode:
             "poll_seconds": admission_poll_interval(
                 self.admission.queue_wait_seconds, self.poll_seconds
             ),
+            "result_tail_bytes": self.result_tail_bytes,
             **values,
         }
-        source = Path(__file__).with_name("goalflight_remote_ci_node.py").read_text()
-        encoded = base64.b64encode(json.dumps(payload).encode()).decode()
-        program = base64.b64encode(source.encode()).decode()
-        script = "python3 -c " + shlex.quote(
-            "import base64;exec(compile(base64.b64decode(" + repr(program) +
-            "), '<remote-ci-node>', 'exec'))"
-        ) + " " + shlex.quote(encoded)
-        argv = expand_command(self.box.remote_exec, {"box": self.box.name, "host": self.box.host},
-                              script=[script])
-        result = self.executor(argv, {**os.environ, **self.box.env}, 30)
-        # The helper prints one JSON document only after the operation finishes,
-        # and errors go to stderr. ssh can still exit 255 after that write.
-        # Discarding the body admits a holder the caller can never name.
+        payload["protocol_version"] = NODE_PROTOCOL_VERSION
+        payload["helper_sha256"] = hashlib.sha256(source).hexdigest()
+        payload["helper_size_bytes"] = len(source)
+        result = self._invoke(payload)
         parsed: Any = None
         if not result.timed_out and result.stdout.strip():
             try:
                 parsed = json.loads(result.stdout)
             except (ValueError, TypeError):
                 parsed = None
+        if (result.returncode == NODE_HELPER_INSTALL_REQUIRED
+                and isinstance(parsed, dict)
+                and parsed.get("bootstrap") == "install-required"):
+            result = self._invoke(payload, source)
+            parsed = None
+            if not result.timed_out and result.stdout.strip():
+                try:
+                    parsed = json.loads(result.stdout)
+                except (ValueError, TypeError):
+                    parsed = None
+            if (result.returncode == NODE_HELPER_INSTALL_REQUIRED
+                    and isinstance(parsed, dict)
+                    and parsed.get("bootstrap") == "install-required"):
+                observed = parsed.get("observed_sha256")
+                raise RemoteCIError(
+                    "remote CI helper install could not be verified "
+                    f"(expected {payload['helper_sha256']}, observed {observed!r})"
+                )
+        if isinstance(parsed, dict) and "protocol_version" in parsed:
+            version = parsed["protocol_version"]
+            if version != NODE_PROTOCOL_VERSION:
+                raise RemoteCIError(
+                    f"remote CI protocol mismatch: expected {NODE_PROTOCOL_VERSION}, "
+                    f"received {version!r}; refusing legacy response"
+                )
+            value = parsed.get("result")
+            if isinstance(value, (dict, list)):
+                return value
+            raise RemoteCIError("remote CI protocol v2 response has no object or list result")
         if isinstance(parsed, (dict, list)):
-            return parsed
+            raise RemoteCIError(
+                f"remote CI protocol mismatch: expected {NODE_PROTOCOL_VERSION}, "
+                "received an unversioned legacy response; refusing legacy full-body behavior"
+            )
         if result.returncode != 0 or result.timed_out:
             raise RemoteCIError(f"node {operation} failed: {result.stderr.strip()}")
         raise RemoteCIError(f"node {operation} returned invalid JSON")
@@ -880,7 +1083,12 @@ class RemoteRunner:
         self.sleeper = sleeper
         self._inflight: set[tuple[str, str]] = set()
         self.nodes = {
-            name: RemoteNode(box, config.admission, self.executor, poll_seconds=config.poll_seconds)
+            name: RemoteNode(
+                box, config.admission, self.executor,
+                poll_seconds=config.poll_seconds,
+                result_tail_bytes=config.result_tail_kib * 1024,
+                control_dir=Path("/tmp") / f"gf-ssh-{os.geteuid()}",
+            )
             for name, box in config.boxes.items()
         }
 
@@ -967,9 +1175,10 @@ class RemoteRunner:
                 if record.get("state") == "released" or not record.get("holder_alive"):
                     raise AdmissionError("node admission holder exited before admission")
                 self._recover_other_forgotten(node)
-                self.sleeper(admission_poll_interval(
-                    self.config.admission.queue_wait_seconds, self.config.poll_seconds
-                ))
+                # This status check crosses SSH. Keep controller polling at
+                # the configured steady interval; token-file retries happen
+                # locally on the node and stay on their separate fast path.
+                self.sleeper(self.config.poll_seconds)
             # Token ownership precedes rendering, checkout, push and test work.
             values = {
                 "box": spec.box, "host": node.box.host, "arm": spec.arm,
@@ -1039,11 +1248,28 @@ class RemoteRunner:
                 if kind == "died":
                     return ArmOutcome(spec.arm, "died", int(completed.get("returncode", 2)),
                                       None, identity, error=completed.get("error"), lease=record)
+                omitted: list[str] = []
                 try:
-                    receipt = receipt_from_output(completed.get("stdout", "") + "\n" + completed.get("stderr", ""))
+                    streams = completed.get("streams")
+                    if not isinstance(streams, Mapping):
+                        raise ReceiptError("node result omitted bounded stdout/stderr receipts")
+                    output_parts: list[str] = []
+                    for name in ("stdout", "stderr"):
+                        stream = streams.get(name)
+                        tail = stream.get("tail") if isinstance(stream, Mapping) else None
+                        if not isinstance(tail, Mapping) or not isinstance(tail.get("text"), str):
+                            raise ReceiptError(f"node result has an invalid {name} tail receipt")
+                        output_parts.append(tail["text"])
+                        if tail.get("truncated") is True:
+                            omitted_bytes = tail.get("omitted_bytes")
+                            if isinstance(omitted_bytes, int) and omitted_bytes > 0:
+                                omitted.append(f"{name} omitted {omitted_bytes} bytes")
+                    receipt = receipt_from_output("\n".join(output_parts))
                     if receipt.hostname != record["sample"]["hostname"]:
                         raise ReceiptError("receipt hostname differs from the measured node")
                 except ReceiptError as exc:
+                    if omitted:
+                        exc = ReceiptError(f"{exc}; truncated output: {', '.join(omitted)}")
                     return ArmOutcome(spec.arm, "red", completed["returncode"], None, identity,
                                       error=str(exc), lease=record)
                 status = "green" if completed["returncode"] == 0 and _receipt_is_green(receipt) else "red"
@@ -1057,7 +1283,7 @@ class RemoteRunner:
                 return ArmOutcome(spec.arm, "timeout", 124, None, identity,
                                   timed_out=True, cancelled=cancelled, lease=record,
                                   error=None if cancelled else "remote cancellation identity unknown")
-            self.sleeper(min(self.config.poll_seconds, 1.0))
+            self.sleeper(self.config.poll_seconds)
 
     def reattach_launch_log(self, launch_log: Path, spec: ArmSpec) -> ArmOutcome:
         identity = parse_launch_identity(launch_log.read_text(), default_host=self.config.boxes[spec.box].host)
