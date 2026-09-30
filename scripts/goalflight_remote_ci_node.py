@@ -34,7 +34,7 @@ SUCCESS_KEEP = 20
 SUCCESS_AGE_SECONDS = 7 * 24 * 3600
 FAILURE_KEEP = 50
 FAILURE_AGE_SECONDS = 14 * 24 * 3600
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 DEFAULT_RESULT_TAIL_BYTES = 16 * 1024
 MAX_RESULT_TAIL_BYTES = 64 * 1024
 MAX_FETCH_BYTES = 256 * 1024
@@ -1998,6 +1998,15 @@ def admission_sleep(run, seconds):
         time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 
+def admission_command_window_seconds(controller_poll_seconds):
+    if (isinstance(controller_poll_seconds, bool)
+            or not isinstance(controller_poll_seconds, (int, float))
+            or not math.isfinite(controller_poll_seconds)
+            or controller_poll_seconds <= 0):
+        raise ValueError('controller_poll_seconds must be a positive finite number')
+    return max(30.0, 2.0 * controller_poll_seconds + 10.0)
+
+
 def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
     """Own admission and the process group; persist identity before executing."""
     os.setsid()
@@ -2067,7 +2076,8 @@ def run_holder(root, run, ticket, ticket_lock, holder_lock, request):
         # The controller does that bookkeeping and then writes command.json.
         # If the reply was dropped, nobody will. Waiting forever pins the token
         # on a live owner that reap will not touch.
-        command_deadline = time.monotonic() + float(request.get('command_wait_seconds', 30))
+        command_deadline = time.monotonic() + admission_command_window_seconds(
+            request['controller_poll_seconds'])
         while not (run / 'command.json').exists():
             if (run / 'release.json').exists():
                 return
@@ -2210,6 +2220,8 @@ def dispatch(request):
     for name in ('runs', 'results', 'keep', 'quarantine'):
         (managed / name).mkdir(exist_ok=True, mode=0o700)
     operation = request['operation']
+    if operation == 'enqueue':
+        admission_command_window_seconds(request.get('controller_poll_seconds'))
     with (root / 'queue.lock').open('a+') as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
         policy_path = root / 'policy.json'

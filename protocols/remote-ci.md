@@ -33,7 +33,7 @@ test files, selection, and configured test command through argv placeholders and
 
 ### Controller-to-node protocol
 
-The controller uses node protocol version 2. Before each operation it hashes
+The controller uses node protocol version 3. Before each operation it hashes
 the local `goalflight_remote_ci_node.py`; the node launcher hashes the
 content-addressed copy under `<managed-root>/helpers/remote-ci/` and executes
 only the bytes that match that expected hash. A missing, mismatched, unreadable,
@@ -44,11 +44,15 @@ file is executed. This prevents derived helper state from outliving a changed
 source file and silently running stale code.
 
 Every operation response emitted by the installed node helper carries
-`protocol_version: 2`. The controller rejects a
+`protocol_version: 3`. The controller rejects a
 version mismatch or an unversioned legacy response with a protocol error. It
 never falls back to shipping the helper inline or accepting full stdout/stderr
-bodies. The node rejects requests that do not name version 2. Direct SSH
-transports use `ControlMaster=auto` and `ControlPersist=5m`. Each configured box
+bodies. The node rejects requests that do not name version 3. Enqueue requests
+carry the controller's configured `daemon.poll_seconds`; after admission, the
+holder waits for `command.json` for `max(30, 2 × poll_seconds + 10)` seconds.
+This keeps the holder alive across the controller's next queued-status poll and
+command creation. Direct SSH transports use `ControlMaster=auto` and
+`ControlPersist=5m`. Each configured box
 gets a socket key derived from its name and exact `remote_exec` argv template;
 the box configuration defines connection identity. SSH setup edits during a
 session may reuse the existing master until it expires after five idle minutes.

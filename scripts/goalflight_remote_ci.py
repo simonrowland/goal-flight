@@ -39,7 +39,7 @@ CONFIG_SCHEMA = "goalflight.remote-ci.config.v2"
 REQUEST_SCHEMA = "goalflight.remote-ci.request.v1"
 RECEIPT_SCHEMA = "goalflight.remote-ci.receipt.v1"
 RESULT_SCHEMA = "goalflight.remote-ci.result.v1"
-NODE_PROTOCOL_VERSION = 2
+NODE_PROTOCOL_VERSION = 3
 NODE_HELPER_INSTALL_REQUIRED = 73
 DEFAULT_RESULT_TAIL_KIB = 16
 MAX_RESULT_TAIL_KIB = 64
@@ -561,6 +561,7 @@ class RemoteNode:
             "poll_seconds": admission_poll_interval(
                 self.admission.queue_wait_seconds, self.poll_seconds
             ),
+            "controller_poll_seconds": self.poll_seconds,
             "result_tail_bytes": self.result_tail_bytes,
             **values,
         }

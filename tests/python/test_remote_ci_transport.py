@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import goalflight_remote_ci as ci
+import goalflight_remote_ci_node as ci_node
 from goalflight_remote_ci import CommandResult, RemoteRunner
 from test_remote_ci import ScriptedExecutor, _config, _raw_config, spec
 
@@ -229,6 +230,33 @@ def test_queued_arm_status_poll_uses_configured_interval(tmp_path):
     assert sleeps == [5.0], "queued status poll was capped below daemon.poll_seconds"
 
 
+def test_admission_command_window_outlives_a_60_second_controller_poll(tmp_path):
+    config = replace(_config(tmp_path), poll_seconds=60.0)
+    requests = []
+
+    def executor(argv, env, timeout):
+        shell = shlex.split(argv[2])
+        requests.append(json.loads(base64.b64decode(shell[3])))
+        return CommandResult(
+            0, json.dumps({"protocol_version": ci.NODE_PROTOCOL_VERSION,
+                           "result": {"state": "queued"}}), "", False
+        )
+
+    node = RemoteRunner(config, executor=executor).nodes["box-a"]
+    node.call("enqueue")
+
+    request = requests[0]
+    controller_poll = request.get("controller_poll_seconds")
+    assert controller_poll == 60.0, (
+        "enqueue request omitted the controller's configured polling interval"
+    )
+    command_window = ci_node.admission_command_window_seconds(controller_poll)
+    assert command_window == 130.0
+    assert 61.0 < command_window, (
+        "holder expires before the controller's next status check can send command.json"
+    )
+
+
 def test_status_returns_stream_sizes_hashes_bounded_tails_and_omitted_counts(
         tmp_path, monkeypatch):
     stdout = b"out-prefix\n" + b"o" * 2048
@@ -326,7 +354,7 @@ def test_remote_node_fails_closed_on_protocol_version_mismatch(tmp_path):
 
     runner = RemoteRunner(config, executor=old_node)
 
-    with pytest.raises(ci.RemoteCIError, match="protocol mismatch.*expected 2.*received 1"):
+    with pytest.raises(ci.RemoteCIError, match="protocol mismatch.*expected 3.*received 1"):
         runner.nodes["box-a"].call("status")
 
 
@@ -347,7 +375,7 @@ def test_node_rejects_controller_request_with_wrong_protocol_version(node_env):
     _, executor, _, node = node_env
     executor.before = lambda payload: payload.__setitem__("protocol_version", 1)
 
-    with pytest.raises(ci.RemoteCIError, match="protocol mismatch: expected 2, received 1"):
+    with pytest.raises(ci.RemoteCIError, match="protocol mismatch: expected 3, received 1"):
         node.call("health")
 
 
@@ -361,7 +389,8 @@ def test_direct_ssh_uses_private_persistent_control_socket(tmp_path):
 
     def executor(argv, env, timeout):
         commands.append(tuple(argv))
-        return CommandResult(0, json.dumps({"protocol_version": 2, "result": []}), "", False)
+        return CommandResult(0, json.dumps({"protocol_version": ci.NODE_PROTOCOL_VERSION,
+                                            "result": []}), "", False)
 
     runner = RemoteRunner(config, executor=executor)
     node = runner.nodes["box-a"]
@@ -441,7 +470,8 @@ def test_insecure_ssh_socket_directory_disables_multiplexing_with_a_warning(
     raw["boxes"]["box-a"]["remote_exec"] = ["ssh", "{host}", "{script}"]
     path = tmp_path / "remote-ci-insecure-socket.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
-    result = CommandResult(0, json.dumps({"protocol_version": 2, "result": []}), "", False)
+    result = CommandResult(0, json.dumps({"protocol_version": ci.NODE_PROTOCOL_VERSION,
+                                         "result": []}), "", False)
     commands = []
 
     def executor(argv, env, timeout):
@@ -470,7 +500,8 @@ def test_foreign_owned_ssh_socket_directory_disables_multiplexing(
     raw["boxes"]["box-a"]["remote_exec"] = ["ssh", "{host}", "{script}"]
     path = tmp_path / "remote-ci-foreign-socket.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
-    result = CommandResult(0, json.dumps({"protocol_version": 2, "result": []}), "", False)
+    result = CommandResult(0, json.dumps({"protocol_version": ci.NODE_PROTOCOL_VERSION,
+                                         "result": []}), "", False)
     commands = []
 
     def executor(argv, env, timeout):
