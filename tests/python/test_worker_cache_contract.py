@@ -60,6 +60,44 @@ def test_codex_worker_disables_remote_plugin_catalog_and_grants_shared_cache(
     assert str(cache) in writable_roots, str(writable_roots)
 
 
+def test_native_codex_read_only_keeps_sandbox_and_shared_cache_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "controller-home"
+    home.mkdir()
+    cache = _shared_cache(home)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "task-cache"))
+    monkeypatch.setattr(
+        dispatch,
+        "_resolve_account_env",
+        lambda _args: {"HOME": str(home), "UV_CACHE_DIR": str(tmp_path / "task-cache")},
+    )
+    monkeypatch.setattr(dispatch, "_guard_grok_seat_permission_mode", lambda *_args: None)
+
+    args = argparse.Namespace(
+        agent="codex",
+        cwd=str(ROOT),
+        model=None,
+        os_sandbox="read-only",
+        read_only=True,
+        parent_dispatch_id=None,
+        codex_session_id=None,
+        reasoning_effort=None,
+    )
+    argv, _stdin = dispatch.build_worker(args, "/tmp/worker.md", [])
+    env = dispatch._resolve_launch_account_env(SimpleNamespace(agent="codex", account=None))
+
+    sandbox_index = argv.index("--sandbox")
+    assert argv[sandbox_index + 1] == "read-only", argv
+    assert "workspace-write" not in argv, argv
+    assert not any(
+        value.startswith("sandbox_workspace_write.writable_roots=")
+        for value in argv
+    ), argv
+    assert env["UV_CACHE_DIR"] == str(cache), env["UV_CACHE_DIR"]
+
+
 def test_codex_acp_worker_disables_remote_plugin_catalog() -> None:
     _binary, argv = acp_run.agent_command("codex-acp")
 
