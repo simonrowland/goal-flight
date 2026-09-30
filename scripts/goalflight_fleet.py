@@ -159,6 +159,26 @@ def cmd_lock_acquire(args: argparse.Namespace) -> int:
 
 
 def cmd_lock_release(args: argparse.Namespace) -> int:
+    if args.reason == "salvage_complete":
+        manifest_path = getattr(args, "manifest", None)
+        if manifest_path is None:
+            print("salvage_complete lock release requires --manifest", file=sys.stderr)
+            return 1
+        manifest_path = manifest_path.expanduser()
+        if not manifest_path.is_file():
+            print(f"missing manifest: {manifest_path}", file=sys.stderr)
+            return 1
+        try:
+            manifest = _read_complete_salvage_manifest(manifest_path)
+        except ValueError as exc:
+            print(f"{exc}: {manifest_path}", file=sys.stderr)
+            return 1
+        if (
+            manifest.get("account_key") != args.account_key
+            or str(manifest.get("fencing_token") or "") != str(args.fencing_token)
+        ):
+            print("manifest lock identity does not match requested account lock", file=sys.stderr)
+            return 1
     try:
         doc = release_account_lock(
             args.fleet_dir,
@@ -226,12 +246,10 @@ def cmd_salvage_complete(args: argparse.Namespace) -> int:
     if not manifest_path.exists():
         print(f"missing manifest: {manifest_path}", file=sys.stderr)
         return 1
-    manifest = read_json(manifest_path)
-    if manifest.get("incomplete") is True:
-        print(
-            "manifest is incomplete; refusing account-lock release until excluded/refused files are reviewed",
-            file=sys.stderr,
-        )
+    try:
+        manifest = _read_complete_salvage_manifest(manifest_path)
+    except ValueError as exc:
+        print(f"{exc}: {manifest_path}", file=sys.stderr)
         return 1
     account_key = manifest.get("account_key")
     fencing_token = manifest.get("fencing_token")
@@ -254,6 +272,23 @@ def cmd_salvage_complete(args: argparse.Namespace) -> int:
         return 1
     print(json.dumps(doc, indent=2))
     return 0
+
+
+def _read_complete_salvage_manifest(path: Path) -> dict:
+    try:
+        manifest = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read salvage manifest: {exc}") from exc
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != "goalflight.fleet.salvage.manifest.v2"
+        or manifest.get("incomplete") is not False
+    ):
+        raise ValueError(
+            "manifest is incomplete or lacks an explicit v2 completion status; "
+            "refusing account-lock release until excluded/refused files are reviewed"
+        )
+    return manifest
 
 
 def _steering_actor(args: argparse.Namespace) -> dict:
@@ -380,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     lock_rel.add_argument("--account-key", required=True)
     lock_rel.add_argument("--fencing-token", required=True)
     lock_rel.add_argument("--reason", default="released")
+    lock_rel.add_argument("--manifest", type=Path)
     lock_rel.set_defaults(func=cmd_lock_release)
 
     recon = sub.add_parser("reconcile")
@@ -484,6 +520,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Relative pytest --basetemp target under src root; repeat as needed",
     )
+    ferry.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Force include a relative path past scratch exclusions; repeat as needed",
+    )
     ferry.add_argument("--exec", action="store_true", help="Run rsync (default preview)")
     ferry.add_argument("--json", action="store_true")
     ferry.set_defaults(func=cmd_ferry)
@@ -498,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
         "--append-only",
         action="append",
         default=None,
-        help="Additional append-only log path/pattern excluded from transfer and convergence",
+        help="Additional append-only log path/pattern ignored when deciding convergence",
     )
     salvage.add_argument(
         "--max-file-bytes",
@@ -511,6 +553,12 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=None,
         help="Relative pytest --basetemp target under the worktree; repeat as needed",
+    )
+    salvage.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        help="Force include a relative path past scratch exclusions; repeat as needed",
     )
     salvage.add_argument("--max-iterations", type=int, default=10)
     salvage.add_argument("--sleep-s", type=float, default=1.0)

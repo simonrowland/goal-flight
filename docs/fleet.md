@@ -227,18 +227,27 @@ must be explicitly allowed instead of being silently truncated. The default
 leaves room for ordinary source and resource files while refusing accidental
 multi-gigabyte artifacts, which otherwise dominate a cellular transfer.
 
-The ferry excludes these regenerable paths and reports each one in the
-versioned result's `excluded_files` array:
+Salvage applies scratch exclusions only to untracked (`??`) paths. A dirty
+tracked path always transfers, including paths under `logs`, `tails`,
+`__pycache__`, `node_modules`, and pytest-looking fixture directories. For
+untracked paths it excludes only:
 
-- `pytest-of-*/pytest-<N>` trees and each relative `--pytest-basetemp <path>`
-  target passed to ferry/salvage: pytest creates these temporary test fixtures.
-- `.pytest_cache`: pytest recreates this cache metadata.
-- `__pycache__` and `*.pyc`: Python regenerates bytecode from source.
-- `node_modules`: package managers recreate dependency installs from manifests
-  and lockfiles.
-- The existing append-only patterns (`*.log`, `logs/*`, `tails/*`,
-  `dispatcher.log`, and stdout/stderr log names): ferrying their full history is
-  not needed to recover source changes.
+- Any `.pytest_cache` path component: pytest recreates its cache metadata.
+- A `.pyc` file inside a `__pycache__` component: Python can regenerate that
+  bytecode; other files inside that component remain eligible.
+- A worktree-root `pytest-of-<user>/pytest-<N>/...` tree or a relative
+  `--pytest-basetemp <path>` supplied to the operation: pytest creates these
+  temporary test fixtures. Similar names nested under product directories are
+  preserved.
+
+It does not exclude `node_modules` or logs. Small logs transfer; a log over the
+per-file cap is refused and reported. Append-only patterns such as `*.log`,
+`tails/*`, and `dispatcher.log` affect only the convergence count. Use repeatable
+`--include <relpath>` to force a path through a scratch exclusion; the size cap
+still refuses an oversized file.
+
+Direct ferry applies these scratch rules to the explicitly requested paths;
+use `--include` when the requested path should cross regardless of its name.
 
 Each report has `path`, `size`, and `rule`; a size refusal also has
 `limit_bytes`. Files above the cap are omitted whole. Result schemas are
@@ -251,8 +260,8 @@ reviewed.
 
 For an arbitrary pytest `--basetemp` location inside the worktree, pass the same
 relative path with `--pytest-basetemp`; repeat the option for multiple targets.
-This avoids guessing from a product directory's name. The conventional
-`pytest-of-*/pytest-<N>` layout is recognized automatically.
+This avoids guessing from a product directory's name. Only a pytest temp tree at
+the worktree root is recognized automatically.
 
 Rsync uses `-z` to compress source and text bytes on the wire. It retains
 `--checksum`: salvage seeds each quarantine pass from the prior destination and
@@ -273,8 +282,13 @@ Manual release is also available when you have the exact lock identity:
 
 ```bash
 python3 scripts/goalflight_fleet.py lock-release \
-  --account-key <account_key> --fencing-token <fencing_token> --reason salvage_complete
+  --account-key <account_key> --fencing-token <fencing_token> \
+  --reason salvage_complete --manifest <salvage-dir>/salvage-manifest.json
 ```
+
+For `salvage_complete`, direct lock release requires that manifest, verifies its
+v2 schema and explicit `incomplete: false` status, verifies its lock identity,
+and refuses release otherwise.
 
 Salvage-held locks are not TTL-reaped; they stay active until this post-salvage
 release (or an operator `lock-release` with the matching fencing token).

@@ -74,6 +74,7 @@ def _remote_preflight_reply(
     sizes: dict[str, int] | None = None,
     ctimes: dict[str, int] | None = None,
     symlink_paths: set[str] | None = None,
+    expanded_paths: dict[str, list[str]] | None = None,
 ) -> tuple[int, str, str]:
     joined = " ".join(argv)
     match = re.search(r"--payload-b64\s+'?([A-Za-z0-9+/=]+)'?", joined)
@@ -83,18 +84,21 @@ def _remote_preflight_reply(
     sizes = sizes or {}
     ctimes = ctimes or {}
     symlink_paths = symlink_paths or set()
-    checked = [
-        {
-            "path": rel,
-            "realpath": str(Path(root) / rel),
-            "exists": True,
-            "nlink": 1,
-            "size": sizes.get(rel, 1),
-            "ctime_ns": ctimes.get(rel, 1),
-            "is_regular_file": rel not in symlink_paths,
-        }
-        for rel in payload["files"]
-    ]
+    expanded_paths = expanded_paths or {}
+    checked = []
+    for requested in payload["files"]:
+        for rel in expanded_paths.get(requested, [requested]):
+            checked.append(
+                {
+                    "path": rel,
+                    "realpath": str(Path(root) / rel),
+                    "exists": True,
+                    "nlink": 1,
+                    "size": sizes.get(rel, 1),
+                    "ctime_ns": ctimes.get(rel, 1),
+                    "is_regular_file": rel not in symlink_paths,
+                }
+            )
     return 0, json.dumps({"ok": True, "checked": checked}), ""
 
 
@@ -801,10 +805,12 @@ class SalvageRunner:
         diffs: list[str],
         *,
         remote_sizes: dict[str, int | list[int]] | None = None,
+        expanded_paths: dict[str, list[str]] | None = None,
     ) -> None:
         self.porcelains = [porcelain] if isinstance(porcelain, str) else list(porcelain)
         self.diffs = list(diffs)
         self.remote_sizes = remote_sizes or {}
+        self.expanded_paths = expanded_paths or {}
         self.rsync_files: list[list[str]] = []
         self.status_calls = 0
         self.preflight_calls = 0
@@ -819,7 +825,7 @@ class SalvageRunner:
                     sizes[path] = values[min(self.preflight_calls - 1, len(values) - 1)]
                 else:
                     sizes[path] = values
-            return _remote_preflight_reply(argv, sizes=sizes)
+            return _remote_preflight_reply(argv, sizes=sizes, expanded_paths=self.expanded_paths)
         if argv[0] == "ssh" and " status " in f" {joined} ":
             idx = min(self.status_calls, len(self.porcelains) - 1)
             self.status_calls += 1
@@ -905,12 +911,9 @@ def test_salvage_append_only_exclusion_converges() -> None:
             )
             assert_true("converged", manifest["converged"] is True)
             assert_true("two zero passes", len(manifest["iterations"]) == 2)
-            assert_true("append-only log never ferried", all("dispatcher.log" not in files for files in runner.rsync_files))
-            assert_true(
-                "changing log size reported",
-                any(entry["path"] == "dispatcher.log" and entry["size"] == 10000 for entry in manifest["excluded_files"]),
-            )
-            assert_true("new excluded tail reported", any(entry["path"] == "tails/active-tail" for entry in manifest["excluded_files"]))
+            assert_true("append-only log ferried", all("dispatcher.log" in files for files in runner.rsync_files))
+            assert_true("append-only logs are not exclusions", manifest["excluded_files"] == [])
+            assert_true("new tail ferried", any("tails/active-tail" in files for files in runner.rsync_files))
 
 
 def test_salvage_default_append_only_exclusion_converges() -> None:
@@ -932,12 +935,10 @@ def test_salvage_default_append_only_exclusion_converges() -> None:
             )
             assert_true("converged via defaults", manifest["converged"] is True)
             assert_true("two default zero passes", len(manifest["iterations"]) == 2)
-            assert_true("default append-only excluded", all(not files for files in runner.rsync_files))
-            assert_true(
-                "default logs reported",
-                {entry["path"] for entry in manifest["excluded_files"]}
-                == {"dispatcher.log", "tails/stdout.log"},
-            )
+            assert_true("default logs transferred", all(
+                {"dispatcher.log", "tails/stdout.log"} <= set(files) for files in runner.rsync_files
+            ))
+            assert_true("default append-only patterns only affect convergence", manifest["excluded_files"] == [])
 
 
 def test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source() -> None:
@@ -946,16 +947,17 @@ def test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source() -
             fleet_dir = Path(td) / "fleet"
             _fixture_fleet(fleet_dir)
             scratch_paths = [
-                ".pytest_cache/v/cache/nodeids",
-                "pytest-of-worker/pytest-3/test_render0/output.bin",
+                ".pytest_cache/x",
+                "pkg/__pycache__/m.cpython-314.pyc",
+                "pytest-of-u/pytest-0/t",
                 "tmp/custom-test-run/test_output.bin",
-                "pkg/__pycache__/module.cpython-313.pyc",
                 "pkg/module.pyc",
                 "vendor/node_modules/library/index.js",
                 "dispatcher.log",
+                "tests/fixtures/pytest-of-alice/pytest-0/input.txt",
             ]
             porcelain = "".join(f"?? {path}\n" for path in scratch_paths)
-            porcelain += "?? src/pytest_fixture.py\n M src/app.py\n"
+            porcelain += " M pkg/__pycache__/helper.py\n M src/pytest_fixture.py\n"
             runner = SalvageRunner(porcelain, ["", ""])
             manifest = ferry.salvage_worktree(
                 fleet_dir,
@@ -968,27 +970,122 @@ def test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source() -
             )
 
             first_transfer = runner.rsync_files[0]
-            assert_true("pytest cache excluded", ".pytest_cache/v/cache/nodeids" not in first_transfer)
-            assert_true("pytest basetemp excluded", "pytest-of-worker/pytest-3/test_render0/output.bin" not in first_transfer)
+            assert_true("pytest cache excluded", ".pytest_cache/x" not in first_transfer)
+            assert_true("pytest basetemp excluded", "pytest-of-u/pytest-0/t" not in first_transfer)
             assert_true("explicit --basetemp target excluded", "tmp/custom-test-run/test_output.bin" not in first_transfer)
-            assert_true("bytecode caches excluded", "pkg/__pycache__/module.cpython-313.pyc" not in first_transfer)
-            assert_true("standalone bytecode excluded", "pkg/module.pyc" not in first_transfer)
-            assert_true("node_modules excluded", "vendor/node_modules/library/index.js" not in first_transfer)
-            assert_true("append-only log excluded", "dispatcher.log" not in first_transfer)
+            assert_true("bytecode cache excluded", "pkg/__pycache__/m.cpython-314.pyc" not in first_transfer)
+            assert_true("standalone bytecode transferred", "pkg/module.pyc" in first_transfer)
+            assert_true("node_modules content transferred", "vendor/node_modules/library/index.js" in first_transfer)
+            assert_true("append-only log transferred", "dispatcher.log" in first_transfer)
+            assert_true("nested pytest-looking fixture transferred", "tests/fixtures/pytest-of-alice/pytest-0/input.txt" in first_transfer)
+            assert_true("tracked Python file in pycache named directory transferred", "pkg/__pycache__/helper.py" in first_transfer)
             assert_true("scratch-like product source retained", "src/pytest_fixture.py" in first_transfer)
             excluded_by_path = {entry["path"]: entry for entry in manifest["excluded_files"]}
             reported = set(excluded_by_path)
-            assert_true("every scratch path reported", set(scratch_paths) <= reported)
-            for path in scratch_paths:
+            excluded_paths = {
+                ".pytest_cache/x",
+                "pkg/__pycache__/m.cpython-314.pyc",
+                "pytest-of-u/pytest-0/t",
+                "tmp/custom-test-run/test_output.bin",
+            }
+            assert_true("only recognized scratch paths reported", reported == excluded_paths)
+            for path in excluded_paths:
                 entry = excluded_by_path[path]
                 assert_true(
                     f"exclusion report has path, size, and rule for {path}",
                     entry.get("path") == path and isinstance(entry.get("size"), int) and bool(entry.get("rule")),
                 )
-            assert_true(
-                "append-only report identifies log rule",
-                excluded_by_path["dispatcher.log"]["rule"].startswith("append-only log pattern"),
+
+
+def test_salvage_transfers_every_dirty_product_path_with_scratch_names() -> None:
+    product_paths = [
+        "src/logs/handler.py",
+        "pkg/logs/sub/handler.py",
+        "a/b/logs/c/d/e.py",
+        "src/tails/notes.md",
+        "data/events.log",
+        "tests/fixtures/server.log",
+        "pkg/__pycache__/helper.py",
+        "vendor/node_modules/leftpad/index.js",
+        "tests/fixtures/pytest-of-alice/pytest-0/input.txt",
+    ]
+    porcelain = "".join(f" M {path}\n" for path in product_paths)
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            runner = SalvageRunner(porcelain, ["", ""])
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "tracked-product"),
+                runner=runner,
+                sleep_s=0,
             )
+
+            transferred = set(runner.rsync_files[0]) if runner.rsync_files else set()
+            assert_true("every dirty product path transferred", set(product_paths) <= transferred)
+            assert_true("tracked product paths are not excluded", not manifest["excluded_files"])
+
+
+def test_salvage_include_rescues_excluded_path() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            first_runner = SalvageRunner("?? .pytest_cache/x\n", ["", ""])
+            first_manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "first-cache-salvage"),
+                runner=first_runner,
+                sleep_s=0,
+            )
+            assert_true(
+                "first run reports scratch path",
+                any(entry["path"] == ".pytest_cache/x" for entry in first_manifest["excluded_files"]),
+            )
+            runner = SalvageRunner("?? .pytest_cache/x\n", ["", ""])
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "include-scratch"),
+                runner=runner,
+                include_paths=[".pytest_cache/x"],
+                sleep_s=0,
+            )
+
+            assert_true("include path transferred", ".pytest_cache/x" in runner.rsync_files[0])
+            assert_true("included path not reported excluded", not manifest["excluded_files"])
+
+
+def test_changing_excluded_cache_does_not_block_salvage_convergence() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            runner = SalvageRunner(
+                ["?? .pytest_cache/x\n"] * 4,
+                [],
+                remote_sizes={".pytest_cache/x": [1, 100, 1000, 10000]},
+            )
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "changing-cache"),
+                runner=runner,
+                sleep_s=0,
+            )
+
+            assert_true("changing excluded cache converges", manifest["converged"] is True)
+            assert_true("two quiet rounds recorded", len(manifest["iterations"]) == 2)
+            assert_true("cache never reaches rsync", runner.rsync_files == [])
+            excluded = next(entry for entry in manifest["excluded_files"] if entry["path"] == ".pytest_cache/x")
+            assert_true("latest excluded size remains visible", excluded["size"] == 10000)
 
 
 def test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete() -> None:
@@ -1007,6 +1104,7 @@ def test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete() -> None:
                 worktree_path="/remote/worktree",
                 out_dir=_staging(fleet_dir, "over-cap-salvage"),
                 runner=runner,
+                include_paths=["artifacts/large.bin"],
                 max_file_bytes=64,
                 sleep_s=0,
             )
@@ -1018,6 +1116,39 @@ def test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete() -> None:
             assert_true("exact capped size reported", refused["size"] == 65)
             assert_true("cap rule reported", refused["rule"] == "max-file-bytes")
             assert_true("configured cap reported", refused["limit_bytes"] == 64)
+
+
+def test_salvage_directory_and_expanded_cap_leaf_converge() -> None:
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            runner = SalvageRunner(
+                [
+                    "?? artifacts/\n",
+                    "?? artifacts/large.bin\n",
+                    "?? artifacts/large.bin\n",
+                    "?? artifacts/large.bin\n",
+                ],
+                [],
+                remote_sizes={"artifacts/large.bin": 65},
+                expanded_paths={"artifacts": ["artifacts/large.bin"]},
+            )
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "directory-cap-salvage"),
+                runner=runner,
+                max_file_bytes=64,
+                sleep_s=0,
+            )
+
+            assert_true("directory expansion does not abort salvage", manifest["converged"] is True)
+            assert_true("two quiet rounds after cap classification", len(manifest["iterations"]) == 2)
+            assert_true("capped leaf never reaches rsync", runner.rsync_files == [])
+            refusal = next(entry for entry in manifest["excluded_files"] if entry["path"] == "artifacts/large.bin")
+            assert_true("expanded capped leaf reported", refusal["size"] == 65 and refusal["rule"] == "max-file-bytes")
 
 
 def test_salvage_capped_path_churn_does_not_block_convergence() -> None:
@@ -1243,8 +1374,9 @@ def test_cli_ferry_returns_incomplete_status() -> None:
         original = ferry.execute_ferry
         captured: dict[str, object] = {}
 
-        def fake_ferry(*_args, max_file_bytes=None, **_kwargs):
+        def fake_ferry(*_args, max_file_bytes=None, include_paths=None, **_kwargs):
             captured["max_file_bytes"] = max_file_bytes
+            captured["include_paths"] = include_paths
             return ferry.FerryReceipt({"schema": "goalflight.fleet.ferry.receipt.v2", "incomplete": True})
 
         ferry.execute_ferry = fake_ferry
@@ -1268,12 +1400,15 @@ def test_cli_ferry_returns_incomplete_status() -> None:
                         "large.bin",
                         "--purpose",
                         "incomplete-test",
+                        "--include",
+                        ".pytest_cache/x",
                     ]
                 )
         finally:
             ferry.execute_ferry = original
         assert_true("ferry CLI rejects incomplete result", rc == 3)
         assert_true("CLI uses default cap", captured["max_file_bytes"] == ferry.DEFAULT_MAX_FILE_BYTES)
+        assert_true("ferry include option passed", captured["include_paths"] == [".pytest_cache/x"])
         assert_true("incomplete JSON printed", '"incomplete": true' in stdout.getvalue())
 
 
@@ -1307,6 +1442,49 @@ def test_cli_salvage_returns_incomplete_status() -> None:
         finally:
             ferry.salvage_worktree = original
         assert_true("salvage CLI rejects incomplete result", rc == 3)
+
+
+def test_cli_salvage_include_is_repeatable() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        original = ferry.salvage_worktree
+        captured: dict[str, object] = {}
+
+        def fake_salvage(*_args, include_paths=None, **_kwargs):
+            captured["include_paths"] = include_paths
+            return {"schema": "goalflight.fleet.salvage.manifest.v2", "incomplete": False}
+
+        ferry.salvage_worktree = fake_salvage
+        try:
+            with redirect_stdout(io.StringIO()):
+                rc = fleet.main(
+                    [
+                        "--fleet-dir",
+                        str(fleet_dir),
+                        "salvage",
+                        "--node",
+                        "localhost",
+                        "--worktree-path",
+                        "/remote/worktree",
+                        "--out-dir",
+                        str(_staging(fleet_dir, "include-cli")),
+                        "--include",
+                        ".pytest_cache/x",
+                        "--include",
+                        "pkg/__pycache__/helper.py",
+                        "--exec",
+                    ]
+                )
+        except SystemExit as exc:
+            rc = int(exc.code)
+        finally:
+            ferry.salvage_worktree = original
+        assert_true("salvage include CLI accepted", rc == 0)
+        assert_true(
+            "salvage include values passed in order",
+            captured.get("include_paths") == [".pytest_cache/x", "pkg/__pycache__/helper.py"],
+        )
 
 
 def test_ferry_preflight_allowlist_shape_is_narrow() -> None:
@@ -1358,6 +1536,60 @@ def test_salvage_manifest_records_lock_identity() -> None:
             assert_true("account key", manifest.get("account_key") == "openai/default")
             assert_true("fencing token", manifest.get("fencing_token") == lock.get("fencing_token"))
             assert_true("release command", "lock-release" in str(manifest.get("lock_release_command")))
+            assert_true("release command is bound to manifest", "--manifest" in str(manifest.get("lock_release_command")))
+            rc = fleet.main(
+                [
+                    "--fleet-dir",
+                    str(fleet_dir),
+                    "lock-release",
+                    "--account-key",
+                    "openai/default",
+                    "--fencing-token",
+                    str(lock.get("fencing_token")),
+                    "--reason",
+                    "salvage_complete",
+                    "--manifest",
+                    str(manifest["manifest_path"]),
+                ]
+            )
+            assert_true("complete manifest permits exact lock release", rc == 0)
+
+
+def test_incomplete_salvage_manifest_omits_lock_release_command() -> None:
+    dispatch_id = "incomplete-salvage-no-release-command"
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            fleet.acquire_account_lock(
+                fleet_dir,
+                account_key="openai/default",
+                owner_dispatch_id=dispatch_id,
+            )
+            dispatch_dir = fleet_dir / "register" / "dispatches" / dispatch_id
+            dispatch_dir.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                dispatch_dir / "meta.json",
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "lease_active": True,
+                    "row_state": "salvage_needed",
+                },
+            )
+            runner = SalvageRunner("?? large.bin\n", ["", ""], remote_sizes={"large.bin": 9})
+            manifest = ferry.salvage_worktree(
+                fleet_dir,
+                node_id="localhost",
+                worktree_path="/remote/worktree",
+                out_dir=_staging(fleet_dir, "incomplete-no-release"),
+                dispatch_id=dispatch_id,
+                runner=runner,
+                max_file_bytes=8,
+                sleep_s=0,
+            )
+            assert_true("salvage result incomplete", manifest["incomplete"] is True)
+            assert_true("incomplete manifest has no direct release command", "lock_release_command" not in manifest)
 
 
 def test_salvage_complete_releases_exact_lock() -> None:
@@ -1380,7 +1612,8 @@ def test_salvage_complete_releases_exact_lock() -> None:
         manifest_path.write_text(
             json.dumps(
                 {
-                    "schema": "goalflight.fleet.salvage.manifest.v1",
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "incomplete": False,
                     "dispatch_id": dispatch_id,
                     "account_key": "openai/default",
                     "fencing_token": lock.get("fencing_token"),
@@ -1445,6 +1678,146 @@ def test_salvage_complete_refuses_incomplete_manifest() -> None:
         assert_true("account lock remains active", held is not None and held.get("state") == "active")
 
 
+def test_lock_release_refuses_incomplete_salvage_manifest() -> None:
+    dispatch_id = "incomplete-direct-lock-release"
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id=dispatch_id,
+        )
+        manifest_path = _staging(fleet_dir, "incomplete-direct", "salvage-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "incomplete": True,
+                    "account_key": "openai/default",
+                    "fencing_token": lock.get("fencing_token"),
+                }
+            )
+            + "\n"
+        )
+        error = io.StringIO()
+        try:
+            with redirect_stderr(error):
+                rc = fleet.main(
+                    [
+                        "--fleet-dir",
+                        str(fleet_dir),
+                        "lock-release",
+                        "--account-key",
+                        "openai/default",
+                        "--fencing-token",
+                        str(lock.get("fencing_token")),
+                        "--reason",
+                        "salvage_complete",
+                        "--manifest",
+                        str(manifest_path),
+                    ]
+                )
+        except SystemExit as exc:
+            rc = int(exc.code)
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("incomplete direct lock release rejected", rc == 1)
+        assert_true("direct release explains refusal", "manifest is incomplete" in error.getvalue())
+        assert_true("direct release leaves account lock active", held is not None and held.get("state") == "active")
+
+
+def test_salvage_complete_refuses_manifest_without_complete_state() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id="missing-complete-state",
+        )
+        manifest_path = _staging(fleet_dir, "missing-complete-state", "salvage-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "account_key": "openai/default",
+                    "fencing_token": lock.get("fencing_token"),
+                }
+            )
+            + "\n"
+        )
+        error = io.StringIO()
+        with redirect_stderr(error):
+            rc = fleet.main(
+                [
+                    "--fleet-dir",
+                    str(fleet_dir),
+                    "salvage-complete",
+                    "--manifest",
+                    str(manifest_path),
+                ]
+            )
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("missing completion state rejected", rc == 1)
+        assert_true("completion state refusal explained", "incomplete" in error.getvalue())
+        assert_true("missing state leaves lock active", held is not None and held.get("state") == "active")
+
+
+def test_lock_release_refuses_manifest_without_complete_state() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id="missing-direct-complete-state",
+        )
+        manifest_path = _staging(fleet_dir, "missing-direct-complete-state", "salvage-manifest.json")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.fleet.salvage.manifest.v2",
+                    "account_key": "openai/default",
+                    "fencing_token": lock.get("fencing_token"),
+                }
+            )
+            + "\n"
+        )
+        error = io.StringIO()
+        with redirect_stderr(error):
+            rc = fleet.main(
+                [
+                    "--fleet-dir",
+                    str(fleet_dir),
+                    "lock-release",
+                    "--account-key",
+                    "openai/default",
+                    "--fencing-token",
+                    str(lock.get("fencing_token")),
+                    "--reason",
+                    "salvage_complete",
+                    "--manifest",
+                    str(manifest_path),
+                ]
+            )
+        held = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
+        assert_true("direct release without complete state rejected", rc == 1)
+        assert_true("direct completeness refusal explained", "incomplete" in error.getvalue())
+        assert_true("missing state leaves direct lock active", held is not None and held.get("state") == "active")
+
+
+def test_pytest_basetemp_rejects_traversal_and_absolute_paths() -> None:
+    for invalid in ("tmp/../src", "../src", "/tmp/pytest-data"):
+        try:
+            ferry._normalize_pytest_basetemp_paths([invalid])
+        except ferry.FerryError:
+            continue
+        raise AssertionError(f"unsafe pytest basetemp accepted: {invalid}")
+
+
 def test_git_status_porcelain_allowlist_shape_is_narrow() -> None:
     argv = fleet_ssh.build_remote_command(
         "git_status_porcelain",
@@ -1502,7 +1875,12 @@ def main() -> None:
         test_salvage_append_only_exclusion_converges,
         test_salvage_default_append_only_exclusion_converges,
         test_salvage_excludes_regenerable_scratch_but_keeps_scratch_named_source,
+        test_salvage_transfers_every_dirty_product_path_with_scratch_names,
+        test_salvage_include_rescues_excluded_path,
+        test_changing_excluded_cache_does_not_block_salvage_convergence,
+        test_incomplete_salvage_manifest_omits_lock_release_command,
         test_salvage_refuses_over_cap_file_and_marks_manifest_incomplete,
+        test_salvage_directory_and_expanded_cap_leaf_converge,
         test_salvage_capped_path_churn_does_not_block_convergence,
         test_push_refuses_over_cap_file_in_ferry_receipt,
         test_synthetic_basetemp_exclusion_byte_reduction,
@@ -1511,9 +1889,14 @@ def main() -> None:
         test_cli_salvage_default_append_only_patterns_merge,
         test_cli_ferry_returns_incomplete_status,
         test_cli_salvage_returns_incomplete_status,
+        test_cli_salvage_include_is_repeatable,
         test_salvage_manifest_records_lock_identity,
         test_salvage_complete_releases_exact_lock,
         test_salvage_complete_refuses_incomplete_manifest,
+        test_lock_release_refuses_incomplete_salvage_manifest,
+        test_salvage_complete_refuses_manifest_without_complete_state,
+        test_lock_release_refuses_manifest_without_complete_state,
+        test_pytest_basetemp_rejects_traversal_and_absolute_paths,
         test_ferry_preflight_allowlist_shape_is_narrow,
         test_git_status_porcelain_allowlist_shape_is_narrow,
     )
