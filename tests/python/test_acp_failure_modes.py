@@ -312,7 +312,7 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
-    assert args == []
+    assert args == ["-c", "features.remote_plugin=false"]
 
     binary, args = agent_command("claude-acp")
     assert Path(binary).name == "claude-code-cli-acp"

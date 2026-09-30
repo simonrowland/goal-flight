@@ -81,8 +81,8 @@ def _write_fake_codex_acp_manifest(
                 "invocation": {
                     "exec": {
                         "kind": "acp",
-                        "binary": sys.executable,
-                        "args": [str(FAKE)],
+                        "binary": str(FAKE),
+                        "args": [],
                         "arg_policy": {"forbidden_args": []},
                     }
                 },
@@ -473,6 +473,8 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         _write_fake_codex_acp_manifest(tmp / "adapters")
         env = _env(tmp)
         dispatch_id = "acp-between-turn-steer"
+        fake_argv_path = tmp / "fake-argv.json"
+        env["GOALFLIGHT_FAKE_ACP_ARGV_FILE"] = str(fake_argv_path)
         status_path = tmp / "status.json"
         proc = subprocess.Popen(
             [
@@ -506,6 +508,11 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         )
         try:
             _wait_for(Path(env["GOALFLIGHT_FAKE_ACP_TURN1_FILE"]), proc=proc)
+            _wait_for(fake_argv_path, proc=proc)
+            assert json.loads(fake_argv_path.read_text(encoding="utf-8")) == [
+                "-c",
+                "features.remote_plugin=false",
+            ]
             watcher_prompt = tmp / "status.assembled.prompt"
             _wait_for(watcher_prompt, proc=proc)
             assert watcher_prompt.read_text(encoding="utf-8") == (

@@ -66,8 +66,8 @@ def _write_fake_codex_acp_manifest(directory: Path) -> None:
                 "invocation": {
                     "exec": {
                         "kind": "acp",
-                        "binary": sys.executable,
-                        "args": [str(FAKE)],
+                        "binary": str(FAKE),
+                        "args": [],
                         "arg_policy": {"forbidden_args": []},
                     }
                 },

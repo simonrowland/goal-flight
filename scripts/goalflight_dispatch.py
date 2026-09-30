@@ -1185,8 +1185,7 @@ SEARCH_SCOPE_PREAMBLE = (
     "Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.\n"
     "Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,\n"
     "`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.\n"
-    "For a file outside your worktree, use its known path.\n"
-    "The dispatcher sets the shared `UV_CACHE_DIR`; reuse it and do not override it."
+    "For a file outside your worktree, use its known path."
 )
 
 

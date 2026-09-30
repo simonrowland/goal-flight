@@ -104,7 +104,9 @@ def case_linked_worktree_argv_is_narrow() -> None:
             str(common_dir / "objects"),
             str(common_dir / "refs" / "heads"),
             str(common_dir / "logs" / "refs" / "heads"),
-        ] + sandbox.worker_channel_roots()
+        ] + sandbox.worker_channel_roots() + [
+            str(sandbox.shared_worker_uv_cache_dir()),
+        ]
 
         bash_argv, _ = dispatch.build_worker(_codex_args(linked), "/tmp/p.md", [])
         assert _configured_roots(bash_argv) == expected
@@ -114,6 +116,14 @@ def case_linked_worktree_argv_is_narrow() -> None:
             "codex-acp", base_acp_argv, cwd=str(linked), os_sandbox="workspace-write"
         )
         assert _configured_roots(acp_argv) == expected
+        cache_root = sandbox.shared_worker_uv_cache_dir()
+        for agent, command in (("codex", "codex"), ("codex-acp", "codex-acp")):
+            read_only_roots = os_sandbox.macos_write_roots(
+                str(linked), "read-only", agent=agent, command=command
+            )
+            assert not any(
+                _is_within(cache_root, Path(root)) for root in read_only_roots
+            ), (agent, read_only_roots)
 
         outer_roots = os_sandbox.macos_write_roots(
             str(linked), "workspace-write", agent="codex-acp", command="codex-acp"
@@ -131,7 +141,11 @@ def case_linked_worktree_argv_is_narrow() -> None:
         # Channel roots are deliberately excluded from this check: every worker
         # needs to post mail regardless of engine, so they are universal by
         # design and their presence for another agent is correct, not a leak.
-        worktree_only = [root for root in expected if root not in sandbox.worker_channel_roots()]
+        shared_cache = str(sandbox.shared_worker_uv_cache_dir())
+        worktree_only = [
+            root for root in expected
+            if root not in sandbox.worker_channel_roots() and root != shared_cache
+        ]
         assert worktree_only, "the spoofing check must still have something to protect"
         assert not any(root in misleading_roots for root in worktree_only), misleading_roots
 
@@ -232,7 +246,9 @@ def case_linked_worktree_argv_is_narrow() -> None:
         # not depend on the worktree, and a worker that cannot reach its mailbox
         # cannot report the very breakage that got it here.
         escaped_roots = _configured_roots(escaped_argv)
-        assert escaped_roots == sandbox.worker_channel_roots(), escaped_argv
+        assert escaped_roots == sandbox.worker_channel_roots() + [
+            str(sandbox.shared_worker_uv_cache_dir())
+        ], escaped_argv
         assert not any(str(common_dir) in root for root in escaped_roots), escaped_argv
         escaped_outer = os_sandbox.macos_write_roots(
             str(linked), "workspace-write", agent="codex", command="codex"
@@ -250,17 +266,21 @@ def case_non_linked_and_non_write_profiles_are_unchanged() -> None:
         normal_argv, _ = dispatch.build_worker(_codex_args(repo), "/tmp/p.md", [])
         # A NORMAL (non-linked) repo needs no worktree narrowing -- codex's own
         # workspace-write already covers the checkout. It still gets the channel
-        # roots, and only those. This is the case that was silently broken: the
-        # grant was gated behind a cwd argument nobody passes, so an ordinary
+        # roots and shared cache, and only those. This case caught a silent bug:
+        # the grant was gated behind a cwd argument nobody passes, so an ordinary
         # worker in an ordinary repo could neither post mail nor start its
         # review, and the failure surfaced only as "Operation not permitted".
         normal_roots = _configured_roots(normal_argv)
-        assert normal_roots == sandbox.worker_channel_roots(), normal_argv
+        assert normal_roots == sandbox.worker_channel_roots() + [
+            str(sandbox.shared_worker_uv_cache_dir())
+        ], normal_argv
 
         read_only_argv, _ = dispatch.build_worker(
             _codex_args(repo, "read-only"), "/tmp/p.md", []
         )
         assert not any("writable_roots=" in part for part in read_only_argv), read_only_argv
+        cache_root = sandbox.shared_worker_uv_cache_dir()
+        assert str(cache_root) not in read_only_argv, read_only_argv
 
         _command, base_acp_argv = acp.agent_command("codex-acp")
         acp_argv = acp._codex_workspace_write_acp_args(

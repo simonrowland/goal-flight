@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -17,6 +18,26 @@ sessions: dict[str, dict] = {}
 AUTHORIZE_TOKEN = re.compile(
     r"USER-CONFIRM-ANSWER:\s+\S+\s+yes(?=[.]|\s|$)"
 )
+
+
+def _consume_config_args() -> None:
+    """Ignore Codex-style config pairs while keeping them visible to tests."""
+    args = sys.argv[1:]
+    remaining: list[str] = []
+    received: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-c", "--config"} and index + 1 < len(args):
+            received.extend((arg, args[index + 1]))
+            index += 2
+        else:
+            remaining.append(arg)
+            index += 1
+    sys.argv[1:] = remaining
+    marker = os.environ.get("GOALFLIGHT_FAKE_ACP_ARGV_FILE")
+    if marker:
+        Path(marker).write_text(json.dumps(received), encoding="utf-8")
 
 
 def send(message: dict) -> None:
@@ -970,6 +991,7 @@ def handle(message: dict) -> None:
 
 
 def main() -> None:
+    _consume_config_args()
     if SCENARIO == "handshake_wedge":
         # Spawn, then never read stdin or answer initialize — the intermittent
         # codex-acp handshake wedge (worker is up but the handshake hangs).
