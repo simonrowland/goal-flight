@@ -7,14 +7,48 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 WORKSPACE_WRITE = "workspace-write"
+try:
+    import pwd
+except ImportError:  # Windows has no passwd database; USERPROFILE is its home.
+    _REAL_USER_HOME = Path(os.environ["USERPROFILE"]).resolve(strict=False)
+else:
+    _REAL_USER_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=False)
+_SHARED_WORKER_UV_CACHE_DIR = (
+    _REAL_USER_HOME / ".cache" / "uv"
+).resolve(strict=False)
 
 
 def shared_worker_uv_cache_dir() -> Path:
-    """Return uv's shared host cache path, independent of worker HOME overrides."""
-    return (Path.home() / ".cache" / "uv").resolve(strict=False)
+    """Return uv's controller cache, captured before any worker HOME override."""
+    return _SHARED_WORKER_UV_CACHE_DIR
+
+
+def shared_worker_uv_cache_symlink() -> Path | None:
+    """Return a cache component that is a symlink under the real user home."""
+    path = _REAL_USER_HOME
+    for component in (".cache", "uv"):
+        path /= component
+        if path.is_symlink():
+            return path
+    return None
+
+
+def shared_worker_uv_cache_write_root() -> Path | None:
+    """Refuse shared-cache sandbox grants when its home-relative path is linked."""
+    symlink = shared_worker_uv_cache_symlink()
+    if symlink is not None:
+        print(
+            "goalflight: refusing shared uv cache write grant; "
+            f"{symlink} is a symlink",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    return shared_worker_uv_cache_dir()
 
 
 def _git_path(cwd: Path, flag: str) -> Path | None:
@@ -176,6 +210,8 @@ def codex_workspace_write_args(cwd: str | Path | None, profile: str | None) -> l
     # permitted", with no hint that the cause was an argument nobody passed.
     roots = list(linked_worktree_writable_roots(cwd)) if cwd else []
     roots += worker_channel_roots()
-    roots.append(str(shared_worker_uv_cache_dir()))
+    cache_root = shared_worker_uv_cache_write_root()
+    if cache_root is not None:
+        roots.append(str(cache_root))
     value = json.dumps(roots, separators=(",", ":"))
     return ["-c", f"sandbox_workspace_write.writable_roots={value}"]

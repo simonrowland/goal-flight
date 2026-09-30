@@ -1120,9 +1120,7 @@ PROMPT_FILE_PREAMBLE = (
     "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
     "internal compaction/summarization, at the start of each long-run goal-loop "
     "iteration, and before final commit/exit; the disk file is authoritative over "
-    "summarized memory. If the brief specifies its own `UV_CACHE_DIR` assignment, "
-    "the dispatcher has replaced it with the shared cache; keep the shared value "
-    "when rereading the brief."
+    "summarized memory."
 )
 # Cursor's CLI auto-reviews shell commands. Reading the prompt-file env var is
 # one of the commands it escalates, and an unattended dispatch has nobody to
@@ -1192,42 +1190,26 @@ SEARCH_SCOPE_PREAMBLE = (
 )
 
 
-_WORKER_UV_CACHE_ASSIGNMENT_RE = re.compile(
-    r"(?P<prefix>(?:\bexport\s+)?\bUV_CACHE_DIR\s*=\s*)"
-    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
-)
+def _warn_worker_prompt_uv_cache_references(prompt_text: str) -> None:
+    """Warn the dispatcher about prompt lines that mention the pinned cache."""
+    lines = [
+        str(number)
+        for number, line in enumerate(prompt_text.splitlines(), start=1)
+        if "UV_CACHE_DIR" in line
+    ]
+    if lines:
+        print(
+            "goalflight_dispatch: WARN: worker prompt references UV_CACHE_DIR on "
+            f"line(s) {', '.join(lines)}; worker environment stays pinned to the shared cache",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
-def _override_worker_prompt_uv_cache(prompt_text: str) -> tuple[str, bool]:
-    """Rewrite explicit per-task cache assignments to the shared warm cache."""
-    shared_cache = shared_worker_uv_cache_dir()
-    changed = False
-
-    def replace_assignment(match: re.Match[str]) -> str:
-        nonlocal changed
-        raw_value = match.group("value")
-        quote = raw_value[0] if raw_value.startswith(("'", '"')) else ""
-        value = raw_value[1:-1] if quote else raw_value
-        try:
-            configured_cache = Path(value).expanduser().resolve(strict=False)
-        except (OSError, RuntimeError):
-            configured_cache = None
-        if configured_cache == shared_cache:
-            return match.group(0)
-        changed = True
-        replacement = f"{quote}{shared_cache}{quote}" if quote else shlex.quote(str(shared_cache))
-        return f"{match.group('prefix')}{replacement}"
-
-    return _WORKER_UV_CACHE_ASSIGNMENT_RE.sub(replace_assignment, prompt_text), changed
-
-
-def _warn_worker_prompt_uv_cache_override() -> None:
-    print(
-        "goalflight_dispatch: WARN: replaced a worker prompt UV_CACHE_DIR assignment "
-        "with the shared cache",
-        file=sys.stderr,
-        flush=True,
-    )
+def _read_worker_prompt(path: Path) -> str:
+    """Read prompt text without normalizing line endings or changing its bytes."""
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        return handle.read()
 
 
 # Workers routinely deliver a correct fix wrapped in scaffolding nobody asked
@@ -8498,10 +8480,8 @@ def _materialize_steer_prompt(
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
-    body = body_path.read_text(encoding="utf-8", errors="replace")
-    body, uv_cache_overridden = _override_worker_prompt_uv_cache(body)
-    if uv_cache_overridden:
-        _warn_worker_prompt_uv_cache_override()
+    body = _read_worker_prompt(body_path)
+    _warn_worker_prompt_uv_cache_references(body)
     preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
     # The watcher binds success markers to the dispatch id, so every agent whose
     # markers are scraped from a text tail must be told the id. That includes
@@ -22544,17 +22524,19 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         disabled=bool(getattr(args, "no_orientation", False)),
     )
     acp_prompt_text = None if prompt_path else args.prompt
+    warned_prompt_body = False
     if orientation_path is not None and prompt_path:
-        body = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+        body = _read_worker_prompt(Path(prompt_path))
+        _warn_worker_prompt_uv_cache_references(body)
+        warned_prompt_body = True
         acp_prompt_text = f"{_project_orientation_preamble(orientation_path)}\n\n{body}"
     delivered_body = (
         acp_prompt_text
         if acp_prompt_text is not None
-        else Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+        else _read_worker_prompt(Path(prompt_path))
     )
-    delivered_body, uv_cache_overridden = _override_worker_prompt_uv_cache(delivered_body)
-    if uv_cache_overridden:
-        _warn_worker_prompt_uv_cache_override()
+    if not warned_prompt_body:
+        _warn_worker_prompt_uv_cache_references(delivered_body)
     acp_prompt_text = f"{SEARCH_SCOPE_PREAMBLE}\n\n{delivered_body}"
     delivered_body = acp_prompt_text
     delivered_prompt = (

@@ -15,7 +15,7 @@ import tempfile
 from goalflight_codex_sandbox import (
     _git_path,
     linked_worktree_writable_roots,
-    shared_worker_uv_cache_dir,
+    shared_worker_uv_cache_write_root,
     worker_task_store_root,
 )
 from typing import Any
@@ -446,8 +446,12 @@ def macos_write_roots(
             )
     roots.extend(extra_roots)
     worker_identity = f"{label} {binary}"
-    if any(kind in worker_identity for kind in ("codex", "grok", "cursor")):
-        roots.append(str(shared_worker_uv_cache_dir()))
+    if profile == OS_SANDBOX_WORKSPACE_WRITE and any(
+        kind in worker_identity for kind in ("codex", "grok", "cursor")
+    ):
+        cache_root = shared_worker_uv_cache_write_root()
+        if cache_root is not None:
+            roots.append(str(cache_root))
     if profile == OS_SANDBOX_READ_ONLY:
         protected = _protected_worktree_paths(cwd)
         for grant in _unique_real_paths(roots):
