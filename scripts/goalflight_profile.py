@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import sys
 
+from goalflight_codex_sandbox import shared_worker_uv_cache_dir
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_PROFILES_DIR = Path.home() / ".goal-flight" / "profiles"
@@ -32,16 +34,17 @@ def dispatch_env(
     base: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Merge gateway slot profile ENV into a subprocess environment."""
+    shared_uv_cache = str(shared_worker_uv_cache_dir())
     env = dict(os.environ)
     if base:
         env.update(base)
-    if agent not in GATEWAY_AGENTS:
-        return env
-    resolved_slot = slot or env.get("GOALFLIGHT_INSTALL_SLOT") or "default"
-    path = profile_path(resolved_slot, profiles_dir)
-    if path.exists():
-        env.update(parse_env_file(path))
-    env["GOALFLIGHT_INSTALL_SLOT"] = resolved_slot
+    if agent in GATEWAY_AGENTS:
+        resolved_slot = slot or env.get("GOALFLIGHT_INSTALL_SLOT") or "default"
+        path = profile_path(resolved_slot, profiles_dir)
+        if path.exists():
+            env.update(parse_env_file(path))
+        env["GOALFLIGHT_INSTALL_SLOT"] = resolved_slot
+    env["UV_CACHE_DIR"] = shared_uv_cache
     return env
 
 

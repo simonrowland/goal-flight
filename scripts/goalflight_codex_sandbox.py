@@ -12,6 +12,11 @@ import subprocess
 WORKSPACE_WRITE = "workspace-write"
 
 
+def shared_worker_uv_cache_dir() -> Path:
+    """Return uv's shared host cache path, independent of worker HOME overrides."""
+    return (Path.home() / ".cache" / "uv").resolve(strict=False)
+
+
 def _git_path(cwd: Path, flag: str) -> Path | None:
     try:
         proc = subprocess.run(
@@ -171,7 +176,6 @@ def codex_workspace_write_args(cwd: str | Path | None, profile: str | None) -> l
     # permitted", with no hint that the cause was an argument nobody passed.
     roots = list(linked_worktree_writable_roots(cwd)) if cwd else []
     roots += worker_channel_roots()
-    if not roots:
-        return []
+    roots.append(str(shared_worker_uv_cache_dir()))
     value = json.dumps(roots, separators=(",", ":"))
     return ["-c", f"sandbox_workspace_write.writable_roots={value}"]

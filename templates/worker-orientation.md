@@ -28,6 +28,7 @@ Use `python3 scripts/goalflight_search.py PATTERN [--tree|--refs GLOB...|--histo
 
 ## Hard Invariants
 
+- The dispatcher sets the shared `UV_CACHE_DIR`; reuse it and do not set a task-specific cache.
 - {{INVARIANT_1_WORKERS_MUST_NOT_VIOLATE}}
 - {{INVARIANT_2_WORKERS_MUST_NOT_VIOLATE}}
 - {{INVARIANT_3_WORKERS_MUST_NOT_VIOLATE}}

@@ -106,7 +106,10 @@ from goalflight_agent_limits import (
     moonshot_family,
     normalize_agent,
 )
-from goalflight_codex_sandbox import codex_workspace_write_args
+from goalflight_codex_sandbox import (
+    codex_workspace_write_args,
+    shared_worker_uv_cache_dir,
+)
 from goalflight_liveness import (
     active_monotonic,
     process_group_id,
@@ -1117,7 +1120,9 @@ PROMPT_FILE_PREAMBLE = (
     "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
     "internal compaction/summarization, at the start of each long-run goal-loop "
     "iteration, and before final commit/exit; the disk file is authoritative over "
-    "summarized memory."
+    "summarized memory. If the brief specifies its own `UV_CACHE_DIR` assignment, "
+    "the dispatcher has replaced it with the shared cache; keep the shared value "
+    "when rereading the brief."
 )
 # Cursor's CLI auto-reviews shell commands. Reading the prompt-file env var is
 # one of the commands it escalates, and an unattended dispatch has nobody to
@@ -1182,8 +1187,47 @@ SEARCH_SCOPE_PREAMBLE = (
     "Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.\n"
     "Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,\n"
     "`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.\n"
-    "For a file outside your worktree, use its known path."
+    "For a file outside your worktree, use its known path.\n"
+    "The dispatcher sets the shared `UV_CACHE_DIR`; reuse it and do not override it."
 )
+
+
+_WORKER_UV_CACHE_ASSIGNMENT_RE = re.compile(
+    r"(?P<prefix>(?:\bexport\s+)?\bUV_CACHE_DIR\s*=\s*)"
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+)
+
+
+def _override_worker_prompt_uv_cache(prompt_text: str) -> tuple[str, bool]:
+    """Rewrite explicit per-task cache assignments to the shared warm cache."""
+    shared_cache = shared_worker_uv_cache_dir()
+    changed = False
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        nonlocal changed
+        raw_value = match.group("value")
+        quote = raw_value[0] if raw_value.startswith(("'", '"')) else ""
+        value = raw_value[1:-1] if quote else raw_value
+        try:
+            configured_cache = Path(value).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            configured_cache = None
+        if configured_cache == shared_cache:
+            return match.group(0)
+        changed = True
+        replacement = f"{quote}{shared_cache}{quote}" if quote else shlex.quote(str(shared_cache))
+        return f"{match.group('prefix')}{replacement}"
+
+    return _WORKER_UV_CACHE_ASSIGNMENT_RE.sub(replace_assignment, prompt_text), changed
+
+
+def _warn_worker_prompt_uv_cache_override() -> None:
+    print(
+        "goalflight_dispatch: WARN: replaced a worker prompt UV_CACHE_DIR assignment "
+        "with the shared cache",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 # Workers routinely deliver a correct fix wrapped in scaffolding nobody asked
@@ -8455,6 +8499,9 @@ def _materialize_steer_prompt(
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
+    body, uv_cache_overridden = _override_worker_prompt_uv_cache(body)
+    if uv_cache_overridden:
+        _warn_worker_prompt_uv_cache_override()
     preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
     # The watcher binds success markers to the dispatch id, so every agent whose
     # markers are scraped from a text tail must be told the id. That includes
@@ -9936,7 +9983,13 @@ def _resolve_launch_account_env(args) -> dict[str, str]:
     """Resolve the seat HOME, then refuse a grok home with no permission_mode."""
     account_env = _resolve_account_env(args)
     _guard_grok_seat_permission_mode(args, account_env)
+    _apply_shared_worker_uv_cache_env(account_env)
     return account_env
+
+
+def _apply_shared_worker_uv_cache_env(env: dict[str, str]) -> None:
+    """Pin every worker launch to the host's existing uv cache."""
+    env["UV_CACHE_DIR"] = str(shared_worker_uv_cache_dir())
 
 
 _CODEX_SEAT_API_UNSET = object()
@@ -22499,6 +22552,9 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         if acp_prompt_text is not None
         else Path(prompt_path).read_text(encoding="utf-8", errors="replace")
     )
+    delivered_body, uv_cache_overridden = _override_worker_prompt_uv_cache(delivered_body)
+    if uv_cache_overridden:
+        _warn_worker_prompt_uv_cache_override()
     acp_prompt_text = f"{SEARCH_SCOPE_PREAMBLE}\n\n{delivered_body}"
     delivered_body = acp_prompt_text
     delivered_prompt = (
@@ -23126,6 +23182,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     )
     web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
     acp_env = {**account_env, **web_qa_updates}
+    _apply_shared_worker_uv_cache_env(acp_env)
     _apply_read_only_env(acp_env, args)
     acp_remove = list(env_remove) + list(web_qa_remove)
     worktree_seat = getattr(args, "_worktree_seat", None)
@@ -23562,7 +23619,8 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     model = getattr(args, "model", None)
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
-                "-c", "approval_policy=never"]
+                "-c", "approval_policy=never",
+                "-c", "features.remote_plugin=false"]
         argv += codex_workspace_write_args(args.cwd, _effective_os_sandbox(args))
         if not _codex_context_mode_enabled():
             # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
@@ -24519,6 +24577,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             account_env = _resolve_launch_account_env(args)
         # build_worker() needs the same account-scoped HOME/XDG roots that the
         # spawned Grok process receives when it prepares its macOS profile.
+        _apply_shared_worker_uv_cache_env(account_env)
         args._account_env = account_env
         _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:

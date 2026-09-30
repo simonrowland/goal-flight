@@ -15,6 +15,7 @@ import tempfile
 from goalflight_codex_sandbox import (
     _git_path,
     linked_worktree_writable_roots,
+    shared_worker_uv_cache_dir,
     worker_task_store_root,
 )
 from typing import Any
@@ -345,6 +346,8 @@ def macos_write_roots(
 ) -> list[str]:
     roots: list[str] = []
     env = os.environ if environment is None else environment
+    label = (agent or "").lower()
+    binary = Path(command).name.lower()
     grok_bash_read_only = (
         profile == OS_SANDBOX_READ_ONLY and _is_bash_grok(agent, command)
     )
@@ -442,6 +445,9 @@ def macos_write_roots(
                 f"inside allowed agent state root {root!r}; move the worktree or use off"
             )
     roots.extend(extra_roots)
+    worker_identity = f"{label} {binary}"
+    if any(kind in worker_identity for kind in ("codex", "grok", "cursor")):
+        roots.append(str(shared_worker_uv_cache_dir()))
     if profile == OS_SANDBOX_READ_ONLY:
         protected = _protected_worktree_paths(cwd)
         for grant in _unique_real_paths(roots):
