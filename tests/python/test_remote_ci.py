@@ -225,13 +225,13 @@ class ScriptedExecutor:
 
     def __call__(self, argv, env, timeout):
         assert argv[:2] == ["scripted-remote", "ci-worker.example.invalid"]
-        self.remote_scripts.append(argv[2])
         shell = shlex.split(argv[2])
         payload = json.loads(base64.b64decode(shell[3]))
         if self._short_command_window is not None:
             payload["helper_sha256"], payload["helper_size_bytes"] = self._short_command_window
             shell[3] = base64.b64encode(json.dumps(
                 payload, separators=(",", ":"), sort_keys=True).encode()).decode()
+        self.remote_scripts.append(shlex.join(shell))
         expected = payload["helper_sha256"]
         helper = (Path(payload["managed_root"]) / "helpers" / "remote-ci" /
                   f"goalflight_remote_ci_node-{expected}.py")
@@ -677,12 +677,11 @@ def test_reattach_rejects_queued_holder_without_token(node_env):
 
 def test_lost_launch_response_cancels_proven_run_before_freeing_token(node_env):
     config, executor, _, node = node_env
-    executor.use_short_command_window()
     config = replace(config, runner=replace(config.runner,
         command=(sys.executable, "-c", "import time;time.sleep(20)")))
     def losing_executor(argv, env, timeout):
         result = executor(argv, env, timeout)
-        if executor.calls[-1] == "start":
+        if executor.calls and executor.calls[-1] == "start":
             return CommandResult(2, stderr="lost response")
         return result
     runner = RemoteRunner(config, executor=losing_executor)
@@ -799,12 +798,11 @@ def _free_tokens(node):
 
 def test_dropped_enqueue_response_does_not_stick_the_token(node_env):
     config, executor, _, node = node_env
-    executor.use_short_command_window()
     config = _green_config(config)
 
     def transport(argv, env, timeout):
         result = executor(argv, env, timeout)
-        if executor.calls[-1] == "enqueue":
+        if executor.calls and executor.calls[-1] == "enqueue":
             return CommandResult(255, stdout=result.stdout, stderr="connection reset by peer")
         return result
 
