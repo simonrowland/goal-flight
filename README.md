@@ -91,8 +91,7 @@ so far — and work it into an architecture the run can execute: closed chunks (
 CHECKLIST / ACCEPTANCE / FORBIDDEN) with parallelism flagged, plus a reviewer pass over
 the decomposition itself, so the design gets adversarial scrutiny *before* any code is
 written. Disagree with a chunk? Say so in chat; mid-session steering is requirements
-input, and the plan revises. (With [gstack](https://github.com/garrytan/gstack) installed,
-`/office-hours` and `/plan-eng-review` add structured interrogation at this step.)
+input, and the plan revises.
 
 **4. Dispatch the work.**
 
@@ -146,9 +145,8 @@ reroutes work away from a limited provider.
   the run.
 - **Independent review before commit.** Every `/goal` chunk runs a 7-category adversarial
   self-review to convergence inside the worker loop; commit-worthy chunks then get an
-  independent reviewer pass (via [gstack](https://github.com/garrytan/gstack)'s `/review`
-  when installed), and milestone reviews sweep at configured cadence with concern-diverse
-  lenses. Each new bug shape caught is minted as a durable bug-class predicate; your
+  independent reviewer pass, and milestone reviews sweep at configured cadence with
+  concern-diverse lenses. Each new bug shape caught is minted as a durable bug-class predicate; your
   already-reviewed code and the saved review archive are swept for further instances, and
   the predicate joins the standing lenses for every later review
   (`protocols/review-mining.md`).
@@ -261,43 +259,6 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
 - **When speed matters more than rigor.** The review-to-convergence design targets
   reference-quality code — its home domain is scientific programming. For a small one-shot
   task it is slower than just writing the script.
-
-## Companion tools
-
-Review skills (recommended — the review gates lean on them):
-
-- **[gstack](https://github.com/garrytan/gstack)** — Garry Tan's skill pack provides
-  `/review`, `/office-hours`, `/plan-eng-review`, `/cso`, `/investigate` for both Claude
-  Code and codex. Goal-flight invokes `/review` as the **default independent reviewer** for
-  chunk-level pre-commit review (`protocols/chunk-review.md`) and for milestone reviews
-  (`protocols/milestone-review.md`, gstack + concern-diverse sweep); `/office-hours` covers
-  fuzzy-goal interrogation at init. **Optional** — without gstack, goal-flight falls back
-  to local prompts at `prompts/gstack-claude-review.md` +
-  `prompts/gstack-codex-challenge.md` (executor self-review still runs its seven-category
-  pass). With gstack installed, you get consistent severity-ranking framing across both
-  review lenses on long runs. `/goal-flight init` offers to install just the subset
-  goal-flight uses — `/review`, `/plan-eng-review`, `/office-hours`, plus the community
-  skills `grill-me` and `thermo-nuclear-code-quality-review` downloaded from their
-  upstream repos — or the full pack, or neither.
-- **autoreview** — Complementary diff-local pre-commit pass (`protocols/chunk-review.md`,
-  `./scripts/autoreview.sh`). Runs in parallel with gstack at chunk level when the
-  orchestrator chooses; does **not** replace gstack as the default review path. Catches
-  diff-local issues (API footguns, missing tests on touched paths, regression invariants)
-  that a structural reviewer may not prioritize. Requires upstream autoreview (typically
-  the Cursor autoreview skill or `AUTOREVIEW_HELPER`); doctor reports WARN when absent.
-
-Also recommended:
-
-- **[context-mode](https://github.com/simonrowland/context-mode)** — MCP plugin that
-  offloads large command outputs (diffs, integration test runs, codex tail files, large
-  greps) to an FTS5 sandbox the orchestrator queries by pattern. On long runs, raw tool
-  output fills the orchestrator's context and triggers early compaction; context-mode
-  keeps that output out of the session.
-- **[codedb](https://github.com/justrach/codedb)** — code-intelligence MCP (tree,
-  outline, symbol, search, deps) the orchestrator uses to anchor dispatch briefs to exact
-  files and lines, and to spot-check worker findings, at a fraction of the context cost
-  of grep-and-read. Optional; use it when indexed lookup beats a broad grep — most useful
-  on large or unfamiliar codebases.
 
 ## Host install notes
 
