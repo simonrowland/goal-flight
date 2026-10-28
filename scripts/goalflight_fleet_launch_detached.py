@@ -26,6 +26,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_dispatch_states as dispatch_states
+import goalflight_dispatch_paths
 import goalflight_ledger
 import goalflight_worktree_pool
 from goalflight_liveness import reset_status_lineage
@@ -688,6 +689,8 @@ def _launch(args: argparse.Namespace) -> int:
         "--status-json",
         str(status_json),
     ]
+    if status_json.parent.parent.name == "attempts":
+        cmd.extend(["--tail", str(status_json.with_name("worker.tail"))])
     if local_account:
         cmd.extend(["--account", local_account])
     if args.read_only:
@@ -695,6 +698,15 @@ def _launch(args: argparse.Namespace) -> int:
 
     env = _sanitized_env(os.environ)
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    dispatch_dir = state_dir / "dispatch"
+    outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(
+        args.dispatch_id,
+        dispatch_dir=dispatch_dir,
+    )
+    outbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(dispatch_dir)
+    env["GOALFLIGHT_DISPATCH_ID"] = args.dispatch_id
+    env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox_dir)
     env["GOALFLIGHT_FLEET_NODE_ID"] = args.node_id
     _ensure_local_bin_on_path(env)
 

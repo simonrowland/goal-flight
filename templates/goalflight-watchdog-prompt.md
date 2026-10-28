@@ -12,7 +12,13 @@ Hard constraints:
 
 First gate — event path owns the work:
 1. Query the project journal's active lease, cursor, and listener coverage row. Coverage is live only when its stored `(pid,start_token)` verifies and its lease generation is current and inside the renewal horizon. Process scans are diagnostics, never authority. An unclaimed fixed-set controller may instead use `goalflight_status.py --wait <ids>`, which reads the same journal event authority.
-2. If that event wait is live, report `event-wait-live` and do nothing else. Do not poll status files, process completions, dispatch work, or re-arm a cron from this pass.
+2. If that event wait is live:
+   - Run `python3 scripts/goalflight_cadence.py --project-root "$PWD" due --controller-label "$GOALFLIGHT_CONTROLLER_LABEL"`.
+   - Act on every returned item. Run the look-ahead directly; run the printed `ci-audit` command; use `templates/tooling-friction-survey.md` for the survey; use `templates/refactor-dedup-scan.md` and `templates/task-store-audit.md` for project duties. Only the registered project-duty owner receives project items. Mark an item done only after its work is complete with `goalflight_cadence.py done <item> --controller-label "$GOALFLIGHT_CONTROLLER_LABEL"`.
+   - For each pulse `WAKE-OWNER` line, run its post command, then its `done wake:<duty>:<period>` command. Mark a listed wake done only after posting succeeds.
+   - With no due items, read `goalflight_task.py lanes show --json` and `goalflight_task.py next --lane <this controller's lane> --json`. Read `goalflight_capacity.py status --json`; dispatch the first ready task through the normal Goal Flight route only when `profile.operating_cap` exceeds the number of active leases. If capacity is full or any read is unknown, record the reason and leave the task queued.
+   - Report one line: `STATUS: watchdog event-wait-live; cadence=<item|none>; next=<task|none>; action=<done|dispatched|waiting>`.
+   Do not poll worker status files or process completions in this branch, change the task-store audit without owner approval, or re-arm a cron. Due items and overdue-owner wake actions are printed in the read-only pulse; survey answers still go by controller mail.
 
 Crash-recovery pass — only when the event path is absent:
 1. Orient from the newest `docs-private/RESUME-NOTES-*.md`, the active `docs-private/goal-queue-*.md`, `git status --short --branch`, and `git log -1 --oneline`.

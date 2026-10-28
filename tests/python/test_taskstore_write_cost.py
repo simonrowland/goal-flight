@@ -93,7 +93,7 @@ def test_snapshot_contents_metadata_and_pruning(store):
         store._snapshot_last_good()
     for src, pattern in ((store.tasks_path, "tasks-*.jsonl"), (store.data_js_path, "tasks-data-*.js")):
         backups = sorted(store.log_dir.glob(pattern))
-        assert len(backups) == 20
+        assert len(backups) == 2
         assert all(p.read_bytes() == src.read_bytes() for p in backups)
         assert all(p.stat().st_mtime_ns == src.stat().st_mtime_ns for p in backups)
 
@@ -107,9 +107,24 @@ def test_pruning_preserves_parent_survivors(store, equal_mtimes):
         stamp = 1000 if equal_mtimes else 1000 - index
         os.utime(path, (stamp, stamp))
     expected = set(sorted(store.log_dir.glob("tasks-*.jsonl"),
-                          key=lambda p: p.stat().st_mtime, reverse=True)[:20])
+                          key=lambda p: (p.stat().st_mtime, p.name), reverse=True)[:2])
     store._prune_backups()
     assert set(store.log_dir.glob("tasks-*.jsonl")) == expected
+
+
+def test_dated_dashboard_snapshots_keep_two_when_export_is_disabled(store, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "0")
+    store.log_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in ("tasks", "tasks-data"):
+        for index in range(4):
+            suffix = ".jsonl" if pattern == "tasks" else ".js"
+            (store.log_dir / f"{pattern}-20260923T00000{index}Z{suffix}").write_text(
+                "snapshot\n", encoding="utf-8"
+            )
+
+    assert task.prune_task_store_snapshots(store.log_dir) == 4
+    assert len(list(store.log_dir.glob("tasks-*.jsonl"))) == 2
+    assert len(list(store.log_dir.glob("tasks-data-*.js"))) == 2
 
 
 def test_export_repairs_symlink_without_touching_referent(store, tmp_path):

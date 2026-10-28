@@ -230,6 +230,7 @@ def test_isolated_launch_does_not_touch_live_dispatch_or_mail() -> None:
 
     with tempfile.TemporaryDirectory(prefix="gf-dispatch-dir-launch-") as tmp_raw:
         tmp = Path(tmp_raw)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
         env = os.environ.copy()
         _isolate_launch_env(env, tmp)
         isolated = Path(env["GOALFLIGHT_DISPATCH_DIR"])
@@ -240,6 +241,7 @@ def test_isolated_launch_does_not_touch_live_dispatch_or_mail() -> None:
                 "--unregistered-forced",
                 "--cwd",
                 str(tmp),
+                "--in-place",
                 "--agent",
                 "test",
                 "--dispatch-id",

@@ -51,6 +51,7 @@ codex exec \
   --skip-git-repo-check \
   --sandbox workspace-write \
   -c approval_policy=never \
+  -c features.plugins=false \
   -C "<workdir>" \
   - < <prompt.md> \
   > /tmp/codex-<slug>.txt 2>&1 &

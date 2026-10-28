@@ -34,16 +34,17 @@ ACP_PY = os.environ.get(
 )
 
 
-def _test_files() -> list[Path]:
+def _test_files(test_dir: Path | None = None) -> list[Path]:
+    directory = TEST_DIR if test_dir is None else test_dir
     return sorted(
-        test for test in TEST_DIR.glob("test_*.py") if test.name != META_DRIVER_NAME
+        test for test in directory.rglob("test_*.py") if test.name != META_DRIVER_NAME
     )
 
 
 def _skip_lines(stdout: str, stderr: str) -> list[str]:
     lines = []
     for line in (stdout + "\n" + stderr).splitlines():
-        if line.startswith("SKIP:"):
+        if line.startswith(("SKIP:", "SKIP-FILE:")):
             lines.append(line)
     return lines
 
@@ -52,7 +53,7 @@ def _is_full_file_skip(test: Path, skips: list[str]) -> bool:
     if not skips:
         return False
     label = test.relative_to(ROOT).as_posix()
-    prefixes = (f"SKIP: {test.name}:", f"SKIP: {label}:")
+    prefixes = (f"SKIP-FILE: {test.name}:", f"SKIP-FILE: {label}:")
     return all(line.startswith(prefixes) for line in skips)
 
 
@@ -72,7 +73,7 @@ def _requirement_skip(test: Path, interpreter: str) -> subprocess.CompletedProce
     return subprocess.CompletedProcess(
         args=[interpreter, str(test)],
         returncode=0,
-        stdout=f"SKIP: {label}: ACP SDK requirement unsatisfied: {reason}\n",
+        stdout=f"SKIP-FILE: {label}: ACP SDK requirement unsatisfied: {reason}\n",
         stderr="",
     )
 
@@ -155,7 +156,15 @@ def main(argv: list[str] | None = None) -> int:
     skipped = 0
     partial_skipped = 0
     failed: list[str] = []
-    for test_index, test in enumerate(_test_files()):
+    tests = _test_files()
+    extension_root = TEST_DIR / "ext"
+    extension_labels = {
+        test.relative_to(ROOT).as_posix()
+        for test in tests
+        if extension_root in test.parents
+    }
+    extension_skipped: set[str] = set()
+    for test_index, test in enumerate(tests):
         label = test.relative_to(ROOT).as_posix()
         try:
             py = _python_for(test)
@@ -227,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             reasons = _pytest_skip_reasons(proc.stdout, proc.stderr)
             if reasons:
                 skipped += 1
+                if label in extension_labels:
+                    extension_skipped.add(label)
                 print(f"SKIP  {label}", flush=True)
                 for line in reasons:
                     print(f"      {line}")
@@ -241,8 +252,24 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         skips = _skip_lines(proc.stdout, proc.stderr)
+        output_lines = (proc.stdout + "\n" + proc.stderr).splitlines()
+        has_file_skip = any(line.startswith("SKIP-FILE:") for line in skips)
+        has_pass_marker = any(line.startswith("PASS:") for line in output_lines)
+        if proc.returncode == 0 and has_file_skip and has_pass_marker:
+            proc = subprocess.CompletedProcess(
+                args=proc.args,
+                returncode=1,
+                stdout=proc.stdout,
+                stderr=(
+                    proc.stderr
+                    + f"\nRUNNER ERROR: {label} reported contradictory PASS and SKIP-FILE "
+                    "execution evidence\n"
+                ),
+            )
         if proc.returncode == 0 and _is_full_file_skip(test, skips):
             skipped += 1
+            if label in extension_labels:
+                extension_skipped.add(label)
             print(f"SKIP  {label}", flush=True)
             for line in skips:
                 print(f"      {line}")
@@ -270,6 +297,18 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(f"===== {passed} passed, {skipped} skipped, {len(failed)} failed =====")
+    if extension_root.is_dir():
+        extension_failures = len(extension_labels.intersection(failed))
+        extension_passes = (
+            len(extension_labels) - extension_failures - len(extension_skipped)
+        )
+        print(
+            "LOCAL EXTENSION TESTS: "
+            f"{len(extension_labels)} discovered, {extension_passes} passed, "
+            f"{len(extension_skipped)} skipped, {extension_failures} failed"
+        )
+    else:
+        print("LOCAL EXTENSION ZONE: absent; no local-only test coverage")
     if partial_skipped:
         print(f"      {partial_skipped} passed files had case-level skips")
     if failed:

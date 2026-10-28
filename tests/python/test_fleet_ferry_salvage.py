@@ -9,6 +9,7 @@ skip_posix_on_native_windows("fleet ferry fixtures use POSIX paths and symlinks"
 
 import json
 import base64
+import hashlib
 import os
 import re
 import sys
@@ -25,6 +26,9 @@ import goalflight_fleet as fleet
 import goalflight_fleet_ferry as ferry
 import goalflight_fleet_ferry_preflight as ferry_preflight
 import goalflight_fleet_ssh as fleet_ssh
+import goalflight_fleet_watch as fleet_watch
+import goalflight_ledger
+import goalflight_liveness
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -899,6 +903,337 @@ def test_salvage_porcelain_file_list_transfer_and_convergence() -> None:
             assert_true("converged after three checks", len(manifest["iterations"]) == 3)
             assert_true("manifest exists", Path(manifest["manifest_path"]).exists())
             assert_true("hash present", bool(manifest["files"][0].get("sha256")))
+
+
+def test_salvage_empty_attempt_token_stays_superseded() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            dispatch_id = "late-salvage-duplicate"
+            controller_status = tmp / "controller-status.json"
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "result_text": "current result",
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "attempt_id": "current-attempt",
+                        "queue_launch_token": "current-token",
+                        "status_path": str(controller_status),
+                        "events": [],
+                    }
+                )
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                meta_path,
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "queue_launch_token": "",
+                },
+            )
+            out_dir = _staging(fleet_dir, "empty-token-salvage")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            completed_review = out_dir / "review.md"
+            completed_review.write_text("current review\n", encoding="utf-8")
+            runner = SalvageRunner(" M review.md\n", ["", ""])
+
+            with live_ssh_env("1"):
+                manifest = ferry.salvage_worktree(
+                    fleet_dir,
+                    node_id="localhost",
+                    worktree_path="/remote/worktree",
+                    out_dir=out_dir,
+                    purpose="late-duplicate",
+                    dispatch_id=dispatch_id,
+                    runner=runner,
+                    sleep_s=0,
+                )
+
+            attempt_dir = Path(str(manifest["salvage_dir"]))
+            assert_true("current review preserved", completed_review.read_text() == "current review\n")
+            assert_true(
+                "duplicate review isolated by attempt",
+                ".superseded" in str(attempt_dir)
+                and (attempt_dir / "review.md").read_text(encoding="utf-8").startswith("pass"),
+            )
+            assert_true("manifest records attempt directory", manifest["salvage_dir"] == str(attempt_dir))
+            status_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            status_notes = status_payload["superseded_duplicate_attempt"]
+            assert_true("one status duplicate event", len(status_notes) == 1)
+            assert_true("status event records artifact path", status_notes[0]["artifact_path"] == str(attempt_dir))
+            assert_true("current status result preserved", status_payload["result_text"] == "current result")
+            late_attempt = status_notes[0]["attempt_id"]
+            record = goalflight_ledger.read_record(dispatch_id)
+            ledger_notes = [
+                event
+                for event in record.get("events", [])
+                if event.get("type") == "superseded_duplicate_attempt"
+                and event.get("attempt_id") == late_attempt
+            ]
+            assert_true("one ledger duplicate event", len(ledger_notes) == 1)
+            assert_true("ledger event records artifact path", ledger_notes[0]["artifact_path"] == str(attempt_dir))
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
+
+
+def test_salvage_duplicate_attempt_preserves_completed_artifact() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            dispatch_id = "late-salvage-duplicate"
+            completed_attempt = "completed-attempt"
+            late_attempt = "late-attempt"
+            controller_status = tmp / "controller-status.json"
+            prior_note = {
+                "type": "superseded_duplicate_attempt",
+                "attempt_id": late_attempt,
+                "supersedes_attempt_id": completed_attempt,
+                "observed_at": goalflight_ledger.utc_now(),
+            }
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "result_text": "completed result",
+                    "superseded_duplicate_attempt": [prior_note],
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "complete",
+                        "terminal_state": "complete",
+                        "attempt_id": completed_attempt,
+                        "queue_launch_token": completed_attempt,
+                        "status_path": str(controller_status),
+                        "events": [prior_note],
+                    }
+                )
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                meta_path,
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "queue_launch_token": late_attempt,
+                },
+            )
+            out_dir = _staging(fleet_dir, "completed-salvage")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            completed_review = out_dir / "review.md"
+            completed_review.write_text("completed review\n", encoding="utf-8")
+            runner = SalvageRunner(" M review.md\n", ["", ""])
+
+            with live_ssh_env("1"):
+                manifest = ferry.salvage_worktree(
+                    fleet_dir,
+                    node_id="localhost",
+                    worktree_path="/remote/worktree",
+                    out_dir=out_dir,
+                    purpose="late-duplicate",
+                    dispatch_id=dispatch_id,
+                    runner=runner,
+                    sleep_s=0,
+                )
+
+            attempt_key = hashlib.sha256(late_attempt.encode("utf-8")).hexdigest()[:20]
+            attempt_dir = out_dir / ".superseded" / attempt_key
+            assert_true(
+                "completed review preserved",
+                completed_review.read_text() == "completed review\n",
+            )
+            assert_true(
+                "duplicate review isolated by attempt",
+                (attempt_dir / "review.md").read_text(encoding="utf-8").startswith("pass"),
+            )
+            assert_true(
+                "manifest records attempt directory",
+                manifest["salvage_dir"] == str(attempt_dir),
+            )
+            status_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            status_notes = status_payload["superseded_duplicate_attempt"]
+            assert_true("one status duplicate event", len(status_notes) == 1)
+            assert_true(
+                "status event records artifact path",
+                status_notes[0]["artifact_path"] == str(attempt_dir),
+            )
+            assert_true(
+                "completed status result preserved",
+                status_payload["result_text"] == "completed result",
+            )
+            record = goalflight_ledger.read_record(dispatch_id)
+            ledger_notes = [
+                event
+                for event in record.get("events", [])
+                if event.get("type") == "superseded_duplicate_attempt"
+                and event.get("attempt_id") == late_attempt
+            ]
+            assert_true("one ledger duplicate event", len(ledger_notes) == 1)
+            assert_true(
+                "ledger event records artifact path",
+                ledger_notes[0]["artifact_path"] == str(attempt_dir),
+            )
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
+
+
+def test_salvage_completion_during_transfer_keeps_completed_artifact() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            dispatch_id = "salvage-completes-during-transfer"
+            attempt_id = "in-flight-attempt"
+            controller_status = tmp / "controller-status.json"
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "result_text": "prior result",
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "attempt_id": attempt_id,
+                        "queue_launch_token": attempt_id,
+                        "status_path": str(controller_status),
+                    }
+                )
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            fleet._atomic_write_json(
+                meta_path,
+                {
+                    "dispatch_id": dispatch_id,
+                    "node_id": "localhost",
+                    "queue_launch_token": attempt_id,
+                },
+            )
+            out_dir = _staging(fleet_dir, "salvage-completes-during-transfer")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            completed_review = out_dir / "review.md"
+            completed_review.write_text("completed review\n", encoding="utf-8")
+            runner = SalvageRunner(" M review.md\n", ["", ""])
+            original_execute = ferry.execute_ferry
+            published = False
+
+            def publish_completion_during_transfer(*args, **kwargs):
+                nonlocal published
+                result = original_execute(*args, **kwargs)
+                if not published:
+                    published = True
+                    goalflight_liveness.write_status(
+                        controller_status,
+                        {
+                            "schema": "goalflight.status.v1",
+                            "dispatch_id": dispatch_id,
+                            "state": "complete",
+                            "terminal_state": "complete",
+                            "result_text": "controller completed result",
+                        },
+                    )
+                    with goalflight_ledger.StateLock():
+                        record = goalflight_ledger.read_record(dispatch_id)
+                        record.update(
+                            {
+                                "state": "complete",
+                                "terminal_state": "complete",
+                            }
+                        )
+                        goalflight_ledger.write_record(record)
+                return result
+
+            ferry.execute_ferry = publish_completion_during_transfer
+            try:
+                with live_ssh_env("1"):
+                    manifest = ferry.salvage_worktree(
+                        fleet_dir,
+                        node_id="localhost",
+                        worktree_path="/remote/worktree",
+                        out_dir=out_dir,
+                        purpose="completion-race",
+                        dispatch_id=dispatch_id,
+                        runner=runner,
+                        sleep_s=0,
+                    )
+            finally:
+                ferry.execute_ferry = original_execute
+
+            attempt_key = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:20]
+            attempt_dir = out_dir / ".superseded" / attempt_key
+            assert_true("completion published before promotion", published)
+            assert_true(
+                "completed review preserved",
+                completed_review.read_text(encoding="utf-8") == "completed review\n",
+            )
+            assert_true(
+                "late review retained under attempt",
+                (attempt_dir / "review.md").read_text(encoding="utf-8").startswith("pass"),
+            )
+            assert_true("manifest identifies attempt destination", manifest["salvage_dir"] == str(attempt_dir))
+            status_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            assert_true(
+                "completion result preserved",
+                status_payload["result_text"] == "controller completed result",
+            )
+            assert_true(
+                "duplicate event records attempt destination",
+                status_payload["superseded_duplicate_attempt"][0]["artifact_path"]
+                == str(attempt_dir),
+            )
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
 
 
 def test_salvage_bounds_at_ten_with_liveness_signal() -> None:
@@ -2173,6 +2508,9 @@ def main() -> None:
         test_pull_refuses_source_changed_during_rsync,
         test_pull_refuses_symlink_changed_during_rsync,
         test_salvage_porcelain_file_list_transfer_and_convergence,
+        test_salvage_empty_attempt_token_stays_superseded,
+        test_salvage_duplicate_attempt_preserves_completed_artifact,
+        test_salvage_completion_during_transfer_keeps_completed_artifact,
         test_salvage_bounds_at_ten_with_liveness_signal,
         test_salvage_append_only_exclusion_converges,
         test_salvage_default_append_only_exclusion_converges,

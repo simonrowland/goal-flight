@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -13,9 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_fleet as fleet
+import goalflight_fleet_dispatch as fleet_dispatch
 import goalflight_fleet_mirror as mirror
 import goalflight_fleet_reconcile as fleet_reconcile
 import goalflight_fleet_watch as fleet_watch
+import goalflight_ledger
 import goalflight_liveness
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
@@ -26,7 +29,7 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def _status_payload(
@@ -219,6 +222,7 @@ def _write_dispatch(
         {
             "dispatch_id": dispatch_id,
             "node_id": "build-1",
+            "queue_launch_token": f"{dispatch_id}-queue-token",
             "remote_status_path": remote_status_path,
             "worktree_path": worktree_path,
             "lease_active": True,
@@ -266,6 +270,7 @@ def _write_unconfirmed_dispatch(
     meta = {
         "dispatch_id": dispatch_id,
         "node_id": "build-1",
+        "queue_launch_token": f"{dispatch_id}-queue-token",
         "billing_account": billing_account,
         "remote_status_path": "/remote/runs/status.json",
         "remote_state_dir": "/home/dev/.goal-flight",
@@ -442,6 +447,343 @@ def test_ingest_accepts_real_dispatch_status_v1_payload() -> None:
         meta = fleet.read_json(status_path.parent / "meta.json")
         assert_true("unconfirmed cleared", meta.get("launch_unconfirmed") is False)
         assert_true("receipt pid", meta.get("launch_receipt", {}).get("remote_pid") == 6666)
+
+
+def test_late_remote_attempt_harvest_preserves_complete_and_records_superseded_note() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            import goalflight_ledger
+
+            dispatch_id = "late-remote-harvest"
+            attempt_id = "late-queue-attempt"
+            controller_status = tmp / "controller-status.json"
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "result_text": "completed output",
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "launch_unconfirmed",
+                        "attempt_id": "completed-worker-attempt",
+                        "queue_launch_token": "completed-queue-attempt",
+                        "status_path": str(controller_status),
+                        "ended_at": goalflight_ledger.utc_now(),
+                    }
+                )
+            preview = fleet_dispatch.DispatchPreview(
+                dispatch_id=dispatch_id,
+                node_id="build-1",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="late attempt",
+                worktree_path=None,
+                base_sha=BASE_SHA,
+            )
+            ledger_result = fleet_dispatch.record_dispatch_ledger(
+                preview,
+                fleet_dispatch.LockChainResult(launch_unconfirmed=True),
+                state="launch_unconfirmed",
+                queue_launch_token=attempt_id,
+                controller_status_path=str(controller_status),
+            )
+            assert_true(
+                "late ledger result preserves terminal status",
+                ledger_result.get("preserved_terminal") is True,
+            )
+            preserved = goalflight_ledger.read_record(dispatch_id)
+            assert_true(
+                "prior ledger attempt survives late launch",
+                preserved["state"] == "launch_unconfirmed",
+            )
+            assert_true(
+                "completed attempt remains bound",
+                preserved["queue_launch_token"] == "completed-queue-attempt",
+            )
+
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            mirror_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=1)
+            goalflight_liveness.write_status(
+                mirror_path,
+                {
+                    "schema": mirror.STATUS_MIRROR_SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "seq": 1,
+                    "state": "complete",
+                    "result_text": "completed output",
+                    "remote_attempt_id": "completed-queue-attempt",
+                },
+            )
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta = fleet_watch._read_json_object(meta_path)
+            meta.update(
+                queue_launch_token=attempt_id,
+                remote_status_path=f"/home/dev/.goal-flight/dispatches/{dispatch_id}/attempts/late/status.json",
+            )
+            fleet._atomic_write_json(meta_path, meta)
+            remote_payload = {
+                "schema": mirror.STATUS_MIRROR_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "seq": 2,
+                "state": "complete",
+                "result_text": "late duplicate output",
+            }
+            transport = FakeTransport({dispatch_id: json.dumps(remote_payload)})
+
+            result = fleet_watch.ingest_dispatch_mirror(
+                fleet_dir, dispatch_id, meta, transport
+            )
+
+            assert_true("late mirror harvested", result.ok and result.action == "ingested")
+            mirror_result = mirror.read_status_mirror(mirror_path)
+            assert_true("completed mirror kept", mirror_result.payload["state"] == "complete")
+            assert_true(
+                "completed mirror result kept",
+                mirror_result.payload["result_text"] == "completed output",
+            )
+            assert_true(
+                "mirror duplicate noted",
+                mirror_result.payload["superseded_duplicate_attempt"][0]["attempt_id"] == attempt_id,
+            )
+            assert_true(
+                "mirror duplicate note is idempotent",
+                len(mirror_result.payload["superseded_duplicate_attempt"]) == 1,
+            )
+            controller_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            assert_true("controller completion kept", controller_payload["state"] == "complete")
+            assert_true(
+                "controller result kept",
+                controller_payload["result_text"] == "completed output",
+            )
+            assert_true(
+                "controller duplicate noted",
+                controller_payload["superseded_duplicate_attempt"][0]["attempt_id"] == attempt_id,
+            )
+            assert_true(
+                "controller duplicate note is idempotent",
+                len(controller_payload["superseded_duplicate_attempt"]) == 1,
+            )
+            record = goalflight_ledger.read_record(dispatch_id)
+            assert_true(
+                "nonterminal ledger row preserved",
+                record["state"] == "launch_unconfirmed",
+            )
+            assert_true(
+                "ledger duplicate noted",
+                any(
+                    event.get("type") == "superseded_duplicate_attempt"
+                    and event.get("attempt_id") == attempt_id
+                    for event in record.get("events", [])
+                ),
+            )
+            assert_true(
+                "ledger duplicate note is idempotent",
+                len(
+                    [
+                        event
+                        for event in record.get("events", [])
+                        if event.get("type") == "superseded_duplicate_attempt"
+                        and event.get("attempt_id") == attempt_id
+                    ]
+                )
+                == 1,
+            )
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
+
+
+def test_empty_remote_attempt_token_is_not_harvested_as_current() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            import goalflight_ledger
+
+            dispatch_id = "empty-remote-attempt-token"
+            controller_status = tmp / "controller-status.json"
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "result_text": "current output",
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "attempt_id": "current-attempt",
+                        "queue_launch_token": "current-token",
+                        "status_path": str(controller_status),
+                    }
+                )
+
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            mirror_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=1)
+            goalflight_liveness.write_status(
+                mirror_path,
+                {
+                    "schema": mirror.STATUS_MIRROR_SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "seq": 1,
+                    "state": "running",
+                    "result_text": "current output",
+                },
+            )
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta = fleet_watch._read_json_object(meta_path)
+            meta["queue_launch_token"] = ""
+            fleet._atomic_write_json(meta_path, meta)
+            transport = FakeTransport(
+                {
+                    dispatch_id: json.dumps(
+                        {
+                            "schema": mirror.STATUS_MIRROR_SCHEMA,
+                            "dispatch_id": dispatch_id,
+                            "seq": 2,
+                            "state": "running",
+                            "result_text": "unidentified output",
+                        }
+                    )
+                }
+            )
+
+            result = fleet_watch.ingest_dispatch_mirror(
+                fleet_dir, dispatch_id, meta, transport
+            )
+
+            assert_true("late mirror harvested", result.ok and result.action == "ingested")
+            mirror_result = mirror.read_status_mirror(mirror_path)
+            assert_true("current mirror kept", mirror_result.payload["state"] == "running")
+            assert_true(
+                "current result kept",
+                mirror_result.payload["result_text"] == "current output",
+            )
+            notes = mirror_result.payload["superseded_duplicate_attempt"]
+            assert_true("missing token records noncurrent attempt", len(notes) == 1)
+            assert_true("fallback identity is explicit", notes[0]["attempt_id"].startswith("unknown-"))
+            controller_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            assert_true("controller result kept", controller_payload["result_text"] == "current output")
+            assert_true(
+                "controller records missing-token harvest",
+                controller_payload["superseded_duplicate_attempt"][0]["attempt_id"]
+                == notes[0]["attempt_id"],
+            )
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
+
+
+def test_same_attempt_late_harvest_cannot_replace_completed_controller_result() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        previous_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "controller-state")
+        try:
+            dispatch_id = "same-attempt-late-harvest"
+            attempt_id = "completed-queue-attempt"
+            controller_status = tmp / "controller-status.json"
+            goalflight_liveness.write_status(
+                controller_status,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "result_text": "controller result",
+                },
+            )
+            with goalflight_ledger.StateLock():
+                goalflight_ledger.write_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "complete",
+                        "terminal_state": "complete",
+                        "attempt_id": attempt_id,
+                        "queue_launch_token": attempt_id,
+                        "status_path": str(controller_status),
+                    }
+                )
+
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            mirror_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=1)
+            meta_path = fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+            meta = fleet_watch._read_json_object(meta_path)
+            meta["queue_launch_token"] = attempt_id
+            fleet._atomic_write_json(meta_path, meta)
+            transport = FakeTransport(
+                {
+                    dispatch_id: json.dumps(
+                        {
+                            "schema": mirror.STATUS_MIRROR_SCHEMA,
+                            "dispatch_id": dispatch_id,
+                            "seq": 2,
+                            "state": "complete",
+                            "result_text": "late result",
+                        }
+                    )
+                }
+            )
+
+            result = fleet_watch.ingest_dispatch_mirror(
+                fleet_dir, dispatch_id, meta, transport
+            )
+
+            assert_true("late harvest observed", result.ok and result.action == "ingested")
+            mirror_result = mirror.read_status_mirror(mirror_path)
+            assert_true("first mirror state preserved", mirror_result.payload["state"] == "running")
+            assert_true("late result not published to mirror", "result_text" not in mirror_result.payload)
+            controller_payload = json.loads(controller_status.read_text(encoding="utf-8"))
+            assert_true("controller result preserved", controller_payload["result_text"] == "controller result")
+            controller_notes = controller_payload["superseded_duplicate_attempt"]
+            assert_true("same-token harvest recorded", len(controller_notes) == 1)
+            assert_true("same-token event identifies attempt", controller_notes[0]["attempt_id"] == attempt_id)
+            record = goalflight_ledger.read_record(dispatch_id)
+            assert_true(
+                "ledger records same-token harvest",
+                any(
+                    event.get("type") == "superseded_duplicate_attempt"
+                    and event.get("attempt_id") == attempt_id
+                    for event in record.get("events", [])
+                ),
+            )
+        finally:
+            if previous_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = previous_state_dir
 
 
 def test_seq_regression_preserves_last_good_mirror() -> None:
@@ -1070,6 +1412,10 @@ def test_until_terminal_stale_dead_identity_marks_worker_dead() -> None:
         assert_true("mirror worker_dead", payload.get("state") == "worker_dead")
         meta = json.loads((status_path.parent / "meta.json").read_text())
         assert_true("meta row state", meta.get("row_state") == "worker_dead")
+        assert_true(
+            "dead mirror keeps worktree path",
+            payload.get("worktree_path") == meta.get("worktree_path"),
+        )
         assert_true("identity checked once", transport.identity_calls == [dispatch_id])
         assert_true("porcelain checked", len(transport.porcelain_calls) == 1)
 
@@ -1081,6 +1427,9 @@ def test_until_terminal_stale_dead_identity_dirty_worktree_marks_salvage_needed(
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
         status_path = _write_dispatch(fleet_dir, dispatch_id=dispatch_id, seq=7)
+        prior_payload = json.loads(status_path.read_text())
+        prior_payload["worktree_seat"] = "seat-a"
+        status_path.write_text(json.dumps(prior_payload) + "\n")
         lock = fleet.acquire_account_lock(
             fleet_dir,
             account_key="openai/default",
@@ -1114,6 +1463,7 @@ def test_until_terminal_stale_dead_identity_dirty_worktree_marks_salvage_needed(
         assert_true("salvage needed", result.state == "salvage_needed")
         payload = json.loads(status_path.read_text())
         assert_true("mirror salvage_needed", payload.get("state") == "salvage_needed")
+        assert_true("salvage mirror keeps worktree seat", payload.get("worktree_seat") == "seat-a")
         assert_true("porcelain on mirror", payload.get("porcelain") == " M scripts/example.py")
         meta = json.loads((status_path.parent / "meta.json").read_text())
         assert_true("meta row state", meta.get("row_state") == "salvage_needed")
@@ -1520,6 +1870,9 @@ def main() -> None:
     test_ingest_accepts_legacy_payload_without_dispatch_id()
     test_single_poll_backfills_launch_unconfirmed_receipt()
     test_ingest_accepts_real_dispatch_status_v1_payload()
+    test_late_remote_attempt_harvest_preserves_complete_and_records_superseded_note()
+    test_empty_remote_attempt_token_is_not_harvested_as_current()
+    test_same_attempt_late_harvest_cannot_replace_completed_controller_result()
     test_seq_regression_preserves_last_good_mirror()
     test_validate_remote_content_rejects_same_pid_legacy_replay_with_newer_timestamp()
     test_validate_remote_content_accepts_legacy_reset_with_cold_cache_and_new_pid()
@@ -1554,7 +1907,7 @@ def main() -> None:
     test_release_lock_skips_foreign_lock()
     test_release_lock_releases_clean_failure_terminal()
     test_release_lock_no_double_release()
-    print("OK: 39 fleet watch tests pass")
+    print("OK: 40 fleet watch tests pass")
 
 
 if __name__ == "__main__":

@@ -132,6 +132,7 @@ def _run_dispatch(
         dispatch_id,
         "--cwd",
         str(project),
+        "--in-place",
         "--poll-secs",
         "0.1",
         "--max-idle-secs",
@@ -688,10 +689,15 @@ def test_dead_sql_active_lease_does_not_make_live_owner_ambiguous(
     assert "controller registry could not be read" in completed.stderr
     assert "Retry the dispatch" in completed.stderr
     assert "--unregistered-forced" not in completed.stderr
-    assert authority.read_all(
-        "SELECT dispatch_id FROM dispatch_attempts WHERE dispatch_id = ?",
-        (dispatch_id,),
-    ) == []
+    refused_record = json.loads(
+        ledger.record_path(dispatch_id, create=False).read_text(encoding="utf-8")
+    )
+    assert refused_record["controller_label"] == "project"
+    assert refused_record["controller_session_id"] is None
+    assert refused_record["controller_pid"] is None
+    owner = _attempt_owner(authority, dispatch_id)
+    assert owner["owner_controller_label"] == "project"
+    assert owner["owner_session_digest"] is None
     assert forced.returncode == 0, (forced.stdout, forced.stderr)
     assert forced_sentinel.is_file()
     assert "ownership could not be determined" in forced.stderr
@@ -970,10 +976,15 @@ def test_multiple_kernel_live_controllers_refuse_without_guessing(
     assert completed.returncode != 0
     assert not sentinel.exists()
     assert _capacity_leases(dispatch_id) == []
-    assert authority.read_all(
-        "SELECT dispatch_id FROM dispatch_attempts WHERE dispatch_id = ?",
-        (dispatch_id,),
-    ) == []
+    refused_record = json.loads(
+        ledger.record_path(dispatch_id, create=False).read_text(encoding="utf-8")
+    )
+    assert refused_record["controller_label"] == "project"
+    assert refused_record["controller_session_id"] is None
+    assert refused_record["controller_pid"] is None
+    owner = _attempt_owner(authority, dispatch_id)
+    assert owner["owner_controller_label"] == "project"
+    assert owner["owner_session_digest"] is None
     _assert_reconnect_bounce(completed.stderr, slug="project")
 
 
@@ -989,7 +1000,15 @@ def test_unregistered_controller_refuses_before_worker_or_capacity(
 
     assert completed.returncode != 0, (completed.stdout, completed.stderr)
     assert not sentinel.exists(), "refused dispatch still launched its worker"
-    assert not ledger.record_path(dispatch_id, create=False).exists()
+    refused_record_path = ledger.record_path(dispatch_id, create=False)
+    assert refused_record_path.exists()
+    refused_record = json.loads(refused_record_path.read_text(encoding="utf-8"))
+    assert refused_record["controller_label"] == "project"
+    assert refused_record["controller_session_id"] is None
+    assert refused_record["controller_pid"] is None
+    owner = _attempt_owner(journal.Journal(project), dispatch_id)
+    assert owner["owner_controller_label"] == "project"
+    assert owner["owner_session_digest"] is None
     assert _capacity_leases(dispatch_id) == []
     pidfiles = tmp_path / "pidfiles"
     assert not pidfiles.exists() or list(pidfiles.iterdir()) == []
@@ -1112,6 +1131,66 @@ def test_unregistered_forced_launches_with_null_owner_and_warns(
     owner = _attempt_owner(authority, dispatch_id)
     assert owner["owner_controller_label"] is None
     assert owner["owner_session_digest"] is None
+
+
+def test_inferred_reconnect_label_does_not_claim_terminal_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    authority, holder_a, _nonce_a = _register_controller(
+        project, env, label="controller-a", export_identity=False
+    )
+    principal_b = ledger.process_identity(os.getpid())
+    assert principal_b is not None
+    claimed_b = authority.claim_or_renew_lease(
+        "controller-b", principal=principal_b
+    )
+    assert claimed_b.committed and claimed_b.value is not None
+    dispatch_id = "inferred-reconnect-label-ownerless"
+    args = _stamp_args(
+        dispatch_id=dispatch_id,
+        agent="codex",
+        shape="bash",
+        cwd=str(project),
+        project_root=str(project),
+        _requested_controller_label=None,
+        _requested_controller_pid=None,
+    )
+    try:
+        dispatch._stamp_prelaunch_controller_identity(args, project)
+        status = dispatch._prelaunch_status_metadata(args)
+        assert status["controller_label"] == "project"
+        assert status["controller_session_id"] is None
+        record = {
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "controller_label": dispatch._controller_label(args),
+            "controller_session_id": dispatch._controller_session_id(args),
+            "controller_pid": dispatch._controller_pid(args),
+        }
+        terminal = ledger.commit_terminal_authority(
+            record,
+            state="complete",
+            reason=None,
+            worker_still_alive=False,
+        )
+        assert terminal.committed
+        authority.project_terminal_outbox(
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        )
+        recipients = authority.read_all(
+            """SELECT recipient_label FROM delivery_events
+               WHERE stream_id = ? AND withdrawn_at IS NULL
+               ORDER BY recipient_label""",
+            (dispatch_id,),
+        )
+        assert [str(row["recipient_label"]) for row in recipients] == [
+            "controller-a",
+            "controller-b",
+        ], recipients
+    finally:
+        holder_a.close()
 
 
 def test_help_documents_unregistered_override() -> None:

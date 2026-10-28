@@ -26,8 +26,10 @@ import goalflight_dispatch as D  # noqa: E402
 import goalflight_fleet as fleet  # noqa: E402
 import goalflight_fleet_billing as billing  # noqa: E402
 import goalflight_fleet_preflight as fleet_preflight  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -355,6 +357,65 @@ def test_remote_drain_routes_claimed_entry_through_fleet_launch() -> None:
         assert_true("remote receipt", record.get("remote_launch_receipt", {}).get("remote_pid") == 4242)
         meta = json.loads((fleet_dir / "register" / "dispatches" / "remote-drain-route" / "meta.json").read_text())
         assert_true("queue token on fleet meta", meta.get("queue_launch_token") == record.get("queue_launch_token"))
+
+
+def test_remote_drain_preserves_queued_controller_over_drainer_environment() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        fleet_dir = tmp / "fleet"
+        _fixture_fleet(fleet_dir)
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        dispatch_id = "remote-drain-queued-owner"
+        entry_path = _write_remote_queue_entry(queue, dispatch_id)
+        entry = json.loads(entry_path.read_text(encoding="utf-8"))
+        entry["controller_label"] = "controller-b"
+        entry["controller_session_id"] = "controller-b-session"
+        entry_path.write_text(json.dumps(entry), encoding="utf-8")
+        captured: list[list[str]] = []
+
+        with isolated_env(tmp, fleet_dir):
+            authority = journal.open_or_create_journal(ROOT)
+            for label, nonce, pid in (
+                ("controller-a", "controller-a-session", 40101),
+                ("controller-b", "controller-b-session", 40102),
+            ):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"pid": pid, "start_token": f"{label}-start"},
+                    nonce=nonce,
+                )
+                assert_true(f"active {label}", claimed.committed and claimed.value is not None)
+            os.environ["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-a"
+            os.environ["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = "controller-a-session"
+
+            payload = D._drain_queue_once(
+                _drain_args(queue, fleet_dir, remote_runner=_receipt_runner(captured))
+            )
+            record = ledger.read_record(dispatch_id)
+            assert_true("launched", payload["launched"] == 1)
+            assert_true("queued controller recorded", record.get("controller_label") == "controller-b")
+            assert_true(
+                "queued session recorded",
+                record.get("controller_session_id") == "controller-b-session",
+            )
+            terminal = ledger.commit_terminal_authority(
+                record,
+                state="complete",
+                reason=None,
+                worker_still_alive=False,
+            )
+            assert_true("terminal committed", terminal.committed)
+            authority.project_terminal_outbox(messages_dir=Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]))
+            recipients = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? AND withdrawn_at IS NULL""",
+                (dispatch_id,),
+            )
+            assert_true(
+                "delivery follows queued controller",
+                [str(row["recipient_label"]) for row in recipients] == ["controller-b"],
+            )
 
 
 def test_remote_drain_uses_queued_base_sha_after_head_moves() -> None:

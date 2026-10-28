@@ -61,6 +61,7 @@ def _isolate_state_env(env: dict[str, str], base: Path) -> None:
         "GOALFLIGHT_PROMPT_FILE",
         "GOALFLIGHT_STEER_FILE",
         "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+        "GOALFLIGHT_CONTROLLER_LABEL",
         "GOALFLIGHT_CONTROLLER_SESSION_ID",
         "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
         "GOALFLIGHT_CONTROLLER_PID",
@@ -239,6 +240,7 @@ def _run(
         proc = subprocess.run(
             [
                 sys.executable, str(DISPATCH), "--unregistered-forced",
+                "--in-place",
                 "--cwd", tmp,
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--dispatch-id", "crash-safe-run",
@@ -338,7 +340,7 @@ def case_dispatch_usage_limit_exit_zero_is_exhausted() -> None:
     assert reason.get("message") == "dispatch_worker_limit_reached", reason
     assert reason.get("limit_kind") == "exhausted", reason
     assert reason.get("reason") == (
-        "worker_dead_no_terminal_marker:death_cause=no_evidence"
+        "worker_dead_no_terminal_marker:death_cause=dispatch record is missing worker_cwd"
     ), reason
     assert record.get("state") == "quota_exhausted", record
     assert record.get("terminal_state") == "quota_exhausted", record
@@ -597,13 +599,14 @@ def case_bound_marker_survives_stream_read_cap_boundary() -> None:
             goalflight_watch.STREAM_READ_CHUNK_CHARS,
             goalflight_watch.STREAM_READ_CHUNK_CHARS + 1,
         ):
-            line = (
-                marker_prefix
-                + ("x" * (total_chars - len(marker_prefix) - 1))
-                + "\n"
-            )
-            assert len(line) == total_chars
-            tail.write_text(line, encoding="utf-8")
+            # The marker parser intentionally rejects marker lines over 1000
+            # characters. Exercise the read cap with a preceding long
+            # physical line, then verify scanning resumes at the valid marker.
+            preceding_line = ("x" * (total_chars - 1)) + "\n"
+            marker_line = marker_prefix + "done\n"
+            assert len(preceding_line) == total_chars
+            assert len(marker_line.rstrip("\n")) <= 1000
+            tail.write_text(preceding_line + marker_line, encoding="utf-8")
 
             terminal = goalflight_watch._full_file_terminal_marker(
                 tail,
@@ -615,6 +618,7 @@ def case_bound_marker_survives_stream_read_cap_boundary() -> None:
 
             assert terminal is not None, (total_chars, terminal)
             assert terminal.get("kind") == "COMPLETE", terminal
+            assert terminal.get("line") == 2, terminal
             assert str(terminal.get("text") or "").startswith(dispatch_id), terminal
 
 
@@ -1214,6 +1218,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         proc = subprocess.Popen(
             [
                 sys.executable, str(DISPATCH), "--unregistered-forced",
+                "--in-place",
                 "--cwd", str(tmp_path),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--dispatch-id", "launcher-pgroup",
@@ -1238,7 +1243,10 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
             assert _wait_for(
                 lambda: started.exists()
                 and status.exists()
-                and _status_payload().get("state") != "starting",
+                and (payload := _status_payload()).get("state")
+                in {"running", "complete"}
+                and payload.get("worker_pid")
+                and payload.get("watcher_pid"),
             ), status.read_text(encoding="utf-8") if status.exists() else "worker/watch did not start"
             os.killpg(proc.pid, signal.SIGTERM)
             _observe_process_exit(proc)
@@ -1260,40 +1268,40 @@ def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> Non
     """HOST-ONLY: registered-controller regression for launcher-group death."""
     with tempfile.TemporaryDirectory(dir=ROOT, prefix=".goalflight-host-") as tmp:
         tmp_path = Path(tmp)
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        subprocess.run(
-            ["git", "init", "-q", str(repo)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "config", "user.name", "Goal Flight Test"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        (repo / "README").write_text("fixture\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "-C", str(repo), "add", "README"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "commit", "-qm", "fixture"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
         for shape, read_only in (("read-only", True), ("seat", False)):
+            repo = tmp_path / f"{shape}-repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(repo)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Goal Flight Test"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            (repo / "README").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "README"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             tail = tmp_path / f"{shape}.dispatch.tail"
             status = tmp_path / f"{shape}.dispatch.status.json"
             started = tmp_path / f"{shape}.started"
@@ -1336,7 +1344,9 @@ def case_host_only_background_dispatch_survives_launcher_pgroup_sigterm() -> Non
                     ["--cwd", str(repo), "--in-place", "--read-only"]
                 )
             else:
-                dispatch_argv.extend(["--worktree-root", str(tmp_path / "worktrees")])
+                dispatch_argv.extend(
+                    ["--worktree-root", str(tmp_path / f"{shape}-worktrees")]
+                )
             dispatch_argv.extend(["--", sys.executable, "-c", worker_code])
             controller_code = (
                 "import os, subprocess, sys, time\n"
@@ -1473,6 +1483,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         )
         dispatch_command = [
             sys.executable, str(DISPATCH), "--unregistered-forced",
+            "--in-place",
             # Pin the project root to the sandbox: the controller registry
             # is per-project, so inheriting this repo as cwd would let a
             # registered local controller be inferred as this dispatch's

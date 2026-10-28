@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 from machine_isolation import isolate_goalflight_machine_state_impl
-from support import has_main_driver
+from support import capture_dispatch_sandbox_posture, has_main_driver
 
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -38,6 +39,7 @@ if _isolated_child:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    capture_dispatch_sandbox_posture()
     config.addinivalue_line(
         "markers",
         "live_machine_state: do not isolate GOALFLIGHT_* machine paths "
@@ -52,6 +54,34 @@ def isolate_goalflight_machine_state(
     request: pytest.FixtureRequest,
 ) -> dict[str, str] | None:
     return isolate_goalflight_machine_state_impl(tmp_path, monkeypatch, request)
+
+
+@pytest.fixture(autouse=True)
+def ample_disk_space_for_launch_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    disk_usage = shutil.disk_usage
+
+    def report_ample_space(path):
+        usage = disk_usage(path)
+        return usage._replace(free=max(usage.free, 50_000_000_000))
+
+    monkeypatch.setattr(shutil, "disk_usage", report_ample_space)
+    child_python = tmp_path / "goalflight-test-python"
+    child_python.mkdir()
+    (child_python / "usercustomize.py").write_text(
+        "import shutil\n"
+        "_disk_usage = shutil.disk_usage\n"
+        "def _ample_disk_space(path):\n"
+        "    usage = _disk_usage(path)\n"
+        "    return usage._replace(free=max(usage.free, 50_000_000_000))\n"
+        "shutil.disk_usage = _ample_disk_space\n",
+        encoding="utf-8",
+    )
+    python_path = [str(child_python), os.environ.get("PYTHONPATH", "")]
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(part for part in python_path if part)
+    )
 
 
 @pytest.fixture(

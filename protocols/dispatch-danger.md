@@ -39,15 +39,45 @@ applies it automatically.
 To retire a dispatch that must never run, use
 `goalflight_dispatch.py withdraw <dispatch_id> --reason TEXT --controller-label <owner>`.
 It never kills a live worker: steer that worker to stop and wait for exit first.
-Withdrawal commits journal terminal state `withdrawn`, projects the terminal ledger row, then
-moves the queue carrier to `dispatch-queue-withdrawn/<id>.<utc-stamp>.json`.
+Withdrawal of a nonterminal attempt commits journal state `withdrawn` and
+projects the terminal ledger row. If the journal attempt is already `TERMINAL`
+while its ledger row is nonterminal, withdrawal projects the existing journal
+outcome without changing it. It then moves the queue carrier to
+`dispatch-queue-withdrawn/<id>.<utc-stamp>.json`.
 Do not remove a carrier by hand: drain can restore it from a nonterminal ledger row.
 The human owner can override controller ownership with `--operator`. If the
 record's project moved, pass `--project-root PATH`; that journal must contain the
 dispatch attempt. `--dry-run` lists planned record fields without writing;
 `--json` returns machine-readable results. Repeating a completed withdrawal is
-a no-op. A spawn intent without a worker PID must age past the claim-stale window
-before withdrawal is allowed.
+a no-op. For a `PREPARED` attempt, a spawn intent without a worker PID must age
+past the claim-stale window before withdrawal is allowed.
+
+A matching, unambiguous journal attempt at `TERMINAL` is already authority for
+the dispatch's end. Reconciliation and `withdraw` may project that outcome to
+a nonterminal ledger row and settle its capacity lease when the terminal
+attempt, transition, and outbox event all identify the same dispatch and
+attempt. This projection does not rewrite the journal or require a status file.
+
+A missing status file is otherwise normally indeterminate. It proves a
+dispatch never launched only when the ledger has no worker PID or identity,
+worker cwd, or worktree path; its journal attempt is still `PREPARED` at launch
+epoch zero with no worker instance; every recorded claimant is absent or
+confirmed dead; and any matching capacity reservation has no worker and a dead
+claimant and can be released by terminal settlement. There must be no
+worker-spawn receipt. A spawn intent is allowed only after it has aged past the
+claim-stale window. All known status paths must be genuinely absent, and the
+newest row or claim timestamp must be older than that window. Malformed or
+unreadable evidence, unknown claimant or lease liveness, a present status entry,
+or a fresh row keeps the refusal. `withdraw` records `withdrawn` and releases
+the reservation; abandoned reconciliation records `inconclusive_no_final`
+with the usual `inferred_abandonment` basis.
+
+The read-only worktree reaper continues to hold an unknown nonterminal row with
+no usable cwd. A dispatch first writes a pathless `waiting_capacity` ledger
+row, then publishes the checkout path in a later `waiting_capacity` write. A
+crash before that path-publishing write leaves an unknown nonterminal row, so
+the reaper conservatively holds snapshots until terminal authority closes it.
+
 Use `--superseded-by <replacement-id>` to record `superseded` instead. Both
 outcomes settle the journal as `TERMINAL`, release the worktree lease, and do not hold
 linked tasks against a fresh dispatch. The replacement keeps its own task claim.

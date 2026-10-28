@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import ctypes
 from dataclasses import dataclass
+import errno
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,9 @@ from typing import Awaitable, Callable
 import uuid
 
 import goalflight_compat
+from goalflight_controller_label import validate_controller_label
 import goalflight_output_redact
+import goalflight_terminal
 
 SYSTEM_STARVED_CACHE_TTL_S = 30.0
 SYSTEM_STARVED_IDLE_PCT = 20.0
@@ -53,6 +56,95 @@ _STATUS_EPOCH_SCHEMAS = {"goalflight.acp-run.v1", "goalflight.status.v1"}
 _STATUS_EPOCH_CACHE: dict[str, str] = {}
 _TEST_ACTIVE_TIME_SCALE: tuple[float, float] | None = None
 _TEST_ACTIVE_TIME_SCALE_CHECKED = False
+_HOST_SLEEP_SAMPLE: tuple[float, float] | None = None
+_HOST_SLEEP_DETECTED_AT: float | None = None
+_HOST_WAKE_CACHE: tuple[float, tuple[float, float] | None] | None = None
+HOST_SLEEP_GRACE_S = 5 * 60
+
+
+def _record_host_sleep_gap(wall_now: float, active_now: float) -> None:
+    """Remember a suspend seen by this process for non-macOS fallback."""
+    global _HOST_SLEEP_SAMPLE, _HOST_SLEEP_DETECTED_AT
+    previous = _HOST_SLEEP_SAMPLE
+    _HOST_SLEEP_SAMPLE = (wall_now, active_now)
+    if previous is None:
+        return
+    paused = system_sleep_pause_s(
+        prev_wall=previous[0],
+        prev_active=previous[1],
+        wall_now=wall_now,
+        active_now=active_now,
+        heartbeat_interval_s=2.5,
+    )
+    if paused <= 0:
+        return
+    _HOST_SLEEP_DETECTED_AT = wall_now
+
+
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int)]
+
+
+def _read_darwin_sleep_wake_times() -> tuple[float, float] | None:
+    """Read the kernel's last sleep and wake epochs, or None if unavailable."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        sysctlbyname = ctypes.CDLL(None).sysctlbyname
+        sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctlbyname.restype = ctypes.c_int
+
+        def read(name: bytes) -> float:
+            value = _Timeval()
+            size = ctypes.c_size_t(ctypes.sizeof(value))
+            if sysctlbyname(name, ctypes.byref(value), ctypes.byref(size), None, 0):
+                raise OSError(ctypes.get_errno(), "sysctlbyname failed")
+            if size.value < ctypes.sizeof(value):
+                raise OSError("short sysctl timeval")
+            return float(value.tv_sec) + float(value.tv_usec) / 1_000_000
+
+        return read(b"kern.sleeptime"), read(b"kern.waketime")
+    except (AttributeError, OSError, ValueError, TypeError):
+        return None
+
+
+def _darwin_sleep_wake_times() -> tuple[float, float] | None:
+    """Cache kernel wake reads briefly so hot-path callers stay cheap."""
+    global _HOST_WAKE_CACHE
+    mono_now = time.monotonic()
+    if _HOST_WAKE_CACHE is not None and mono_now - _HOST_WAKE_CACHE[0] < 1.0:
+        return _HOST_WAKE_CACHE[1]
+    result = _read_darwin_sleep_wake_times()
+    _HOST_WAKE_CACHE = (mono_now, result)
+    return result
+
+
+def host_slept_recently(
+    *, now: float | None = None, grace_s: float = HOST_SLEEP_GRACE_S
+) -> bool:
+    """Whether host wake grace applies, independent of another process."""
+    current = time.time() if now is None else float(now)
+    if sys.platform == "darwin":
+        times = _darwin_sleep_wake_times()
+        if times is not None:
+            slept_at, woke_at = times
+            age = current - woke_at
+            return slept_at > 0 and 0 <= age <= max(0.0, float(grace_s))
+    # CLOCK_UPTIME_RAW / CLOCK_MONOTONIC excludes suspend. On platforms without
+    # an authoritative kernel wake timestamp, sample this process's gap.
+    if sys.platform != "darwin":
+        active_monotonic()
+    detected_at = _HOST_SLEEP_DETECTED_AT
+    if detected_at is None:
+        return False
+    age = current - detected_at
+    return 0 <= age <= max(0.0, float(grace_s))
 
 
 def active_monotonic() -> float:
@@ -71,6 +163,8 @@ def active_monotonic() -> float:
                 pass
     if now is None:
         now = time.monotonic()
+
+    _record_host_sleep_gap(time.time(), now)
 
     # Hermetic acceptance tests can compress an incident-scale awake-time gap
     # without sleeping for an hour. The gate is test-mode-only and resolved
@@ -868,14 +962,170 @@ def status_tmp_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}{suffix}.tmp")
 
 
-def write_status(path: Path, payload: dict) -> None:
-    """Atomically write status JSON (write temp sibling, then os.replace).
+class StatusWriteLock:
+    """Serialize status read/modify/write transactions for one status path."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock_file = None
+
+    def __enter__(self) -> "StatusWriteLock":
+        if self._lock_file is not None:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self._lock_file = os.fdopen(fd, "a+b")
+        try:
+            goalflight_compat.flock(self._lock_file, goalflight_compat.LOCK_EX)
+        except BaseException:
+            self._lock_file.close()
+            self._lock_file = None
+            raise
+        return self
+
+    def acquire_until(self, deadline_s: float, *, poll_s: float = 0.010) -> bool:
+        """Acquire this status lock without an unbounded wait."""
+        if self._lock_file is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self._lock_file = os.fdopen(fd, "a+b")
+        while True:
+            try:
+                goalflight_compat.flock(
+                    self._lock_file,
+                    goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+                )
+                return True
+            except (BlockingIOError, OSError) as exc:
+                if not isinstance(exc, BlockingIOError) and exc.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                }:
+                    self._lock_file.close()
+                    self._lock_file = None
+                    raise
+                if time.monotonic() >= deadline_s:
+                    self._lock_file.close()
+                    self._lock_file = None
+                    return False
+                time.sleep(min(poll_s, max(0.0, deadline_s - time.monotonic())))
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._lock_file is None:
+            return
+        try:
+            goalflight_compat.flock(self._lock_file, goalflight_compat.LOCK_UN)
+        finally:
+            self._lock_file.close()
+            self._lock_file = None
+
+    def read(self) -> dict | None:
+        """Read the current sidecar while holding its status lock."""
+        if self._lock_file is None:
+            raise RuntimeError("status read requires an active status lock")
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def write(self, payload: dict) -> None:
+        """Replace this path; the first terminal-complete payload is final."""
+        if self._lock_file is None:
+            raise RuntimeError("status write requires an active status lock")
+        current = self.read()
+        current_complete = isinstance(current, dict) and "complete" in {
+            current.get("state"), current.get("terminal_state")
+        }
+        if current_complete:
+            return
+        admission_token = (
+            current.get("launch_admission_token")
+            if isinstance(current, dict)
+            else None
+        )
+        if admission_token and "launch_admission_token" not in payload:
+            payload = {**payload, "launch_admission_token": admission_token}
+        _write_status_unlocked(self.path, payload)
+
+    def clear_launch_admission(self, token: str) -> bool:
+        """Remove a matching launch marker while preserving the current state."""
+        if self._lock_file is None:
+            raise RuntimeError("status write requires an active status lock")
+        current = self.read()
+        if not isinstance(current, dict) or current.get("launch_admission_token") != token:
+            return False
+        updated = dict(current)
+        updated.pop("launch_admission_token", None)
+        _write_status_unlocked(self.path, updated)
+        return True
+
+    def append_terminal_complete_note(self, key: str, note: dict) -> bool:
+        """Append audit detail without replacing a completed result payload."""
+        if self._lock_file is None:
+            raise RuntimeError("status note requires an active status lock")
+        current = self.read()
+        if not isinstance(current, dict) or "complete" not in {
+            current.get("state"), current.get("terminal_state")
+        }:
+            return False
+        existing = current.get(key)
+        notes = (
+            list(existing)
+            if isinstance(existing, list)
+            else ([existing] if isinstance(existing, dict) else [])
+        )
+        attempt_id = note.get("attempt_id")
+        if isinstance(attempt_id, str) and attempt_id:
+            identity = (note.get("type"), attempt_id)
+            for index, entry in enumerate(notes):
+                if not isinstance(entry, dict) or (
+                    entry.get("type"), entry.get("attempt_id")
+                ) != identity:
+                    continue
+                merged = {**entry, **note}
+                if merged == entry:
+                    return False
+                notes[index] = merged
+                break
+            else:
+                notes.append(note)
+        else:
+            if note in notes:
+                return False
+            notes.append(note)
+        updated = dict(current)
+        updated[key] = notes
+        _write_status_unlocked(self.path, updated)
+        return True
+
+
+def status_write_lock(path: Path) -> StatusWriteLock:
+    """Lock shared by terminal publication and guarded reconcile updates."""
+    return StatusWriteLock(Path(path))
+
+
+def append_terminal_complete_note(path: Path, key: str, note: dict) -> bool:
+    """Record an audit note while preserving a terminal-complete status."""
+    with status_write_lock(path) as lock:
+        return lock.append_terminal_complete_note(key, note)
+
+
+def _write_status_unlocked(path: Path, payload: dict) -> None:
+    """Atomically replace status JSON. The caller holds its status-file lock.
 
     Same-directory tmp + replace is atomic on POSIX, so a concurrent reader
     never sees a half-written file. Shared by goalflight_acp_run.py (runner
     heartbeat) and goalflight_watch.py (log watcher) so the two writers stay
     byte-identical (grok 2026-05-20 DRY note).
     """
+    if "controller_label" in payload:
+        payload["controller_label"] = validate_controller_label(
+            payload["controller_label"], field="controller_label"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     _ensure_status_epoch(path, payload)
     redacted = goalflight_output_redact.redact_data(payload)
@@ -888,6 +1138,59 @@ def write_status(path: Path, payload: dict) -> None:
         payload.clear()
         payload["state"] = "blocked"
         payload["reason"] = "status_redact_failed"
+    blocked_record = dict(payload)
+    for authority_field in (
+        "_wait_journal_terminal",
+        "_wait_file_snapshots_corroborated",
+        "terminal_event_uuid",
+    ):
+        blocked_record.pop(authority_field, None)
+    terminal_marker = blocked_record.get("terminal_marker")
+    terminal_blocked = (
+        blocked_record.get("state") == "blocked"
+        or blocked_record.get("terminal_state") == "blocked"
+        or terminal_marker == "BLOCKED"
+        or (
+            isinstance(terminal_marker, dict)
+            and terminal_marker.get("kind") == "BLOCKED"
+        )
+    )
+    blocked_marker = (
+        goalflight_terminal.blocked_outcome_marker(blocked_record)
+        if terminal_blocked
+        else None
+    )
+    worker_alive = (
+        False
+        if payload.get("prelaunch_failure") is True
+        else payload.get("worker_alive")
+    )
+    identity_reason = (
+        None if payload.get("prelaunch_failure") is True
+        else payload.get("worker_identity_reason")
+    )
+    if blocked_marker is not None and goalflight_terminal.blocked_outcome_is_provisional(
+        blocked_record,
+        goalflight_terminal.worker_liveness_from_probe(
+            worker_alive, identity_reason
+        ),
+    ):
+        payload["attention_marker"] = dict(blocked_marker)
+        for marker_field in (
+            "terminal_marker",
+            "last_marker",
+            "markers",
+            "terminal_event_uuid",
+            "_wait_journal_terminal",
+            "_wait_file_snapshots_corroborated",
+        ):
+            payload.pop(marker_field, None)
+        payload.pop("terminal_state", None)
+        payload.pop("terminal_marker_source", None)
+        payload["state"] = "watcher_stopped"
+        payload["classification"] = "watcher_stopped"
+        payload["terminal_pending_state"] = "blocked"
+        payload["liveness_state"] = "terminal_pending"
     tmp = status_tmp_path(path)
     try:
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -896,6 +1199,12 @@ def write_status(path: Path, payload: dict) -> None:
         if tmp.exists():
             with contextlib.suppress(OSError):
                 tmp.unlink()
+
+
+def write_status(path: Path, payload: dict) -> None:
+    """Serialize an atomic status replacement with every writer for this path."""
+    with status_write_lock(path) as lock:
+        lock.write(payload)
 
 
 async def cpu_liveness_keep_waiting(

@@ -25,9 +25,10 @@ import goalflight_compat  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 import goalflight_messages as M  # noqa: E402
+import goalflight_worktree_gc as G  # noqa: E402
 
 
-SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
+SESSION_ID = "00000000-0000-4000-8000-000000000033"
 
 
 def _gone_controller() -> dict:
@@ -253,6 +254,256 @@ def test_no_pid_no_lease_no_marker_closes_without_asserting_outcome(tmp_path: Pa
     assert reconciliation["observed_outcome"] is False
     assert reconciliation["process_evidence"] == "no_recorded_pid"
     assert reconciliation["lease_evidence"] == "lease_absent"
+
+
+def test_stale_waiting_capacity_without_status_reconciles_as_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "waiting-capacity-no-status"
+    lease_id = "waiting-capacity-lease"
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text="",
+        state="waiting_capacity",
+        lease_id=lease_id,
+        **_gone_controller(),
+    )
+    record.pop("worker_cwd")
+    record.update(
+        claimant_pid=2**30,
+        claimant_identity={"pid": 2**30, "start_token": "exited"},
+        updated_at=(dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat(),
+    )
+    Path(str(record["status_path"])).unlink()
+    Path(str(record["stdout_path"])).unlink()
+    L.record_path(dispatch_id).write_text(json.dumps(record), encoding="utf-8")
+    authority = D.goalflight_journal.Journal.create(tmp_path)
+    prepared = authority.prepare_attempt(
+        dispatch_id, owner_controller_label="dead-controller"
+    )
+    assert prepared.committed
+    _stub_controller_probe(
+        monkeypatch,
+        state="dead",
+        session=None,
+        expected_label="dead-controller",
+    )
+    C.save_state(
+        {
+            "schema": C.SCHEMA,
+            "machine_id": C.machine_id(),
+            "leases": {
+                lease_id: {
+                    "lease_id": lease_id,
+                    "dispatch_id": dispatch_id,
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": C.machine_id(),
+                    "lease_schema": C.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "claimant_pid": 2**30,
+                    "project_root": str(tmp_path),
+                    "expires_at": C.iso(
+                        C.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert result["entries"][0]["never_launched"] is True
+    assert closed["state"] == closed["terminal_state"] == "inconclusive_no_final"
+    assert closed["outcome"]["reconciliation"]["basis"] == "inferred_abandonment"
+    assert authority.attempt_for_dispatch(dispatch_id).lifecycle_state == (
+        D.goalflight_journal.ATTEMPT_TERMINAL
+    )
+    assert C.load_state()["leases"][lease_id]["state"] == "inconclusive_no_final"
+
+
+def test_terminal_prelaunch_journal_projects_waiting_capacity_row(
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "terminal-prelaunch-projection"
+    lease_id = "terminal-prelaunch-lease"
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text="",
+        state="waiting_capacity",
+        lease_id=lease_id,
+    )
+    record.pop("worker_cwd")
+    authority = D.goalflight_journal.Journal.create(tmp_path)
+    prepared = authority.prepare_attempt(dispatch_id, owner_controller_label="dead-controller")
+    assert prepared.committed and prepared.value is not None
+    record.update(
+        attempt_id=prepared.value.attempt_id,
+        launch_token=prepared.value.launch_token,
+        launch_epoch=0,
+        updated_at="2020-01-01T00:00:00Z",
+    )
+    Path(str(record["status_path"])).unlink()
+    Path(str(record["stdout_path"])).unlink()
+    L.write_record(record)
+    observation = {
+        "reason": "worktree_occupied",
+        "terminal_state": "failed_worktree",
+        "reconciliation": {
+            "source": "goalflight_dispatch.drain",
+            "basis": "inferred_abandonment",
+            "reason": "never_launched_no_final",
+            "process_evidence": "no_recorded_pid",
+            "status_evidence": "status_file_absent",
+            "output_evidence": "no_worker_output",
+            "lease_evidence": "lease_absent",
+            "controller_evidence": "recorded_controller_beacon_absent",
+            "progress_age_s": 7200.0,
+            "checked_output": True,
+            "observed_outcome": False,
+        },
+        "outcome": {"reason": "worktree_occupied"},
+        "prelaunch_failure": True,
+        "state": "failed_worktree",
+        "worker_still_alive": False,
+    }
+    assert authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="failed_worktree",
+        observation=observation,
+    ).committed
+    with C.StateLock():
+        C.save_state(
+            {
+                "schema": C.SCHEMA,
+                "machine_id": C.machine_id(),
+                "leases": {
+                    lease_id: {
+                        "lease_id": lease_id,
+                        "dispatch_id": dispatch_id,
+                        "state": "active",
+                        "agent": "codex",
+                        "machine_id": C.machine_id(),
+                        "lease_schema": C.LEASE_SCHEMA,
+                        "launch_state": "reserved",
+                        "project_root": str(tmp_path),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+    ledger_dir = L.runs_dir(create=False)
+    unowned = G.check_unowned(
+        str(tmp_path / "readonly-snapshot"),
+        ledger_dir,
+        project_root=tmp_path,
+        ledger_index=G.ledger_index_for_dir(ledger_dir),
+    )
+
+    assert result["closed"] == 1, result
+    assert result["entries"][0]["reason"] == "journal_terminal_projection"
+    assert closed["state"] == closed["terminal_state"] == "failed_worktree"
+    assert closed["attempt_id"] == prepared.value.attempt_id
+    assert C.load_state()["leases"][lease_id]["state"] == "failed_worktree"
+    assert unowned["verdict"] == "yes", unowned
+    assert authority.attempt_for_dispatch(dispatch_id).lifecycle_state == (
+        D.goalflight_journal.ATTEMPT_TERMINAL
+    )
+    mismatched = _read(dispatch_id)
+    mismatched.update(
+        state="waiting_capacity",
+        terminal_state="unknown",
+        attempt_id="different-attempt",
+    )
+    Path(str(mismatched["status_path"])).unlink()
+    L.write_record(mismatched)
+    refused = _run(tmp_path)
+    assert refused["closed"] == 0
+    assert _read(dispatch_id)["state"] == "waiting_capacity"
+
+
+def test_young_waiting_capacity_without_status_stays_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "young-waiting-capacity-no-status"
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text="",
+        state="waiting_capacity",
+        started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        **_gone_controller(),
+    )
+    record.pop("worker_cwd")
+    Path(str(record["status_path"])).unlink()
+    Path(str(record["stdout_path"])).unlink()
+    L.record_path(dispatch_id).write_text(json.dumps(record), encoding="utf-8")
+    authority = D.goalflight_journal.Journal.create(tmp_path)
+    prepared = authority.prepare_attempt(
+        dispatch_id, owner_controller_label="dead-controller"
+    )
+    assert prepared.committed
+    _stub_controller_probe(
+        monkeypatch,
+        state="dead",
+        session=None,
+        expected_label="dead-controller",
+    )
+
+    result = _run(tmp_path, now=dt.datetime.now(dt.timezone.utc))
+
+    assert result["closed"] == 0
+    assert result["kept_reasons"] == {"recent_progress": 1}
+    assert _read(dispatch_id)["state"] == "waiting_capacity"
+
+
+def test_stale_waiting_capacity_identity_without_pid_stays_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "waiting-capacity-identity-without-pid"
+    record = _record(
+        tmp_path,
+        dispatch_id,
+        tail_text="",
+        state="waiting_capacity",
+        **_gone_controller(),
+    )
+    record.pop("worker_cwd")
+    record["claimant_identity"] = {"pid": 2**30, "start_token": "orphaned"}
+    record["updated_at"] = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)
+    ).isoformat()
+    Path(str(record["status_path"])).unlink()
+    Path(str(record["stdout_path"])).unlink()
+    L.record_path(dispatch_id).write_text(json.dumps(record), encoding="utf-8")
+    authority = D.goalflight_journal.Journal.create(tmp_path)
+    prepared = authority.prepare_attempt(
+        dispatch_id, owner_controller_label="dead-controller"
+    )
+    assert prepared.committed
+    _stub_controller_probe(
+        monkeypatch,
+        state="dead",
+        session=None,
+        expected_label="dead-controller",
+    )
+
+    result = _run(tmp_path)
+
+    assert result["closed"] == 0
+    assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+    assert _read(dispatch_id)["state"] == "waiting_capacity"
 
 
 def test_live_worker_pid_is_never_closed(

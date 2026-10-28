@@ -48,7 +48,12 @@ import grok_usage  # noqa: E402
 # still usable headroom left to flip with.
 EXHAUSTED_AT_PERCENT = 98.0
 
-STATE_PATH = Path.home() / ".goal-flight" / "grok-seat-states.json"
+_state_path_override = os.environ.get("GOALFLIGHT_GROK_SEAT_STATE_FILE", "").strip()
+STATE_PATH = (
+    Path(_state_path_override).expanduser()
+    if _state_path_override
+    else Path.home() / ".goal-flight" / "grok-seat-states.json"
+)
 STATE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 10.0
 HOST_KEY = ""  # the host ~/.grok login, which has no account label
@@ -76,7 +81,11 @@ def _optional_recover():
     if _RECOVER_CACHE is not _UNSET:
         return _RECOVER_CACHE
     try:
-        from ext import grok_rotate
+        path_before_import = sys.path[:]
+        try:
+            from ext import grok_rotate
+        finally:
+            sys.path[:] = path_before_import
 
         hook = getattr(grok_rotate, "recover_probe", None)
     except BaseException:
@@ -91,7 +100,11 @@ def _optional_mark_exhausted():
     if _MARK_CACHE is not _UNSET:
         return _MARK_CACHE
     try:
-        from ext import grok_rotate
+        path_before_import = sys.path[:]
+        try:
+            from ext import grok_rotate
+        finally:
+            sys.path[:] = path_before_import
 
         hook = getattr(grok_rotate, "mark_exhausted", None)
     except BaseException:

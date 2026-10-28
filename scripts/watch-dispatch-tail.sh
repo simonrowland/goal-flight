@@ -467,6 +467,15 @@ for required in WORKER_PID TAIL_PATH CONTROLLER_PID AGENT_LABEL SESSION_ID; do
   fi
 done
 
+if [[ "$TAIL_PATH" == *.gz ]]; then
+  echo "watch-dispatch-tail: tail is gzip-compressed at $TAIL_PATH; live follow is unavailable" >&2
+  exit 0
+fi
+if [ ! -f "$TAIL_PATH" ] && [ -f "$TAIL_PATH.gz" ]; then
+  echo "watch-dispatch-tail: tail is gzip-compressed at $TAIL_PATH.gz; live follow is unavailable" >&2
+  exit 0
+fi
+
 # Validate PID args are integers — without this, a non-integer WORKER_PID
 # produces invalid JSON in the pidfile body ({"pid": abc, ...}), which
 # cleanup_ghosts json.JSONDecodeError-skips but leaks the file.

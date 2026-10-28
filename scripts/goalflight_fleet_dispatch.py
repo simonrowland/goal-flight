@@ -9,6 +9,7 @@ auth/quarantine gates.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -408,8 +409,16 @@ def assert_dispatch_gates(
         raise DispatchGateError(str(exc), code="tool_smoke") from exc
 
 
-def remote_status_path_for_dispatch(state_dir: str, dispatch_id: str) -> str:
+def remote_status_path_for_dispatch(
+    state_dir: str,
+    dispatch_id: str,
+    *,
+    attempt_id: str | None = None,
+) -> str:
     base = str(state_dir or "~/.goal-flight").strip().rstrip("/")
+    if attempt_id:
+        attempt_key = hashlib.sha256(str(attempt_id).encode("utf-8")).hexdigest()[:20]
+        return f"{base}/dispatches/{dispatch_id}/attempts/{attempt_key}/status.json"
     return f"{base}/dispatches/{dispatch_id}/status.json"
 
 
@@ -437,12 +446,15 @@ def build_remote_command_plan(
     base_sha: str,
     billing_account: str | None = None,
     recover_unconfirmed: bool = False,
+    attempt_id: str | None = None,
 ) -> list[dict[str, Any]]:
     import goalflight_fleet_ssh as fleet_ssh
 
     repo_root = str(node_entry.get("repo_root") or "")
     state_dir = str(node_entry.get("state_dir") or "~/.goal-flight")
-    status_json = remote_status_path_for_dispatch(state_dir, dispatch_id)
+    status_json = remote_status_path_for_dispatch(
+        state_dir, dispatch_id, attempt_id=attempt_id
+    )
     plans: list[dict[str, Any]] = []
     for command_class, extra in (
         ("git_prune_claude_refs", {"python": str(node_entry.get("python") or "python3")}),
@@ -490,6 +502,7 @@ def preview_dispatch(
     dispatch_id: str | None = None,
     base_sha: str | None = None,
     thin_mode: bool = False,
+    attempt_id: str | None = None,
 ) -> DispatchPreview:
     import goalflight_dispatch as dispatch
 
@@ -541,6 +554,7 @@ def preview_dispatch(
             base_sha=resolved_base_sha,
             billing_account=resolved_billing,
             recover_unconfirmed=recover_unconfirmed,
+            attempt_id=attempt_id,
         ),
     )
     return preview
@@ -632,6 +646,52 @@ def _is_confirmed_launch_refusal(*, exit_code: int, stdout: str, stderr: str) ->
     return "WARN-REFUSE duplicate dispatch-id exists" in f"{stdout}\n{stderr}"
 
 
+def _probe_wake_expired_account_lock(
+    fleet_dir: Path, lock_doc: dict[str, Any], *,
+    runner: Callable[[list[str]], tuple[int, str, str]] | None,
+) -> str:
+    import goalflight_fleet_store as fleet
+    import goalflight_fleet_status as fleet_status
+    import goalflight_fleet_watch as fleet_watch
+
+    owner_id = str(lock_doc.get("owner_dispatch_id") or "")
+    meta = fleet_watch._read_json_object(
+        fleet_watch.dispatch_meta_path(fleet_dir, owner_id),
+    )
+    node_id = meta.get("node_id")
+    remote_path = meta.get("remote_status_path")
+    fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+    node_entry = (fleet_doc.get("nodes") or {}).get(node_id) if isinstance(node_id, str) else None
+    if not isinstance(node_entry, dict) or not isinstance(remote_path, str) or not remote_path:
+        raise DispatchError(
+            f"expired account lock for {owner_id} needs a remote holder check, but its status path is unavailable"
+        )
+    fetched = fleet_watch.SshFleetWatchTransport(
+        runner=runner, fleet_dir=fleet_dir,
+    ).fetch_remote_status(
+        node_id=node_id, dispatch_id=owner_id,
+        remote_status_path=remote_path, node_entry=node_entry,
+    )
+    if not fetched.ok or not fetched.content:
+        raise DispatchError(
+            f"expired account lock for {owner_id} needs a remote holder check: "
+            f"{fetched.error or 'remote status is empty'}"
+        )
+    try:
+        payload = json.loads(fetched.content)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise DispatchError(
+            f"expired account lock for {owner_id} has unreadable remote status"
+        ) from exc
+    state = payload.get("state") if isinstance(payload, dict) else None
+    if (not isinstance(state, str) or not fleet_status.is_terminal_state(state)
+            or state in fleet_status.SALVAGE_NEEDED_STATES):
+        raise DispatchError(
+            f"expired account lock for {owner_id} remains held; remote status is {state or 'unknown'}"
+        )
+    return state
+
+
 def acquire_lock_chain(
     fleet_dir: Path,
     preview: DispatchPreview,
@@ -647,6 +707,28 @@ def acquire_lock_chain(
     node_entry: dict[str, Any] = {}
     try:
         existing_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, preview.billing_account))
+        if (existing_lock and existing_lock.get("state") == "active"
+                and fleet.account_lock_expired_after_wake(existing_lock)):
+            terminal_state = _probe_wake_expired_account_lock(
+                fleet_dir, existing_lock, runner=runner,
+            )
+            fresh_lock = fleet.load_account_lock(
+                fleet.account_lock_path(fleet_dir, preview.billing_account),
+            )
+            if (not fresh_lock or fresh_lock.get("state") != "active"
+                    or fresh_lock.get("fencing_token") != existing_lock.get("fencing_token")
+                    or not fleet.account_lock_expired_after_wake(fresh_lock)):
+                raise DispatchError(
+                    f"account lock for {existing_lock.get('owner_dispatch_id')} "
+                    "changed during its post-wake holder check"
+                )
+            fleet.release_account_lock(
+                fleet_dir,
+                account_key=str(fresh_lock.get("account_key") or preview.billing_account),
+                fencing_token=str(fresh_lock.get("fencing_token") or ""),
+                reason=f"expired_after_wake:{terminal_state}",
+            )
+            existing_lock = None
         recovery_allowed = launch_recovery_allowed(
             fleet_dir,
             dispatch_id=preview.dispatch_id,
@@ -787,7 +869,11 @@ def register_dispatch_meta(
     fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
     node_entry = (fleet_doc.get("nodes") or {}).get(preview.node_id) or {}
     state_dir = str(node_entry.get("state_dir") or "~/.goal-flight")
-    remote_status_path = remote_status_path_for_dispatch(state_dir, preview.dispatch_id)
+    remote_status_path = remote_status_path_for_dispatch(
+        state_dir,
+        preview.dispatch_id,
+        attempt_id=queue_launch_token,
+    )
     if launch_receipt and launch_receipt.get("remote_status_path"):
         remote_status_path = str(launch_receipt["remote_status_path"])
 
@@ -884,6 +970,8 @@ def record_dispatch_ledger(
     state: str = "running",
     queue_launch_token: str | None = None,
     preflight: dict[str, Any] | None = None,
+    controller_status_path: str | None = None,
+    dispatch_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import goalflight_ledger as ledger
 
@@ -893,7 +981,12 @@ def record_dispatch_ledger(
         "prompt_path": preview.prompt if preview.prompt.endswith(".md") else None,
         "agent": preview.agent,
         "transport": "fleet-ssh",
-        "project_root": str(Path.cwd()),
+        "project_root": str(
+            dispatch_record.get("project_root")
+            if isinstance(dispatch_record, dict)
+            and dispatch_record.get("project_root")
+            else Path.cwd()
+        ),
         "state": state,
         "remote_lease_id": chain.remote_lease_id,
         "lease_id": chain.remote_lease_id,
@@ -906,11 +999,65 @@ def record_dispatch_ledger(
         "hostname": __import__("socket").gethostname(),
         "remote_preflight": preflight,
     }
+    # Fleet dispatch runs in the controller process that launches this record.
+    record.update(
+        ledger.controller_attribution_from_active_lease(
+            record["project_root"],
+            dispatch_id=preview.dispatch_id,
+            dispatch_record=dispatch_record,
+            ambient_is_dispatcher=dispatch_record is None,
+        )
+    )
     if queue_launch_token:
         record["queue_launch_token"] = queue_launch_token
+    if controller_status_path:
+        record["status_path"] = controller_status_path
+    controller_status_complete = False
+    if controller_status_path:
+        try:
+            status_payload = json.loads(
+                Path(controller_status_path).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            status_payload = None
+        controller_status_complete = isinstance(status_payload, dict) and "complete" in {
+            status_payload.get("state"), status_payload.get("terminal_state")
+        }
+    preserved_record: dict[str, Any] | None = None
     with ledger.StateLock():
-        path = ledger.write_record(record)
-    return {"ok": True, "path": str(path), "record": record}
+        path = ledger.record_path(preview.dispatch_id, create=False)
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict) and (
+                controller_status_complete
+                or "complete" in {existing.get("state"), existing.get("terminal_state")}
+            ):
+                if controller_status_path:
+                    existing.setdefault("status_path", controller_status_path)
+                preserved_record = existing
+                path = ledger.write_record(existing)
+        if preserved_record is None:
+            path = ledger.write_record(record)
+            preserved_record = record
+    if controller_status_complete and queue_launch_token:
+        import goalflight_fleet_watch as fleet_watch
+
+        superseded = fleet_watch._record_superseded_duplicate_attempt(
+            preview.dispatch_id, {"queue_launch_token": queue_launch_token}
+        )
+        if superseded is not None and superseded[1]:
+            from goalflight_liveness import append_terminal_complete_note
+
+            append_terminal_complete_note(
+                Path(superseded[1]), "superseded_duplicate_attempt", superseded[0]
+            )
+    result = {"ok": True, "path": str(path), "record": preserved_record}
+    if preserved_record is not record:
+        result["preserved_terminal"] = True
+    return result
 
 
 def default_ssh_runner(argv: list[str], timeout_s: float | None = None) -> tuple[int, str, str]:
@@ -1018,6 +1165,8 @@ def execute_dispatch(
     tool_smoke_policy: str | None = "auto",
     tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
     queue_launch_token: str | None = None,
+    controller_status_path: str | None = None,
+    dispatch_record: dict[str, Any] | None = None,
     preflight_timeout_s: float = fleet_preflight.DEFAULT_TIMEOUT_S,
     override_preflight: bool = False,
 ) -> dict[str, Any]:
@@ -1072,6 +1221,8 @@ def execute_dispatch(
         state="launch_unconfirmed" if chain.launch_unconfirmed else "running",
         queue_launch_token=queue_launch_token,
         preflight=preflight_result,
+        controller_status_path=controller_status_path,
+        dispatch_record=dispatch_record,
     )
     if stub_terminal:
         import goalflight_ledger as ledger

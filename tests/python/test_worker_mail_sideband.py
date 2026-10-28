@@ -21,13 +21,14 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+from support import sandbox_exec_unavailable_reason
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
 
 import goalflight_codex_sandbox as codex_sandbox  # noqa: E402
-import goalflight_messages as gm  # noqa: E402
 import goalflight_os_sandbox as sandbox  # noqa: E402
 
 
@@ -40,20 +41,40 @@ def _writable(roots: list[str], probe: str) -> bool:
     return any(probe == r or probe.startswith(r.rstrip("/") + "/") for r in roots)
 
 
-def case_messages_tree_is_writable_from_inside_the_sandbox() -> None:
+def case_messages_tree_is_writable_from_inside_the_sandbox() -> bool | None:
     if sandbox.os_sandbox_platform_key() != "darwin":
-        print("SKIP: macOS sandbox profiles only")
-        return
+        print(
+            "SKIP: case_messages_tree_is_writable_from_inside_the_sandbox: "
+            "macOS sandbox profiles only"
+        )
+        return False
+    checkout = (Path.home() / "gf-worker-mail-synthetic-project").resolve()
+    agent_state_root = (Path.home() / ".goal-flight").resolve()
+    try:
+        checkout.relative_to(agent_state_root)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            f"synthetic sandbox workspace is inside agent state root: {checkout}"
+        )
     roots = sandbox.macos_write_roots(
-        str(ROOT), sandbox.OS_SANDBOX_WORKSPACE_WRITE, agent="grok-code", command="grok"
+        str(checkout),
+        sandbox.OS_SANDBOX_WORKSPACE_WRITE,
+        agent="grok-code",
+        command="grok",
     )
+    # The suite redirects GOALFLIGHT_MESSAGES_DIR to an isolated temp path;
+    # this assertion checks the default worker-channel grant itself.
+    messages_dir = Path.home() / ".goal-flight" / "messages"
     assert_true(
         "a worker can write the messages tree",
-        _writable(roots, str(gm.default_messages_dir())),
+        _writable(roots, str(messages_dir)),
     )
+    print("PASS: case_messages_tree_is_writable_from_inside_the_sandbox")
 
 
-def case_worker_still_cannot_author_fleet_state() -> None:
+def case_worker_still_cannot_author_fleet_state() -> bool | None:
     """The grant is a channel, not an opening.
 
     The fleet directory holds the registry and the derived aggregate: state a
@@ -62,15 +83,13 @@ def case_worker_still_cannot_author_fleet_state() -> None:
     the very records the controller uses to judge it.
     """
     if sandbox.os_sandbox_platform_key() != "darwin":
-        print("SKIP: macOS sandbox profiles only")
-        return
+        print("SKIP: case_worker_still_cannot_author_fleet_state: macOS sandbox profiles only")
+        return False
     roots = sandbox.macos_write_roots(
         str(ROOT), sandbox.OS_SANDBOX_WORKSPACE_WRITE, agent="grok-code", command="grok"
     )
     # The isolated suite redirects GOALFLIGHT_FLEET_DIR below the system temp
-    # root, which is intentionally granted to a seatbelt worker. This assertion
-    # is about the production default fleet registry, not the test's writable
-    # isolation directory.
+    # root, which is outside every sandbox worker's dispatch-scoped write roots.
     default_fleet_dir = Path.home() / ".goal-flight" / "fleet"
     assert_true(
         "fleet state stays denied",
@@ -80,6 +99,175 @@ def case_worker_still_cannot_author_fleet_state() -> None:
         "the rest of HOME stays denied",
         not _writable(roots, str(Path.home() / "Documents")),
     )
+
+
+def case_grok_state_cache_is_atomic_without_granting_fleet() -> bool | None:
+    if sandbox.os_sandbox_platform_key() != "darwin":
+        print("SKIP: case_grok_state_cache_is_atomic_without_granting_fleet: macOS sandbox profiles only")
+        return False
+    reason = sandbox_exec_unavailable_reason()
+    if reason is not None:
+        print(f"SKIP: case_grok_state_cache_is_atomic_without_granting_fleet: {reason}")
+        return False
+    # Keep the simulated operator home outside the sandbox's shared temp grant.
+    with tempfile.TemporaryDirectory(prefix="gf-seat-state-", dir=Path.home()) as td:
+        operator = Path(td)
+        for routed in (False, True):
+            home = (
+                operator / ".goal-flight" / "accounts" / "probe" / "grok"
+                if routed
+                else operator
+            )
+            home.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="gf-seat-scratch-") as scratch_parent:
+                scratch = Path(scratch_parent) / "dispatch.scratch"
+                scratch.mkdir()
+                private_tmp = tempfile.mkdtemp(
+                    prefix="goalflight-grok-read-only-", dir=scratch
+                )
+                env = dict(
+                    os.environ,
+                    HOME=str(home),
+                    GOALFLIGHT_SCRATCH_DIR=str(scratch),
+                    TMPDIR=private_tmp,
+                )
+                env.pop("GOALFLIGHT_GROK_SEAT_STATE_FILE", None)
+                for name in (
+                    "XDG_CONFIG_HOME",
+                    "XDG_STATE_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_CACHE_HOME",
+                ):
+                    env.pop(name, None)
+                profile = (
+                    sandbox.OS_SANDBOX_READ_ONLY
+                    if routed
+                    else sandbox.OS_SANDBOX_WORKSPACE_WRITE
+                )
+                with patch.object(Path, "home", return_value=operator):
+                    policy, _ = sandbox.macos_sandbox_profile(
+                        str(ROOT),
+                        profile,
+                        agent="grok-code",
+                        command="grok",
+                        environment=env,
+                    )
+                # Exercise the real writer twice: mkdir, temp write, chmod and
+                # atomic replacement. No account discovery or network probes.
+                child = '''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import grok_seats
+grok_seats.grok_usage.accounts = lambda: []
+for now in (1, 2):
+    document = grok_seats.refresh_states(now=now, recover=None)
+    assert json.loads(grok_seats.STATE_PATH.read_text()) == document
+    assert grok_seats.STATE_PATH.stat().st_mode & 0o777 == 0o600
+    assert not grok_seats.STATE_PATH.with_suffix('.json.tmp').exists()
+for target in (Path.home()/'.goal-flight'/'fleet', Path.home()/'.goal-flight'/'unrelated'):
+    try:
+        target.mkdir()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('unauthorized sibling directory created: ' + str(target))
+'''
+                proc = subprocess.run(
+                    [
+                        "/usr/bin/sandbox-exec",
+                        "-p",
+                        policy,
+                        sys.executable,
+                        "-c",
+                        child,
+                        str(ROOT / "scripts"),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                assert_true(
+                    f"Grok cache works and fleet stays denied (routed={routed}): {proc.stderr}",
+                    proc.returncode == 0,
+                )
+                for protected_home in {home, operator}:
+                    fleet = protected_home / ".goal-flight" / "fleet"
+                    fleet.mkdir(exist_ok=True)
+                    registry = fleet / "registry.json"
+                    registry.write_text("controller-owned\n")
+                    proc = subprocess.run(
+                        [
+                            "/usr/bin/sandbox-exec",
+                            "-p",
+                            policy,
+                            sys.executable,
+                            "-c",
+                            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('tampered')",
+                            str(registry),
+                        ],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    assert_true(
+                        "existing fleet registry writes denied",
+                        proc.returncode != 0 and "PermissionError" in proc.stderr,
+                    )
+                    assert_true(
+                        "controller registry unchanged",
+                        registry.read_text() == "controller-owned\n",
+                    )
+                    for name in (
+                        "grok-seat-states.json",
+                        "grok-seat-states.json.tmp",
+                    ):
+                        leaf = home / ".goal-flight" / name
+                        leaf.unlink(missing_ok=True)
+                        leaf.symlink_to(registry)
+                        try:
+                            with patch.object(Path, "home", return_value=operator):
+                                try:
+                                    symlink_policy, _ = sandbox.macos_sandbox_profile(
+                                        str(ROOT),
+                                        profile,
+                                        agent="grok-code",
+                                        command="grok",
+                                        environment=env,
+                                    )
+                                except sandbox.OsSandboxError as exc:
+                                    assert_true(
+                                        "outside-account symlink fails closed",
+                                        routed
+                                        and "outside selected account" in str(exc),
+                                    )
+                                    continue
+                            for target in (registry, leaf):
+                                proc = subprocess.run(
+                                    [
+                                        "/usr/bin/sandbox-exec",
+                                        "-p",
+                                        symlink_policy,
+                                        sys.executable,
+                                        "-c",
+                                        "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('tampered')",
+                                        str(target),
+                                    ],
+                                    env=env,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                assert_true(
+                                    "state symlink cannot grant fleet target",
+                                    proc.returncode != 0
+                                    and "PermissionError" in proc.stderr,
+                                )
+                                assert_true(
+                                    "symlink target unchanged",
+                                    registry.read_text() == "controller-owned\n",
+                                )
+                        finally:
+                            leaf.unlink()
 
 
 def case_worker_can_write_the_task_store_it_is_told_to_capture_into() -> None:
@@ -242,14 +430,24 @@ def case_a_worker_posting_mail_reaches_the_controller_summary() -> None:
 
 
 def main() -> None:
-    case_messages_tree_is_writable_from_inside_the_sandbox()
-    case_worker_still_cannot_author_fleet_state()
-    case_worker_can_write_the_task_store_it_is_told_to_capture_into()
-    case_the_grant_stops_at_the_task_stores_parent()
-    case_grant_follows_the_store_override_not_just_xdg()
-    case_dispatch_tells_the_worker_its_own_id()
-    case_a_worker_posting_mail_reaches_the_controller_summary()
-    print("OK: worker mail sideband tests pass")
+    cases = (
+        case_messages_tree_is_writable_from_inside_the_sandbox,
+        case_worker_still_cannot_author_fleet_state,
+        case_grok_state_cache_is_atomic_without_granting_fleet,
+        case_worker_can_write_the_task_store_it_is_told_to_capture_into,
+        case_the_grant_stops_at_the_task_stores_parent,
+        case_grant_follows_the_store_override_not_just_xdg,
+        case_dispatch_tells_the_worker_its_own_id,
+        case_a_worker_posting_mail_reaches_the_controller_summary,
+    )
+    skipped = sum(case() is False for case in cases)
+    executed = len(cases) - skipped
+    if executed == 0:
+        raise AssertionError("no worker mail sideband cases executed")
+    print(
+        f"OK: worker mail sideband tests pass "
+        f"({executed} cases run, {skipped} skipped)"
+    )
 
 
 if __name__ == "__main__":

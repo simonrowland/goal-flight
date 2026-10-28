@@ -11,6 +11,13 @@ import sys
 
 
 WORKSPACE_WRITE = "workspace-write"
+
+
+def codex_plugins_off_args() -> list[str]:
+    """Disable per-invocation plugin downloads for Codex subprocesses."""
+    return ["-c", "features.plugins=false"]
+
+
 try:
     import pwd
 except ImportError:  # Windows has no passwd database; USERPROFILE is its home.
@@ -136,7 +143,7 @@ def worker_task_store_root() -> Path:
     return base / "task-stores"
 
 
-def worker_channel_roots() -> list[str]:
+def worker_channel_roots(environment: Mapping[str, str] | None = None) -> list[str]:
     """Paths a sandboxed worker needs beyond its workspace.
 
     Three things the worker contract REQUIRES were impossible without these,
@@ -165,15 +172,22 @@ def worker_channel_roots() -> list[str]:
     deliberately absent, as are the cross-project index and setup backups
     that sit beside the task stores.
     """
-    home = Path.home()
+    env = os.environ if environment is None else environment
+    home = Path(env.get("HOME") or Path.home())
     roots = [
         home / ".goal-flight" / "messages",
         home / ".goal-flight" / "dispatch-homes",
         worker_task_store_root(),
     ]
-    configured_home = os.environ.get("CODEX_HOME")
+    configured_home = env.get("CODEX_HOME")
     if configured_home:
         roots.append(Path(configured_home))
+    spool = str(env.get("GOALFLIGHT_REMOTE_CI_SPOOL_DIR") or "").strip()
+    if spool:
+        roots.append(Path(spool).expanduser() / "requests")
+    question_outbox = str(env.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or "").strip()
+    if question_outbox:
+        roots.append(Path(question_outbox).expanduser())
     # Emit the expanded AND the resolved form of each root. On macOS the temp
     # and state paths are symlinked -- $TMPDIR reports /var/folders/... while
     # the real inode is /private/var/folders/... -- so a grant written one way
@@ -199,8 +213,32 @@ def worker_channel_roots() -> list[str]:
     return out
 
 
-def codex_workspace_write_args(cwd: str | Path | None, profile: str | None) -> list[str]:
+def codex_workspace_write_args(
+    cwd: str | Path | None,
+    profile: str | None,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> list[str]:
     """Build Codex config argv for a linked-worktree workspace-write sandbox."""
+    env = os.environ if environment is None else environment
+    spool = str(env.get("GOALFLIGHT_REMOTE_CI_SPOOL_DIR") or "").strip()
+    question_outbox = str(env.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or "").strip()
+    if profile == "read-only" and (spool or question_outbox):
+        # Codex --add-dir is an explicit extra writable workspace root and
+        # composes with its read-only primary workspace.
+        roots = []
+        if spool:
+            roots.append(Path(spool).expanduser() / "requests")
+        if question_outbox:
+            roots.append(Path(question_outbox).expanduser())
+        expanded_roots = list(roots)
+        for root in roots:
+            try:
+                expanded_roots.append(root.resolve())
+            except OSError:
+                pass
+        roots = list(dict.fromkeys(expanded_roots))
+        return [arg for root in dict.fromkeys(roots) for arg in ("--add-dir", str(root))]
     if profile != WORKSPACE_WRITE:
         return []
     # The cwd guard governs WORKTREE roots only. Channel roots do not depend on
@@ -209,7 +247,7 @@ def codex_workspace_write_args(cwd: str | Path | None, profile: str | None) -> l
     # mail AND to start its own review, both reported as bare "Operation not
     # permitted", with no hint that the cause was an argument nobody passed.
     roots = list(linked_worktree_writable_roots(cwd)) if cwd else []
-    roots += worker_channel_roots()
+    roots += worker_channel_roots(env)
     cache_root = shared_worker_uv_cache_write_root()
     if cache_root is not None:
         roots.append(str(cache_root))

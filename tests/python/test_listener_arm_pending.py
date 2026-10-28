@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,6 +80,52 @@ def fail_arm_after_claim(self, *args, **kwargs):
 journal.Journal.arm_listener = fail_arm_after_claim
 import goalflight_messages
 raise SystemExit(goalflight_messages.main(sys.argv[1:]))
+"""
+
+
+_GATE_PENDING_REPORT_CLAIM = r"""
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
+import goalflight_wake
+
+original_acquire = goalflight_wake.acquire_pending_report
+ready = Path(os.environ["GOALFLIGHT_TEST_PENDING_REPORT_READY"])
+release = Path(os.environ["GOALFLIGHT_TEST_PENDING_REPORT_RELEASE"])
+
+def gated_acquire(*args, **kwargs):
+    temporary = ready.with_suffix(".tmp")
+    temporary.write_text("ready\n", encoding="utf-8")
+    temporary.replace(ready)
+    deadline = time.monotonic() + 45
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not release.exists():
+        raise RuntimeError("test did not release concurrent pending-report claims")
+    return original_acquire(*args, **kwargs)
+
+goalflight_wake.acquire_pending_report = gated_acquire
+import goalflight_messages
+result = goalflight_messages.main(sys.argv[1:])
+finished_value = os.environ.get("GOALFLIGHT_TEST_LISTENER_FINISHED")
+finish_release_value = os.environ.get("GOALFLIGHT_TEST_LISTENER_FINISH_RELEASE")
+if finished_value and finish_release_value:
+    # Keep a ringed claimant alive during the test's observation window; its
+    # normal exit would allow the documented at-least-once takeover duplicate.
+    finished = Path(finished_value)
+    release_after_listen = Path(finish_release_value)
+    temporary = finished.with_suffix(".tmp")
+    temporary.write_text("finished\n", encoding="utf-8")
+    temporary.replace(finished)
+    deadline = time.monotonic() + 15
+    while not release_after_listen.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not release_after_listen.exists():
+        raise RuntimeError("test did not release the finished listener process")
+raise SystemExit(result)
 """
 
 
@@ -249,6 +297,108 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+def test_ring_pass_skips_reported_backlog_before_peek_limit(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-reported-limit-test"}
+    ).value
+    assert lease is not None
+    messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+    addressee = messages.controller_addressee("armtest", project_root=project)
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        for index in range(1000):
+            messages.post_message(
+                dispatch_id=f"old-backlog-{index:04d}",
+                msg_type="controller-notice",
+                payload={"text": f"old event {index}"},
+                messages_dir=messages_dir,
+                source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+                addressee=addressee,
+                event_ts="2020-01-01T00:00:00Z",
+            )
+        listener_env = {
+            **env,
+            "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+            "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        }
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "30",
+            ],
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            arm_report = json.loads(proc.stdout.readline())
+            assert arm_report["kind"] == "pending-at-arm"
+            assert len(arm_report["items"]) == 1000
+            assert proc.poll() is None, "live reporter exited before the later event"
+            report_state = wait_until(
+                lambda: (
+                    state
+                    if (state := wake.pending_report_state(
+                        project,
+                        controller_label="armtest",
+                        lease_nonce=lease.nonce,
+                    ))
+                    and state.phase == "reported"
+                    else None
+                ),
+                timeout_s=5,
+                message="live listener report to reach the reported phase",
+            )
+            assert report_state.phase == "reported"
+            assert len(report_state.positions) == 1000
+            assert proc.poll() is None, "reported owner exited before the later event"
+
+            messages.post_message(
+                dispatch_id="zzzz-new-event",
+                msg_type="controller-notice",
+                payload={"text": "new event after reported backlog"},
+                messages_dir=messages_dir,
+                source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+                addressee=addressee,
+            )
+            wait_until(
+                lambda: proc.poll() is not None,
+                timeout_s=35,
+                message="listener to finish after the event beyond reported backlog",
+            )
+            remaining_stdout, stderr = proc.communicate()
+            payloads = [
+                json.loads(line)
+                for line in remaining_stdout.splitlines()
+                if line.strip()
+            ]
+            assert proc.returncode == 0, (stderr, payloads)
+            assert payloads[0]["kind"] == "ring", payloads
+            assert "zzzz-new-event=1" in payloads[0]["advance_command"]
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=5)
 
 
 def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
@@ -575,83 +725,6 @@ def test_unread_reported_flush_is_re_reported_after_reporter_dies(
     assert [int(item["stream_seq"]) for item in payloads[0]["items"]] == [1]
     assert payloads[-1]["reason"] == "timeout"
 
-
-@pytest.mark.parametrize(
-    ("phase", "zombie_probe", "expect_ring"),
-    [
-        ("reported", None, True),
-        ("claimed", False, True),
-        ("reported", False, False),
-    ],
-    ids=[
-        "unknown-reported-owner",
-        "known-live-claimed-owner",
-        "known-live-reported-owner",
-    ],
-)
-def test_pending_report_suppression_distinguishes_reported_mail(
-    isolated: tuple[Path, dict[str, str]],
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    phase: str,
-    zombie_probe: bool | None,
-    expect_ring: bool,
-) -> None:
-    """Only a known-live reported owner may suppress a duplicate report."""
-    project, env = isolated
-    authority = journal.open_or_create_journal(project)
-    lease = authority.claim_or_renew_lease(
-        "armtest", principal={"principal_id": "arm-unknown-zombie-test"}
-    ).value
-    assert lease is not None
-    dispatch_id = "unknown-zombie-report"
-    _post(env, project, "reported before unknown probe", dispatch_id=dispatch_id)
-    identity = messages.goalflight_compat.process_start_identity(os.getpid())
-    assert identity is not None
-    pending = SimpleNamespace(
-        phase=phase,
-        positions={dispatch_id: 1},
-        owner_pid=os.getpid(),
-        owner_start_token=str(identity["start_token"]),
-    )
-    monkeypatch.setattr(
-        wake,
-        "recover_pending_report_state",
-        lambda *_args, **_kwargs: pending,
-    )
-    monkeypatch.setattr(
-        messages.goalflight_compat,
-        "pid_is_zombie",
-        lambda _pid: zombie_probe,
-    )
-    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
-    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
-    args = SimpleNamespace(
-        project_root=str(project),
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-        poll_secs=0.01,
-        listener_slots=2,
-        timeout_s=1.0,
-        json=True,
-        report_pending=False,
-        watch_follow=False,
-    )
-
-    with wake.register_lease_holder(
-        project, controller_label=lease.label, lease_nonce=lease.nonce
-    ):
-        result = messages.cmd_listen(args)
-
-    payloads = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    if expect_ring:
-        assert result == 0
-        assert payloads[-1]["kind"] == "ring", payloads
-        assert f"{dispatch_id}=1" in payloads[-1]["advance_command"]
-    else:
-        assert result == 1
-        assert payloads[-1]["kind"] == "exit", payloads
-        assert payloads[-1]["reason"] == "timeout", payloads
 
 
 def test_missing_carrier_is_rechecked_until_restored(
@@ -1643,8 +1716,554 @@ def test_rearm_does_not_raise_unreportable_carrier_water(
     assert str(carrier) in stderr
 
 
-def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
+def test_stuck_carrier_does_not_block_later_same_or_other_streams(
     isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-stuck-stream-progress"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    stream_id = "stuck-stream-with-followup"
+    carrier = messages.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), stream_id)
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "will be malformed", dispatch_id=stream_id)
+        _post(env, project, "same-stream followup", dispatch_id=stream_id)
+        _post(env, project, "other-stream followup", dispatch_id="healthy-stream")
+        same_stream_later = next(
+            row
+            for row in authority.pending_delivery_events("armtest")
+            if row["stream_id"] == stream_id and int(row["stream_seq"]) == 2
+        )
+        lines = carrier.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        carrier.write_text("{invalid json\n" + lines[1] + "\n", encoding="utf-8")
+
+        listener = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--timeout-s",
+                "1",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    payloads = [json.loads(line) for line in listener.stdout.splitlines() if line]
+    report = next(payload for payload in payloads if payload.get("kind") == "pending-at-arm")
+    assert {item["stream_id"] for item in report["items"]} == {"healthy-stream"}
+    assert report["pending_behind_stuck"] == [
+        {
+            "id": same_stream_later["event_uuid"],
+            "stream_id": "stuck-stream-with-followup",
+            "stream_seq": 2,
+            "type": "controller-notice",
+        }
+    ]
+    assert "stuck-stream-with-followup=" not in report["advance_command"]
+    assert "healthy-stream=1" in report["advance_command"]
+    fault_events = [
+        payload
+        for payload in payloads
+        if payload.get("kind") == "event"
+        and isinstance(payload.get("payload"), dict)
+        and payload["payload"].get("type") == "listener-fault"
+    ]
+    assert any(
+        event["payload"].get("dispatch_id") == stream_id
+        and event["payload"].get("stream_id") == stream_id
+        and event["payload"].get("stream_seq") == 1
+        and event["payload"].get("reason") == "carrier-corrupt"
+        for event in fault_events
+    ), payloads
+    assert listener.returncode == 1, (listener.stdout, listener.stderr)
+    assert "STUCK:" in listener.stderr
+
+    # Restore the missing first carrier row. The next listener snapshot sees
+    # the repaired first event and the already-visible same-stream followup;
+    # only then may its position advance through seq 2.
+    carrier.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    repaired = authority.cursor_peek("armtest", nonce=lease.nonce, limit=1000)
+    materialized = messages._envelopes_with_rows(
+        authority, list(repaired.items), controller_label="armtest"
+    )
+    repaired_stream = [
+        envelope
+        for row, envelope in materialized
+        if row["stream_id"] == "stuck-stream-with-followup"
+    ]
+    assert [int(envelope["seq"]) for envelope in repaired_stream] == [1, 2]
+    repaired_positions = messages._cursor_positions_for_shown_rows(
+        list(repaired.items), materialized
+    )
+    assert repaired_positions == {
+        "stuck-stream-with-followup": 2,
+        "healthy-stream": 1,
+    }
+    advanced = authority.advance_cursor(
+        "armtest",
+        nonce=lease.nonce,
+        expected_cursor_version=repaired.cursor_version,
+        expected_stream_snapshots=repaired.stream_snapshots,
+        advances=repaired_positions,
+        actor="armtest",
+    )
+    assert advanced.committed
+    assert not authority.cursor_peek("armtest", nonce=lease.nonce).items
+
+
+def test_listener_ring_hides_terminal_until_stuck_head_is_repaired(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-stuck-ring"}
+    ).value
+    assert lease is not None
+    stream_id = "stuck-ring-terminal"
+    addressee = messages.controller_addressee("armtest", project_root=project)
+    source = {"node": "peer", "adapter": "pytest", "transport": "controller"}
+    first = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="controller-notice",
+        payload={"text": "unreadable ring head"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    result = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="result",
+        payload={"complete": True, "text": "ring terminal"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    carrier = Path(first["path"])
+    original_lines = carrier.read_text(encoding="utf-8").splitlines()
+    assert len(original_lines) == 2
+    carrier.write_text("{invalid head\n" + original_lines[1] + "\n", encoding="utf-8")
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "armtest",
+        "--lease-nonce",
+        lease.nonce,
+        "--no-report-pending",
+        "--poll-secs",
+        "0.02",
+        "--timeout-s",
+        "2",
+    ]
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        stuck = subprocess.run(
+            command,
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert stuck.returncode == 1, (stuck.stdout, stuck.stderr)
+        assert "[result]" not in stuck.stdout
+        pending_records = [
+            json.loads(line)
+            for line in stuck.stdout.splitlines()
+            if line.startswith("{")
+        ]
+        assert any(
+            record.get("payload", {}).get("type") == "listener-fault"
+            and record["payload"].get("stream_id") == stream_id
+            and record["payload"].get("stream_seq") == 1
+            for record in pending_records
+        ), stuck.stdout
+        assert any(
+            record.get("payload", {}).get("reason") == "pending_behind_stuck"
+            and record["payload"].get("pending_behind_stuck", {}).get("id")
+            == result["envelope"]["id"]
+            for record in pending_records
+        ), stuck.stdout
+
+        carrier.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+        repaired = subprocess.run(
+            [*command[:-1], "2"],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    assert repaired.returncode == 0, (repaired.stdout, repaired.stderr)
+    result_lines = [
+        line for line in repaired.stdout.splitlines()
+        if line.startswith("[result] ") and f"{stream_id} seq=2" in line
+    ]
+    assert len(result_lines) == 1, repaired.stdout
+
+
+def test_listener_hides_terminal_behind_unprojected_head_until_projection(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-unprojected-ring"}
+    ).value
+    assert lease is not None
+    stream_id = "unprojected-ring-terminal"
+    addressee = messages.controller_addressee("armtest", project_root=project)
+    source = {"node": "peer", "adapter": "pytest", "transport": "controller"}
+    first = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="controller-notice",
+        payload={"text": "unprojected ring head"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    second = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="result",
+        payload={"complete": True, "text": "ring terminal"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    projected_at = authority.read_all(
+        "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+        (first["envelope"]["id"],),
+    )[0]["projected_at"]
+    connection = authority._connect()
+    try:
+        connection.execute(
+            "UPDATE delivery_events SET projected_at = NULL WHERE event_uuid = ?",
+            (first["envelope"]["id"],),
+        )
+    finally:
+        connection.close()
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "armtest",
+        "--lease-nonce",
+        lease.nonce,
+        "--report-pending",
+        "--poll-secs",
+        "0.02",
+        "--timeout-s",
+        "4",
+    ]
+    stdout_path = project.parent / "unprojected-listener.stdout"
+    stderr_path = project.parent / "unprojected-listener.stderr"
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr:
+            proc = subprocess.Popen(
+                command,
+                env=listener_env,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+            )
+            try:
+                wait_until(
+                    lambda: (
+                        output
+                        if (output := stdout_path.read_text(encoding="utf-8"))
+                        and "pending_behind_stuck" in output
+                        else None
+                    ),
+                    timeout_s=3,
+                    message="listener did not report the unprojected barrier",
+                )
+                interim = [
+                    json.loads(line)
+                    for line in stdout_path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("{")
+                ]
+                assert not any(
+                    isinstance(record.get("payload"), dict)
+                    and record["payload"].get("dispatch_id") == stream_id
+                    and record["payload"].get("stream_seq") == 2
+                    and record["payload"].get("type") == "result"
+                    for record in interim
+                ), interim
+                assert any(
+                    isinstance(record.get("payload"), dict)
+                    and record["payload"].get("type") == "pending-projection"
+                    and record["payload"].get("pending_projection") == {
+                        "stream_id": stream_id,
+                        "stream_seq": 1,
+                    }
+                    for record in interim
+                ), interim
+                assert not any(
+                    isinstance(record.get("payload"), dict)
+                    and record["payload"].get("type") == "listener-fault"
+                    and record["payload"].get("stream_id") == stream_id
+                    and record["payload"].get("stream_seq") == 1
+                    for record in interim
+                ), interim
+                assert proc.poll() is None, "listener exited while an unprojected row was pending"
+
+                connection = authority._connect()
+                try:
+                    connection.execute(
+                        "UPDATE delivery_events SET projected_at = ? WHERE event_uuid = ?",
+                        (projected_at, first["envelope"]["id"]),
+                    )
+                finally:
+                    connection.close()
+                wait_until(
+                    lambda: (
+                        output
+                        if (output := stdout_path.read_text(encoding="utf-8"))
+                        and f"[controller-notice] {stream_id} seq=1" in output
+                        and f"[result] {stream_id} seq=2" in output
+                        else None
+                    ),
+                    timeout_s=3,
+                    message="listener did not deliver both rows after projection",
+                )
+                output = stdout_path.read_text(encoding="utf-8")
+                assert output.count(f"[controller-notice] {stream_id} seq=1") == 1
+                assert output.count(f"[result] {stream_id} seq=2") == 1
+                assert proc.wait(timeout=3) == 0, output
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+
+
+def test_listener_reports_stuck_once_and_waits_for_repair(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-stuck-wait-repair"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    stream_id = "stuck-wait-stream"
+    carrier = messages.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), stream_id)
+    stdout_path = project.parent / "stuck-listener.stdout"
+    stderr_path = project.parent / "stuck-listener.stderr"
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "stuck head", dispatch_id=stream_id)
+        _post(env, project, "readable successor", dispatch_id=stream_id)
+        original_lines = carrier.read_text(encoding="utf-8").splitlines()
+        assert len(original_lines) == 2
+        carrier.write_text("{invalid stuck head\n" + original_lines[1] + "\n", encoding="utf-8")
+        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr:
+            listener = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    "listen",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    "armtest",
+                    "--report-pending",
+                    "--json",
+                    "--poll-secs",
+                    "0.02",
+                    "--timeout-s",
+                    "3",
+                ],
+                env=listener_env,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+            )
+            wait_until(
+                lambda: (
+                    output
+                    if (output := stdout_path.read_text(encoding="utf-8"))
+                    and "listener-fault" in output
+                    else None
+                ),
+                timeout_s=5,
+                message="listener did not report the stuck head",
+            )
+            time.sleep(0.16)
+            assert listener.poll() is None, "stuck successor caused the listener to exit"
+            interim = [
+                json.loads(line)
+                for line in stdout_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            interim_faults = [
+                item for item in interim
+                if item.get("kind") == "event"
+                and isinstance(item.get("payload"), dict)
+                and item["payload"].get("type") == "listener-fault"
+            ]
+            interim_stuck = [
+                item
+                for item in interim_faults
+                if item["payload"].get("reason") != "pending_behind_stuck"
+            ]
+            interim_pending = [
+                item
+                for item in interim_faults
+                if item["payload"].get("reason") == "pending_behind_stuck"
+            ]
+            assert len(interim_stuck) == 1, interim
+            assert len(interim_pending) == 1, interim
+
+            carrier.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+            listener.wait(timeout=5)
+
+    payloads = [
+        json.loads(line)
+        for line in stdout_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    faults = [
+        item for item in payloads
+        if item.get("kind") == "event"
+        and isinstance(item.get("payload"), dict)
+        and item["payload"].get("type") == "listener-fault"
+    ]
+    rings = [item for item in payloads if item.get("kind") == "ring"]
+    stuck = [
+        item
+        for item in faults
+        if item["payload"].get("reason") != "pending_behind_stuck"
+    ]
+    pending = [
+        item
+        for item in faults
+        if item["payload"].get("reason") == "pending_behind_stuck"
+    ]
+    assert listener.returncode == 0, (payloads, stderr_path.read_text(encoding="utf-8"))
+    assert len(stuck) == 1, payloads
+    assert len(pending) == 1, payloads
+    assert len(rings) == 1, payloads
+    assert f"{stream_id}=2" in rings[0]["advance_command"]
+
+
+def test_recovered_materialization_clears_stale_stuck_flag_before_safe_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "carrier_path": "/carrier",
+        "event_uuid": "recovered-event",
+        "event_type": "result",
+        "stream_id": "single-stuck-repair",
+        "stream_seq": 1,
+    }
+    attempts = 0
+    envelope = {
+        "id": "recovered-event",
+        "dispatch_id": "single-stuck-repair",
+        "seq": 1,
+        "type": "result",
+    }
+
+    def recover_after_first_attempt(source, item, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise messages.MessageError("STUCK: injected unreadable carrier")
+        return envelope
+
+    monkeypatch.setattr(messages, "_listener_envelope", recover_after_first_attempt)
+    first_errors: list[dict[str, object]] = []
+    assert messages._envelopes_with_rows(
+        object(), [row], carrier_errors=first_errors
+    ) == []
+    assert row["listener_status"] == "STUCK"
+
+    recovered = messages._envelopes_with_rows(object(), [row])
+    assert recovered == [(row, envelope)]
+    assert messages._cursor_positions_for_shown_rows([row], recovered) == {
+        "single-stuck-repair": 1
+    }
+
+
+def test_unprojected_row_has_internal_pending_code_and_remains_unshown() -> None:
+    row = {
+        "carrier_path": "journal:project",
+        "event_uuid": "pending-projection-event",
+        "event_type": "result",
+        "stream_id": "pending-projection-stream",
+        "stream_seq": 1,
+        "projected_at": None,
+    }
+    errors: list[dict[str, object]] = []
+
+    assert messages._deliverable_rows(object(), [row], carrier_errors=errors) == []
+    assert errors == [
+        {
+            "code": "projection_pending",
+            "carrier_path": "journal:project",
+            "error": "STUCK: delivery row is not projected",
+            "reason": "STUCK: delivery row is not projected",
+            "status": "STUCK",
+            "delivery_id": "pending-projection-event",
+            "dispatch_id": "pending-projection-stream",
+            "stream_id": "pending-projection-stream",
+            "stream_seq": 1,
+            "type": "result",
+        }
+    ]
+
+
+def test_dead_claim_takeover_delivers_at_least_once_and_preserves_listener_pool(
+    isolated: tuple[Path, dict[str, str]],
+    record_property: Callable[[str, object], None],
 ) -> None:
     project, env = isolated
     authority = journal.open_or_create_journal(project)
@@ -1659,12 +2278,20 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
         "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
     }
     output_paths = [project.parent / f"takeover-{index}.jsonl" for index in range(4)]
+    error_paths = [project.parent / f"takeover-{index}.stderr" for index in range(4)]
+    gate_directory = project.parent / "takeover-gate"
+    gate_directory.mkdir()
+    release_path = gate_directory / "release"
+    finished_path = gate_directory / "listener-finished"
+    finish_release_path = gate_directory / "finish-release"
+    ready_paths = [gate_directory / f"ready-{index}" for index in range(4)]
     processes: list[subprocess.Popen[str]] = []
 
     with wake.register_lease_holder(
         project, controller_label="armtest", lease_nonce=lease.nonce
     ):
         _post(env, project, "pool backlog", dispatch_id="claim-pool")
+        _post(env, project, "second pool backlog", dispatch_id="claim-pool-secondary")
         failed = subprocess.run(
             [
                 sys.executable,
@@ -1685,13 +2312,136 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
         assert failed.returncode == 2, failed.stderr
 
         try:
-            for path in output_paths:
+            def _payloads() -> list[dict]:
+                payloads = []
+                for path in output_paths:
+                    try:
+                        contents = path.read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        continue
+                    for line in contents.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            payloads.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            # A listener may have opened the file but not flushed
+                            # its complete JSON line yet.
+                            continue
+                return payloads
+
+            def _payload_count(kind: str) -> int:
+                return sum(payload.get("kind") == kind for payload in _payloads())
+
+            def _pending_reports() -> int:
+                return _payload_count("pending-at-arm")
+
+            def _ring_signatures() -> list[tuple[int, str]]:
+                return [
+                    (
+                        int(payload.get("cursor_version") or 0),
+                        str(payload.get("advance_command") or ""),
+                    )
+                    for payload in _payloads()
+                    if payload.get("kind") == "ring"
+                ]
+
+            def _reported_backlog_positions() -> set[tuple[str, int]]:
+                return {
+                    (
+                        str(item.get("stream_id") or ""),
+                        int(item.get("stream_seq") or 0),
+                    )
+                    for payload in _payloads()
+                    if payload.get("kind") == "pending-at-arm"
+                    for item in payload.get("items", [])
+                }
+
+            def _payload_summary():
+                summary = []
+                for index, path in enumerate(output_paths):
+                    try:
+                        contents = path.read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        continue
+                    rows = []
+                    for line in contents.splitlines():
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        items = [
+                            (
+                                str(item.get("stream_id") or ""),
+                                int(item.get("stream_seq") or 0),
+                            )
+                            for item in payload.get("items", [])
+                        ]
+                        rows.append((str(payload.get("kind") or ""), items))
+                    if rows:
+                        summary.append((processes[index].pid, rows))
+                return summary
+
+            def _start_rearmed_listener() -> None:
+                index = len(processes)
+                output_path = project.parent / f"takeover-rearm-{index}.jsonl"
+                error_path = project.parent / f"takeover-rearm-{index}.stderr"
+                ready_path = gate_directory / f"rearm-ready-{index}"
+                output_paths.append(output_path)
+                error_paths.append(error_path)
+                ready_paths.append(ready_path)
+                with output_path.open("w", encoding="utf-8") as stdout:
+                    with error_path.open("w", encoding="utf-8") as stderr:
+                        process = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-c",
+                                _GATE_PENDING_REPORT_CLAIM,
+                                "listen",
+                                "--project-root",
+                                str(project),
+                                "--controller-label",
+                                "armtest",
+                                "--listener-slots",
+                                "4",
+                                "--json",
+                                "--poll-secs",
+                                "0.01",
+                                "--timeout-s",
+                                "300",
+                            ],
+                            env={
+                                **listener_env,
+                                "GOALFLIGHT_TEST_PENDING_REPORT_READY": str(
+                                    ready_path
+                                ),
+                                "GOALFLIGHT_TEST_PENDING_REPORT_RELEASE": str(
+                                    release_path
+                                ),
+                                "GOALFLIGHT_TEST_LISTENER_FINISHED": str(
+                                    finished_path
+                                ),
+                                "GOALFLIGHT_TEST_LISTENER_FINISH_RELEASE": str(
+                                    finish_release_path
+                                ),
+                            },
+                            stdout=stdout,
+                            stderr=stderr,
+                            text=True,
+                        )
+                processes.append(process)
+
+            for index, (path, ready_path) in enumerate(
+                zip(output_paths, ready_paths)
+            ):
                 handle = path.open("w", encoding="utf-8")
+                error_handle = error_paths[index].open("w", encoding="utf-8")
                 processes.append(
                     subprocess.Popen(
                         [
                             sys.executable,
-                            str(SCRIPTS / "goalflight_messages.py"),
+                            "-c",
+                            _GATE_PENDING_REPORT_CLAIM,
                             "listen",
                             "--project-root",
                             str(project),
@@ -1703,29 +2453,121 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
                             "--poll-secs",
                             "0.01",
                             "--timeout-s",
-                            "60",
+                            "300",
                         ],
-                        env=listener_env,
+                        env={
+                            **listener_env,
+                            "GOALFLIGHT_TEST_PENDING_REPORT_READY": str(ready_path),
+                            "GOALFLIGHT_TEST_PENDING_REPORT_RELEASE": str(release_path),
+                            "GOALFLIGHT_TEST_LISTENER_FINISHED": str(finished_path),
+                            "GOALFLIGHT_TEST_LISTENER_FINISH_RELEASE": str(
+                                finish_release_path
+                            ),
+                        },
                         stdout=handle,
-                        stderr=subprocess.DEVNULL,
+                        stderr=error_handle,
                         text=True,
                     )
                 )
                 handle.close()
+                error_handle.close()
 
             wait_until(
-                lambda: len(
-                    wake.live_waiters(
+                lambda: all(path.exists() for path in ready_paths),
+                timeout_s=45,
+                message="all replacement listeners reach the pending-report claim gate",
+            )
+            temporary_release = release_path.with_suffix(".tmp")
+            temporary_release.write_text("release\n", encoding="utf-8")
+            temporary_release.replace(release_path)
+            wait_until(
+                lambda: _pending_reports() >= 1,
+                timeout_s=30,
+                message="a pending-at-arm report after concurrent dead-claim takeover",
+            )
+            wait_until(
+                lambda: {("claim-pool", 1), ("claim-pool-secondary", 1)}
+                <= _reported_backlog_positions(),
+                timeout_s=10,
+                message="every pending backlog event appears in a pending-at-arm report",
+            )
+            wait_until(
+                lambda: (
+                    state
+                    if (state := wake.pending_report_state(
                         project,
                         controller_label="armtest",
-                        kinds={"listener"},
-                    )
-                    or []
-                )
-                == 4,
-                timeout_s=60,
-                message="four listener slot locks after dead-claim takeover",
+                        lease_nonce=lease.nonce,
+                    ))
+                    and state.phase == "reported"
+                    else None
+                ),
+                timeout_s=10,
+                message="the pending-at-arm report is durably marked before re-arm",
             )
+
+            report_observation_deadline = time.monotonic() + 1.0
+            wait_until(
+                lambda: time.monotonic() >= report_observation_deadline,
+                timeout_s=1.5,
+                interval_s=0.02,
+                message="one-second observation after concurrent pending-at-arm reports",
+            )
+            record_property(
+                "duplicate_pending_reports_observed",
+                max(0, _pending_reports() - 1),
+            )
+
+            backlog = authority.cursor_peek("armtest", nonce=lease.nonce)
+            advances = {
+                str(item["stream_id"]): int(item["stream_seq"])
+                for item in backlog.items
+                if str(item.get("stream_id") or "")
+                in {"claim-pool", "claim-pool-secondary"}
+            }
+            assert advances == {
+                "claim-pool": 1,
+                "claim-pool-secondary": 1,
+            }
+            acknowledged = authority.advance_cursor(
+                "armtest",
+                nonce=lease.nonce,
+                expected_cursor_version=backlog.cursor_version,
+                expected_stream_snapshots={
+                    stream_id: backlog.stream_snapshots[stream_id]
+                    for stream_id in advances
+                },
+                advances=advances,
+                actor="test-concurrent-takeover-ack",
+            )
+            assert acknowledged.committed
+
+            live = wake.live_waiters(
+                project,
+                controller_label="armtest",
+                kinds={"listener"},
+            ) or []
+            while len(live) < 4:
+                _start_rearmed_listener()
+                wait_until(
+                    lambda: len(
+                        wake.live_waiters(
+                            project,
+                            controller_label="armtest",
+                            kinds={"listener"},
+                        )
+                        or []
+                    )
+                    > len(live),
+                    timeout_s=10,
+                    message="re-armed listener restores one missing pool slot",
+                )
+                live = wake.live_waiters(
+                    project,
+                    controller_label="armtest",
+                    kinds={"listener"},
+                ) or []
+
             live = (
                 wake.live_waiters(
                     project,
@@ -1736,39 +2578,49 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
             )
             assert len(live) == 4
 
-            def _pending_reports() -> int:
-                payloads = [
-                    json.loads(line)
-                    for path in output_paths
-                    for line in path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
-                return [payload["kind"] for payload in payloads].count("pending-at-arm")
-
-            wait_until(
-                lambda: _pending_reports() >= 1,
-                timeout_s=15,
-                message="the one pending-at-arm report after pool takeover",
-            )
-            assert _pending_reports() == 1
+            assert _pending_reports() >= 1, _payloads()
             assert all(process.poll() is None for process in processes)
 
             _post(env, project, "new after pool takeover", dispatch_id="claim-pool")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                exited = [process for process in processes if process.poll() is not None]
-                if exited:
-                    break
-                time.sleep(0.02)
-            assert len(exited) == 1
-            assert exited[0].returncode == 0
-            live = wake.live_waiters(
-                project,
-                controller_label="armtest",
-                kinds={"listener"},
-            ) or []
-            assert len(live) == 3
+            wait_until(
+                lambda: any(
+                    payload.get("kind") == "ring"
+                    and "claim-pool=2" in payload.get("advance_command", "")
+                    for payload in _payloads()
+                )
+                and finished_path.exists(),
+                timeout_s=5,
+                message="one listener rings and reaches its bounded observation hold",
+            )
+            assert _payload_count("ring") >= 1
+            assert all(process.poll() is None for process in processes)
+            observation_deadline = time.monotonic() + 1.0
+            wait_until(
+                lambda: time.monotonic() >= observation_deadline,
+                timeout_s=1.5,
+                interval_s=0.02,
+                message="one-second observation after the first listener rings",
+            )
+            assert all(process.poll() is None for process in processes)
+            assert _pending_reports() >= 1, {
+                "payloads": _payload_summary(),
+                "stderr": [path.read_text(encoding="utf-8") for path in error_paths],
+            }
+            assert _reported_backlog_positions() >= {
+                ("claim-pool", 1),
+                ("claim-pool-secondary", 1),
+            }
+            ring_count = _payload_count("ring")
+            assert ring_count >= 1
+            ring_signatures = _ring_signatures()
+            record_property(
+                "duplicate_rings_observed",
+                max(0, ring_count - len(set(ring_signatures))),
+            )
         finally:
+            temporary_release = finish_release_path.with_suffix(".tmp")
+            temporary_release.write_text("release\n", encoding="utf-8")
+            temporary_release.replace(finish_release_path)
             for process in processes:
                 if process.poll() is None:
                     process.kill()
@@ -2067,6 +2919,85 @@ def test_genuine_ring_still_exits_zero(
     assert payloads
     assert payloads[-1]["kind"] == "ring"
     assert payloads[-1]["reason"] == "event"
+
+
+def test_grokbot_helper_reports_duplicate_arm_and_forwards_hup(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    label = "grokbot-single-arm"
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        label, principal={"principal_id": "grokbot-single-arm-test"}
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_grok_bot_listen.py"),
+        "--project-root",
+        str(project),
+        "--controller-label",
+        label,
+        "--lease-nonce",
+        lease.nonce,
+        "--timeout-s",
+        "60",
+    ]
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=lease.nonce
+    ):
+        first = subprocess.Popen(
+            command,
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            listener_pids: list[int] = []
+            while time.monotonic() < deadline:
+                listener_pids = wake.listener_slot_holder_pids(
+                    project, controller_label=label
+                )
+                if listener_pids:
+                    break
+                assert first.poll() is None
+                time.sleep(0.02)
+            assert len(listener_pids) == 1
+            incumbent = listener_pids[0]
+            assert incumbent != first.pid
+
+            second = subprocess.run(
+                command,
+                cwd=project,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            assert second.returncode == 3, (second.stdout, second.stderr)
+            assert f"pid(s)={incumbent}" in second.stderr
+            assert "duplicate arm not started" in second.stderr
+            assert first.poll() is None
+            assert wake.listener_slot_holder_pids(project, controller_label=label) == [
+                incumbent
+            ]
+
+            first.send_signal(signal.SIGHUP)
+            stdout, stderr = first.communicate(timeout=4)
+            assert first.returncode == messages.listener_posix_signal_exit_code(
+                signal.SIGHUP
+            ), (stdout, stderr)
+            assert "QUOTE-CHECK:" in stdout
+            assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+        finally:
+            if first.poll() is None:
+                first.kill()
+                first.communicate(timeout=2)
 
 
 def main() -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 from pathlib import Path
@@ -279,11 +280,465 @@ def test_force_advanced_dead_dispatch_pins_wip_and_releases_task(authority, tmp_
 
     assert dead["superseded_by"] == "fresh"
     assert dead["wip_ref"].startswith("refs/goalflight/keep/")
+    ref_name = dead["wip_ref"].rsplit("/", 1)[-1]
+    assert ref_name.rsplit("-", 2)[-2].isdecimal()
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", dead["wip_ref"]],
         cwd=wip,
     ).returncode == 0
     assert [item["id"] for item in store.load_items()] == ["t-001"]
+
+
+def test_never_launched_attempt_does_not_block_parent_wip_pin(authority, tmp_path, monkeypatch):
+    root, _store, records, make_args = authority
+    wip = tmp_path / "parent-wip"
+    wip.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=wip, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=wip, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=wip, check=True)
+    (wip / "work.txt").write_text("parent work\n", encoding="utf-8")
+    subprocess.run(["git", "add", "work.txt"], cwd=wip, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "parent work"], cwd=wip, check=True)
+    parent = {
+        "dispatch_id": "launched-parent", "project_root": str(root),
+        "task_ids": ["t-001"], "state": "worker_dead", "terminal_state": "worker_dead",
+        "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_committed",
+        "worker_cwd": str(wip),
+    }
+    never = {
+        "dispatch_id": "never-launched-retry", "project_root": str(root),
+        "task_ids": ["t-001"], "state": "worker_dead", "terminal_state": "worker_dead",
+        "reason": "partial_task_supersession",
+    }
+    records.append(parent)
+    records.append(never)
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{"lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL, "launch_epoch": 0,
+                     "worker_instance_json": None,
+                     "terminal_outcome_json": None}]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    launch_args = make_args(force=True)
+    D._refuse_launch_blocked_by_completion_authority(launch_args)
+    D._commit_task_redispatch(launch_args)
+
+    assert parent["wip_ref"].startswith("refs/goalflight/keep/")
+    assert "wip_ref" not in never
+    assert never["superseded_by"] == parent["superseded_by"] == "fresh"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "status_evidence", "tail_output", "expected_never_launched"),
+    [
+        (None, None, "", True),
+        ({"worker_pid": 4242}, None, "", False),
+        ({"worker_identity": {"pid": 4242, "start_token": "worker"}}, None, "", False),
+        ({"worker_cwd": "recorded-worker"}, None, "", False),
+        ({"worktree_seat": "s-1"}, None, "", False),
+        (None, {"worker_pid": 4242}, "", False),
+        (None, None, "worker output\n", False),
+    ],
+)
+def test_ownerless_drain_retry_record_redispatch_requires_no_worker_evidence(
+    authority, tmp_path, monkeypatch, evidence, status_evidence, tail_output,
+    expected_never_launched
+):
+    root, _store, records, make_args = authority
+    record = json.loads(
+        """{
+          "agent": "codex",
+          "dispatch_id": "example-dispatch-1",
+          "epoch": "status-00000000000000000000000000000004",
+          "liveness_state": "worker_dead",
+          "project_root": "/tmp/example-project",
+          "reason": "partial_task_supersession",
+          "reconciliation": {
+            "checked_output": true,
+            "checked_task_ids": ["b-0001"],
+            "claim_recovery_count": 0,
+            "launch_timeout_s": 300.0,
+            "queue_launch_token": "00000000000000000000000000000003",
+            "salvage_required": true,
+            "source": "drain_claim_recovery"
+          },
+          "schema": "goalflight.status.v1",
+          "shape": "bash",
+          "state": "worker_dead",
+          "terminal_marker": null,
+          "terminal_state": "worker_dead",
+          "task_ids": ["b-0001"],
+          "updated_at": 1767225600,
+          "worker_alive": false,
+          "worker_pid": null
+        }"""
+    )
+    record["project_root"] = str(root)
+    if evidence:
+        record.update(evidence)
+    if evidence and evidence.get("worker_cwd"):
+        record["worker_cwd"] = str(tmp_path / evidence["worker_cwd"])
+
+    dispatch_dir = D._dispatch_base_dir()
+    status_path = dispatch_dir / f"{record['dispatch_id']}.status.json"
+    tail_path = dispatch_dir / f"{record['dispatch_id']}.tail"
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    status_record = json.loads(json.dumps(record))
+    if status_evidence:
+        status_record.update(status_evidence)
+    status_path.write_text(json.dumps(status_record), encoding="utf-8")
+    tail_path.write_text(tail_output, encoding="utf-8")
+    if evidence and evidence.get("worker_cwd"):
+        (tmp_path / evidence["worker_cwd"]).mkdir()
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{
+                "lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                "launch_epoch": 0,
+                "worker_instance_json": None,
+                "terminal_outcome_json": None,
+            }]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    records.append(record)
+    assert D._record_proves_never_launched(record, []) is expected_never_launched
+
+    args = make_args(force=True)
+    args._redispatch_pending = {
+        "records": [record],
+        "wip_refs": {},
+        "completed": [],
+        "replacement_id": "fresh",
+        "actor": "controller",
+        "reason": "forced redispatch",
+        "committed": False,
+    }
+    if expected_never_launched:
+        D._commit_task_redispatch(args)
+        assert record["superseded_by"] == "fresh"
+        assert "wip_ref" not in record
+    else:
+        with pytest.raises(D.DispatchUsageError):
+            D._commit_task_redispatch(args)
+
+
+def test_never_launched_proof_rejects_nonzero_worker_output(authority, tmp_path, monkeypatch):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{"lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL, "launch_epoch": 0,
+                     "worker_instance_json": None,
+                     "terminal_outcome_json": None}]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {"dispatch_id": "never-output", "project_root": str(root)}
+    tail = tmp_path / "worker.tail"
+    record["stdout_path"] = str(tail)
+    tail.touch()
+    assert D._record_proves_never_launched(record, [])
+    tail.write_text("worker ran\n", encoding="utf-8")
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_root", 7),
+        ("stdout_path", "/bad\0tail"),
+        ("stdout_path", "~unknown_user/tail"),
+    ],
+)
+def test_never_launched_proof_fails_closed_on_malformed_paths(
+    authority, monkeypatch, field, value
+):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{
+                "lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                "launch_epoch": 0,
+                "worker_instance_json": None,
+                "terminal_outcome_json": None,
+            }]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {"dispatch_id": "malformed-never-launched", "project_root": str(root)}
+    record[field] = value
+    assert D._record_proves_never_launched(record, []) is False
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"remote_launch_receipt": {"remote_pid": 4242, "worktree_path": "/remote/wt"}},
+        {"launch_unconfirmed": True},
+        {"launch_issued_at": "2026-10-17T00:00:00Z"},
+        {"expected_worker_identity": {"pid": 4242}},
+    ],
+)
+def test_remote_launch_evidence_is_not_never_launched(authority, monkeypatch, evidence):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{"lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL, "launch_epoch": 0,
+                     "worker_instance_json": None,
+                     "terminal_outcome_json": None}]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {"dispatch_id": "remote-launch", "project_root": str(root), **evidence}
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize("field", ["remote_pid_lstart", "remote_pid_identity"])
+def test_remote_pid_identity_fields_are_not_never_launched(authority, monkeypatch, field):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{"lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL, "launch_epoch": 0,
+                     "worker_instance_json": None,
+                     "terminal_outcome_json": None}]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {"dispatch_id": "remote-pid-evidence", "project_root": str(root), field: "present"}
+    assert not D._record_proves_never_launched(record, [])
+
+
+def test_unknown_record_field_is_not_never_launched(authority, monkeypatch):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{"lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                     "launch_epoch": 0, "worker_instance_json": None,
+                     "terminal_outcome_json": None}]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {
+        "dispatch_id": "future-evidence",
+        "project_root": str(root),
+        "some_future_field": "x",
+    }
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"terminal_state": "worker_dead", "future_outcome": "x"},
+        {"reconciliation": {"source": "drain_claim_recovery", "future_detail": "x"}},
+    ],
+)
+def test_unknown_nested_outcome_field_is_not_never_launched(authority, outcome):
+    root, _store, _records, _make_args = authority
+    record = {
+        "dispatch_id": "future-outcome-evidence",
+        "project_root": str(root),
+        "outcome": outcome,
+    }
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize(
+    "reconciliation",
+    [
+        {"checked_output": {"worker_pid": 4242}},
+        {"checked_task_ids": "b-1"},
+        {"claim_recovery_count": False},
+        {"launch_timeout_s": float("inf")},
+        {"queue_launch_token": 42},
+        {"salvage_required": 1},
+        {"source": []},
+    ],
+)
+@pytest.mark.parametrize("source", ["ledger", "sidecar"])
+def test_top_level_reconciliation_values_must_match_their_shapes(
+    authority, tmp_path, monkeypatch, reconciliation, source
+):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{
+                "lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                "launch_epoch": 0,
+                "worker_instance_json": None,
+                "terminal_outcome_json": None,
+            }]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {"dispatch_id": "malformed-reconciliation", "project_root": str(root)}
+    if source == "ledger":
+        record["reconciliation"] = reconciliation
+    else:
+        status_path = tmp_path / "malformed-reconciliation.status.json"
+        record["status_path"] = str(status_path)
+        status_path.write_text(
+            json.dumps({
+                "dispatch_id": record["dispatch_id"],
+                "project_root": record["project_root"],
+                "state": "worker_dead",
+                "reconciliation": reconciliation,
+            }),
+            encoding="utf-8",
+        )
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize(
+    "terminal_outcome",
+    [
+        {"outcome": {"worker_pid": 4242}},
+        {
+            "metadata": [
+                {"attempt": {"identity": {"worker_pid": 4242}}}
+            ]
+        },
+        {"future": {"details": "unrecognized terminal structure"}},
+    ],
+)
+def test_terminal_outcome_rejects_nested_worker_evidence_and_unknown_shapes(
+    authority, monkeypatch, terminal_outcome
+):
+    root, _store, _records, _make_args = authority
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{
+                "lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                "launch_epoch": 0,
+                "worker_instance_json": None,
+                "terminal_outcome_json": json.dumps(terminal_outcome),
+            }]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    record = {
+        "dispatch_id": "nested-terminal-worker-evidence",
+        "project_root": str(root),
+    }
+    assert not D._record_proves_never_launched(record, [])
+
+
+@pytest.mark.parametrize(
+    ("launch_epoch", "include_epoch", "expected"),
+    [
+        (0, True, True),
+        (1, True, False),
+        (None, True, False),
+        ("0", True, False),
+        (-1, True, False),
+        (False, True, False),
+        (None, False, False),
+    ],
+)
+def test_production_record_requires_zero_journal_launch_epoch(
+    authority, tmp_path, monkeypatch, launch_epoch, include_epoch, expected
+):
+    root, _store, _records, _make_args = authority
+    tail = tmp_path / "production-retry.tail"
+    status = tmp_path / "production-retry.status.json"
+    tail.touch()
+    status.touch()
+    record = {
+        "agent": "codex",
+        "attempt_id": "00000000-0000-4000-8000-000000000034",
+        "dispatch_id": "example-dispatch-2",
+        "ended_at": "2026-01-01T00:00:01+00:00",
+        "liveness_state": "worker_dead",
+        "outcome": {
+            "reason": "partial_task_supersession",
+            "reconciliation": {
+                "checked_output": True,
+                "checked_task_ids": ["b-0002"],
+                "claim_recovery_count": 0,
+                "launch_timeout_s": 300.0,
+                "queue_launch_token": "00000000000000000000000000000005",
+                "salvage_required": True,
+                "source": "drain_claim_recovery",
+            },
+            "terminal_state": "worker_dead",
+        },
+        "producer_descendants": [],
+        "producer_group_contract": False,
+        "producer_group_contract_enforced": False,
+        "project_root": str(root),
+        "queue_launch_token": "00000000000000000000000000000005",
+        "reason": "partial_task_supersession",
+        "salvage_required": True,
+        "schema": "goalflight.dispatch.v1",
+        "shape": "bash",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "state": "worker_dead",
+        "status_path": str(status),
+        "stdout_path": str(tail),
+        "task_ids": ["b-0002"],
+        "terminal_event_uuid": "00000000-0000-4000-8000-000000000029",
+        "terminal_state": "worker_dead",
+        "transition_id": "00000000-0000-4000-8000-000000000025",
+        "transport": "dispatch",
+        "updated_at": "2026-01-01T00:00:02+00:00",
+        "worker_group_leader_identity": None,
+        "worker_identity": None,
+        "worker_pgid": None,
+        "worker_pid": None,
+        "worker_still_alive": False,
+    }
+    expected_keys = {
+        "agent", "attempt_id", "dispatch_id", "ended_at", "liveness_state",
+        "outcome", "producer_descendants", "producer_group_contract",
+        "producer_group_contract_enforced", "project_root", "queue_launch_token",
+        "reason", "salvage_required", "schema", "shape", "started_at", "state",
+        "status_path", "stdout_path", "task_ids", "terminal_event_uuid",
+        "terminal_state", "transition_id", "transport", "updated_at",
+        "worker_group_leader_identity", "worker_identity", "worker_pgid",
+        "worker_pid", "worker_still_alive",
+    }
+    assert set(record) == expected_keys
+
+    class Reader:
+        def read_all(self, *_args):
+            attempt = {
+                "lifecycle_state": D.goalflight_journal.ATTEMPT_TERMINAL,
+                "worker_instance_json": None,
+                "terminal_outcome_json": json.dumps({"terminal_state": "worker_dead"}),
+            }
+            if include_epoch:
+                attempt["launch_epoch"] = launch_epoch
+            return [attempt]
+
+    monkeypatch.setattr(D.goalflight_journal.Journal, "open_reader", lambda _root: Reader())
+    assert D._record_proves_never_launched(record, []) is expected
+
+
+@pytest.mark.parametrize(("started", "expected"), [(False, True), (True, False)])
+def test_never_launched_proof_uses_real_journal_rows(authority, started, expected):
+    root, _store, _records, _make_args = authority
+    dispatch_id = f"real-journal-{int(started)}"
+    journal = D.goalflight_journal.Journal.create(root)
+    prepared = journal.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None, prepared.reason
+
+    if started:
+        started_result = journal.start_attempt(
+            prepared.value.attempt_id, prepared.value.launch_token
+        )
+        assert started_result.committed, started_result.reason
+
+    terminal = journal.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="worker_dead",
+        observation={"terminal_state": "worker_dead"},
+    )
+    assert terminal.committed, terminal.reason
+
+    assert D._record_proves_never_launched(
+        {"dispatch_id": dispatch_id, "project_root": str(root)}, []
+    ) is expected
 
 
 def test_force_advanced_pin_and_supersession_share_ledger_lock(authority, monkeypatch):
@@ -323,7 +778,7 @@ def test_force_advanced_pin_and_supersession_share_ledger_lock(authority, monkey
         task_ids=["t-001"],
     )
 
-    def pin(record):
+    def pin(record, _carrier_entries):
         pin_calls.append(record["dispatch_id"])
         pin_entered.set()
 

@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -407,6 +411,35 @@ def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) 
     }
     assert goalflight_watch._identity_token(identity) == {
         "pid": PID,
+        "start_token": START_TOKEN,
+    }
+
+
+def test_process_identity_timeout_only_becomes_unknown_with_deadline(monkeypatch) -> None:
+    goalflight_compat = goalflight_ledger.goalflight_compat
+    monkeypatch.setattr(goalflight_compat, "is_windows", lambda: False)
+    monkeypatch.setattr(goalflight_compat, "pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(
+        goalflight_compat,
+        "process_start_identity",
+        lambda pid: {"pid": pid, "start_token": START_TOKEN},
+    )
+
+    def timeout(_pid: int, **_kwargs):
+        raise subprocess.TimeoutExpired("ps", 1)
+
+    monkeypatch.setattr(goalflight_ledger, "_ps_identity", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        goalflight_ledger.process_identity(PID)
+
+    identity = goalflight_ledger._process_identity_before_deadline(
+        PID, deadline=time.monotonic() + 1
+    )
+    assert identity == {
+        "pid": PID,
+        "identity_available": False,
+        "identity_probe_error": True,
+        "identity_source": "ps_probe_timeout",
         "start_token": START_TOKEN,
     }
 

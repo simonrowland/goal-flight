@@ -6,7 +6,7 @@ Drives scripts/check_tasks_mirror.js (node-only; no network, no localhost):
   - PASS on the non-empty fixture tests/fixtures/tasks-mirror/.
   - FAIL on planted-drift temp copies (changed field / added id / stray status).
 
-If node is unavailable, the whole file SKIPs (runner-recognized "SKIP:" prefix).
+Cases that invoke Node skip individually when the executable is refused.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from support import skip_if_node_unavailable
 import pytest
 
 
@@ -35,7 +36,6 @@ CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
 SKELETON = ROOT / "templates" / "state-skeleton"
 FIXTURE = ROOT / "tests" / "fixtures" / "tasks-mirror"
 TASK = ROOT / "goalflight_task.py"
-NODE = shutil.which("node")
 
 os.environ.setdefault(
     "GOALFLIGHT_TASK_STORE_DIR",
@@ -66,9 +66,9 @@ def assert_true(name: str, condition: bool) -> None:
         raise AssertionError(name)
 
 
-def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
+def run_node(args: list[str], *, timeout: float = 30) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [NODE, str(CHECKER), str(target_dir)],
+        ["node", *args],
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,
@@ -79,15 +79,17 @@ def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.Complete
 
 
 def run_live_checker(project_root: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [NODE, str(CHECKER), str(_canonical_docs(project_root)), str(_canonical_dashboard(project_root))],
-        cwd=str(ROOT),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    return run_node(
+        [
+            str(CHECKER), str(_canonical_docs(project_root)),
+            str(_canonical_dashboard(project_root)),
+        ],
         timeout=timeout,
-        check=False,
     )
+
+
+def run_checker(target_dir: Path, *, timeout: float = 30) -> subprocess.CompletedProcess:
+    return run_node([str(CHECKER), str(target_dir)], timeout=timeout)
 
 
 def run_task(
@@ -161,16 +163,10 @@ def _load_goalflight_task_module():
 
 
 def test_default_fixture_passes() -> None:
+    if skip_if_node_unavailable("test_default_fixture_passes", script_mode=__name__ == "__main__"):
+        return
     # No dir arg -> checker defaults to the empty templates/state-skeleton/.
-    proc = subprocess.run(
-        [NODE, str(CHECKER)],
-        cwd=str(ROOT),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
-    )
+    proc = run_node([str(CHECKER)])
     assert_true("default fixture exit 0", proc.returncode == 0)
     assert_true("default fixture OK line", "OK: tasks mirror in sync" in proc.stdout)
     assert_true("default scaffold store is empty", (SKELETON / "tasks.jsonl").read_text(encoding="utf-8") == "")
@@ -178,12 +174,16 @@ def test_default_fixture_passes() -> None:
 
 
 def test_explicit_fixture_passes() -> None:
+    if skip_if_node_unavailable("test_explicit_fixture_passes", script_mode=__name__ == "__main__"):
+        return
     proc = run_checker(FIXTURE)
     assert_true("explicit fixture exit 0", proc.returncode == 0)
     assert_true("explicit fixture OK line", "OK: tasks mirror in sync" in proc.stdout)
 
 
 def test_drift_changed_field_fails() -> None:
+    if skip_if_node_unavailable("test_drift_changed_field_fails", script_mode=__name__ == "__main__"):
+        return
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         _copy_fixture(d)
@@ -202,6 +202,8 @@ def test_drift_changed_field_fails() -> None:
 
 
 def test_drift_added_id_fails() -> None:
+    if skip_if_node_unavailable("test_drift_added_id_fails", script_mode=__name__ == "__main__"):
+        return
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         _copy_fixture(d)
@@ -224,6 +226,8 @@ def test_drift_added_id_fails() -> None:
 
 
 def test_drift_injected_status_key_fails() -> None:
+    if skip_if_node_unavailable("test_drift_injected_status_key_fails", script_mode=__name__ == "__main__"):
+        return
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         _copy_fixture(d)
@@ -242,6 +246,8 @@ def test_drift_injected_status_key_fails() -> None:
 
 
 def test_drift_undefined_value_in_data_js_fails() -> None:
+    if skip_if_node_unavailable("test_drift_undefined_value_in_data_js_fails", script_mode=__name__ == "__main__"):
+        return
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
         item = {
@@ -277,6 +283,10 @@ def test_drift_undefined_value_in_data_js_fails() -> None:
 
 
 def test_goalflight_task_new_allocator_concurrency() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_new_allocator_concurrency", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         procs = [
@@ -413,6 +423,11 @@ def test_goalflight_task_inconclusive_breadcrumb_is_not_failed() -> None:
     Reverting the watch mapper while leaving this consumer would still store
     worker-failed; this pins the task-store side of that contract.
     """
+    if skip_if_node_unavailable(
+        "test_goalflight_task_inconclusive_breadcrumb_is_not_failed",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
         state_dir = Path(td) / "state"
@@ -473,6 +488,11 @@ def test_goalflight_task_inconclusive_breadcrumb_is_not_failed() -> None:
 
 
 def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_sync_writes_mirror_only_derived_status",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
         items = [
@@ -540,6 +560,10 @@ def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
 
 
 def test_goalflight_task_sync_appends_plural_task_ids() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_sync_appends_plural_task_ids", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         project = base / "project-a"
@@ -828,6 +852,11 @@ def test_goalflight_task_list_lane_facet_and_status_collision() -> None:
 
 
 def test_goalflight_task_edit_existing_item_fields_and_audit() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_edit_existing_item_fields_and_audit",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
         prompts = project / "prompts"
@@ -921,6 +950,11 @@ def test_goalflight_task_edit_existing_item_fields_and_audit() -> None:
 
 
 def test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         project = root / "project-a"
@@ -970,6 +1004,11 @@ def test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation()
 
 
 def test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
         items = [
@@ -1014,6 +1053,11 @@ def test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutatio
 
 
 def test_goalflight_task_show_prompt_rejects_unsafe_stored_paths() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_show_prompt_rejects_unsafe_stored_paths",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     cases = [
         ("absolute outside", lambda root, _project, _prompts: root / "outside.md", "resolves outside project root"),
         ("dot-dot outside", lambda _root, _project, _prompts: Path("../outside.md"), "contains '..' component"),
@@ -1045,6 +1089,11 @@ def test_goalflight_task_show_prompt_rejects_unsafe_stored_paths() -> None:
 
 
 def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_two_state_accept_and_review_breadcrumb",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(
@@ -1099,6 +1148,11 @@ def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
 
 
 def test_goalflight_task_review_captures_confirmed_bug_item() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_review_captures_confirmed_bug_item",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(
@@ -1168,6 +1222,11 @@ def test_goalflight_task_review_captures_confirmed_bug_item() -> None:
 
 
 def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_harvest_idempotent_with_source_links_and_history",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         # Harvest sources + history.md are human/external inputs the tool reads
@@ -1339,6 +1398,11 @@ def test_goalflight_task_harvest_idempotent_with_source_links_and_history() -> N
 
 
 def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_harvest_ignores_skeleton_placeholders",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
@@ -1373,6 +1437,11 @@ def test_goalflight_task_harvest_ignores_skeleton_placeholders() -> None:
 
 
 def test_goalflight_task_harvest_allows_real_angle_bracket_titles() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_harvest_allows_real_angle_bracket_titles",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
@@ -1418,6 +1487,11 @@ def test_goalflight_task_harvest_allows_real_angle_bracket_titles() -> None:
 
 
 def test_goalflight_task_harvest_keeps_literal_punctuation_distinct() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_harvest_keeps_literal_punctuation_distinct",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
@@ -1463,6 +1537,11 @@ def test_goalflight_task_harvest_keeps_literal_punctuation_distinct() -> None:
 
 
 def test_goalflight_task_harvest_allows_nested_generated_basename_sources() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_harvest_allows_nested_generated_basename_sources",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         docs = project / "docs-private"
@@ -1483,6 +1562,11 @@ def test_goalflight_task_harvest_allows_nested_generated_basename_sources() -> N
 
 
 def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_schema_version_tolerance_and_read_api",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(
@@ -1527,6 +1611,11 @@ def test_goalflight_task_schema_version_tolerance_and_read_api() -> None:
 
 
 def test_goalflight_task_append_dispatch_breadcrumbs_preserves_history() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_append_dispatch_breadcrumbs_preserves_history",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         _write_tasks(
@@ -1556,6 +1645,11 @@ def test_goalflight_task_append_dispatch_breadcrumbs_preserves_history() -> None
 
 
 def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_atomic_write_rejects_bad_content",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         proc = run_task(project, "new", "Good task")
@@ -1595,6 +1689,11 @@ def test_goalflight_task_atomic_write_rejects_bad_content() -> None:
 
 
 def test_goalflight_task_refuses_symlinked_state_write_dirs() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_refuses_symlinked_state_write_dirs",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         project = root / "project"
@@ -1643,6 +1742,11 @@ def test_goalflight_task_refuses_symlinked_state_write_dirs() -> None:
 
 
 def test_goalflight_task_interrupted_publish_marker_repairs_mirror() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_interrupted_publish_marker_repairs_mirror",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         old_item = {
@@ -1771,6 +1875,11 @@ def _assert_non_regular_task_read_fails(project: Path, *args: str) -> None:
 
 
 def test_goalflight_task_rejects_non_regular_store_files_without_hanging() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_rejects_non_regular_store_files_without_hanging",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     item = {
         "schema_version": 1,
         "id": "t-001",
@@ -1924,6 +2033,10 @@ def test_goalflight_task_next_nudge_logs_failure_once_per_key() -> None:
 
 
 def test_goalflight_task_sync_repairs_stale_mirror() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_sync_repairs_stale_mirror", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         item = {
@@ -1946,6 +2059,11 @@ def test_goalflight_task_sync_repairs_stale_mirror() -> None:
 
 
 def test_goalflight_task_data_js_escapes_script_end_and_html() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_data_js_escapes_script_end_and_html",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         bad_title = "Bad </script><img src=x onerror=alert(1)> t-001"
@@ -1968,6 +2086,11 @@ def test_goalflight_task_data_js_escapes_script_end_and_html() -> None:
 
 
 def test_goalflight_task_sync_generates_markdown_views() -> None:
+    if skip_if_node_unavailable(
+        "test_goalflight_task_sync_generates_markdown_views",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         items = [
@@ -2088,9 +2211,6 @@ def test_goalflight_task_sync_generates_markdown_views() -> None:
 
 def main() -> None:
     os.environ["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
-    if not NODE:
-        print("SKIP: test_tasks_mirror.py: node not found on PATH")
-        return
     if not CHECKER.is_file():
         raise AssertionError(f"checker missing: {CHECKER}")
     if not TASK.is_file():

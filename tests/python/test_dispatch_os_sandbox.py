@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -340,10 +342,10 @@ def case_moonshot_argv_stays_unwrapped_on_darwin() -> None:
 
 
 def case_boundary_rejected_early_names_the_real_cause() -> None:
-    """The sandbox refuses when cwd sits in a temp/agent-state root. Say so up front.
+    """The sandbox refuses when cwd sits in its per-dispatch TMPDIR. Say so up front.
 
-    That refusal is correct -- inside those roots it cannot separate "the
-    workspace" from "everywhere the worker may already write". But it used to
+    That refusal is correct -- inside the scratch root it cannot separate "the
+    workspace" from the worker's temp writes. But it used to
     surface only after a detached worker had launched and died as
     `blocked_os_sandbox`, with the reason buried in a status file.
 
@@ -357,25 +359,50 @@ def case_boundary_rejected_early_names_the_real_cause() -> None:
     repo_cwd = str(Path(__file__).resolve().parents[2])
     for shape in ("acp", "bash"):
         for profile in ("read-only", "workspace-write"):
-            try:
-                d._validate_os_sandbox_boundary(
-                    _args(agent="cursor", shape=shape, os_sandbox=profile, cwd="/tmp/gf-probe")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GOALFLIGHT_SCRATCH_DIR": "/tmp/gf-probe",
+                    "TMPDIR": "/tmp/gf-probe",
+                },
+            ):
+                try:
+                    d._validate_os_sandbox_boundary(
+                        _args(
+                            agent="cursor",
+                            shape=shape,
+                            os_sandbox=profile,
+                            cwd="/tmp/gf-probe",
+                        )
+                    )
+                except d.DispatchUsageError as exc:
+                    message = str(exc)
+                    assert "working directory" in message, message
+                    # Must name the cause and a way out, not just fail.
+                    assert "temp" in message or "root" in message, message
+                    assert "--os-sandbox off" in message, message
+                else:
+                    raise AssertionError(
+                        f"cwd inside a per-dispatch TMPDIR must reject early "
+                        f"({shape}/{profile})"
+                    )
+
+            d._validate_os_sandbox_boundary(
+                _args(
+                    agent="cursor",
+                    shape=shape,
+                    os_sandbox=profile,
+                    cwd="/tmp/gf-probe",
                 )
-            except d.DispatchUsageError as exc:
-                message = str(exc)
-                assert "working directory" in message, message
-                # Must name the cause and a way out, not just fail.
-                assert "temp" in message or "root" in message, message
-                assert "--os-sandbox off" in message, message
-            else:
-                raise AssertionError(f"cwd inside a temp root must reject early ({shape}/{profile})")
+            )
 
             # A real worktree is fine for BOTH shapes -- the case a shape-based
             # rejection would have wrongly blocked.
             d._validate_os_sandbox_boundary(
                 _args(agent="cursor", shape=shape, os_sandbox=profile, cwd=repo_cwd)
             )
-    # `off` asks for no boundary, so it is never rejected, even from /tmp.
+    # The system temp directory is no longer a write grant. `off` asks for no
+    # boundary, so it is never rejected there either.
     d._validate_os_sandbox_boundary(
         _args(agent="cursor", shape="acp", os_sandbox="off", cwd="/tmp/gf-probe")
     )
@@ -398,6 +425,102 @@ def case_boundary_rejected_early_names_the_real_cause() -> None:
             )
 
 
+def case_remote_ci_seatbelt_grants_requests() -> None:
+    spool = Path("/var/tmp/goal-flight-remote-ci-policy-test/spool")
+    requests = (spool / "requests").resolve()
+    environment = {"GOALFLIGHT_REMOTE_CI_SPOOL_DIR": str(spool)}
+    profile, roots = sandbox.macos_sandbox_profile(
+        str(Path.home()),
+        sandbox.OS_SANDBOX_WORKSPACE_WRITE,
+        agent="grok",
+        command="grok",
+        environment=environment,
+    )
+    assert requests in {Path(root).resolve() for root in roots}
+
+
+def case_grok_read_only_resume_and_worktree_provision_private_tmpdir() -> None:
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory(prefix="gf-grok-scratch-") as raw:
+        scratch = Path(raw) / "dispatch.scratch"
+        scratch.mkdir(mode=0o700)
+        seat = Path(raw) / ".goal-flight" / "accounts" / "seat" / "grok"
+        seat.mkdir(parents=True)
+        env = {
+            "HOME": str(seat),
+            "GOALFLIGHT_SCRATCH_DIR": str(scratch),
+            # An inherited caller path outside this dispatch must be replaced.
+            "TMPDIR": str(Path(raw) / "caller-tmp"),
+        }
+        checked = []
+        def check_then_stub(command, argv, **kwargs):
+            environment = kwargs["environment"]
+            roots = sandbox.macos_write_roots(
+                kwargs["cwd"], "read-only", agent="grok-code",
+                command=command, environment=environment,
+            )
+            tmp = Path(environment["TMPDIR"]).resolve()
+            assert tmp.is_dir() and tmp.parent == scratch.resolve()
+            assert tmp.stat().st_mode & 0o077 == 0
+            assert str(tmp) in roots
+            checked.append(tmp)
+            return SimpleNamespace(command="sandbox-exec", args=["-p", "stub"] + argv)
+
+        with (
+            _force_darwin_sandbox_exec(),
+            mock.patch.object(sandbox.Path, "home", return_value=Path(raw)),
+            mock.patch.object(d, "_account_home", return_value=seat),
+            mock.patch.object(sandbox, "prepare_os_sandbox_command", side_effect=check_then_stub),
+        ):
+            # Resume has a cached path from an earlier attempt that no longer
+            # belongs to this dispatch scratch root.
+            resume = _args(
+                agent="grok-code", read_only=True, cwd=str(REPO_ROOT),
+                account="seat", dispatch_id="resume-case", parent_dispatch_id="parent",
+                _account_env=dict(env), _grok_read_only_tmpdir=env["TMPDIR"],
+            )
+            resumed_argv, _ = d.build_worker(resume, "/tmp/p.md", [])
+            assert resumed_argv[0] == "sandbox-exec", resumed_argv
+
+            # Explicit --worktree launches follow the same worker builder.
+            worktree = _args(
+                agent="grok-code", read_only=True, cwd=str(REPO_ROOT),
+                account="seat", dispatch_id="worktree-case", worktree="1aec3db79",
+                _account_env=dict(env),
+            )
+            worktree_argv, _ = d.build_worker(worktree, "/tmp/p.md", [])
+            assert worktree_argv[0] == "sandbox-exec", worktree_argv
+
+            symlink_target = scratch / "valid-target"
+            symlink_target.mkdir(mode=0o700)
+            symlink = scratch / "caller-link"
+            symlink.symlink_to(symlink_target, target_is_directory=True)
+            for index, bad_tmp in enumerate((symlink,)):
+                args = _args(
+                    agent="grok-code", read_only=True, cwd=str(REPO_ROOT),
+                    account="seat", dispatch_id=f"symlink-{index}",
+                    _account_env=dict(env), _grok_read_only_tmpdir=str(bad_tmp),
+                )
+                d.build_worker(args, "/tmp/p.md", [])
+                assert Path(args._grok_read_only_tmpdir) != symlink_target
+
+            for index, mode in enumerate((0o500, 0o000)):
+                unusable = scratch / f"unusable-{index}"
+                unusable.mkdir(mode=0o700)
+                unusable.chmod(mode)
+                args = _args(
+                    agent="grok-code", read_only=True, cwd=str(REPO_ROOT),
+                    account="seat", dispatch_id=f"mode-{index}",
+                    _account_env=dict(env), _grok_read_only_tmpdir=str(unusable),
+                )
+                d.build_worker(args, "/tmp/p.md", [])
+                assert Path(args._grok_read_only_tmpdir) != unusable
+
+        assert len(checked) == 5, checked
+        assert len(set(checked)) == 5, checked
+
+
 def main() -> None:
     case_resolution_precedence()
     case_codex_sandbox_mapping()
@@ -411,6 +534,8 @@ def main() -> None:
     case_cursor_read_only_argv_stays_unwrapped_off_darwin()
     case_moonshot_argv_stays_unwrapped_on_darwin()
     case_boundary_rejected_early_names_the_real_cause()
+    case_remote_ci_seatbelt_grants_requests()
+    case_grok_read_only_resume_and_worktree_provision_private_tmpdir()
     print("test_dispatch_os_sandbox: all cases passed")
 
 

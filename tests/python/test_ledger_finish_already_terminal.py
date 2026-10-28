@@ -14,10 +14,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_ledger as ledger  # noqa: E402
+import goalflight_dispatch_states as dispatch_states  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
 
 
 def _write_running(dispatch_id: str, project: Path) -> None:
@@ -366,3 +370,129 @@ def test_finish_cli_refuses_conflicting_terminal_state(tmp_path: Path) -> None:
     assert rc == 2, payload
     assert payload["error"] == "already_terminal"
     assert payload["current_terminal_state"] == "quota_exhausted"
+
+
+@pytest.mark.parametrize(
+    "worker_still_alive",
+    (None, True),
+)
+@pytest.mark.parametrize("state", sorted(dispatch_states.LAUNCHER_BLOCKED_STATES))
+def test_finish_cli_preserves_launcher_blocked_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    worker_still_alive: bool | None,
+) -> None:
+    for key, child in (
+        ("GOALFLIGHT_STATE_DIR", "state"),
+        ("GOALFLIGHT_JOURNAL_DIR", "journal"),
+        ("GOALFLIGHT_MESSAGES_DIR", "messages"),
+        ("GOALFLIGHT_TASK_STORE_DIR", "task-store"),
+        ("GOALFLIGHT_DISPATCH_DIR", "dispatch"),
+    ):
+        monkeypatch.setenv(key, str(tmp_path / child))
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    dispatch_id = f"cli-{state}-{worker_still_alive}"
+    _write_running(dispatch_id, project)
+
+    # The public finish command has no liveness switch. Pin its existing probe
+    # boundary to exercise both the CLI's unknown default and a live caller.
+    monkeypatch.setattr(
+        ledger.goalflight_terminal,
+        "worker_liveness_from_probe",
+        lambda _alive, _reason=None: (
+            "live" if worker_still_alive is True else "unknown"
+        ),
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        code = ledger.main(
+            ["finish", "--dispatch-id", dispatch_id, "--state", state]
+        )
+    payload = json.loads(output.getvalue())
+    assert code == 0, payload
+    assert payload["ok"] is True, payload
+    row = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert row["state"] == state, row
+    assert row["terminal_state"] == state, row
+
+
+@pytest.mark.parametrize(
+    ("state", "worker_still_alive"),
+    (("running", True), ("watcher_stopped", None)),
+)
+def test_finish_derived_nonterminal_keeps_blocked_markers_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    worker_still_alive: bool | None,
+) -> None:
+    for key, child in (
+        ("GOALFLIGHT_STATE_DIR", "state"),
+        ("GOALFLIGHT_JOURNAL_DIR", "journal"),
+        ("GOALFLIGHT_MESSAGES_DIR", "messages"),
+        ("GOALFLIGHT_TASK_STORE_DIR", "task-store"),
+        ("GOALFLIGHT_DISPATCH_DIR", "dispatch"),
+    ):
+        monkeypatch.setenv(key, str(tmp_path / child))
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    dispatch_id = f"derived-{state}"
+    _write_running(dispatch_id, project)
+    record = ledger.read_record(dispatch_id)
+    assert record is not None
+    blocked_marker = {"kind": "BLOCKED", "text": "worker reported BLOCKED"}
+    record.update(
+        terminal_marker=blocked_marker,
+        last_marker=blocked_marker,
+        attention_marker=blocked_marker,
+    )
+    ledger.write_record(record)
+
+    monkeypatch.setattr(
+        ledger.goalflight_terminal,
+        "worker_liveness_from_probe",
+        lambda _alive, _reason=None: (
+            "live" if worker_still_alive is True else "unknown"
+        ),
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        code = ledger.cmd_finish(
+            argparse.Namespace(
+                dispatch_id=dispatch_id,
+                state=state,
+                reason=None,
+                terminal_state=None,
+                elapsed_s=None,
+                worker_still_alive=worker_still_alive,
+            )
+        )
+    payload = json.loads(output.getvalue())
+    assert code != 0, payload
+    retained = ledger.read_record(dispatch_id)
+    assert retained is not None
+    assert retained["state"] == "running", retained
+    assert retained["terminal_marker"] == blocked_marker, retained
+    assert retained["last_marker"] == blocked_marker, retained
+    assert retained["attention_marker"] == blocked_marker, retained
+    attempt = journal.open_or_create_journal(project).attempt_for_dispatch(dispatch_id)
+    assert attempt is None, attempt
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        complete_code = ledger.cmd_finish(
+            argparse.Namespace(
+                dispatch_id=dispatch_id,
+                state="complete",
+                reason=None,
+                terminal_state=None,
+                elapsed_s=None,
+                worker_still_alive=False,
+            )
+        )
+    assert complete_code == 0, output.getvalue()
+    assert ledger.read_record(dispatch_id)["terminal_state"] == "complete"

@@ -246,6 +246,9 @@ authorize only that report path. Neither transport authorizes source edits;
 those require the separate patching gate below. Scratch output may be
 temporary; the report and verdict may not be.
 
+Use `$TMPDIR` for temporary scratch output, separate clones, logs and browser profiles; it is the dispatch scratch directory or a private child, is retention-managed and removed after dispatch ends. Do not create `/tmp/<name>` or `/private/tmp/<name>` entries.
+Start headless Chrome or Chromium with `--use-mock-keychain` and `--user-data-dir` under `$TMPDIR`; Grok and Cursor account homes have no keychain, so Chrome may show a dialog on the owner's screen.
+
 ## Premises-table contract
 
 Every scout report records:

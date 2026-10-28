@@ -44,7 +44,12 @@ import urllib.request
 
 BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 AUTH_PATH = Path(os.environ.get("GROK_HOME", Path.home() / ".grok")) / "auth.json"
-ACCOUNTS_DIR = Path.home() / ".goal-flight" / "accounts"
+_accounts_dir_override = os.environ.get("GOALFLIGHT_GROK_ACCOUNTS_DIR", "").strip()
+ACCOUNTS_DIR = (
+    Path(_accounts_dir_override).expanduser()
+    if _accounts_dir_override
+    else Path.home() / ".goal-flight" / "accounts"
+)
 DEFAULT_TIMEOUT_S = 15.0
 LABEL = "grok"
 PROBE_USABLE = "usable"

@@ -22,12 +22,12 @@ import goalflight_engine_sessions as E  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 
 
-GROK_SESSION = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-KIMI_SESSION = "session_bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
-CURSOR_SESSION = "0123456789abcdef0123456789abcdef"
-CLAUDE_SESSION = "cccccccc-dddd-4eee-8fff-000000000000"
-CURSOR_SESSION_UUID = "d128e49d-883f-44e2-8cca-1fe16902cba9"
-PRIOR_CURSOR_SESSION = "11111111-2222-4333-8444-555555555555"
+GROK_SESSION = "00000000-0000-4000-8000-000000000034"
+KIMI_SESSION = "session_00000000-0000-4000-8000-000000000027"
+CURSOR_SESSION = "00000000000000000000000000000002"
+CLAUDE_SESSION = "00000000-0000-4000-8000-000000000031"
+CURSOR_SESSION_UUID = "00000000-0000-4000-8000-000000000032"
+PRIOR_CURSOR_SESSION = "00000000-0000-4000-8000-000000000035"
 
 
 pytestmark = pytest.mark.skipif(
@@ -95,6 +95,53 @@ def _grok_args(**overrides):
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_claude_resume_publication_uses_recorded_handle_without_seat_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "claude-publication-parent"
+    child_id = "claude-publication-child"
+    _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="claude",
+        engine="claude",
+        session_id=CLAUDE_SESSION,
+        state="complete",
+    )
+    args = SimpleNamespace(
+        agent="claude",
+        parent_dispatch_id=parent_id,
+        dispatch_id=child_id,
+        engine_session_id=CLAUDE_SESSION,
+    )
+    monkeypatch.setattr(
+        D,
+        "_seat_session_dir",
+        lambda *_args: pytest.fail("Claude has no seat-scoped session directory"),
+    )
+
+    with D._resume_publication_lock(args):
+        L.write_record(
+            {
+                "schema": L.SCHEMA,
+                "dispatch_id": child_id,
+                "parent_dispatch_id": parent_id,
+                "agent": "claude",
+                "engine": "claude",
+                "engine_session_id": CLAUDE_SESSION,
+                "state": "waiting_capacity",
+                "worker_pid": None,
+                "project_root": str(tmp_path),
+            }
+        )
+
+    child = L.read_record(child_id)
+    assert child is not None
+    assert child["parent_dispatch_id"] == parent_id
+    assert child["engine_session_id"] == CLAUDE_SESSION
 
 
 def test_fork_policy_is_reuse() -> None:
@@ -330,7 +377,7 @@ def test_resume_honors_explicit_grok_account(
     tmp_path: Path,
 ) -> None:
     parent_id = "grok-quota-parent"
-    worktree = tmp_path / "b-3363"
+    worktree = tmp_path / "b-0001"
     worktree.mkdir()
     record = _write_parent(
         tmp_path,
@@ -536,12 +583,12 @@ def test_kimi_harvest_never_guesses_among_many(tmp_path: Path) -> None:
     index.parent.mkdir(parents=True)
     rows = [
         {
-            "sessionId": "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "sessionId": "session_00000000-0000-4000-8000-000000000033",
             "workDir": str(work),
             "sessionDir": str(home / "s1"),
         },
         {
-            "sessionId": "session_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "sessionId": "session_00000000-0000-4000-8000-000000000026",
             "workDir": str(work),
             "sessionDir": str(home / "s2"),
         },
@@ -558,7 +605,7 @@ def test_kimi_harvest_returns_sole_match(tmp_path: Path) -> None:
     work.mkdir()
     index = home / ".kimi-code" / "session_index.jsonl"
     index.parent.mkdir(parents=True)
-    handle = "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    handle = "session_00000000-0000-4000-8000-000000000033"
     index.write_text(
         json.dumps(
             {
@@ -576,9 +623,9 @@ def test_kimi_harvest_returns_sole_match(tmp_path: Path) -> None:
 def test_footer_parser_reads_kimi_dash_s() -> None:
     assert (
         E.parse_resume_footer_handle(
-            "To resume this session: kimi -S session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            "To resume this session: kimi -S session_00000000-0000-4000-8000-000000000033"
         )
-        == "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        == "session_00000000-0000-4000-8000-000000000033"
     )
 
 
@@ -681,6 +728,7 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
             "seat",
             "--prompt-file",
             str(prompt),
+            "--in-place",
             "--cwd",
             str(tmp_path),
             "--foreground",
@@ -704,6 +752,11 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
     assert "--fork-session" not in first_argv
     session_id = first_argv.split("--session-id", 1)[1].split()[0]
     assert E.valid_session_id("grok", session_id) == session_id
+    session = D._seat_session_dir("seat", "grok", str(tmp_path), session_id)
+    assert session is not None
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    (session / "chat_history.jsonl").write_text("{}\n", encoding="utf-8")
     ledger_path = tmp_path / "state" / "runs.d" / "grok-first.json"
     if not ledger_path.is_file():
         found = list((tmp_path / "state").rglob("grok-first.json"))
@@ -742,6 +795,77 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
     assert session_id in resume_argv
     assert "--fork-session" not in resume_argv
     assert "--session-id" not in resume_argv
+
+
+def test_grok_resume_with_missing_session_directory_exits_64(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "goalflight-test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "Goal Flight Test"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+    parent_id = "grok-missing-session-parent"
+    record = _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="grok-code",
+        engine="grok",
+        session_id=GROK_SESSION,
+        state="complete",
+    )
+    record.update(
+        project_root=str(repo),
+        worker_cwd=str(repo),
+        account="seat",
+        effective_account="seat",
+        terminal_state="complete",
+    )
+    L.write_record(record)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue the recorded session.\n", encoding="utf-8")
+    account_home = Path(os.environ["HOME"]) / ".goal-flight" / "accounts" / "seat" / "grok" / ".grok"
+    account_home.mkdir(parents=True)
+    (account_home / "config.toml").write_text(
+        '[cli]\n\n[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    (account_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_grok = fake_bin / "grok"
+    fake_grok.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_grok.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
+
+    result = D.main(
+        [
+            "--agent", "grok-code",
+            "--shape", "bash",
+            "--unregistered-forced",
+            "--account", "seat",
+            "--prompt-file", str(prompt),
+            "--in-place",
+            "--cwd", str(repo),
+            "--foreground",
+            "--dispatch-id", "grok-missing-session-child",
+            "--parent-dispatch-id", parent_id,
+            "--engine-session-id", GROK_SESSION,
+        ]
+    )
+
+    assert result == 64
+    assert "resume source no longer exists" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

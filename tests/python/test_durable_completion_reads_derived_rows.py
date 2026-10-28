@@ -70,7 +70,7 @@ def launch_authority(tmp_path, monkeypatch):
         yield args, store, row, records
 
 
-@pytest.mark.parametrize("ledger_time", ["absent", "2026-01-01T00:00:00+00:00"])
+@pytest.mark.parametrize("ledger_time", ["absent", "2000-01-01T00:00:00+00:00"])
 def test_open_row_with_prior_complete_dispatch_can_launch(launch_authority, ledger_time, capsys):
     args, store, row, records = launch_authority
     row.update(done=False, done_at=None, closed_at=None, dispatches=[{
@@ -163,6 +163,186 @@ def test_partial_supersession_names_advanced_record(launch_authority, monkeypatc
     assert "reconcile-outbox" not in output.err
     assert "--force" in output.err
     assert "Do not open a new task row" in output.err
+
+
+@pytest.mark.parametrize(
+    ("carrier_output", "carrier_evidence", "carrier_status_kind"),
+    [
+        ("partial", {}, None),
+        ("unreadable", {}, None),
+        ("empty", {}, None),
+        ("empty", {"queue_worker_pid": 4242}, None),
+        ("empty", {"queue_worker_identity": {"pid": 4242, "start_token": "worker-start"}}, None),
+        ("empty", {"queue_worker_spawned_at": "2026-10-19T00:00:00Z"}, None),
+        ("empty", {"future_carrier_receipt": "present"}, None),
+        ("empty", {}, "worker"),
+        ("empty", {}, "output"),
+        ("empty", {}, "clean"),
+        ("empty", {}, "missing"),
+        ("empty", {}, "unreadable"),
+    ],
+)
+def test_partial_supersession_requires_carrier_tail_empty_for_salvage_bypass(
+    launch_authority, monkeypatch, carrier_output, carrier_evidence,
+    carrier_status_kind,
+):
+    args, _store, _row, _records = launch_authority
+    dispatch_id = "example-dispatch-1"
+    queue_token = "00000000000000000000000000000003"
+    record = json.loads(
+        """{
+          "agent": "codex",
+          "dispatch_id": "example-dispatch-1",
+          "epoch": "status-00000000000000000000000000000004",
+          "liveness_state": "worker_dead",
+          "project_root": "/tmp/example-project",
+          "reason": "partial_task_supersession",
+          "reconciliation": {
+            "checked_output": true,
+            "checked_task_ids": ["b-0001"],
+            "claim_recovery_count": 0,
+            "launch_timeout_s": 300.0,
+            "queue_launch_token": "00000000000000000000000000000003",
+            "salvage_required": true,
+            "source": "drain_claim_recovery"
+          },
+          "schema": "goalflight.status.v1",
+          "shape": "bash",
+          "state": "worker_dead",
+          "terminal_marker": null,
+          "terminal_state": "worker_dead",
+          "task_ids": ["b-0001"],
+          "updated_at": 1767225600,
+          "worker_alive": false,
+          "worker_pid": null
+        }"""
+    )
+    record["project_root"] = args.project_root
+    record["queue_launch_token"] = queue_token
+
+    authority = D.goalflight_journal.Journal.create(Path(args.project_root))
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None, prepared.reason
+    terminal = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="worker_dead",
+        observation={"terminal_state": "worker_dead"},
+    )
+    assert terminal.committed, terminal.reason
+
+    carrier_tail = Path(args.project_root) / f"{carrier_output}.tail"
+    carrier_tail.touch()
+    if carrier_output == "partial":
+        carrier_tail.write_text("partial worker output\n", encoding="utf-8")
+    elif carrier_output == "unreadable":
+        original_open = Path.open
+
+        def unreadable_open(path, *open_args, **open_kwargs):
+            if path == carrier_tail:
+                raise PermissionError("carrier tail is unreadable")
+            return original_open(path, *open_args, **open_kwargs)
+
+        monkeypatch.setattr(Path, "open", unreadable_open)
+
+    request = {"tail": str(carrier_tail)}
+    if carrier_status_kind:
+        status_path = Path(args.project_root) / f"{carrier_status_kind}.status.json"
+        request["status_json"] = str(status_path)
+        if carrier_status_kind != "missing":
+            status_record = {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": dispatch_id,
+                "project_root": args.project_root,
+                "state": "worker_dead",
+                "terminal_state": "worker_dead",
+            }
+            if carrier_status_kind == "worker":
+                status_record.update(
+                    worker_pid=4242,
+                    worker_identity={"pid": 4242, "start_token": "worker-start"},
+                )
+            elif carrier_status_kind == "output":
+                worker_output = Path(args.project_root) / "sidecar-worker.tail"
+                worker_output.write_text("partial worker output\n", encoding="utf-8")
+                status_record["tail_path"] = str(worker_output)
+            else:
+                status_record["tail_path"] = str(carrier_tail)
+            status_path.write_text(json.dumps(status_record), encoding="utf-8")
+        if carrier_status_kind == "unreadable":
+            original_read_text = Path.read_text
+
+            def unreadable_status(path, *read_args, **read_kwargs):
+                if path == status_path:
+                    raise PermissionError("carrier status sidecar is unreadable")
+                return original_read_text(path, *read_args, **read_kwargs)
+
+            monkeypatch.setattr(Path, "read_text", unreadable_status)
+
+    monkeypatch.setattr(
+        D, "_linked_task_truth_detail",
+        lambda *_a, **_kw: ("some_advanced", None, []),
+    )
+    entry = {
+        "dispatch_id": dispatch_id,
+        "project_root": args.project_root,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "task_ids": ["b-0001"],
+        "queue_launch_token": "replacement-queue-token",
+        "request": request,
+    }
+    entry.update(carrier_evidence)
+    decision = D._entry_completion_authority(
+        entry,
+        record,
+    )
+    expected_salvage = (
+        carrier_output != "empty"
+        or bool(carrier_evidence)
+        or carrier_status_kind in {"worker", "output", "missing", "unreadable"}
+    )
+    assert decision["state"] == "worker_dead"
+    assert decision["reason"] == "partial_task_supersession"
+    assert decision.get("salvage_required", False) is expected_salvage
+
+    D.goalflight_ledger.write_record(record)
+    queue_entry = {
+        "dispatch_id": dispatch_id,
+        "project_root": args.project_root,
+        "request": request,
+        **carrier_evidence,
+    }
+    queue_path = D._queue_entry_path(dispatch_id)
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.write_text(json.dumps(queue_entry), encoding="utf-8")
+    args._redispatch_pending = {
+        "records": [record],
+        "wip_refs": {},
+        "completed": [],
+        "replacement_id": "replacement",
+        "actor": "controller",
+        "reason": "forced redispatch",
+        "committed": False,
+    }
+    pin_calls = []
+    pin = D._pin_redispatch_wip
+
+    def track_pin(current, carriers):
+        pin_calls.append(current["dispatch_id"])
+        return pin(current, carriers)
+
+    monkeypatch.setattr(D, "_pin_redispatch_wip", track_pin)
+    if not expected_salvage:
+        D._commit_task_redispatch(args)
+        assert record["superseded_by"] == "replacement"
+        assert "wip_ref" not in record
+        assert pin_calls == []
+    else:
+        with pytest.raises(D.DispatchUsageError, match="has no worker cwd to pin"):
+            D._commit_task_redispatch(args)
+        assert pin_calls == [dispatch_id]
+        persisted = D.goalflight_ledger.read_record(dispatch_id)
+        assert "superseded_by" not in persisted
+        assert persisted["reconciliation"]["salvage_required"] is True
 
 
 @pytest.mark.parametrize("status_kind", ["failed", "healthy", "foreign", "unreadable"])
@@ -273,7 +453,7 @@ def test_direct_resume_refuses_unproven_dead_parent_before_bind(
         "--agent", "claude", "--shape", shape, "--unregistered-forced",
         "--dispatch-id", "resume-child", "--task", row["id"],
         "--parent-dispatch-id", "resume-parent",
-        "--engine-session-id", "12345678-1234-4abc-8def-1234567890ab",
+        "--engine-session-id", "00000000-0000-4000-8000-000000000033",
         "--cwd", args.project_root, "--prompt", "continue", "--launch-detached",
     ])
 

@@ -20,6 +20,7 @@ import select
 import shlex
 import signal
 import sqlite3
+import socket
 import stat
 import subprocess
 import tempfile
@@ -28,7 +29,7 @@ import uuid
 from pathlib import Path
 import sys
 import time
-from typing import TextIO, TypeVar
+from typing import Iterator, TextIO, TypeVar
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -49,12 +50,19 @@ TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
 PROJECT_MAIL_ALIASES_ENV = "GOALFLIGHT_PROJECT_MAIL_ALIASES"
 MIN_DERIVED_PROJECT_ALIAS_LEN = 4
 _MONITOR_JOURNAL_PROBE_BUDGET_S = 0.05
+_WORKER_JOURNAL_OUTBOX_SCHEMA = "goalflight.worker-journal-delivery.v1"
+_WORKER_JOURNAL_OUTBOX_MAX_RECORDS_PER_PASS = 16
+_WORKER_JOURNAL_OUTBOX_PASS_BUDGET_S = 0.2
+_WORKER_JOURNAL_OUTBOX_QUARANTINE_SCAN_BYTES = 64 * 1024
+_WORKER_JOURNAL_OUTBOX_MAX_PROJECTION_FAILURES = 3
+_WORKER_JOURNAL_OUTBOX_RETRY_BASE_S = 0.25
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_compat  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_wake  # noqa: E402
+from goalflight_liveness import host_slept_recently  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
 _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS = (
@@ -294,7 +302,39 @@ _STDIN_TEXT_FILE_NAMES = frozenset({"-", "/dev/stdin"})
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
 CONTROLLER_ADDRESSEE_KIND = "controller"
+
+
+def _is_task_store_nudge_replacement(previous: object, replacement: object) -> bool:
+    """Whether two task-store nudges share an explicit replacement identity."""
+    def identity(envelope: object) -> tuple[str, str, str, str] | None:
+        if not isinstance(envelope, dict) or envelope.get("type") != "user_need":
+            return None
+        payload = envelope.get("payload")
+        source = envelope.get("source")
+        if not isinstance(payload, dict) or not isinstance(source, dict):
+            return None
+        nudge_kind = str(payload.get("nudge_kind") or "")
+        project_root = str(payload.get("project_root") or "")
+        dispatch_id = str(envelope.get("dispatch_id") or "")
+        origin_node = str(source.get("node") or "")
+        if (
+            nudge_kind not in TASK_STORE_STATUS_NUDGE_KINDS
+            or not project_root
+            or not dispatch_id
+            or not origin_node
+            or source.get("adapter") != "task-store"
+        ):
+            return None
+        return dispatch_id, origin_node, nudge_kind, project_root
+
+    previous_identity = identity(previous)
+    return previous_identity is not None and previous_identity == identity(replacement)
+
+
 STREAM_TOKEN_MAX = 255
+# One 255-byte dispatch id, eight 20-digit counters, and 512 bytes of JSON keys,
+# punctuation, booleans, and schema text is larger than any valid cursor.
+_WORKER_JOURNAL_OUTBOX_CURSOR_MAX_BYTES = STREAM_TOKEN_MAX + 8 * 20 + 512
 STREAM_TOKEN_RE = re.compile(
     rf"[A-Za-z0-9](?:[A-Za-z0-9._:@+\-]{{0,{STREAM_TOKEN_MAX - 2}}}[A-Za-z0-9])?\Z"
 )
@@ -315,6 +355,9 @@ QUARANTINE_BYTES_LIMIT = 256
 MAX_JSON_DEPTH = 32
 MAX_ENVELOPE_JSON_BYTES = 1_048_576
 MAX_PAYLOAD_JSON_BYTES = 786_432
+_WORKER_JOURNAL_OUTBOX_MAX_RECORD_BYTES = 2 * MAX_ENVELOPE_JSON_BYTES + 8192
+_WORKER_JOURNAL_OUTBOX_MAX_BYTES_PER_PASS = 4 * MAX_ENVELOPE_JSON_BYTES
+_CARRIER_RECOVERY_QUARANTINE_REASON_BYTES = 4_096
 
 REQUIRED_ENVELOPE_FIELDS = (
     "schema",
@@ -333,6 +376,10 @@ class MessageError(Exception):
     pass
 
 
+class JournalRetryableError(MessageError):
+    """A journal projection write was deferred and should be retried."""
+
+
 class CarrierReadStatus(str, Enum):
     OK = "ok"
     CORRUPT_RECORDS_QUARANTINED = "corrupt-records-quarantined"
@@ -341,10 +388,34 @@ class CarrierReadStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class CarrierReadRecord:
+    line_no: int
+    offset: int
+    next_offset: int
+    envelope: dict | None
+    error: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class CarrierRecoverySlice:
+    data: bytes
+    bytes_read: int
+    next_offset: int
+    device: int
+    inode: int
+    file_size: int
+    data_offset: int
+    skipped_line: CarrierReadRecord | None
+    skipping_line: bool
+    skipped_line_offset: int | None
+
+
+@dataclass(frozen=True)
 class CarrierReadResult:
     status: CarrierReadStatus
     envelopes: tuple[dict, ...]
     errors: tuple[dict[str, object], ...]
+    records: tuple[CarrierReadRecord, ...] = ()
 
 
 def require_positive_int_seq(value: object, *, path: str) -> int:
@@ -357,6 +428,23 @@ def require_positive_int_seq(value: object, *, path: str) -> int:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def emit_not_recorded(reason: object, next_command: str) -> None:
+    """Report one refused or failed write with a concrete recovery command."""
+    detail = str(reason).replace("\r", " ").replace("\n", " ").strip()
+    command = " ".join(str(next_command).split())
+    print(f"NOT RECORDED: {detail or 'write failed'}; next: {command}", file=sys.stderr)
+
+
+def emit_recorded_not_delivered(reason: object, next_command: str) -> None:
+    """Report a durable write whose delivery needs recovery."""
+    detail = str(reason).replace("\r", " ").replace("\n", " ").strip()
+    command = " ".join(str(next_command).split())
+    print(
+        f"RECORDED, NOT DELIVERED: {detail or 'worker delivery failed'}; next: {command}",
+        file=sys.stderr,
+    )
 
 
 def default_messages_dir() -> Path:
@@ -378,6 +466,15 @@ def validate_stream_id(dispatch_id: object, *, path: str = "dispatch_id") -> str
             "using letters, digits, '.', '_', ':', '@', '+', or '-'"
         )
     return dispatch_id
+
+
+def _validate_post_stream_id(dispatch_id: object, *, path: str = "dispatch_id") -> str:
+    if isinstance(dispatch_id, str) and (
+        not dispatch_id.strip()
+        or dispatch_id in {"None", "none", "null", "NULL", "undefined"}
+    ):
+        raise MessageError(f"{path}: dispatch id is unset; pass a real stream id")
+    return validate_stream_id(dispatch_id, path=path)
 
 
 def _lexical_absolute(path: Path) -> Path:
@@ -1018,12 +1115,13 @@ def validate_envelope(
             )
         raw_type = str(envelope.get("type") or "")
         if (
-            canonical_event_type(raw_type) not in CONTROLLER_CHANNEL_TYPES
+            raw_type not in {"blocked", "result", "user_need", "user_confirm"}
+            and canonical_event_type(raw_type) not in CONTROLLER_CHANNEL_TYPES
             and raw_type not in CONTROLLER_ADDRESSEE_TYPES
         ):
             raise MessageError(
                 f"{path}.addressee: controller addressing is only valid for "
-                "controller-channel types or merge-request/patch/finding; "
+                "controller-channel, patch/finding, or terminal event types; "
                 "use --type controller-notice with --to-controller LABEL"
             )
     return _canonical_json_text(envelope, path=path, byte_limit=MAX_ENVELOPE_JSON_BYTES)
@@ -1527,6 +1625,216 @@ class CarrierTransaction:
         self._read_succeeded = True
         return data
 
+    def read_tail_bytes(self, max_bytes: int) -> tuple[bytes, bool]:
+        """Read a bounded tail window from this locked regular carrier."""
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("tail read limit must be a positive integer")
+        self._read_succeeded = False
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise MessageError(f"{self.path}: unreadable carrier: {type(exc).__name__}: {exc}") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise MessageError(f"{self.path}: carrier is not a regular file; refusing access")
+            size = info.st_size
+            start = max(0, size - max_bytes)
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                if start:
+                    handle.seek(start - 1)
+                    previous = handle.read(1)
+                    handle.seek(start)
+                handle.seek(start)
+                data = handle.read(size - start)
+            if start and previous != b"\n":
+                first_newline = data.find(b"\n")
+                if first_newline >= 0:
+                    start += first_newline + 1
+                    data = data[first_newline + 1 :]
+                else:
+                    start = size
+                    data = b""
+            if len(data) != size - start:
+                raise MessageError(f"{self.path}: carrier changed during tail read")
+            self._read_succeeded = True
+            return data, start > 0
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def read_recovery_slice(
+        self,
+        offset: int,
+        *,
+        max_bytes: int,
+        max_records: int,
+        line_no: int,
+        deadline: float | None = None,
+        skipping_line: bool = False,
+        skipped_line_offset: int | None = None,
+    ) -> CarrierRecoverySlice:
+        """Read bounded JSONL records, resuming oversized-line skips if needed."""
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("recovery offset must be a non-negative integer")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("recovery byte limit must be a positive integer")
+        if not isinstance(max_records, int) or isinstance(max_records, bool) or max_records <= 0:
+            raise ValueError("recovery record limit must be a positive integer")
+        self._read_succeeded = False
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise MessageError(
+                f"{self.path}: unreadable carrier: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise MessageError(f"{self.path}: carrier is not a regular file; refusing access")
+            if offset > info.st_size:
+                raise MessageError(f"{self.path}: recovery offset exceeds carrier size")
+            data = bytearray()
+            bytes_read = 0
+            complete_lines = 0
+            skipped_record: CarrierReadRecord | None = None
+            next_offset = offset
+            data_offset = offset
+            if skipping_line and skipped_line_offset is None:
+                raise ValueError("a skipped carrier line requires its original offset")
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                handle.seek(offset)
+                if skipping_line:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        self._read_succeeded = True
+                        return CarrierRecoverySlice(
+                            b"",
+                            0,
+                            offset,
+                            int(info.st_dev),
+                            int(info.st_ino),
+                            int(info.st_size),
+                            offset,
+                            None,
+                            True,
+                            skipped_line_offset,
+                        )
+                    chunk = handle.readline(max_bytes)
+                    bytes_read += len(chunk)
+                    next_offset += len(chunk)
+                    if chunk.endswith(b"\n") or handle.tell() >= info.st_size:
+                        reason = f"carrier line exceeds {MAX_ENVELOPE_JSON_BYTES} bytes"
+                        error = {
+                            "path": str(self.path),
+                            "line": line_no,
+                            "offset": skipped_line_offset,
+                            "error": f"{self.path}:{line_no}: {reason}",
+                            "reason": reason,
+                            "validated_envelopes": 0,
+                            "validated_through_seq": 0,
+                        }
+                        skipped_record = CarrierReadRecord(
+                            line_no,
+                            skipped_line_offset,
+                            next_offset,
+                            None,
+                            error,
+                        )
+                        complete_lines += 1
+                        line_no += 1
+                        skipping_line = False
+                    else:
+                        self._read_succeeded = True
+                        return CarrierRecoverySlice(
+                            b"",
+                            bytes_read,
+                            next_offset,
+                            int(info.st_dev),
+                            int(info.st_ino),
+                            int(info.st_size),
+                            next_offset,
+                            None,
+                            True,
+                            skipped_line_offset,
+                        )
+                data_offset = next_offset
+                while (
+                    bytes_read < max_bytes
+                    and complete_lines < max_records
+                    and (deadline is None or time.monotonic() < deadline)
+                ):
+                    remaining = max_bytes - bytes_read
+                    line_offset = next_offset
+                    chunk = handle.readline(remaining)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    next_offset += len(chunk)
+                    if chunk.endswith(b"\n"):
+                        data.extend(chunk)
+                        complete_lines += 1
+                    elif handle.tell() >= info.st_size:
+                        data.extend(chunk)
+                        complete_lines += 1
+                    elif len(chunk) > MAX_ENVELOPE_JSON_BYTES:
+                        skipped_line_offset = line_offset
+                        if bytes_read >= max_bytes:
+                            skipping_line = True
+                            break
+                        chunk = handle.readline(max_bytes - bytes_read)
+                        bytes_read += len(chunk)
+                        next_offset += len(chunk)
+                        if chunk.endswith(b"\n") or handle.tell() >= info.st_size:
+                            reason = f"carrier line exceeds {MAX_ENVELOPE_JSON_BYTES} bytes"
+                            error = {
+                                "path": str(self.path),
+                                "line": line_no,
+                                "offset": skipped_line_offset,
+                                "error": f"{self.path}:{line_no}: {reason}",
+                                "reason": reason,
+                                "validated_envelopes": 0,
+                                "validated_through_seq": 0,
+                            }
+                            skipped_record = CarrierReadRecord(
+                                line_no,
+                                skipped_line_offset,
+                                next_offset,
+                                None,
+                                error,
+                            )
+                            complete_lines += 1
+                            line_no += 1
+                            data_offset = next_offset
+                        else:
+                            skipping_line = True
+                            break
+                    else:
+                        # The remaining byte allowance was too small to finish a
+                        # valid envelope. Leave its cursor at the line boundary.
+                        next_offset = line_offset
+                        break
+            self._read_succeeded = True
+            value = bytes(data)
+            return CarrierRecoverySlice(
+                value,
+                bytes_read,
+                next_offset,
+                int(info.st_dev),
+                int(info.st_ino),
+                int(info.st_size),
+                data_offset,
+                skipped_record,
+                skipping_line,
+                skipped_line_offset if skipping_line else None,
+            )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     def _require_read_before_write(self) -> None:
         if not self._read_succeeded:
             raise MessageError(
@@ -1545,7 +1853,6 @@ class CarrierTransaction:
             raise TypeError("carrier replacement requires bytes")
         self._require_read_before_write()
         _replace_fsync(self.path, data)
-
 
 @contextlib.contextmanager
 def carrier_transaction(
@@ -1586,17 +1893,45 @@ def _quarantine_row(path: Path, offset: int, reason: str, raw_line: bytes) -> di
     }
 
 
-def _record_quarantine(row: dict) -> None:
+def _record_quarantine(
+    row: dict,
+    *,
+    lock_timeout_secs: float = 5.0,
+    max_recovery_bytes: int | None = None,
+) -> int:
     carrier = _canonical_jsonl_path(Path(str(row["path"])))
     canonical_row = {**row, "path": str(carrier)}
+    if max_recovery_bytes is not None:
+        reason = canonical_row.get("reason")
+        if isinstance(reason, str):
+            reason_bytes = reason.encode("utf-8", "replace")
+            if len(reason_bytes) > _CARRIER_RECOVERY_QUARANTINE_REASON_BYTES:
+                reason_bytes = (
+                    reason_bytes[:_CARRIER_RECOVERY_QUARANTINE_REASON_BYTES - 3]
+                    + b"..."
+                )
+            canonical_row["reason"] = reason_bytes.decode("utf-8", "ignore")
     sidecar = quarantine_path(carrier)
     identity = (canonical_row["path"], canonical_row["offset"], canonical_row["hash"])
+    encoded = (
+        json.dumps(canonical_row, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    max_existing_bytes = max_recovery_bytes
+    if max_recovery_bytes is not None:
+        if max_recovery_bytes <= len(encoded) + 1:
+            raise MessageError("quarantine row exceeds carrier recovery byte budget")
+        max_existing_bytes -= len(encoded) + 1
     with carrier_transaction(
         sidecar,
         quarantine_sidecar=True,
-        lock_timeout_secs=5.0,
+        lock_timeout_secs=lock_timeout_secs,
     ) as transaction:
-        existing = transaction.read_bytes()
+        if max_existing_bytes is None or not transaction.path.exists():
+            existing = transaction.read_bytes()
+            bytes_read = len(existing)
+        else:
+            existing, truncated = transaction.read_tail_bytes(max_existing_bytes)
+            bytes_read = len(existing) if not truncated else max_existing_bytes + 1
         for raw in existing.splitlines():
             try:
                 item = json.loads(raw)
@@ -1605,12 +1940,9 @@ def _record_quarantine(row: dict) -> None:
             if not isinstance(item, dict):
                 continue
             if (item.get("path"), item.get("offset"), item.get("hash")) == identity:
-                return
-        transaction.append_bytes(
-            (json.dumps(canonical_row, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-                "utf-8"
-            ),
-        )
+                return bytes_read
+        transaction.append_bytes(encoded)
+        return bytes_read + len(encoded)
 
 
 def record_carrier_quarantine(path: Path, offset: int, reason: str, raw_line: bytes) -> dict:
@@ -1647,7 +1979,15 @@ def _carrier_error(
 
 
 def _read_envelope_records(
-    path: Path, *, tolerate_errors: bool, locked_data: bytes | None = None
+    path: Path,
+    *,
+    tolerate_errors: bool,
+    locked_data: bytes | None = None,
+    offset_base: int = 0,
+    first_line_no: int = 1,
+    include_records: bool = False,
+    seen_sequences: set[int] | None = None,
+    record_quarantine: bool = True,
 ) -> CarrierReadResult:
     path = _canonical_jsonl_path(Path(path))
     expected_dispatch_id = _require_carrier_path(path)
@@ -1688,14 +2028,20 @@ def _read_envelope_records(
             (error,),
         )
     envelopes: list[dict] = []
-    seen_sequences: set[int] = set()
+    seen_sequences = seen_sequences if seen_sequences is not None else set()
     errors: list[dict[str, object]] = []
+    records: list[CarrierReadRecord] | None = [] if include_records else None
     offset = 0
-    for line_no, chunk in enumerate(data.splitlines(keepends=True), start=1):
+    for line_no, chunk in enumerate(
+        data.splitlines(keepends=True), start=first_line_no
+    ):
         raw_line = chunk.rstrip(b"\r\n")
-        line_offset = offset
+        line_offset = offset_base + offset
         offset += len(chunk)
+        next_offset = offset_base + offset
         if not raw_line.strip():
+            if records is not None:
+                records.append(CarrierReadRecord(line_no, line_offset, next_offset, None, None))
             continue
         reason: str | None = None
         envelope: object = None
@@ -1731,20 +2077,29 @@ def _read_envelope_records(
                 envelopes=envelopes,
             )
             errors.append(error)
-            _record_quarantine(
-                _quarantine_row(path, line_offset, reason, raw_line)
-            )
+            if record_quarantine:
+                _record_quarantine(
+                    _quarantine_row(path, line_offset, reason, raw_line)
+                )
+            if records is not None:
+                records.append(
+                    CarrierReadRecord(line_no, line_offset, next_offset, None, error)
+                )
             if not tolerate_errors:
                 break
             continue
         seen_sequences.add(int(envelope["seq"]))
         envelopes.append(envelope)  # type: ignore[arg-type]
+        if records is not None:
+            records.append(
+                CarrierReadRecord(line_no, line_offset, next_offset, envelope, None)
+            )
     status = (
         CarrierReadStatus.CORRUPT_RECORDS_QUARANTINED
         if errors
         else CarrierReadStatus.OK
     )
-    return CarrierReadResult(status, tuple(envelopes), tuple(errors))
+    return CarrierReadResult(status, tuple(envelopes), tuple(errors), tuple(records or ()))
 
 
 def read_envelopes_result(
@@ -1888,6 +2243,9 @@ def update_envelopes(
 # poll the dispatch mailbox from `goalflight_dispatch.py steer`, not this type.
 STEERING_DISPATCH_ID = "fleet-steering"
 
+# These streams intentionally combine posts from multiple project roots.
+FLEET_WIDE_STREAM_IDS = frozenset({"controller-quota-advisory"})
+
 
 def _reject_steer_type_off_worker_mailbox(dispatch_id: str, msg_type: str) -> None:
     """Refuse `steer`/`steering` except on the fleet-steering register."""
@@ -1905,6 +2263,104 @@ def _reject_steer_type_off_worker_mailbox(dispatch_id: str, msg_type: str) -> No
 def _worker_own_inbox_post(dispatch_id: str) -> bool:
     """True when this process is the worker posting to its own dispatch stream."""
     return os.environ.get("GOALFLIGHT_DISPATCH_ID") == dispatch_id
+
+
+def _stream_owner_path(path: Path) -> Path:
+    return path.with_name(f"{path.name[:-len('.jsonl')]}.owner.json")
+
+
+def _stream_posting_project(
+    dispatch_id: str,
+    *,
+    addressee: dict | None,
+    source: dict,
+) -> tuple[str | None, str | None]:
+    """Return the stream's canonical project and known controller label."""
+    if dispatch_id in FLEET_WIDE_STREAM_IDS:
+        return None, None
+    record, _lookup_error = _dispatch_record(dispatch_id)
+    root = addressee.get("project_root") if isinstance(addressee, dict) else None
+    if not root and isinstance(record, dict):
+        root = record.get("project_root")
+    if not root:
+        root = _current_project_root()
+    project_root = str(root or "").strip()
+    if not project_root or not Path(project_root).is_absolute():
+        raise MessageError(
+            f"cannot determine the posting project for stream {dispatch_id!r}; "
+            "run the post from its project checkout"
+        )
+
+    controller_label = str(source.get("controller_label") or "").strip()
+    if controller_label == UNKNOWN_CONTROLLER_LABEL:
+        controller_label = ""
+    if not controller_label and isinstance(record, dict):
+        controller_label = str(record.get("controller_label") or "").strip()
+    return project_root, controller_label or None
+
+
+def _read_stream_owner(path: Path) -> str:
+    try:
+        owner = json.loads(_read_nofollow_bytes(path, missing_ok=False))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MessageError(f"{path}: invalid stream owner sidecar; refusing post") from exc
+    except MessageError as exc:
+        raise MessageError(f"{path}: cannot read stream owner sidecar: {exc}") from exc
+    project_root = owner.get("project_root") if isinstance(owner, dict) else None
+    if (
+        not isinstance(project_root, str)
+        or not project_root.strip()
+        or not Path(project_root).is_absolute()
+    ):
+        raise MessageError(f"{path}: invalid stream owner project; refusing post")
+    return project_root
+
+
+def _ensure_stream_owner(
+    path: Path,
+    *,
+    dispatch_id: str,
+    project_root: str | None,
+    controller_label: str | None,
+) -> None:
+    # Fleet-wide streams intentionally have no per-project owner sidecar.
+    if dispatch_id in FLEET_WIDE_STREAM_IDS:
+        return
+    if project_root is None:
+        raise MessageError(f"cannot determine the posting project for stream {dispatch_id!r}")
+    owner_path = _stream_owner_path(path)
+    owner: dict[str, str] = {"project_root": project_root}
+    if controller_label:
+        owner["controller_label"] = controller_label
+    content = (json.dumps(owner, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(owner_path, flags, 0o600)
+    except FileExistsError:
+        existing_project = _read_stream_owner(owner_path)
+        if existing_project != project_root:
+            raise MessageError(
+                f"stream {dispatch_id!r} belongs to project "
+                f"{existing_project!r}, but this post is from project "
+                f"{project_root!r}; choose a project-distinct stream id"
+            )
+        return
+    except OSError as exc:
+        raise MessageError(f"cannot create stream owner sidecar {owner_path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise MessageError(f"cannot write stream owner sidecar {owner_path}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _fsync_directory(owner_path.parent)
 
 
 def _is_advisory_junk_drawer_type(msg_type: str) -> bool:
@@ -2030,6 +2486,7 @@ def post_message(
     project_journal_delivery: bool = True,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
+    dispatch_id = _validate_post_stream_id(dispatch_id)
     addressee = _normalize_controller_addressee(addressee)
     _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
     _reject_unaddressed_controller_mail(
@@ -2050,6 +2507,7 @@ def post_message(
     except Exception:
         payload = {"text": "[redacted]"}
     path = inbox_path(messages_dir, dispatch_id)
+    worker_context = bool(str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip())
     _reject_casefold_stream_collision(messages_dir, dispatch_id)
     _require_carrier_path(path)
     provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
@@ -2067,6 +2525,11 @@ def post_message(
     # omit the field. Producers that bypass post_message (write_steering_envelope)
     # stamp the same way. Non-controller transports are unchanged.
     _stamp_controller_source_label(base_source)
+    posting_project_root, posting_controller_label = _stream_posting_project(
+        dispatch_id,
+        addressee=addressee,
+        source=base_source,
+    )
     envelope = {
         "schema": "goalflight.message.v1",
         "schema_version": 1,
@@ -2113,6 +2576,12 @@ def post_message(
         # win the case-insensitive name race between the preflight scan and
         # this append.
         _reject_casefold_stream_collision(messages_dir, dispatch_id)
+        _ensure_stream_owner(
+            transaction.path,
+            dispatch_id=dispatch_id,
+            project_root=posting_project_root,
+            controller_label=posting_controller_label,
+        )
         existing = _read_envelopes_for_write(transaction)
         same_identity = next(
             (
@@ -2170,12 +2639,24 @@ def post_message(
                 raise MessageError(
                     "event identity integrity conflict: same origin_node + event_uuid has different content"
                 )
-            assignment = (
-                _prepare_journal_delivery(same_identity, path)
-                if project_journal_delivery
-                else ()
-            )
-            controller_deliveries = _mark_journal_delivery(assignment)
+            projection_error = None
+            if project_journal_delivery and worker_context:
+                controller_deliveries, projection_error = (
+                    _worker_journal_projection_with_outbox(
+                        same_identity,
+                        path,
+                        worker_dispatch_id=str(
+                            os.environ.get("GOALFLIGHT_DISPATCH_ID") or ""
+                        ),
+                    )
+                )
+            else:
+                assignment = (
+                    _prepare_journal_delivery(same_identity, path)
+                    if project_journal_delivery
+                    else ()
+                )
+                controller_deliveries = _mark_journal_delivery(assignment)
             delivery = (_deliver_message_to_worker(dispatch_id, same_identity,
                 retain_terminal_worker_view=retain_terminal_worker_view) if deliver_to_worker else {
                     "requested": False, "delivered": False, "worker_view_written": False,
@@ -2188,20 +2669,33 @@ def post_message(
                 "delivery": delivery,
             }
             if not deliver_to_worker:
-                result["controller_delivery"] = _controller_delivery_report(
+                result["controller_delivery"] = _controller_delivery_report_after_projection(
                     controller_deliveries,
                     envelope=same_identity,
+                    projection_error=projection_error,
                 )
             return result
         if skip_if is not None:
             duplicate = next((item for item in existing if skip_if(item)), None)
             if duplicate is not None:
-                assignment = (
-                    _prepare_journal_delivery(duplicate, path)
-                    if project_journal_delivery
-                    else ()
-                )
-                controller_deliveries = _mark_journal_delivery(assignment)
+                projection_error = None
+                if project_journal_delivery and worker_context:
+                    controller_deliveries, projection_error = (
+                        _worker_journal_projection_with_outbox(
+                            duplicate,
+                            path,
+                            worker_dispatch_id=str(
+                                os.environ.get("GOALFLIGHT_DISPATCH_ID") or ""
+                            ),
+                        )
+                    )
+                else:
+                    assignment = (
+                        _prepare_journal_delivery(duplicate, path)
+                        if project_journal_delivery
+                        else ()
+                    )
+                    controller_deliveries = _mark_journal_delivery(assignment)
                 result = {
                     "envelope": duplicate,
                     "line": serialize_envelope_line(duplicate),
@@ -2216,9 +2710,10 @@ def post_message(
                     },
                 }
                 if not deliver_to_worker:
-                    result["controller_delivery"] = _controller_delivery_report(
+                    result["controller_delivery"] = _controller_delivery_report_after_projection(
                         controller_deliveries,
                         envelope=duplicate,
+                        projection_error=projection_error,
                     )
                 return result
         resolved_seq = require_positive_int_seq(
@@ -2239,7 +2734,7 @@ def post_message(
                 path,
                 replaced_envelopes=replaced,
             )
-            if project_journal_delivery
+            if project_journal_delivery and not worker_context
             else ()
         )
         if replace_if is not None:
@@ -2249,7 +2744,29 @@ def post_message(
             )
         else:
             _carrier_append_locked(transaction, envelope)
-        controller_deliveries = _mark_journal_delivery(assignment)
+        if project_journal_delivery and worker_context:
+            # Commit the carrier before the worker's best-effort journal write.
+            # A denied journal projection is staged in this dispatch's outbox
+            # for its unsandboxed watcher to publish.
+            controller_deliveries, projection_error = (
+                _worker_journal_projection_with_outbox(
+                envelope,
+                path,
+                worker_dispatch_id=str(
+                    os.environ.get("GOALFLIGHT_DISPATCH_ID") or ""
+                ),
+                replaced_envelopes=replaced,
+                )
+            )
+        else:
+            projection_error = None
+            try:
+                controller_deliveries = _mark_journal_delivery(assignment)
+            except Exception as exc:
+                # The carrier is already durable. Preserve that fact in the CLI
+                # result instead of letting cmd_post report the write as refused.
+                controller_deliveries = ()
+                projection_error = exc
         # The messages lock orders both the canonical record and its materialized
         # worker view. Releasing it between the two writes lets concurrent posts
         # assign message seq 1/2 but append steer entries in the order 2/1.
@@ -2277,10 +2794,11 @@ def post_message(
         "recorded": True,
         "delivery": delivery,
     }
-    if not deliver_to_worker:
-        result["controller_delivery"] = _controller_delivery_report(
+    if not deliver_to_worker or projection_error is not None:
+        result["controller_delivery"] = _controller_delivery_report_after_projection(
             controller_deliveries,
             envelope=envelope,
+            projection_error=projection_error,
         )
     return result
 
@@ -2299,7 +2817,12 @@ def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
     return record, None
 
 
-def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str, bool], ...]:
+def _journal_delivery_targets(
+    envelope: dict,
+    *,
+    reader_authority=None,
+    deadline: float | None = None,
+) -> tuple[tuple[Path, str, bool], ...]:
     """Return root, recipient, and whether an exact roster choice must stay active."""
     addressee_label = controller_addressee_label(envelope)
     addressee_root = controller_addressee_project_root(envelope)
@@ -2338,11 +2861,27 @@ def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str, bool], .
             try:
                 import goalflight_journal  # type: ignore
 
+                if reader_authority is not None:
+                    reader = reader_authority
+                elif deadline is None:
+                    reader = goalflight_journal.Journal.open_reader(root)
+                else:
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        raise TimeoutError("carrier recovery pass budget expired")
+                    reader = goalflight_journal.Journal.open_reader(
+                        root,
+                        retry_budget_s=remaining_s,
+                        open_retry_budget_s=remaining_s,
+                        transaction_budget_s=remaining_s,
+                    )
                 recipients = tuple(
                     str(row["label"])
-                    for row in goalflight_journal.Journal.open_reader(root).lease_records()
+                    for row in reader.lease_records()
                     if str(row.get("label") or "").strip()
                 )
+            except TimeoutError:
+                raise
             except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS as exc:
                 raise MessageError(
                     f"cannot resolve unowned terminal recipients: {exc}"
@@ -2374,13 +2913,43 @@ def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str, bool], .
     return ()
 
 
+def _journal_call_with_deadline(client, deadline: float | None, action):
+    if deadline is None:
+        return action()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("carrier recovery pass budget expired")
+    previous = {
+        name: getattr(client, name)
+        for name in ("retry_budget_s", "open_retry_budget_s", "transaction_budget_s")
+        if client is not None and hasattr(client, name)
+    }
+    try:
+        for name, value in previous.items():
+            setattr(client, name, min(float(value), remaining))
+        return action()
+    finally:
+        for name, value in previous.items():
+            setattr(client, name, value)
+
+
 def _prepare_journal_delivery(
     envelope: dict,
     path: Path,
     *,
     replaced_envelopes: Iterable[dict] = (),
+    deadline: float | None = None,
+    reader_authority=None,
 ) -> tuple[dict[str, object], ...]:
-    targets = _journal_delivery_targets(envelope)
+    targets = _journal_call_with_deadline(
+        reader_authority,
+        deadline,
+        lambda: _journal_delivery_targets(
+            envelope,
+            reader_authority=reader_authority,
+            deadline=deadline,
+        ),
+    )
     if not targets:
         for replaced in replaced_envelopes:
             _withdraw_journal_delivery(replaced, path)
@@ -2402,7 +2971,15 @@ def _prepare_journal_delivery(
                 old_root,
                 old_recipient,
                 _require_active,
-            ) in _journal_delivery_targets(replaced):
+            ) in _journal_call_with_deadline(
+                reader_authority,
+                deadline,
+                lambda: _journal_delivery_targets(
+                    replaced,
+                    reader_authority=reader_authority,
+                    deadline=deadline,
+                ),
+            ):
                 replacement_keys_by_root.setdefault(old_root, []).append(
                     (
                         old_recipient,
@@ -2422,25 +2999,88 @@ def _prepare_journal_delivery(
         for project_root, recipient_label, require_active_recipient in targets:
             authority = authorities.get(project_root)
             if authority is None:
-                authority = goalflight_journal.open_or_create_journal(project_root)
+                remaining_s = (
+                    None if deadline is None else deadline - time.monotonic()
+                )
+                if remaining_s is not None and remaining_s <= 0:
+                    raise TimeoutError("carrier recovery pass budget expired")
+                authority = (
+                    goalflight_journal.open_or_create_journal(project_root)
+                    if remaining_s is None
+                    else goalflight_journal.Journal(
+                        project_root,
+                        retry_budget_s=remaining_s,
+                        open_retry_budget_s=remaining_s,
+                        transaction_budget_s=remaining_s,
+                    )
+                )
                 authorities[project_root] = authority
-            recorded = authority.record_delivery_event(
-                recipient_label=recipient_label,
-                origin_node=origin_node,
-                event_uuid=str(envelope.get("id") or ""),
-                stream_id=str(envelope.get("dispatch_id") or ""),
-                stream_seq=int(envelope.get("seq") or 0),
-                carrier_path=path,
-                event_type=str(envelope.get("type") or ""),
-                wake_class=event_wake_class(
-                    str(envelope.get("type") or ""),
-                    envelope.get("payload"),
-                ),
-                created_at=str(envelope.get("ts") or ""),
-                replaces=replacement_keys_by_root.get(project_root, ()),
-                fallback_to_wildcard_if_inactive=require_active_recipient,
-            )
+            event_id = str(envelope.get("id") or "")
+            stream_id = str(envelope.get("dispatch_id") or "")
+            stream_seq = int(envelope.get("seq") or 0)
+            event_type = str(envelope.get("type") or "")
+            wake_class = event_wake_class(event_type, envelope.get("payload"))
+            created_at = str(envelope.get("ts") or "")
+            try:
+                recorded = _journal_call_with_deadline(
+                    authority,
+                    deadline,
+                    lambda: authority.record_delivery_event(
+                        recipient_label=recipient_label,
+                        origin_node=origin_node,
+                        event_uuid=event_id,
+                        stream_id=stream_id,
+                        stream_seq=stream_seq,
+                        carrier_path=path,
+                        event_type=event_type,
+                        wake_class=wake_class,
+                        created_at=created_at,
+                        replaces=replacement_keys_by_root.get(project_root, ()),
+                        fallback_to_wildcard_if_inactive=require_active_recipient,
+                    ),
+                )
+            except goalflight_journal.JournalIntegrityError:
+                existing = authority.read_all(
+                    """SELECT * FROM delivery_events
+                       WHERE project_root = ? AND recipient_label IN (?, '*')
+                         AND origin_node = ? AND event_uuid = ?
+                         AND withdrawn_at IS NULL""",
+                    (str(project_root), recipient_label, origin_node, event_id),
+                )
+                repairable = [
+                    row
+                    for row in existing
+                    if row["stream_id"] == stream_id
+                    and row["carrier_path"] == str(path.resolve(strict=False))
+                    and row["event_type"] == event_type
+                    and row["wake_class"] == wake_class
+                    and row["created_at"] == created_at
+                    and int(row["stream_seq"]) != stream_seq
+                ]
+                if len(repairable) != 1:
+                    raise
+                old = repairable[0]
+                recorded = _journal_call_with_deadline(
+                    authority,
+                    deadline,
+                    lambda: authority._repair_delivery_event_sequence_through_safe_prefix(
+                        recipient_label=str(old["recipient_label"]),
+                        origin_node=origin_node,
+                        event_uuid=event_id,
+                        stream_id=stream_id,
+                        old_stream_seq=int(old["stream_seq"]),
+                        stream_seq=stream_seq,
+                        carrier_path=path,
+                        event_type=event_type,
+                        wake_class=wake_class,
+                        created_at=created_at,
+                    ),
+                )
             if not recorded.committed:
+                if recorded.retryable:
+                    raise JournalRetryableError(
+                        "journal delivery assignment exceeded its write budget"
+                    )
                 raise MessageError(
                     "journal delivery assignment was not committed: "
                     + str(recorded.reason or recorded.disposition.value)
@@ -2459,6 +3099,8 @@ def _prepare_journal_delivery(
         return tuple(assignments)
     except MessageError:
         raise
+    except TimeoutError:
+        raise
     except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS as exc:
         raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
 
@@ -2475,6 +3117,10 @@ def _mark_journal_delivery(
             event_uuid=str(assignment["event_uuid"]),
         )
         if not result.committed:
+            if result.retryable:
+                raise JournalRetryableError(
+                    "journal delivery projection exceeded its write budget"
+                )
             raise MessageError(
                 "journal delivery projection was not committed: "
                 + str(result.reason or result.disposition.value)
@@ -2555,6 +3201,899 @@ def _controller_delivery_report(
     elif delivery_items:
         report["deliveries"] = delivery_items
     return report
+
+
+def _controller_delivery_report_after_projection(
+    deliveries: Iterable[dict[str, object]],
+    *,
+    envelope: dict,
+    projection_error: Exception | None,
+) -> dict[str, object]:
+    report = _controller_delivery_report(deliveries, envelope=envelope)
+    if projection_error is not None:
+        report.update(
+            {
+                "requested": True,
+                "delivered": False,
+                "status": "controller_projection_failed",
+                "detail": (
+                    "message recorded but controller delivery projection failed: "
+                    f"{type(projection_error).__name__}: {projection_error}"
+                ),
+            }
+        )
+    return report
+
+
+def _worker_journal_projection(
+    envelope: dict,
+    path: Path,
+    *,
+    replaced_envelopes: Iterable[dict] = (),
+) -> tuple[tuple[dict[str, object], ...], Exception | None]:
+    """Best-effort journal projection from the worker process."""
+    try:
+        return _mark_journal_delivery(
+            _prepare_journal_delivery(
+                envelope,
+                path,
+                replaced_envelopes=replaced_envelopes,
+            )
+        ), None
+    except Exception as exc:
+        return (), exc
+
+
+def _worker_journal_outbox_dir(
+    dispatch_id: str,
+    *,
+    outbox_dir: Path | None = None,
+) -> Path:
+    import goalflight_dispatch_paths
+
+    dispatch_id = validate_stream_id(dispatch_id, path="dispatch_id")
+    if outbox_dir is None:
+        resolved = goalflight_dispatch_paths.worker_question_outbox_dir(dispatch_id)
+    else:
+        supplied = Path(outbox_dir).expanduser()
+        resolved = goalflight_dispatch_paths.worker_question_outbox_dir(
+            dispatch_id,
+            dispatch_dir=supplied.parent,
+        )
+        if supplied.resolve(strict=False) != resolved.resolve(strict=False):
+            raise MessageError(
+                f"worker journal outbox does not match dispatch {dispatch_id!r}"
+            )
+    return resolved
+
+
+def _configured_worker_journal_outbox_dir(dispatch_id: str) -> Path | None:
+    configured = str(os.environ.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or "").strip()
+    if not configured:
+        return None
+    return _worker_journal_outbox_dir(dispatch_id, outbox_dir=Path(configured))
+
+
+def _worker_journal_outbox_storage_dir(
+    outbox_dir: Path,
+    *,
+    deadline: float | None = None,
+) -> Path:
+    outbox_dir = Path(outbox_dir)
+    storage_dir = outbox_dir / "journal"
+    layout_marker = storage_dir / ".layout-v1"
+    storage_dir.mkdir(mode=0o700, exist_ok=True)
+    if layout_marker.is_file():
+        return storage_dir
+    timeout_secs = (
+        2.0 if deadline is None else deadline - time.monotonic()
+    )
+    if timeout_secs <= 0:
+        return storage_dir
+    with mail_lock(outbox_dir / ".journal-layout.lock", timeout_secs=timeout_secs):
+        if not layout_marker.is_file():
+            with os.scandir(outbox_dir) as entries:
+                for entry in entries:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return storage_dir
+                    name = entry.name
+                    is_legacy_record = name.startswith("journal-") and (
+                        name.endswith((".delivery", ".published", ".retry", ".jsonl"))
+                    )
+                    is_legacy_queue_marker = name.startswith(".journal-") and name.endswith(
+                        ".queued"
+                    )
+                    if not (
+                        name in {".journal-sequence", ".journal-cursor"}
+                        or is_legacy_queue_marker
+                        or is_legacy_record
+                    ):
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    os.replace(entry.path, storage_dir / name)
+            if deadline is None or time.monotonic() < deadline:
+                _replace_fsync(layout_marker, b"v1\n")
+    return storage_dir
+
+
+def _worker_journal_outbox_record_path(outbox_dir: Path, sequence: int) -> Path:
+    return _worker_journal_outbox_storage_dir(Path(outbox_dir)) / f"journal-{sequence:020d}.delivery"
+
+
+def _worker_journal_outbox_queued_marker(outbox_dir: Path, event_id: str) -> Path:
+    digest = hashlib.sha256(str(event_id).encode("utf-8")).hexdigest()
+    return _worker_journal_outbox_storage_dir(Path(outbox_dir)) / f".journal-{digest}.queued"
+
+
+def _read_bounded_regular_file(path: Path, limit: int) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MessageError(f"{path}: expected a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read(limit + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _append_worker_journal_outbox(
+    worker_dispatch_id: str,
+    envelope: dict,
+    *,
+    replaced_envelopes: Iterable[dict] = (),
+) -> int:
+    outbox_dir = _configured_worker_journal_outbox_dir(worker_dispatch_id)
+    if outbox_dir is None or not outbox_dir.is_dir():
+        raise MessageError("worker question outbox is unavailable for journal delivery")
+    event_id = str(envelope.get("id") or "")
+    if not event_id:
+        raise MessageError("worker journal outbox event is missing its id")
+    storage_dir = _worker_journal_outbox_storage_dir(outbox_dir)
+    queued_marker = _worker_journal_outbox_queued_marker(outbox_dir, event_id)
+    if queued_marker.is_file():
+        try:
+            return int(queued_marker.read_text(encoding="ascii").strip())
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
+
+    sequence_path = storage_dir / ".journal-sequence"
+    with mail_lock(sequence_path, timeout_secs=2.0):
+        if queued_marker.is_file():
+            try:
+                return int(queued_marker.read_text(encoding="ascii").strip())
+            except (OSError, ValueError, UnicodeDecodeError):
+                pass
+        try:
+            previous = int(sequence_path.read_text(encoding="ascii").strip())
+        except FileNotFoundError:
+            previous = 0
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise MessageError(f"worker journal outbox sequence is unreadable: {exc}") from exc
+        if previous < 0:
+            raise MessageError("worker journal outbox sequence is invalid")
+        sequence = previous + 1
+        while _worker_journal_outbox_record_path(outbox_dir, sequence).exists():
+            sequence += 1
+        record = {
+            "schema": _WORKER_JOURNAL_OUTBOX_SCHEMA,
+            "dispatch_id": worker_dispatch_id,
+            "sequence": sequence,
+            "project_journal_delivery": True,
+            "envelope": envelope,
+            "replaced_envelopes": [dict(item) for item in replaced_envelopes],
+        }
+        encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+        if len(encoded) > _WORKER_JOURNAL_OUTBOX_MAX_RECORD_BYTES:
+            raise MessageError("worker journal outbox record exceeds its byte limit")
+        _replace_fsync(_worker_journal_outbox_record_path(outbox_dir, sequence), encoded)
+        _replace_fsync(sequence_path, f"{sequence}\n".encode("ascii"))
+        _replace_fsync(queued_marker, f"{sequence}\n".encode("ascii"))
+    return sequence
+
+
+def _worker_journal_projection_with_outbox(
+    envelope: dict,
+    path: Path,
+    *,
+    worker_dispatch_id: str,
+    replaced_envelopes: Iterable[dict] = (),
+) -> tuple[tuple[dict[str, object], ...], Exception | None]:
+    deliveries, projection_error = _worker_journal_projection(
+        envelope,
+        path,
+        replaced_envelopes=replaced_envelopes,
+    )
+    if projection_error is None:
+        return deliveries, None
+    try:
+        _append_worker_journal_outbox(
+            worker_dispatch_id,
+            envelope,
+            replaced_envelopes=replaced_envelopes,
+        )
+    except Exception as outbox_error:
+        return (), MessageError(
+            f"{projection_error}; worker journal outbox append failed: {outbox_error}"
+        )
+    return deliveries, projection_error
+
+
+def worker_journal_outbox_has_event(event_id: str) -> bool:
+    worker_dispatch_id = str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip()
+    if not worker_dispatch_id:
+        return False
+    outbox_dir = _configured_worker_journal_outbox_dir(worker_dispatch_id)
+    if outbox_dir is None:
+        return False
+    return _worker_journal_outbox_queued_marker(outbox_dir, event_id).is_file()
+
+
+def _worker_journal_outbox_quarantine(
+    outbox_dir: Path,
+    sequence: int,
+    raw: bytes,
+    reason: str,
+    *,
+    deadline: float,
+) -> None:
+    quarantine_carrier = _worker_journal_outbox_storage_dir(outbox_dir) / f"journal-{sequence:020d}.jsonl"
+    row = _quarantine_row(quarantine_carrier, 0, reason, raw)
+    remaining = max(0.001, deadline - time.monotonic())
+    _record_quarantine(
+        row,
+        lock_timeout_secs=remaining,
+        max_recovery_bytes=_WORKER_JOURNAL_OUTBOX_QUARANTINE_SCAN_BYTES,
+    )
+
+
+def _read_worker_journal_outbox_cursor(
+    path: Path,
+    dispatch_id: str,
+) -> tuple[int, dict[str, object] | None]:
+    try:
+        raw = _read_bounded_regular_file(
+            path, _WORKER_JOURNAL_OUTBOX_CURSOR_MAX_BYTES
+        )
+    except FileNotFoundError:
+        return 0, None
+    except OSError as exc:
+        raise MessageError("worker journal outbox cursor is unreadable") from exc
+    if len(raw) > _WORKER_JOURNAL_OUTBOX_CURSOR_MAX_BYTES:
+        raise MessageError("worker journal outbox cursor exceeds its byte limit")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise MessageError("worker journal outbox cursor is invalid JSON") from None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "goalflight.worker-journal-cursor.v1"
+        or value.get("dispatch_id") != dispatch_id
+        or isinstance(value.get("last_sequence"), bool)
+        or not isinstance(value.get("last_sequence"), int)
+        or value["last_sequence"] < 0
+    ):
+        raise MessageError("worker journal outbox cursor has an invalid shape")
+    carrier_scan = value.get("carrier_scan")
+    if carrier_scan is not None and (
+        not isinstance(carrier_scan, dict)
+        or any(
+            isinstance(carrier_scan.get(name), bool)
+            or not isinstance(carrier_scan.get(name), int)
+            or carrier_scan[name] < 0
+            for name in (
+                "sequence",
+                "device",
+                "inode",
+                "file_size",
+                "offset",
+                "line_no",
+            )
+        )
+        or not isinstance(carrier_scan.get("skipping_line", False), bool)
+        or not isinstance(carrier_scan.get("target_sequence_seen", False), bool)
+        or not isinstance(carrier_scan.get("task_nudge_replaced", False), bool)
+        or (
+            carrier_scan.get("skipped_line_offset") is not None
+            and (
+                isinstance(carrier_scan.get("skipped_line_offset"), bool)
+                or not isinstance(carrier_scan.get("skipped_line_offset"), int)
+                or carrier_scan["skipped_line_offset"] < 0
+            )
+        )
+        or (
+            "carrier_high_water" in carrier_scan
+            and (
+                isinstance(carrier_scan.get("carrier_high_water"), bool)
+                or not isinstance(carrier_scan.get("carrier_high_water"), int)
+                or carrier_scan["carrier_high_water"] < 0
+            )
+        )
+    ):
+        raise MessageError("worker journal outbox cursor has an invalid carrier scan")
+    return int(value["last_sequence"]), carrier_scan
+
+
+def _write_worker_journal_outbox_cursor(
+    path: Path,
+    dispatch_id: str,
+    sequence: int,
+    *,
+    carrier_scan: dict[str, object] | None = None,
+) -> None:
+    payload = {
+        "schema": "goalflight.worker-journal-cursor.v1",
+        "dispatch_id": dispatch_id,
+        "last_sequence": sequence,
+    }
+    if carrier_scan is not None:
+        payload["carrier_scan"] = carrier_scan
+    _replace_fsync(
+        path,
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        ),
+    )
+
+
+def _worker_journal_outbox_retry_path(record_path: Path) -> Path:
+    return record_path.with_suffix(".retry")
+
+
+def _read_worker_journal_outbox_retry(path: Path) -> tuple[int, float]:
+    try:
+        raw = _read_bounded_regular_file(path, 4096)
+        if len(raw) > 4096:
+            return 0, 0.0
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return 0, 0.0
+    failures = value.get("failures") if isinstance(value, dict) else None
+    retry_at = value.get("retry_at") if isinstance(value, dict) else None
+    if (
+        isinstance(failures, bool)
+        or not isinstance(failures, int)
+        or failures < 0
+        or isinstance(retry_at, bool)
+        or not isinstance(retry_at, (int, float))
+        or not math.isfinite(float(retry_at))
+    ):
+        return 0, 0.0
+    return failures, float(retry_at)
+
+
+def _write_worker_journal_outbox_retry(
+    path: Path,
+    *,
+    failures: int,
+    retry_at: float,
+    reason: str,
+) -> None:
+    payload = {
+        "schema": "goalflight.worker-journal-retry.v1",
+        "failures": failures,
+        "retry_at": retry_at,
+        "reason": reason[:2048],
+    }
+    _replace_fsync(
+        path,
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8", "replace"
+        ),
+    )
+
+
+def project_worker_journal_outbox(
+    dispatch_id: str,
+    *,
+    outbox_dir: Path | None = None,
+    messages_dir: Path | None = None,
+    max_records: int = _WORKER_JOURNAL_OUTBOX_MAX_RECORDS_PER_PASS,
+    max_bytes: int = _WORKER_JOURNAL_OUTBOX_MAX_BYTES_PER_PASS,
+    budget_s: float = _WORKER_JOURNAL_OUTBOX_PASS_BUDGET_S,
+    min_first_record_age_s: float = 0.0,
+) -> int:
+    """Project one dispatch's bounded journal outbox slice, in its own sequence."""
+    import goalflight_journal  # type: ignore
+
+    dispatch_id = _validate_post_stream_id(dispatch_id, path="dispatch_id")
+    if isinstance(max_records, bool) or max_records < 1:
+        raise ValueError("worker journal outbox max_records must be positive")
+    if isinstance(max_bytes, bool) or max_bytes < 1:
+        raise ValueError("worker journal outbox max_bytes must be positive")
+    if not math.isfinite(float(budget_s)) or budget_s <= 0:
+        raise ValueError("worker journal outbox budget_s must be positive")
+    if isinstance(min_first_record_age_s, bool):
+        raise ValueError("worker journal outbox minimum record age must be nonnegative")
+    try:
+        min_first_record_age_s = float(min_first_record_age_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("worker journal outbox minimum record age must be nonnegative") from exc
+    if (
+        not math.isfinite(min_first_record_age_s)
+        or min_first_record_age_s < 0
+    ):
+        raise ValueError("worker journal outbox minimum record age must be nonnegative")
+    deadline = time.monotonic() + float(budget_s)
+    outbox_dir = _worker_journal_outbox_dir(dispatch_id, outbox_dir=outbox_dir)
+    if not outbox_dir.is_dir():
+        return 0
+    if messages_dir is None:
+        messages_dir = default_messages_dir()
+    try:
+        storage_dir = _worker_journal_outbox_storage_dir(
+            outbox_dir,
+            deadline=deadline,
+        )
+    except TimeoutError:
+        return 0
+    if time.monotonic() >= deadline:
+        return 0
+    sequence_path = storage_dir / ".journal-sequence"
+    cursor_path = storage_dir / ".journal-cursor"
+    if not sequence_path.is_file():
+        return 0
+    projected = 0
+    bytes_read = 0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return 0
+    with contextlib.ExitStack() as locks:
+        try:
+            locks.enter_context(mail_lock(cursor_path, timeout_secs=remaining))
+        except TimeoutError:
+            return 0
+        last_sequence, carrier_scan = _read_worker_journal_outbox_cursor(
+            cursor_path,
+            dispatch_id,
+        )
+        try:
+            sequence_raw = _read_bounded_regular_file(sequence_path, 128)
+            if len(sequence_raw) > 128:
+                raise MessageError("worker journal outbox sequence exceeds its byte limit")
+            max_sequence = int(sequence_raw.decode("ascii").strip())
+        except FileNotFoundError:
+            max_sequence = 0
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise MessageError(f"worker journal outbox sequence is unreadable: {exc}") from exc
+        if max_sequence < 0:
+            raise MessageError("worker journal outbox sequence is invalid")
+        if min_first_record_age_s and last_sequence < max_sequence:
+            first_record = storage_dir / f"journal-{last_sequence + 1:020d}.delivery"
+            try:
+                first_record_age_s = time.time() - first_record.stat().st_mtime
+            except FileNotFoundError:
+                first_record_age_s = min_first_record_age_s
+            if first_record_age_s < min_first_record_age_s:
+                return 0
+
+        processed = 0
+        while processed < max_records and time.monotonic() < deadline:
+            sequence = last_sequence + 1
+            record_path = storage_dir / f"journal-{sequence:020d}.delivery"
+            if not record_path.exists():
+                if sequence > max_sequence:
+                    break
+                marker_path = record_path.with_suffix(".published")
+                _replace_fsync(marker_path, b"missing outbox record\n")
+                last_sequence = sequence
+                _write_worker_journal_outbox_cursor(cursor_path, dispatch_id, sequence)
+                processed += 1
+                continue
+            raw = b""
+            try:
+                raw = _read_bounded_regular_file(
+                    record_path,
+                    _WORKER_JOURNAL_OUTBOX_MAX_RECORD_BYTES,
+                )
+                bytes_read += len(raw)
+                if len(raw) > _WORKER_JOURNAL_OUTBOX_MAX_RECORD_BYTES:
+                    raise ValueError("outbox record exceeds its byte limit")
+                if bytes_read > max_bytes and processed:
+                    break
+                value = json.loads(raw.decode("utf-8"))
+                if (
+                    not isinstance(value, dict)
+                    or value.get("schema") != _WORKER_JOURNAL_OUTBOX_SCHEMA
+                    or value.get("dispatch_id") != dispatch_id
+                    or isinstance(value.get("sequence"), bool)
+                    or value.get("sequence") != sequence
+                    or value.get("project_journal_delivery") is not True
+                    or not isinstance(value.get("envelope"), dict)
+                    or not isinstance(value.get("replaced_envelopes", []), list)
+                    or any(
+                        not isinstance(item, dict)
+                        for item in value.get("replaced_envelopes", [])
+                    )
+                ):
+                    raise ValueError("outbox record has an invalid shape")
+                envelope = value["envelope"]
+                validate_envelope(
+                    envelope,
+                    expected_dispatch_id=str(envelope.get("dispatch_id") or ""),
+                )
+            except (OSError, UnicodeDecodeError, ValueError, RecursionError, MessageError) as exc:
+                try:
+                    _worker_journal_outbox_quarantine(
+                        outbox_dir,
+                        sequence,
+                        raw,
+                        f"invalid worker journal outbox record: {exc}",
+                        deadline=deadline,
+                    )
+                except Exception:
+                    pass
+                _replace_fsync(record_path.with_suffix(".published"), b"quarantined\n")
+                last_sequence = sequence
+                _write_worker_journal_outbox_cursor(cursor_path, dispatch_id, sequence)
+                processed += 1
+                continue
+
+            source = envelope.get("source")
+            is_steer = isinstance(source, dict) and (
+                (
+                    source.get("adapter") == "goalflight-dispatch"
+                    and source.get("transport") == "steer"
+                )
+                or (
+                    source.get("adapter") == "journal-outbox"
+                    and source.get("transport") == "journal"
+                )
+            )
+            record_projected = False
+            if not is_steer:
+                outbox_dispatch_id = _validate_post_stream_id(
+                    envelope["dispatch_id"], path="envelope.dispatch_id"
+                )
+                carrier_path = inbox_path(messages_dir, outbox_dispatch_id)
+                envelope_source = envelope.get("source")
+                posting_project_root, posting_controller_label = _stream_posting_project(
+                    str(envelope["dispatch_id"]),
+                    addressee=(
+                        envelope.get("addressee")
+                        if isinstance(envelope.get("addressee"), dict)
+                        else None
+                    ),
+                    source=envelope_source if isinstance(envelope_source, dict) else {},
+                )
+                retry_path = _worker_journal_outbox_retry_path(record_path)
+                failures, retry_at = _read_worker_journal_outbox_retry(retry_path)
+                if retry_at > time.time():
+                    break
+                carrier_byte_budget = max_bytes - bytes_read
+                if carrier_byte_budget <= 0:
+                    break
+                carrier_scan_pending = False
+                retired_event = False
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with carrier_transaction(
+                        carrier_path,
+                        lock_timeout_secs=remaining,
+                    ) as transaction:
+                        _ensure_stream_owner(
+                            transaction.path,
+                            dispatch_id=str(envelope["dispatch_id"]),
+                            project_root=posting_project_root,
+                            controller_label=posting_controller_label,
+                        )
+                        current = False
+                        if transaction.path.exists():
+                            info = transaction.path.stat()
+                            scan = carrier_scan
+                            if not (
+                                isinstance(scan, dict)
+                                and scan.get("sequence") == sequence
+                                and scan.get("device") == int(info.st_dev)
+                                and scan.get("inode") == int(info.st_ino)
+                                and scan.get("offset", 0) <= int(info.st_size)
+                            ):
+                                scan = None
+                            offset = int(scan.get("offset", 0)) if scan else 0
+                            line_no = int(scan.get("line_no", 1)) if scan else 1
+                            skipping_line = bool(scan.get("skipping_line", False)) if scan else False
+                            target_sequence_seen = (
+                                bool(scan.get("target_sequence_seen", False)) if scan else False
+                            )
+                            task_nudge_replaced = (
+                                bool(scan.get("task_nudge_replaced", False)) if scan else False
+                            )
+                            carrier_high_water = (
+                                int(scan.get("carrier_high_water", 0)) if scan else 0
+                            )
+                            skipped_line_offset = (
+                                scan.get("skipped_line_offset") if scan else None
+                            )
+                            carrier_max_bytes = min(
+                                carrier_byte_budget,
+                                _WORKER_JOURNAL_OUTBOX_MAX_BYTES_PER_PASS,
+                            )
+                            scan_slice = transaction.read_recovery_slice(
+                                offset,
+                                max_bytes=carrier_max_bytes,
+                                max_records=16,
+                                line_no=line_no,
+                                deadline=deadline,
+                                skipping_line=skipping_line,
+                                skipped_line_offset=skipped_line_offset,
+                            )
+                            bytes_read += scan_slice.bytes_read
+                            carrier_result = _read_envelope_records(
+                                transaction.path,
+                                tolerate_errors=True,
+                                locked_data=scan_slice.data,
+                                offset_base=scan_slice.data_offset,
+                                first_line_no=line_no,
+                                include_records=True,
+                                seen_sequences={int(envelope["seq"])}
+                                if target_sequence_seen
+                                else set(),
+                                record_quarantine=False,
+                            )
+                            carrier_high_water = max(
+                                carrier_high_water,
+                                max(
+                                    (int(item.get("seq") or 0) for item in carrier_result.envelopes),
+                                    default=0,
+                                ),
+                            )
+                            for carrier_record in carrier_result.records:
+                                if carrier_record.error is None:
+                                    continue
+                                _emit_carrier_error(carrier_record.error)
+                                error = carrier_record.error
+                                remaining = deadline - time.monotonic()
+                                if (
+                                    error.get("hash")
+                                    and isinstance(error.get("bytes"), list)
+                                    and remaining > 0
+                                ):
+                                    quarantine_row = {
+                                        "path": str(transaction.path),
+                                        "offset": carrier_record.offset,
+                                        "reason": str(error.get("reason") or "invalid carrier record"),
+                                        "hash": error["hash"],
+                                        "bytes": error["bytes"],
+                                    }
+                                    _record_quarantine(
+                                        quarantine_row,
+                                        lock_timeout_secs=remaining,
+                                        max_recovery_bytes=_WORKER_JOURNAL_OUTBOX_QUARANTINE_SCAN_BYTES,
+                                    )
+                            current_envelope = next(
+                                (
+                                    item
+                                    for item in carrier_result.envelopes
+                                    if item.get("id") == envelope.get("id")
+                                    and isinstance(item.get("source"), dict)
+                                    and isinstance(envelope.get("source"), dict)
+                                    and item["source"].get("node")
+                                    == envelope["source"].get("node")
+                                ),
+                                None,
+                            )
+                            current = current_envelope is not None
+                            same_event_present = any(
+                                item.get("id") == envelope.get("id")
+                                for item in carrier_result.envelopes
+                            )
+                            task_nudge_replaced = task_nudge_replaced or any(
+                                int(item.get("seq") or 0)
+                                > int(envelope.get("seq") or 0)
+                                and _is_task_store_nudge_replacement(envelope, item)
+                                and not same_event_present
+                                for item in carrier_result.envelopes
+                            )
+                            if current_envelope is not None:
+                                immutable_fields = (
+                                    "schema", "schema_version", "id", "dispatch_id",
+                                    "ts", "source", "type", "priority", "payload",
+                                    "addressee", "author_digest",
+                                )
+                                if any(
+                                    current_envelope.get(key) != envelope.get(key)
+                                    for key in immutable_fields
+                                ):
+                                    raise MessageError(
+                                        "worker journal outbox event conflicts with its carrier row"
+                                    )
+                                envelope = current_envelope
+                            target_sequence_seen = target_sequence_seen or any(
+                                int(item["seq"]) == int(envelope["seq"])
+                                for item in carrier_result.envelopes
+                            )
+                            scan_complete = (
+                                scan_slice.next_offset >= scan_slice.file_size
+                                and not scan_slice.skipping_line
+                            )
+                            if current:
+                                carrier_scan = None
+                            elif not scan_complete:
+                                next_line_no = line_no + len(carrier_result.records)
+                                if scan_slice.skipped_line is not None:
+                                    next_line_no += 1
+                                carrier_scan = {
+                                    "sequence": sequence,
+                                    "device": scan_slice.device,
+                                    "inode": scan_slice.inode,
+                                    "file_size": scan_slice.file_size,
+                                    "offset": scan_slice.next_offset,
+                                    "line_no": next_line_no,
+                                    "skipping_line": scan_slice.skipping_line,
+                                    "skipped_line_offset": scan_slice.skipped_line_offset,
+                                    "target_sequence_seen": target_sequence_seen,
+                                    "carrier_high_water": carrier_high_water,
+                                    "task_nudge_replaced": task_nudge_replaced,
+                                }
+                                _write_worker_journal_outbox_cursor(
+                                    cursor_path,
+                                    dispatch_id,
+                                    last_sequence,
+                                    carrier_scan=carrier_scan,
+                                )
+                                carrier_scan_pending = True
+                            else:
+                                carrier_scan = None
+                                if not current:
+                                    targets = _journal_delivery_targets(
+                                        envelope,
+                                        deadline=deadline,
+                                    )
+                                    assignments = []
+                                    source = envelope.get("source")
+                                    origin_node = str(
+                                        source.get("node")
+                                        if isinstance(source, dict)
+                                        else "local"
+                                    )
+                                    for project_root, _recipient, _require_active in targets:
+                                        remaining = deadline - time.monotonic()
+                                        if remaining <= 0:
+                                            raise TimeoutError(
+                                                "carrier recovery pass budget expired"
+                                            )
+                                        reader = goalflight_journal.Journal.open_reader(
+                                            project_root,
+                                            retry_budget_s=remaining,
+                                            open_retry_budget_s=remaining,
+                                            transaction_budget_s=remaining,
+                                        )
+                                        assignments.extend(
+                                            reader.read_all(
+                                                """SELECT withdrawn_at FROM delivery_events
+                                                   WHERE project_root = ? AND origin_node = ?
+                                                     AND event_uuid = ? AND stream_id = ?
+                                                     AND stream_seq = ? AND carrier_path = ?""",
+                                                (
+                                                    str(project_root),
+                                                    origin_node,
+                                                    str(envelope.get("id") or ""),
+                                                    str(envelope.get("dispatch_id") or ""),
+                                                    int(envelope.get("seq") or 0),
+                                                    str(carrier_path.resolve(strict=False)),
+                                                ),
+                                            )
+                                        )
+                                    retired_event = bool(assignments) and all(
+                                        row["withdrawn_at"] is not None
+                                        for row in assignments
+                                    )
+                                    payload = envelope.get("payload")
+                                    retired_event = retired_event or (
+                                        not assignments
+                                        and isinstance(payload, dict)
+                                        and payload.get("replaceable") is True
+                                        and any(
+                                            item.get("dispatch_id")
+                                            == envelope.get("dispatch_id")
+                                            and int(item.get("seq") or 0)
+                                            > int(envelope.get("seq") or 0)
+                                            and isinstance(item.get("source"), dict)
+                                            and isinstance(source, dict)
+                                            and item["source"].get("node")
+                                            == source.get("node")
+                                            for item in carrier_result.envelopes
+                                        )
+                                    )
+                                    retired_event = retired_event or task_nudge_replaced
+                                    if not retired_event:
+                                        envelope = dict(envelope)
+                                        envelope["seq"] = carrier_high_water + 1
+                                        _carrier_append_locked(transaction, envelope)
+                                        current = True
+                        else:
+                            carrier_scan = None
+                            transaction.read_bytes()
+                            envelope = dict(envelope)
+                            envelope["seq"] = 1
+                            _carrier_append_locked(transaction, envelope)
+                            current = True
+                        if current:
+                            _write_worker_journal_outbox_cursor(
+                                cursor_path,
+                                dispatch_id,
+                                last_sequence,
+                            )
+                            assignments = _prepare_journal_delivery(
+                                envelope,
+                                carrier_path,
+                                replaced_envelopes=value.get("replaced_envelopes", []),
+                                deadline=deadline,
+                            )
+                            for assignment in assignments:
+                                authority = assignment["authority"]
+                                _journal_call_with_deadline(
+                                    authority,
+                                    deadline,
+                                    lambda assignment=assignment: _mark_journal_delivery(
+                                        (assignment,)
+                                    ),
+                                )
+                            record_projected = True
+                    if carrier_scan_pending:
+                        break
+                    with contextlib.suppress(OSError):
+                        retry_path.unlink()
+                except (TimeoutError, JournalRetryableError):
+                    break
+                except Exception as exc:
+                    failures += 1
+                    if failures >= _WORKER_JOURNAL_OUTBOX_MAX_PROJECTION_FAILURES:
+                        try:
+                            _worker_journal_outbox_quarantine(
+                                outbox_dir,
+                                sequence,
+                                raw,
+                                "journal projection failed after "
+                                f"{failures} attempts: {type(exc).__name__}: {exc}",
+                                deadline=deadline,
+                            )
+                        except Exception:
+                            break
+                        _replace_fsync(
+                            record_path.with_suffix(".published"),
+                            b"quarantined after repeated journal projection failures\n",
+                        )
+                        last_sequence = sequence
+                        _write_worker_journal_outbox_cursor(
+                            cursor_path,
+                            dispatch_id,
+                            sequence,
+                        )
+                        processed += 1
+                        continue
+                    retry_delay = min(
+                        _WORKER_JOURNAL_OUTBOX_RETRY_BASE_S * (2 ** (failures - 1)),
+                        2.0,
+                    )
+                    _write_worker_journal_outbox_retry(
+                        retry_path,
+                        failures=failures,
+                        retry_at=time.time() + retry_delay,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                    break
+            if not record_path.with_suffix(".published").exists():
+                goalflight_steer_mailbox.write_worker_question_published_marker(
+                    record_path.with_suffix(".published")
+                )
+            last_sequence = sequence
+            _write_worker_journal_outbox_cursor(cursor_path, dispatch_id, sequence)
+            if record_projected:
+                projected += 1
+            processed += 1
+            if bytes_read >= max_bytes:
+                break
+    return projected
 
 
 def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
@@ -2977,6 +4516,66 @@ def post_result_is_error(result: dict) -> bool:
     return worker_error or controller_error
 
 
+def _plain_steer_confirm_refusal(
+    dispatch_id: str,
+    text: str,
+    *,
+    entries: list[dict] | None = None,
+) -> str | None:
+    """Explain how to answer a live USER-CONFIRM before a plain steer lands."""
+    if re.search(
+        r"\b(?:HALT|STOP|WITHDRAW|CANCEL|ABORT|TERMINATE|QUIT)\b",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ):
+        return None
+    if str(os.environ.get("GOALFLIGHT_PROCESS_ROLE") or "").strip().lower() in {
+        "system",
+        "watcher",
+    }:
+        return None
+
+    import goalflight_steer_mailbox
+
+    record, _record_error = _dispatch_record(dispatch_id)
+    current_attempt_id = str((record or {}).get("attempt_id") or "")
+    worker_pid = (record or {}).get("worker_pid")
+    worker_pgid = (record or {}).get("worker_pgid")
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0:
+        worker_pid = None
+    if isinstance(worker_pgid, bool) or not isinstance(worker_pgid, int) or worker_pgid <= 0:
+        worker_pgid = None
+    if entries is None:
+        entries = goalflight_steer_mailbox.read_steer_entries(
+            goalflight_steer_mailbox.steer_file(dispatch_id)
+        )
+    active_wait = goalflight_steer_mailbox.active_worker_wait(
+        entries,
+        dispatch_id=dispatch_id,
+        worker_pid=worker_pid,
+        worker_pgid=worker_pgid,
+    )
+    if (
+        active_wait is None
+        or not current_attempt_id
+        or active_wait.get("attempt_id") != current_attempt_id
+        or active_wait.get("question_kind") != "USER-CONFIRM"
+    ):
+        return None
+    wait_id = str(active_wait.get("wait_id") or "")
+    if not wait_id:
+        return None
+    reply_command = goalflight_steer_mailbox.worker_wait_reply_command(
+        dispatch_id,
+        wait_id,
+        "USER-CONFIRM",
+    )
+    return (
+        f"active USER-CONFIRM wait {wait_id!r} requires a correlated answer; "
+        f"use: {reply_command}"
+    )
+
+
 def post_controller_steer(
     dispatch_id: str,
     text: str,
@@ -2992,6 +4591,10 @@ def post_controller_steer(
         sender,
         cross_project=cross_project,
     )
+    if reply_to is None:
+        refusal = _plain_steer_confirm_refusal(dispatch_id, text)
+        if refusal is not None:
+            raise MessageError(refusal)
     source = {
         "node": "local",
         "adapter": "goalflight-dispatch",
@@ -3061,6 +4664,47 @@ def post_worker_wait_question(
             "transport": "steer-wait",
         },
         event_id=event_id,
+        deliver_to_worker=False,
+    )
+
+
+def post_worker_wait_blocked(
+    *,
+    dispatch_id: str,
+    wait_id: str,
+    rejected_wait_id: str,
+    reason: str,
+    reply_command: str,
+) -> dict:
+    """Notify the controller when a new wait cannot replace an open wait."""
+    text = (
+        f"Worker wait renewal refused for wait-id={rejected_wait_id}: "
+        f"prior wait-id={wait_id} is unsettled. Settle it with: {reply_command}. "
+        f"Reason: {reason}"
+    )
+    return post_message(
+        dispatch_id=dispatch_id,
+        msg_type="blocked",
+        payload={
+            "text": text,
+            "wait_id": wait_id,
+            "prior_wait_id": wait_id,
+            "rejected_wait_id": rejected_wait_id,
+            "reason": reason,
+            "reply_command": reply_command,
+        },
+        messages_dir=default_messages_dir(),
+        source={
+            "node": "local",
+            "adapter": "goalflight-dispatch",
+            "transport": "steer-wait",
+        },
+        event_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"goalflight:steer-wait-blocked:{dispatch_id}:{wait_id}:{rejected_wait_id}",
+            )
+        ),
         deliver_to_worker=False,
     )
 
@@ -3308,43 +4952,56 @@ def _last_steering(envelopes_by_dispatch: dict[str, list[dict]]) -> dict | None:
     }
 
 
+def _inbox_path_for_entry(entry, dispatch_ids: set[str] | None) -> Path | None:
+    name = entry.name
+    if (
+        not name.endswith(".jsonl")
+        or name.endswith(".quarantine.jsonl")
+        or not STREAM_TOKEN_RE.fullmatch(name[:-6])
+        or (dispatch_ids is not None and name[:-6] not in dispatch_ids)
+    ):
+        return None
+    try:
+        if not entry.is_file(follow_symlinks=False):
+            return None
+    except OSError:
+        return None
+    return Path(entry.path).resolve(strict=False)
+
+
+def _iter_inbox_path_entries(
+    messages_dir: Path,
+    fleet_dir: Path | None = None,
+    *,
+    dispatch_ids: set[str] | None = None,
+) -> Iterator[Path | None]:
+    directories = [messages_dir]
+    if fleet_dir is not None:
+        directories.append(fleet_dir / "register" / "dispatches")
+    for directory in directories:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    yield _inbox_path_for_entry(entry, dispatch_ids)
+        except OSError:
+            continue
+
+
+
 def collect_inbox_paths(
     messages_dir: Path,
     fleet_dir: Path | None = None,
     *,
     dispatch_ids: set[str] | None = None,
 ) -> list[Path]:
-    # Only REGULAR files are inbox candidates. A non-regular `*.jsonl` entry (a
-    # FIFO/device, accidental or hostile) would block a later read_text() open()
-    # indefinitely — which on the read-side status mail check would HANG status
-    # before its fail-open guard could fire. `is_file()` is a non-blocking stat()
-    # (open() is what blocks on a FIFO), so this filter is safe and cheap.
-    def _want(stem: str) -> bool:
-        return dispatch_ids is None or stem in dispatch_ids
-
     paths: dict[str, list[Path]] = {}
-    if messages_dir.is_dir():
-        for path in sorted(messages_dir.glob("*.jsonl")):
-            if (
-                path.is_file()
-                and not path.is_symlink()
-                and not path.name.endswith(".quarantine.jsonl")
-                and STREAM_TOKEN_RE.fullmatch(path.stem)
-                and _want(path.stem)
-            ):
-                paths.setdefault(path.stem, []).append(path.resolve(strict=False))
-    if fleet_dir is not None:
-        register_dir = fleet_dir / "register" / "dispatches"
-        if register_dir.is_dir():
-            for path in sorted(register_dir.glob("*.jsonl")):
-                if (
-                    path.is_file()
-                    and not path.is_symlink()
-                    and not path.name.endswith(".quarantine.jsonl")
-                    and STREAM_TOKEN_RE.fullmatch(path.stem)
-                    and _want(path.stem)
-                ):
-                    paths.setdefault(path.stem, []).append(path.resolve(strict=False))
+    for path in _iter_inbox_path_entries(
+        messages_dir,
+        fleet_dir,
+        dispatch_ids=dispatch_ids,
+    ):
+        if path is not None:
+            paths.setdefault(path.stem, []).append(path)
     return [path for dispatch_id in sorted(paths) for path in paths[dispatch_id]]
 
 
@@ -3671,7 +5328,7 @@ def cmd_post(args: argparse.Namespace) -> int:
             detail=detail,
         )
         _print_post_result(result, args)
-        print(detail, file=sys.stderr)
+        emit_not_recorded(detail, f"python3 scripts/goalflight_messages.py read --dispatch-id {args.dispatch_id} --json")
         return 2
     if getattr(args, "subject", None) and isinstance(payload, dict):
         payload.setdefault("subject", args.subject)
@@ -3712,7 +5369,7 @@ def cmd_post(args: argparse.Namespace) -> int:
                     detail=detail,
                 )
                 _print_post_result(result, args)
-                print(detail, file=sys.stderr)
+                emit_not_recorded(detail, f"python3 scripts/goalflight_messages.py read --dispatch-id {args.dispatch_id} --json")
                 return 2
             # Exit 1 (plus controller_delivery.status) is the scripted signal
             # that a --to-controller send reached nobody. A JSON note on exit 0
@@ -3733,7 +5390,7 @@ def cmd_post(args: argparse.Namespace) -> int:
                     project_root=addressing.get("project_root"),
                 )
                 _print_post_result(result, args)
-                print(detail, file=sys.stderr)
+                emit_not_recorded(detail, f"python3 scripts/goalflight_messages.py read --dispatch-id {args.dispatch_id} --json")
                 return 2
             addressee = controller_addressee(
                 args.to_controller,
@@ -3786,7 +5443,7 @@ def cmd_post(args: argparse.Namespace) -> int:
             project_root=project_root,
         )
         _print_post_result(result, args)
-        print(detail, file=sys.stderr)
+        emit_not_recorded(detail, f"python3 scripts/goalflight_messages.py read --dispatch-id {args.dispatch_id} --json")
         return 2
     if (
         addressing is not None
@@ -3796,8 +5453,17 @@ def cmd_post(args: argparse.Namespace) -> int:
         _apply_other_project_controller_delivery(result["controller_delivery"], addressing)
     _print_post_result(result, args)
     delivery = result["delivery"]
-    if post_result_is_error(result):
-        controller_delivery = result.get("controller_delivery")
+    controller_delivery = result.get("controller_delivery")
+    envelope = result.get("envelope")
+    worker_projection_pending = (
+        bool(str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip())
+        and isinstance(controller_delivery, dict)
+        and controller_delivery.get("status") == "controller_projection_failed"
+        and isinstance(envelope, dict)
+        and worker_journal_outbox_has_event(str(envelope.get("id") or ""))
+    )
+    # A worker post is pending only after its dispatch-scoped outbox accepted it.
+    if post_result_is_error(result) and not worker_projection_pending:
         failed_delivery = (
             controller_delivery
             if isinstance(controller_delivery, dict)
@@ -3805,7 +5471,10 @@ def cmd_post(args: argparse.Namespace) -> int:
             and not controller_delivery.get("delivered")
             else delivery
         )
-        print(failed_delivery["detail"], file=sys.stderr)
+        emit_recorded_not_delivered(
+            failed_delivery["detail"],
+            f"python3 scripts/goalflight_messages.py read --dispatch-id {args.dispatch_id} --json",
+        )
         return 1
     return 0
 
@@ -3826,6 +5495,54 @@ def _replay_controller_steer_views(dispatch_id: str, envelopes: list[dict]) -> N
 
 def cmd_read(args: argparse.Namespace) -> int:
     """Read a carrier for diagnostics and replay committed steer projections."""
+    project_root_value = getattr(args, "project_root", None)
+    project_root = (
+        project_root_value
+        if isinstance(project_root_value, (str, os.PathLike))
+        else None
+    )
+    controller_label_value = getattr(args, "controller_label", None)
+    controller_label = (
+        controller_label_value if isinstance(controller_label_value, str) else None
+    )
+    if project_root or controller_label or _explicit_controller_label():
+        selected_project_root = project_root or _current_project_root()
+        if selected_project_root is None:
+            print(
+                "read: project root is unavailable; pass --project-root or run "
+                "from the project checkout",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            import goalflight_journal  # type: ignore
+            import goalflight_task  # type: ignore
+
+            root = goalflight_task.resolve_project_root(str(selected_project_root))
+            authority = goalflight_journal.Journal.open_reader(root)
+            try:
+                label = _require_relay_controller_label(
+                    authority, controller_label
+                )
+                if authority.active_lease(label) is None:
+                    raise MessageError(_no_active_lease_reconnect(label, root))
+            except MessageError as exc:
+                declared_label = (
+                    str(controller_label or "").strip()
+                    or _explicit_controller_label()
+                )
+                if declared_label:
+                    raise MessageError(_no_active_lease_reconnect(declared_label, root)) from exc
+                raise
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            MessageError,
+            ValueError,
+        ) as exc:
+            print(f"read: {exc}", file=sys.stderr)
+            return 2
     paths = collect_inbox_paths(
         args.messages_dir,
         args.fleet_dir,
@@ -4235,6 +5952,7 @@ def _listener_envelope(
     authority,
     row: dict[str, object],
     *,
+    repair_authority=None,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
     carrier_errors: list[dict[str, object]] | None = None,
@@ -4284,17 +6002,58 @@ def _listener_envelope(
     origin_node = str(row.get("origin_node") or "")
     event_uuid = str(row.get("event_uuid") or "")
     stream_seq = int(row.get("stream_seq") or 0)
-    envelope = next(
-        (
-            item
-            for item in result.envelopes
-            if item.get("id") == event_uuid
-            and int(item.get("seq") or 0) == stream_seq
-            and isinstance(item.get("source"), dict)
-            and str(item["source"].get("node") or "") == origin_node
-        ),
-        None,
-    )
+    identity_matches = [
+        item
+        for item in result.envelopes
+        if item.get("id") == event_uuid
+        and isinstance(item.get("source"), dict)
+        and str(item["source"].get("node") or "") == origin_node
+    ]
+    envelope = None
+    repair_error = None
+    if len(identity_matches) == 1:
+        candidate = identity_matches[0]
+        candidate_matches_stream = (
+            candidate.get("dispatch_id") == row.get("stream_id")
+            and candidate.get("type") == row.get("event_type")
+        )
+        if candidate_matches_stream and int(candidate.get("seq") or 0) == stream_seq:
+            envelope = candidate
+        elif candidate_matches_stream:
+            import goalflight_journal  # type: ignore
+
+            repair = getattr(
+                repair_authority or authority,
+                "_repair_delivery_event_sequence_through_safe_prefix",
+                None,
+            )
+            if callable(repair):
+                try:
+                    repaired = repair(
+                        recipient_label=str(row.get("recipient_label") or ""),
+                        origin_node=origin_node,
+                        event_uuid=event_uuid,
+                        stream_id=str(row.get("stream_id") or ""),
+                        old_stream_seq=stream_seq,
+                        stream_seq=int(candidate["seq"]),
+                        carrier_path=path,
+                        event_type=str(candidate.get("type") or ""),
+                        wake_class=event_wake_class(
+                            str(candidate.get("type") or ""), candidate.get("payload")
+                        ),
+                        created_at=str(candidate.get("ts") or ""),
+                    )
+                except (
+                    goalflight_journal.JournalBusy,
+                    goalflight_journal.JournalDisappeared,
+                    goalflight_journal.JournalIOError,
+                ) as exc:
+                    repair_error = str(exc)
+                else:
+                    if repaired.committed and repaired.value is not None:
+                        row["stream_seq"] = int(candidate["seq"])
+                        row["_journal_sequence_repaired"] = True
+                        envelope = candidate
     if envelope is not None:
         return envelope
     if envelope is None:
@@ -4344,6 +6103,13 @@ def _listener_envelope(
             )
         else:
             details = f"{diagnostic}; {details or result.status.value}"
+            if result.envelopes:
+                details += (
+                    "; valid carrier row does not match the journal delivery identity "
+                    "(event/source/sequence)"
+                )
+        if repair_error:
+            details += f"; sequence repair refused: {repair_error}"
         raise MessageError(
             "STUCK: carrier delivery is not reportable; "
             f"path={path}; reason={details}; delivery_id={event_uuid}; "
@@ -4600,6 +6366,27 @@ def _monitor_lease_status(
     if deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=dt.timezone.utc)
     if deadline.astimezone(dt.timezone.utc) <= dt.datetime.now(dt.timezone.utc):
+        if host_slept_recently():
+            try:
+                alive = goalflight_wake.lease_holder_alive(
+                    getattr(active_lease, "project_root", ""),
+                    controller_label=str(getattr(active_lease, "label", "") or ""),
+                    lease_nonce=active_nonce,
+                )
+            except (OSError, RuntimeError, ValueError):
+                alive = None
+            if alive is True:
+                return {
+                    "state": "current",
+                    "reason": "live-holder-after-host-sleep",
+                    **details,
+                }
+            if alive is None:
+                return {
+                    "state": "unknown",
+                    "reason": "lease-holder-reprobe-unknown-after-host-sleep",
+                    **details,
+                }
         return {"state": "orphaned", "reason": "renew-deadline-past", **details}
     if prefix_ambiguous:
         return {
@@ -4764,15 +6551,31 @@ def controller_mail_summary(
         # waking_only=True and are untouched: the mid-wait watermark in
         # goalflight_status and the controller_pending_events default. Widening
         # here restores the count without re-arming the wake this item silenced.
-        rows = authority.pending_delivery_events(label, waking_only=False, limit=1000)
+        rows = authority.cursor_peek(
+            label,
+            waking_only=False,
+            limit=1000,
+            complete_addressed_streams=True,
+        ).items
+        carrier_errors: list[dict[str, object]] = []
+        shown = _deliverable_rows(
+            authority,
+            rows,
+            controller_label=label,
+            carrier_errors=carrier_errors,
+        )
     except goalflight_journal.JournalUpgradeRequired:
         # Must propagate: converting this into UNKNOWN hides a pending migration.
+        raise
+    except goalflight_journal.JournalIntegrityError:
+        # Integrity faults are not availability failures; keep mail fail-closed.
         raise
     except (
         goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
         goalflight_journal.JournalError,
+        goalflight_journal.CASMismatch,
         ValueError,
     ) as exc:
         if monitor_argv is None:
@@ -4784,32 +6587,7 @@ def controller_mail_summary(
         return _monitor_lease_fields(monitor_lease)
 
     items: list[dict[str, object]] = []
-    carrier_errors: list[dict[str, object]] = []
-    for row in rows:
-        try:
-            envelope = _listener_envelope(
-                authority,
-                row,
-                controller_label=label,
-                carrier_errors=carrier_errors,
-            )
-        except MessageError as exc:
-            error = {"error": str(exc), "carrier_path": row.get("carrier_path")}
-            existing_error = next(
-                (
-                    item
-                    for item in carrier_errors
-                    if item.get("carrier_path") == error["carrier_path"]
-                ),
-                None,
-            )
-            if existing_error is None:
-                carrier_errors.append(error)
-            else:
-                existing_error.update(error)
-            continue
-        if envelope is None:
-            continue
+    for row, envelope in shown:
         payload = envelope.get("payload")
         payload = payload if isinstance(payload, dict) else {}
         items.append(
@@ -5857,24 +7635,40 @@ def _envelopes_with_rows(
     authority,
     rows: list[dict] | tuple[dict, ...],
     *,
+    repair_authority=None,
     controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
     carrier_errors: list[dict[str, object]] | None = None,
 ) -> list[tuple[dict, dict]]:
+    import goalflight_journal  # type: ignore
+
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
     items = []
     observed_errors: list[dict[str, object]] = []
     for row in rows:
+        row.pop("listener_status", None)
+        row.pop("_listener_reason", None)
+        row.pop("_journal_sequence_repaired", None)
         try:
             envelope = _listener_envelope(
                 authority,
                 row,
+                repair_authority=repair_authority,
                 controller_label=controller_label,
                 attention_by_id=attention_by_id,
                 carrier_errors=observed_errors,
             )
-        except MessageError as exc:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            goalflight_journal.JournalUpgradeRequired,
+            goalflight_journal.JournalIntegrityError,
+            goalflight_journal.JournalError,
+        ):
+            raise
+        except Exception as exc:
             carrier_path = str(row.get("carrier_path") or "")
             detail = str(exc)
             existing_error = next(
@@ -5882,6 +7676,10 @@ def _envelopes_with_rows(
                     item
                     for item in observed_errors
                     if item.get("carrier_path") == carrier_path
+                    and (
+                        item.get("status") != "STUCK"
+                        or item.get("delivery_id") == str(row.get("event_uuid") or "")
+                    )
                 ),
                 None,
             )
@@ -5889,33 +7687,162 @@ def _envelopes_with_rows(
                 "carrier_path": carrier_path,
                 "error": detail,
                 "reason": detail,
+                "status": "STUCK",
+                "delivery_id": str(row.get("event_uuid") or ""),
+                "dispatch_id": str(row.get("stream_id") or ""),
+                "stream_id": str(row.get("stream_id") or ""),
+                "stream_seq": int(row.get("stream_seq") or 0),
+                "type": str(row.get("event_type") or ""),
             }
-            if detail.startswith("STUCK:"):
-                error.update(
-                    {
-                        "status": "STUCK",
-                        "delivery_id": str(row.get("event_uuid") or ""),
-                    }
-                )
+            row["listener_status"] = "STUCK"
+            row["_listener_reason"] = detail
             if existing_error is None:
                 observed_errors.append(error)
             else:
                 existing_error.update(error)
             continue
+        if row.get("_journal_sequence_repaired"):
+            row["listener_status"] = "STUCK"
+            reason = "STUCK: delivery sequence was repaired; retry from a fresh snapshot"
+            row["_listener_reason"] = reason
+            observed_errors.append(
+                {
+                    "carrier_path": str(row.get("carrier_path") or ""),
+                    "error": reason,
+                    "reason": reason,
+                    "status": "STUCK",
+                    "delivery_id": str(row.get("event_uuid") or ""),
+                    "dispatch_id": str(row.get("stream_id") or ""),
+                    "stream_id": str(row.get("stream_id") or ""),
+                    "stream_seq": int(row.get("stream_seq") or 0),
+                    "type": str(row.get("event_type") or ""),
+                }
+            )
+            continue
         if envelope is not None:
             items.append((row, envelope))
+        else:
+            reason = "STUCK: delivery row could not be materialized"
+            row["listener_status"] = "STUCK"
+            row["_listener_reason"] = reason
+            observed_errors.append(
+                {
+                    "carrier_path": str(row.get("carrier_path") or ""),
+                    "error": reason,
+                    "reason": reason,
+                    "status": "STUCK",
+                    "delivery_id": str(row.get("event_uuid") or ""),
+                    "dispatch_id": str(row.get("stream_id") or ""),
+                    "stream_id": str(row.get("stream_id") or ""),
+                    "stream_seq": int(row.get("stream_seq") or 0),
+                    "type": str(row.get("event_type") or ""),
+                }
+            )
     if carrier_errors is not None:
         for error in observed_errors:
-            if not any(
-                item.get("carrier_path") == error.get("carrier_path")
-                and item.get("error") == error.get("error")
-                for item in carrier_errors
-            ):
+            if error.get("status") == "STUCK":
+                existing_error = next(
+                    (
+                        item
+                        for item in carrier_errors
+                        if item.get("carrier_path") == error.get("carrier_path")
+                        and item.get("status") == "STUCK"
+                        and item.get("delivery_id") == error.get("delivery_id")
+                    ),
+                    None,
+                )
+                if existing_error is None:
+                    existing_error = next(
+                        (
+                            item
+                            for item in carrier_errors
+                            if item.get("carrier_path") == error.get("carrier_path")
+                            and item.get("status") != "STUCK"
+                        ),
+                        None,
+                    )
+            else:
+                if any(
+                    item.get("carrier_path") == error.get("carrier_path")
+                    and item.get("status") == "STUCK"
+                    for item in carrier_errors
+                ):
+                    continue
+                existing_error = next(
+                    (
+                        item
+                        for item in carrier_errors
+                        if item.get("carrier_path") == error.get("carrier_path")
+                        and item.get("error") == error.get("error")
+                    ),
+                    None,
+                )
+            if existing_error is None:
                 carrier_errors.append(error)
+            elif error.get("status") == "STUCK":
+                existing_error.update(error)
     else:
         for error in observed_errors:
             _emit_carrier_error(error)
     return items
+
+
+def _deliverable_rows(
+    authority,
+    rows: list[dict] | tuple[dict, ...],
+    *,
+    repair_authority=None,
+    controller_label: str | None = None,
+    attention_by_id: dict[str, dict[str, object]] | None = None,
+    carrier_errors: list[dict[str, object]] | None = None,
+) -> list[tuple[dict, dict]]:
+    """Materialize a complete snapshot and return only each stream's safe prefix."""
+    observed_errors: list[dict[str, object]] = []
+    materializable = []
+    for row in rows:
+        row.pop("listener_status", None)
+        row.pop("_listener_reason", None)
+        row.pop("_journal_sequence_repaired", None)
+        if "projected_at" in row and row.get("projected_at") is None:
+            reason = "STUCK: delivery row is not projected"
+            row["listener_status"] = "STUCK"
+            row["_listener_reason"] = reason
+            observed_errors.append(
+                {
+                    "code": "projection_pending",
+                    "carrier_path": str(row.get("carrier_path") or ""),
+                    "error": reason,
+                    "reason": reason,
+                    "status": "STUCK",
+                    "delivery_id": str(row.get("event_uuid") or ""),
+                    "dispatch_id": str(row.get("stream_id") or ""),
+                    "stream_id": str(row.get("stream_id") or ""),
+                    "stream_seq": int(row.get("stream_seq") or 0),
+                    "type": str(row.get("event_type") or ""),
+                }
+            )
+        else:
+            materializable.append(row)
+    materialized = _envelopes_with_rows(
+        authority,
+        materializable,
+        repair_authority=repair_authority,
+        controller_label=controller_label,
+        attention_by_id=attention_by_id,
+        carrier_errors=observed_errors,
+    )
+    if carrier_errors is not None:
+        carrier_errors.extend(observed_errors)
+    else:
+        for error in observed_errors:
+            _emit_carrier_error(error)
+    positions = _cursor_positions_for_shown_rows(rows, materialized)
+    return [
+        (row, envelope)
+        for row, envelope in materialized
+        if int(row.get("stream_seq") or 0)
+        <= positions.get(str(row.get("stream_id") or ""), 0)
+    ]
 
 
 def _foreign_controller_items(
@@ -5969,22 +7896,73 @@ def _cursor_positions_for_shown_rows(
     rows: list[dict] | tuple[dict, ...],
     shown_items: list[tuple[dict, dict]],
 ) -> dict[str, int]:
-    """Return positions only for streams whose peek rows were shown."""
+    """Return the shown prefix of each stream, stopping before unsafe rows."""
     shown_rows = {id(row) for row, _envelope in shown_items}
     positions: dict[str, int] = {}
     blocked: set[str] = set()
-    for row in rows:
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("stream_id") or ""),
+            int(item.get("stream_seq") or 0),
+        ),
+    ):
         stream_id = str(row.get("stream_id") or "")
         if not stream_id or stream_id in blocked:
             continue
-        if id(row) not in shown_rows:
+        if (
+            id(row) not in shown_rows
+            or row.get("listener_status") == "STUCK"
+            or row.get("_journal_sequence_repaired")
+        ):
             blocked.add(stream_id)
-            positions.pop(stream_id, None)
             continue
         positions[stream_id] = max(
             positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
         )
     return positions
+
+
+def _stuck_carrier_records(
+    carrier_errors: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "delivery_id": str(error.get("delivery_id") or ""),
+            "dispatch_id": str(error.get("dispatch_id") or ""),
+            "stream_id": str(error.get("stream_id") or ""),
+            "stream_seq": int(error.get("stream_seq") or 0),
+            "type": str(error.get("type") or ""),
+            "reason": str(error.get("reason") or error.get("error") or "STUCK"),
+        }
+        for error in carrier_errors
+        if error.get("status") == "STUCK"
+    ]
+
+
+def _pending_behind_stuck_rows(
+    rows: list[dict] | tuple[dict, ...],
+) -> list[dict[str, object]]:
+    stuck_at: dict[str, int] = {}
+    for row in rows:
+        if row.get("listener_status") != "STUCK":
+            continue
+        stream_id = str(row.get("stream_id") or "")
+        if not stream_id:
+            continue
+        sequence = int(row.get("stream_seq") or 0)
+        stuck_at[stream_id] = min(stuck_at.get(stream_id, sequence), sequence)
+    return [
+        {
+            "id": str(row.get("event_uuid") or ""),
+            "stream_id": str(row.get("stream_id") or ""),
+            "stream_seq": int(row.get("stream_seq") or 0),
+            "type": str(row.get("event_type") or ""),
+        }
+        for row in sorted(rows, key=lambda item: (str(item.get("stream_id") or ""), int(item.get("stream_seq") or 0)))
+        if str(row.get("stream_id") or "") in stuck_at
+        and int(row.get("stream_seq") or 0) > stuck_at[str(row.get("stream_id") or "")]
+    ]
 
 
 @dataclass(frozen=True)
@@ -6125,6 +8103,114 @@ def _cursor_advance_command(
     return shlex.join(argv)
 
 
+def _relay_shown_record_path(
+    *, project_root: Path | str, controller_label: str, session_id: str | None,
+) -> Path:
+    """Path for this controller session's most recently displayed relay."""
+    identity = json.dumps(
+        [str(Path(project_root).resolve()), controller_label, session_id or ""],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return goalflight_compat.resolve_state_dir() / "relay-shown" / f"{digest}.json"
+
+
+def _write_relay_shown_record(path: Path, record: dict[str, object]) -> None:
+    _replace_fsync(path, (json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _read_relay_shown_record(path: Path) -> dict[str, object] | None:
+    try:
+        raw = _read_nofollow_bytes(path)
+    except (OSError, MessageError) as exc:
+        raise ValueError(f"cannot read last relay display: {exc}") from exc
+    if not raw:
+        return None
+    try:
+        record = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("last relay display record is invalid; run relay --new") from exc
+    if not isinstance(record, dict):
+        raise ValueError("last relay display record is invalid; run relay --new")
+    return record
+
+
+def _save_relay_shown_snapshot(
+    *,
+    project_root: Path,
+    controller_label: str,
+    lease_nonce: str,
+    session_id: str | None,
+    cursor_version: int,
+    positions: dict[str, int],
+    stream_snapshots: dict[str, str],
+    visible_items: list[tuple[dict, dict]],
+) -> None:
+    shown_count = sum(
+        1
+        for row, _envelope in visible_items
+        if str(row.get("stream_id") or "") in positions
+        and int(row.get("stream_seq") or 0)
+        <= positions[str(row.get("stream_id") or "")]
+    )
+    path = _relay_shown_record_path(
+        project_root=project_root,
+        controller_label=controller_label,
+        session_id=session_id,
+    )
+    # A relay is made under the current ACTIVE lease. Discard older generations
+    # for this project and label so a session cannot leave stale snapshots behind.
+    if path.parent.is_dir():
+        for candidate in path.parent.iterdir():
+            if candidate.suffix != ".json" or candidate == path:
+                continue
+            try:
+                record = json.loads(_read_nofollow_bytes(candidate))
+            except (OSError, MessageError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("project_root") == str(project_root.resolve())
+                and record.get("controller_label") == controller_label
+                and record.get("lease_nonce") != lease_nonce
+            ):
+                candidate.unlink(missing_ok=True)
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("controller_label") == controller_label
+                and isinstance(record.get("session_id"), (str, type(None)))
+                and record.get("lease_nonce")
+            ):
+                legacy_identity = json.dumps(
+                    [
+                        str(project_root.resolve()),
+                        controller_label,
+                        record["lease_nonce"],
+                        record.get("session_id") or "",
+                    ],
+                    separators=(",", ":"),
+                )
+                legacy_digest = hashlib.sha256(
+                    legacy_identity.encode("utf-8")
+                ).hexdigest()
+                if candidate.name == f"{legacy_digest}.json":
+                    candidate.unlink(missing_ok=True)
+    _write_relay_shown_record(
+        path,
+        {
+            "project_root": str(project_root.resolve()),
+            "controller_label": controller_label,
+            "lease_nonce": lease_nonce,
+            "session_id": session_id,
+            "cursor_version": cursor_version,
+            "positions": positions,
+            "stream_snapshots": stream_snapshots,
+            "acknowledged_events": shown_count,
+        },
+    )
+
+
 def _active_controller_labels(authority) -> list[str]:
     """ACTIVE lease labels for this project, in journal roster order."""
     labels: list[str] = []
@@ -6187,14 +8273,18 @@ def cmd_relay(args: argparse.Namespace) -> int:
     since_text = str(getattr(args, "since", None) or "").strip()
     project_root = getattr(args, "project_root", None) or _current_project_root()
     if project_root is None:
-        print(
-            "relay: project root is unavailable; pass --project-root or run "
-            "from the project checkout",
-            file=sys.stderr,
-        )
+        detail = "project root is unavailable; pass --project-root or run from the project checkout"
+        if drain:
+            emit_not_recorded(
+                detail,
+                "python3 scripts/goalflight_messages.py relay --project-root PROJECT --new --json",
+            )
+        else:
+            print(f"relay: {detail}", file=sys.stderr)
         return 2
     try:
         import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
         import goalflight_task  # type: ignore
 
         if drain and (summary_only or since_text):
@@ -6205,17 +8295,67 @@ def cmd_relay(args: argparse.Namespace) -> int:
             authority = goalflight_journal.Journal(root)
         else:
             authority = goalflight_journal.Journal.open_reader(root)
-        controller_label = _require_relay_controller_label(
-            authority,
-            getattr(args, "controller_label", None),
-        )
+        try:
+            controller_label = _require_relay_controller_label(
+                authority,
+                getattr(args, "controller_label", None),
+            )
+        except MessageError:
+            declared_label = (
+                str(getattr(args, "controller_label", None) or "").strip()
+                or _explicit_controller_label()
+            )
+            if declared_label:
+                raise MessageError(_no_active_lease_reconnect(declared_label, root))
+            raise
         lease = authority.active_lease(controller_label)
         if lease is None:
-            raise MessageError("active controller lease is unavailable")
+            raise MessageError(_no_active_lease_reconnect(controller_label, root))
+        try:
+            renew_deadline = dt.datetime.fromisoformat(
+                str(lease.renew_deadline_at).replace("Z", "+00:00")
+            )
+            if renew_deadline.tzinfo is None:
+                renew_deadline = renew_deadline.replace(tzinfo=dt.timezone.utc)
+            stale = renew_deadline <= dt.datetime.now(dt.timezone.utc)
+        except (AttributeError, TypeError, ValueError):
+            stale = False
+        principal = lease.principal if isinstance(lease.principal, dict) else {}
+        has_local_identity = (
+            isinstance(principal.get("pid"), int)
+            and isinstance(principal.get("start_token"), str)
+            and principal.get("hostname") == socket.gethostname()
+        )
+        holder_alive = None
+        if has_local_identity:
+            try:
+                holder_alive = goalflight_wake.lease_holder_alive(
+                    root,
+                    controller_label=controller_label,
+                    lease_nonce=lease.nonce,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if stale or holder_alive is False:
+            raise MessageError(
+                _no_active_lease_reconnect(controller_label, root, takeover=True)
+            )
+        if drain:
+            renewed = authority.renew_active_lease(
+                controller_label,
+                nonce=lease.nonce,
+                generation=lease.generation,
+            )
+            if not renewed.committed or renewed.value is None:
+                raise MessageError(
+                    "controller lease heartbeat could not be renewed before drain: "
+                    f"{renewed.reason or renewed.disposition.value}"
+                )
+            lease = renewed.value
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
         carrier_errors: list[dict[str, object]] = []
-        items_with_rows = _envelopes_with_rows(
+        items_with_rows = _deliverable_rows(
             authority,
             rows,
             controller_label=controller_label,
@@ -6243,19 +8383,39 @@ def cmd_relay(args: argparse.Namespace) -> int:
         MessageError,
         ValueError,
     ) as exc:
-        print(f"relay: {exc}", file=sys.stderr)
+        if drain:
+            emit_not_recorded(exc, f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json")
+        else:
+            print(f"relay: {exc}", file=sys.stderr)
         return 2
-    for error in carrier_errors:
-        _emit_carrier_error(error)
+    if not drain:
+        for error in carrier_errors:
+            _emit_carrier_error(error)
     shown_items = items_with_rows if drain else visible_items
     positions = _cursor_positions_for_shown_rows(
         rows,
         shown_items,
     )
-    position_snapshots = {
-        stream_id: peek.stream_snapshots[stream_id]
-        for stream_id in positions
-    }
+    if not drain:
+        visible_items = [
+            (row, envelope)
+            for row, envelope in visible_items
+            if int(row.get("stream_seq") or 0)
+            <= positions.get(str(row.get("stream_id") or ""), 0)
+        ]
+        visible_envelopes = [envelope for _row, envelope in visible_items]
+        shown_items = visible_items
+    stuck_records = _stuck_carrier_records(carrier_errors)
+    pending_behind_stuck = _pending_behind_stuck_rows(rows)
+    if drain:
+        items_with_rows = [
+            (row, envelope)
+            for row, envelope in items_with_rows
+            if int(row.get("stream_seq") or 0)
+            <= positions.get(str(row.get("stream_id") or ""), 0)
+        ]
+        envelopes = [envelope for _row, envelope in items_with_rows]
+    position_snapshots = _cursor_snapshots_for_rows(rows, positions)
     # --summary-only/--since are diagnostic: they must not look like a drain
     # recipe for a filtered subset, which would skip unshown mail.
     if summary_only or since_text:
@@ -6277,8 +8437,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
                         "controller_label": controller_label,
                         "cursor_version": peek.cursor_version,
                         "drained": 0,
-                        "items": envelopes,
+                        "items": [],
                         "status": "blocked",
+                        "stuck": stuck_records,
+                        "pending_behind_stuck": pending_behind_stuck,
                     }
                     if carrier_errors:
                         payload["carrier_errors"] = carrier_errors
@@ -6292,7 +8454,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             body = payload.get("text")
                             if isinstance(body, str) and body:
                                 print(body, flush=True)
-                    print("drain blocked · unresolved mail remains", file=sys.stderr)
+                emit_not_recorded(
+                    "unresolved mail remains; no safe cursor advance was possible"
+                    + (
+                        "; " + "; ".join(str(error.get("reason") or "carrier error") for error in carrier_errors)
+                        if carrier_errors else ""
+                    ),
+                    f"python3 scripts/goalflight_messages.py relay --project-root {root} --new --json",
+                )
                 emit_listener_activity_signal(
                     project_root=root, controller_label=controller_label
                 )
@@ -6306,6 +8475,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             "drained": 0,
                             "items": [],
                             "status": "no_mail",
+                            "stuck": stuck_records,
+                            "pending_behind_stuck": pending_behind_stuck,
                             **({"carrier_errors": carrier_errors} if carrier_errors else {}),
                         },
                         sort_keys=True,
@@ -6349,7 +8520,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
             goalflight_journal.JournalDisappeared,
             goalflight_journal.JournalIOError,
         ) as exc:
-            print(f"relay: {exc}", file=sys.stderr)
+            if drain:
+                emit_not_recorded(exc, f"python3 scripts/goalflight_messages.py relay --project-root {root} --new --json")
+            else:
+                print(f"relay: {exc}", file=sys.stderr)
             return 2
         except goalflight_journal.JournalError:
             raise
@@ -6367,6 +8541,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             ),
                             "next": "retry relay --drain",
                             "status": "conflict",
+                            "carrier_errors": carrier_errors,
+                            "stuck": stuck_records,
+                            "pending_behind_stuck": pending_behind_stuck,
                         },
                         sort_keys=True,
                     )
@@ -6377,6 +8554,21 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 project_root=root, controller_label=controller_label
             )
             return 3
+        committed_positions = advanced.value.get("advances", positions)
+        committed_positions = (
+            committed_positions if isinstance(committed_positions, dict) else positions
+        )
+        items_with_rows = [
+            (row, envelope)
+            for row, envelope in items_with_rows
+            if int(row.get("stream_seq") or 0)
+            <= committed_positions.get(str(row.get("stream_id") or ""), 0)
+        ]
+        envelopes = [envelope for _row, envelope in items_with_rows]
+        stuck_records = list(advanced.value.get("stuck") or stuck_records)
+        pending_behind_stuck = list(
+            advanced.value.get("pending_behind_stuck") or pending_behind_stuck
+        )
         try:
             _acknowledge_pending_report_from_cursor(
                 root,
@@ -6390,6 +8582,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
             # The cursor commit is authoritative. A stale claim may duplicate a
             # report, but acknowledgement cleanup must not turn success into loss.
             pass
+        for error in carrier_errors:
+            _emit_carrier_error(error)
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
         if getattr(args, "json", False):
@@ -6400,6 +8594,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 "items": envelopes,
                 "previous_cursor_version": previous_version,
                 "status": "drained",
+                "stuck": stuck_records,
+                "pending_behind_stuck": pending_behind_stuck,
             }
             if carrier_errors:
                 payload["carrier_errors"] = carrier_errors
@@ -6423,8 +8619,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
             "registry_generation": peek.registry_generation,
             "cursor_version": peek.cursor_version,
             "positions": positions,
-            "stream_snapshots": peek.stream_snapshots,
+            "stream_snapshots": position_snapshots,
             "advance_command": advance_command,
+            "stuck": stuck_records,
+            "pending_behind_stuck": pending_behind_stuck,
         }
         if carrier_errors:
             payload["carrier_errors"] = carrier_errors
@@ -6450,6 +8648,21 @@ def cmd_relay(args: argparse.Namespace) -> int:
         else:
             payload["items"] = visible_envelopes
         print(json.dumps(payload, sort_keys=True))
+        if not summary_only and not since_text and not drain:
+            try:
+                _save_relay_shown_snapshot(
+                    project_root=root,
+                    controller_label=controller_label,
+                    lease_nonce=lease.nonce,
+                    session_id=sessions.resolve_controller_session_id(),
+                    cursor_version=peek.cursor_version,
+                    positions=positions,
+                    stream_snapshots=position_snapshots,
+                    visible_items=visible_items,
+                )
+            except (OSError, MessageError, ValueError) as exc:
+                print(f"relay: could not save displayed snapshot: {exc}", file=sys.stderr)
+                return 2
         emit_listener_activity_signal(
             project_root=root, controller_label=controller_label
         )
@@ -6466,6 +8679,22 @@ def cmd_relay(args: argparse.Namespace) -> int:
             print(headlines)
             print("bodies: re-run with --bodies")
     print(format_pending_counts(counts))
+    if not summary_only and not since_text and not drain:
+        try:
+            session_id = sessions.resolve_controller_session_id()
+            _save_relay_shown_snapshot(
+                project_root=root,
+                controller_label=controller_label,
+                lease_nonce=lease.nonce,
+                session_id=session_id,
+                cursor_version=peek.cursor_version,
+                positions=positions,
+                stream_snapshots=position_snapshots,
+                visible_items=visible_items,
+            )
+        except (OSError, MessageError, ValueError) as exc:
+            print(f"relay: could not save displayed snapshot: {exc}", file=sys.stderr)
+            return 2
     emit_listener_activity_signal(
         project_root=root, controller_label=controller_label
     )
@@ -6504,28 +8733,299 @@ def _parse_cursor_positions(
 _ACKED_PEEK_LIMIT = 500
 
 
-def _acked_positions(peek) -> dict[str, int]:
-    """Highest deliverable seq per stream, from one peek.
-
-    Advancing means "I have seen everything up to here", so the target is the
-    largest seq the peek reports per stream, not a single located item. Two
-    envelopes addressed to this controller on one stream are both in that
-    range; taking max acks both. Treating them as one logical delivery would
-    need payload identity in the journal and is not simpler. Deriving the max
-    also removes the step where a caller transcribes STREAM=SEQ pairs by hand
-    and mistypes one.
-    """
-    positions: dict[str, int] = {}
-    for item in peek.items or []:
-        stream = getattr(item, "stream_id", None)
-        seq = getattr(item, "stream_seq", None)
-        if stream is None and isinstance(item, dict):
-            stream, seq = item.get("stream_id"), item.get("stream_seq")
-        if stream is None or seq is None:
+def _acked_positions(rows, shown_items) -> dict[str, int]:
+    """Highest contiguous sequence actually materialized for each stream."""
+    valid_rows = []
+    for row in rows:
+        value = row.get("stream_seq") if isinstance(row, dict) else None
+        if (
+            isinstance(value, bool)
+            or value is None
+            or not isinstance(value, (int, str))
+            or (isinstance(value, str) and not value.isdecimal())
+        ):
             continue
-        stream = str(stream)
-        positions[stream] = max(int(seq), positions.get(stream, 0))
-    return positions
+        try:
+            sequence = int(value)
+        except (TypeError, ValueError):
+            continue
+        if sequence < 1:
+            continue
+        valid_rows.append(row)
+    valid_ids = {id(row) for row in valid_rows}
+    valid_shown = [
+        (row, envelope)
+        for row, envelope in shown_items
+        if id(row) in valid_ids
+    ]
+    return _cursor_positions_for_shown_rows(valid_rows, valid_shown)
+
+
+def _cursor_snapshots_for_rows(rows, positions) -> dict[str, str]:
+    """Hash each stream only through its selected, materialized prefix."""
+    import goalflight_journal  # type: ignore
+
+    snapshots: dict[str, str] = {}
+    for stream_id, position in positions.items():
+        selected = [
+            row
+            for row in rows
+            if str(row.get("stream_id") or "") == str(stream_id)
+            and int(row.get("stream_seq") or 0) <= int(position)
+        ]
+        snapshots[str(stream_id)] = goalflight_journal.Journal._cursor_snapshot_token(
+            selected
+        )
+    return snapshots
+
+
+def _advance_cursor_through_safe_prefix(
+    authority,
+    label: str,
+    *,
+    mode: str,
+    actor: str,
+    nonce: str | None = None,
+    expected_cursor_version: int | None = None,
+    expected_stream_snapshots: Mapping[str, str] | None = None,
+    advances: Mapping[str, int] | None = None,
+    allow_no_lease: bool = False,
+    positions: Mapping[str, int] | None = None,
+    repair: Mapping[str, object] | None = None,
+) -> object:
+    """Clamp every cursor write to the readable, shown prefix per stream."""
+    import goalflight_journal  # type: ignore
+
+    def cas_lost(reason: str):
+        return goalflight_journal.WriteResult(
+            goalflight_journal.WriteDisposition.CAS_LOST,
+            attempts=0,
+            reason=reason,
+        )
+
+    if mode not in {"advance", "set", "repair"}:
+        raise ValueError("cursor update mode is invalid")
+    if mode == "repair":
+        if not isinstance(repair, Mapping):
+            raise ValueError("delivery sequence repair is invalid")
+        with authority._cursor_write_scope():
+            return authority._repair_delivery_event_sequence(**dict(repair))
+    if mode == "advance":
+        if nonce is None and not allow_no_lease:
+            raise ValueError("cursor lease nonce must be a bounded identity token")
+        live_lease = authority.active_lease(label)
+        if allow_no_lease:
+            if live_lease is not None:
+                return cas_lost(
+                    "cursor CAS lost: an active lease exists for this label"
+                )
+        elif live_lease is None:
+            return cas_lost(
+                "cursor CAS lost: no active lease exists"
+            )
+        elif nonce is None or live_lease.nonce != nonce:
+            return cas_lost(
+                "cursor CAS lost: lease generation changed"
+            )
+        if not isinstance(advances, Mapping) or not advances:
+            raise ValueError("cursor advances are empty or invalid")
+        requested: dict[str, int] | None = {}
+        for stream, position in advances.items():
+            resolved = authority._identity_token(stream, label="cursor stream")
+            if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+                raise ValueError("cursor position is invalid")
+            requested[resolved] = position
+        supplied_snapshots = expected_stream_snapshots or {}
+        if not isinstance(supplied_snapshots, Mapping) or supplied_snapshots.keys() != requested.keys():
+            raise ValueError("cursor advances and stream snapshots must name the same streams")
+    else:
+        if positions is None:
+            requested = None
+        else:
+            if not isinstance(positions, Mapping) or not positions:
+                raise ValueError("cursor positions are empty or invalid")
+            requested = {}
+            for stream, position in positions.items():
+                resolved = authority._identity_token(stream, label="cursor stream")
+                if not isinstance(position, int) or isinstance(position, bool) or position < 0:
+                    raise ValueError("cursor position must be a non-negative integer")
+                requested[resolved] = position
+        supplied_snapshots = {}
+
+    current_positions, rows = authority._cursor_rows_for_safe_advance(
+        label,
+        positions=requested,
+    )
+    carrier_errors: list[dict[str, object]] = []
+    shown_items = _deliverable_rows(
+        authority,
+        rows,
+        repair_authority=authority,
+        controller_label=label,
+        carrier_errors=carrier_errors,
+    )
+    safe_positions = _cursor_positions_for_shown_rows(rows, shown_items)
+    stuck_records = _stuck_carrier_records(carrier_errors)
+    pending_behind_stuck = _pending_behind_stuck_rows(rows)
+    stuck_streams = {str(item.get("stream_id") or "") for item in stuck_records}
+
+    if mode == "set" and requested is None:
+        requested = _cursor_positions(rows)
+
+    assert requested is not None
+    selected: dict[str, int] = {}
+    selected_snapshots: dict[str, str] = {}
+    clamped: dict[str, int] = {}
+    if mode == "advance":
+        if (
+            not isinstance(expected_cursor_version, int)
+            or isinstance(expected_cursor_version, bool)
+            or expected_cursor_version < 0
+        ):
+            raise ValueError("expected cursor version must be a non-negative integer")
+        for stream_id, target in requested.items():
+            expected = supplied_snapshots[stream_id]
+            request_snapshot = _cursor_snapshots_for_rows(
+                rows, {stream_id: target}
+            )[stream_id]
+            if expected != request_snapshot:
+                return cas_lost(
+                    f"cursor CAS lost: unseen position changed the selected prefix at "
+                    f"{stream_id}={target}"
+                )
+            safe = safe_positions.get(stream_id, 0)
+            current = current_positions.get(stream_id, 0)
+            position = min(target, safe)
+            if position <= current:
+                clamped[stream_id] = current
+                continue
+            if position < target and stream_id not in stuck_streams:
+                clamped[stream_id] = position
+                continue
+            selected[stream_id] = position
+            if position < target:
+                clamped[stream_id] = position
+            selected_snapshots[stream_id] = _cursor_snapshots_for_rows(
+                rows, {stream_id: position}
+            )[stream_id]
+        if not selected:
+            detail = _stuck_ack_detail(carrier_errors)
+            reason = "cursor advance refused: no safe materialized prefix"
+            if not detail:
+                detail = "requested rows were missing or outside the materialized prefix"
+            if detail:
+                reason += f"; {detail}"
+            value = {
+                "advances": {},
+                "stuck": stuck_records,
+                "pending_behind_stuck": pending_behind_stuck,
+                "clamped": clamped,
+            }
+            return goalflight_journal.WriteResult(
+                goalflight_journal.WriteDisposition.CAS_LOST,
+                value=value,
+                attempts=0,
+                reason=reason,
+            )
+        with authority._cursor_write_scope():
+            result = authority._advance_cursor_raw(
+                label,
+                nonce=nonce,
+                expected_cursor_version=expected_cursor_version,
+                expected_stream_snapshots=selected_snapshots,
+                advances=selected,
+                actor=actor,
+                allow_no_lease=allow_no_lease,
+            )
+    else:
+        for stream_id, target in requested.items():
+            current = current_positions.get(stream_id, 0)
+            if target <= current:
+                selected[stream_id] = target
+                continue
+            position = min(target, safe_positions.get(stream_id, 0))
+            if position <= current:
+                clamped[stream_id] = current
+                continue
+            if position < target and stream_id not in stuck_streams:
+                clamped[stream_id] = position
+                continue
+            selected[stream_id] = position
+            if position < target:
+                clamped[stream_id] = position
+            selected_snapshots[stream_id] = _cursor_snapshots_for_rows(
+                rows, {stream_id: position}
+            )[stream_id]
+        if requested and not selected:
+            detail = _stuck_ack_detail(carrier_errors)
+            reason = "cursor set refused: no safe materialized prefix"
+            if detail:
+                reason += f"; {detail}"
+            return goalflight_journal.WriteResult(
+                goalflight_journal.WriteDisposition.CAS_LOST,
+                value={
+                    "advances": {},
+                    "stuck": stuck_records,
+                    "pending_behind_stuck": pending_behind_stuck,
+                    "clamped": clamped,
+                },
+                attempts=0,
+                reason=reason,
+            )
+        with authority._cursor_write_scope():
+            result = authority._set_cursor_raw(
+                label,
+                positions=selected,
+                expected_stream_snapshots=selected_snapshots,
+                actor=actor,
+            )
+
+    value = dict(result.value) if isinstance(result.value, dict) else {}
+    value.update(
+        {
+            "advances": selected,
+            "stuck": stuck_records,
+            "pending_behind_stuck": pending_behind_stuck,
+            "acknowledged_events": sum(
+                1
+                for row in rows
+                if str(row.get("stream_id") or "") in selected
+                and int(row.get("stream_seq") or 0)
+                <= selected[str(row.get("stream_id") or "")]
+            ),
+        }
+    )
+    if clamped:
+        value["clamped"] = clamped
+    return goalflight_journal.WriteResult(
+        result.disposition,
+        value=value,
+        attempts=result.attempts,
+        reason=result.reason,
+    )
+
+
+def _materialized_ack_positions(project_root, peek):
+    import goalflight_journal  # type: ignore
+
+    errors: list[dict[str, object]] = []
+    authority = goalflight_journal.Journal.open_reader(project_root)
+    rows = list(peek.items or [])
+    shown_items = _deliverable_rows(
+        authority,
+        rows,
+        controller_label=peek.controller_label if hasattr(peek, "controller_label") else None,
+        carrier_errors=errors,
+    )
+    return _acked_positions(rows, shown_items), errors
+
+
+def _stuck_ack_detail(errors: list[dict[str, object]]) -> str:
+    return "; ".join(
+        f"STUCK: {error.get('reason') or error.get('error') or 'carrier row unreadable'}"
+        for error in errors
+        if error.get("status") == "STUCK"
+    )
 
 
 def _parse_cursor_stream_snapshots(
@@ -6548,18 +9048,29 @@ def _parse_cursor_stream_snapshots(
     return snapshots
 
 
-def _no_active_lease_reconnect(label: str) -> str:
-    """One actionable reconnect line naming the slug, not a nonce hunt."""
-    command = shlex.join(
+def _no_active_lease_reconnect(
+    label: str, project_root: Path | str, *, takeover: bool = False
+) -> str:
+    """Give startup guidance for an absent lease or reclaim for a dead one."""
+    argv = [
+        "python3",
+        str(goalflight_compat.advertised_script("goalflight_session_status.py")),
+        "--controller-startup",
+    ]
+    if takeover:
+        argv.append("--takeover")
+    argv.extend(
         [
-            "python3",
-            str(goalflight_compat.advertised_script("goalflight_session_status.py")),
-            "--controller-startup",
             "--controller-pid-from-ancestry",
             "--session-label",
             label,
+            "--project-root",
+            str(project_root),
         ]
     )
+    command = shlex.join(argv)
+    if takeover:
+        return f"controller lease for {label} is dead or stale; reclaim with: {command}"
     return f"no active lease for {label}; reconnect as: {command}"
 
 
@@ -6580,14 +9091,31 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
     nonce = str(
         args.lease_nonce
         or os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
-        or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
         or ""
     ).strip() or None
+    session_id = sessions.resolve_controller_session_id()
     orphaned = bool(getattr(args, "orphaned_label", False))
     acked = bool(getattr(args, "acked", False))
+    to_latest = str(getattr(args, "to_latest", None) or "").strip() or None
+    acknowledged_events = 0
+    pending_events = 0
+    relay_command = shlex.join(
+        [
+            "python3",
+            str(goalflight_compat.advertised_script("goalflight_messages.py", running_file=__file__)),
+            "relay",
+            "--project-root",
+            str(project_root),
+            "--controller-label",
+            label,
+            "--new",
+        ]
+    )
     try:
         if not label:
             raise ValueError("active controller label is required")
+        if to_latest and (acked or orphaned):
+            raise ValueError("--to-latest cannot be combined with --acked or --orphaned-label")
         if orphaned and acked:
             raise ValueError(
                 "--acked is refused with --orphaned-label; name every stream "
@@ -6611,13 +9139,23 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
                 label
             )
             if lease is None:
-                raise ValueError(_no_active_lease_reconnect(label))
+                prior_leases = goalflight_journal.Journal.open_reader(
+                    project_root
+                ).lease_records(include_ended=True)
+                had_prior_lease = any(
+                    str(record.get("label") or "") == label for record in prior_leases
+                )
+                raise ValueError(
+                    _no_active_lease_reconnect(
+                        label, project_root, takeover=had_prior_lease
+                    )
+                )
             nonce = lease.nonce
-        if acked:
+        if to_latest:
             if args.position or args.stream_snapshot or args.cursor_version is not None:
                 raise ValueError(
-                    "--acked derives cursor-version, stream-snapshot and position "
-                    "itself; pass it alone"
+                    "--to-latest derives cursor-version, stream-snapshot and position; "
+                    "pass it without those options"
                 )
             peek = controller_cursor_peek(
                 project_root=project_root,
@@ -6626,14 +9164,139 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
                 limit=_ACKED_PEEK_LIMIT,
                 complete_addressed_streams=True,
             )
-            advances = _acked_positions(peek)
-            stream_snapshots = dict(peek.stream_snapshots)
+            safe_positions, carrier_errors = _materialized_ack_positions(
+                project_root,
+                peek,
+            )
+            position = safe_positions.get(to_latest)
+            snapshot = _cursor_snapshots_for_rows(
+                peek.items,
+                {to_latest: position} if position is not None else {},
+            ).get(to_latest)
+            if position is None or snapshot is None:
+                stuck_detail = _stuck_ack_detail(carrier_errors)
+                raise ValueError(
+                    f"stream {to_latest!r} has no latest deliverable snapshot"
+                    + (f"; {stuck_detail}" if stuck_detail else "")
+                )
+            advances = {to_latest: position}
+            stream_snapshots = {to_latest: snapshot}
             args.cursor_version = peek.cursor_version
+            acknowledged_events = sum(
+                1
+                for item in peek.items
+                if str(item.get("stream_id") or "") == to_latest
+                and int(item.get("stream_seq") or 0) <= position
+            )
+        elif acked:
+            if args.position or args.stream_snapshot or args.cursor_version is not None:
+                raise ValueError(
+                    "--acked derives cursor-version, stream-snapshot and position "
+                    "itself; pass it alone"
+                )
+            if not session_id:
+                peek = controller_cursor_peek(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    limit=_ACKED_PEEK_LIMIT,
+                    complete_addressed_streams=True,
+                )
+                advances, carrier_errors = _materialized_ack_positions(
+                    project_root,
+                    peek,
+                )
+                snapshots = _cursor_snapshots_for_rows(peek.items, advances)
+                exact_command = _cursor_advance_command(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=str(nonce),
+                    cursor_version=peek.cursor_version,
+                    positions=advances,
+                    stream_snapshots=snapshots,
+                )
+                detail = (
+                    "use this exact per-position command: " + exact_command
+                    if exact_command is not None
+                    else f"run {relay_command} to see pending events"
+                )
+                raise ValueError(
+                    "--acked requires GOALFLIGHT_CONTROLLER_SESSION_ID; " + detail
+                    + (f"; {_stuck_ack_detail(carrier_errors)}" if carrier_errors else "")
+                )
+            shown_path = _relay_shown_record_path(
+                project_root=project_root,
+                controller_label=label,
+                session_id=session_id,
+            )
+            shown = _read_relay_shown_record(shown_path)
+            if shown is None:
+                peek = controller_cursor_peek(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    limit=_ACKED_PEEK_LIMIT,
+                    complete_addressed_streams=True,
+                )
+                advances, carrier_errors = _materialized_ack_positions(
+                    project_root,
+                    peek,
+                )
+                snapshots = _cursor_snapshots_for_rows(peek.items, advances)
+                exact_command = _cursor_advance_command(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=str(nonce),
+                    cursor_version=peek.cursor_version,
+                    positions=advances,
+                    stream_snapshots=snapshots,
+                )
+                if exact_command is None:
+                    raise ValueError(
+                        f"no relay display recorded; run {relay_command} to see pending events"
+                        + (f"; {_stuck_ack_detail(carrier_errors)}" if carrier_errors else "")
+                    )
+                raise ValueError(
+                    "no relay display recorded; use this exact per-position command: "
+                    + exact_command
+                    + (f"; {_stuck_ack_detail(carrier_errors)}" if carrier_errors else "")
+                )
+            if (
+                shown.get("controller_label") != label
+                or shown.get("lease_nonce") != nonce
+                or shown.get("session_id") != session_id
+            ):
+                raise ValueError(
+                    f"no relay display recorded for this controller session; run {relay_command}"
+                )
+            raw_positions = shown.get("positions")
+            raw_snapshots = shown.get("stream_snapshots")
+            if not isinstance(raw_positions, dict) or not isinstance(raw_snapshots, dict):
+                raise ValueError("last relay display record is invalid; run relay --new")
+            advances = {str(stream): int(position) for stream, position in raw_positions.items()}
+            stream_snapshots = {str(stream): str(token) for stream, token in raw_snapshots.items()}
+            if advances.keys() != stream_snapshots.keys():
+                raise ValueError("last relay display record is invalid; run relay --new")
+            args.cursor_version = int(shown["cursor_version"])
+            acknowledged_events = int(shown.get("acknowledged_events", 0))
             if not advances:
-                if args.json:
-                    print(json.dumps({"advanced": {}, "reason": "nothing deliverable"}))
-                else:
-                    print("advance: nothing deliverable")
+                pending = controller_cursor_peek(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    limit=10_000,
+                )
+                pending_events = len(pending.items)
+                summary = {
+                    "advanced": {},
+                    "acknowledged_events": 0,
+                    "pending_events": pending_events,
+                    "relay_command": relay_command,
+                    "reason": "nothing shown to acknowledge",
+                }
+                print(json.dumps(summary, sort_keys=True) if args.json else (
+                    f"acknowledged 0 events; {pending_events} remain pending · see: {relay_command}"
+                ))
                 return 0
         else:
             if args.cursor_version is None:
@@ -6642,6 +9305,29 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
                 )
             advances = _parse_cursor_positions(args.position)
             stream_snapshots = _parse_cursor_stream_snapshots(args.stream_snapshot)
+            if not orphaned:
+                try:
+                    before = controller_cursor_peek(
+                        project_root=project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                        limit=10_000,
+                    )
+                except (
+                    goalflight_journal.JournalBusy,
+                    goalflight_journal.JournalDisappeared,
+                    goalflight_journal.JournalIOError,
+                    goalflight_journal.CASMismatch,
+                ):
+                    # Explicit CAS validation below remains authoritative.
+                    before = None
+                if before is not None:
+                    acknowledged_events = sum(
+                        1
+                        for item in before.items
+                        if int(item.get("stream_seq") or 0)
+                        <= advances.get(str(item.get("stream_id") or ""), 0)
+                    )
         result = goalflight_journal.Journal(project_root).advance_cursor(
             label,
             nonce=nonce,
@@ -6662,16 +9348,33 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
     ) as exc:
-        print(f"advance: {exc}", file=sys.stderr)
+        emit_not_recorded(exc, f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json")
         return 2
     except goalflight_journal.JournalError:
         raise
     except ValueError as exc:
-        print(f"advance: {exc}", file=sys.stderr)
+        emit_not_recorded(exc, f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json")
         return 2
     if not result.committed or result.value is None:
-        print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
+        emit_not_recorded(
+            result.reason or "cursor CAS lost",
+            f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json",
+        )
         return 3
+    acknowledged_events = int(
+        result.value.get("acknowledged_events", acknowledged_events)
+    )
+    if result.value.get("clamped") and not args.json:
+        detail = "; ".join(
+            f"STUCK {item.get('stream_id')}={item.get('stream_seq')}: "
+            f"{item.get('reason') or 'carrier unreadable'}"
+            for item in result.value.get("stuck", [])
+        )
+        print(
+            "cursor clamped to the safe prefix"
+            + (f"; {detail}" if detail else ""),
+            file=sys.stderr,
+        )
     try:
         if nonce is not None:
             _acknowledge_pending_report_from_cursor(
@@ -6687,12 +9390,40 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         # The cursor already committed; preserving a provisional claim can
         # duplicate a report but cannot revoke the acknowledged delivery.
         pass
-    if args.json:
-        print(json.dumps(result.value, sort_keys=True))
+    if not orphaned:
+        try:
+            pending = controller_cursor_peek(
+                project_root=project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                limit=10_000,
+            )
+            pending_events = len(pending.items)
+        except (OSError, RuntimeError, ValueError, goalflight_journal.CASMismatch):
+            pending_events = 0
+    if orphaned:
+        if args.json:
+            print(json.dumps(result.value, sort_keys=True))
+        else:
+            print(
+                f"cursor advanced {result.value['previous_cursor_version']}"
+                f"->{result.value['cursor_version']}"
+            )
+    elif args.json:
+        result_value = dict(result.value)
+        result_value.update(
+            {
+                "acknowledged_events": acknowledged_events,
+                "pending_events": pending_events,
+                "relay_command": relay_command,
+            }
+        )
+        print(json.dumps(result_value, sort_keys=True))
     else:
         print(
             f"cursor advanced {result.value['previous_cursor_version']}"
-            f"->{result.value['cursor_version']}"
+            f"->{result.value['cursor_version']}; acknowledged {acknowledged_events} events; "
+            f"{pending_events} remain pending · see: {relay_command}"
         )
     return 0
 
@@ -6726,10 +9457,13 @@ def cmd_set_cursor(args: argparse.Namespace) -> int:
         goalflight_journal.JournalIOError,
         ValueError,
     ) as exc:
-        print(f"set: {exc}", file=sys.stderr)
+        emit_not_recorded(exc, f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json")
         return 2
     if not result.committed or result.value is None:
-        print(f"set: {result.reason or 'cursor write failed'}", file=sys.stderr)
+        emit_not_recorded(
+            result.reason or "cursor write failed",
+            f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json",
+        )
         return 3
     if args.json:
         print(json.dumps(result.value, sort_keys=True))
@@ -6856,6 +9590,7 @@ DETACHED_LISTENER_EXIT_CODE = 4
 # after an arm). Reusing those would keep a re-arm loop spinning.
 LISTENER_DID_NOT_ARM_EXIT = 5
 LISTENER_POSIX_SIGNAL_EXIT_BASE = 128
+LISTENER_SHUTDOWN_BOUND_S = 2.0
 _SETTLED_DID_NOT_ARM_REASONS = frozenset(
     {
         "lease-nonce-not-live",
@@ -6932,10 +9667,20 @@ class _ListenerDeathWatch:
     fatal_signum: int | None = None
     notices: list[int] = field(default_factory=list)
     _prior: list[tuple[int, object]] = field(default_factory=list)
+    _force_exit_timer: threading.Timer | None = field(default=None, init=False)
 
     def install(self) -> None:
         def _fatal(signum: int, _frame: object) -> None:
             self.fatal_signum = signum
+            if self._force_exit_timer is None:
+                timer = threading.Timer(
+                    LISTENER_SHUTDOWN_BOUND_S,
+                    os._exit,
+                    args=(listener_posix_signal_exit_code(signum),),
+                )
+                timer.daemon = True
+                self._force_exit_timer = timer
+                timer.start()
             name = _listener_signal_name(signum)
             line = (
                 f"listen: killed by {name} ({signum}); releasing slot "
@@ -6971,6 +9716,9 @@ class _ListenerDeathWatch:
                 self._prior.append((sig, old))
 
     def restore(self) -> None:
+        if self._force_exit_timer is not None:
+            self._force_exit_timer.cancel()
+            self._force_exit_timer = None
         while self._prior:
             sig, old = self._prior.pop()
             with contextlib.suppress(OSError, ValueError):
@@ -7036,6 +9784,8 @@ SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S = 3.0
 # Journal.open_reader (1.0s): they want to fail fast. The writer-capable
 # Journal() default is a separate 5.0s contract and must not be the peek path.
 LISTENER_JOURNAL_BUSY_BUDGET_S = 10.0
+WAKE_MODE_ENV = "GOALFLIGHT_WAKE_MODE"
+WAKE_NOTIFY_SAFETY_POLL_S = 30.0
 # Continuous journal-busy failure past this window is no longer transient.
 # The journal's own open budget (goalflight_journal.JOURNAL_OPEN_RETRY_BUDGET_S,
 # 75s) was sized from a measured one-minute live incident; four of those spans
@@ -7155,6 +9905,18 @@ def _follow_heartbeat_record(seq: int, interval_s: float) -> dict[str, object]:
             "interval_s": interval_s,
         },
     }
+
+
+def _follow_wait_timeout(
+    interval_s: float,
+    *,
+    now: float,
+    next_heartbeat: float,
+) -> float:
+    return min(
+        interval_s,
+        max(0.0, next_heartbeat - now),
+    )
 
 
 def _follow_event_record(
@@ -7620,6 +10382,290 @@ def _follow_recovered_record(reason: str, degraded_s: float) -> dict[str, object
     return _fit_follow_record(record, shrink_fields=("reason",))
 
 
+def _wake_mode() -> str:
+    requested = os.environ.get(WAKE_MODE_ENV, "poll").strip().lower()
+    if requested in {"poll", "gated", "notify"}:
+        return requested
+    print(
+        f"wake: unsupported {WAKE_MODE_ENV}={requested!r}; using poll mode",
+        file=sys.stderr,
+    )
+    return "poll"
+
+
+class _JournalChangeGate:
+    """Detect journal changes cheaply before running a listener's full pass."""
+
+    def __init__(self, journal_path: Path | str) -> None:
+        # SQLite updates -shm lock metadata during reads; those changes do not
+        # indicate new journal data and would defeat the idle-pass gate.
+        self._paths = tuple(
+            Path(path)
+            for path in (
+                journal_path,
+                f"{journal_path}-wal",
+            )
+        )
+        self._data_version: int | None = None
+        self._file_signature: tuple[tuple[int, int, int] | None, ...] | None = None
+        self._reader_connection: object | None = None
+        self.wal_replaced = False
+
+    def changed(
+        self,
+        data_version: int,
+        *,
+        reader_connection: object | None = None,
+    ) -> bool:
+        self.wal_replaced = False
+        if reader_connection is not self._reader_connection:
+            # SQLite data_version is local to one connection. A replacement
+            # reader needs a fresh baseline, even when its value matches.
+            self._reader_connection = reader_connection
+            self._data_version = None
+            self._file_signature = None
+        try:
+            file_signature: list[tuple[int, int, int] | None] = []
+            for path in self._paths:
+                try:
+                    info = path.stat()
+                except FileNotFoundError:
+                    # A disappearing sidecar is itself a journal change; record
+                    # its absence and verify durable state on the full pass.
+                    file_signature.append(None)
+                else:
+                    file_signature.append(
+                        (int(info.st_size), int(info.st_mtime_ns), int(info.st_ino))
+                    )
+            signature = tuple(file_signature)
+        except OSError:
+            # If the filesystem cannot be sampled, fail open to the full pass.
+            signature = None
+
+        previous_signature = self._file_signature
+        self.wal_replaced = bool(
+            previous_signature is not None
+            and signature is not None
+            and previous_signature[1] is not None
+            and (
+                signature[1] is None
+                or previous_signature[1][2] != signature[1][2]
+            )
+        )
+        changed = (
+            self._data_version is None
+            or data_version != self._data_version
+            or signature is None
+            or signature != self._file_signature
+        )
+        self._data_version = data_version
+        if signature is not None:
+            self._file_signature = signature
+        return changed
+
+
+def _reset_persistent_journal_reader(authority) -> None:
+    """Drop a listener's SQLite handle after its WAL inode was replaced."""
+    connection = getattr(authority, "_reader_connection", None)
+    if connection is not None:
+        authority._reader_connection = None
+        authority._reader_pid = None
+        connection.close()
+
+
+class _JournalChangeNotifier:
+    """Wake a listener when its journal WAL changes; never carry delivery state."""
+
+    def __init__(self, journal_path: Path | str) -> None:
+        self._journal_path = Path(journal_path)
+        self._wal_path = Path(f"{self._journal_path}-wal")
+        self._queue = None
+        self._directory_fd: int | None = None
+        self._wal_fd: int | None = None
+        self._wal_identity: tuple[int, int] | None = None
+        self._wal_replaced = False
+        self.active = False
+        self._fallback_logged = False
+
+        queue_factory = getattr(select, "kqueue", None)
+        if queue_factory is None:
+            raise OSError(errno.ENOTSUP, "kqueue is unavailable")
+        self._filter = getattr(select, "KQ_FILTER_VNODE", None)
+        self._event_flags = getattr(select, "KQ_EV_ADD", 0) | getattr(
+            select, "KQ_EV_CLEAR", 0
+        )
+        self._signal_filter = getattr(select, "KQ_FILTER_SIGNAL", None)
+        if self._signal_filter is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "kqueue signal notifications are unavailable",
+            )
+        self._note_flags = 0
+        for name in (
+            "KQ_NOTE_WRITE",
+            "KQ_NOTE_EXTEND",
+            "KQ_NOTE_DELETE",
+            "KQ_NOTE_RENAME",
+            "KQ_NOTE_ATTRIB",
+        ):
+            self._note_flags |= int(getattr(select, name, 0))
+        if self._filter is None or not self._event_flags or not self._note_flags:
+            raise OSError(errno.ENOTSUP, "kqueue vnode notifications are unavailable")
+
+        self._queue = queue_factory()
+        try:
+            self._directory_fd = os.open(
+                self._journal_path.parent,
+                self._node_open_flags(directory=True),
+            )
+            self._register(self._directory_fd)
+            self._register_signals()
+            self._rearm_wal()
+            self.active = True
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _node_open_flags(*, directory: bool) -> int:
+        flags = getattr(os, "O_EVTONLY", os.O_RDONLY)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        if directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        return flags
+
+    def _register(self, fd: int) -> None:
+        event = select.kevent(
+            fd,
+            filter=self._filter,
+            flags=self._event_flags,
+            fflags=self._note_flags,
+        )
+        self._queue.control([event], 0, 0)
+
+    def _register_signals(self) -> None:
+        events = [
+            select.kevent(
+                int(getattr(signal, name)),
+                filter=self._signal_filter,
+                flags=self._event_flags,
+            )
+            for name in _LISTENER_FATAL_SIGNAL_NAMES
+            if getattr(signal, name, None) is not None
+        ]
+        if events:
+            self._queue.control(events, 0, 0)
+
+    def _rearm_wal(self) -> bool:
+        old_identity = self._wal_identity
+        try:
+            info = self._wal_path.stat()
+        except FileNotFoundError:
+            identity = None
+        else:
+            identity = (int(info.st_dev), int(info.st_ino))
+            if identity == old_identity:
+                return False
+
+        fd = None
+        if identity is not None:
+            try:
+                fd = os.open(self._wal_path, self._node_open_flags(directory=False))
+            except FileNotFoundError:
+                identity = None
+            else:
+                try:
+                    info = os.fstat(fd)
+                    identity = (int(info.st_dev), int(info.st_ino))
+                    self._register(fd)
+                except BaseException:
+                    os.close(fd)
+                    raise
+
+        old_fd = self._wal_fd
+        self._wal_fd = fd
+        self._wal_identity = identity
+        if old_fd is not None:
+            os.close(old_fd)
+        return identity != old_identity
+
+    def _disable(self, exc: BaseException) -> None:
+        if not self._fallback_logged:
+            print(
+                "wake: notify failed; falling back to poll mode for this process: "
+                f"{exc}",
+                file=sys.stderr,
+            )
+            self._fallback_logged = True
+        self.close()
+
+    def wait(self, timeout_s: float) -> bool:
+        """Return true for a WAL change or WAL path replacement."""
+        if not self.active or self._queue is None:
+            return False
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        try:
+            while self.active:
+                remaining = max(0.0, deadline - time.monotonic())
+                events = self._queue.control([], 8, remaining)
+                if not events:
+                    return False
+                signal_changed = any(
+                    event.filter == self._signal_filter for event in events
+                )
+                wal_fd = self._wal_fd
+                wal_changed = any(event.ident == wal_fd for event in events)
+                directory_changed = any(
+                    event.ident == self._directory_fd for event in events
+                )
+                rearmed = (
+                    signal_changed or directory_changed or wal_changed
+                ) and self._rearm_wal()
+                if rearmed:
+                    self._wal_replaced = True
+                if signal_changed or wal_changed or rearmed:
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+            return False
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._disable(exc)
+            return False
+
+    def take_wal_replacement(self) -> bool:
+        replaced = self._wal_replaced
+        self._wal_replaced = False
+        return replaced
+
+    def close(self) -> None:
+        self.active = False
+        for attribute in ("_wal_fd", "_directory_fd"):
+            fd = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        queue = self._queue
+        self._queue = None
+        if queue is not None:
+            with contextlib.suppress(OSError):
+                queue.close()
+
+
+def _new_journal_notifier(mode: str, journal_path: Path | str):
+    if mode != "notify":
+        return None
+    try:
+        return _JournalChangeNotifier(journal_path)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(
+            "wake: notify unavailable; falling back to poll mode for this process: "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 class _JournalBusyTolerance:
     """One persistent listener loop's continuous journal-busy failure window.
 
@@ -7887,29 +10933,41 @@ def _emit_claimed_follow_events(
     visible: list[tuple[dict, dict]],
     emit: Callable[[dict[str, object]], bool],
     delivered: set[tuple[str, int, str]] | None = None,
-) -> tuple[bool, bool]:
-    """Emit unread rows once per owner; a partial batch remains replayable."""
+) -> tuple[bool, bool, bool]:
+    """Emit unread rows once per stdout owner; replacement owners may replay."""
     if not visible:
-        return True, False
+        return True, False, False
+    identities = []
+    for row, envelope in visible:
+        event_type = str(envelope.get("type") or "")
+        identities.append(
+            (
+                str(row["stream_id"]),
+                int(row["stream_seq"]),
+                event_type if event_type in PRIORITY_BY_TYPE else "",
+            )
+        )
     ring_claimed = goalflight_wake.claim_ring(
         project_root,
         controller_label=controller_label,
         cursor_version=cursor_version,
     )
     if not ring_claimed:
-        return True, False
+        # A previous successful emit by this owner already holds the ring for
+        # this cursor version. Do not keep a retry deadline alive until ack.
+        already_delivered = delivered is not None and all(
+            identity in delivered for identity in identities
+        )
+        return True, False, already_delivered
     emitted_event = False
     batch_delivered: set[tuple[str, int, str]] = set()
     try:
-        for row, envelope in visible:
+        for (row, envelope), identity in zip(visible, identities):
             # Carrier reads and earlier writes can outlive a controller drain.
             # The batch is only a candidate list; the journal owns consumption.
             positions = _journal_cursor_positions(authority, controller_label)
             if int(row["stream_seq"]) <= positions.get(str(row["stream_id"]), 0):
                 continue
-            event_type = str(envelope.get("type") or "")
-            identity = (str(row["stream_id"]), int(row["stream_seq"]),
-                        event_type if event_type in PRIORITY_BY_TYPE else "")
             if identity in batch_delivered or (delivered is not None and identity in delivered):
                 continue
             if not emit(
@@ -7926,9 +10984,13 @@ def _emit_claimed_follow_events(
                     raise FollowStateError(
                         "failed delivery could not release its cursor ring"
                     )
-                return False, False
+                return False, False, True
             emitted_event = True
             batch_delivered.add(identity)
+            if delivered is not None:
+                # Keep successful stdout writes in this owner's recovery memory
+                # if a later row fails and the persistent reader must reopen.
+                delivered.add(identity)
     except BaseException:
         goalflight_wake.release_ring_claim(
             project_root,
@@ -7936,9 +10998,7 @@ def _emit_claimed_follow_events(
             cursor_version=cursor_version,
         )
         raise
-    if delivered is not None:
-        delivered.update(batch_delivered)
-    return True, emitted_event
+    return True, emitted_event, True
 
 
 def cmd_follow(args) -> int:
@@ -7999,14 +11059,14 @@ def cmd_follow(args) -> int:
     stdout_refusal = _follow_stdout_refusal(sys.stdout)
     if stdout_refusal:
         print(f"follow: refused: {stdout_refusal}", file=sys.stderr)
+        print(
+            "follow: stdout must be owned by the host persistent monitor; "
+            "ordinary shell backgrounding produces no controller wakes",
+            file=sys.stderr,
+        )
         return 2
     for warning in _follow_inert_knob_warnings():
         print(warning, file=sys.stderr)
-    print(
-        "follow: stdout must be owned by the host persistent monitor; "
-        "ordinary shell backgrounding produces no controller wakes",
-        file=sys.stderr,
-    )
 
     def startup_fail(reason: str, detail: object) -> int:
         stdout_alive = True
@@ -8084,10 +11144,12 @@ def cmd_follow(args) -> int:
         print("follow: active controller lease is unavailable", file=sys.stderr)
         return 2
 
+    wake_mode = _wake_mode()
     try:
         authority = _retry_listener_journal_busy(
-            lambda: goalflight_journal.Journal(
+            lambda: goalflight_journal.Journal.open_reader(
                 project_root,
+                persistent=wake_mode != "poll",
                 retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
             ),
             busy_error=goalflight_journal.JournalBusy,
@@ -8143,10 +11205,43 @@ def cmd_follow(args) -> int:
             pass
         print(f"follow: durable monitor state unavailable: {exc}", file=sys.stderr)
         return 2 if stdout_alive else 0
-    _emit_supervised_armed()
-
     death_watch = _ListenerDeathWatch()
     death_watch.install()
+    _emit_supervised_armed()
+    notifier = _new_journal_notifier(wake_mode, authority.path)
+    journal_gate = _JournalChangeGate(authority.path)
+    def current_reader_wal_identity() -> tuple[int, int] | None:
+        try:
+            info = Path(f"{authority.path}-wal").stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        return int(info.st_dev), int(info.st_ino)
+
+    reader_wal_identity = (
+        current_reader_wal_identity() if wake_mode != "poll" else None
+    )
+    reader_recovery_pending = False
+
+    def retry_reader_after_wal_replacement(
+        previous_identity: tuple[int, int] | None,
+    ) -> bool:
+        nonlocal reader_wal_identity, reader_recovery_pending
+        if wake_mode == "poll" or reader_recovery_pending:
+            return False
+        try:
+            authority.path.stat()
+        except OSError:
+            return False
+        current_identity = current_reader_wal_identity()
+        if current_identity == previous_identity:
+            return False
+        _reset_persistent_journal_reader(authority)
+        reader_wal_identity = current_identity
+        reader_recovery_pending = True
+        return True
+
     heartbeat_seq = 0
     next_heartbeat = time.monotonic()
     last_frontier_signature: str | None = None
@@ -8173,6 +11268,9 @@ def cmd_follow(args) -> int:
     delivered: set[tuple[str, int, str]] = set()
     seen_rewinds: dict[str, int] = {}
     active_carrier_errors: dict[tuple[str, str], dict[str, object]] = {}
+    active_pending_projections: set[tuple[str, str]] = set()
+    ring_retry_pending = False
+    ring_retry_candidate = None
     reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
@@ -8230,6 +11328,7 @@ def cmd_follow(args) -> int:
         while True:
             fatal = death_watch.fatal_signum
             if fatal is not None:
+                waiter.close()
                 emit(
                     {
                         "kind": "event",
@@ -8241,7 +11340,42 @@ def cmd_follow(args) -> int:
                     }
                 )
                 return listener_posix_signal_exit_code(fatal)
+            holder_alive = goalflight_wake.lease_holder_alive(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                prune_dead=False,
+            )
+            if holder_alive is False:
+                emit(
+                    {
+                        "kind": "event",
+                        "payload": {
+                            "type": "listener-exit",
+                            "reason": "stale-lease",
+                        },
+                    }
+                )
+                return 3
+            wal_identity_before_pass = reader_wal_identity
+            delivered_before_pass = len(delivered)
             try:
+                journal_changed = journal_gate.changed(
+                    authority._data_version(),
+                    reader_connection=authority._reader_connection,
+                )
+                if journal_gate.wal_replaced:
+                    if not reader_recovery_pending:
+                        _reset_persistent_journal_reader(authority)
+                        reader_wal_identity = current_reader_wal_identity()
+                        wal_identity_before_pass = reader_wal_identity
+                    journal_changed = True
+                scan_due = (
+                    journal_changed
+                    or bool(active_carrier_errors)
+                    or bool(active_pending_projections)
+                    or journal_tolerance.degraded
+                )
                 lease = authority.active_lease(label)
                 if lease is None or lease.nonce != nonce:
                     emit(
@@ -8254,91 +11388,217 @@ def cmd_follow(args) -> int:
                         }
                     )
                     return 3
-                rewinds = authority._cursor_rewinds(label)
-                changed_streams = {
-                    stream for stream, version in rewinds.items()
-                    if version != seen_rewinds.get(stream, 0)
-                }
-                if changed_streams:
-                    # A rewind can commit between the previous evidence read
-                    # and peek, leaving its new-version ring claimed before
-                    # delivery memory was invalidated. Reclaim that reservation.
-                    reset_owner_ring = True
-                    delivered.difference_update(
-                        identity for identity in tuple(delivered)
-                        if identity[0] in changed_streams
-                    )
-                    for stream in changed_streams:
-                        arm_high.pop(stream, None)
-                seen_rewinds = rewinds
-                # A fresh peek selects candidates; delivery rechecks positions
-                # because carrier reads and stdout writes can span advances.
-                snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-                candidate_rows = [
-                    item
-                    for item in snapshot.items
-                    if str(item.get("wake_class") or "") == "waking"
-                    and int(item.get("stream_seq") or 0)
-                    > arm_high.get(str(item.get("stream_id") or ""), 0)
-                ]
-                carrier_errors: list[dict[str, object]] = []
-                visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
-                    _envelopes_with_rows(
+                if scan_due:
+                    rewinds = authority._cursor_rewinds(label)
+                    changed_streams = {
+                        stream for stream, version in rewinds.items()
+                        if version != seen_rewinds.get(stream, 0)
+                    }
+                    if changed_streams:
+                        # A rewind can commit between the previous evidence read
+                        # and peek, leaving its new-version ring claimed before
+                        # delivery memory was invalidated. Reclaim that reservation.
+                        reset_owner_ring = True
+                        delivered.difference_update(
+                            identity for identity in tuple(delivered)
+                            if identity[0] in changed_streams
+                        )
+                        for stream in changed_streams:
+                            arm_high.pop(stream, None)
+                    seen_rewinds = rewinds
+                    # A fresh peek selects candidates; delivery rechecks positions
+                    # because carrier reads and stdout writes can span advances.
+                    snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+                    candidate_rows = [
+                        item
+                        for item in snapshot.items
+                        if str(item.get("wake_class") or "") == "waking"
+                        and int(item.get("stream_seq") or 0)
+                        > arm_high.get(str(item.get("stream_id") or ""), 0)
+                    ]
+                    carrier_errors: list[dict[str, object]] = []
+                    attention_by_id = _attention_items_for_rows(
                         authority,
-                        candidate_rows,
-                        controller_label=label,
-                        carrier_errors=carrier_errors,
-                    ),
-                    controller_label=label,
-                    lease_nonce=nonce,
-                )
-                new_carrier_error = False
-                for error in carrier_errors:
-                    identity = (
-                        str(error.get("carrier_path") or ""),
-                        str(error.get("error") or error.get("reason") or ""),
+                        snapshot.items,
                     )
-                    if identity not in active_carrier_errors:
-                        if not emit(
-                            _follow_fault_record(
+                    deliverable = _deliverable_rows(
+                        authority,
+                        list(snapshot.items),
+                        controller_label=label,
+                        attention_by_id=attention_by_id,
+                        carrier_errors=carrier_errors,
+                    )
+                    candidate_ids = {id(row) for row in candidate_rows}
+                    visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
+                        [pair for pair in deliverable if id(pair[0]) in candidate_ids],
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                    new_carrier_error = False
+                    pending_behind_stuck = _pending_behind_stuck_rows(
+                        list(snapshot.items)
+                    )
+                    pending_projections: set[tuple[str, str]] = set()
+                    pending_reported_streams: set[str] = set()
+                    for error in carrier_errors:
+                        identity = (
+                            str(error.get("carrier_path") or ""),
+                            str(error.get("error") or error.get("reason") or ""),
+                        )
+                        if (
+                            error.get("status") == "STUCK"
+                            and error.get("code") == "projection_pending"
+                        ):
+                            pending_projections.add(identity)
+                            if identity not in active_pending_projections:
+                                pending_record = {
+                                    "kind": "event",
+                                    "payload": {
+                                        "type": "pending-projection",
+                                        "reason": "pending-projection",
+                                        "pending_projection": {
+                                            "stream_id": error.get("stream_id"),
+                                            "stream_seq": error.get("stream_seq"),
+                                        },
+                                    },
+                                }
+                                if not emit(pending_record):
+                                    return 0
+                                stream_id = str(error.get("stream_id") or "")
+                                if stream_id:
+                                    for pending in pending_behind_stuck:
+                                        if pending["stream_id"] != stream_id:
+                                            continue
+                                        pending_record = _fit_follow_record(
+                                            {
+                                                "kind": "event",
+                                                "payload": {
+                                                    "type": "pending-projection",
+                                                    "reason": "pending_behind_stuck",
+                                                    "pending_behind_stuck": {
+                                                        "id": _truncate_utf8(pending["id"], 72),
+                                                        "stream_id": _truncate_utf8(pending["stream_id"], 72),
+                                                        "stream_seq": pending["stream_seq"],
+                                                        "type": _truncate_utf8(pending["type"], 40),
+                                                    },
+                                                },
+                                            },
+                                            shrink_fields=("reason",),
+                                        )
+                                        if not emit(pending_record):
+                                            return 0
+                            continue
+                        if identity not in active_carrier_errors:
+                            fault_record = _follow_fault_record(
                                 "carrier-corrupt",
                                 f"{identity[0]}: {identity[1]}",
                             )
-                        ):
-                            return 0
-                        new_carrier_error = True
-                    active_carrier_errors[identity] = error
-                active_carrier_errors = {
-                    (
-                        str(error.get("carrier_path") or ""),
-                        str(error.get("error") or error.get("reason") or ""),
-                    ): error
-                    for error in carrier_errors
-                }
-                if new_carrier_error:
-                    next_heartbeat = time.monotonic() + heartbeat_s
-                try:
-                    if reset_owner_ring:
-                        # The exclusive monitor slot proves the prior follow
-                        # owner is gone. Its pipe flush cannot prove delivery
-                        # through the supervisor to this host. Release only the
-                        # matching unread reservation, never journal consumption.
-                        if snapshot.items:
-                            goalflight_wake.release_ring_claim(
-                                project_root,
-                                controller_label=label,
-                                cursor_version=snapshot.cursor_version,
+                            fault_payload = fault_record["payload"]
+                            assert isinstance(fault_payload, dict)
+                            for key in (
+                                "dispatch_id",
+                                "stream_id",
+                                "stream_seq",
+                            ):
+                                if error.get(key) is not None:
+                                    fault_payload[key] = (
+                                        int(error[key])
+                                        if key == "stream_seq"
+                                        else _truncate_utf8(error[key], 72)
+                                    )
+                            fault_payload["stuck_reason"] = _truncate_utf8(
+                                error.get("reason") or error.get("error") or "STUCK",
+                                180,
                             )
-                        reset_owner_ring = False
-                    alive, emitted_event = _emit_claimed_follow_events(
-                        project_root,
-                        authority=authority,
-                        controller_label=label,
-                        cursor_version=snapshot.cursor_version,
-                        visible=visible,
-                        emit=emit,
-                        delivered=delivered,
-                    )
+                            fault_record = _fit_follow_record(
+                                fault_record,
+                                shrink_fields=(
+                                    "detail",
+                                    "stuck_reason",
+                                    "stream_id",
+                                    "dispatch_id",
+                                    "reason",
+                                ),
+                            )
+                            if not emit(fault_record):
+                                return 0
+                            stream_id = str(error.get("stream_id") or "")
+                            if (
+                                error.get("status") == "STUCK"
+                                and stream_id
+                                and stream_id not in pending_reported_streams
+                            ):
+                                pending_reported_streams.add(stream_id)
+                                for pending in pending_behind_stuck:
+                                    if pending["stream_id"] != stream_id:
+                                        continue
+                                    pending_record = _fit_follow_record(
+                                        {
+                                            "kind": "event",
+                                            "payload": {
+                                                "type": "listener-fault",
+                                                "reason": "pending_behind_stuck",
+                                                "pending_behind_stuck": {
+                                                    "id": _truncate_utf8(pending["id"], 72),
+                                                    "stream_id": _truncate_utf8(pending["stream_id"], 72),
+                                                    "stream_seq": pending["stream_seq"],
+                                                    "type": _truncate_utf8(pending["type"], 40),
+                                                },
+                                            },
+                                        },
+                                        shrink_fields=("reason",),
+                                    )
+                                    if not emit(pending_record):
+                                        return 0
+                            new_carrier_error = True
+                        active_carrier_errors[identity] = error
+                    active_pending_projections = pending_projections
+                    active_carrier_errors = {
+                        (
+                            str(error.get("carrier_path") or ""),
+                            str(error.get("error") or error.get("reason") or ""),
+                        ): error
+                        for error in carrier_errors
+                        if error.get("code") != "projection_pending"
+                    }
+                    if new_carrier_error:
+                        next_heartbeat = time.monotonic() + heartbeat_s
+                elif ring_retry_pending and ring_retry_candidate is not None:
+                    # A sibling already owns this cursor version's ring. Retry
+                    # only the cheap reservation against the snapshot we saw;
+                    # the journal gate remains responsible for refreshing it.
+                    snapshot, visible = ring_retry_candidate
+                else:
+                    visible = []
+                try:
+                    if scan_due or ring_retry_pending:
+                        if reset_owner_ring:
+                            # The exclusive monitor slot proves the prior follow
+                            # owner is gone. Its pipe flush cannot prove delivery
+                            # through the supervisor to this host. Release only the
+                            # matching unread reservation, never journal consumption.
+                            if snapshot.items:
+                                goalflight_wake.release_ring_claim(
+                                    project_root,
+                                    controller_label=label,
+                                    cursor_version=snapshot.cursor_version,
+                                )
+                            reset_owner_ring = False
+                        alive, emitted_event, candidate_settled = _emit_claimed_follow_events(
+                            project_root,
+                            authority=authority,
+                            controller_label=label,
+                            cursor_version=snapshot.cursor_version,
+                            visible=visible,
+                            emit=emit,
+                            delivered=delivered,
+                        )
+                        ring_retry_pending = bool(visible) and not candidate_settled
+                        ring_retry_candidate = (
+                            (snapshot, visible) if ring_retry_pending else None
+                        )
+                    else:
+                        alive, emitted_event = True, False
                 except (
                     goalflight_journal.JournalBusy,
                     goalflight_journal.JournalDisappeared,
@@ -8371,13 +11631,26 @@ def cmd_follow(args) -> int:
                 # would spin forever against a deleted journal.
                 return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalIOError as exc:
-                # Fatal on purpose. JournalIOError has three relevant origins:
-                # an immediate path.stat() OSError that prevents
-                # identity/disappearance verification, an immediate verified
-                # permission denial during journal open, or exhausted 75s
-                # present-path open retries. Neither is SQLite contention, so
-                # only JournalBusy enters the listener tolerance below.
-                return fail(_journal_failure_reason(exc), exc, code=2)
+                if retry_reader_after_wal_replacement(wal_identity_before_pass):
+                    visible = []
+                    alive = True
+                    emitted_event = len(delivered) > delivered_before_pass
+                    if emitted_event:
+                        next_heartbeat = time.monotonic() + heartbeat_s
+                else:
+                    # A reader that failed again after its single replacement
+                    # recovery is a persistent failure and follows the normal
+                    # fatal exit below.
+                    return fail(_journal_failure_reason(exc), exc, code=2)
+            except sqlite3.OperationalError as exc:
+                if retry_reader_after_wal_replacement(wal_identity_before_pass):
+                    visible = []
+                    alive = True
+                    emitted_event = len(delivered) > delivered_before_pass
+                    if emitted_event:
+                        next_heartbeat = time.monotonic() + heartbeat_s
+                else:
+                    return fail("journal-unavailable", exc, code=2)
             except goalflight_journal.JournalBusy as exc:
                 first = not journal_tolerance.degraded
                 if not journal_tolerance.note_failure(exc):
@@ -8396,6 +11669,7 @@ def cmd_follow(args) -> int:
             except ValueError as exc:
                 return fail("journal-unavailable", exc, code=2)
             else:
+                reader_recovery_pending = False
                 recovered_s = journal_tolerance.note_success()
                 if recovered_s is not None:
                     if not emit(
@@ -8418,7 +11692,13 @@ def cmd_follow(args) -> int:
                         return 0
                     next_heartbeat = time.monotonic() + heartbeat_s
                 delay = journal_tolerance.backoff_s(poll_s)
-                time.sleep(min(delay, max(0.0, next_heartbeat - time.monotonic())))
+                time.sleep(
+                    _follow_wait_timeout(
+                        delay,
+                        now=time.monotonic(),
+                        next_heartbeat=next_heartbeat,
+                    )
+                )
                 continue
 
             if not alive:
@@ -8451,7 +11731,25 @@ def cmd_follow(args) -> int:
                     last_frontier_signature = signature
                     last_frontier_at = now
                 next_heartbeat = time.monotonic() + heartbeat_s
-            time.sleep(min(poll_s, max(0.0, next_heartbeat - time.monotonic())))
+            delay = _follow_wait_timeout(
+                poll_s,
+                now=time.monotonic(),
+                next_heartbeat=next_heartbeat,
+            )
+            if notifier is not None and notifier.active:
+                delay = _follow_wait_timeout(
+                    WAKE_NOTIFY_SAFETY_POLL_S,
+                    now=time.monotonic(),
+                    next_heartbeat=next_heartbeat,
+                )
+                if ring_retry_pending:
+                    delay = min(delay, poll_s)
+                notifier.wait(delay)
+                if notifier.take_wal_replacement() and not reader_recovery_pending:
+                    _reset_persistent_journal_reader(authority)
+                    reader_wal_identity = current_reader_wal_identity()
+            else:
+                time.sleep(delay)
     except FollowWriteStalled as exc:
         return fail("stdout-backpressure", exc, code=2, write_stdout=False)
     except FollowStateError as exc:
@@ -8469,8 +11767,21 @@ def cmd_follow(args) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         return fail("stream-runtime", exc, code=2)
     finally:
-        waiter.close()
-        death_watch.restore()
+        try:
+            waiter.close()
+        finally:
+            try:
+                if notifier is not None:
+                    notifier.close()
+            finally:
+                try:
+                    reader_connection = getattr(authority, "_reader_connection", None)
+                    if reader_connection is not None:
+                        authority._reader_connection = None
+                        authority._reader_pid = None
+                        reader_connection.close()
+                finally:
+                    death_watch.restore()
 
 
 def _cmd_watch_follow(
@@ -8586,6 +11897,8 @@ def _cmd_watch_follow(
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
         return 2
+    death_watch = _ListenerDeathWatch()
+    death_watch.install()
     _emit_supervised_armed()
 
     started = time.monotonic()
@@ -8653,6 +11966,19 @@ def _cmd_watch_follow(
 
     try:
         while True:
+            fatal = death_watch.fatal_signum
+            if fatal is not None:
+                waiter.close()
+                payload = {
+                    "kind": "event",
+                    "payload": {
+                        "type": "listener-exit",
+                        "reason": "signal",
+                        "signal": _listener_signal_name(fatal),
+                    },
+                }
+                _write_follow_record(payload, stream=sys.stdout)
+                return listener_posix_signal_exit_code(fatal)
             current_parent = os.getppid()
             if current_parent == 1:
                 if time.monotonic() - started >= detached_grace:
@@ -8717,6 +12043,17 @@ def _cmd_watch_follow(
             if lease is None or lease.nonce != nonce:
                 print(
                     "listen: stale-lease: watchdog generation is no longer active",
+                    file=sys.stderr,
+                )
+                return 3
+            if goalflight_wake.lease_holder_alive(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                prune_dead=False,
+            ) is False:
+                print(
+                    "listen: stale-lease: controller lease holder is gone",
                     file=sys.stderr,
                 )
                 return 3
@@ -8828,6 +12165,7 @@ def _cmd_watch_follow(
         return 2
     finally:
         waiter.close()
+        death_watch.restore()
 
 
 def cmd_listen(args) -> int:
@@ -9031,11 +12369,15 @@ def cmd_listen(args) -> int:
         return 2
 
     def close_read_authority() -> None:
+        if notifier is not None:
+            notifier.close()
         connection = getattr(read_authority, "_reader_connection", None)
         if connection is not None:
             read_authority._reader_connection = None
             read_authority._reader_pid = None
             connection.close()
+
+    notifier = None
 
     # Acquire the kernel witness before superseding journal coverage.  If the
     # ledger is unavailable, the incumbent listener remains both ARMED and
@@ -9048,8 +12390,22 @@ def cmd_listen(args) -> int:
             slots=listener_slots,
         )
     except BlockingIOError as exc:
+        holders = goalflight_wake.listener_slot_holder_pids(
+            project_root,
+            controller_label=label,
+        )
         detail = exc.strerror or str(exc)
-        print(f"listen: refused: {detail}", file=sys.stderr)
+        # The grokbot wrapper deliberately has one slot, so a second arm
+        # while that slot is held is a duplicate. For a multi-slot pool,
+        # exhausting every slot is a ceiling refusal, not a duplicate claim.
+        if holders and listener_slots == 1 and "listener-slots cap is" in detail:
+            print(
+                "listen: refused: live listener already holds this controller "
+                f"slot pid(s)={','.join(map(str, holders))}; duplicate arm not started",
+                file=sys.stderr,
+            )
+        else:
+            print(f"listen: refused: {detail}", file=sys.stderr)
         return 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
@@ -9075,9 +12431,10 @@ def cmd_listen(args) -> int:
     ) -> list[tuple[dict, dict]]:
         nonlocal stuck_carrier_seen
         errors: list[dict[str, object]] = []
-        items = _envelopes_with_rows(
+        items = _deliverable_rows(
             source,
             rows,
+            repair_authority=authority,
             controller_label=label,
             attention_by_id=attention_by_id,
             carrier_errors=errors,
@@ -9086,6 +12443,8 @@ def cmd_listen(args) -> int:
             error.get("status") == "STUCK"
             for error in errors
         )
+        pending_behind_stuck = _pending_behind_stuck_rows(list(rows))
+        pending_reported_streams: set[str] = set()
         for error in errors:
             identity = (
                 str(error.get("carrier_path") or ""),
@@ -9094,7 +12453,87 @@ def cmd_listen(args) -> int:
             if identity in reported_carrier_errors:
                 continue
             reported_carrier_errors.add(identity)
-            _emit_carrier_error(error)
+            if (
+                error.get("status") == "STUCK"
+                and error.get("code") == "projection_pending"
+            ):
+                print(
+                    json.dumps(
+                        {
+                            "kind": "event",
+                            "payload": {
+                                "type": "pending-projection",
+                                "reason": "pending-projection",
+                                "pending_projection": {
+                                    "stream_id": error.get("stream_id"),
+                                    "stream_seq": error.get("stream_seq"),
+                                },
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                stream_id = str(error.get("stream_id") or "")
+                if stream_id and stream_id not in pending_reported_streams:
+                    pending_reported_streams.add(stream_id)
+                    for pending in pending_behind_stuck:
+                        if pending["stream_id"] != stream_id:
+                            continue
+                        print(
+                            json.dumps(
+                                {
+                                    "kind": "event",
+                                    "payload": {
+                                        "type": "pending-projection",
+                                        "reason": "pending_behind_stuck",
+                                        "pending_behind_stuck": pending,
+                                    },
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+            else:
+                if error.get("status") == "STUCK":
+                    print(
+                        json.dumps(
+                            {
+                                "kind": "event",
+                                "payload": {
+                                    "type": "listener-fault",
+                                    "dispatch_id": error.get("dispatch_id"),
+                                    "stream_id": error.get("stream_id"),
+                                    "stream_seq": error.get("stream_seq"),
+                                    "reason": "carrier-corrupt",
+                                    "stuck_reason": error.get("reason") or error.get("error"),
+                                },
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    stream_id = str(error.get("stream_id") or "")
+                    if stream_id and stream_id not in pending_reported_streams:
+                        pending_reported_streams.add(stream_id)
+                        for pending in pending_behind_stuck:
+                            if pending["stream_id"] != stream_id:
+                                continue
+                            print(
+                                json.dumps(
+                                    {
+                                        "kind": "event",
+                                        "payload": {
+                                            "type": "listener-fault",
+                                            "reason": "pending_behind_stuck",
+                                            "pending_behind_stuck": pending,
+                                        },
+                                    },
+                                    sort_keys=True,
+                                ),
+                                flush=True,
+                            )
+                _emit_carrier_error(error)
         return items
 
     def arm_once():
@@ -9273,6 +12712,11 @@ def cmd_listen(args) -> int:
     rearm_command = _exact_listener_command()
     death_watch = _ListenerDeathWatch()
     death_watch.install()
+    wake_mode = _wake_mode()
+    notifier = _new_journal_notifier(wake_mode, read_authority.path)
+    journal_gate = (
+        _JournalChangeGate(read_authority.path) if wake_mode == "gated" else None
+    )
 
     def rearm_plan_after_release() -> dict[str, object] | None:
         try:
@@ -9404,48 +12848,48 @@ def cmd_listen(args) -> int:
             "detail": detail,
         }
         try:
-            exit_authority = authority
-            if reopen_for_exit:
-                # The old writer is fenced to the inode that was replaced. A
-                # validated fresh writer can close the copied coverage row when
-                # the replacement is a usable restore; otherwise finish still
-                # emits its exit record with the write failure attached.
-                exit_authority = goalflight_journal.Journal(
-                    project_root,
-                    retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
-                    open_retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
-                )
-            exited = exit_authority.exit_listener(coverage_id, reason=reason)
-            if not exited.committed:
-                payload["coverage_exit_error"] = (
-                    exited.reason or "coverage exit CAS lost"
-                )
-        except (
-            goalflight_journal.JournalBusy,
-            goalflight_journal.JournalDisappeared,
-            goalflight_journal.JournalIOError,
-        ) as exc:
-            payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
-        except goalflight_journal.JournalError as exc:
-            payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
-        finally:
             if waiter is not None:
                 waiter.close()
-            death_watch.restore()
+            try:
+                exit_authority = authority
+                if reopen_for_exit:
+                    # The old writer is fenced to the inode that was replaced. A
+                    # validated fresh writer can close the copied coverage row when
+                    # the replacement is a usable restore; otherwise finish still
+                    # emits its exit record with the write failure attached.
+                    exit_authority = goalflight_journal.Journal(
+                        project_root,
+                        retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+                        open_retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+                    )
+                exited = exit_authority.exit_listener(coverage_id, reason=reason)
+                if not exited.committed:
+                    payload["coverage_exit_error"] = (
+                        exited.reason or "coverage exit CAS lost"
+                    )
+            except (
+                goalflight_journal.JournalBusy,
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+            ) as exc:
+                payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
+            except goalflight_journal.JournalError as exc:
+                payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
             close_read_authority()
-        emit_payload(payload, detail=None if args.json else payload.get("detail"))
-        return code
+            emit_payload(payload, detail=None if args.json else payload.get("detail"))
+            return code
+        finally:
+            death_watch.restore()
 
     def finish_detached() -> int:
         # Best-effort journal audit must never turn the refusal into multiple
         # lines; the one diagnostic is deliberately copy/paste actionable.
+        waiter.close()
         _exit_listener_before_final_event(
             authority,
             coverage_id,
             reason="orphaned",
         )
-        waiter.close()
-        death_watch.restore()
         close_read_authority()
         action = _wake_recovery_action(
             project_root,
@@ -9481,6 +12925,7 @@ def cmd_listen(args) -> int:
                 f"(pid {os.getpid()}); {action['instruction']}",
                 file=sys.stderr,
             )
+        death_watch.restore()
         return DETACHED_LISTENER_EXIT_CODE
 
     def finish_watchdog_dead(*, claim_state: str = "claimed") -> int:
@@ -9489,13 +12934,12 @@ def cmd_listen(args) -> int:
         # lone watchdog death loud without a new task, daemon, or delivery
         # slot. It cannot witness its own death, and no controller-scoped task
         # survives the correlated case where the host reaps every tracked task.
+        waiter.close()
         _exit_listener_before_final_event(
             authority,
             coverage_id,
             reason="watchdog-dead",
         )
-        waiter.close()
-        death_watch.restore()
         close_read_authority()
         status = goalflight_wake.coverage_status(
             project_root,
@@ -9520,6 +12964,7 @@ def cmd_listen(args) -> int:
                 _silence_broken_stdout(sys.stdout)
         except (FollowWriteStalled, OSError):
             pass
+        death_watch.restore()
         return 0
 
     def parent_exit() -> int | None:
@@ -9570,7 +13015,12 @@ def cmd_listen(args) -> int:
         return None
 
     def wait_for_next_poll() -> int | None:
-        delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll
+        notify_active = notifier is not None and notifier.active
+        delay = (
+            journal_tolerance.backoff_s(poll)
+            if journal_tolerance.degraded
+            else WAKE_NOTIFY_SAFETY_POLL_S if notify_active else poll
+        )
         sleep_until = time.monotonic() + delay
         while time.monotonic() < sleep_until:
             parent_result = parent_exit()
@@ -9581,7 +13031,25 @@ def cmd_listen(args) -> int:
                 return signal_result
             if deadline is not None and time.monotonic() >= deadline:
                 return finish("timeout", code=1, detail="no waking event before timeout")
-            time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
+            wait_s = min(0.25, max(0.0, sleep_until - time.monotonic()))
+            if notifier is not None and notifier.active:
+                notified = notifier.wait(wait_s)
+                if notifier.take_wal_replacement():
+                    _reset_persistent_journal_reader(read_authority)
+                if notified:
+                    return None
+                if not notifier.active:
+                    fallback_delay = (
+                        journal_tolerance.backoff_s(poll)
+                        if journal_tolerance.degraded
+                        else poll
+                    )
+                    sleep_until = min(
+                        sleep_until,
+                        time.monotonic() + fallback_delay,
+                    )
+            else:
+                time.sleep(wait_s)
         return None
 
     emit_wake_entry_notice(
@@ -9590,15 +13058,15 @@ def cmd_listen(args) -> int:
         stream=sys.stderr,
     )
 
-    def quarantine_claim_unit() -> None:
+    def quarantine_claim_unit() -> bool:
         try:
-            goalflight_wake.quarantine_pending_report(
+            return goalflight_wake.quarantine_pending_report(
                 project_root,
                 controller_label=label,
                 lease_nonce=nonce,
             )
         except (OSError, RuntimeError, ValueError):
-            pass
+            return False
 
     def emit_pending_report(
         claim: goalflight_wake.PendingReportState,
@@ -9636,6 +13104,32 @@ def cmd_listen(args) -> int:
             if int(item.get("stream_seq") or 0)
             <= claim.positions.get(str(item.get("stream_id") or ""), 0)
         )
+        if not args.json:
+            oldest_age = "unknown"
+            timestamps: list[dt.datetime] = []
+            for item in report_items:
+                raw_created = item.get("created_at")
+                if not isinstance(raw_created, str):
+                    continue
+                try:
+                    created = dt.datetime.fromisoformat(
+                        raw_created.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    continue
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=dt.timezone.utc)
+                timestamps.append(created.astimezone(dt.timezone.utc))
+            if timestamps:
+                age_s = max(
+                    0.0,
+                    (dt.datetime.now(dt.timezone.utc) - min(timestamps)).total_seconds(),
+                )
+                oldest_age = f"{age_s:.0f}"
+            print(
+                f"pending backlog: count={len(report_items)} oldest_age_s={oldest_age}",
+                flush=True,
+            )
         if _cursor_positions(report_items) != claim.positions:
             # New traffic in an earlier-sorting stream can push an old claimed
             # row beyond cursor_peek's global limit. A takeover is rare, so
@@ -9684,20 +13178,23 @@ def cmd_listen(args) -> int:
                     if str(item.get("stream_id") or "") in remainder
                 )
             else:
-                quarantine_claim_unit()
-                return True
+                return quarantine_claim_unit()
         if (
             claim.cursor_version is None
             or report_snapshots.keys() != report_positions.keys()
         ):
-            quarantine_claim_unit()
-            return True
+            return quarantine_claim_unit()
         claimed_positions = dict(report_positions)
         if visible_items is None:
+            materialization_rows = list(snapshot.items)
+            materialized_row_ids = {id(item) for item in materialization_rows}
+            materialization_rows.extend(
+                item for item in report_items if id(item) not in materialized_row_ids
+            )
             materialized_items = _retry_listener_journal_busy(
                 lambda: listener_envelopes(
                     authority,
-                    list(report_items),
+                    materialization_rows,
                 ),
                 busy_error=goalflight_journal.JournalBusy,
                 tolerance=journal_tolerance,
@@ -9722,16 +13219,37 @@ def cmd_listen(args) -> int:
         # not show or successfully quarantine. A partial report remains
         # pending, while safe siblings can still be delivered below.
         report_complete = report_positions == claimed_positions
-        report_snapshots = {
-            stream_id: stream_snapshot
-            for stream_id, stream_snapshot in claim.stream_snapshots.items()
-            if stream_id in report_positions
-        }
+        report_snapshots = _cursor_snapshots_for_rows(
+            report_items,
+            report_positions,
+        )
         if report_snapshots.keys() != report_positions.keys():
-            quarantine_claim_unit()
-            return True
-        if not report_positions:
-            return True
+            return quarantine_claim_unit()
+        safe_report_items = tuple(
+            item
+            for item in report_items
+            if int(item.get("stream_seq") or 0)
+            <= report_positions.get(str(item.get("stream_id") or ""), 0)
+        )
+        safe_materialized_items = [
+            (row, envelope)
+            for row, envelope in shown_items
+            if int(row.get("stream_seq") or 0)
+            <= report_positions.get(str(row.get("stream_id") or ""), 0)
+        ]
+        pending_behind_stuck = _pending_behind_stuck_rows(list(snapshot.items))
+        stuck_records = [
+            {
+                "delivery_id": str(item.get("event_uuid") or ""),
+                "dispatch_id": str(item.get("stream_id") or ""),
+                "stream_id": str(item.get("stream_id") or ""),
+                "stream_seq": int(item.get("stream_seq") or 0),
+                "type": str(item.get("event_type") or ""),
+                "reason": str(item.get("_listener_reason") or "STUCK"),
+            }
+            for item in snapshot.items
+            if item.get("listener_status") == "STUCK"
+        ]
         arm_advance = _cursor_advance_command(
             project_root=project_root,
             controller_label=label,
@@ -9744,37 +13262,61 @@ def cmd_listen(args) -> int:
             "kind": "pending-at-arm",
             "items": (
                 [
-                    row
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "_cursor_rowid"
+                    }
                     for row, _envelope in (
-                        materialized_items
+                        safe_materialized_items
                         if visible_items is None
-                        else (prearmed_materialized_items or visible_arm_items)
+                        else safe_materialized_items
                     )
                 ]
                 if args.json
-                else report_items
+                else safe_report_items
             ),
             "cursor_version": claim.cursor_version,
             "advance_command": arm_advance,
+            "stuck": stuck_records,
+            "pending_behind_stuck": pending_behind_stuck,
         }
+        # Takeover delivery is at-least-once: racing or crashed claimants may
+        # flush this report more than once; controllers ack by position, so
+        # duplicate rings are harmless.
         if args.json:
             print(
                 json.dumps(arm_payload, sort_keys=True, default=str),
                 flush=True,
             )
         else:
-            for row, envelope in visible_arm_items:
+            for row, envelope in safe_materialized_items:
                 print(format_receipt_headline(row, envelope), flush=True)
-            print(f"advance: {arm_advance}", flush=True)
+            for item in stuck_records:
+                print(
+                    "stuck: "
+                    f"{item['stream_id']} seq={item['stream_seq']} "
+                    f"{item['reason']}",
+                    flush=True,
+                )
+            for item in pending_behind_stuck:
+                print(
+                    "pending behind stuck: "
+                    f"{item['stream_id']} seq={item['stream_seq']} "
+                    f"{item['type']} id={item['id']}",
+                    flush=True,
+                )
+            if arm_advance is not None:
+                print(f"advance: {arm_advance}", flush=True)
         if not report_complete:
-            return True
+            return False
         if claim.claim_token is None or not goalflight_wake.mark_pending_report_reported(
             project_root,
             controller_label=label,
             lease_nonce=nonce,
             claim_token=claim.claim_token,
         ):
-            return True
+            return False
         return True
 
     # Report the snapshot selected before coverage became externally visible.
@@ -9782,12 +13324,11 @@ def cmd_listen(args) -> int:
     # It remains takeover-eligible after owner death until cursor acknowledgement.
     if report_claim is not None:
         try:
-            if emit_pending_report(
+            pending_report_settled = emit_pending_report(
                 report_claim,
                 arm_snapshot,
                 visible_items=prearmed_visible_items,
-            ):
-                pending_report_settled = True
+            )
         except goalflight_journal.CASMismatch as exc:
             return finish("stale-lease", code=3, detail=str(exc))
         except goalflight_journal.JournalUpgradeRequired as exc:
@@ -9803,21 +13344,23 @@ def cmd_listen(args) -> int:
             raise
         except MessageError as exc:
             if "superseded" not in str(exc):
-                quarantine_claim_unit()
-            pending_report_settled = True
+                pending_report_settled = quarantine_claim_unit()
+            else:
+                pending_report_settled = False
         except goalflight_wake.PendingReportStateError as exc:
             if "lock remained busy" in str(exc):
                 pending_report_settled = False
             else:
-                quarantine_claim_unit()
-                pending_report_settled = True
+                pending_report_settled = quarantine_claim_unit()
         except (OSError, RuntimeError, ValueError):
             pending_report_settled = False
 
     observed_data_version: int | None = None
     observed_lease = None
     peek_needed = True
+    pending_ring_candidate = None
     stuck_carrier_retry = False
+    stuck_retry_due = False
     while True:
         stuck_carrier_seen = False
         parent_result = parent_exit()
@@ -9826,6 +13369,17 @@ def cmd_listen(args) -> int:
         signal_result = signal_or_stdio_exit()
         if signal_result is not None:
             return signal_result
+        if goalflight_wake.lease_holder_alive(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            prune_dead=False,
+        ) is False:
+            return finish(
+                "stale-lease",
+                code=3,
+                detail="controller lease holder is gone",
+            )
         if getattr(args, "report_pending", False) and not pending_report_settled:
             try:
                 observed_report = goalflight_wake.recover_pending_report_state(
@@ -9879,17 +13433,18 @@ def cmd_listen(args) -> int:
                 raise
             except MessageError as exc:
                 if "superseded" not in str(exc):
-                    quarantine_claim_unit()
-                pending_report_settled = True
+                    pending_report_settled = quarantine_claim_unit()
+                else:
+                    pending_report_settled = False
             except goalflight_wake.PendingReportStateError as exc:
                 if "lock remained busy" in str(exc):
                     pending_report_settled = False
                 else:
-                    quarantine_claim_unit()
-                    pending_report_settled = True
+                    pending_report_settled = quarantine_claim_unit()
             except (OSError, RuntimeError, ValueError):
                 pending_report_settled = False
         if stuck_carrier_seen:
+            pending_ring_candidate = None
             peek_needed = True
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
@@ -9903,12 +13458,23 @@ def cmd_listen(args) -> int:
         try:
             current_data_version = read_authority._data_version()
             journal_changed = (
-                observed_data_version is None
-                or current_data_version != observed_data_version
+                journal_gate.changed(
+                    current_data_version,
+                    reader_connection=read_authority._reader_connection,
+                )
+                if journal_gate is not None
+                else (
+                    observed_data_version is None
+                    or current_data_version != observed_data_version
+                )
             )
+            if journal_gate is not None and journal_gate.wal_replaced:
+                _reset_persistent_journal_reader(read_authority)
+                journal_changed = True
+            retry_due = wake_mode == "gated" and journal_tolerance.degraded
             lease = (
                 read_authority.active_lease(label)
-                if journal_changed
+                if journal_changed or retry_due
                 else observed_lease
             )
             measured = (
@@ -9938,6 +13504,24 @@ def cmd_listen(args) -> int:
                 lease_nonce=nonce,
             )
             suppression = pending_report_suppression()
+            wakeable_items = False
+            cached_candidate = pending_ring_candidate
+            if (
+                cached_candidate is not None
+                and not journal_changed
+                and not retry_due
+                and cached_candidate[4] == suppression
+            ):
+                peek, visible_rows, ring_materialized_items, visible_ring_items = (
+                    cached_candidate[:4]
+                )
+                wakeable_items = True
+                peek_needed = False
+            else:
+                if cached_candidate is not None:
+                    pending_ring_candidate = None
+                    if not journal_changed and not retry_due:
+                        peek_needed = True
             watchdog_status = witness_status.get("watchdog")
             watchdog_state = (
                 str(watchdog_status.get("state") or "")
@@ -9980,8 +13564,7 @@ def cmd_listen(args) -> int:
                 )
                 if claim_state != "already-claimed":
                     return finish_watchdog_dead(claim_state=claim_state)
-            wakeable_items = False
-            if journal_changed or peek_needed:
+            if not wakeable_items and (journal_changed or peek_needed or retry_due):
                 # With a reported pending report, the cheap limit-1 peek would
                 # forever see
                 # the oldest already-reported item; peek wide and ring only for
@@ -9991,15 +13574,22 @@ def cmd_listen(args) -> int:
                 # A stuck carrier can be restored without a journal write. Keep
                 # polling its durable row, but avoid a SQLite peek storm until the
                 # data version changes or the carrier becomes readable.
-                if not (stuck_carrier_retry and not journal_changed):
-                    peek = read_authority.cursor_peek(label, nonce=nonce, limit=1000)
-                visible_rows = [
-                    item
-                    for item in peek.items
-                    if not suppression
-                    or int(item.get("stream_seq") or 0)
-                    > suppression.get(str(item.get("stream_id") or ""), 0)
-                ]
+                if not (
+                    stuck_carrier_retry
+                    and not journal_changed
+                    and not retry_due
+                    and not stuck_retry_due
+                ):
+                    peek = read_authority.cursor_peek(
+                        label,
+                        nonce=nonce,
+                        limit=1000,
+                        after_positions=suppression,
+                    )
+                # Apply the live reporter's boundary in the journal query so
+                # those already-reported rows do not consume the peek limit.
+                stuck_retry_due = False
+                visible_rows = list(peek.items)
                 candidate_rows = [
                     item
                     for item in visible_rows
@@ -10007,13 +13597,19 @@ def cmd_listen(args) -> int:
                 ]
                 candidate_attention = _attention_items_for_rows(
                     read_authority,
-                    candidate_rows,
+                    visible_rows,
                 )
-                candidate_items = listener_envelopes(
+                candidate_deliverable = listener_envelopes(
                     read_authority,
-                    candidate_rows,
+                    visible_rows,
                     attention_by_id=candidate_attention,
                 )
+                candidate_ids = {id(row) for row in candidate_rows}
+                candidate_items = [
+                    pair
+                    for pair in candidate_deliverable
+                    if id(pair[0]) in candidate_ids
+                ]
                 wakeable_items = bool(
                     _foreign_controller_items(
                         candidate_items,
@@ -10034,10 +13630,15 @@ def cmd_listen(args) -> int:
                     # Reuse a waking synthetic candidate's attention read when the
                     # complete snapshot is rendered. When the candidate is a normal
                     # carrier, a quiet synthetic backlog is loaded once here.
-                    visible_attention = _attention_items_for_rows(
-                        read_authority,
-                        peek.items,
-                    )
+                    visible_attention = candidate_attention
+                    if visible_attention is None and suppression:
+                        # Suppressed report rows can still back buffered
+                        # attention that must be materialized before this
+                        # later ring is claimed.
+                        visible_attention = {
+                            str(value.get("item_id") or ""): value
+                            for value in read_authority.attention_items()
+                        }
                     ring_materialized_items = listener_envelopes(
                         read_authority,
                         visible_rows,
@@ -10128,10 +13729,17 @@ def cmd_listen(args) -> int:
                     detail=f"listener ring stamp unavailable: {exc}",
                 )
             if not ring_claimed:
-                # The ring stamp is external to SQLite. A sibling releasing it
-                # cannot change data_version, so preserve the pending peek even
-                # when the journal itself remains unchanged.
-                peek_needed = True
+                # A sibling releasing the stamp cannot change data_version.
+                # Keep this exact candidate and retry only the reservation so
+                # an unchanged journal never rematerializes the backlog.
+                pending_ring_candidate = (
+                    peek,
+                    visible_rows,
+                    ring_materialized_items,
+                    visible_ring_items,
+                    dict(suppression) if suppression is not None else None,
+                )
+                peek_needed = False
                 retry_result = wait_for_next_poll()
                 if retry_result is not None:
                     return retry_result
@@ -10140,10 +13748,16 @@ def cmd_listen(args) -> int:
                 visible_rows,
                 ring_materialized_items,
             )
-            position_snapshots = {
-                stream_id: snapshot.stream_snapshots[stream_id]
-                for stream_id in positions
-            }
+            position_snapshots = _cursor_snapshots_for_rows(
+                visible_rows,
+                positions,
+            )
+            visible_ring_items = [
+                (row, envelope)
+                for row, envelope in visible_ring_items
+                if int(row.get("stream_seq") or 0)
+                <= positions.get(str(row.get("stream_id") or ""), 0)
+            ]
             advance_command = _cursor_advance_command(
                 project_root=project_root,
                 controller_label=label,
@@ -10163,6 +13777,16 @@ def cmd_listen(args) -> int:
                     assert visible_ring_items is not None
                     for row, envelope in visible_ring_items:
                         print(format_receipt_headline(row, envelope), flush=True)
+                if stuck_carrier_seen:
+                    pending_ring_candidate = None
+                    stuck_carrier_retry = True
+                    peek_needed = False
+                    poll_result = wait_for_next_poll()
+                    if poll_result is not None:
+                        return poll_result
+                    stuck_retry_due = True
+                    peek_needed = True
+                    continue
                 return finish(
                     "corrupt",
                     code=2,
@@ -10181,6 +13805,9 @@ def cmd_listen(args) -> int:
                 "registry_generation": snapshot.registry_generation,
                 "cursor_version": snapshot.cursor_version,
                 "advance_command": advance_command,
+                "pending_behind_stuck": _pending_behind_stuck_rows(
+                    visible_rows
+                ),
             }
             try:
                 # The cursor-version stamp, not the single audit row, arbitrates
@@ -10195,6 +13822,13 @@ def cmd_listen(args) -> int:
                     assert visible_ring_items is not None
                     for row, envelope in visible_ring_items:
                         print(format_receipt_headline(row, envelope), flush=True)
+                    for item in payload["pending_behind_stuck"]:
+                        print(
+                            "pending behind stuck: "
+                            f"{item['stream_id']} seq={item['stream_seq']} "
+                            f"{item['type']} id={item['id']}",
+                            flush=True,
+                        )
                     print(f"advance: {advance_command}", flush=True)
                 emit_payload(payload)
             except BaseException:
@@ -10504,12 +14138,24 @@ def cmd_supervise(args) -> int:
     def forwarding_frontier(project_root: Path) -> dict[str, object]:
         return _supervisor_frontier_snapshot(goalflight_task.TaskStore(project_root))
 
+    def startup_pulse(project_root: Path, label: str, deadline: float) -> dict[str, object]:
+        import goalflight_cadence
+
+        return goalflight_cadence.build_pulse_record(
+            project_root, label, deadline=deadline
+        )
+
     result = supervise.cmd_supervise(
         args,
         forwarding_frontier=forwarding_frontier,
+        startup_pulse=startup_pulse,
         before_renewal=check_incumbents_before_renewal,
         on_startup_probe=release_incumbents_after_probe,
     )
+    if not probe_seen and result == 0:
+        # supervise returned early because this generation already owns the
+        # slot; the repeated command is an idempotent no-op.
+        return result
     if not probe_seen:
         print(
             "supervise: replacement did not emit the stdout-peer-liveness probe; "
@@ -10617,6 +14263,19 @@ def _run_cli(argv: list[str] | None = None) -> int:
 
     read = sub.add_parser("read")
     read.add_argument("--dispatch-id", required=True)
+    read.add_argument(
+        "--project-root",
+        default=None,
+        help="project root used to resolve this command's controller context",
+    )
+    read.add_argument(
+        "--controller-label",
+        default=None,
+        help=(
+            "controller mailbox label; defaults to GOALFLIGHT_CONTROLLER_LABEL, "
+            "then the unique ACTIVE lease"
+        ),
+    )
     read.add_argument("--last", type=int, default=None)
     read.add_argument("--json", action="store_true")
     read.set_defaults(func=cmd_read)
@@ -10680,14 +14339,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     advance.add_argument("--cursor-version", type=int, default=None)
     advance.add_argument(
+        "--to-latest",
+        metavar="STREAM",
+        help="derive one stream's latest position and snapshot from a single peek",
+    )
+    advance.add_argument(
         "--acked",
         action="store_true",
-        help="Advance past everything currently deliverable, deriving the CAS "
-             "inputs from one peek. All three (--cursor-version, "
-             "--stream-snapshot, --position) come from the same peek anyway, so "
-             "transcribing them by hand adds friction without adding safety: the "
-             "compare-and-swap still fails if anything lands between the peek "
-             "and the write.",
+        help="advance only this identified session's most recent relay display",
     )
     advance.add_argument(
         "--orphaned-label",
@@ -10864,7 +14523,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
         description=(
             "Own the persistent wake pool as one tracked stdout feed: spawn the "
             "stream, backup doorbells, and watchdog, multiplex their lines, and "
-            "restart them. Do not grep this feed: default is terse and "
+            "restart them. Each start also emits one compact kind=pulse line. "
+            "Do not grep this feed: default is terse and "
             "Monitor-safe. It emits one owned stream/backup/watchdog arm line, "
             "then only actionable wakes plus a first-or-changed next reminder "
             "(ids and short titles), not a keepalive ping. --chatty restores "
@@ -10954,7 +14614,20 @@ def _run_cli(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except MessageError as exc:
-        print(f"{args.cmd}: refused: {exc}", file=sys.stderr)
+        is_write = args.cmd in {"post", "advance", "set"} or (
+            args.cmd == "relay" and bool(getattr(args, "drain", False))
+        )
+        if is_write:
+            dispatch_id = getattr(args, "dispatch_id", None)
+            project_root = getattr(args, "project_root", None) or Path.cwd()
+            check = (
+                f"python3 scripts/goalflight_messages.py read --dispatch-id {dispatch_id} --json"
+                if dispatch_id
+                else f"python3 scripts/goalflight_messages.py relay --project-root {project_root} --new --json"
+            )
+            emit_not_recorded(exc, check)
+        else:
+            print(f"{args.cmd}: refused: {exc}", file=sys.stderr)
         return 2
 
 
@@ -10967,11 +14640,33 @@ def main(argv: list[str] | None = None) -> int:
             detail = sanitize_display(str(exc), limit=240) or "internal failure"
         except Exception:
             detail = "internal failure"
-        print(
-            f"goalflight_messages: {type(exc).__name__}: {detail} · "
-            "next: run goalflight_messages.py --help",
-            file=sys.stderr,
+        supplied = list(argv if argv is not None else sys.argv[1:])
+        write_command = next(
+            (
+                token for token in supplied
+                if token in {"post", "advance", "set"}
+                or (token == "relay" and "--drain" in supplied)
+            ),
+            None,
         )
+        if write_command:
+            dispatch_id = None
+            if write_command == "post" and "--dispatch-id" in supplied:
+                index = supplied.index("--dispatch-id")
+                if index + 1 < len(supplied):
+                    dispatch_id = supplied[index + 1]
+            check = (
+                f"python3 scripts/goalflight_messages.py read --dispatch-id {dispatch_id} --json"
+                if dispatch_id
+                else f"python3 scripts/goalflight_messages.py relay --new --json"
+            )
+            emit_not_recorded(f"{type(exc).__name__}: {detail}", check)
+        else:
+            print(
+                f"goalflight_messages: {type(exc).__name__}: {detail} · "
+                "next: run goalflight_messages.py --help",
+                file=sys.stderr,
+            )
         return 1
 
 

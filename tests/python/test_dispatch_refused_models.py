@@ -499,7 +499,7 @@ def _write_codex_parent(
     agent: str = "codex",
     dispatch_argv: list[str] | None = None,
 ) -> Path:
-    session_id = "12345678-1234-4abc-8def-1234567890ab"
+    session_id = "00000000-0000-4000-8000-000000000033"
     home = state / "dispatch-homes" / dispatch_id
     rollout = (
         home

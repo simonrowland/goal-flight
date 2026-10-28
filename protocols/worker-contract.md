@@ -8,6 +8,18 @@ status, delivery, return-shape, marker, and no-bypass contract in one place.
 Never `git add -f` a gitignored path. Forcing an ignored path into the index
 publishes files the repository chose to keep private. Stage explicit paths.
 
+## Test and CI commands
+
+Run test and CI commands through `goalflight-remote-run`; the laptop daemon
+snapshots the working tree, including modified and untracked non-ignored files,
+before routing to a Studio. Ignored build output is not shipped and must be
+rebuilt by the suite. If `GOALFLIGHT_REMOTE_RUN` is unset, run the command
+locally. Use:
+
+```shell
+"$GOALFLIGHT_REMOTE_RUN" --kind gate --cmd-id goalflight-full-gate -- ./tests/run.sh
+```
+
 ## Ledger and status fields
 
 Every spawned worker must have:
@@ -89,6 +101,18 @@ Recommended orchestrator action: <one line>
 Marker grammar and terminal-state parsing live in
 `protocols/worker-markers.md`; follow that file rather than duplicating marker
 rules here.
+
+When controller input is needed during a live dispatch, run `python3
+"$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --wait
+--question-kind USER-NEED --timeout-secs <seconds> '<question>'` (use
+`USER-CONFIRM` for explicit authorization); this writes to the dispatch-only
+question outbox and polls the steer mailbox read-only. The default wait is 10
+minutes and is bounded by the configured maximum; on timeout, print the final
+`!BLOCKED: <dispatch-id> - wait timed out; wait-id=<id>; question=<text>` marker
+and stop cleanly, leaving the question and wait id durable for a later reply and
+resume. ACP v1 ends the current ACP turn for an ask without creating a wait id;
+the controller starts a child dispatch with the answer in its prompt. A terminal
+marker does not trigger post-terminal worker signaling.
 
 ## Loop exit discipline (goal-loop workers)
 

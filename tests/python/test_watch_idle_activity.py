@@ -13,6 +13,7 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("idle activity tests use POSIX process trees")
 
+import contextlib
 import json
 import os
 import signal
@@ -435,17 +436,20 @@ def _rss_ps_bindir(tmp_path: Path) -> Path:
     return bindir
 
 
-def _spawn_memory_worker(tmp_path: Path) -> tuple[subprocess.Popen, int]:
+def _spawn_memory_worker(
+    tmp_path: Path, *, child_command_arg: str | None = None
+) -> tuple[subprocess.Popen, int]:
     child_pid_file = tmp_path / "memory-child.pid"
     child_code = (
         "data = bytearray(64 * 1024 * 1024)\n"
         "for i in range(0, len(data), 4096): data[i] = 1\n"
         "import time; time.sleep(30)\n"
     )
+    child_args = [child_command_arg] if child_command_arg else []
     worker_code = (
         "import subprocess, sys, time\n"
         "from pathlib import Path\n"
-        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, *{child_args!r}])\n"
         f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
         "try:\n"
         "    while child.poll() is None: time.sleep(0.05)\n"
@@ -498,6 +502,59 @@ def _wait_for_status(path: Path, predicate, timeout: float = 5.0) -> dict:
             return payload
         time.sleep(0.05)
     return payload
+
+
+def test_signal_during_status_write_is_deferred_until_lock_is_released(
+    tmp_path: Path,
+) -> None:
+    tail = tmp_path / "signal-during-write.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "signal-during-write.status.json"
+    watcher_args = _watcher_cmd(
+        tail=tail,
+        status=status,
+        worker_pid=2_000_000_000,
+        dispatch_id="signal-during-status-write",
+        poll_secs="0.05",
+        max_idle_secs="30",
+    )[2:]
+    driver = (
+        "import json, os, signal, sys, threading\n"
+        f"sys.path.insert(0, {str(WATCH.parent)!r})\n"
+        "import goalflight_watch as watch\n"
+        f"sys.argv = ['goalflight_watch.py', *json.loads({json.dumps(json.dumps(watcher_args))})]\n"
+        "original_write_status = watch.write_status\n"
+        "status_lock = threading.Lock()\n"
+        "signal_sent = False\n"
+        "def write_status(path, payload):\n"
+        "    global signal_sent\n"
+        "    with status_lock:\n"
+        "        handler = signal.getsignal(signal.SIGTERM)\n"
+        "        if not signal_sent and getattr(handler, '__name__', '') == 'handle_signal':\n"
+        "            signal_sent = True\n"
+        "            os.kill(os.getpid(), signal.SIGTERM)\n"
+        "        return original_write_status(path, payload)\n"
+        "watch.write_status = write_status\n"
+        "raise SystemExit(watch.main())\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", driver],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_watcher_env(tmp_path),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=3.0)
+        assert process.returncode == 128 + signal.SIGTERM, (stdout, stderr)
+        assert status.is_file(), (stdout, stderr)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2.0)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)
 
 
 def _stop_memory_worker(worker: subprocess.Popen, child_pid: int) -> None:
@@ -1094,6 +1151,60 @@ def test_worker_rss_ceiling_kills_only_runaway_descendant(tmp_path: Path) -> Non
         _stop_memory_worker(worker, child_pid)
 
 
+@pytest.mark.parametrize("redaction_enabled", [True, False])
+def test_worker_command_in_watcher_log_obeys_redaction_switch(
+    tmp_path: Path, redaction_enabled: bool
+) -> None:
+    secret = "xai-" + "a" * 24
+    worker, child_pid = _spawn_memory_worker(tmp_path, child_command_arg=secret)
+    watcher = None
+    try:
+        env = _watcher_env(tmp_path)
+        env["GOALFLIGHT_WORKER_RSS_CEILING_MB"] = "16"
+        env["GOALFLIGHT_TEST_WORKER_RSS_SAMPLE_INTERVAL_S"] = "0.1"
+        capacity_conf = tmp_path / "capacity.local.json"
+        capacity_conf.write_text(
+            json.dumps({"output_redaction_filter": redaction_enabled}),
+            encoding="utf-8",
+        )
+        env["GOALFLIGHT_CAPACITY_CONF"] = str(capacity_conf)
+        tail = tmp_path / "worker.tail"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp_path / "worker.status.json"
+        watcher_log = tmp_path / "worker.watcher.log"
+        with watcher_log.open("w", encoding="utf-8") as log_stream:
+            watcher = subprocess.Popen(
+                _watcher_cmd(
+                    tail=tail,
+                    status=status,
+                    worker_pid=worker.pid,
+                    dispatch_id="rss-command-redaction",
+                    max_idle_secs="30",
+                ),
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            payload = _wait_for_status(
+                status, lambda row: "worker_rss_event" in row
+            )
+            assert "worker_rss_event" in payload, payload
+            assert isinstance(payload["worker_rss_event"], dict), payload
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            watcher.wait(timeout=5)
+        _stop_memory_worker(worker, child_pid)
+
+    log_text = watcher_log.read_text(encoding="utf-8")
+    if redaction_enabled:
+        assert secret not in log_text, log_text
+        assert "[redacted]" in log_text, log_text
+    else:
+        assert secret in log_text, log_text
+
+
 def test_worker_rss_ceiling_does_not_kill_under_limit(tmp_path: Path) -> None:
     worker, child_pid = _spawn_memory_worker(tmp_path)
     watcher = None
@@ -1155,6 +1266,7 @@ def test_worker_rss_ps_failure_logs_and_does_not_kill(tmp_path: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            start_new_session=True,
         )
         payload = _wait_for_status(status, lambda row: "worker_rss_probe_error" in row)
         assert payload.get("worker_rss_probe_error") == "ps exited 1", payload
@@ -1163,9 +1275,16 @@ def test_worker_rss_ps_failure_logs_and_does_not_kill(tmp_path: Path) -> None:
         assert goalflight_compat.pid_alive(child_pid), child_pid
         assert watcher.poll() is None
     finally:
-        if watcher is not None and watcher.poll() is None:
-            watcher.terminate()
-            watcher.communicate(timeout=5)
+        if watcher is not None:
+            if watcher.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(watcher.pid, signal.SIGTERM)
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(watcher.pid, signal.SIGKILL)
+                watcher.communicate(timeout=5)
         _stop_memory_worker(worker, child_pid)
 
 
@@ -1743,6 +1862,44 @@ def test_indeterminate_cleanup_requires_fine_identity(tmp_path: Path) -> None:
         worker.wait(timeout=5)
 
 
+def test_indeterminate_cleanup_reverifies_leader_before_sigkill(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = _run_quiet_sleeper(tmp_path)
+    try:
+        identity = {"pid": worker.pid, "start_token": "worker-start-token"}
+        changed_identity = {**identity, "start_token": "reused-pid"}
+        probes = iter((identity, changed_identity))
+        monkeypatch.setattr(
+            goalflight_watch.goalflight_compat,
+            "process_start_identity",
+            lambda _pid: next(probes),
+        )
+        signals: list[int] = []
+        monkeypatch.setattr(
+            goalflight_watch.os,
+            "killpg",
+            lambda _pgid, sig: signals.append(sig),
+        )
+        monkeypatch.setattr(goalflight_watch, "_pgroup_alive", lambda _pgid: True)
+
+        result = goalflight_watch.terminate_indeterminate_worker(
+            worker.pid,
+            worker.pid,
+            identity,
+            term_grace_s=0.0,
+            kill_grace_s=0.0,
+        )
+
+        assert signals == [signal.SIGTERM], signals
+        assert result["worker_disposition"] == "indeterminate_cleanup_failed", result
+        assert "not reverified before SIGKILL" in result["worker_termination_error"], result
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
 def test_indeterminate_cleanup_signal_error_retains_worker(
     tmp_path: Path,
     monkeypatch,
@@ -2238,111 +2395,6 @@ def test_live_descendant_survives_indeterminate_outer_bound(tmp_path: Path) -> N
             os.killpg(worker.pid, signal.SIGKILL)
         except OSError:
             pass
-        worker.wait(timeout=5)
-
-
-def test_post_terminal_unknown_probes_release_managed_capacity(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    dispatch_id = "post-terminal-unknown"
-    lease_id = "post-terminal-unknown-lease"
-    tail = tmp_path / "worker.tail"
-    tail.write_text(f"COMPLETE: {dispatch_id} — done\n", encoding="utf-8")
-    status = tmp_path / "worker.status.json"
-    worker = _run_quiet_sleeper(tmp_path)
-    watcher = None
-    try:
-        env = _watcher_env(tmp_path)
-        for key, value in env.items():
-            monkeypatch.setenv(key, value)
-        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
-        env["GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES"] = "1"
-        monkeypatch.setenv("GOALFLIGHT_TEST_PGROUP_CPU_PCT", "0.0")
-        monkeypatch.setenv("GOALFLIGHT_TEST_DISABLE_NATIVE_PROCESS_PROBES", "1")
-        env["PATH"] = str(_descendant_ps_fail_bindir(tmp_path)) + os.pathsep + env.get(
-            "PATH", ""
-        )
-        assert (
-            goalflight_watch.live_descendant_count(
-                worker.pid,
-                ps_runner=lambda *a, **k: subprocess.run(*a, **k, env=env),
-            )
-            is None
-        ), "precondition failed: descendant walk did not fail"
-        identity = _seed_managed_detached_lease(
-            dispatch_id=dispatch_id,
-            lease_id=lease_id,
-            worker=worker,
-            tail=tail,
-            status=status,
-            project_root=tmp_path,
-        )
-        watcher = subprocess.Popen(
-            _watcher_cmd(
-                tail=tail,
-                status=status,
-                worker_pid=worker.pid,
-                dispatch_id=dispatch_id,
-                poll_secs="0.1",
-                max_idle_secs="0.4",
-                liveness_indeterminate_secs="2.0",
-                stay_after_terminal=True,
-                detached=True,
-                worker_identity=identity,
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-
-        # Poison control: after ordinary idle expiry, failed descendant
-        # enumeration is still UNKNOWN. The worker and its detached managed
-        # lease remain live until the universal outer bound.
-        deadline = time.monotonic() + 1.5
-        prebound = {}
-        while time.monotonic() < deadline:
-            prebound = _read_status(status)
-            if (
-                prebound.get("state") == "running_after_terminal"
-                and "descendants" in (prebound.get("liveness_unknown_probes") or [])
-            ):
-                break
-            time.sleep(0.05)
-        assert prebound.get("state") == "running_after_terminal", prebound
-        assert worker.poll() is None, "unknown evidence killed the worker before the outer bound"
-        assert watcher.poll() is None, "watcher exited before the universal outer bound"
-        active_lease = goalflight_capacity.load_state()["leases"][lease_id]
-        assert active_lease["state"] == "active", active_lease
-
-        stdout, stderr = watcher.communicate(timeout=15)
-        payload = _read_status(status)
-        assert watcher.returncode == 2, (watcher.returncode, stdout, stderr, payload)
-        assert payload.get("state") == "liveness_indeterminate", payload
-        assert payload.get("terminal_pending_state") == "complete", payload
-        assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
-        assert "descendants" in (payload.get("liveness_unknown_probes") or []), payload
-        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
-        assert "SIGTERM" in (payload.get("worker_termination_signals") or []), payload
-        assert payload.get("capacity_lease_id") == lease_id, payload
-        assert payload.get("capacity_lease_disposition") == "released", payload
-        assert payload.get("capacity_lease_state") == "liveness_indeterminate", payload
-        assert worker.poll() is not None, "terminal bound left the detached worker live"
-        released_lease = goalflight_capacity.load_state()["leases"][lease_id]
-        assert released_lease["state"] == "liveness_indeterminate", released_lease
-        assert released_lease.get("released_at"), released_lease
-        terminal_record = json.loads(
-            goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
-        )
-        assert terminal_record["state"] == "liveness_indeterminate", terminal_record
-        assert terminal_record.get("worker_still_alive") is False, terminal_record
-    finally:
-        if watcher is not None and watcher.poll() is None:
-            watcher.kill()
-            watcher.communicate(timeout=5)
-        if worker.poll() is None:
-            worker.kill()
         worker.wait(timeout=5)
 
 

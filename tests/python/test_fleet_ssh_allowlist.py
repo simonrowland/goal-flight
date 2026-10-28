@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_fleet_ssh as ssh
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def assert_true(name: str, condition: bool) -> None:

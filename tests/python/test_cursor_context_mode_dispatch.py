@@ -14,11 +14,13 @@ from test_codex_dispatch_seams import (
     _stub_bash_launch,
 )
 import goalflight_cursor as C
+import goalflight_compat
 
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path, _isolated_state):
     monkeypatch.setattr(C.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(C.goalflight_compat, "temp_base", lambda: tmp_path)
     for name in ("CURSOR_DATA_DIR", "GOALFLIGHT_CURSOR_CONTEXT_MODE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
@@ -71,7 +73,7 @@ def test_cursor_spawn_excludes_only_context_mode(monkeypatch, tmp_path, transpor
     else:
         _, env, _ = _run_acp_to_spawn_failure(
             monkeypatch, tmp_path, resolved=(None, None), account=None,
-            agent="cursor", spawn_base_env=dict(os.environ),
+            agent="cursor", spawn_base_env=dict(os.environ), spawn_uncertain=True,
         )
     assert env["HOME"] == os.environ["HOME"]
     if opt_in:
@@ -113,6 +115,38 @@ def test_cursor_alias_uses_selected_data_and_actual_worktree(monkeypatch, tmp_pa
     result = Path(env["CURSOR_DATA_DIR"]) / "projects" / source.name
     assert json.loads((result / "mcp-auth.json").read_text()) == {"hindsight": "test-credential"}
     assert "context-mode" in json.loads((result / "mcp-disabled.json").read_text())
+
+
+def test_cursor_data_creation_and_cleanup_use_fixed_temp_base(monkeypatch, tmp_path):
+    import goalflight_ledger as L
+
+    fixed_base = tmp_path / "fixed-temp"
+    worker_tmp = tmp_path / "worker-tmp"
+    controller_tmp = tmp_path / "controller-tmp"
+    for directory in (fixed_base, worker_tmp, controller_tmp):
+        directory.mkdir()
+    monkeypatch.setattr(goalflight_compat, "temp_base", lambda: fixed_base)
+    monkeypatch.setenv("TMPDIR", str(worker_tmp))
+    env = {"HOME": str(tmp_path / "home"), "GOALFLIGHT_DISPATCH_ID": "fixed-temp"}
+
+    C.isolate_context_mode("cursor", env, cwd=str(tmp_path))
+    data = Path(env["CURSOR_DATA_DIR"])
+    assert data.parent == fixed_base
+    assert not list(worker_tmp.glob("goalflight-cursor-data-*"))
+
+    record = L.record_path("fixed-temp")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({"state": "complete", "worker_pid": 42001}))
+    monkeypatch.setenv("TMPDIR", str(controller_tmp))
+    monkeypatch.setattr(C.tempfile, "tempdir", str(controller_tmp))
+
+    def gone(*_args):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(C.os, "kill", gone)
+    monkeypatch.setattr(C.os, "killpg", gone)
+    C.cleanup_dispatch_data()
+    assert not data.exists()
 
 
 def test_invalid_disabled_state_refuses_launch(tmp_path):
@@ -176,10 +210,13 @@ def test_failed_spawn_cleanup_requires_confirmed_absence(monkeypatch, tmp_path, 
                           agent="cursor", failure_phase="spawn" if transport == "text" else "after_isolation")
     else:
         _run_acp_to_spawn_failure(monkeypatch, tmp_path, resolved=(None, None),
-                                 agent="cursor", account=None, spawn_base_env=dict(os.environ))
-    # Text daemon errors can lose the PID receipt after the child started.
-    # ACP's retry helper accounts for unconfirmed termination explicitly.
-    assert bool(list(tmp_path.glob("goalflight-cursor-data-*"))) is (transport == "text")
+                                 agent="cursor", account=None, spawn_base_env=dict(os.environ),
+                                 spawn_uncertain=True)
+    # Text and ACP launch errors can occur after spawn without a confirmed
+    # process-death receipt; validation failures happen before spawn.
+    assert bool(list(tmp_path.glob("goalflight-cursor-data-*"))) is (
+        transport != "text-validation"
+    )
 
 
 @pytest.mark.parametrize("state,launcher_live,worker_live,group_live,probe_error,removed", [

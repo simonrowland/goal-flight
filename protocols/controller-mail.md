@@ -65,6 +65,16 @@ If an item needs its body or any other processing, peek first (`relay --new`
 keeps arrival order) and run the emitted exact `advance` command only after
 that processing finishes. Receipt means settled, not merely observed.
 
+In JSON drain output, `items` and `drained` cover only the committed prefix.
+`stuck` lists unreadable carrier assignments with their identity and reason;
+`pending_behind_stuck` lists later assignments on streams whose prefix is
+blocked. These fields are additive, so older readers can ignore them. A listen
+that finds a stuck carrier emits the existing `kind: event` record with
+`payload.type: listener-fault`, including dispatch/stream identity, sequence,
+and reason; supervise forwards that diagnostic to the controller feed. The
+listener stays armed and retries on a bounded poll until the carrier or journal
+cursor changes, rather than exiting into a supervisor re-arm loop.
+
 A worker-terminal item's headline is the worker's own `COMPLETE` / `BLOCKED`
 marker text when one was harvested — including when the watcher called the run
 `idle_timeout`. The state string is the fallback, not the default.
@@ -202,6 +212,26 @@ only. Empty and unknown idle next records stay off stdout.
 Periodic heartbeat, unchanged coverage, backoff chatter, healthy child
 start/stop, and poll ticks are not controller-visible. Heartbeat remains an
 internal last-ditch peer-liveness write and does not print unless `--debug`.
+After listener startup, `supervise` computes a compact pulse on a daemon thread
+with a three-second deadline. It is read-only: it does not post mail or update
+the ledger. A timeout or read error emits one `{"kind":"pulse",
+"unavailable":"..."}` line; the line may arrive after coverage. Its text
+contains at most five short lines for the controller's lane, ready tasks,
+capacity, due duties, an overdue-owner wake command, and an idle reminder.
+The idle reminder requires ready work, zero live workers owned by this controller
+in this project, and no controller-owned ledger activity in the last 15 minutes;
+activity includes rows from other projects and rows without task ids. If ledger
+rows are unreadable, the pulse omits the reminder. Consumers that handle known
+`kind` values must ignore unknown values.
+
+When a project duty reaches 2x its cadence, the sibling pulse prints a
+`WAKE-OWNER` line containing the exact `controller-notice` post command followed
+by `goalflight_cadence.py done wake:<duty>:<period> --controller-label <self>`.
+The controller acts on that line and records it done after posting; the shared
+cadence ledger then suppresses the same wake for that period. The owner handles
+the intersession notice and records its own due work with the ordinary `done`
+command. Due items and wake lines are instructions for the controller, not
+side effects of pulse computation.
 Use `supervise --chatty` to restore raw stream keepalives and advisory
 frontier lines. `--debug` restores per-tick heartbeat and coverage. Exit is
 never mute: reader-gone / EPIPE / monitor-drop prints a reason on stderr.
@@ -228,6 +258,8 @@ follows:
   supervisor `rearm` command while suppressing `live` / `target`. `--debug`
   independently restores per-tick `heartbeat` and `coverage` emission, and
   chatty output restores raw keepalives plus `live` / `target` diagnostics
+- pulse: one compact startup JSON line with the controller's lane reminder;
+  existing consumers must ignore this unknown kind if they do not handle it
 
 Default `coverage` is silent except for operator-actionable loss (for example
 4/4 → 0/4). `--chatty` restores change-driven `live` / `target` records.
@@ -443,6 +475,10 @@ Use this path on codex, grok, cursor, opencode, and any other host with no persi
 stdout monitor. Do not launch `follow` there: a stream whose lines are not watched
 provides no wakes.
 
+Grok Bot uses one tracked `goalflight_grok_bot_listen.py` arm with
+`--listener-slots 1`; do not use the generic four-listener recipe below for that
+controller. A second arm reports the incumbent PID and exits 3.
+
 Hosts whose `listen` tasks die when a local-exec session drops (Grok Bot via a
 registered Mac) keep two independent doorbells: portable exit-as-wake `listen`
 and an optional outbound HTTP webhook. Either may fire; both may fire.
@@ -467,10 +503,12 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
 
 Each listener holds one `listener-slot-N` lock. When foreign waking mail is newer
 than the cursor, the listeners race to stamp that cursor version; exactly one wins
-and exits, while the other stays blocked. Cursor advance changes the version, so
-leftovers or later arrivals permit exactly one fresh ring from the survivors. The
-stamp persists independently of process lock ownership, making crash staleness a
-version comparison rather than a guess about which process lived.
+and exits, while the others stay blocked. Cursor advance changes the version, so
+leftovers or later arrivals may cause another survivor to ring. Pending-at-arm
+reports are at-least-once: racing or crashed claimants can produce duplicate rings.
+Controllers acknowledge by stream position, so duplicates are harmless. The stamp
+persists independently of process lock ownership, making crash staleness a version
+comparison rather than a guess about which process lived.
 
 Self-authored events carry an author digest derived from the lease capability the
 poster actually presented. Only that digest can suppress a ring or plain relay
@@ -537,10 +575,10 @@ Supervisors must branch on the listener's exit code instead of blindly restartin
 | 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then issue each printed remaining-depth command as its own tracked background task. |
 | 1 | Timeout: no waking event arrived before the requested deadline. | Treat it as a clean timer expiry; re-arm only when ongoing coverage is still required. |
 | 2 | Infrastructure or corruption failure, including an unreadable journal or holder witness. Retryable; not a dead nonce. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
-| 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
+| 3 | Contention, supersession, orphaning, or stale lease. | Run `python3 scripts/goalflight_process_census.py` before process cleanup; reconcile lease/PIDs, never kill by pattern, and re-arm only under the current lease. |
 | 4 | Detached-listener refusal: its exit cannot wake a tracked controller. | Use the emitted command to launch a tracked background listener; do not detach it again. |
 | 5 | Did-not-arm: the lease nonce is known-dead or does not match the live session. This process never waited. | Do not treat as a ring and do not re-arm this nonce; the stderr reason names the settled cause (`lease-nonce-not-live`, capability mismatch, or no live lease). |
-| 128+N | POSIX signal N. On macOS 144 is SIGURG (16). | SIGURG is logged and the listener stays alive (kernel default is discard). A terminating signal prints who/why, releases the slot, and exits 128+N. Empty 144 is a harness report, not this refusal. |
+| 128+N | POSIX signal N. On macOS 144 is SIGURG (16). | SIGURG is logged and the listener stays alive (kernel default is discard). A terminating signal releases the slot before the journal audit and exits within 2 seconds, even if cleanup stalls. Empty 144 is a harness report, not this refusal. |
 
 The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener
 reminder. Coverage rows retain audit and supersession history only.

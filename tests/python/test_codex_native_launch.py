@@ -97,6 +97,100 @@ def _wait_for_lsof_fd(pid: int, fd: int, lock_path: Path, *, timeout_s: float = 
     raise AssertionError(f"lsof did not show pid={pid} fd={fd} path={expected}")
 
 
+def _lsof_unavailable_reason() -> str | None:
+    executable = shutil.which("lsof")
+    if executable is None:
+        return "lsof is not installed on this host"
+    try:
+        result = subprocess.run(
+            [executable, "-p", str(os.getpid()), "-a", "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except PermissionError:
+        return "sandbox denies exec of lsof"
+    except FileNotFoundError:
+        raise AssertionError("lsof disappeared after PATH resolution")
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("lsof capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"lsof capability probe failed: {exc}") from exc
+    lines = result.stdout.splitlines()
+    if result.returncode == 0 and f"p{os.getpid()}" in lines and "fcwd" in lines:
+        return None
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if "operation not permitted" in output or "permission denied" in output:
+        return "sandbox denies lsof process inspection"
+    raise AssertionError(
+        "lsof capability probe failed without a sandbox refusal: "
+        f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+
+
+def _require_lsof() -> None:
+    reason = _lsof_unavailable_reason()
+    if reason is not None:
+        pytest.skip(reason)
+
+
+def test_lsof_probe_skips_permission_refusal_but_fails_on_other_errors(monkeypatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/lsof")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, f"p{os.getpid()}\nfcwd\nn/worktree\n", "",
+        ),
+    )
+    assert _lsof_unavailable_reason() is None
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(subprocess, "run", denied)
+    assert _lsof_unavailable_reason() == "sandbox denies exec of lsof"
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, "", "invalid lsof option",
+        ),
+    )
+    with pytest.raises(AssertionError, match="without a sandbox refusal"):
+        _lsof_unavailable_reason()
+
+
+def _node_arch() -> str:
+    executable = shutil.which("node")
+    if executable is None:
+        pytest.skip("Node is not installed on this host")
+    try:
+        result = subprocess.run(
+            [executable, "-p", "process.arch"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except PermissionError:
+        pytest.skip("sandbox denies exec of Node")
+    except FileNotFoundError:
+        raise AssertionError("Node disappeared after PATH resolution")
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("Node capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"Node capability probe failed: {exc}") from exc
+    if result.returncode != 0:
+        raise AssertionError(
+            "Node capability probe failed without a sandbox refusal: "
+            f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+    return result.stdout.strip()
+
+
 def _wait_for_pid_exit(pid: int, *, timeout_s: float = 5.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -528,8 +622,7 @@ def test_dispatch_status_and_watcher_record_wrapper_fallback() -> None:
 
 
 def test_native_engine_and_child_keep_flock_after_parent_kill(tmp_path: Path) -> None:
-    if shutil.which("lsof") is None:
-        pytest.skip("ownership proof requires lsof")
+    _require_lsof()
     wrapper, native = _codex_layout(tmp_path)
     native_pid = tmp_path / "native.pid"
     child_pid = tmp_path / "child.pid"
@@ -616,13 +709,10 @@ child.wait()
 
 
 def test_review_job_native_engine_keeps_flock_after_launcher_kill(tmp_path: Path) -> None:
-    if shutil.which("lsof") is None or shutil.which("node") is None:
-        pytest.skip("ownership proof requires lsof and Node")
     if sys.platform != "darwin":
         pytest.skip("fixture models the Darwin Codex package layout")
-    node_arch = subprocess.check_output(
-        ["node", "-p", "process.arch"], text=True
-    ).strip()
+    _require_lsof()
+    node_arch = _node_arch()
     if node_arch not in {"arm64", "x64"}:
         pytest.skip(f"unsupported local Node architecture: {node_arch}")
 
@@ -730,15 +820,12 @@ while True:
 def test_acp_runner_and_pool_native_engines_keep_flock_after_launcher_kill(
     tmp_path: Path,
 ) -> None:
-    if shutil.which("lsof") is None or shutil.which("node") is None:
-        pytest.skip("ownership proof requires lsof and Node")
     if sys.platform != "darwin":
         pytest.skip("fixture models the Darwin Codex ACP package layout")
+    _require_lsof()
+    node_arch = _node_arch()
     if goalflight_acp_client.ACP_IMPORT_ERROR is not None:
         pytest.skip("ACP SDK is not installed in this test interpreter")
-    node_arch = subprocess.check_output(
-        ["node", "-p", "process.arch"], text=True
-    ).strip()
     if node_arch not in {"arm64", "x64"}:
         pytest.skip(f"unsupported local Node architecture: {node_arch}")
 
@@ -894,8 +981,7 @@ asyncio.run(main())
 def test_real_codex_sandbox_keeps_flock_after_goalflight_launcher_kill(
     tmp_path: Path,
 ) -> None:
-    if shutil.which("lsof") is None:
-        pytest.skip("ownership proof requires lsof")
+    _require_lsof()
     codex = shutil.which("codex")
     if codex is None:
         pytest.skip("real Codex is not installed")
@@ -904,14 +990,17 @@ def test_real_codex_sandbox_keeps_flock_after_goalflight_launcher_kill(
     codex_home.mkdir()
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
-    sandbox_probe = subprocess.run(
-        [codex, "sandbox", "--", "/bin/true"],
-        cwd=str(tmp_path),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        sandbox_probe = subprocess.run(
+            [codex, "sandbox", "--", "/bin/true"],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except PermissionError:
+        pytest.skip("sandbox denies exec of Codex")
     sandbox_output = f"{sandbox_probe.stdout}\n{sandbox_probe.stderr}"
     if sandbox_probe.returncode != 0 and (
         "sandbox_apply" in sandbox_output

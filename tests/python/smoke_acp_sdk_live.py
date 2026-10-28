@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +25,23 @@ async def amain() -> int:
     if not binary:
         print("SKIP: codex-acp not on PATH")
         return 0
+    try:
+        subprocess.run(
+            [binary, "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except PermissionError:
+        print("SKIP: sandbox denies exec of codex-acp")
+        return 0
+    except FileNotFoundError as exc:
+        raise AssertionError("codex-acp disappeared after PATH resolution") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("codex-acp execution capability probe timed out") from exc
+
     conn = await spawn_acp_connection(
         binary,
         [],

@@ -44,11 +44,22 @@ Rules:
   accept legacy `seat/<dispatch-id>` branches during mixed-version upgrades.
   `DISPATCH-START` / `DISPATCH-LAUNCHED` and status/ledger JSON dual-write
   `worktree_id` and legacy `worktree_seat`.
-- Acquire reclaims only terminal holders whose worker PID and start identity
-  are proven dead, or whose terminal record explicitly proves no worker
-  launched, after acquiring both pool and path locks. It pins HEAD at
-  `refs/goalflight/keep/<dispatch-id>/head`, and quarantines abandoned dirty
-  product files, including untracked files, using a temporary index at
+- Acquire retains holders whose worker identity is live or unknown, regardless
+  of lock-holder metadata or cwd census. A proven-dead worker is reclaimable
+  only after a complete, clear host cwd census, for every lock-holder type
+  including native. A terminal record that explicitly proves no worker
+  launched is reclaimable without a census; nonterminal prelaunch flags do not
+  qualify. The census runs lazily during candidate validation, after that
+  candidate's seat and path locks are held and the allocation lock is
+  released; its result is never reused for another candidate. Incomplete
+  output, timeout, or error retains the seat. A free per-seat kernel lock is a
+  precondition for validation, not evidence that the seat is empty. A journal
+  fallback has unknown worker identity and retains without a census, even when
+  the journal state is terminal.
+  An acquisition reclaims at most one seat. Reclaim pins HEAD at
+  `refs/goalflight/keep/<dispatch-id>/head-<stamp>-<12-character SHA>`, and
+  quarantines abandoned dirty product files, including untracked files, using
+  a temporary index at
   `refs/goalflight/keep/<dispatch-id>/dirty-<UTC-time>` (also exposed through
   the legacy `goalflight/quarantine/s-<N>-<UTC-time>` branch), then checks out the new branch at `<base>` and
   runs `git clean -fd -e .goal-flight`. A seat resets only when every byte reset

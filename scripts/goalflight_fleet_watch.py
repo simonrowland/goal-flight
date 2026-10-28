@@ -12,6 +12,7 @@ unknown, and the last good mirror file is left untouched.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import tempfile
@@ -33,6 +34,25 @@ DEFAULT_UNTIL_JITTER_S = 5.0
 DEFAULT_STALE_S = 300.0
 LAUNCH_UNCONFIRMED_GRACE_POLLS = 2
 LAUNCH_UNCONFIRMED_GRACE_S = 60.0
+
+
+def _remote_attempt_identity(dispatch_id: str, meta: dict[str, Any]) -> str:
+    """Return the remote attempt token, or a stable non-current fallback."""
+    attempt_id = str(
+        meta.get("queue_launch_token") or meta.get("remote_attempt_id") or ""
+    ).strip()
+    if attempt_id:
+        return attempt_id
+    identity = meta.get("remote_pid_identity")
+    identity = identity if isinstance(identity, dict) else {}
+    fallback = {
+        "dispatch_id": dispatch_id,
+        "remote_pid": meta.get("remote_pid") or identity.get("pid"),
+        "remote_lstart": meta.get("remote_pid_lstart") or identity.get("lstart"),
+        "remote_status_path": meta.get("remote_status_path"),
+    }
+    encoded = json.dumps(fallback, sort_keys=True, separators=(",", ":"))
+    return f"unknown-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:20]}"
 
 
 class FleetWatchTransport(Protocol):
@@ -440,6 +460,133 @@ def _mark_launch_recovered(
     _atomic_write_json(meta_path, meta)
 
 
+def _record_superseded_duplicate_attempt(
+    dispatch_id: str,
+    meta: dict[str, Any],
+    *,
+    artifact_path: str | None = None,
+) -> tuple[dict[str, Any], str | None] | None:
+    """Record a non-current attempt or one harvested after completion."""
+    attempt_id = _remote_attempt_identity(dispatch_id, meta)
+    queue_launch_token = str(meta.get("queue_launch_token") or "").strip()
+    import goalflight_ledger as ledger
+
+    with ledger.StateLock():
+        record = ledger.read_record(dispatch_id)
+        if not isinstance(record, dict):
+            if queue_launch_token:
+                return None
+            note = {
+                "type": "superseded_duplicate_attempt",
+                "attempt_id": attempt_id,
+                "supersedes_attempt_id": "unknown-current",
+                "observed_at": ledger.utc_now(),
+            }
+            if artifact_path:
+                note["artifact_path"] = artifact_path
+            return note, None
+        status_path = str(record.get("status_path") or "").strip()
+    status_complete = False
+    if status_path:
+        try:
+            status_payload = json.loads(Path(status_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            status_payload = None
+        status_complete = isinstance(status_payload, dict) and "complete" in {
+            status_payload.get("state"), status_payload.get("terminal_state")
+        }
+    with ledger.StateLock():
+        record = ledger.read_record(dispatch_id)
+        if not isinstance(record, dict):
+            return None
+        current_attempt_id = str(record.get("queue_launch_token") or "").strip()
+        noncurrent_attempt = not queue_launch_token or (
+            not current_attempt_id or queue_launch_token != current_attempt_id
+        )
+        ledger_complete = "complete" in {
+            record.get("state"), record.get("terminal_state")
+        }
+        if not ledger_complete and not status_complete and not noncurrent_attempt:
+            return None
+        note = {
+            "type": "superseded_duplicate_attempt",
+            "attempt_id": attempt_id,
+            "supersedes_attempt_id": str(
+                record.get("attempt_id") or current_attempt_id or "terminal-status"
+            ),
+            "observed_at": ledger.utc_now(),
+        }
+        if artifact_path:
+            note["artifact_path"] = artifact_path
+        prior_events = record.get("events")
+        events = list(prior_events) if isinstance(prior_events, list) else []
+        existing_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if isinstance(event, dict)
+                and event.get("type") == note["type"]
+                and event.get("attempt_id") == attempt_id
+            ),
+            None,
+        )
+        if existing_index is None:
+            events.append(note)
+            record["events"] = events
+            ledger.write_record(record)
+        else:
+            existing_note = events[existing_index]
+            merged_note = dict(existing_note)
+            if artifact_path:
+                merged_note["artifact_path"] = artifact_path
+            if merged_note != existing_note:
+                events[existing_index] = merged_note
+                record["events"] = events
+                ledger.write_record(record)
+            note = merged_note
+        controller_status_path = str(record.get("status_path") or "") or None
+    if artifact_path and controller_status_path:
+        _append_superseded_attempt_note(Path(controller_status_path), note)
+    return note, controller_status_path
+
+
+def _append_superseded_attempt_note(path: Path, note: dict[str, Any]) -> bool:
+    """Record a superseded attempt without replacing a completed status."""
+    from goalflight_liveness import status_write_lock
+
+    with status_write_lock(path) as lock:
+        current = lock.read()
+        if not isinstance(current, dict):
+            return False
+        if "complete" in {current.get("state"), current.get("terminal_state")}:
+            return lock.append_terminal_complete_note(
+                "superseded_duplicate_attempt", note
+            )
+        existing = current.get("superseded_duplicate_attempt")
+        notes = (
+            list(existing)
+            if isinstance(existing, list)
+            else ([existing] if isinstance(existing, dict) else [])
+        )
+        identity = (note.get("type"), note.get("attempt_id"))
+        for index, entry in enumerate(notes):
+            if not isinstance(entry, dict) or (
+                entry.get("type"), entry.get("attempt_id")
+            ) != identity:
+                continue
+            merged = {**entry, **note}
+            if merged == entry:
+                return False
+            notes[index] = merged
+            break
+        else:
+            notes.append(note)
+        updated = dict(current)
+        updated["superseded_duplicate_attempt"] = notes
+        lock.write(updated)
+        return True
+
+
 def _write_launch_failed_and_release(
     fleet_dir: Path,
     dispatch_id: str,
@@ -658,7 +805,22 @@ def ingest_dispatch_mirror(
         )
 
     assert validated.payload is not None
-    write_status(status_path, validated.payload)
+    attempt_meta = dict(meta)
+    if not attempt_meta.get("queue_launch_token"):
+        remote_attempt_id = validated.payload.get("remote_attempt_id")
+        if isinstance(remote_attempt_id, str) and remote_attempt_id.strip():
+            attempt_meta["remote_attempt_id"] = remote_attempt_id.strip()
+    attempt_id = _remote_attempt_identity(dispatch_id, attempt_meta)
+    validated.payload["remote_attempt_id"] = attempt_id
+    superseded = _record_superseded_duplicate_attempt(dispatch_id, attempt_meta)
+    if superseded is not None:
+        note, controller_status_path = superseded
+        validated.payload["superseded_duplicate_attempt"] = [note]
+        if controller_status_path:
+            _append_superseded_attempt_note(Path(controller_status_path), note)
+        _append_superseded_attempt_note(status_path, note)
+    else:
+        write_status(status_path, validated.payload)
     _mark_meta_ingested(
         meta_path,
         seq=int(validated.last_seq or validated.payload["seq"]),
@@ -995,13 +1157,20 @@ def _write_worker_dead_mirror(
         "reason": "remote_launch_pid_dead",
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    if prior.ok and prior.payload:
-        for key in ("agent", "tail_path", "worker_pid"):
-            if key in prior.payload:
-                payload[key] = prior.payload[key]
-    write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)
     meta_path = dispatch_meta_path(fleet_dir, dispatch_id)
     meta = _read_json_object(meta_path)
+    if prior.ok and prior.payload:
+        for key in ("agent", "tail_path", "worker_pid", "worktree_seat"):
+            if key in prior.payload:
+                payload[key] = prior.payload[key]
+    worktree_path = _declared_worktree_path(meta)
+    if worktree_path is None and prior.ok and prior.payload:
+        prior_path = prior.payload.get("worktree_path")
+        if isinstance(prior_path, str) and prior_path.strip():
+            worktree_path = prior_path.strip()
+    if worktree_path is not None:
+        payload["worktree_path"] = worktree_path
+    write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)
     meta["last_mirror_seq"] = seq
     meta["mirror_stale"] = False
     meta["pid_hint"] = "dead"
@@ -1038,7 +1207,7 @@ def _write_salvage_needed_mirror(
     if porcelain_result.error:
         payload["porcelain_error"] = porcelain_result.error
     if prior.ok and prior.payload:
-        for key in ("agent", "tail_path", "worker_pid"):
+        for key in ("agent", "tail_path", "worker_pid", "worktree_seat"):
             if key in prior.payload:
                 payload[key] = prior.payload[key]
     write_status(dispatch_status_path(fleet_dir, dispatch_id), payload)

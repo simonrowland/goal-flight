@@ -25,6 +25,7 @@ import time
 import uuid
 
 import goalflight_compat
+import goalflight_subprocess
 import goalflight_compat as fcntl
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
@@ -180,22 +181,25 @@ def sha256_file(path: str | None) -> str | None:
     return h.hexdigest()
 
 
-def _ps_identity(pid: int) -> tuple[dict[str, str | None] | None, bool]:
+def _ps_identity(
+    pid: int, *, timeout: float | None = None, deadline: float | None = None,
+) -> tuple[dict[str, str | None] | None, bool]:
     """Read the diagnostic identity fields with one process-table probe."""
     try:
-        out = subprocess.check_output(
-            [
-                "ps",
-                "-o",
-                "ppid=,pgid=,lstart=,comm=,args=",
-                "-p",
-                str(pid),
-            ],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stderr=subprocess.DEVNULL,
-        ).strip()
+        args = [
+            "ps", "-o", "ppid=,pgid=,lstart=,comm=,args=", "-p", str(pid),
+        ]
+        options = {
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "stderr": subprocess.DEVNULL,
+        }
+        result = goalflight_subprocess.run_with_deadline(
+            args, stdout=subprocess.PIPE, check=True, timeout=timeout,
+            deadline=deadline, **options,
+        )
+        out = result.stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None, False
     if not out:
@@ -212,12 +216,79 @@ def _ps_identity(pid: int) -> tuple[dict[str, str | None] | None, bool]:
     }, True
 
 
+def _ps_identity_snapshot(
+    pids: list[int], *, timeout: float | None = None, deadline: float | None = None,
+) -> tuple[dict[int, dict[str, str | None]], bool]:
+    """Read diagnostic identity fields for several PIDs with one ``ps`` call."""
+    if not pids:
+        return {}, True
+    try:
+        args = [
+            "ps", "-o", "pid=,ppid=,pgid=,lstart=,comm=,args=",
+            "-p", ",".join(str(pid) for pid in pids),
+        ]
+        options = {
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "stderr": subprocess.DEVNULL,
+        }
+        result = goalflight_subprocess.run_with_deadline(
+            args, stdout=subprocess.PIPE, check=True, timeout=timeout,
+            deadline=deadline, **options,
+        )
+        out = result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return {}, False
+    identities: dict[int, dict[str, str | None]] = {}
+    for line in out.splitlines():
+        fields = line.split(None, 9)
+        if len(fields) < 9:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        identities[pid] = {
+            "ppid": fields[1],
+            "pgid": fields[2],
+            "lstart": " ".join(fields[3:8]),
+            "comm": fields[8],
+            "args": fields[9] if len(fields) > 9 else None,
+        }
+    return identities, True
+
+
+_PS_RESULT_UNSET = object()
+_PS_RESULT_TIMEOUT = object()
+_PS_RESULT_MISSING = object()
+_START_TOKEN_UNSET = object()
+
+
 def _capped_backoff_s(initial_s: float, attempt: int, *, cap_s: float) -> float:
     """Return an exponential delay that never exceeds its caller's cap."""
     return min(float(cap_s), float(initial_s) * (2 ** max(0, int(attempt))))
 
 
 def process_identity(pid: int | None) -> dict | None:
+    return _process_identity_before_deadline(pid, deadline=None)
+
+
+def _process_start_token(pid: int) -> str | None:
+    try:
+        identity = goalflight_compat.process_start_identity(pid)
+    except (OSError, subprocess.SubprocessError):
+        # A native start-token probe is evidence, not authority. If its
+        # platform probe is denied or fails, let comparison classify it as UNKNOWN.
+        return None
+    return identity.get("start_token") if isinstance(identity, dict) else None
+
+
+def _process_identity_before_deadline(
+    pid: int | None, *, deadline: float | None,
+    ps_result: object = _PS_RESULT_UNSET,
+    start_token_result: object = _START_TOKEN_UNSET,
+) -> dict | None:
     if not pid:
         return None
     try:
@@ -233,16 +304,23 @@ def process_identity(pid: int | None) -> dict | None:
             "identity_probe_error": True,
             "identity_source": "pid_probe_error",
         }
-    try:
-        start_identity = goalflight_compat.process_start_identity(pid)
-    except (OSError, subprocess.SubprocessError):
-        # A native start-token probe is evidence, not authority. If its
-        # platform probe is denied or fails, retain the combined ps probe and
-        # let identity comparison classify the missing token as UNKNOWN.
-        start_identity = None
-    start_token = (
-        start_identity.get("start_token") if isinstance(start_identity, dict) else None
-    )
+    def start_token() -> str | None:
+        if start_token_result is not _START_TOKEN_UNSET:
+            return start_token_result
+        return _process_start_token(pid)
+
+    def unknown_identity() -> dict:
+        ident = {
+            "pid": pid,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": "ps_probe_timeout",
+        }
+        token = start_token()
+        if token:
+            ident["start_token"] = token
+        return ident
+
     if goalflight_compat.is_windows():
         # Reject dead PIDs on Windows too, else a dead worker reads as
         # 'identity_indeterminate' instead of 'dead'. Windows lacks the ps
@@ -252,8 +330,9 @@ def process_identity(pid: int | None) -> dict | None:
             "identity_available": False,
             "identity_source": "windows_pid_probe_only",
         }
-        if start_token:
-            ident["start_token"] = start_token
+        token = start_token()
+        if token:
+            ident["start_token"] = token
         return ident
     try:
         liveness = goalflight_compat.pid_liveness(pid)
@@ -268,10 +347,43 @@ def process_identity(pid: int | None) -> dict | None:
             "identity_probe_error": True,
             "identity_source": "pid_probe_error",
         }
-        if start_token:
-            ident["start_token"] = start_token
+        token = start_token()
+        if token:
+            ident["start_token"] = token
         return ident
-    fields, probe_ok = _ps_identity(pid)
+    if ps_result is _PS_RESULT_TIMEOUT:
+        return unknown_identity()
+    if ps_result is _PS_RESULT_MISSING:
+        try:
+            liveness = goalflight_compat.pid_liveness(pid)
+        except (OSError, subprocess.SubprocessError):
+            liveness = None
+        if liveness is False:
+            return None
+        if liveness is None:
+            ident = {
+                "pid": pid,
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "pid_probe_error",
+            }
+            token = start_token()
+            if token:
+                ident["start_token"] = token
+            return ident
+        fields, probe_ok = None, True
+    elif ps_result is not _PS_RESULT_UNSET:
+        fields, probe_ok = ps_result
+    elif deadline is None:
+        fields, probe_ok = _ps_identity(pid)
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return unknown_identity()
+        try:
+            fields, probe_ok = _ps_identity(pid, timeout=remaining, deadline=deadline)
+        except subprocess.TimeoutExpired:
+            return unknown_identity()
     if not probe_ok:
         # Same rule as the first probe: a failing re-probe is unknown, never a raise.
         try:
@@ -288,17 +400,21 @@ def process_identity(pid: int | None) -> dict | None:
                 "ps_probe_error" if liveness is True else "pid_probe_error"
             ),
         }
-        if start_token:
-            ident["start_token"] = start_token
+        token = start_token()
+        if token:
+            ident["start_token"] = token
         return ident
     if fields is None:
         fields = {}
+    # Sample the native start token immediately after the ps lstart snapshot,
+    # minimizing the interval in which a PID could be reused between probes.
+    token = start_token()
     ident = {
         "pid": pid,
         **fields,
     }
-    if start_token:
-        ident["start_token"] = start_token
+    if token:
+        ident["start_token"] = token
     if ident.get("lstart"):
         return ident
     if ident is not None:
@@ -310,6 +426,57 @@ def process_identity(pid: int | None) -> dict | None:
             }
         )
     return ident
+
+
+def _process_identity_snapshot(
+    pids: list[int] | set[int] | tuple[int, ...], *, deadline: float | None = None
+) -> dict[int, dict | None]:
+    """Return PID+start-token identities from one process-table snapshot."""
+    ordered = sorted({int(pid) for pid in pids if int(pid) > 0})
+    if not ordered:
+        return {}
+    if goalflight_compat.is_windows():
+        return {
+            pid: _process_identity_before_deadline(pid, deadline=deadline)
+            for pid in ordered
+        }
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        ps_result: object = _PS_RESULT_TIMEOUT
+        snapshot: dict[int, dict[str, str | None]] = {}
+        probe_ok = False
+    else:
+        try:
+            snapshot, probe_ok = _ps_identity_snapshot(
+                ordered, timeout=remaining, deadline=deadline,
+            )
+            ps_result = _PS_RESULT_UNSET
+        except subprocess.TimeoutExpired:
+            snapshot = {}
+            probe_ok = False
+            ps_result = _PS_RESULT_TIMEOUT
+    # Pair native tokens with the just-captured lstart values before per-PID
+    # liveness probes add delay between the two identity components.
+    start_tokens = {
+        pid: _process_start_token(pid)
+        for pid in ordered
+        if probe_ok and pid in snapshot
+    }
+    identities: dict[int, dict | None] = {}
+    for pid in ordered:
+        if ps_result is _PS_RESULT_TIMEOUT:
+            current_result = _PS_RESULT_TIMEOUT
+        elif not probe_ok:
+            current_result = ({}, False)
+        elif pid not in snapshot:
+            current_result = _PS_RESULT_MISSING
+        else:
+            current_result = (snapshot[pid], True)
+        identities[pid] = _process_identity_before_deadline(
+            pid, deadline=deadline, ps_result=current_result,
+            start_token_result=start_tokens.get(pid, _START_TOKEN_UNSET),
+        )
+    return identities
 
 
 def compare_process_identities(
@@ -430,6 +597,20 @@ def identity_matches(
     return False, reason
 
 
+def _identity_matches_before_deadline(
+    record: dict, deadline: float
+) -> tuple[bool, str]:
+    pid = (
+        record.get("worker_pid")
+        or record.get("claimant_pid")
+        or record.get("controller_pid")
+    )
+    if not pid:
+        return identity_matches(record)
+    current = _process_identity_before_deadline(int(pid), deadline=deadline)
+    return identity_matches(record, current_identity=current)
+
+
 def worker_identity_liveness(
     record: dict,
     *,
@@ -473,6 +654,30 @@ def _terminal_sidecar_observation(
         ):
             return None
         candidate = loaded
+    attention_marker = candidate.get("attention_marker")
+    if (
+        isinstance(attention_marker, dict)
+        and attention_marker.get("kind") == "BLOCKED"
+    ):
+        return candidate
+    terminal_marker = candidate.get("terminal_marker")
+    if isinstance(terminal_marker, dict) and terminal_marker.get("kind") in goalflight_terminal.TERMINAL_MARKERS:
+        if terminal_marker.get("kind") == "BLOCKED":
+            candidate = dict(candidate)
+            candidate["attention_marker"] = terminal_marker
+        return candidate
+    if candidate.get("terminal_pending_state") == "blocked":
+        reason = candidate.get("reason") or candidate.get("error")
+        marker_kind = (
+            reason.get("marker_kind")
+            if isinstance(reason, dict)
+            else str(reason).removeprefix("marker:").split(":", 1)[0]
+            if isinstance(reason, str) and reason.startswith("marker:")
+            else None
+        )
+        if marker_kind in {"USER-NEED", "USER-CONFIRM", "FAILED"}:
+            return candidate
+        return None
     state = candidate.get("terminal_pending_state") or candidate.get("state")
     terminal = terminal_state_for(
         state, candidate.get("reason") or candidate.get("error")
@@ -599,6 +804,7 @@ def write_record(record: dict) -> Path:
     present row whose bytes cannot be interpreted remains authoritative
     evidence of an indeterminate outcome, so this writer refuses to replace it.
     """
+    goalflight_journal.validate_dispatch_owner_fields(record)
     if record.get("project_root") not in (None, ""):
         record["project_root"] = canonicalize_project_root_on_store(
             record["project_root"]
@@ -757,6 +963,123 @@ def read_record(dispatch_id: str) -> dict | None:
     if not isinstance(record, dict):
         return _unreadable_record(path)
     return record
+
+
+def _dispatch_parent_ids(record: dict) -> list[str]:
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    sources = [record]
+    for source in (record.get("request"), envelope, envelope.get("request")):
+        if isinstance(source, dict):
+            sources.append(source)
+    parent_ids: list[str] = []
+    for source in sources:
+        for key in ("parent_dispatch_id", "requeued_from", "retry_of"):
+            value = source.get(key)
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and value.strip() not in parent_ids
+            ):
+                parent_ids.append(value.strip())
+    return parent_ids
+
+
+class _MalformedDispatchOwnerLabel(ValueError):
+    def __init__(self, value_type: str, ancestor_depth: int) -> None:
+        self.value_type = value_type
+        self.ancestor_depth = ancestor_depth
+        super().__init__(
+            "malformed controller_label at "
+            + ("current dispatch record" if ancestor_depth == 0 else f"ancestor depth {ancestor_depth}")
+            + f" (type {value_type})"
+        )
+
+
+def _dispatch_owner_label(
+    record: dict | None,
+    *,
+    project_root: str | Path | None = None,
+    seen: set[str] | None = None,
+    reject_malformed: bool = False,
+    _ancestor_depth: int = 0,
+) -> str | None:
+    """Resolve a dispatch owner through explicit parent links in the same project."""
+    if not isinstance(record, dict) or record_is_unreadable(record):
+        return None
+    root = project_root or record.get("project_root")
+    record_root = record.get("project_root")
+    if root:
+        if not record_root or (
+            canonicalize_project_root_on_store(root)
+            != canonicalize_project_root_on_store(record_root)
+        ):
+            return None
+    label = record.get("controller_label")
+    if reject_malformed:
+        if label is not None and not isinstance(label, str):
+            raise _MalformedDispatchOwnerLabel(type(label).__name__, _ancestor_depth)
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    elif label and str(label).strip():
+        return str(label).strip()
+
+    visited = set(seen or ())
+    dispatch_id = str(record.get("dispatch_id") or "").strip()
+    if dispatch_id:
+        if dispatch_id in visited:
+            return None
+        visited.add(dispatch_id)
+    if not root:
+        return None
+    for parent_id in _dispatch_parent_ids(record):
+        if parent_id in visited:
+            continue
+        parent = read_record(parent_id)
+        owner = _dispatch_owner_label(
+            parent,
+            project_root=root,
+            seen=visited,
+            reject_malformed=reject_malformed,
+            _ancestor_depth=_ancestor_depth + 1,
+        )
+        if owner:
+            return owner
+    return None
+
+
+def _dispatch_parent_owner_label(
+    record: dict | None,
+    *,
+    project_root: str | Path | None = None,
+    reject_malformed: bool = False,
+) -> str | None:
+    """Resolve an owner from parent links, excluding the record's stored label."""
+    if not isinstance(record, dict) or record_is_unreadable(record):
+        return None
+    root = project_root or record.get("project_root")
+    if not root:
+        return None
+    visited = set()
+    dispatch_id = str(record.get("dispatch_id") or "").strip()
+    if dispatch_id:
+        visited.add(dispatch_id)
+    for parent_id in _dispatch_parent_ids(record):
+        if parent_id in visited:
+            continue
+        owner = _dispatch_owner_label(
+            read_record(parent_id),
+            project_root=root,
+            seen=visited,
+            reject_malformed=reject_malformed,
+            _ancestor_depth=1,
+        )
+        if owner:
+            return owner
+    return None
 
 
 # Pretty-printed ledger rows from write_record (indent=2, sort_keys=True)
@@ -924,6 +1247,32 @@ def record_is_unreadable(record: dict | None) -> bool:
     placeholder as a settled terminal invent a verdict they did not observe.
     """
     return isinstance(record, dict) and record.get("state") == "unreadable"
+
+
+def prelaunch_without_worker_evidence(record: dict | None) -> bool:
+    """Whether a prelaunch row proves no worker process could have started.
+
+    Session handles can be copied from a parent dispatch, so they are not
+    worker evidence. Process identity, worker cwd, or any spawn marker is.
+    """
+    if not isinstance(record, dict) or record.get("prelaunch_failure") is not True:
+        return False
+    if any(
+        record.get(key) not in (None, "", {}, [])
+        for key in (
+            "worker_pid",
+            "worker_identity",
+            "expected_worker_identity",
+            "worker_pgid",
+            "worker_instance",
+            "worker_process_identity",
+            "worker_cwd",
+        )
+    ):
+        return False
+    if record.get("worker_spawn_attempted") not in (None, False):
+        return False
+    return record.get("spawn_state") in (None, "", "none")
 
 
 def infer_engine(agent: object) -> str:
@@ -1100,6 +1449,60 @@ def commit_terminal_authority(
     prelaunch_failure: bool | None = None,
 ) -> goalflight_journal.WriteResult[goalflight_journal.TerminalCommit]:
     """Sole journal emitter used by every terminal classifier."""
+    resolved_terminal = terminal_state or terminal_state_for(state, reason)
+    if (
+        terminal_state is None
+        and state in goalflight_dispatch_states.LAUNCHER_BLOCKED_STATES
+    ):
+        # Preserve launcher/admission refusals through terminal normalization.
+        resolved_terminal = state
+    if (
+        terminal_state is None
+        and resolved_terminal not in goalflight_dispatch_states.TERMINAL_STATES
+    ):
+        return goalflight_journal.WriteResult(
+            goalflight_journal.WriteDisposition.RETRYABLE,
+            reason=f"derived outcome {resolved_terminal!r} is not terminal",
+        )
+    outcome_record = {
+        **record,
+        "state": state,
+        "reason": reason,
+        "terminal_state": resolved_terminal,
+    }
+    # The caller has just probed liveness; the record's reason may be stale.
+    worker_liveness = goalflight_terminal.worker_liveness_from_probe(
+        False if prelaunch_failure is True else worker_still_alive
+    )
+    provisional_record = dict(outcome_record)
+    for authority_field in (
+        "_wait_journal_terminal",
+        "_wait_file_snapshots_corroborated",
+        "terminal_event_uuid",
+    ):
+        provisional_record.pop(authority_field, None)
+    reason_has_marker_kind = (
+        isinstance(reason, dict) and isinstance(reason.get("marker_kind"), str)
+    ) or (isinstance(reason, str) and reason.startswith("marker:"))
+    # Only a caller override or a raw terminal verdict can supersede retained
+    # observations; derived nonterminal classifications leave them intact.
+    current_outcome_supersedes_retained_markers = (
+        terminal_state is not None
+        or state in goalflight_dispatch_states.TERMINAL_STATES
+        or reason_has_marker_kind
+    )
+    if current_outcome_supersedes_retained_markers:
+        # This call's verdict outranks marker snapshots left on the record.
+        # Keep retained evidence only when the call supplies no terminal outcome.
+        for marker_field in ("terminal_marker", "last_marker", "attention_marker"):
+            provisional_record.pop(marker_field, None)
+    if goalflight_terminal.blocked_outcome_is_provisional(
+        provisional_record, worker_liveness
+    ):
+        return goalflight_journal.WriteResult(
+            goalflight_journal.WriteDisposition.RETRYABLE,
+            reason="blocked outcome remains provisional while worker liveness is not dead",
+        )
     dispatch_id = str(record.get("dispatch_id") or "")
     project_root = record.get("project_root") or Path.cwd()
     authority = goalflight_journal.open_or_create_journal(project_root)
@@ -1109,7 +1512,7 @@ def commit_terminal_authority(
         owner_session = str(record.get("controller_session_id") or "").strip()
         prepared = authority.prepare_attempt(
             dispatch_id,
-            owner_controller_label=owner_label if owner_label and owner_session else None,
+            owner_controller_label=owner_label or None,
             owner_session_nonce=owner_session if owner_label and owner_session else None,
         )
         if not prepared.committed or prepared.value is None:
@@ -1119,7 +1522,6 @@ def commit_terminal_authority(
                 reason=prepared.reason,
             )
         attempt = prepared.value
-    resolved_terminal = terminal_state or terminal_state_for(state, reason)
     marker_kind = reason.get("marker_kind") if isinstance(reason, dict) else None
     event_type = (
         "user_need"
@@ -1147,6 +1549,58 @@ def commit_terminal_authority(
         observation=observation,
         event_type=event_type,
     )
+
+
+def controller_attribution_from_active_lease(
+    project_root: str | Path,
+    *,
+    dispatch_id: str | None = None,
+    dispatch_record: dict | None = None,
+    ambient_is_dispatcher: bool = False,
+) -> dict[str, str]:
+    """Return dispatch-bound (or explicitly trusted ambient) ownership.
+
+    Recovery callers must supply the dispatch's own record. Ambient identity
+    is accepted only for callers known to run in the dispatching controller.
+    In either case, the exact label/nonce pair must still match its active
+    lease in this project.
+    """
+    if isinstance(dispatch_record, dict):
+        if not dispatch_id or dispatch_record.get("dispatch_id") != dispatch_id:
+            return {}
+        label = str(dispatch_record.get("controller_label") or "").strip()
+        nonce = str(dispatch_record.get("controller_session_id") or "").strip()
+        if not label and not nonce and ambient_is_dispatcher:
+            label = str(os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip()
+            nonce = str(
+                os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
+                or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
+                or ""
+            ).strip()
+    elif ambient_is_dispatcher:
+        label = str(os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip()
+        nonce = str(
+            os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
+            or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
+            or ""
+        ).strip()
+    else:
+        return {}
+    if not label or not nonce:
+        return {}
+    try:
+        lease = goalflight_journal.Journal.open_reader(project_root).active_lease(label)
+    except (
+        OSError,
+        ValueError,
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return {}
+    if lease is None or lease.nonce != nonce:
+        return {}
+    return {"controller_label": lease.label, "controller_session_id": lease.nonce}
 
 
 def claim_attempt_running(
@@ -1398,18 +1852,69 @@ def scan_surplus(records: list[dict], limit: int = 20) -> list[dict] | None:
 def cmd_record(args: argparse.Namespace) -> int:
     dispatch_id = args.dispatch_id or str(uuid.uuid4())
     worker_identity = process_identity(args.worker_pid)
+    request_envelope = None
+    request_envelope_json = getattr(args, "request_envelope_json", None)
+    if request_envelope_json:
+        try:
+            parsed_envelope = json.loads(request_envelope_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_envelope = None
+        if isinstance(parsed_envelope, dict):
+            request_envelope = parsed_envelope
+    parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
+    parent_link_id = parent_dispatch_id
+    if not parent_link_id and request_envelope is not None:
+        parent_ids = _dispatch_parent_ids({"request_envelope": request_envelope})
+        parent_link_id = parent_ids[0] if parent_ids else None
+    inherited_controller_label = None
+    inherited_owner_malformed = False
+    if parent_link_id:
+        parent_record = read_record(str(parent_link_id))
+        try:
+            _dispatch_parent_owner_label(
+                parent_record,
+                project_root=getattr(args, "project_root", None),
+                reject_malformed=True,
+            )
+            inherited_controller_label = _dispatch_owner_label(
+                parent_record,
+                project_root=getattr(args, "project_root", None),
+                reject_malformed=True,
+            )
+        except _MalformedDispatchOwnerLabel:
+            inherited_owner_malformed = True
     # Ownership comes from the long-lived controller beacon. This command is
     # commonly called by short-lived dispatcher/runner processes, whose pids
     # are implementation details rather than evidence of a controller.
     controller_pid = getattr(args, "controller_pid", None)
     controller_session_id = getattr(args, "controller_session_id", None)
     controller_label = getattr(args, "controller_label", None)
+    has_controller_identity = bool(
+        controller_session_id and controller_pid is not None
+    )
     owner_controller_label = None
-    if not controller_session_id or controller_pid is None:
+    if not has_controller_identity:
         controller_pid = None
         controller_session_id = None
-        controller_label = None
+        if inherited_owner_malformed:
+            # A CLI label may itself have been copied from the malformed parent.
+            # Leave the row ownerless and preserve its parent link for strict
+            # authority checks instead of materializing a coerced string.
+            controller_label = None
+        else:
+            controller_label = goalflight_journal.validate_controller_label(
+                controller_label, field="controller_label"
+            )
+            controller_label = (
+                str(controller_label)[:64]
+                if controller_label
+                else (inherited_controller_label[:64] if inherited_controller_label else None)
+            )
+        owner_controller_label = controller_label
     else:
+        controller_label = goalflight_journal.validate_controller_label(
+            controller_label, field="controller_label"
+        )
         controller_session_id = str(controller_session_id)
         owner_controller_label = str(controller_label) if controller_label else None
         controller_label = owner_controller_label[:64] if owner_controller_label else None
@@ -1474,20 +1979,15 @@ def cmd_record(args: argparse.Namespace) -> int:
         "resume_mode",
         "model",
         "reasoning_effort",
+        "lock_holder",
     ):
         value = getattr(args, key, None)
         if value:
             record[key] = value
     if record.get("codex_session_id") and not record.get("engine_session_id"):
         record["engine_session_id"] = record["codex_session_id"]
-    request_envelope_json = getattr(args, "request_envelope_json", None)
-    if request_envelope_json:
-        try:
-            request_envelope = json.loads(request_envelope_json)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            request_envelope = None
-        if isinstance(request_envelope, dict):
-            record["request_envelope"] = request_envelope
+    if request_envelope is not None:
+        record["request_envelope"] = request_envelope
     worker_cwd = getattr(args, "worker_cwd", None)
     if worker_cwd:
         record["worker_cwd"] = str(worker_cwd)
@@ -1501,6 +2001,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         "worktree_keep_ref",
         "worktree_quarantine_ref",
         "worktree_reclaimed_dispatch_id",
+        "worktree_ignored_archive",
     ):
         value = getattr(args, key, None)
         if value:
@@ -1510,6 +2011,21 @@ def cmd_record(args: argparse.Namespace) -> int:
     dispatch_argv = getattr(args, "dispatch_argv", None)
     if isinstance(dispatch_argv, list) and dispatch_argv:
         record["dispatch_argv"] = [str(part) for part in dispatch_argv]
+    if inherited_owner_malformed and not has_controller_identity:
+        record.pop("dispatch_argv", None)
+        envelope = record.get("request_envelope")
+        if isinstance(envelope, dict):
+            envelope = dict(envelope)
+            envelope.pop("controller_label", None)
+            envelope.pop("dispatch_argv", None)
+            request = envelope.get("request")
+            if isinstance(request, dict):
+                request = dict(request)
+                request.pop("controller_label", None)
+                request.pop("dispatch_argv", None)
+                envelope["request"] = request
+            record["request_envelope"] = envelope
+    goalflight_journal.validate_dispatch_owner_fields(record)
     task_ids = task_ids_from_args(args)
     if task_ids:
         record["task_ids"] = task_ids
@@ -1628,6 +2144,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "worktree_keep_ref",
                 "worktree_quarantine_ref",
                 "worktree_reclaimed_dispatch_id",
+                "worktree_ignored_archive",
             ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
@@ -1640,14 +2157,15 @@ def cmd_record(args: argparse.Namespace) -> int:
             ):
                 record["controller_session_id"] = existing_controller_session_id
                 record["controller_pid"] = existing_controller_pid
-                record["controller_label"] = existing.get("controller_label")
                 record["controller_identity"] = existing.get("controller_identity")
+            if existing.get("controller_label") and not inherited_owner_malformed:
+                record["controller_label"] = existing["controller_label"]
             elif (
                 record.get("controller_label") is None
-                and record.get("controller_session_id") == existing_controller_session_id
-                and record.get("controller_pid") == existing_controller_pid
+                and inherited_controller_label
+                and not inherited_owner_malformed
             ):
-                record["controller_label"] = existing.get("controller_label")
+                record["controller_label"] = inherited_controller_label[:64]
             if record.get("claimant_pid") is None and existing.get("claimant_pid"):
                 record["claimant_pid"] = existing["claimant_pid"]
                 record["claimant_identity"] = existing.get("claimant_identity")
@@ -1659,6 +2177,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "parent_dispatch_id",
                 "model",
                 "reasoning_effort",
+                "lock_holder",
                 "superseded_by",
                 "superseded_at",
                 "supersession_actor",
@@ -1772,12 +2291,11 @@ def cmd_finish(args: argparse.Namespace) -> int:
         print(json.dumps(_unreadable_dispatch_payload(args.dispatch_id), sort_keys=True))
         return 2
     requested_terminal = getattr(args, "terminal_state", None)
-    terminal_state = requested_terminal or terminal_state_for(args.state, args.reason)
     committed = commit_terminal_authority(
         record,
         state=args.state,
         reason=args.reason,
-        terminal_state=terminal_state,
+        terminal_state=requested_terminal,
         worker_still_alive=getattr(args, "worker_still_alive", None),
         headline=getattr(args, "headline", None),
         prelaunch_failure=getattr(args, "prelaunch_failure", None),
@@ -1841,6 +2359,24 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if "prelaunch_failure" in winner.observation:
             record["prelaunch_failure"] = bool(winner.observation["prelaunch_failure"])
             record["outcome"]["prelaunch_failure"] = record["prelaunch_failure"]
+            if record["prelaunch_failure"] and not any(
+                record.get(key) not in (None, "", {}, [])
+                for key in (
+                    "worker_pid",
+                    "worker_identity",
+                    "worker_pgid",
+                    "worker_instance",
+                    "worker_process_identity",
+                )
+            ):
+                for key in (
+                    "worker_cwd",
+                    "engine_session_id",
+                    "codex_session_id",
+                    "acp_session_id",
+                    "session_handle",
+                ):
+                    record.pop(key, None)
         headline = winner.observation.get("headline")
         if isinstance(headline, str) and headline.strip():
             record["headline"] = headline.strip()
@@ -2244,12 +2780,51 @@ def reconcile_terminal_outbox(
             "watcher_stopped",
         }
         if status_observation is not None:
-            state = str(
-                status_observation.get("terminal_pending_state")
-                or status_observation.get("state")
+            record_terminal_key = terminal_state
+            marker = status_observation.get("terminal_marker") or status_observation.get(
+                "attention_marker"
             )
-            reason = status_observation.get("reason") or status_observation.get("error")
-            marker = status_observation.get("terminal_marker")
+            tail_marker_selected = False
+            attention_marker = status_observation.get("attention_marker")
+            if isinstance(attention_marker, dict) and attention_marker.get("kind") == "BLOCKED":
+                tail_value = status_observation.get("tail_path") or record.get("stdout_path")
+                if tail_value:
+                    import goalflight_status
+
+                    ignored_prompt_lines = goalflight_status._ignore_prefix_lines(
+                        record.get("prompt_path") or status_observation.get("prompt_path")
+                    )
+                    if ignored_prompt_lines is not None:
+                        tail_marker = goalflight_status._final_terminal_marker(
+                            Path(str(tail_value)).expanduser(),
+                            ignore_prefix_lines=ignored_prompt_lines,
+                            kimi_output=goalflight_status.moonshot_family(
+                                record.get("agent")
+                            ),
+                            expected_dispatch_id=str(record["dispatch_id"]),
+                        )
+                        if isinstance(tail_marker, dict):
+                            marker = tail_marker
+                            tail_marker_selected = True
+            sidecar_state = str(status_observation.get("state") or "")
+            if goalflight_dispatch_states.is_terminal_state(record_terminal_key):
+                state = str(record.get("state") or record_terminal_key)
+            elif (
+                isinstance(marker, dict)
+                and marker.get("kind") in goalflight_terminal.SUCCESS_TERMINAL_MARKERS
+            ):
+                state = "complete"
+            elif goalflight_dispatch_states.is_terminal_state(sidecar_state):
+                state = sidecar_state
+            else:
+                state = str(
+                    status_observation.get("terminal_pending_state") or sidecar_state
+                )
+            reason = (
+                f"marker:{marker.get('kind')}:post_watcher_reconciliation"
+                if tail_marker_selected and isinstance(marker, dict)
+                else status_observation.get("reason") or status_observation.get("error")
+            )
             if isinstance(marker, dict):
                 headline = str(marker.get("text") or "").strip() or None
                 if marker.get("kind") in {"USER-NEED", "USER-CONFIRM", "BLOCKED"}:
@@ -2258,7 +2833,6 @@ def reconcile_terminal_outbox(
                         "marker_kind": marker["kind"],
                         "text": headline or "",
                     }
-            record_terminal_key = terminal_state
             terminal_state = terminal_state_for(state, reason)
             # Process identity outranks a sidecar verdict. A terminal sidecar
             # (failed / idle_timeout / complete) is a statement about the
@@ -2301,7 +2875,7 @@ def reconcile_terminal_outbox(
             # and first-terminal-wins keeps the original verdict, so a
             # disagreeing sidecar cannot overwrite it. Gating that path would
             # strand the ledger/journal repair this reconciler exists to do.
-            if record_terminal_key in {"", "unknown", "watcher_stopped"}:
+            if not goalflight_dispatch_states.is_terminal_state(record_terminal_key):
                 attempt = authority.attempt_for_dispatch(str(record["dispatch_id"]))
                 attempt_final = (
                     attempt is not None
@@ -2310,7 +2884,23 @@ def reconcile_terminal_outbox(
                 )
                 if not attempt_final:
                     liveness, liveness_reason = worker_identity_liveness(record)
-                    if liveness != "dead":
+                    guard_observation = {
+                        **status_observation,
+                        "state": state,
+                        "reason": reason,
+                    }
+                    if isinstance(marker, dict):
+                        guard_observation["terminal_marker"] = marker
+                    if (
+                        isinstance(marker, dict)
+                        and marker.get("kind") == "BLOCKED"
+                        and not isinstance(guard_observation.get("attention_marker"), dict)
+                    ):
+                        guard_observation["attention_marker"] = marker
+                    provisional_blocked = goalflight_terminal.blocked_outcome_is_provisional(
+                        guard_observation, liveness
+                    )
+                    if provisional_blocked or liveness != "dead":
                         authority.resolve_system_attention(
                             item_type="sidecar_terminal_overruled",
                             dispatch_id=str(record["dispatch_id"]),
@@ -2336,6 +2926,14 @@ def reconcile_terminal_outbox(
                             },
                         )
                         continue
+                    if isinstance(marker, dict) and marker.get("kind") == "BLOCKED":
+                        state = "blocked"
+                        terminal_state = "blocked"
+                        reason = {
+                            "reason": reason,
+                            "marker_kind": "BLOCKED",
+                            "text": str(marker.get("text") or ""),
+                        }
                 authority.resolve_system_attention(
                     item_type="sidecar_terminal_overruled",
                     dispatch_id=str(record["dispatch_id"]),

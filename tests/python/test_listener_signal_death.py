@@ -237,6 +237,131 @@ def test_sigterm_dies_loudly_releases_slot_and_exits_128_plus_signal(
         assert str(rows[0]["exit_reason"]) == "signal"
 
 
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGHUP"])
+def test_terminating_signal_releases_slot_before_slow_journal_exit(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+    signal_name: str,
+) -> None:
+    project, env = isolated
+    signum = getattr(signal, signal_name)
+    label = "slow-exit-ctl"
+    claimed = _claim(project, label)
+    authority = journal.open_or_create_journal(project)
+    marker = tmp_path / f"{signal_name}.exit-started"
+    bootstrap = tmp_path / f"slow-{signal_name}.py"
+    bootstrap.write_text(
+        "\n".join(
+            [
+                "import os, sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                "import goalflight_journal",
+                "import goalflight_messages",
+                "original_exit = goalflight_journal.Journal.exit_listener",
+                "def slow_exit(self, *args, **kwargs):",
+                "    Path(os.environ['SLOW_EXIT_MARKER']).write_text('started')",
+                "    time.sleep(10)",
+                "    return original_exit(self, *args, **kwargs)",
+                "goalflight_journal.Journal.exit_listener = slow_exit",
+                "raise SystemExit(goalflight_messages.main(sys.argv[1:]))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    child_env = {**env, "SLOW_EXIT_MARKER": str(marker)}
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    ):
+        proc = subprocess.Popen(
+            [sys.executable, str(bootstrap), *_listen_cmd(
+                project, label=label, nonce=claimed.nonce
+            )[2:]],
+            cwd=project,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _wait_armed(authority, proc, label=label)
+        started = time.monotonic()
+        os.kill(proc.pid, signum)
+        try:
+            deadline = started + 2
+            while time.monotonic() < deadline and not marker.exists():
+                time.sleep(0.01)
+            assert marker.exists(), "listener did not enter the slow journal exit"
+            assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+            stdout, stderr = proc.communicate(
+                timeout=messages.LISTENER_SHUTDOWN_BOUND_S + 1.0
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=2)
+            raise AssertionError(
+                f"listener exceeded shutdown bound stdout={stdout!r} stderr={stderr!r}"
+            )
+        assert proc.returncode == messages.listener_posix_signal_exit_code(signum)
+        assert time.monotonic() - started <= messages.LISTENER_SHUTDOWN_BOUND_S + 1.0
+        assert "releasing slot" in stderr
+
+
+def test_listener_exits_when_controller_lease_holder_is_gone(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    label = "gone-controller-ctl"
+    claimed = _claim(project, label)
+    authority = journal.open_or_create_journal(project)
+    holder = wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    )
+    proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
+    try:
+        _wait_armed(authority, proc, label=label)
+        holder.close()
+        stdout, stderr = proc.communicate(timeout=4)
+        assert proc.returncode == 3, (stdout, stderr)
+        assert "controller lease holder is gone" in stderr
+        assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+    finally:
+        holder.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def test_listener_exits_when_its_lease_nonce_is_superseded(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    label = "superseded-controller-ctl"
+    claimed = _claim(project, label)
+    authority = journal.open_or_create_journal(project)
+    holder = wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    )
+    proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
+    try:
+        _wait_armed(authority, proc, label=label)
+        replacement = authority.claim_or_renew_lease(
+            label,
+            principal={"principal_id": "replacement-controller"},
+            takeover=True,
+        )
+        assert replacement.committed and replacement.value is not None
+        assert replacement.value.nonce != claimed.nonce
+        stdout, stderr = proc.communicate(timeout=4)
+        assert proc.returncode == 3, (stdout, stderr)
+        assert "superseded" in stderr or "stale-lease" in stderr
+        assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+    finally:
+        holder.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
 def test_sigkill_releases_slot_lock_without_journal_exit(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

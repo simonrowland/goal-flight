@@ -88,6 +88,8 @@ def seat_limit(limit: int):
 def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     old_seats = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
+    occupancy_fd_env = goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+    old_occupancy_fd = os.environ.get(occupancy_fd_env)
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -114,7 +116,9 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
 
             args_one = admission_args("acp-test-one")
             args_two = admission_args("acp-test-two")
+            os.environ.pop(occupancy_fd_env, None)
             lease_one = goalflight_dispatch._admit_dispatch_worktree(args_one)
+            os.environ.pop(occupancy_fd_env, None)
             lease_two = goalflight_dispatch._admit_dispatch_worktree(args_two)
             assert lease_one is not None
             assert lease_two is not None
@@ -170,6 +174,10 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
         else:
             os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = old_seats
+        if old_occupancy_fd is None:
+            os.environ.pop(occupancy_fd_env, None)
+        else:
+            os.environ[occupancy_fd_env] = old_occupancy_fd
 
 
 def test_worktree_root_symlink_is_rejected() -> None:
@@ -398,10 +406,18 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             status_path = repo / "status.json"
             args = runner_args(repo, "acp-run-contract", status_path)
             spawn_calls: list[dict] = []
+            fake_proc = type("SpawnedProc", (), {"pid": 2_147_483_000, "returncode": 0})()
 
             async def capture_spawn(*_args, **kwargs):
-                spawn_calls.append(kwargs)
-                return FakeProc(), FakeConn()
+                admission = kwargs.get("launch_admission")
+                if admission is None:
+                    raise AssertionError("ACP launch admission callback missing")
+                with admission():
+                    spawn_calls.append(kwargs)
+                on_attempt = kwargs.get("on_attempt")
+                if callable(on_attempt):
+                    await on_attempt(0, fake_proc)
+                return fake_proc, FakeConn()
 
             goalflight_acp_run.agent_command = lambda _agent, model=None, fast=False: ("fake-agent", [])
             goalflight_acp_run.validate_acp_dispatch_readiness = lambda _agent, _cmd: None

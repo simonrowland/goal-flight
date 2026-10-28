@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
+import fnmatch
 import json
+import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 
 import pytest
@@ -22,6 +26,7 @@ import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_status as status  # noqa: E402
 import goalflight_terminal as terminal  # noqa: E402
+import dispatch_watcher_gate as dispatch_gate  # noqa: E402
 
 
 def test_attention_state_wakes_without_a_scraped_marker() -> None:
@@ -101,6 +106,57 @@ def test_terminal_rate_limit_numbers_require_token_boundaries() -> None:
     assert terminal.rate_limit_signature_in_text("provider returned HTTP 529") == "529"
     assert terminal.rate_limit_signature_in_text("ordinary log line 1429") is None
     assert terminal.rate_limit_signature_in_text("ordinary log line 5290") is None
+
+
+def test_blocked_provisional_uses_attention_and_fresh_probe() -> None:
+    assert terminal.worker_liveness_from_probe(False, "identity_indeterminate") == "unknown"
+    for evidence in (
+        {"state": "blocked"},
+        {"reason": "marker:BLOCKED"},
+        {"reason": {"marker_kind": "BLOCKED"}},
+        {"terminal_marker": {"kind": "BLOCKED"}},
+    ):
+        assert terminal.blocked_outcome_is_provisional(evidence, "live"), evidence
+        assert terminal.blocked_outcome_is_provisional(evidence, "unknown"), evidence
+    for kind in ("FAILED", "USER-NEED", "USER-CONFIRM", "COMPLETE"):
+        evidence = {
+            "state": "blocked",
+            "terminal_marker": {"kind": kind},
+            "reason": {"marker_kind": kind},
+        }
+        assert not terminal.blocked_outcome_is_provisional(evidence, "live"), evidence
+    assert not terminal.blocked_outcome_is_provisional(
+        {"state": "watcher_stopped", "terminal_pending_state": "blocked"},
+        "live",
+    )
+    assert ledger._terminal_sidecar_observation(
+        {"dispatch_id": "pending-only"},
+        {
+            "dispatch_id": "pending-only",
+            "state": "watcher_stopped",
+            "terminal_pending_state": "blocked",
+        },
+    ) is None
+    assert terminal.blocked_outcome_is_provisional(
+        {"attention_marker": {"kind": "BLOCKED"}}, "live"
+    )
+    assert terminal.blocked_outcome_is_provisional(
+        {"attention_marker": {"kind": "BLOCKED"}}, "unknown"
+    )
+    assert not terminal.blocked_outcome_is_provisional(
+        {
+            "attention_marker": {"kind": "BLOCKED"},
+            "terminal_marker": {"kind": "COMPLETE"},
+        },
+        "unknown",
+    )
+    assert not terminal.blocked_outcome_is_provisional(
+        {"state": "complete", "attention_marker": {"kind": "BLOCKED"}},
+        "live",
+    )
+    assert not terminal.blocked_outcome_is_provisional(
+        {"attention_marker": {"kind": "BLOCKED"}}, "dead"
+    )
 
 
 def test_attention_marker_helper_is_shared_by_status(
@@ -220,10 +276,689 @@ def test_missing_narrow_journal_api_is_not_silently_skipped(
     monkeypatch.setattr(journal.Journal, "open_reader", None)
     with pytest.raises(AttributeError):
         status._mail_watermark(str(project), ["shape-check"])
-
     monkeypatch.delattr(journal.Journal, "open_reader")
     with pytest.raises(AttributeError):
         status._mail_watermark(str(project), ["shape-check"])
+
+
+def _source_function(filename: str, name: str) -> str:
+    path = REPO_ROOT / "scripts" / filename
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == name
+    )
+    return ast.get_source_segment(source, function) or ""
+
+
+def test_terminal_withdrawal_and_expiry_guards_remain() -> None:
+    assert "_withdraw_preflight(" in _source_function(
+        "goalflight_dispatch.py", "_settle_final_dispatch"
+    )
+    assert "_withdraw_preflight(" in _source_function(
+        "goalflight_dispatch.py", "_cmd_withdraw"
+    )
+    expired_attempt = _source_function("goalflight_journal.py", "commit_expired_attempt")
+    assert "_deadline_at_or_before=observed_at" in expired_attempt
+
+
+def test_live_blocked_is_provisional_at_terminal_sinks(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    result = ledger.commit_terminal_authority(
+        {"dispatch_id": "blocked-string-reason", "project_root": str(project)},
+        state="blocked",
+        reason="marker:BLOCKED",
+        worker_still_alive=True,
+    )
+    status_results = []
+    for worker_alive in (True, None):
+        payload = {
+            "dispatch_id": f"direct-blocked-{worker_alive}",
+            "state": "blocked",
+            "worker_alive": worker_alive,
+            "terminal_marker": {"kind": "BLOCKED"},
+        }
+        status_path = tmp_path / f"{payload['dispatch_id']}.status.json"
+        liveness.write_status(status_path, payload)
+        persisted = json.loads(status_path.read_text(encoding="utf-8"))
+        status_results.append(
+            {
+                "converted": (
+                    persisted.get("state") == "watcher_stopped"
+                    and persisted.get("terminal_pending_state") == "blocked"
+                    and persisted.get("terminal_marker") is None
+                    and persisted.get("attention_marker", {}).get("kind") == "BLOCKED"
+                ),
+                "payload": persisted,
+            }
+        )
+    assert (
+        not result.committed
+        and result.disposition is journal.WriteDisposition.RETRYABLE
+        and all(item["converted"] for item in status_results)
+    ), {"ledger_result": result, "status_sink_results": status_results}
+
+
+def test_dispatch_watcher_gate_selector_returns_policy_union(tmp_path: Path) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    for name in (
+        "test_dispatch_core.py",
+        "test_watch_rules.py",
+        "test_drain_worker.py",
+        "test_review_job.py",
+        "test_unrelated.py",
+    ):
+        (test_dir / name).write_text("# selector fixture\n", encoding="utf-8")
+
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+    review_patterns = ("test_drain_*.py", "test_review_job.py")
+    selection = dispatch_gate.select_gate(tmp_path, review_patterns, policy=policy)
+    all_modules = {
+        path.relative_to(tmp_path).as_posix(): path.name
+        for path in test_dir.rglob(policy["module_pattern"])
+    }
+    prefix_family = {
+        module
+        for module, name in all_modules.items()
+        if any(
+            fnmatch.fnmatchcase(name, pattern)
+            for pattern in policy["prefix_patterns"]
+        )
+    }
+    review_family = {
+        module
+        for module, name in all_modules.items()
+        if any(
+            fnmatch.fnmatchcase(name, pattern)
+            for pattern in review_patterns
+        )
+    }
+
+    assert set(selection.modules) == prefix_family | review_family
+    assert "tests/python/test_unrelated.py" not in selection.modules
+    assert selection.revisions == tuple(policy["revision_targets"])
+    assert selection.fallback_reason is None
+
+
+def test_dispatch_watcher_gate_selects_all_drain_modules_without_count_pins(
+    tmp_path: Path,
+) -> None:
+    tracked = subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", "tests/python"]
+    ).decode("utf-8").split("\0")
+    policy_template = dispatch_gate.load_policy()
+    tracked_modules = sorted(
+        path
+        for path in tracked
+        if path
+        and fnmatch.fnmatchcase(Path(path).name, policy_template["module_pattern"])
+    )
+    selected_tracked = [
+        path
+        for path in tracked_modules
+        if Path(path).name.startswith("test_drain_")
+        or any(
+            fnmatch.fnmatchcase(Path(path).name, pattern)
+            for pattern in policy_template["prefix_patterns"]
+        )
+    ]
+    required_untracked = policy_template["required_untracked_modules"]
+
+    for label, local_only_modules in (
+        ("worktree", []),
+        ("main-checkout", required_untracked),
+    ):
+        repo_root = tmp_path / label
+        for relative_path in (*selected_tracked, *local_only_modules):
+            module_path = repo_root / relative_path
+            module_path.parent.mkdir(parents=True, exist_ok=True)
+            module_path.write_text("# selector fixture\n", encoding="utf-8")
+        if local_only_modules:
+            (repo_root / ".gitignore").write_text(
+                "tests/python/ext/\n", encoding="utf-8"
+            )
+
+        policy = _prepare_dispatch_watcher_gate_fixture(repo_root)
+        policy["required_untracked_modules"] = list(local_only_modules)
+        test_dir = repo_root / "tests" / "python"
+        all_modules = {
+            path.relative_to(repo_root).as_posix(): path.name
+            for path in test_dir.rglob(policy["module_pattern"])
+        }
+        drains = {
+            module
+            for module, name in all_modules.items()
+            if name.startswith("test_drain_")
+        }
+        prefix_family = {
+            module
+            for module, name in all_modules.items()
+            if any(
+                fnmatch.fnmatchcase(name, pattern)
+                for pattern in policy["prefix_patterns"]
+            )
+        }
+        selection = dispatch_gate.select_gate(
+            repo_root,
+            ("test_drain_*",),
+            policy=policy,
+        )
+
+        assert drains, label
+        assert not prefix_family.intersection(drains), label
+        assert drains <= set(selection.modules), label
+        assert prefix_family <= set(selection.modules), label
+
+
+def test_dispatch_watcher_gate_policy_pins_the_required_local_only_modules() -> None:
+    assert set(dispatch_gate.load_policy()["required_untracked_modules"]) == {
+        "tests/python/ext/test_claude_desktop_backfill.py",
+        "tests/python/ext/test_claude_desktop_sidebar_save.py",
+        "tests/python/ext/test_claude_usage.py",
+        "tests/python/ext/test_codex_fence.py",
+        "tests/python/ext/test_codex_parity_probe.py",
+        "tests/python/ext/test_codex_rotate.py",
+        "tests/python/ext/test_codex_seat_integration.py",
+        "tests/python/ext/test_codex_seat_lib.py",
+        "tests/python/ext/test_codex_seatd.py",
+        "tests/python/ext/test_cursor_usage.py",
+        "tests/python/ext/test_grok_rotate.py",
+        "tests/python/ext/test_kimi_usage.py",
+    }
+
+
+def _run_dispatch_watcher_gate_driver(
+    tmp_path: Path,
+    selection: dict[str, object],
+    label: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    policy_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    gate_text = policy_text.split("## Dispatch/watcher family A/B deploy gate", 1)[1]
+    gate_text = gate_text.split("## Git workflow", 1)[0]
+    driver_start = 'python3 - "$selection_json" "$DEPLOYED_SHA" <<\'PY\'\n'
+    assert driver_start in gate_text
+    driver = gate_text.split(driver_start, 1)[1].split("\nPY\n", 1)[0]
+    fake_runner = tmp_path / "fake-remote-runner"
+    fake_runner.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['REMOTE_ARGS_PATH']).write_text(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    fake_runner.chmod(0o755)
+    args_path = tmp_path / f"remote-args-{label}.json"
+    result = subprocess.run(
+        [sys.executable, "-c", driver, json.dumps(selection), "deployed-sha"],
+        check=False,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GOALFLIGHT_REMOTE_RUN": str(fake_runner),
+            "REMOTE_ARGS_PATH": str(args_path),
+        },
+        text=True,
+    )
+    return result, args_path
+
+
+def _prepare_dispatch_watcher_gate_fixture(repo_root: Path) -> dict[str, object]:
+    policy = dispatch_gate.load_policy()
+    policy["required_untracked_modules"] = []
+    scripts = repo_root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "dispatch_watcher_gate_policy.json").write_text(
+        json.dumps(policy), encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "init", "--quiet", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_root), "add", "--", "tests/python"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return policy
+
+
+def test_dispatch_watcher_gate_refuses_a_missing_tracked_module(
+    tmp_path: Path,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_present.py").write_text("# present\n", encoding="utf-8")
+    missing = test_dir / "test_missing.py"
+    missing.write_text("# staged, then made invisible\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+    policy["required_untracked_modules"] = [
+        "tests/python/ext/test_local_only.py"
+    ]
+    missing.unlink()
+
+    with pytest.raises(
+        dispatch_gate.GatePolicyError, match="module universe mismatch"
+    ) as exc:
+        dispatch_gate.select_gate(tmp_path, ("test_present.py",), policy=policy)
+
+    assert "tests/python/test_missing.py" in str(exc.value)
+    assert "tests/python/ext/test_local_only.py" in str(exc.value)
+    assert "copy tests/python/ext/" in str(exc.value)
+    assert "Remove the copied tests/python/ext/ directory after the gate run." in str(
+        exc.value
+    )
+
+
+def test_dispatch_watcher_gate_refuses_an_untracked_stray_module(
+    tmp_path: Path,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_present.py").write_text("# present\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+    stray = test_dir / "test_stray.py"
+    stray.write_text("# generated under the test root\n", encoding="utf-8")
+
+    with pytest.raises(
+        dispatch_gate.GatePolicyError, match="module universe mismatch"
+    ) as exc:
+        dispatch_gate.select_gate(tmp_path, ("test_present.py",), policy=policy)
+
+    assert "tests/python/test_stray.py" in str(exc.value)
+
+
+def test_dispatch_watcher_gate_refuses_when_git_index_cannot_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_present.py").write_text("# present\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    assert dispatch_gate.select_gate(
+        tmp_path, ("test_present.py",), policy=policy
+    ).fallback_reason is None
+    monkeypatch.setenv("PATH", str(empty_path))
+
+    with pytest.raises(
+        dispatch_gate.GatePolicyError,
+        match="cannot read tracked test modules from Git index",
+    ):
+        dispatch_gate.select_gate(tmp_path, ("test_present.py",), policy=policy)
+
+
+def test_dispatch_watcher_gate_refuses_when_git_index_read_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_present.py").write_text("# present\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+
+    def timed_out(*_args: object, **kwargs: object) -> bytes:
+        assert kwargs.get("timeout") == 30
+        raise subprocess.TimeoutExpired(cmd=["git", "ls-files"], timeout=30)
+
+    monkeypatch.setattr(dispatch_gate.subprocess, "check_output", timed_out)
+
+    with pytest.raises(
+        dispatch_gate.GatePolicyError,
+        match="cannot read tracked test modules from Git index",
+    ) as raised:
+        dispatch_gate.select_gate(tmp_path, None, policy=policy)
+
+    assert "timed out after 30 seconds" in str(raised.value)
+    assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
+
+
+def test_dispatch_watcher_gate_combines_patterns_and_falls_back_on_unknown_input(
+    tmp_path: Path,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    for name in (
+        "test_dispatch_core.py",
+        "test_review_job.py",
+        "test_unrelated.py",
+    ):
+        (test_dir / name).write_text("# selector fixture\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+    all_modules = {
+        path.relative_to(tmp_path).as_posix()
+        for path in test_dir.rglob(policy["module_pattern"])
+    }
+    review_patterns = ("test_review_job.py", "test_unknown_review_group.py")
+
+    separate_results = [
+        dispatch_gate.select_gate(tmp_path, (pattern,), policy=policy)
+        for pattern in review_patterns
+    ]
+    kept_result = next(
+        selection
+        for selection in separate_results
+        if selection.fallback_reason is None
+    )
+
+    combined_result = dispatch_gate.select_gate(
+        tmp_path,
+        review_patterns,
+        policy=policy,
+    )
+
+    assert set(kept_result.modules) < all_modules
+    assert combined_result.fallback_reason == "ambiguous"
+    assert set(combined_result.modules) == all_modules
+
+
+@pytest.mark.parametrize(
+    ("review_patterns", "reason"),
+    (
+        (None, "missing"),
+        ((), "empty"),
+        (("test_missing_review_group_*.py",), "ambiguous"),
+        (("nested/test_review_job.py",), "ambiguous"),
+        (("test_review_job.py", "UNMAPPED"), "unmapped"),
+    ),
+)
+def test_dispatch_watcher_gate_fallback_is_full_suite_for_policy_targets(
+    tmp_path: Path,
+    review_patterns: tuple[str, ...] | None,
+    reason: str,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    for name in ("test_dispatch_core.py", "test_review_job.py", "test_unrelated.py"):
+        (test_dir / name).write_text("# selector fixture\n", encoding="utf-8")
+    policy = _prepare_dispatch_watcher_gate_fixture(tmp_path)
+
+    selection = dispatch_gate.select_gate(tmp_path, review_patterns, policy=policy)
+
+    expected_modules = {
+        path.relative_to(tmp_path).as_posix()
+        for path in test_dir.rglob(policy["module_pattern"])
+    }
+    assert set(selection.modules) == expected_modules
+    assert selection.revisions == tuple(policy["revision_targets"])
+    assert selection.fallback_reason == reason
+
+
+def test_dispatch_watcher_gate_cli_reports_selection_without_completeness_claim(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_review.py").write_text("# selected\n", encoding="utf-8")
+    _prepare_dispatch_watcher_gate_fixture(tmp_path)
+
+    assert dispatch_gate.main(
+        ["--repo-root", str(tmp_path), "--review-pattern", "test_review.py"]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["modules"] == ["tests/python/test_review.py"]
+    assert "patterns_complete" not in result
+
+
+def test_dispatch_watcher_gate_documentation_uses_one_policy_driven_invocation(
+    tmp_path: Path,
+) -> None:
+    policy_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    gate_text = policy_text.split("## Dispatch/watcher family A/B deploy gate", 1)[1]
+    gate_text = gate_text.split("## Git workflow", 1)[0]
+
+    assert (
+        "python3 scripts/dispatch_watcher_gate.py "
+        "--review-pattern '<pattern-1>' "
+        "--review-pattern '<pattern-2>'"
+    ) in gate_text
+    assert "does not attest that" in gate_text
+    assert "review patterns cover every affected module" in gate_text
+    assert "patterns_complete" not in gate_text
+    assert "once per pattern" not in gate_text
+    assert "--review-pattern UNMAPPED" in gate_text
+    normalized_gate_text = " ".join(gate_text.split())
+    assert (
+        "Prefer copying `tests/python/ext/` from the main checkout"
+        in normalized_gate_text
+    )
+    assert "fallback_reason` widens to the full universe" in normalized_gate_text
+    assert "Remote CI does not ship gitignored files" in normalized_gate_text
+    assert "After the gate run, remove the copied directory" in normalized_gate_text
+    assert "throwaway gate worktree" in normalized_gate_text
+    normalized_docstring = " ".join((dispatch_gate.__doc__ or "").split())
+    assert "every declared file to be present" in normalized_docstring
+    assert "complete or current" in normalized_docstring
+
+    selections = (
+        (
+            {
+                "revisions": ["deployed-baseline", "candidate"],
+                "modules": ["tests/python/test_dispatch_core.py"],
+            },
+            ["--pair", "--base", "deployed-sha"],
+        ),
+        (
+            {
+                "revisions": ["candidate"],
+                "modules": ["tests/python/test_dispatch_core.py"],
+            },
+            [],
+        ),
+    )
+    for index, (selection, revision_args) in enumerate(selections):
+        result, args_path = _run_dispatch_watcher_gate_driver(
+            tmp_path, selection, str(index)
+        )
+
+        assert result.returncode == 0, result.stderr
+        args = json.loads(args_path.read_text(encoding="utf-8"))
+        assert args == [
+            "--kind",
+            "gate",
+            *revision_args,
+            "--cmd-id",
+            "goalflight-full-gate",
+            "--",
+            "python3",
+            "-m",
+            "pytest",
+            "-q",
+            *selection["modules"],
+        ]
+
+
+def test_dispatch_watcher_gate_fails_closed_when_repository_has_no_rule(
+    tmp_path: Path,
+) -> None:
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    (test_dir / "test_dispatch_core.py").write_text("# baseline fixture\n", encoding="utf-8")
+
+    with pytest.raises(dispatch_gate.GatePolicyError, match="policy is missing"):
+        dispatch_gate.select_gate(tmp_path, ("test_dispatch*",))
+
+
+def test_string_attention_blocked_marker_is_normalized_on_status_write(
+    tmp_path: Path,
+) -> None:
+    status_path = tmp_path / "string-attention.status.json"
+    liveness.write_status(
+        status_path,
+        {
+            "dispatch_id": "string-attention",
+            "state": "blocked",
+            "worker_alive": True,
+            "attention_marker": "BLOCKED",
+        },
+    )
+    persisted = json.loads(status_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "watcher_stopped", persisted
+    assert persisted["terminal_pending_state"] == "blocked", persisted
+    assert persisted["attention_marker"] == {"kind": "BLOCKED"}, persisted
+    assert persisted.get("terminal_marker") is None, persisted
+
+
+def test_live_nonblocked_markers_keep_their_terminal_kind(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outcomes = []
+    publications = []
+    for kind in ("FAILED", "USER-NEED", "USER-CONFIRM"):
+        dispatch_id = f"live-{kind.lower()}"
+        result = ledger.commit_terminal_authority(
+            {"dispatch_id": dispatch_id, "project_root": str(project)},
+            state="blocked",
+            reason={"marker_kind": kind, "text": f"{dispatch_id} — outcome"},
+            worker_still_alive=True,
+        )
+        outcomes.append((kind, result.committed, result.value.event_type if result.value else None))
+
+        payload = {
+            "dispatch_id": dispatch_id,
+            "state": "blocked",
+            "worker_alive": True,
+            "terminal_marker": {"kind": kind, "text": "worker outcome"},
+        }
+        status_path = tmp_path / f"{dispatch_id}.status.json"
+        liveness.write_status(status_path, payload)
+        persisted = json.loads(status_path.read_text(encoding="utf-8"))
+        publications.append(
+            (
+                kind,
+                persisted.get("state") == "blocked"
+                and persisted.get("terminal_marker", {}).get("kind") == kind
+                and "attention_marker" not in persisted,
+            )
+        )
+
+    expected_events = {
+        "FAILED": "blocked",
+        "USER-NEED": "user_need",
+        "USER-CONFIRM": "user_confirm",
+    }
+    assert all(
+        committed and event_type == expected_events[kind]
+        for kind, committed, event_type in outcomes
+    ), outcomes
+    assert all(kept for _kind, kept in publications), publications
+
+
+def test_live_ledger_guard_uses_effective_terminal_outcome(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    cases = (
+        (
+            "terminal-state-override",
+            {"dispatch_id": "terminal-state-override", "project_root": str(project)},
+            "watcher_stopped",
+            "explicit terminal override",
+            "blocked",
+        ),
+        (
+            "retained-complete-new-blocked-reason",
+            {
+                "dispatch_id": "retained-complete-new-blocked-reason",
+                "project_root": str(project),
+                "terminal_marker": {"kind": "COMPLETE"},
+            },
+            "watcher_stopped",
+            "marker:BLOCKED:new verdict",
+            "blocked",
+        ),
+        (
+            "retained-complete-new-blocked-state",
+            {
+                "dispatch_id": "retained-complete-new-blocked-state",
+                "project_root": str(project),
+                "terminal_marker": {"kind": "COMPLETE"},
+            },
+            "blocked",
+            "new blocked verdict",
+            None,
+        ),
+    )
+    results = []
+    for dispatch_id, record, state, reason, terminal_state in cases:
+        result = ledger.commit_terminal_authority(
+            record,
+            state=state,
+            reason=reason,
+            terminal_state=terminal_state,
+            worker_still_alive=True,
+        )
+        results.append((dispatch_id, result.committed, result.disposition))
+    assert all(
+        not committed and disposition is journal.WriteDisposition.RETRYABLE
+        for _dispatch_id, committed, disposition in results
+    ), results
+
+
+@pytest.mark.parametrize(
+    ("marker_field", "marker"),
+    (
+        ("last_marker", {"kind": "COMPLETE"}),
+        ("terminal_marker", {"kind": "FAILED"}),
+        ("attention_marker", {"kind": "USER-NEED"}),
+    ),
+)
+def test_live_terminal_override_ignores_retained_markers(
+    tmp_path: Path, marker_field: str, marker: dict[str, str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    record = {
+        "dispatch_id": f"terminal-override-retained-{marker_field}",
+        "project_root": str(project),
+        marker_field: marker,
+    }
+    result = ledger.commit_terminal_authority(
+        record,
+        state="watcher_stopped",
+        reason="explicit terminal override",
+        terminal_state="blocked",
+        worker_still_alive=True,
+    )
+    assert not result.committed and result.disposition is journal.WriteDisposition.RETRYABLE, (
+        marker_field,
+        result,
+    )
+
+
+@pytest.mark.parametrize("worker_still_alive", (None, True))
+@pytest.mark.parametrize(
+    "state", sorted(ledger.goalflight_dispatch_states.LAUNCHER_BLOCKED_STATES)
+)
+def test_launcher_blocked_outcomes_commit_without_worker_wait(
+    tmp_path: Path, state: str, worker_still_alive: bool | None
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    result = ledger.commit_terminal_authority(
+        {
+            "dispatch_id": f"launcher-{state}-{worker_still_alive}",
+            "project_root": str(project),
+        },
+        state=state,
+        reason="launcher refused before worker start",
+        worker_still_alive=worker_still_alive,
+    )
+    assert (
+        result.committed
+        and result.value is not None
+        and result.value.terminal_state == state
+        and result.value.observation.get("state") == state
+    ), (state, worker_still_alive, result)
 
 
 def test_dispatch_projection_lookup_is_exact_id_not_history_scan(

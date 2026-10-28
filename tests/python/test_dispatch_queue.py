@@ -1048,9 +1048,9 @@ def test_corrupt_task_store_row_does_not_abort_recover_or_drain() -> None:
 
 
 def test_parked_status_write_failure_is_visible_on_claim() -> None:
-    original_write = D.write_status
+    original_lock = D.status_write_lock
 
-    def fail_status(_path, _payload):
+    def fail_status_lock(_path):
         raise OSError("injected status sidecar failure")
 
     with tempfile.TemporaryDirectory() as td:
@@ -1065,11 +1065,11 @@ def test_parked_status_write_failure_is_visible_on_claim() -> None:
                 "status-write-visible",
                 created_at="2026-01-02T00:00:00+00:00",
             )
-            D.write_status = fail_status
+            D.status_write_lock = fail_status_lock
             try:
                 recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
             finally:
-                D.write_status = original_write
+                D.status_write_lock = original_lock
             assert recovered["cleared"] == 0, recovered
             parked = json.loads(claim.read_text(encoding="utf-8"))
             assert parked.get("reason") == "completion_authority_unavailable", parked
@@ -1080,6 +1080,7 @@ def test_parked_status_write_failure_is_visible_on_claim() -> None:
 def test_drain_launches_queued_request_once_and_exits() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
         env = _env(tmp)
         marker = tmp / "launch-count.txt"
         worker_code = (
@@ -1106,40 +1107,162 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
             "0.1",
             "--cwd",
             str(tmp),
+            "--in-place",
             "--",
             sys.executable,
             "-c",
             worker_code,
         ]
         D._write_json_atomic(queue_path, entry)
-        drain = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
+        drain = _run(
+            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
+            env,
+            timeout=90,
+        )
         assert drain.returncode == 0, (drain.stdout, drain.stderr)
         payload = json.loads(drain.stdout)
         assert payload["launched"] == 1, payload
         assert not (tmp / "state" / "dispatch-queue" / "drain-launch.json").exists()
         assert _wait_for(lambda: marker.exists() and marker.read_text() == "x"), "worker did not run once"
 
-        second = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
+        second = _run(
+            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
+            env,
+            timeout=90,
+        )
         assert second.returncode == 0, (second.stdout, second.stderr)
         assert json.loads(second.stdout)["launched"] == 0, second.stdout
         _wait_for_dispatch_shutdown(env, "drain-launch", tmp / "drain.status.json")
         assert marker.read_text() == "x", "second drain double-launched the request"
 
 
-def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry() -> None:
+def test_deferred_bash_admission_restores_claim_and_retries() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+        env = _env(tmp)
+        marker = tmp / "deferred-launch-count.txt"
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        queue_path = _write_queue_entry(queue, "deferred-admission", filename="deferred-admission")
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["dispatch_argv"] = [
+            "--agent",
+            "test-dispatch",
+            "--unregistered-forced",
+            "--dispatch-id",
+            "deferred-admission",
+            "--tail",
+            str(tmp / "deferred.tail"),
+            "--status-json",
+            str(tmp / "deferred.status.json"),
+            "--poll-secs",
+            "0.1",
+            "--cwd",
+            str(tmp),
+            "--in-place",
+            "--",
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; p=Path({str(marker)!r}); p.write_text('x'); print('COMPLETE: deferred-admission — retried')",
+        ]
+        entry["request"]["status_json"] = str(tmp / "deferred.status.json")
+        D._write_json_atomic(queue_path, entry)
+        status_path = tmp / "deferred.status.json"
+        D.write_status(status_path, {"state": "queued", "worker_alive": False})
+        ready = tmp / "admission-ready"
+        release = tmp / "admission-release"
+        env.update(
+            {
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_BASH_ADMISSION_READY_FILE": str(ready),
+                "GOALFLIGHT_TEST_BASH_ADMISSION_RELEASE_FILE": str(release),
+            }
+        )
+        with D.status_write_lock(status_path):
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(DISPATCH),
+                    "drain",
+                    "--capacity-wait-s",
+                    "0",
+                    "--json",
+                ],
+                cwd=tmp,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                reached_admission = _wait_for(ready.exists, timeout=30)
+            finally:
+                release.write_text("release\n", encoding="utf-8")
+            stdout, stderr = proc.communicate(timeout=90)
+        first = subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout=stdout, stderr=stderr
+        )
+        first_payload = json.loads(first.stdout)
+
+        assert reached_admission, (
+            "bash launch did not reach status admission",
+            first_payload.get("details"),
+            first_payload.get("failed"),
+            first_payload.get("launched"),
+            first.stderr,
+        )
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        assert queue_path.exists(), "deferred admission stranded its claim"
+        assert not list(queue.glob("*.json.claimed-*")), list(queue.glob("*"))
+        restored = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert not D._queue_claim_worker_spawn_intent(restored), restored
+        restored["launch_backoff_until"] = "2000-01-01T00:00:00+00:00"
+        D._write_json_atomic(queue_path, restored)
+
+        env.pop("GOALFLIGHT_TEST_MODE", None)
+        env.pop("GOALFLIGHT_TEST_BASH_ADMISSION_READY_FILE", None)
+        env.pop("GOALFLIGHT_TEST_BASH_ADMISSION_RELEASE_FILE", None)
+        retry = _run(
+            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
+            env,
+            timeout=90,
+        )
+        assert retry.returncode == 0, (retry.stdout, retry.stderr)
+        assert json.loads(retry.stdout)["launched"] == 1, (
+            retry.stdout,
+            retry.stderr,
+            json.loads(status_path.read_text(encoding="utf-8")),
+        )
+        assert _wait_for(lambda: marker.exists()), "restored claim did not launch on retry"
+        _wait_for_dispatch_shutdown(env, "deferred-admission", tmp / "deferred.status.json")
+
+
+def test_registered_queue_refusal_after_controller_replacement_terminalizes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
         env = _env(tmp)
         old_env = os.environ.copy()
         marker = tmp / "expired-controller-worker-ran"
         dispatch_id = "expired-controller-queue"
         queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
+        replacement = None
+        replacement_holder = None
         try:
             os.environ.clear()
             os.environ.update(env)
             authority = journal.open_or_create_journal(tmp)
-            principal = ledger.process_identity(os.getpid())
+            controller = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            principal = ledger.process_identity(controller.pid)
+            controller.kill()
+            controller.wait(timeout=5)
             assert principal is not None
+            assert D.goalflight_compat.pid_liveness(controller.pid) is False
             claimed = authority.claim_or_renew_lease(
                 "queue-controller",
                 principal=principal,
@@ -1161,10 +1284,11 @@ def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry(
                     dispatch_id,
                     "--cwd",
                     str(tmp),
+                    "--in-place",
                     "--controller-label",
                     "queue-controller",
                     "--controller-beacon-pid",
-                    str(os.getpid()),
+                    str(principal["pid"]),
                     "--controller-session-id",
                     claimed.value.nonce,
                     "--",
@@ -1180,36 +1304,126 @@ def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry(
             finally:
                 holder.close()
 
-            assert queue_path.is_file()
-            drain = _run(
-                [
-                    sys.executable,
-                    str(DISPATCH),
-                    "drain",
-                    "--capacity-wait-s",
-                    "0",
-                    "--json",
-                ],
-                env,
+            replacement = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            payload = json.loads(drain.stdout)
-            assert drain.returncode == 0, (drain.stdout, drain.stderr)
-            assert payload["launched"] == 0, payload
-            assert payload["left_queued"] == 1, payload
-            assert payload["pending_claims"] == 0, payload
-            assert len(payload["details"]) == 1, payload
-            detail = payload["details"][0]
-            assert detail["dispatch_id"] == dispatch_id, detail
-            assert detail["state"] == "queued", detail
-            assert detail["reason"] == "launch_refused_pre_spawn:64", detail
-            assert queue_path.is_file(), "refusal removed the runnable queue entry"
-            assert list(queue_path.parent.glob(f"{dispatch_id}.json.claimed-*")) == []
-            assert not marker.exists(), "refused queued worker still launched"
-            record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
-            assert record["state"] == "queued", record
+            replacement_principal = ledger.process_identity(replacement.pid)
+            assert replacement_principal is not None
+            replacement_claim = authority.claim_or_renew_lease(
+                "queue-controller",
+                principal=replacement_principal,
+            )
+            assert replacement_claim.committed and replacement_claim.value is not None
+            assert replacement_claim.value.nonce != claimed.value.nonce
+            replacement_holder = wake.register_lease_holder(
+                tmp,
+                controller_label="queue-controller",
+                lease_nonce=replacement_claim.value.nonce,
+            )
+            try:
+                assert queue_path.is_file()
+                recorded_entry = json.loads(queue_path.read_text(encoding="utf-8"))
+                assert D._queued_controller_generation_state(recorded_entry) == "dead"
+                for failure_count in range(1, D.MAX_DRAIN_PRE_WORKER_FAILURES + 1):
+                    if failure_count > 1:
+                        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+                        entry["launch_backoff_until"] = "2000-01-01T00:00:00+00:00"
+                        D._write_json_atomic(queue_path, entry)
+                    drain = _run(
+                        [
+                            sys.executable,
+                            str(DISPATCH),
+                            "drain",
+                            "--capacity-wait-s",
+                            "0",
+                            "--json",
+                        ],
+                        env,
+                    )
+                    payload = json.loads(drain.stdout)
+                    expected_returncode = (
+                        0
+                        if failure_count < D.MAX_DRAIN_PRE_WORKER_FAILURES
+                        else 1
+                    )
+                    assert drain.returncode == expected_returncode, (
+                        drain.stdout,
+                        drain.stderr,
+                    )
+                    assert payload["launched"] == 0, payload
+                    assert payload["pending_claims"] == 0, payload
+                    assert not marker.exists(), "refused queued worker still launched"
+                    remaining_claims = list(
+                        queue_path.parent.glob(f"{dispatch_id}.json.claimed-*")
+                    )
+                    record = json.loads(
+                        ledger.record_path(dispatch_id).read_text(encoding="utf-8")
+                    )
+                    if failure_count < D.MAX_DRAIN_PRE_WORKER_FAILURES:
+                        assert remaining_claims == [], remaining_claims
+                        assert payload["left_queued"] == 1, payload
+                        assert len(payload["details"]) == 1, payload
+                        detail = payload["details"][0]
+                        assert detail["dispatch_id"] == dispatch_id, detail
+                        assert detail["state"] == "queued", detail
+                        assert queue_path.is_file(), payload
+                        assert record["state"] == "queued", record
+                        assert record["launch_pre_worker_failure_count"] == failure_count, record
+                    else:
+                        assert remaining_claims and all(
+                            path.name.endswith(".failed") for path in remaining_claims
+                        ), remaining_claims
+                        assert payload["failed"] == 1, payload
+                        assert payload["left_queued"] == 0, payload
+                        assert payload["details"][0]["state"] == "failed", payload
+                        assert payload["details"][0]["launch_pre_worker_failure_count"] == failure_count, payload
+                        assert not queue_path.exists(), "dead controller generation stayed queued"
+                        assert record["state"] == "failed", record
+                        assert record["launch_pre_worker_failure_count"] == failure_count, record
+            finally:
+                replacement_holder.close()
+                replacement_holder = None
         finally:
+            if replacement_holder is not None:
+                replacement_holder.close()
+            if replacement is not None and replacement.poll() is None:
+                replacement.terminate()
+                replacement.wait(timeout=5)
             os.environ.clear()
             os.environ.update(old_env)
+
+
+def test_controller_refusal_with_unknown_liveness_remains_retryable() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        entry = {
+            "project_root": td,
+            "dispatch_argv": [
+                "--controller-label", "queue-controller",
+                "--controller-beacon-pid", "12345",
+                "--controller-session-id", "recorded-generation",
+            ],
+        }
+        proc = subprocess.CompletedProcess(
+            ["goalflight_dispatch.py"],
+            64,
+            stdout="",
+            stderr=(
+                "goalflight_dispatch: controller not connected; reconnect as: "
+                "python3 goalflight_session_status.py"
+            ),
+        )
+        original_lookup = D._kernel_live_controller_sessions
+        D._kernel_live_controller_sessions = lambda _root: D._ControllerSessionLookup(
+            sessions=None, unreadable_reason="journal busy"
+        )
+        try:
+            assert D._classify_local_pre_spawn_attempt(proc, entry) == (
+                D.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+            )
+        finally:
+            D._kernel_live_controller_sessions = original_lookup
 
 
 def test_drain_write_error_is_json_error_without_traceback() -> None:
@@ -1328,6 +1542,162 @@ def test_acp_drain_replays_preexisting_queue_entry() -> None:
                     status_path,
                     watcher=False,
                 )
+
+
+def test_deferred_acp_admission_retries_prepared_attempt_with_same_token() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "deferred-acp-admission"
+            status_path = tmp / "deferred-acp.status.json"
+            queue_path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+            entry = json.loads(queue_path.read_text(encoding="utf-8"))
+            entry["agent"] = "codex-acp"
+            entry["shape"] = "acp"
+            entry["project_root"] = str(tmp)
+            entry["process_cwd"] = str(tmp)
+            entry["dispatch_argv"] = [
+                "--agent",
+                "codex-acp",
+                "--shape",
+                "acp",
+                "--in-place",
+                "--unregistered-forced",
+                "--dispatch-id",
+                dispatch_id,
+                "--prompt",
+                "hello",
+                "--tail",
+                str(tmp / "deferred-acp.tail"),
+                "--status-json",
+                str(status_path),
+                "--cwd",
+                str(tmp),
+                "--max-idle-secs",
+                "5",
+                "--poll-secs",
+                "0.1",
+            ]
+            entry["request"].update(
+                {
+                    "agent": "codex-acp",
+                    "cwd": str(tmp),
+                    "prompt": "hello",
+                    "tail": str(tmp / "deferred-acp.tail"),
+                    "status_json": str(status_path),
+                }
+            )
+            D._write_json_atomic(queue_path, entry)
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "worker_alive": False,
+                },
+            )
+
+            launch_token = "prepared-acp-launch-token"
+            prepared = journal.Journal.create(tmp).prepare_attempt(
+                dispatch_id,
+                launch_token=launch_token,
+            )
+            assert prepared.committed and prepared.value is not None, prepared
+            with ledger.StateLock():
+                ledger.write_record(
+                    {
+                        "schema": ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "agent": "codex-acp",
+                        "engine": "codex",
+                        "shape": "acp",
+                        "transport": "dispatch",
+                        "project_root": str(tmp),
+                        "worker_pid": None,
+                        "state": "queued",
+                        "terminal_state": "unknown",
+                        "queue_launch_token": launch_token,
+                        "status_path": str(status_path),
+                        "stdout_path": str(tmp / "deferred-acp.tail"),
+                        "started_at": ledger.utc_now(),
+                    }
+                )
+
+            launch_tokens: list[str] = []
+            original_run = D.subprocess.run
+
+            def fake_dispatch_run(argv, **_kwargs):
+                argv = list(argv)
+                if "--queue-launch-token" not in argv:
+                    return original_run(argv, **_kwargs)
+                token = argv[argv.index("--queue-launch-token") + 1]
+                launch_tokens.append(token)
+                if len(launch_tokens) == 1:
+                    # The ACP child prepared the attempt and refused before
+                    # STARTING because status admission was deferred.
+                    return subprocess.CompletedProcess(
+                        argv,
+                        1,
+                        stdout="",
+                        stderr="StatusLaunchAdmissionDeferred: wait for a status lock",
+                    )
+                with ledger.StateLock():
+                    ledger.write_record(
+                        {
+                            "schema": ledger.SCHEMA,
+                            "dispatch_id": dispatch_id,
+                            "agent": "codex-acp",
+                            "engine": "codex",
+                            "shape": "acp",
+                            "transport": "dispatch",
+                            "project_root": str(tmp),
+                            "worker_pid": os.getpid(),
+                            "worker_identity": ledger.process_identity(os.getpid()),
+                            "state": "running",
+                            "terminal_state": "unknown",
+                            "queue_launch_token": token,
+                            "status_path": str(status_path),
+                            "stdout_path": str(tmp / "deferred-acp.tail"),
+                            "started_at": ledger.utc_now(),
+                        }
+                    )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n",
+                    stderr="",
+                )
+
+            D.subprocess.run = fake_dispatch_run
+            try:
+                first = D._drain_queue_once(_drain_args(queue))
+                assert queue_path.exists(), "deferred ACP claim was not restored"
+                attempt = journal.Journal.open_reader(tmp).attempt_for_dispatch(dispatch_id)
+                assert attempt is not None
+                assert attempt.lifecycle_state == journal.ATTEMPT_PREPARED, attempt
+                assert attempt.launch_token == launch_token, attempt
+
+                restored = json.loads(queue_path.read_text(encoding="utf-8"))
+                restored["launch_backoff_until"] = "2000-01-01T00:00:00+00:00"
+                D._write_json_atomic(queue_path, restored)
+                retry = D._drain_queue_once(_drain_args(queue))
+            finally:
+                D.subprocess.run = original_run
+
+            assert first["left_queued"] == 1, first
+            assert retry["launched"] == 1, retry
+            assert launch_tokens == [launch_token, launch_token], launch_tokens
+            assert not queue_path.exists(), "successful ACP retry left its queue entry"
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 def _write_grok_os_sandbox_manifest(
@@ -3600,6 +3970,7 @@ def test_token_mismatch_recovery_preserves_terminal_worker_record() -> None:
 def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
         env = _env(tmp)
         worker_code = (
             "import sys\n"
@@ -3621,6 +3992,7 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
                 str(tmp / "rate-limit.status.json"),
                 "--cwd",
                 str(tmp),
+                "--in-place",
                 "--poll-secs",
                 "0.1",
                 "--max-idle-secs",
@@ -3645,8 +4017,10 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         # the original classification is preserved as previous_reason.
         error_obj = record.get("error", {})
         assert error_obj.get("message") == "dispatch_worker_limit_reached", record
+        # This in-place fixture shares its cwd with project_root, so the watcher
+        # has no worker-specific tree to inspect and must not claim no_evidence.
         assert error_obj.get("previous_reason") == (
-            "worker_dead_no_terminal_marker:death_cause=no_evidence"
+            "worker_dead_no_terminal_marker:death_cause=dispatch record is missing worker_cwd"
         ), record
         assert error_obj.get("previous_state") == "worker_dead", record
         # Rate-pressure policy is shared-pool scoped and now refuses per-session
@@ -4722,7 +5096,7 @@ def test_remote_grok_effort_refuses_before_fleet_preview(
         ],
         "request": {
             "prompt": "implement",
-            "base_sha": "0123456789abcdef0123456789abcdef01234567",
+            "base_sha": "0000000000000000000000000000000201234567",
         },
     }
     if carrier_agent is not None:
@@ -5993,6 +6367,1087 @@ def test_round5_tail_substitution_and_frozen_lock_order() -> None:
             os.environ.update(old_env)
 
 
+def _write_complete_attempt_without_queue_token(
+    tmp: Path,
+    dispatch_id: str,
+    launch_token: str,
+    *,
+    status_path: Path,
+    tail_path: Path,
+) -> None:
+    authority = journal.Journal.create(tmp)
+    prepared = authority.prepare_attempt(dispatch_id, launch_token=launch_token)
+    assert prepared.committed and prepared.value is not None, prepared
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_still_alive": False,
+        },
+        event_type="result",
+    )
+    assert committed.committed and committed.value is not None, committed
+    D.goalflight_ledger.write_record(
+        {
+            "schema": D.goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "test-dispatch",
+            "state": "complete",
+            "terminal_state": "complete",
+            "project_root": str(tmp),
+            "status_path": str(status_path),
+            "stdout_path": str(tail_path),
+            "attempt_id": committed.value.attempt_id,
+            "launch_token": launch_token,
+            "started_at": D.goalflight_ledger.utc_now(),
+            "ended_at": D.goalflight_ledger.utc_now(),
+            "worker_still_alive": False,
+        }
+    )
+
+
+def _write_completed_claim(
+    queue: Path,
+    dispatch_id: str,
+    launch_token: str,
+    *,
+    status_path: Path,
+    tail_path: Path,
+) -> Path:
+    stamp = "2000-01-01T00:00:00+00:00"
+    worker_pid, worker_identity = _dead_process_identity()
+    claimer_pid, claimer_identity = _dead_process_identity()
+    entry = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "claimed",
+        "dispatch_id": dispatch_id,
+        "agent": "test-dispatch",
+        "shape": "bash",
+        "project_root": str(queue.parent.parent),
+        "created_at": stamp,
+        "queue_launch_token": launch_token,
+        "queue_launch_started": True,
+        "queue_launch_started_at": stamp,
+        "queue_worker_spawn_intent": True,
+        "queue_worker_spawn_intent_at": stamp,
+        "queue_worker_pid": worker_pid,
+        "queue_worker_identity": worker_identity,
+        "queue_worker_pgid": worker_pid,
+        "queue_worker_group_leader_identity": worker_identity,
+        "queue_claimer_pid": claimer_pid,
+        "queue_claimer_identity": claimer_identity,
+        "task_ids": ["completed-claim-task"],
+        "request": {
+            "agent": "test-dispatch",
+            "cwd": str(queue.parent.parent),
+            "tail": str(tail_path),
+            "status_json": str(status_path),
+        },
+    }
+    claim = queue / f"{dispatch_id}.json.claimed-123"
+    claim.write_text(json.dumps(entry), encoding="utf-8")
+    return claim
+
+
+def _dead_process_identity() -> tuple[int, dict]:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        identity = D.goalflight_ledger.process_identity(process.pid)
+    finally:
+        process.terminate()
+        process.wait(timeout=_ASYNC_WAIT_TIMEOUT_S)
+    assert isinstance(identity, dict) and identity.get("start_token"), identity
+    return process.pid, identity
+
+
+def test_indeterminate_completed_claim_drain_keeps_terminal_status() -> None:
+    """An unbound ledger token reports and holds; it cannot downgrade COMPLETE."""
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp_path = Path(td)
+        with _isolated_completion_authority(tmp_path):
+            queue = tmp_path / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "indeterminate-complete-claim"
+            token = "indeterminate-complete-token"
+            status_path = tmp_path / f"{dispatch_id}.status.json"
+            tail_path = tmp_path / f"{dispatch_id}.tail"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp_path),
+                    "status_path": str(status_path),
+                    "stdout_path": str(tail_path),
+                    "started_at": D.goalflight_ledger.utc_now(),
+                    "ended_at": D.goalflight_ledger.utc_now(),
+                }
+            )
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_alive": False,
+                    "status_path": str(status_path),
+                    "tail_path": str(tail_path),
+                },
+            )
+            claim = _write_completed_claim(
+                queue,
+                dispatch_id,
+                token,
+                status_path=status_path,
+                tail_path=tail_path,
+            )
+            monkeypatch.setattr(D, "_release_stale_capacity_for_drain", lambda: None)
+            monkeypatch.setattr(D, "_run_drain_prelaunch_hook", lambda _agents: None)
+            args = _drain_args(queue)
+            args.claim_stale_s = 0
+
+            payload = D._drain_queue_once(args)
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+
+        assert status["state"] == "complete", status
+        assert claim.exists(), "unknown token binding must preserve the carrier"
+        assert any(
+            row.get("dispatch_id") == dispatch_id
+            and row.get("reason") == "completion_authority_token_indeterminate"
+            for row in payload.get("details") or []
+        ), payload.get("details")
+        assert not (queue / f"{dispatch_id}.json").exists()
+
+
+def test_drain_clears_final_claim_when_ledger_queue_token_is_missing() -> None:
+    """The journal launch token binds and clears a completed attempt's stale claim."""
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp_path = Path(td)
+        with _isolated_completion_authority(tmp_path):
+            queue = tmp_path / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "final-claim-missing-queue-token"
+            token = "final-claim-launch-token"
+            status_path = tmp_path / f"{dispatch_id}.status.json"
+            tail_path = tmp_path / f"{dispatch_id}.tail"
+            _write_complete_attempt_without_queue_token(
+                tmp_path,
+                dispatch_id,
+                token,
+                status_path=status_path,
+                tail_path=tail_path,
+            )
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_alive": False,
+                    "status_path": str(status_path),
+                    "tail_path": str(tail_path),
+                },
+            )
+            claim = _write_completed_claim(
+                queue,
+                dispatch_id,
+                token,
+                status_path=status_path,
+                tail_path=tail_path,
+            )
+            monkeypatch.setattr(D, "_release_stale_capacity_for_drain", lambda: None)
+            monkeypatch.setattr(D, "_run_drain_prelaunch_hook", lambda _agents: None)
+            args = _drain_args(queue)
+            args.claim_stale_s = 0
+
+            drain_result: list[dict] = []
+            drain_errors: list[BaseException] = []
+
+            def drain() -> None:
+                try:
+                    drain_result.append(D._drain_queue_once(args))
+                except BaseException as exc:
+                    drain_errors.append(exc)
+
+            claim_cleared_while_status_held = False
+            ledger_available_while_status_held = False
+            with D.status_write_lock(status_path):
+                drain_thread = threading.Thread(target=drain, daemon=True)
+                drain_thread.start()
+                claim_cleared_while_status_held = _wait_for(
+                    lambda: not claim.exists(), timeout=2.0
+                )
+                ledger_lock = D.goalflight_ledger.StateLock.try_acquire(
+                    time.monotonic() + 0.1
+                )
+                if ledger_lock is not None:
+                    ledger_available_while_status_held = True
+                    ledger_lock.release()
+            drain_thread.join(5)
+            assert not drain_thread.is_alive(), "terminal mirror stayed blocked"
+            assert not drain_errors, drain_errors
+            assert claim_cleared_while_status_held, (
+                "terminal claim cleanup waited on the held status lock"
+            )
+            assert ledger_available_while_status_held, (
+                "status mirror wait retained ledger lock"
+            )
+            payload = drain_result[0]
+
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+        assert not claim.exists(), payload.get("details")
+
+
+def test_drain_never_launches_entry_with_terminal_complete_status() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp_path = Path(td)
+        with _isolated_completion_authority(tmp_path):
+            queue = tmp_path / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "complete-status-no-relaunch"
+            path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+            status_path = tmp_path / f"{dispatch_id}.status.json"
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_alive": False,
+                    "status_path": str(status_path),
+                },
+            )
+            original_run = D.subprocess.run
+            launches: list[list[str]] = []
+
+            def record_launch(argv, **kwargs):
+                argv = list(argv)
+                if any(Path(str(arg)).name == "goalflight_dispatch.py" for arg in argv):
+                    launches.append(argv)
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n",
+                        stderr="",
+                    )
+                return original_run(argv, **kwargs)
+
+            monkeypatch.setattr(D.subprocess, "run", record_launch)
+            monkeypatch.setattr(D, "_release_stale_capacity_for_drain", lambda: None)
+            monkeypatch.setattr(D, "_run_drain_prelaunch_hook", lambda _agents: None)
+            args = _drain_args(queue)
+            args.claim_stale_s = 0
+
+            payload = D._drain_queue_once(args)
+
+        assert launches == [], launches
+        assert path.exists(), "unresolved completion status must not consume the queued entry"
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+        assert any(
+            row.get("dispatch_id") == dispatch_id and row.get("reason") == "terminal_status_complete"
+            for row in payload.get("details") or []
+        ), payload.get("details")
+
+
+def _force_completion_after_status_read(
+    monkeypatch: pytest.MonkeyPatch,
+    status_path: Path,
+) -> tuple[list[threading.Thread], list[BaseException]]:
+    original_write = D.write_status
+    original_read = D._read_entry_status
+    attempted = threading.Event()
+    finished = threading.Event()
+    failures: list[BaseException] = []
+    threads: list[threading.Thread] = []
+
+    def publish_complete() -> None:
+        attempted.set()
+        try:
+            original_write(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": status_path.stem.removesuffix(".status"),
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_alive": False,
+                },
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    def start_writer() -> None:
+        if not threads:
+            thread = threading.Thread(target=publish_complete)
+            threads.append(thread)
+            thread.start()
+            assert attempted.wait(2), "completion writer did not start"
+
+    def read_then_complete(entry: dict) -> dict:
+        payload = original_read(entry)
+        if Path(D._entry_status_json_path(entry)) == status_path and not threads:
+            # The caller has observed the non-terminal payload. With the
+            # shared lock held, completion blocks here until the queued write
+            # is done; without it, completion lands before the caller writes.
+            start_writer()
+            finished.wait(0.1)
+        return payload
+
+    monkeypatch.setattr(D, "_read_entry_status", read_then_complete)
+    return threads, failures
+
+
+def test_parked_status_write_cannot_overwrite_concurrent_completion() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "parked-status-race.status.json"
+            D.write_status(status_path, {"state": "running", "worker_alive": True})
+            entry = {
+                "dispatch_id": "parked-status-race",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                    "tail": str(tmp / "parked-status-race.tail"),
+                },
+            }
+            threads, failures = _force_completion_after_status_read(
+                monkeypatch, status_path
+            )
+            assert D._write_parked_status(
+                entry, {"state": "deferred", "reason": "completion_authority_unavailable"}
+            )
+            assert len(threads) == 1
+            threads[0].join(timeout=5)
+            assert not threads[0].is_alive(), "completion writer remained blocked"
+            assert not failures, failures
+            assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_restore_status_write_cannot_overwrite_concurrent_completion() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "restore-status-race.status.json"
+            D.write_status(status_path, {"state": "running", "worker_alive": True})
+            entry = {
+                "dispatch_id": "restore-status-race",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                    "tail": str(tmp / "restore-status-race.tail"),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {"state": "queued", "terminal_state": "unknown"},
+            )
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda _root: None)
+            monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda _root: None)
+            threads, failures = _force_completion_after_status_read(
+                monkeypatch, status_path
+            )
+            D._restore_queued_record_from_entry(entry, tmp / "restore.json")
+            assert len(threads) == 1
+            threads[0].join(timeout=5)
+            assert not threads[0].is_alive(), "completion writer remained blocked"
+            assert not failures, failures
+            assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_parked_status_preserves_worktree_identity_for_launched_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "parked-seat.status.json"
+            entry = {
+                "dispatch_id": "parked-seat",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {
+                    "dispatch_id": "parked-seat",
+                    "state": "worker_dead",
+                    "worktree_path": str(tmp / "worktrees" / "seat-a"),
+                    "worktree_seat": "seat-a",
+                },
+            )
+
+            assert D._write_parked_status(entry, {"reason": "parked"})
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            assert status["worktree_path"] == str(tmp / "worktrees" / "seat-a")
+            assert status["worktree_seat"] == "seat-a"
+
+
+def test_parked_status_keeps_prelaunch_failure_as_a_no_seat_record() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "parked-prelaunch.status.json"
+            entry = {
+                "dispatch_id": "parked-prelaunch",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {
+                    "dispatch_id": "parked-prelaunch",
+                    "state": "blocked",
+                    "prelaunch_failure": True,
+                    "worktree_path": str(tmp / "stale-seat"),
+                    "worktree_seat": "stale-seat",
+                },
+            )
+
+            assert D._write_parked_status(entry, {"reason": "parked"})
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            assert status["prelaunch_failure"] is True
+            assert "worktree_path" not in status
+            assert "worktree_seat" not in status
+
+
+def test_restore_status_preserves_worktree_identity_for_launched_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "restore-seat.status.json"
+            entry = {
+                "dispatch_id": "restore-seat",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "restore_txn_id": "restore-seat-txn",
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {
+                    "dispatch_id": "restore-seat",
+                    "state": "queued",
+                    "restore_txn_id": "restore-seat-txn",
+                    "worktree_path": str(tmp / "worktrees" / "seat-b"),
+                    "worktree_seat": "seat-b",
+                },
+            )
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda _root: None)
+            monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda _root: None)
+
+            D._restore_queued_record_from_entry(entry, tmp / "queue.json")
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            assert status["worktree_path"] == str(tmp / "worktrees" / "seat-b")
+            assert status["worktree_seat"] == "seat-b"
+
+
+def test_restore_status_keeps_prelaunch_failure_as_a_no_seat_record() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "restore-prelaunch.status.json"
+            entry = {
+                "dispatch_id": "restore-prelaunch",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "restore_txn_id": "restore-prelaunch-txn",
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {
+                    "dispatch_id": "restore-prelaunch",
+                    "state": "queued",
+                    "restore_txn_id": "restore-prelaunch-txn",
+                    "prelaunch_failure": True,
+                    "worktree_path": str(tmp / "stale-seat"),
+                    "worktree_seat": "stale-seat",
+                },
+            )
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda _root: None)
+            monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda _root: None)
+
+            D._restore_queued_record_from_entry(entry, tmp / "queue.json")
+
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            assert status["prelaunch_failure"] is True
+            assert "worktree_path" not in status
+            assert "worktree_seat" not in status
+
+
+def test_restore_defers_status_mirror_when_ledger_is_held_and_status_lock_is_busy() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            status_path = tmp / "restore-status-busy.json"
+            D.write_status(status_path, {"state": "running", "worker_alive": True})
+            entry = {
+                "dispatch_id": "restore-status-busy",
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "request": {
+                    "cwd": str(tmp),
+                    "status_json": str(status_path),
+                    "tail": str(tmp / "restore-status-busy.tail"),
+                },
+            }
+            monkeypatch.setattr(
+                D,
+                "_find_dispatch_record",
+                lambda _dispatch_id: {"state": "queued", "terminal_state": "unknown"},
+            )
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda _root: None)
+            monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda _root: None)
+
+            with D.status_write_lock(status_path):
+                started = time.monotonic()
+                D._restore_queued_record_from_entry(entry, tmp / "restore.json")
+                elapsed = time.monotonic() - started
+                ledger_lock = D.goalflight_ledger.StateLock.try_acquire(
+                    time.monotonic() + 0.1
+                )
+                assert ledger_lock is not None, "restore retained ledger lock while status was busy"
+                ledger_lock.release()
+
+            assert elapsed < 0.5, f"status lock wait held the ledger for {elapsed:.3f}s"
+            assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "running"
+
+
+def _assert_drain_rejects_completion_after_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    complete_after_claim: bool,
+) -> tuple[dict, list[list[str]], Path, Path]:
+    queue = tmp_path / "state" / "dispatch-queue"
+    queue.mkdir(parents=True)
+    dispatch_id = "complete-after-claim" if complete_after_claim else "complete-before-spawn"
+    path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+    status_path = tmp_path / f"{dispatch_id}.status.json"
+    D.write_status(status_path, {"state": "running", "worker_alive": True})
+    completed = {
+        "schema": "goalflight.status.v1",
+        "dispatch_id": dispatch_id,
+        "state": "complete",
+        "terminal_state": "complete",
+        "worker_alive": False,
+    }
+    if complete_after_claim:
+        original_claim = D._claim_queue_entry
+        injected = False
+
+        def claim_then_complete(queue_path: Path) -> Path | None:
+            nonlocal injected
+            claim = original_claim(queue_path)
+            if claim is not None and not injected:
+                injected = True
+                D.write_status(status_path, completed)
+            return claim
+
+        monkeypatch.setattr(D, "_claim_queue_entry", claim_then_complete)
+    else:
+        original_argv = D._drain_launch_argv
+        injected = False
+
+        def argv_then_complete(*args, **kwargs) -> list[str]:
+            nonlocal injected
+            argv = original_argv(*args, **kwargs)
+            if not injected:
+                injected = True
+                D.write_status(status_path, completed)
+            return argv
+
+        monkeypatch.setattr(D, "_drain_launch_argv", argv_then_complete)
+
+    original_run = D.subprocess.run
+    launches: list[list[str]] = []
+
+    def record_launch(argv, **kwargs):
+        argv = list(argv)
+        if any(Path(str(arg)).name == "goalflight_dispatch.py" for arg in argv):
+            launches.append(argv)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=f"DISPATCH-LAUNCHED {dispatch_id}\n",
+                stderr="",
+            )
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, "run", record_launch)
+    monkeypatch.setattr(D, "_settle_final_for_drain", lambda _entry, _queue: None)
+    monkeypatch.setattr(D, "_release_stale_capacity_for_drain", lambda: None)
+    monkeypatch.setattr(D, "_run_drain_prelaunch_hook", lambda _agents: None)
+    args = _drain_args(queue)
+    args.claim_stale_s = 0
+    payload = D._drain_queue_once(args)
+    return payload, launches, path, status_path
+
+
+def test_drain_rechecks_terminal_status_after_claim() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _payload, launches, _path, status_path = _assert_drain_rejects_completion_after_claim(
+                tmp, monkeypatch, complete_after_claim=True
+            )
+        assert launches == [], launches
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_drain_rechecks_terminal_status_immediately_before_spawn() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _payload, launches, _path, status_path = _assert_drain_rejects_completion_after_claim(
+                tmp, monkeypatch, complete_after_claim=False
+            )
+        assert launches == [], launches
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_launched_child_refuses_completion_published_during_sidecar_env() -> None:
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        subprocess.run(["git", "init", "--quiet", str(tmp)], check=True)
+        dispatch_id = "complete-during-sidecar-env"
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        queue_path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+        status_path = tmp / f"{dispatch_id}.status.json"
+        marker = tmp / "worker-launched"
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["dispatch_argv"] = [
+            "--agent",
+            "test-dispatch",
+            "--unregistered-forced",
+            "--dispatch-id",
+            dispatch_id,
+            "--tail",
+            str(tmp / f"{dispatch_id}.tail"),
+            "--status-json",
+            str(status_path),
+            "--poll-secs",
+            "0.1",
+            "--cwd",
+            str(tmp),
+            "--in-place",
+            "--",
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"Path({str(marker)!r}).write_text('launched')"
+            ),
+        ]
+        D._write_json_atomic(queue_path, entry)
+        D.write_status(status_path, {"state": "running", "worker_alive": True})
+        completed = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": dispatch_id,
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_alive": False,
+        }
+        original_sidecar_env = D._sidecar_env
+
+        def complete_during_sidecar_env(env: dict[str, str]) -> dict[str, str]:
+            D.write_status(status_path, completed)
+            return original_sidecar_env(env)
+
+        monkeypatch.setattr(D, "_sidecar_env", complete_during_sidecar_env)
+        with _isolated_completion_authority(tmp):
+            D._drain_queue_once(_drain_args(queue))
+            authority = journal.open_or_create_journal(tmp)
+            attempt = authority.attempt_for_dispatch(dispatch_id)
+            assert attempt is not None, "launch refusal removed its journal attempt"
+            completion = authority.commit_terminal(
+                attempt.attempt_id,
+                terminal_state="complete",
+                observation={
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_still_alive": False,
+                },
+                event_type="result",
+            )
+            assert completion.committed and completion.value is not None, completion
+            assert completion.value.terminal_state == "complete", completion.value
+
+        assert not _wait_for(marker.exists, timeout=3.0), "completed dispatch launched its worker"
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_terminal_complete_blocks_child_waiting_and_starting_status_writes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        status_path = Path(td) / "terminal-child-status.json"
+        completed = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": "terminal-child-status",
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_alive": False,
+        }
+        for state in ("waiting_capacity", "starting"):
+            D.write_status(status_path, completed.copy())
+            D.write_status(
+                status_path,
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": "terminal-child-status",
+                    "state": state,
+                    "worker_alive": False,
+                },
+            )
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            assert payload["state"] == "complete", (state, payload)
+            assert payload["terminal_state"] == "complete", (state, payload)
+
+
+def test_launch_admission_marker_is_cleared_after_spawn_scope() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        status_path = Path(td) / "launch-admission-status.json"
+        D.write_status(status_path, {"state": "running", "worker_alive": True})
+        with D._status_launch_admission(status_path, "launch-admission-token") as lock:
+            assert lock is not None
+        cleared = json.loads(status_path.read_text(encoding="utf-8"))
+        assert cleared["state"] == "running", cleared
+        assert "launch_admission_token" not in cleared, cleared
+
+
+def test_remote_drain_rechecks_terminal_status_after_preview() -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        status_path = tmp / "remote-complete-after-preview.status.json"
+        D.write_status(status_path, {"state": "running", "worker_alive": True})
+        entry = {
+            "dispatch_id": "remote-complete-after-preview",
+            "agent": "codex",
+            "project_root": str(tmp),
+            "request": {
+                "cwd": str(tmp),
+                "status_json": str(status_path),
+                "prompt": "do the work",
+                "base_sha": "0000000000000000000000000000000201234567",
+            },
+        }
+        args = argparse.Namespace(
+            remote_node="test-node",
+            fleet_dir=str(tmp / "fleet"),
+            remote_runner=object(),
+            remote_tool_smoke="auto",
+        )
+        completed = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": entry["dispatch_id"],
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_alive": False,
+        }
+        launch_stamps: list[dict] = []
+        executions: list[dict] = []
+
+        def complete_during_preview(*_args, **_kwargs):
+            D.write_status(status_path, completed)
+            return object()
+
+        def record_execute(*_args, **_kwargs):
+            executions.append({})
+            return {"launch_unconfirmed": False}
+
+        monkeypatch.setattr(D, "_occupancy_argv_from_record", lambda _entry: [])
+        monkeypatch.setattr(D, "agent_model_allowlist", lambda _agent: None)
+        monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: tmp / "fleet")
+        monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda args: launch_stamps.append(vars(args)))
+        monkeypatch.setattr(fleet_dispatch, "preview_dispatch", complete_during_preview)
+        monkeypatch.setattr(fleet_dispatch, "execute_dispatch", record_execute)
+        with _isolated_completion_authority(tmp):
+            result = D._drain_launch_remote_claim(
+                args,
+                entry,
+                dispatch_id=entry["dispatch_id"],
+                launch_token="launch-token",
+                claim=tmp / "claim.json",
+            )
+
+        assert result is None, result
+        assert launch_stamps == [], launch_stamps
+        assert executions == [], executions
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_remote_drain_refuses_completion_published_during_claim_stamp() -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        status_path = tmp / "remote-complete-during-claim-stamp.status.json"
+        dispatch_id = "remote-complete-during-claim-stamp"
+        D.write_status(status_path, {"state": "running", "worker_alive": True})
+        entry = {
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "project_root": str(tmp),
+            "request": {
+                "cwd": str(tmp),
+                "status_json": str(status_path),
+                "prompt": "do the work",
+                "base_sha": "0000000000000000000000000000000201234567",
+            },
+        }
+        args = argparse.Namespace(
+            remote_node="test-node",
+            fleet_dir=str(tmp / "fleet"),
+            remote_runner=object(),
+            remote_tool_smoke="auto",
+        )
+        completed = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": dispatch_id,
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_alive": False,
+        }
+        launch_stamps: list[dict] = []
+        executions: list[dict] = []
+
+        def complete_during_claim_stamp(stamp_args) -> None:
+            launch_stamps.append(vars(stamp_args))
+            D.write_status(status_path, completed)
+
+        def record_execute(*_args, **_kwargs):
+            executions.append({})
+            return {"launch_unconfirmed": False}
+
+        monkeypatch.setattr(D, "_occupancy_argv_from_record", lambda _entry: [])
+        monkeypatch.setattr(D, "agent_model_allowlist", lambda _agent: None)
+        monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: tmp / "fleet")
+        monkeypatch.setattr(D, "_mark_queue_claim_launch_started", complete_during_claim_stamp)
+        monkeypatch.setattr(fleet_dispatch, "preview_dispatch", lambda *_args, **_kwargs: object())
+        monkeypatch.setattr(fleet_dispatch, "execute_dispatch", record_execute)
+        with _isolated_completion_authority(tmp):
+            result = D._drain_launch_remote_claim(
+                args,
+                entry,
+                dispatch_id=dispatch_id,
+                launch_token="claim-stamp-token",
+                claim=tmp / "claim.json",
+            )
+
+        assert result is None, result
+        assert len(launch_stamps) == 1, launch_stamps
+        assert executions == [], executions
+        assert json.loads(status_path.read_text(encoding="utf-8"))["state"] == "complete"
+
+
+def test_remote_timeout_does_not_hold_status_lock_and_late_harvest_keeps_complete() -> None:
+    import goalflight_fleet_dispatch as fleet_dispatch
+    import goalflight_fleet_mirror as fleet_mirror
+    import goalflight_fleet_watch as fleet_watch
+
+    with tempfile.TemporaryDirectory() as td, pytest.MonkeyPatch.context() as monkeypatch:
+        tmp = Path(td)
+        status_path = tmp / "remote-spawn-ack.status.json"
+        dispatch_id = "remote-spawn-ack"
+        D.write_status(status_path, {"state": "running", "worker_alive": True})
+        entry = {
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "project_root": str(tmp),
+            "request": {
+                "cwd": str(tmp),
+                "status_json": str(status_path),
+                "prompt": "do the work",
+                "base_sha": "0000000000000000000000000000000201234567",
+            },
+        }
+        launch_started = threading.Event()
+        allow_receipt = threading.Event()
+        completion_started = threading.Event()
+        completion_done = threading.Event()
+        events: list[str] = []
+        attempt_ids: list[str | None] = []
+        failures: list[BaseException] = []
+        fleet_dir = tmp / "fleet"
+        completed = {
+            "schema": "goalflight.status.v1",
+            "dispatch_id": dispatch_id,
+            "state": "complete",
+            "terminal_state": "complete",
+            "result_text": "controller completed output",
+            "worker_alive": False,
+        }
+
+        def remote_runner(argv: list[str]):
+            assert any("goalflight_fleet_launch_detached.py" in part for part in argv), argv
+            launch_started.set()
+            if not allow_receipt.wait(5):
+                raise AssertionError("test did not release remote launch receipt")
+            events.append("late_node_spawn")
+            return 124, "", "ssh timeout"
+
+        args = argparse.Namespace(
+            remote_node="test-node",
+            fleet_dir=str(tmp / "fleet"),
+            remote_runner=remote_runner,
+            remote_tool_smoke="auto",
+        )
+
+        def fake_execute(_fleet_dir, _preview, *, runner, **_kwargs):
+            runner(["ssh", "node", "goalflight_fleet_launch_detached.py"])
+            fleet_dir.mkdir()
+            late_status = {
+                "schema": fleet_mirror.STATUS_MIRROR_SCHEMA,
+                "dispatch_id": dispatch_id,
+                "seq": 1,
+                "state": "complete",
+                "result_text": "late duplicate result",
+            }
+            meta = {
+                "dispatch_id": dispatch_id,
+                "node_id": "test-node",
+                "queue_launch_token": "remote-spawn-ack-token",
+                "remote_status_path": "/home/dev/.goal-flight/attempts/late/status.json",
+            }
+
+            class LateAttemptTransport:
+                def fetch_remote_status(self, **_kwargs):
+                    return fleet_watch.RemoteFetchResult(
+                        True, content=json.dumps(late_status)
+                    )
+
+            harvested = fleet_watch.ingest_dispatch_mirror(
+                fleet_dir, dispatch_id, meta, LateAttemptTransport()
+            )
+            assert harvested.ok and harvested.action == "ingested", harvested
+            events.append("late_harvest")
+            return {"launch_unconfirmed": True}
+
+        def publish_completion() -> None:
+            completion_started.set()
+            D.write_status(status_path, completed)
+            with D.goalflight_ledger.StateLock():
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(tmp),
+                        "transport": "fleet-ssh",
+                        "state": "complete",
+                        "terminal_state": "complete",
+                        "attempt_id": "completed-worker-attempt",
+                        "queue_launch_token": "completed-queue-attempt",
+                        "status_path": str(status_path),
+                        "ended_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+            events.append("completion")
+            completion_done.set()
+
+        def drain() -> None:
+            try:
+                D._drain_launch_remote_claim(
+                    args,
+                    entry,
+                    dispatch_id=dispatch_id,
+                    launch_token="remote-spawn-ack-token",
+                    claim=tmp / "claim.json",
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        monkeypatch.setattr(D, "_occupancy_argv_from_record", lambda _entry: [])
+        monkeypatch.setattr(D, "agent_model_allowlist", lambda _agent: None)
+        monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: tmp / "fleet")
+        monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
+
+        def capture_preview(*_args, **kwargs):
+            attempt_ids.append(kwargs.get("attempt_id"))
+            return object()
+
+        monkeypatch.setattr(fleet_dispatch, "preview_dispatch", capture_preview)
+        monkeypatch.setattr(fleet_dispatch, "execute_dispatch", fake_execute)
+        drain_thread = threading.Thread(target=drain, daemon=True)
+        with _isolated_completion_authority(tmp):
+            drain_thread.start()
+            assert launch_started.wait(5), "remote launch request did not start"
+            completion_thread = threading.Thread(target=publish_completion, daemon=True)
+            completion_thread.start()
+            assert completion_started.wait(5), "completion publisher did not start"
+            completed_before_timeout = completion_done.wait(2.0)
+            allow_receipt.set()
+            drain_thread.join(5)
+            completion_thread.join(5)
+
+        assert not drain_thread.is_alive(), "remote drain did not finish"
+        assert not completion_thread.is_alive(), "completion writer did not finish"
+        assert not failures, failures
+        assert completed_before_timeout, events
+        assert attempt_ids == ["remote-spawn-ack-token"], attempt_ids
+        assert events == ["completion", "late_node_spawn", "late_harvest"], events
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        assert payload["state"] == "complete", payload
+        assert payload["result_text"] == "controller completed output", payload
+        assert payload["superseded_duplicate_attempt"][0]["attempt_id"] == (
+            "remote-spawn-ack-token"
+        ), payload
+        assert not fleet_watch.dispatch_status_path(fleet_dir, dispatch_id).exists()
+        with _isolated_completion_authority(tmp):
+            ledger_record = D.goalflight_ledger.read_record(dispatch_id)
+        assert any(
+            event.get("type") == "superseded_duplicate_attempt"
+            and event.get("attempt_id") == "remote-spawn-ack-token"
+            for event in ledger_record.get("events", [])
+        ), ledger_record
+
+
 def main() -> None:
     test_terminal_ended_at_uses_first_journal_commit_and_is_write_once()
     test_prior_ledger_completion_does_not_supersede_deliberate_follow_up()
@@ -6013,9 +7468,12 @@ def main() -> None:
     test_parked_status_write_failure_is_visible_on_claim()
     test_mark_claim_failed_reports_whether_it_committed()
     test_drain_launches_queued_request_once_and_exits()
-    test_registered_queue_refusal_after_controller_exit_restores_runnable_entry()
+    test_deferred_bash_admission_restores_claim_and_retries()
+    test_registered_queue_refusal_after_controller_replacement_terminalizes()
+    test_controller_refusal_with_unknown_liveness_remains_retryable()
     test_drain_write_error_is_json_error_without_traceback()
     test_acp_drain_replays_preexisting_queue_entry()
+    test_deferred_acp_admission_retries_prepared_attempt_with_same_token()
     test_unreadable_adapter_manifest_does_not_terminalize_queued_os_sandbox()
     test_absent_os_sandbox_capability_still_terminalizes_queued_row()
     test_drain_leaves_request_queued_when_capacity_full()
@@ -6074,6 +7532,20 @@ def main() -> None:
     test_round5_normal_restore_revalidates_fresh_admission()
     test_round5_launch_owned_claim_writers_hold_queue_lock()
     test_round5_tail_substitution_and_frozen_lock_order()
+    test_indeterminate_completed_claim_drain_keeps_terminal_status()
+    test_drain_clears_final_claim_when_ledger_queue_token_is_missing()
+    test_drain_never_launches_entry_with_terminal_complete_status()
+    test_parked_status_write_cannot_overwrite_concurrent_completion()
+    test_restore_status_write_cannot_overwrite_concurrent_completion()
+    test_restore_defers_status_mirror_when_ledger_is_held_and_status_lock_is_busy()
+    test_drain_rechecks_terminal_status_after_claim()
+    test_drain_rechecks_terminal_status_immediately_before_spawn()
+    test_launched_child_refuses_completion_published_during_sidecar_env()
+    test_terminal_complete_blocks_child_waiting_and_starting_status_writes()
+    test_launch_admission_marker_is_cleared_after_spawn_scope()
+    test_remote_drain_rechecks_terminal_status_after_preview()
+    test_remote_drain_refuses_completion_published_during_claim_stamp()
+    test_remote_timeout_does_not_hold_status_lock_and_late_harvest_keeps_complete()
     print("OK: dispatch queue tests pass")
 
 

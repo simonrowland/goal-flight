@@ -80,30 +80,29 @@ Rules:
   first so partial output cannot claim consumption before delivery. Generic
   backlog rows report as `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a
   confirmation-looking reply.
-  A watched-tail typed reply receipt also settles renewal when the waiter's end
-  row is unavailable, and each consumed reply's receipt is persisted to the
-  mailbox's append-only receipts sidecar so renewal evidence does not age out
-  of the status marker window or bounded stdout rescan. After flushing the
-  reply, `steer --wait` launches the receipt and end-row writes as independent
-  detached operations and returns without waiting on either lock, write, or
-  fsync. Each helper owns its complete operation and survives the short-lived
-  wait command; separating them prevents one wedged fsync from serializing the
-  other evidence write. During the lag window a reader accepts whichever exact
-  evidence has completed. If neither has, the fsynced typed reply remains the
-  recovery record and is redelivered at least once, scheduling cleanup again.
-  Redelivery does not spawn another helper while one is already live for that
-  same `(wait_id, reply_seq, operation)`: at most one receipt helper and one
-  end-row helper in flight per exact reply. A helper that finds the slot held
-  exits without retrying the write. A helper holding the mailbox lock may make
-  that bounded read report its own deadline, but cannot create a lasting
-  refusal. Transient mailbox read failures
-  inside the wait are retried until the deadline. A lock-holding admitted writer
-  may outlive that deadline, and the current wait may therefore return nonzero;
-  deadline writes no settlement or lasting refusal. Before creating another
-  arm, the next wait redelivers the prior exact typed reply when consumption is
-  unproven. A genuinely unresolved arm with no typed reply remains
-  non-renewable, so repeated waits cannot re-arm forever. On deadline ordinary
-  idle accounting resumes.
+  After flushing the human reply and its typed `STEER-REPLY` receipt,
+  `steer --wait` writes a durable reply settlement to that wait's question
+  outbox. The watcher reads the settlement and appends the mailbox end row. If
+  output or settlement fails, the wait stays unsettled and the exact reply
+  remains recoverable by explicitly resuming that wait. A new question always
+  gets a new wait id; matching text never reuses an older answer. Timeout writes
+  a durable timeout settlement. The watcher uses that settlement, not its own
+  wall-clock estimate, to decide whether the wait has ended. Typed reply markers
+  in status or the bounded worker tail remain a fallback receipt when the
+  mailbox end row is unavailable. On deadline ordinary idle accounting
+  resumes.
+- Dispatch-dir isolation for question outboxes is enforced by the Seatbelt
+  profiles Goal Flight generates. Native Codex workers rely on Codex's own
+  sandbox policy, including its temp-directory access. Native Codex read-only
+  workers are reviewers and cannot ask with `steer --wait`; an unwritable
+  outbox returns `WorkerQuestionOutboxWriteDenied` with that limitation.
+- If an outbox question cannot be armed because another wait is still live,
+  the watcher records a durable `.rejected` marker so that request is not
+  retried after the worker exits.
+- ACP v1 does not create a wait id for `USER-NEED`: that marker ends the current
+  provider turn, and the controller starts a child dispatch with the answer in
+  its prompt. The watcher does not signal a worker merely because it remains
+  alive after a terminal marker.
 - Bash-tail otherwise keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits
   at the next turn boundary for a correlated steer reply. The guarded action

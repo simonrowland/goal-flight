@@ -28,6 +28,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_task  # noqa: E402
 import goalflight_doctor  # noqa: E402
 import goalflight_setup  # noqa: E402
+import goalflight_compat  # noqa: E402
 
 os.environ.setdefault(
     "GOALFLIGHT_TASK_STORE_DIR",
@@ -75,6 +76,23 @@ def _task_store_base(path: Path):
 
 def _read_view_manifest(repo: Path) -> dict:
     return json.loads(goalflight_task.view_manifest_path(repo).read_text(encoding="utf-8"))
+
+
+def test_posix_default_state_dir_does_not_follow_tmpdir() -> None:
+    if goalflight_compat.is_windows():
+        return
+    prior_tmpdir = os.environ.get("TMPDIR")
+    try:
+        with tempfile.TemporaryDirectory() as tmp_path:
+            os.environ["TMPDIR"] = tmp_path
+            assert goalflight_compat.default_state_dir() == Path("/tmp") / (
+                f"goal-flight-{os.getuid()}"
+            )
+    finally:
+        if prior_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = prior_tmpdir
 
 
 PRE_V11_INDEX_HTML = """<!doctype html>
@@ -967,6 +985,7 @@ def test_state_protocols_are_discoverable_from_index_and_commands() -> None:
 def main() -> None:
     os.environ["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
     tests = [
+        test_posix_default_state_dir_does_not_follow_tmpdir,
         test_scaffold_project_state_is_idempotent_and_respects_existing_files,
         test_scaffold_project_state_empty_store_has_no_ready_frontier,
         test_scaffold_project_state_corrupt_legacy_store_fails_clean,
@@ -1031,7 +1050,7 @@ def test_every_worktree_of_a_repo_resolves_to_one_task_store() -> None:
     """A real git worktree, reached four ways, must give ONE store.
 
     The explicit forms used to skip the git resolution and hand each worktree its
-    own store, so each fork minted its own id sequence and the same ``b-1141``
+    own store, so each fork minted its own id sequence and the same ``b-0001``
     named different rows in different worktrees.
     """
     with tempfile.TemporaryDirectory() as td:

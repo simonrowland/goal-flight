@@ -127,6 +127,7 @@ STREAM_FRONTIER_GRACE_S = 1.0
 # records are not controller wakes. --chatty restores the raw
 # heartbeat/frontier feed. --debug may print the old heartbeat record.
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
+STARTUP_PULSE_DEADLINE_S = 3.0
 NEXT_REMINDER_REPEAT_FLOOR_S = math.inf
 # Escalations and listener health must survive even a routine record carrying
 # the same envelope identity. Keep these types aligned with the message registry;
@@ -140,6 +141,7 @@ _PASSTHROUGH_EVENT_TYPES = frozenset(
         "watchdog-dead",
         "listener-degraded",
         "listener-recovered",
+        "pending-projection",
     }
 )
 _DEAD_NONCE_MARKERS = (
@@ -446,6 +448,25 @@ def _supervise_line(record: dict[str, object]) -> str:
     encoded = (payload + "\n").encode("utf-8")
     if len(encoded) <= STREAM_LINE_MAX_BYTES:
         return payload + "\n"
+    if record.get("kind") == "pulse" and isinstance(record.get("text"), str):
+        text = str(record["text"])
+        while text:
+            if "\n" in text:
+                text = text.rsplit("\n", 1)[0]
+            else:
+                text = text[:-1]
+            pulse = {"kind": "pulse", "text": text or "LANE unavailable"}
+            payload = json.dumps(
+                pulse,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            encoded = (payload + "\n").encode("utf-8")
+            if len(encoded) <= STREAM_LINE_MAX_BYTES:
+                return payload + "\n"
+        payload = '{"kind":"pulse","text":"LANE unavailable"}'
+        return payload + "\n"
     detail = record.get("detail")
     if isinstance(detail, str) and detail:
         trimmed = dict(record)
@@ -496,6 +517,25 @@ def _live_target(slots: list[_Slot]) -> tuple[int, int]:
         and slot.stopped_reason is None
     )
     return live, len(slots)
+
+
+class _StartupPulseJob:
+    def __init__(self, callback: Callable[[float], dict[str, object]], deadline: float):
+        self.result: dict[str, object] | None = None
+
+        def run() -> None:
+            try:
+                self.result = callback(deadline)
+            except BaseException:
+                self.result = {"kind": "pulse", "unavailable": "error"}
+
+        self.thread = threading.Thread(
+            target=run, name="goalflight-startup-pulse", daemon=True
+        )
+        self.thread.start()
+
+    def poll(self) -> dict[str, object] | None:
+        return self.result
 
 
 def _report_stdout_detector(
@@ -1284,12 +1324,23 @@ def run_supervisor(
     debug: bool = False,
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
+    startup_pulse: Callable[[float], dict[str, object]] | None = None,
     cursor_rewinds: Callable[[], dict[str, int]] | None = None,
+    on_heartbeat: Callable[[Path, str, str], str | None] | None = None,
     next_repeat_floor_s: float = DEFAULT_NEXT_REPEAT_FLOOR_S,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
+    pulse_deadline = time.monotonic() + STARTUP_PULSE_DEADLINE_S
+    pulse_job: _StartupPulseJob | None = None
+    pulse_emitted = False
+    pulse_start_failed = False
+    if startup_pulse is not None:
+        try:
+            pulse_job = _StartupPulseJob(startup_pulse, pulse_deadline)
+        except Exception:
+            pulse_start_failed = True
     rearm = _supervisor_rearm_command(
         project_root=project_root,
         controller_label=controller_label,
@@ -1325,6 +1376,28 @@ def run_supervisor(
         }
         record.update(fields)
         return emit_recovery(record)
+
+    def refresh_controller_heartbeat() -> bool:
+        if on_heartbeat is None:
+            return True
+        try:
+            renewed_nonce = on_heartbeat(
+                Path(project_root), controller_label, nonce
+            )
+        except Exception as exc:
+            renewed_nonce = None
+            detail = f"{type(exc).__name__}: {exc}"
+        else:
+            detail = "pinned lease generation could not be renewed"
+        if renewed_nonce == nonce:
+            return True
+        emit_stop(
+            reason="dead-lease-nonce",
+            scope="supervisor",
+            detail=detail[:180],
+        )
+        host.kill_all()
+        return False
 
     if not nonce:
         if not emit_stop(
@@ -1620,6 +1693,23 @@ def run_supervisor(
         coverage_ok, _coverage_emitted = emit_coverage(force=True)
         if not coverage_ok:
             return stop_after_failed_write()
+    def emit_ready_pulse() -> int | None:
+        nonlocal pulse_emitted, pulse_job
+        if pulse_emitted or (pulse_job is None and not pulse_start_failed):
+            return None
+        record = (
+            {"kind": "pulse", "unavailable": "error"}
+            if pulse_job is None
+            else pulse_job.poll()
+        )
+        if record is None:
+            return None
+        pulse_job = None
+        pulse_emitted = True
+        if not _emit(host, record):
+            return stop_after_failed_write()
+        return None
+
     if debug and not emit_heartbeat():
         return stop_after_failed_write()
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
@@ -1631,9 +1721,10 @@ def run_supervisor(
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
     next_gate = _RepeatGate()
-    # Scoped to this stdout owner, shared across every child and replacement
-    # child. This is delivery memory, never journal acknowledgement. A new
-    # supervisor starts empty and can recover any partially delivered batch.
+    # This set only deduplicates overlapping children during this supervisor
+    # process. It is deliberately not persisted: stdout writes do not prove the
+    # monitor consumed an envelope, so the cursor remains the delivery authority
+    # across re-arms.
     delivered_envelopes: dict[str, str] = {}
     seen_rewinds: dict[str, int] = {}
 
@@ -1712,23 +1803,31 @@ def run_supervisor(
         nonlocal seen_rewinds
         record = _parse_child_record(line)
         rows = _child_mail_rows(line)
-        if rows and cursor_rewinds is not None:
+        rewind_probe_ok = True
+        row_identities = {
+            identity: str(row.get("stream_id") or row.get("dispatch_id"))
+            for row in rows
+            if isinstance(row, dict)
+            and (identity := _envelope_identity(row)) is not None
+        }
+        if cursor_rewinds is not None and any(
+            identity in delivered_envelopes for identity in row_identities
+        ):
             try:
                 rewinds = cursor_rewinds()
             except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
-                # No current evidence cannot prove a duplicate. Preserve both
-                # the output and old memory until a later successful read.
-                text = line if line.endswith("\n") else line + "\n"
-                return _write_stdout(host, text, source="write-child-output")
-            changed_streams = {
-                stream for stream, version in rewinds.items()
-                if version != seen_rewinds.get(stream, 0)
-            }
-            if changed_streams:
+                # No current evidence cannot prove a duplicate. Forward it and
+                # leave the in-memory deduper intact for a later successful read.
+                rewind_probe_ok = False
+            else:
+                changed_streams = {
+                    stream for stream, version in rewinds.items()
+                    if version != seen_rewinds.get(stream, 0)
+                }
                 for identity, stream in tuple(delivered_envelopes.items()):
                     if stream in changed_streams:
                         del delivered_envelopes[identity]
-            seen_rewinds = rewinds
+                seen_rewinds = rewinds
         identities: dict[str, str] = {}
         if record is not None and record.get("kind") == "pending-at-arm":
             remaining = []
@@ -1736,30 +1835,62 @@ def run_supervisor(
                 identity = _envelope_identity(row)
                 if (
                     _backlog_capable_row(row) and identity is not None
-                    and (identity in delivered_envelopes or identity in identities)
+                    and (
+                        (rewind_probe_ok and identity in delivered_envelopes)
+                        or identity in identities
+                    )
                 ):
                     continue
                 remaining.append(row)
                 if identity is not None:
                     identities[identity] = str(row.get("stream_id") or row.get("dispatch_id"))
-            if len(remaining) != len(rows):
+            filtered = len(remaining) != len(rows)
+            if filtered:
                 # Keep cursor/advance and all other metadata intact; only
                 # repeated mail items disappear from the report.
                 record["items"] = remaining
+            if remaining:
+                # A startup backlog can include an envelope already observed
+                # by the prior host monitor. Its cursor identity lets the
+                # controller recognize at-least-once replay without suppressing
+                # an unacknowledged envelope.
+                record["replay"] = True
+                record["items"] = [
+                    {**row, "replay": True} if isinstance(row, dict) else row
+                    for row in record.get("items", remaining)
+                ]
+            if filtered or remaining:
+                # Preserve the cursor snapshot and advance command even when
+                # every item was deduplicated. Forwarding the original line
+                # here would reintroduce the entire duplicate batch.
                 line = json.dumps(record, ensure_ascii=False)
         elif _is_backlog_capable_line(line):
             identity = _backlog_line_identity(line)
             if identity.startswith("envelope:"):
-                if identity in delivered_envelopes:
+                if rewind_probe_ok and identity in delivered_envelopes:
                     return True
                 identities[identity] = str(rows[0].get("stream_id") or rows[0].get("dispatch_id"))
+                if record is not None and record.get("kind") == "event":
+                    # Follow emits only rows beyond the acknowledged cursor.
+                    # A replacement supervisor can therefore see an envelope
+                    # already written by the prior monitor; mark it so the
+                    # controller can recognize and deduplicate that replay.
+                    payload = record.get("payload")
+                    if isinstance(payload, dict):
+                        record["payload"] = {**payload, "replay": True}
+                    record["replay"] = True
+                    line = json.dumps(record, ensure_ascii=False)
         text = line if line.endswith("\n") else line + "\n"
         if not _write_stdout(host, text, source="write-child-output"):
             return False
-        delivered_envelopes.update(identities)
+        if identities:
+            delivered_envelopes.update(identities)
         return True
 
     while host.running():
+        pulse_stop = emit_ready_pulse()
+        if pulse_stop is not None:
+            return pulse_stop
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
         # is the sole terminal policy. The probes around wait are allowed to be
         # inconclusive, while registration failure or persistently unusable
@@ -1788,6 +1919,10 @@ def run_supervisor(
             return SUPERVISE_STOP_EXIT
         now = host.now
         wake_at = min(next_heartbeat, next_coverage)
+        if (pulse_job is not None or pulse_start_failed) and not pulse_emitted:
+            remaining = pulse_deadline - time.monotonic()
+            pulse_poll_s = max(0.0, remaining) if remaining > 0 else 0.1
+            wake_at = min(wake_at, now + pulse_poll_s)
         if pending_stream_heartbeat is not None:
             wake_at = min(wake_at, pending_stream_heartbeat_due)
         for slot in slots:
@@ -1816,13 +1951,20 @@ def run_supervisor(
         ):
             break
         for child, line in result.lines:
+            stream_heartbeat = _own_stream_record(
+                child, line, kind="heartbeat"
+            )
+            if (
+                stream_heartbeat is not None
+                and not refresh_controller_heartbeat()
+            ):
+                return SUPERVISE_STOP_EXIT
             if not chatty:
-                heartbeat = _own_stream_record(child, line, kind="heartbeat")
-                if heartbeat is not None:
+                if stream_heartbeat is not None:
                     if pending_stream_heartbeat is not None:
                         if not emit_pending_stream_wake():
                             return stop_after_failed_write()
-                    pending_stream_heartbeat = heartbeat
+                    pending_stream_heartbeat = stream_heartbeat
                     pending_stream_heartbeat_due = (
                         host.now + STREAM_FRONTIER_GRACE_S
                     )
@@ -1942,6 +2084,8 @@ def run_supervisor(
         if not coverage_ok:
             return stop_after_failed_write()
         if host.now >= next_heartbeat:
+            if not refresh_controller_heartbeat():
+                return SUPERVISE_STOP_EXIT
             if not emit_heartbeat():
                 return stop_after_failed_write()
             next_heartbeat = host.now + max(0.01, float(heartbeat_s))
@@ -1961,6 +2105,9 @@ def run_supervisor(
 
     if not emit_pending_restarts():
         return stop_after_failed_write()
+    pulse_stop = emit_ready_pulse()
+    if pulse_stop is not None:
+        return pulse_stop
     signum = getattr(host, "stop_signum", None)
     if isinstance(signum, int) and signum > 0:
         live, target = _live_target(slots)
@@ -2794,6 +2941,7 @@ def cmd_supervise(
     args: Any,
     *,
     forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+    startup_pulse: Callable[[Path, str, float], dict[str, object]] | None = None,
     before_renewal: Callable[[Path, str, str], str | None] | None = None,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
@@ -2812,6 +2960,35 @@ def cmd_supervise(
     if refusal:
         print(f"supervise: refused: {refusal}", file=sys.stderr)
         return SUPERVISE_START_EXIT
+
+    def startup_record(kind: str, reason: str, detail: str) -> None:
+        try:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "kind": "supervise",
+                        "type": kind,
+                        "reason": reason,
+                        "detail": detail,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    def did_not_arm(detail: str, code: int) -> int:
+        startup_record("stop", "did-not-arm", detail)
+        print(f"supervise: did-not-arm: {detail}", file=sys.stderr)
+        return code
+
+    def retry_probe(detail: str) -> int:
+        startup_record("probe", "unknown-retry", detail)
+        print(f"supervise: retry: {detail}", file=sys.stderr)
+        return SUPERVISE_START_EXIT
+
     project_root = goalflight_task.resolve_project_root(
         getattr(args, "project_root", None) or str(Path.cwd())
     )
@@ -2822,20 +2999,74 @@ def cmd_supervise(
     if not label:
         print("supervise: controller label is unavailable", file=sys.stderr)
         return SUPERVISE_START_EXIT
-    live_nonce, refusal, refusal_code = resolve_startup_lease_nonce(
-        project_root=project_root,
-        controller_label=label,
-        explicit=str(getattr(args, "lease_nonce", None) or ""),
-    )
-    if not live_nonce:
-        print(f"supervise: {refusal}", file=sys.stderr)
-        return int(refusal_code or SUPERVISE_START_EXIT)
+    explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip()
+    if explicit_nonce:
+        live_nonce, refusal, refusal_code = resolve_startup_lease_nonce(
+            project_root=project_root,
+            controller_label=label,
+            explicit=explicit_nonce,
+        )
+        if not live_nonce:
+            detail = str(refusal or "controller lease could not be verified")
+            if detail.startswith("did-not-arm: "):
+                detail = detail[len("did-not-arm: "):]
+                return did_not_arm(
+                    detail,
+                    int(refusal_code or SUPERVISE_STOP_EXIT),
+                )
+            startup_record("stop", "startup-failed", detail)
+            print(f"supervise: {detail}", file=sys.stderr)
+            return int(refusal_code or SUPERVISE_START_EXIT)
+    else:
+        declared_pid = sessions.resolve_controller_pid()
+        claim = sessions.claim_controller_startup(
+            project_root,
+            pid=declared_pid,
+            label=label,
+            pid_from_ancestry=declared_pid is None,
+            hold_lock=True,
+        )
+        session = claim.get("session")
+        if not claim.get("claimed") or not isinstance(session, dict):
+            reason = str(
+                claim.get("message")
+                or claim.get("reason")
+                or "controller lease claim failed"
+            )
+            claim_reason = str(claim.get("reason") or "")
+            if claim_reason in {
+                "label_in_use",
+                "controller_label_conflict",
+                "controller_label_mismatch",
+                "role_does_not_claim",
+                "missing_controller_label",
+                "volatile_project_root",
+                "conflicting_controller_pid_sources",
+            }:
+                return did_not_arm(
+                    f"controller lease claim failed: {reason}",
+                    SUPERVISE_STOP_EXIT,
+                )
+            return retry_probe(
+                f"controller lease claim is unavailable; retry the same "
+                f"supervise command: {reason}"
+            )
+        label = str(session.get("label") or label)
+        live_nonce = str(
+            session.get("lease_nonce") or session.get("id") or ""
+        ).strip()
+        if not live_nonce:
+            return did_not_arm(
+                "controller lease claim returned no live nonce",
+                SUPERVISE_STOP_EXIT,
+            )
     if on_startup_probe is not None:
         slot_state, _ = wake.supervisor_slot_probe(
             project_root,
             controller_label=label,
             generation_key=live_nonce,
         )
+        listing = None
         if slot_state != wake.SUPERVISOR_ABSENT:
             existing = slot_state
         else:
@@ -2852,31 +3083,54 @@ def cmd_supervise(
                 controller_label=label,
                 lease_nonce=live_nonce,
             )
-        if existing != wake.SUPERVISOR_ABSENT:
-            takeover = bool(getattr(args, "takeover", False))
-            if existing == wake.SUPERVISOR_RUNNING:
-                detail = (
+        if existing == wake.SUPERVISOR_RUNNING:
+            if bool(getattr(args, "takeover", False)):
+                return did_not_arm(
                     "takeover refused: an existing supervisor remains live; "
-                    "wake coverage was not verified; run --list-controllers"
-                    if takeover
-                    else "an existing supervisor remains live; wake coverage "
-                    "was not verified; run --list-controllers"
+                    "wake coverage was not verified; run --list-controllers",
+                    SUPERVISE_START_EXIT,
                 )
-            else:
-                detail = (
-                    "takeover refused: supervisor owner death is not proven "
-                    "by PID + start token; run --list-controllers"
-                    if takeover
-                    else "existing supervisor state is indeterminate; wake "
-                    "coverage was not verified; run --list-controllers or "
-                    "retry with --takeover only after PID + start token "
-                    "prove the owner is dead"
+            supervisor_pid = None
+            if listing is not None:
+                for pid, command in listing:
+                    if wake._supervisor_generation_state_from_listing(
+                        [(pid, command)],
+                        project_root=project_root,
+                        controller_label=label,
+                        lease_nonce=live_nonce,
+                    ) == wake.SUPERVISOR_RUNNING:
+                        supervisor_pid = pid
+                        break
+            if supervisor_pid is None:
+                records = wake.live_waiters(
+                    project_root,
+                    controller_label=label,
+                    generation_key=live_nonce,
+                    kinds={wake.SUPERVISOR_KIND},
                 )
+                if records:
+                    supervisor_pid = records[0].pid
+            coverage = wake.coverage_status(
+                project_root,
+                controller_label=label,
+                lease_nonce=live_nonce,
+            )
+            live = coverage.get("live_waiters")
+            target = coverage.get("target_waiters")
+            live_text = str(live) if isinstance(live, int) else "unknown"
+            target_text = str(target) if isinstance(target, int) else "unknown"
+            pid_text = str(supervisor_pid) if supervisor_pid is not None else "unknown"
             print(
-                f"supervise: did-not-arm: {detail}",
+                "supervise: already live "
+                f"(pid {pid_text}, coverage {live_text}/{target_text}); "
+                "not starting another",
                 file=sys.stderr,
             )
-            return SUPERVISE_START_EXIT
+            return 0
+        if existing != wake.SUPERVISOR_ABSENT:
+            return retry_probe(
+                "supervisor presence is unknown; retry the same supervise command"
+            )
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     heartbeat_s = float(
         getattr(args, "heartbeat_secs", DEFAULT_SUPERVISOR_HEARTBEAT_S)
@@ -2904,8 +3158,7 @@ def cmd_supervise(
     if before_renewal is not None:
         refusal = before_renewal(project_root, label, live_nonce)
         if refusal:
-            print(f"supervise: did-not-arm: {refusal}", file=sys.stderr)
-            return SUPERVISE_START_EXIT
+            return did_not_arm(str(refusal), SUPERVISE_START_EXIT)
     # Eligibility refusals must not extend the lease. Later startup I/O failures
     # (including broken stdout or child-start failure) can follow renewal; this
     # is not an atomic arm operation. Release still waits for stdout proof.
@@ -2915,11 +3168,10 @@ def cmd_supervise(
         nonce=live_nonce,
     )
     if not renewed_nonce:
-        print(
-            "supervise: did-not-arm: controller lease lost before arm",
-            file=sys.stderr,
+        return did_not_arm(
+            "controller lease lost before arm",
+            SUPERVISE_STOP_EXIT,
         )
-        return SUPERVISE_STOP_EXIT
     live_nonce = renewed_nonce
     host = RealHost(
         project_root=project_root,
@@ -2935,12 +3187,11 @@ def cmd_supervise(
                 generation_key=live_nonce,
             )
         except (BlockingIOError, OSError, RuntimeError, ValueError) as exc:
-            print(
-                "supervise: did-not-arm: supervisor slot could not be claimed; "
-                f"wake coverage was not verified: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
+            return did_not_arm(
+                "supervisor slot could not be claimed; wake coverage was not "
+                f"verified: {type(exc).__name__}: {exc}",
+                SUPERVISE_START_EXIT,
             )
-            return SUPERVISE_START_EXIT
         reader = goalflight_journal.Journal.open_reader(
             project_root,
             persistent=True,
@@ -2982,6 +3233,18 @@ def cmd_supervise(
                 (lambda: forwarding_frontier(project_root))
                 if forwarding_frontier is not None
                 else None
+            ),
+            startup_pulse=(
+                (lambda deadline: startup_pulse(project_root, label, deadline))
+                if startup_pulse is not None
+                else None
+            ),
+            on_heartbeat=lambda heartbeat_root, heartbeat_label, heartbeat_nonce: (
+                _renew_controller_lease_before_arm(
+                    project_root=heartbeat_root,
+                    controller_label=heartbeat_label,
+                    nonce=heartbeat_nonce,
+                )
             ),
             on_startup_probe=on_startup_probe,
         )

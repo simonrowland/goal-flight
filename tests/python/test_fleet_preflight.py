@@ -18,7 +18,7 @@ import goalflight_fleet_dispatch as dispatch
 import goalflight_fleet_preflight as preflight
 
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 AGENT = "codex-acp"
 
 

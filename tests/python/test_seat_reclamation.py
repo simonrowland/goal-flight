@@ -19,6 +19,7 @@ from test_dispatch_worktree_pool import _make_repo, _git, _env, _dispatch_cmd
 import goalflight_dispatch as dispatch
 import goalflight_ledger as ledger
 import goalflight_worktree_pool as pool
+from test_worktree_seat_pool import _rewrite_seat_holder_as_dead
 
 
 @pytest.fixture
@@ -32,7 +33,25 @@ def holder(tmp_path, monkeypatch):
            "worker_pid": 34567, "worker_identity": {"pid": 34567, "start_token": "old-token"}}
     monkeypatch.setattr(ledger, "read_record", lambda ident: row if ident == "old" else None)
     monkeypatch.setattr(pool.goalflight_compat, "process_identity_matches", lambda pid, token: False)
+    monkeypatch.setattr(pool, "_process_cwd_snapshot", lambda *, timeout_s: [])
     return repo, path, row
+
+
+def _move_seat_to_legacy(repo, path, slot):
+    global_lock = pool.worktree_lock_path_for_path(repo, path)
+    legacy_path = repo / "worktrees" / "legacy" / slot
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "move", str(path), str(legacy_path))
+    legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / f"{slot}.lock"
+    legacy_lock.parent.mkdir(parents=True, exist_ok=True)
+    global_lock.replace(legacy_lock)
+
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    entry = registry["locks"].pop(pool._lock_registry_key(global_lock))
+    registry["locks"][pool._lock_registry_key(legacy_lock)] = entry
+    registry_path.write_text(json.dumps(registry))
+    return legacy_path
 
 
 def test_terminal_holder_pins_head_and_dirty_files(holder):
@@ -44,7 +63,14 @@ def test_terminal_holder_pins_head_and_dirty_files(holder):
     (path / "new.txt").write_text("untracked\n")
     with pool.acquire_worktree_seat(repo, "next") as lease:
         assert lease.path == path
-        assert _git(repo, "rev-parse", "refs/goalflight/keep/old/head") == head
+        head_refs = _git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/goalflight/keep/old/head-*",
+        ).splitlines()
+        assert len(head_refs) == 1
+        assert _git(repo, "rev-parse", head_refs[0]) == head
         refs = _git(repo, "for-each-ref", "--format=%(refname)", "refs/goalflight/keep/old/dirty-*").splitlines()
         assert len(refs) == 1
         assert _git(repo, "show", refs[0] + ":tracked.txt") == "dirty"
@@ -83,13 +109,22 @@ def test_quarantine_failure_preserves_real_index(holder, monkeypatch):
     (path / "tracked.txt").write_text("unstaged\n")
     original = _git(path, "diff", "--cached")
     real_git = pool._git
+    injected_refs = []
+
     def fail_ref(cwd, *args, **kwargs):
-        if args[0] == "update-ref" and "dirty-" in args[1]:
+        if (
+            args[0] == "update-ref"
+            and len(args) > 2
+            and args[2].startswith("refs/goalflight/keep/old/dirty-")
+        ):
+            injected_refs.append(args[2])
             raise pool.WorktreeSeatError("pin failed")
         return real_git(cwd, *args, **kwargs)
+
     monkeypatch.setattr(pool, "_git", fail_ref)
     with pytest.raises(pool.WorktreeSeatError):
         pool.acquire_worktree_seat(repo, "next")
+    assert len(injected_refs) == 1
     assert _git(path, "diff", "--cached") == original
     assert (path / "tracked.txt").read_text() == "unstaged\n"
 
@@ -298,6 +333,13 @@ def test_retained_legacy_ring_seat_counts_toward_cap(holder):
     legacy_lock = pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
     legacy_lock.parent.mkdir(parents=True)
     global_lock.replace(legacy_lock)
+    registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
+    registry = json.loads(registry_path.read_text())
+    global_key = pool._lock_registry_key(global_lock)
+    legacy_key = pool._lock_registry_key(legacy_lock)
+    registry_entry = registry["locks"].pop(global_key)
+    registry["locks"][legacy_key] = registry_entry
+    registry_path.write_text(json.dumps(registry))
     global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
     if global_ring.exists():
         global_ring.unlink()
@@ -318,6 +360,179 @@ def test_retained_legacy_ring_seat_counts_toward_cap(holder):
         pool.acquire_worktree_seat(repo, "next")
     assert not (repo / "worktrees" / "s-1").exists()
     assert (collision / "payload").read_text() == "must survive\n"
+
+
+@pytest.mark.parametrize("global_live", [False, True])
+def test_global_and_legacy_seats_share_capacity(holder, monkeypatch, global_live):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, path, old_row = holder
+    legacy_path = _move_seat_to_legacy(repo, path, "s-1")
+    lock_root = pool._seat_lock_root(repo)
+    pool._write_ring_hwm(lock_root, 0)
+
+    with pool.acquire_worktree_seat(repo, "global-old") as global_lease:
+        global_path = global_lease.path
+
+    global_row = {
+        "dispatch_id": "global-old",
+        "state": "complete",
+        "controller_label": "owner",
+        "worker_pid": 45678,
+        "worker_identity": {"pid": 45678, "start_token": "global-token"},
+    }
+    records = {"old": old_row, "global-old": global_row}
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: bool(global_live and pid == 45678),
+    )
+    monkeypatch.setattr(pool, "_process_cwd_snapshot", lambda *, timeout_s: [])
+
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        if global_live:
+            assert lease.path == legacy_path
+        else:
+            assert lease.path in {global_path, legacy_path}
+
+    assert global_path.is_dir()
+    assert legacy_path.is_dir()
+    assert not (pool.repository_worktree_root(repo) / "s-2").exists()
+    assert pool._read_ring_hwm(lock_root) == 1
+
+
+def test_concurrent_allocators_recheck_capacity_under_mutation_lock(
+    holder, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, path, _row = holder
+    legacy_path = _move_seat_to_legacy(repo, path, "s-1")
+    lock_root = pool._seat_lock_root(repo)
+    pool._write_ring_hwm(lock_root, 0)
+    legacy_lock_path = (
+        pool._seat_lock_root(repo, controller_label="legacy") / "s-1.lock"
+    )
+    legacy_lock_file = legacy_lock_path.open("r+", encoding="utf-8")
+    fcntl.flock(legacy_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    allocator_a_waiting = tmp_path / "allocator-a-waiting"
+    allow_allocator_a = tmp_path / "allow-allocator-a"
+    allocator_a_result = tmp_path / "allocator-a-result.json"
+    scripts_path = Path(pool.__file__).parent
+    script = "\n".join(
+        [
+            "import contextlib, json, sys, time",
+            "from pathlib import Path",
+            f"sys.path.insert(0, {str(scripts_path)!r})",
+            "import goalflight_worktree_pool as pool",
+            f"entered = Path({str(allocator_a_waiting)!r})",
+            f"resume = Path({str(allow_allocator_a)!r})",
+            "real_hold = pool._hold_worktree_mutation_lock",
+            "@contextlib.contextmanager",
+            "def pause_before_mutation(root, **kwargs):",
+            "    entered.touch()",
+            "    deadline = time.monotonic() + 30",
+            "    while not resume.exists():",
+            "        if time.monotonic() >= deadline:",
+            "            raise TimeoutError('allocator A was not released')",
+            "        time.sleep(0.01)",
+            "    with real_hold(root, **kwargs) as release: yield release",
+            "pool._hold_worktree_mutation_lock = pause_before_mutation",
+            "try:",
+            f"    lease = pool.acquire_worktree_seat(Path({str(repo)!r}), 'allocator-a')",
+            "    result = {'seat': lease.path.name, 'path': str(lease.path)}",
+            "    lease.release()",
+            "except BaseException as exc:",
+            "    result = {'error': type(exc).__name__, 'message': str(exc)}",
+            f"Path({str(allocator_a_result)!r}).write_text(json.dumps(result))",
+        ]
+    )
+    process = None
+    lease_b = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            env=os.environ.copy(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 30
+        while not allocator_a_waiting.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert allocator_a_waiting.is_file(), "allocator A did not finish its census"
+
+        lease_b = pool.acquire_worktree_seat(repo, "allocator-b")
+        assert lease_b.path == pool.repository_worktree_root(repo) / "s-1"
+
+        allow_allocator_a.touch()
+        deadline = time.monotonic() + 30
+        while not allocator_a_result.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert allocator_a_result.is_file(), "allocator A did not finish"
+        result_a = json.loads(allocator_a_result.read_text())
+        assert result_a.get("error") == "WorktreeSeatUnavailable", result_a
+
+        assert legacy_path.is_dir()
+        assert (pool.repository_worktree_root(repo) / "s-1").is_dir()
+        assert not (pool.repository_worktree_root(repo) / "s-2").exists()
+        assert not (lock_root / "s-2.lock").exists()
+        assert pool._ring_state_path(lock_root).is_file()
+        assert pool._read_ring_hwm(lock_root) == 1
+        assert _git(repo, "worktree", "list", "--porcelain").count("worktree ") == 3
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, f"{stdout}\n{stderr}"
+    finally:
+        allow_allocator_a.touch()
+        if process is not None and process.poll() is None:
+            try:
+                process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=10)
+        if lease_b is not None:
+            lease_b.release()
+        fcntl.flock(legacy_lock_file.fileno(), fcntl.LOCK_UN)
+        legacy_lock_file.close()
+
+
+def test_reset_false_skips_live_legacy_holder(holder, monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
+    repo, first_path, first_row = holder
+    with pool.acquire_worktree_seat(repo, "second-old") as second_lease:
+        second_path = second_lease.path
+
+    first_legacy = _move_seat_to_legacy(repo, first_path, "s-1")
+    second_legacy = _move_seat_to_legacy(repo, second_path, "s-2")
+    lock_root = pool._seat_lock_root(repo)
+    pool._write_ring_hwm(lock_root, 0)
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "1")
+
+    second_row = {
+        "dispatch_id": "second-old",
+        "state": "complete",
+        "controller_label": "owner",
+        "worker_pid": 45678,
+        "worker_identity": {"pid": 45678, "start_token": "second-token"},
+    }
+    records = {"old": first_row, "second-old": second_row}
+    monkeypatch.setattr(ledger, "read_record", lambda ident: records.get(ident))
+    monkeypatch.setattr(
+        pool.goalflight_compat,
+        "process_identity_matches",
+        lambda pid, token: pid == 34567,
+    )
+    monkeypatch.setattr(pool, "_process_cwd_snapshot", lambda *, timeout_s: [])
+
+    with pool.acquire_worktree_seat(repo, "next", reset=False) as lease:
+        assert lease.path == second_legacy
+
+    assert _git(first_legacy, "branch", "--show-current") == "worktree/old"
+    assert _git(second_legacy, "branch", "--show-current") == "worktree/second-old"
 
 
 def test_unregistered_live_legacy_ring_lock_reports_holder_and_counts_toward_cap(
@@ -355,7 +570,7 @@ def test_unregistered_live_legacy_ring_lock_reports_holder_and_counts_toward_cap
     assert legacy_path.is_dir()
 
 
-def test_unregistered_terminal_legacy_ring_lock_is_reused_with_free_slot(
+def test_unregistered_terminal_legacy_ring_lock_prefers_available_global_slot(
     holder, monkeypatch
 ):
     monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "2")
@@ -381,7 +596,9 @@ def test_unregistered_terminal_legacy_ring_lock_is_reused_with_free_slot(
     registry_path.write_text(json.dumps(registry))
 
     with pool.acquire_worktree_seat(repo, "next") as lease:
-        assert lease.path == legacy_path
+        assert lease.path == pool.repository_worktree_root(repo) / "s-1"
+        assert legacy_path.is_dir()
+        assert _git(legacy_path, "branch", "--show-current") == "worktree/old"
 
 
 def test_unregistered_terminal_legacy_ring_lock_is_reused_when_pool_is_full(
@@ -397,8 +614,10 @@ def test_unregistered_terminal_legacy_ring_lock_is_reused_when_pool_is_full(
     legacy_lock.parent.mkdir(parents=True)
     global_lock.replace(legacy_lock)
     global_ring = pool._ring_state_path(pool._seat_lock_root(repo))
-    if global_ring.exists():
-        global_ring.unlink()
+    global_slot = pool.repository_worktree_root(repo) / "s-1"
+    assert global_ring.is_file()
+    assert pool._read_ring_hwm(pool._seat_lock_root(repo)) == 1
+    assert not global_slot.exists()
 
     registry_path = pool._lock_registry_path(pool._git_common_dir(repo))
     registry = json.loads(registry_path.read_text())
@@ -411,6 +630,9 @@ def test_unregistered_terminal_legacy_ring_lock_is_reused_when_pool_is_full(
 
     with pool.acquire_worktree_seat(repo, "next") as lease:
         assert lease.path == legacy_path
+    assert not global_slot.exists()
+    assert not global_lock.exists()
+    assert pool._read_ring_hwm(pool._seat_lock_root(repo)) == 1
 
 
 @pytest.mark.parametrize("metadata", ["live", "empty"])
@@ -438,6 +660,23 @@ def test_unregistered_missing_checkout_requires_holder_evidence(
         )
     else:
         global_lock.write_text("", encoding="utf-8")
+
+    # git worktree remove deletes the admin dir and its occupancy lock file
+    # but leaves the registry key. That stale entry keeps the repo not clean
+    # until the operator drops it. Holder evidence is what still sends the
+    # next dispatch to a new slot instead of recreating this one.
+    stale_lock = (
+        pool._git_common_dir(repo) / "worktrees" / path.name / pool.OCCUPANCY_LOCK_NAME
+    )
+    report = pool._repo_clean_report(repo)
+    assert not report.clean
+    assert any(
+        item.startswith("registry file_missing ") and str(stale_lock) in item
+        for item in report.items
+    )
+    assert "--drop-stale" in report.reason
+    pool.drop_one_stale_worktree_item(repo, str(stale_lock))
+    assert pool._repo_clean_report(repo).clean
 
     with pool.acquire_worktree_seat(repo, "next") as lease:
         assert lease.path == repo / "worktrees" / "s-2"
@@ -950,8 +1189,16 @@ def test_unparseable_local_config_cap_fails_loudly(tmp_path, monkeypatch):
         pool.configured_worktree_seats()
 
 
-def test_seat_wait_retries_without_terminal_record(monkeypatch):
-    args = SimpleNamespace(capacity_wait_s=10)
+def test_seat_wait_retries_without_terminal_record(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    worker_cwd = tmp_path / "worker"
+    project_root.mkdir()
+    worker_cwd.mkdir()
+    args = SimpleNamespace(
+        capacity_wait_s=10,
+        project_root=str(project_root),
+        cwd=str(worker_cwd),
+    )
     lease = object()
     bind = Mock(side_effect=[pool.WorktreeSeatUnavailable("full"), lease])
     monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", bind)
@@ -961,8 +1208,16 @@ def test_seat_wait_retries_without_terminal_record(monkeypatch):
     assert bind.call_count == 2
 
 
-def test_retained_seat_wait_retries_without_terminal_record(monkeypatch):
-    args = SimpleNamespace(capacity_wait_s=10)
+def test_retained_seat_wait_retries_without_terminal_record(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    worker_cwd = tmp_path / "worker"
+    project_root.mkdir()
+    worker_cwd.mkdir()
+    args = SimpleNamespace(
+        capacity_wait_s=10,
+        project_root=str(project_root),
+        cwd=str(worker_cwd),
+    )
     lease = object()
     bind = Mock(
         side_effect=[
@@ -987,12 +1242,125 @@ def test_seat_wait_expiry_is_admission_refusal(monkeypatch):
     assert args._worktree_seat_refused
 
 
+def test_queue_seat_wait_stops_before_remaining_launch_deadline(monkeypatch):
+    clock = [10.0]
+    sleeps = []
+    args = SimpleNamespace(
+        capacity_wait_s=120,
+        from_queue=True,
+        _queue_launch_deadline=15.25,
+        _worktree_wait_notified=True,
+    )
+
+    def refuse(_args):
+        raise pool.WorktreeSeatUnavailable("held")
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(dispatch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dispatch.time, "sleep", advance)
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", refuse)
+    monkeypatch.setattr(dispatch, "_prepare_attempt_worktree_occupancy", lambda _args: None)
+    with pytest.raises(
+        pool.WorktreeSeatUnavailable,
+        match="seat busy: queue launch budget exhausted",
+    ):
+        dispatch._admit_dispatch_worktree(args)
+    assert sleeps == pytest.approx([0.25])
+    assert args._worktree_seat_refused
+
+
+def test_queue_pinned_seat_wait_uses_retryable_budget_refusal(monkeypatch):
+    clock = [10.0]
+    args = SimpleNamespace(
+        capacity_wait_s=120,
+        from_queue=True,
+        _queue_launch_deadline=15.25,
+        _worktree_wait_notified=True,
+    )
+
+    def refuse(_args):
+        raise pool.WorktreeSeatUnavailable("held", flock_held=True)
+
+    monkeypatch.setattr(dispatch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dispatch.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(dispatch, "_pinned_worktree_seat_name", lambda _args: "s-1")
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", refuse)
+    with pytest.raises(
+        pool.WorktreeSeatUnavailable,
+        match="seat busy: queue launch budget exhausted",
+    ) as exc_info:
+        dispatch._admit_dispatch_worktree(args)
+    assert exc_info.value.flock_held
+    assert args._worktree_seat_refused
+
+
+@pytest.mark.parametrize("queue_deadline", [None, float("nan"), float("inf")])
+def test_queue_seat_wait_keeps_requested_budget_without_finite_deadline(
+    monkeypatch, queue_deadline
+):
+    clock = [0.0]
+    args = SimpleNamespace(
+        capacity_wait_s=110,
+        from_queue=True,
+        _queue_launch_deadline=queue_deadline,
+        _worktree_wait_notified=True,
+    )
+
+    def refuse(_args):
+        raise pool.WorktreeSeatUnavailable("held")
+
+    monkeypatch.setattr(dispatch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        dispatch.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", refuse)
+    monkeypatch.setattr(
+        dispatch, "_prepare_attempt_worktree_occupancy", lambda _args: None
+    )
+
+    with pytest.raises(
+        pool.WorktreeSeatUnavailable, match="seat wait expired after 110s"
+    ):
+        dispatch._admit_dispatch_worktree(args)
+    assert clock[0] == pytest.approx(110.0)
+
+
+def test_direct_seat_wait_ignores_queue_deadline(monkeypatch):
+    clock = [0.0]
+    sleeps = []
+    args = SimpleNamespace(
+        capacity_wait_s=2,
+        from_queue=False,
+        in_place=True,
+        _queue_launch_deadline=0.1,
+        _worktree_wait_notified=True,
+    )
+    lease = object()
+    bind = Mock(side_effect=[pool.WorktreeSeatUnavailable("held"), lease])
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(dispatch.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(dispatch.time, "sleep", advance)
+    monkeypatch.setattr(dispatch, "_bind_dispatch_worktree", bind)
+    monkeypatch.setattr(dispatch, "_prepare_attempt_worktree_occupancy", lambda _args: None)
+    assert dispatch._admit_dispatch_worktree(args) is lease
+    assert sleeps == [1.0]
+
+
 def test_resume_replacement_preserves_seat_wait_deadline(tmp_path, monkeypatch):
     deadline = time.monotonic() + 10
     args = SimpleNamespace(
         dispatch_id="replacement-child",
+        cwd=str(tmp_path / "replacement-worker"),
         _worktree_capacity_deadline=deadline,
     )
+    (tmp_path / "replacement-worker").mkdir()
     lease = object()
     observed = {}
     monkeypatch.setattr(
@@ -1003,7 +1371,17 @@ def test_resume_replacement_preserves_seat_wait_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "_resume_worktree_branch_spec",
-        lambda *_args: ("worktree/replacement-parent", "base-sha", None, None),
+        lambda *_args, **_kwargs: (
+            "worktree/replacement-parent",
+            "base-sha",
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_resume_recovery_refusal",
+        lambda *_args: "recovery refs are available",
     )
     monkeypatch.setattr(
         dispatch, "_controller_ring_label", lambda *_args: "unlabeled"
@@ -1014,10 +1392,11 @@ def test_resume_replacement_preserves_seat_wait_deadline(tmp_path, monkeypatch):
         return lease
 
     monkeypatch.setattr(pool, "acquire_worktree_seat", acquire)
-    assert dispatch._resume_replacement_worktree(
+    assert dispatch._resume_recycled_worktree_in_place(
         args,
         project_root=tmp_path,
         parent_dispatch_id="replacement-parent",
+        recovery_refs=["refs/goalflight/keep/replacement-parent/head"],
     ) is lease
     assert observed["capacity_deadline"] == deadline
 
@@ -1063,7 +1442,9 @@ def test_path_lock_prevents_reset(holder):
 
 
 @pytest.mark.parametrize("wait_s", [None, 0.2])
-def test_dispatch_refusal_leaves_no_row_and_emits_once(tmp_path, monkeypatch, wait_s):
+def test_dispatch_refusal_persists_and_new_id_retries_after_release(
+    tmp_path, monkeypatch, wait_s
+):
     env = _env(tmp_path, seats=1)
     for key, value in env.items():
         if key.startswith("GOALFLIGHT_"):
@@ -1075,16 +1456,45 @@ def test_dispatch_refusal_leaves_no_row_and_emits_once(tmp_path, monkeypatch, wa
             command[command.index("--"):command.index("--")] = ["--capacity-wait-s", str(wait_s)]
         result = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True, timeout=30)
         assert result.returncode == 2, result.stdout + result.stderr
-        assert result.stderr.count("1/1 worktrees busy") == 1
+        diagnostic = (
+            "1/1 worktrees busy"
+            if wait_s is None
+            else "seat wait expired after 0.2s"
+        )
+        assert diagnostic in result.stderr, result.stderr
+        assert result.stderr.count(diagnostic) == 1, result.stderr
         assert "DISPATCH-END" not in result.stdout
         assert "DISPATCH-BLOCKED" not in result.stdout
-        assert ledger.read_record("waiting") is None
-        assert not (tmp_path / "waiting.status.json").exists()
+        refusal = ledger.read_record("waiting")
+        assert refusal is not None
+        assert refusal["state"] == "failed_worktree"
+        assert refusal["terminal_state"] == "error"
+        assert refusal["prelaunch_failure"] is True
+        assert refusal.get("worker_pid") is None
+        assert refusal.get("worker_cwd") is None
+        assert not any(
+            refusal.get(key)
+            for key in ("worktree_id", "worktree_path", "worktree_reclaimed_dispatch_id")
+        )
+        status = json.loads(Path(refusal["status_path"]).read_text(encoding="utf-8"))
+        assert status["state"] == "failed_worktree"
+        assert status["terminal_state"] == "error"
+        assert status["prelaunch_failure"] is True
         from test_worktree_seat_pool import finish_seat_holder
         finish_seat_holder(holder)
-        retried = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+        retry_command = list(command)
+        retry_command[retry_command.index("--dispatch-id") + 1] = "waiting-retry"
+        for option, path in (
+            ("--tail", tmp_path / "waiting-retry.tail"),
+            ("--status-json", tmp_path / "waiting-retry.status.json"),
+        ):
+            retry_command[retry_command.index(option) + 1] = str(path)
+        if "--capacity-wait-s" in retry_command:
+            retry_command[retry_command.index("--capacity-wait-s") + 1] = "5"
+        retried = subprocess.run(retry_command, cwd=repo, env=env, capture_output=True, text=True, timeout=30)
         assert retried.returncode == 0, retried.stdout + retried.stderr
         assert "DISPATCH-LAUNCHED" in retried.stdout
+        assert ledger.read_record("waiting")["state"] == "failed_worktree"
 
 
 def test_missing_holder_record_retains_tree(holder, monkeypatch):
@@ -1117,10 +1527,18 @@ def test_saved_head_is_never_overwritten(holder):
     (path / "tracked.txt").write_text("new commit\n")
     _git(path, "commit", "-am", "another commit")
     head = _git(path, "rev-parse", "HEAD")
-    with pytest.raises(pool.WorktreeSeatResetRefused):
-        pool.acquire_worktree_seat(repo, "next")
-    assert _git(path, "rev-parse", "HEAD") == head
+    with pool.acquire_worktree_seat(repo, "next") as lease:
+        assert lease.path == path
+    assert base != head
     assert _git(path, "rev-parse", "refs/goalflight/keep/old/head") == base
+    head_refs = _git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/goalflight/keep/old/head-*",
+    ).splitlines()
+    assert len(head_refs) == 1
+    assert _git(repo, "rev-parse", head_refs[0]) == head
 
 
 def test_unique_target_branch_is_pinned_before_reset(holder):
@@ -1154,6 +1572,7 @@ def test_full_pool_waits_then_launches_same_id(tmp_path, monkeypatch):
     # This generation is intentionally gone, even though its PID was reused.
     ledger.record_path("held").write_text(json.dumps({"dispatch_id": "held", "state": "complete",
         "worker_pid": os.getpid(), "worker_identity": {"pid": os.getpid(), "start_token": "previous-generation"}}))
+    _rewrite_seat_holder_as_dead(repo, holder.path.name, "held")
     marker = tmp_path / "launched"
     command = _dispatch_cmd(tmp_path, repo, "waiting", sys.executable, "-c",
         f"from pathlib import Path; Path({str(marker)!r}).write_text('launched')")
@@ -1206,6 +1625,7 @@ def test_retained_seat_waits_then_launches_same_id(tmp_path, monkeypatch):
             }
         )
     )
+    _rewrite_seat_holder_as_dead(repo, seat.name, "held")
 
     (seat / ".gitignore").write_text("build/\n")
     _git(seat, "add", ".gitignore")
@@ -1272,13 +1692,17 @@ def test_acp_uses_same_seat_wait_and_refusal(tmp_path, monkeypatch, free_seat):
     repo = _make_repo(tmp_path)
     holder = pool.acquire_worktree_seat(repo, "acp-held")
     record_finished_holder("acp-held")
+    _rewrite_seat_holder_as_dead(repo, holder.path.name, "acp-held")
     args = runner_args(repo, "acp-waiter", tmp_path / "acp.status.json")
     args.capacity_wait_s = 3 if free_seat else 0.05
     spawned = []
 
     async def spawn(*_args, **kwargs):
+        with kwargs["launch_admission"]():
+            proc, conn = FakeProc(), FakeConn()
+        await kwargs["on_attempt"](0, proc)
         spawned.append(kwargs)
-        return FakeProc(), FakeConn()
+        return proc, conn
 
     monkeypatch.setattr(acp, "agent_command", lambda *_args, **kwargs: ("fake-agent", []))
     monkeypatch.setattr(acp, "validate_acp_dispatch_readiness", lambda *args: None)
@@ -1300,7 +1724,12 @@ def test_acp_uses_same_seat_wait_and_refusal(tmp_path, monkeypatch, free_seat):
             assert not spawned
             assert payload["state"] == "failed_worktree"
             assert "seat wait expired" in payload["error"]
-            assert ledger.read_record("acp-waiter") is None
+            refusal = ledger.read_record("acp-waiter")
+            assert refusal is not None
+            assert refusal["state"] == "failed_worktree"
+            assert refusal["terminal_state"] == "error"
+            assert refusal["prelaunch_failure"] is True
+            assert refusal.get("worker_pid") is None
     finally:
         if timer:
             timer.cancel()

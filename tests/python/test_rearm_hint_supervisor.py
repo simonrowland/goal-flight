@@ -99,6 +99,23 @@ def _component_commands(
     )
 
 
+def _listed_supervise_command(
+    project: Path,
+    lease: journal.LeaseIdentity,
+    *,
+    nonce: str | None = None,
+) -> str:
+    """Legacy process-table argv, which carries the generation nonce."""
+    command = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    return shlex.join(
+        [*shlex.split(command), "--lease-nonce", nonce or lease.nonce]
+    )
+
+
 def _persistent_shortfall_plan(
     project: Path,
     lease: journal.LeaseIdentity,
@@ -583,6 +600,26 @@ def test_session_start_journal_activity_bounds_open_retry_budget(
             id="refused",
         ),
         pytest.param(
+            {
+                "claimed": False,
+                "reason": "invalid_controller_label",
+                "message": "controller_label must match 1-64 ASCII letters, digits, '.', '_' or '-'; starting with a letter or digit",
+            },
+            False,
+            "Supply a valid label with `--session-label <label>`",
+            id="invalid-label-guidance",
+        ),
+        pytest.param(
+            {
+                "claimed": False,
+                "reason": "volatile_project_root",
+                "message": "use a durable repo",
+            },
+            False,
+            "RESOLVE THE CONTROLLER CLAIM REFUSAL FIRST",
+            id="non-holder-refusal",
+        ),
+        pytest.param(
             {},
             False,
             (
@@ -647,6 +684,12 @@ def test_session_start_claim_outcome_controls_arm_preamble(
             "goalflight_session_status.py --controller-startup "
             "--controller-pid-from-ancestry --takeover"
         ) in context
+    if claim_result.get("reason") == "invalid_controller_label":
+        assert "1-64 ASCII letters" in context
+        assert "--session-label" in context
+        assert "--takeover" not in context
+    if claim_result.get("reason") == "volatile_project_root":
+        assert "--takeover" not in context
 
 
 def test_session_start_probe_failure_emits_without_claiming(
@@ -809,6 +852,7 @@ def test_real_process_table_with_spaced_root_never_proves_absence(
             lease_nonce=lease.nonce,
         )
     )
+    parts.extend(["--lease-nonce", lease.nonce])
     parts[0] = sys.executable
     supervisor = subprocess.Popen(
         parts,
@@ -860,13 +904,9 @@ def test_rearm_hint_supervised_omits_component_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, lease = isolated
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     plan = _persistent_shortfall_plan(
-        project, lease, monkeypatch, [(4242, supervise_cmd)]
+        project, lease, monkeypatch,
+        [(4242, _listed_supervise_command(project, lease))],
     )
     hint = wake.coverage_rearm_hint(plan)
     stream_cmd, backup_cmd, watchdog_cmd = _component_commands(project, lease)
@@ -997,15 +1037,10 @@ def test_unknown_coverage_is_not_rendered_as_zero_shortfall(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, lease = isolated
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     monkeypatch.setattr(
         wake,
         "_process_listing",
-        lambda: [(4242, supervise_cmd)],
+        lambda: [(4242, _listed_supervise_command(project, lease))],
     )
     shutil.rmtree(wake.ledger_dir(project))
     status = wake.coverage_status(
@@ -1135,12 +1170,11 @@ def test_rearm_hint_supervised_portable_shortfall_omits_listen(
 ) -> None:
     """b-242 shortfall: supervise is live, children never armed, mode is portable."""
     project, lease = isolated
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
+    monkeypatch.setattr(
+        wake,
+        "_process_listing",
+        lambda: [(4242, _listed_supervise_command(project, lease))],
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: [(4242, supervise_cmd)])
     status = wake.coverage_status(
         project,
         controller_label=lease.label,
@@ -1195,13 +1229,11 @@ def test_other_generation_supervise_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, lease = isolated
-    other = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce="not-this-generation",
-    )
     plan = _persistent_shortfall_plan(
-        project, lease, monkeypatch, [(7, other)]
+        project,
+        lease,
+        monkeypatch,
+        [(7, _listed_supervise_command(project, lease, nonce="not-this-generation"))],
     )
     hint = wake.coverage_rearm_hint(plan)
     assert plan["supervisor"] == wake.SUPERVISOR_ABSENT
@@ -1265,28 +1297,32 @@ def test_genuine_supervise_argv_still_running(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Executable-position supervise still binds as running."""
+    """Only a nonce-bound process row proves a supervisor generation."""
     project, lease = isolated
     genuine = wake.coverage_supervise_command(
         project,
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
-    listing = [(4242, genuine)]
+    assert _state_from_listing(
+        project, lease, [(4242, genuine)]
+    ) == wake.SUPERVISOR_UNKNOWN
+    listed = _listed_supervise_command(project, lease)
+    listing = [(4242, listed)]
     assert _state_from_listing(project, lease, listing) == wake.SUPERVISOR_RUNNING
-    with_u_parts = shlex.split(genuine)
+    with_u_parts = shlex.split(listed)
     with_u_parts.insert(1, "-u")
     assert (
         _state_from_listing(project, lease, [(4243, shlex.join(with_u_parts))])
         == wake.SUPERVISOR_RUNNING
     )
-    shebang = shlex.join(shlex.split(genuine)[1:])
+    shebang = shlex.join(shlex.split(listed)[1:])
     assert (
         _state_from_listing(project, lease, [(4244, shebang)])
         == wake.SUPERVISOR_RUNNING
     )
     assert (
-        _state_from_listing(project, lease, [(4245, "env " + genuine)])
+        _state_from_listing(project, lease, [(4245, "env " + listed)])
         == wake.SUPERVISOR_RUNNING
     )
     plan = _persistent_shortfall_plan(project, lease, monkeypatch, listing)
@@ -1320,13 +1356,9 @@ def test_reminder_and_activity_surfaces_follow_the_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, lease = isolated
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     plan = _persistent_shortfall_plan(
-        project, lease, monkeypatch, [(4242, supervise_cmd)]
+        project, lease, monkeypatch,
+        [(4242, _listed_supervise_command(project, lease))],
     )
     stream = __import__("io").StringIO()
     line = messages.emit_listener_reminder(
@@ -1381,6 +1413,80 @@ def test_supervisor_forwarded_listener_exit_keeps_reason_not_action(
     assert "listen: timeout: no waking event before timeout" in forwarded
     assert component_command not in forwarded
     assert "re-arm" not in forwarded
+
+
+def test_supervisor_does_not_deduplicate_result_after_pending_projection(
+    isolated: tuple[Path, journal.LeaseIdentity],
+) -> None:
+    project, lease = isolated
+    pending = json.dumps(
+        {
+            "kind": "event",
+            "payload": {
+                "type": "pending-projection",
+                "reason": "pending-projection",
+                "dispatch_id": "terminal-stream",
+                "stream_id": "terminal-stream",
+                "stream_seq": 1,
+            },
+        }
+    )
+    result = json.dumps(
+        {
+            "kind": "event",
+            "payload": {
+                "type": "result",
+                "dispatch_id": "terminal-stream",
+                "stream_id": "terminal-stream",
+                "stream_seq": 1,
+            },
+        }
+    )
+
+    output: list[str] = []
+    lines = [pending, result]
+    projection_complete = False
+    child = SimpleNamespace(kind="stream")
+    host = SimpleNamespace(
+        now=1.0,
+        stop_signum=None,
+        stdout_write_progress=0,
+        running=lambda: bool(lines),
+        live_nonce=lambda: lease.nonce,
+        nonce_probe=lambda: "live",
+        write_stdout=lambda line: output.append(line) is None,
+        touch_stdout=lambda: True,
+        stdio_peer_gone=lambda: False,
+        report_stdout_detector=lambda *_args, **_kwargs: None,
+        stdout_detector_status=lambda: supervise._DetectorStatus(
+            "available", False, None
+        ),
+        spawn=lambda _kind, _command: child,
+        kill_all=lambda: None,
+    )
+
+    def wait(_children: list[object], _timeout_s: float):
+        nonlocal projection_complete
+        line = lines.pop(0)
+        projection_complete = line == result
+        host.now += 0.01
+        return supervise.WaitResult([(child, line)], [])
+
+    host.wait = wait
+    assert supervise.run_supervisor(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        host=host,
+        items=[("stream", "unused")],
+    ) == 0
+    assert projection_complete
+    delivered = [json.loads(line) for line in output]
+    assert [
+        record["payload"]["type"]
+        for record in delivered
+        if record.get("kind") == "event"
+    ] == ["pending-projection", "result"]
 
 
 def test_supervisor_forwarded_json_exit_keeps_reason_not_rearm_plan(
@@ -1507,18 +1613,13 @@ def test_direct_json_exit_beside_detected_supervisor_omits_rearm(
     )
     command_parts[0] = sys.executable
     command_parts.extend(["--timeout-s", "0.15", "--poll-secs", "0.02", "--json"])
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     env = dict(os.environ)
     env.pop("GOALFLIGHT_SUPERVISED", None)
     env = _ps_listing_env(
         tmp_path,
         env,
         name="probe-running-json-exit",
-        rows=[f"4242 {supervise_cmd}"],
+        rows=[f"4242 {_listed_supervise_command(project, lease)}"],
     )
     with wake.register_watchdog_waiter(
         project,
@@ -1778,15 +1879,10 @@ def test_direct_dead_events_beside_detected_supervisor_omit_rearm_command(
 ) -> None:
     project, lease = isolated
     monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     monkeypatch.setattr(
         wake,
         "_process_listing",
-        lambda: [(4242, supervise_cmd)],
+        lambda: [(4242, _listed_supervise_command(project, lease))],
     )
     record = builder(
         status,
@@ -2142,6 +2238,7 @@ def test_doctor_wake_coverage_reports_supervisor_state(
         lease_nonce=lease.nonce,
     )
     parts = shlex.split(supervise_cmd)
+    parts.extend(["--lease-nonce", lease.nonce])
     parts[0] = sys.executable
     supervise_env = dict(os.environ)
     supervise_env.pop("GOALFLIGHT_DISPATCH_ID", None)
@@ -2269,7 +2366,10 @@ def test_stopped_slot_is_not_healthy(
         lease_nonce=lease.nonce,
     )
     _persistent_shortfall_plan(
-        project, lease, monkeypatch, [(4242, supervise_cmd)]
+        project,
+        lease,
+        monkeypatch,
+        [(4242, _listed_supervise_command(project, lease))],
     )
     result = doctor.check_wake_coverage(project)
     pool = result["pools"][0]
@@ -2293,15 +2393,12 @@ def test_doctor_supervised_full_pool_stays_green(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, lease = isolated
-    supervise_cmd = wake.coverage_supervise_command(
-        project,
-        controller_label=lease.label,
-        lease_nonce=lease.nonce,
-    )
     monkeypatch.setattr(
         wake,
         "_process_listing",
-        lambda *args, **kwargs: [(4242, supervise_cmd)],
+        lambda *args, **kwargs: [
+            (4242, _listed_supervise_command(project, lease))
+        ],
     )
     wake.activate_monitor_state(
         project,

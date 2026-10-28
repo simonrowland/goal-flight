@@ -18,9 +18,19 @@ import goalflight_watch as watch  # noqa: E402
 
 
 STARTED = 1_700_000_000.0
-OLD_HANDLE = "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-NEW_HANDLE = "session_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-LATER_HANDLE = "session_cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+OLD_HANDLE = "session_00000000-0000-4000-8000-000000000033"
+NEW_HANDLE = "session_00000000-0000-4000-8000-000000000026"
+LATER_HANDLE = "session_00000000-0000-4000-8000-000000000030"
+
+
+@pytest.fixture(autouse=True)
+def _clear_active_worker_probe_after_test():
+    yield
+    probe = watch._ACTIVE_WORKER_PROCESS_PROBE
+    if probe is not None:
+        probe.close()
+        if watch._ACTIVE_WORKER_PROCESS_PROBE is probe:
+            watch._ACTIVE_WORKER_PROCESS_PROBE = None
 
 
 def _iso(epoch: float) -> str:

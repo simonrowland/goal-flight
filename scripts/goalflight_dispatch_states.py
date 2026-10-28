@@ -33,11 +33,11 @@ LIMIT_TERMINAL_STATES = frozenset(LIMIT_KIND_FOR_STATE)
 
 SUCCESS_TERMINAL_RECORD_STATES = frozenset({"complete", "released"})
 
-FAILURE_TERMINAL_RECORD_STATES = frozenset(
+# These vocabulary states distinguish launcher refusals from a worker's own
+# BLOCKED marker. Keep them explicit so prefix-like unknown states do not gain
+# launcher semantics.
+LAUNCHER_BLOCKED_STATES = frozenset(
     {
-        "error",
-        "failed",
-        "blocked",
         "blocked_adapter_gate",
         "blocked_auth",
         "blocked_capacity",
@@ -46,6 +46,15 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "blocked_session_limit",
         "blocked_task_breadcrumb",
         "blocked_windows_dispatch",
+    }
+)
+
+FAILURE_TERMINAL_RECORD_STATES = frozenset(
+    {
+        "error",
+        "failed",
+        "prelaunch_failed",
+        "blocked",
         "inconclusive_timeout",
         "inconclusive_no_final",
         "worker_dead",
@@ -59,7 +68,7 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "superseded",
         "withdrawn",
     }
-) | LIMIT_TERMINAL_STATES
+) | LAUNCHER_BLOCKED_STATES | LIMIT_TERMINAL_STATES
 
 WEDGED_TERMINAL_RECORD_STATES = frozenset(
     {"idle_timeout", "wedged", "liveness_indeterminate"}

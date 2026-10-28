@@ -61,6 +61,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import goalflight_compat
+from goalflight_controller_label import (
+    ControllerLabelValidationError,
+    validate_controller_label,
+)
 import goalflight_journal
 import goalflight_task
 import goalflight_wake
@@ -148,8 +152,7 @@ def _git_project_root() -> Path | None:
 
 
 def _normalize_controller_label(value: object) -> str | None:
-    label = str(value or "").strip()
-    return label[:64] or None
+    return validate_controller_label(value, field="controller_label")
 
 
 def resolve_controller_label(
@@ -171,7 +174,7 @@ def resolve_controller_label(
         return None
     resolved = goalflight_task.resolve_project_root_for_read(str(root))
     # None: label cannot be derived from a checkout that is not there.
-    return (resolved.name[:64] or None) if resolved is not None else None
+    return _normalize_controller_label(resolved.name) if resolved is not None else None
 
 
 def resolve_controller_pid(
@@ -1374,6 +1377,12 @@ def claim_controller_startup(
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
         }
+    except ControllerLabelValidationError as exc:
+        return {
+            "claimed": False,
+            "reason": "invalid_controller_label",
+            "message": str(exc),
+        }
     except sqlite3.IntegrityError:
         conflict_label = (
             resolved_label
@@ -1425,7 +1434,14 @@ def register_controller(
             "reason": "volatile_project_root",
             "message": refusal,
         }
-    label = _normalize_controller_label(name)
+    try:
+        label = _normalize_controller_label(name)
+    except ControllerLabelValidationError as exc:
+        return {
+            "registered": False,
+            "reason": "invalid_controller_label",
+            "message": str(exc),
+        }
     if label is None:
         return {"registered": False, "reason": "missing_controller_label"}
     if pid is not None and _doomed_invocation_pid(pid, _controller_process_ancestry()):

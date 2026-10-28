@@ -19,6 +19,8 @@ Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <patte
 Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
 `$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
 For a file outside your worktree, use its known path.
+Use `$TMPDIR` for scratch files, separate clones, logs and browser profiles; it is the dispatch scratch directory or a private child, is retention-managed and removed after dispatch ends. Do not create `/tmp/<name>` or `/private/tmp/<name>` entries.
+Start headless Chrome or Chromium with `--use-mock-keychain` and `--user-data-dir` under `$TMPDIR`; Grok and Cursor account homes have no keychain, so Chrome may show a dialog on the owner's screen.
 
 You are READ-ONLY unless this prompt explicitly authorizes exact edit paths.
 Do not commit. Do not run rm -rf or cleanup traps. Never print credential,

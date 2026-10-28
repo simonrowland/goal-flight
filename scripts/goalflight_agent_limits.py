@@ -170,6 +170,8 @@ def cap_pool(agent: str) -> str:
 #   "operating_total"|"max_total": int  persistent machine operating cap       #
 #      (equivalent to $GOALFLIGHT_CAPACITY_MAX_TOTAL but durable; the explicit  #
 #      env var and CLI --max-total still win)                                   #
+#   "dispatch_gc_enabled": true  allow periodic dispatch scratch/tail cleanup  #
+#      (default false; review the report before enabling)                       #
 # --------------------------------------------------------------------------- #
 
 

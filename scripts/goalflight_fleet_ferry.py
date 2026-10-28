@@ -1117,6 +1117,33 @@ def salvage_worktree(
     out_dir = out_dir.expanduser()
     assert_controller_staging_root_allowed(fleet_dir, out_dir)
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    requested_out_dir = out_dir
+    attempt_id = ""
+    attempt_meta: dict[str, Any] | None = None
+    attempt_out_dir: Path | None = None
+    controller_status_path: str | None = None
+    fleet_watch = None
+    if dispatch_id:
+        import goalflight_fleet_watch as fleet_watch
+
+        meta = fleet_watch._read_json_object(
+            fleet_watch.dispatch_meta_path(fleet_dir, dispatch_id)
+        )
+        attempt_meta = meta
+        attempt_id = fleet_watch._remote_attempt_identity(dispatch_id, meta)
+        attempt_key = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:20]
+        attempt_out_dir = out_dir / ".superseded" / attempt_key
+        import goalflight_ledger
+
+        with goalflight_ledger.StateLock():
+            record = goalflight_ledger.read_record(dispatch_id)
+        if isinstance(record, dict):
+            controller_status_path = str(record.get("status_path") or "") or None
+        # Stage every remote attempt separately, including attempts without a
+        # queue token. The final promotion checks completion under the status
+        # lock after network transfer.
+        out_dir = attempt_out_dir
+        out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     append_only_patterns = _merge_append_only_patterns(append_only_paths)
     basetemp_paths = _normalize_pytest_basetemp_paths(pytest_basetemp_paths)
     included_paths = _normalize_include_paths(include_paths)
@@ -1326,6 +1353,58 @@ def salvage_worktree(
         if idx < max_iterations:
             time.sleep(sleep_s)
 
+    if attempt_out_dir is not None and fleet_watch is not None:
+        import goalflight_ledger
+
+        promoted = False
+        if controller_status_path:
+            from goalflight_liveness import status_write_lock
+
+            with status_write_lock(Path(controller_status_path)) as status_lock:
+                status_payload = status_lock.read()
+                status_complete = (
+                    isinstance(status_payload, dict)
+                    and "complete" in {
+                        status_payload.get("state"), status_payload.get("terminal_state")
+                    }
+                )
+                # Keep the same status -> ledger lock order as completion
+                # publication while deciding whether this attempt may promote.
+                # The ledger token and terminal status stay fenced through the
+                # local rename, after the remote transfer has finished.
+                with goalflight_ledger.StateLock():
+                    record = goalflight_ledger.read_record(str(dispatch_id))
+                    if isinstance(record, dict):
+                        controller_status_path = str(record.get("status_path") or "") or controller_status_path
+                    attempt_token = str(
+                        (attempt_meta or {}).get("queue_launch_token") or ""
+                    ).strip()
+                    current_token = str(
+                        record.get("queue_launch_token") or ""
+                    ).strip() if isinstance(record, dict) else ""
+                    ledger_complete = isinstance(record, dict) and "complete" in {
+                        record.get("state"), record.get("terminal_state")
+                    }
+                    if (
+                        attempt_token
+                        and current_token
+                        and attempt_token == current_token
+                        and not status_complete
+                        and not ledger_complete
+                    ):
+                        _promote_pull_quarantine(
+                            attempt_out_dir,
+                            str(requested_out_dir),
+                            sorted(transferred_paths),
+                        )
+                        out_dir = requested_out_dir
+                        promoted = True
+        if not promoted:
+            fleet_watch._record_superseded_duplicate_attempt(
+                str(dispatch_id),
+                attempt_meta or {},
+                artifact_path=str(attempt_out_dir),
+            )
     excluded_files = sorted(excluded_by_key.values(), key=lambda entry: (entry["path"], entry["rule"]))
     skipped = sorted(skipped_by_key.values(), key=lambda item: (item["path"], item["reason"]))
     files = [_file_entry(out_dir, rel) for rel in sorted(transferred_paths)]

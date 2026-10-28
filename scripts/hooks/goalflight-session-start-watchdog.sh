@@ -486,6 +486,7 @@ def main() -> None:
         prompt_file = repo_prompt if os.path.isfile(repo_prompt) else plugin_prompt
     claim_state = claim_result.get("claimed")
     claim_reason = str(claim_result.get("reason") or "").strip()
+    claim_message = str(claim_result.get("message") or "").strip()
     wake_instruction = ""
     wake_state = ""
     if claim_state is True:
@@ -500,14 +501,29 @@ def main() -> None:
             )
         )
     if claim_state is False and claim_reason:
-        wake_preamble = (
-            "RESOLVE CONTROLLER OWNERSHIP FIRST: the controller claim was refused "
-            f"with reason `{claim_reason}`; inspect the current holder, then adopt "
-            "a dead or same-session holder by re-running "
-            "`goalflight_session_status.py --controller-startup "
-            "--controller-pid-from-ancestry --takeover`. Do not arm event wake "
-            "until a claim succeeds. "
-        )
+        if claim_reason == "invalid_controller_label":
+            wake_preamble = (
+                "RESOLVE THE CONTROLLER LABEL FIRST: "
+                f"{claim_message or 'the configured controller label is invalid.'} "
+                "Supply a valid label with `--session-label <label>` and retry. "
+                "Do not arm event wake until a claim succeeds. "
+            )
+        elif claim_reason == "label_in_use":
+            wake_preamble = (
+                "RESOLVE CONTROLLER OWNERSHIP FIRST: the controller claim was refused "
+                f"with reason `{claim_reason}`; inspect the current holder, then adopt "
+                "a dead or same-session holder by re-running "
+                "`goalflight_session_status.py --controller-startup "
+                "--controller-pid-from-ancestry --takeover`. Do not arm event wake "
+                "until a claim succeeds. "
+            )
+        else:
+            wake_preamble = (
+                "RESOLVE THE CONTROLLER CLAIM REFUSAL FIRST: "
+                f"reason `{claim_reason}`. "
+                f"{claim_message} "
+                "Do not arm event wake until a claim succeeds. "
+            )
     elif claim_state is not True:
         wake_preamble = (
             "claim state unknown: re-run "

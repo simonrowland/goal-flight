@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -22,6 +24,58 @@ sys.modules[SPEC.name] = seats
 SPEC.loader.exec_module(seats)
 
 NOW = 1_786_000_000.0
+
+
+@pytest.mark.parametrize("hook", ["_optional_recover", "_optional_mark_exhausted"])
+def test_optional_rotator_does_not_leak_sys_path_changes(
+    hook: str, tmp_path: Path
+) -> None:
+    shadow = tmp_path / "shadow"
+    ext = shadow / "ext"
+    ext.mkdir(parents=True)
+    (ext / "__init__.py").write_text("", encoding="utf-8")
+    (ext / "grok_rotate.py").write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, os.environ['GOALFLIGHT_TEST_DECOY_SCRIPTS'])\n"
+        "def recover_probe(**kwargs): return None\n"
+        "def mark_exhausted(**kwargs): return None\n",
+        encoding="utf-8",
+    )
+    decoy = tmp_path / "old-scripts"
+    decoy.mkdir()
+    (decoy / "goalflight_worktree_gc.py").write_text(
+        "# old copy, missing _ignored_payload_roots\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=os.pathsep.join((str(shadow), str(ROOT / "scripts"))),
+        GOALFLIGHT_TEST_DECOY_SCRIPTS=str(decoy),
+        GOALFLIGHT_STATE_DIR=str(tmp_path / "state"),
+        GOALFLIGHT_GROK_SEAT_STATE_FILE=str(tmp_path / "seats.json"),
+    )
+    script = (
+        "import json, sys; import ext; import grok_seats; "
+        "before = sys.path[:]; getattr(grok_seats, "
+        f"{hook!r})()"
+        "; restored = sys.path == before; import goalflight_worktree_gc as gc; "
+        "print(json.dumps({'restored': restored, 'gc': gc.__file__, "
+        "'has_helper': hasattr(gc, '_ignored_payload_roots')}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["restored"] is True
+    assert payload["gc"] == str((ROOT / "scripts" / "goalflight_worktree_gc.py").resolve())
+    assert payload["has_helper"] is True
 
 
 def _states(path: Path, mapping: dict, *, updated_at: float = NOW) -> Path:

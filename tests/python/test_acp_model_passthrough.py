@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 from support import skip_posix_on_native_windows
 
@@ -77,6 +78,16 @@ async def _handshake_calls(agent: str, model: str | None, *, fail_model: bool = 
     return fake_conn.calls
 
 
+def _codex_overrides(args: list[str]) -> list[str]:
+    """Values of the leading `-c <key=value>` global overrides, in argv order."""
+    values = []
+    index = 0
+    while index + 1 < len(args) and args[index] == "-c":
+        values.append(args[index + 1])
+        index += 2
+    return values
+
+
 def case_agent_command_per_agent_placement() -> None:
     # grok ACP: --model must sit BEFORE the `stdio` terminal (verified form).
     for agent in ("grok", "grok-acp"):
@@ -84,7 +95,8 @@ def case_agent_command_per_agent_placement() -> None:
         assert args[-3:] == ["--model", MODEL, "stdio"], (agent, args)
     # codex: global `-c model=<id>` override (NOT --model).
     _, args = acp.agent_command("codex", model=MODEL)
-    assert args[:2] == ["-c", f"model={MODEL}"] and "--model" not in args, args
+    assert _codex_overrides(args) == ["features.plugins=false", f"model={MODEL}"], args
+    assert "--model" not in args, args
     # cursor/opencode: --model ahead of the (sub)command.
     for agent in ("cursor", "opencode"):
         _, args = acp.agent_command(agent, model=MODEL)
@@ -102,7 +114,7 @@ def test_agent_command_has_no_premium_tier() -> None:
     assert all(TIER_KEY not in token for token in default_args), default_args
 
     _, model_args = acp.agent_command("codex-acp", model="X")
-    assert model_args[:2] == ["-c", "model=X"], model_args
+    assert _codex_overrides(model_args) == ["features.plugins=false", "model=X"], model_args
     assert all(TIER_KEY not in token for token in model_args), model_args
 
 
@@ -289,6 +301,24 @@ def case_promptless_acp_spawn_env_clears_prompt_file() -> None:
     assert "GOALFLIGHT_PROMPT_FILE" not in env, env.get("GOALFLIGHT_PROMPT_FILE")
 
 
+def case_acp_worker_spawn_env_binds_dispatch_outbox() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        dispatch_dir = Path(td) / "dispatch"
+        dispatch_id = "acp-worker-outbox-env"
+        cfg = argparse.Namespace(
+            agent="codex-acp",
+            install_slot=None,
+            dispatch_id=dispatch_id,
+            project_root=Path(td),
+        )
+        with patch.dict(os.environ, {"GOALFLIGHT_DISPATCH_DIR": str(dispatch_dir)}):
+            env = acp._worker_spawn_env(cfg, None)
+        outbox = dispatch_dir / f"{dispatch_id}.questions"
+        assert env["GOALFLIGHT_DISPATCH_ID"] == dispatch_id
+        assert Path(env["GOALFLIGHT_QUESTION_OUTBOX_DIR"]) == outbox
+        assert outbox.is_dir()
+
+
 def case_acp_prompt_file_preamble_is_shared() -> None:
     assembled = acp._prompt_with_original_prompt_file_preamble("body\n", "/tmp/brief.md")
     assert dispatch.PROMPT_FILE_PREAMBLE in assembled, assembled
@@ -300,6 +330,7 @@ def test_acp_prompt_file_env_and_preamble() -> None:
     case_dispatch_acp_cfg_passes_resolved_prompt_file()
     case_direct_acp_prompt_exports_resolved_prompt_file()
     case_promptless_acp_spawn_env_clears_prompt_file()
+    case_acp_worker_spawn_env_binds_dispatch_outbox()
     case_acp_prompt_file_preamble_is_shared()
 
 

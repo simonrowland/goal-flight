@@ -494,13 +494,13 @@ def test_macos_argv_buffer_and_parser(monkeypatch, argc, payload, expected) -> N
         calls.append(buffer is None)
         if buffer is not None:
             assert size._obj.value == len(raw)
-            R.ctypes.memmove(buffer, raw, len(raw))
+            R.goalflight_compat.ctypes.memmove(buffer, raw, len(raw))
         size._obj.value = len(raw)
         return 0
 
-    monkeypatch.setattr(R.sys, "platform", "darwin")
+    monkeypatch.setattr(R.goalflight_compat.sys, "platform", "darwin")
     monkeypatch.setattr(
-        R.ctypes, "CDLL",
+        R.goalflight_compat.ctypes, "CDLL",
         lambda *a, **k: type("Libc", (), {"sysctl": staticmethod(sysctl)})(),
     )
 

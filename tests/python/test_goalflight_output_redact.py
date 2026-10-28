@@ -263,6 +263,7 @@ def test_spawn_filter_redacts_tail_regardless_of_seat(tmp_path: Path) -> None:
         stdout_mode="wb",
         stderr="stdout",
         serialize_stdout=True,
+        filter_stdout=True,
         label="redact-filter",
     )
     deadline = time.monotonic() + 10.0
@@ -284,6 +285,147 @@ def test_spawn_filter_redacts_tail_regardless_of_seat(tmp_path: Path) -> None:
     assert PLACEHOLDER not in text
     assert "LEAK:" in text
     assert redact.REDACTED in text
+
+
+def test_daemon_spawn_filters_only_the_worker_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[list[str], dict, object]] = []
+
+    class FakeProcess:
+        def __init__(self, argv: list[str], kwargs: dict, pid: int) -> None:
+            self.argv = argv
+            self.kwargs = kwargs
+            self.pid = pid
+            self.returncode = None
+            self.stdin = io.BytesIO() if kwargs.get("stdin") == subprocess.PIPE else None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    def fake_popen(argv: list[str], **kwargs) -> FakeProcess:
+        proc = FakeProcess(argv, kwargs, 5000 + len(calls))
+        calls.append((argv, kwargs, proc))
+        if any("goalflight_output_redact.py" in token for token in argv):
+            ready_fd = int(kwargs["env"][redact.READY_FD_ENV])
+            os.write(ready_fd, b"1")
+        return proc
+
+    monkeypatch.setattr(D.subprocess, "Popen", fake_popen)
+    streams = [
+        ("worker", tmp_path / "worker.tail", True),
+        ("watcher", tmp_path / "watcher.log", False),
+        ("caffeinate", tmp_path / "caffeinate.log", False),
+    ]
+    for label, path, redacted in streams:
+        spec = {
+            "argv": [label],
+            "stdout_path": str(path),
+            "stdout_mode": "wb",
+            "serialize_stdout": label == "worker",
+        }
+        if redacted:
+            spec["redact_stdout"] = True
+        monkeypatch.setattr(D.sys, "stdin", io.StringIO(json.dumps(spec)))
+        assert D._cmd_spawn_daemon() == 0
+        capsys.readouterr()
+
+    filters = [
+        call
+        for call in calls
+        if any("goalflight_output_redact.py" in token for token in call[0])
+    ]
+    assert len(filters) == 1, calls
+    filter_argv, _filter_kwargs, filter_proc = filters[0]
+    assert filter_argv[-1] == str(tmp_path / "worker.tail")
+    assert "--lock" in filter_argv
+
+    worker_call = next(call for call in calls if call[0] == ["worker"])
+    assert worker_call[1]["stdout"] is filter_proc.stdin
+    for label in ("watcher", "caffeinate"):
+        sidecar_call = next(call for call in calls if call[0] == [label])
+        assert sidecar_call[1]["stdout"].name == str(tmp_path / f"{label}.log")
+
+
+def test_redaction_disabled_writes_direct_and_holds_tail_flock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(D, "LOCAL_OVERRIDES", {"output_redaction_filter": False})
+    tail = tmp_path / "direct.tail"
+    ready = tmp_path / "worker.ready"
+    release = tmp_path / "worker.release"
+    script = (
+        "from pathlib import Path\n"
+        "import time\n"
+        f"secret = {PLACEHOLDER!r}\n"
+        "print('LEAK:' + secret, flush=True)\n"
+        "print('COMPLETE: redact-off — marker', flush=True)\n"
+        f"Path({str(ready)!r}).write_text('ready')\n"
+        f"release = Path({str(release)!r})\n"
+        "while not release.exists(): time.sleep(0.01)\n"
+    )
+    pid = D._spawn_daemonized_process(
+        [sys.executable, "-c", script],
+        env=os.environ.copy(),
+        stdout_path=tail,
+        stdout_mode="wb",
+        stderr="stdout",
+        serialize_stdout=True,
+        filter_stdout=True,
+        label="worker",
+    )
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not ready.exists():
+        time.sleep(0.02)
+    assert ready.is_file(), "worker did not write its direct tail output"
+    during = tail.read_text(encoding="utf-8", errors="replace")
+    assert PLACEHOLDER in during
+    assert "COMPLETE: redact-off — marker" in during
+    with pytest.raises(D._TailLockBusy):
+        with D._tail_reconciliation_lock(tail):
+            pass
+
+    release.touch()
+    deadline = time.monotonic() + 10.0
+    final = ""
+    while time.monotonic() < deadline:
+        try:
+            with D._tail_reconciliation_lock(tail):
+                final = tail.read_text(encoding="utf-8", errors="replace")
+            break
+        except D._TailLockBusy:
+            time.sleep(0.02)
+    else:
+        raise AssertionError(f"worker did not release its tail flock (pid={pid})")
+    assert PLACEHOLDER in final
+    assert "COMPLETE: redact-off — marker" in final
+
+
+@pytest.mark.parametrize("label", ["watcher", "caffeinate"])
+def test_internal_helper_stdout_is_a_plain_file(
+    tmp_path: Path,
+    label: str,
+) -> None:
+    log = tmp_path / f"{label}.log"
+    script = f"print({('INTERNAL:' + PLACEHOLDER)!r}, flush=True)\n"
+    pid = D._spawn_daemonized_process(
+        [sys.executable, "-c", script],
+        env=os.environ.copy(),
+        stdout_path=log,
+        label=label,
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and goalflight_compat.pid_alive(pid):
+        time.sleep(0.02)
+    assert not goalflight_compat.pid_alive(pid), f"{label} child did not exit"
+    assert log.read_text(encoding="utf-8").strip() == "INTERNAL:" + PLACEHOLDER
 
 
 def _isolated_env(tmp_path: Path, home: Path) -> dict[str, str]:

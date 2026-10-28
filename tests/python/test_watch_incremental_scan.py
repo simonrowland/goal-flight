@@ -21,11 +21,23 @@ POLL_SECS = 0.125
 DISPATCH_ID = "incremental-watch"
 
 
+@pytest.fixture(autouse=True)
+def _clear_active_worker_probe_after_test():
+    yield
+    probe = watch._ACTIVE_WORKER_PROCESS_PROBE
+    if probe is not None:
+        probe.close()
+        if watch._ACTIVE_WORKER_PROCESS_PROBE is probe:
+            watch._ACTIVE_WORKER_PROCESS_PROBE = None
+
+
 def _run_live_watcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     initial: bytes,
     on_poll_sleep: Callable[[int, Path], None],
+    *,
+    dispatch_record: dict | None = None,
 ) -> tuple[int, list[dict], Path]:
     """Run ``main`` against disk files without invoking process/CPU probes."""
 
@@ -74,6 +86,8 @@ def _run_live_watcher(
         ],
     )
     monkeypatch.setattr(watch, "write_status", capture_status)
+    if dispatch_record is not None:
+        monkeypatch.setattr(watch, "_load_dispatch_record", lambda _dispatch_id: dispatch_record)
     monkeypatch.setattr(watch.time, "sleep", controlled_sleep)
     monkeypatch.setattr(watch.atexit, "register", lambda _callback: None)
     monkeypatch.setattr(watch.signal, "signal", lambda *_args: None)
@@ -147,6 +161,34 @@ def test_live_entry_point_detects_split_marker_once(
     assert terminal_payload["terminal_marker"]["kind"] == "COMPLETE"
     assert [m["kind"] for m in terminal_payload["markers"]].count("COMPLETE") == 1
     assert terminal_payload["tail_scan"]["content_bytes"] == len(suffix)
+
+
+def test_live_status_write_retains_worker_checkout_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_record = {
+        "project_root": str(tmp_path),
+        "worker_cwd": str(tmp_path),
+        "worktree_path": str(tmp_path),
+        "worktree_seat": "seat-a",
+    }
+
+    def append_terminal(_index: int, tail: Path) -> None:
+        _append(tail, b"COMPLETE: incremental-watch - retained status metadata\n")
+
+    returncode, payloads, _tail = _run_live_watcher(
+        monkeypatch,
+        tmp_path,
+        b"",
+        append_terminal,
+        dispatch_record=dispatch_record,
+    )
+
+    assert returncode == 0
+    terminal_payload = payloads[-1]
+    assert terminal_payload["worker_cwd"] == dispatch_record["worker_cwd"]
+    assert terminal_payload["worktree_path"] == dispatch_record["worktree_path"]
+    assert terminal_payload["worktree_seat"] == dispatch_record["worktree_seat"]
 
 
 def test_live_entry_point_resyncs_replaced_tail(

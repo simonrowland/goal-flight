@@ -456,6 +456,22 @@ def test_watcher_status_snapshot_carries_ledger_effective_account() -> None:
                 process.wait(timeout=2)
 
 
+def test_status_snapshot_retains_worker_checkout_and_prelaunch_discriminator() -> None:
+    payload = {
+        "worker_cwd": "/tmp/worker-tree",
+        "worktree_path": "/tmp/worktree-seat",
+        "worktree_seat": "seat-a",
+        "prelaunch_failure": True,
+    }
+
+    snapshot = watch._status_snapshot(payload)
+
+    assert snapshot["worker_cwd"] == payload["worker_cwd"]
+    assert snapshot["worktree_path"] == payload["worktree_path"]
+    assert snapshot["worktree_seat"] == payload["worktree_seat"]
+    assert snapshot["prelaunch_failure"] is True
+
+
 def test_channel_absent_keeps_verdict_identical() -> None:
     baseline = watch.classify_liveness(
         True,
@@ -631,6 +647,57 @@ def test_final_response_recovery_waits_for_worker_exit_with_live_trace() -> None
         os.waitpid(payload["worker_pid"], 0)
         assert process.wait(timeout=3) == 4
         assert _payload(status_path)["terminal_marker"]["kind"] == "BLOCKED"
+
+
+def test_dead_controller_live_final_blocked_stays_provisional_until_worker_exit() -> None:
+    dispatch_id = "dead-controller-live-final-blocked"
+    with _dead_controller_case(dispatch_id) as case:
+        root, env, process, status_path, tail = case
+        _assert_live_controller_loss_is_nonterminal(
+            root, env, dispatch_id, process, status_path
+        )
+        trace = (
+            root
+            / "state"
+            / "dispatch-homes"
+            / dispatch_id
+            / "sessions"
+            / "turn.jsonl"
+        )
+        def refresh_trace() -> bool:
+            with trace.open("a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            return bool(_payload(status_path).get("trace_active"))
+
+        assert _wait_for(refresh_trace), _payload(status_path)
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — needs controller\n",
+            encoding="utf-8",
+        )
+        assert _wait_for(
+            lambda: (
+                _payload(status_path).get("state") == "watcher_stopped"
+                and _payload(status_path).get("terminal_pending_state") == "blocked"
+            )
+        ), _payload(status_path)
+        provisional = _payload(status_path)
+        assert provisional.get("controller_alive") is False, provisional
+        assert provisional.get("worker_alive") is True, provisional
+        assert provisional.get("terminal_marker") is None, provisional
+        assert process.poll() is None, provisional
+        row = _journal_row(root, env, dispatch_id)
+        assert row["lifecycle_state"] == journal.ATTEMPT_RUNNING, row
+        assert row["terminal_state"] is None, row
+
+        os.killpg(provisional["worker_pid"], signal.SIGTERM)
+        os.waitpid(provisional["worker_pid"], 0)
+        assert process.wait(timeout=3) == 4
+        terminal = _payload(status_path)
+        assert terminal.get("state") == "blocked", terminal
+        assert terminal.get("terminal_marker", {}).get("kind") == "BLOCKED", terminal
+        row = _journal_row(root, env, dispatch_id)
+        assert row["lifecycle_state"] == journal.ATTEMPT_TERMINAL, row
+        assert row["terminal_state"] == "blocked", row
 
 
 def test_dead_controller_live_worker_with_stale_trace_stays_nonterminal() -> None:

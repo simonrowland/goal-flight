@@ -106,7 +106,7 @@ def test_no_unsorted_trees_reachable_from_head() -> None:
     if not (ROOT / ".git").exists():
         # Not a git checkout (e.g. tarball install). Skip — there's nothing
         # to corrupt without a worktree history.
-        print("SKIP: not a git repo")
+        print("SKIP-FILE: test_tree_integrity.py: not a git repo")
         return
     # `git ls-tree -r -t HEAD` lists every tree reachable from HEAD's root
     # tree, recursively. Each line is "<mode> <type> <sha>\t<path>".
@@ -140,6 +140,8 @@ def main() -> int:
     for t in tests:
         try:
             t()
+            if not (ROOT / ".git").exists():
+                continue
             print(f"PASS {t.__name__}")
         except AssertionError as exc:
             print(f"FAIL {t.__name__}: {exc}")

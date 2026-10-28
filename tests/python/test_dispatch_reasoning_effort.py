@@ -31,7 +31,10 @@ def codex_home(tmp_path, monkeypatch):
 
 def validate(home, model="capable", effort="max"):
     args = SimpleNamespace(agent="codex", model=model, reasoning_effort=effort)
-    D._validate_codex_reasoning_effort(args, {"CODEX_HOME": str(home)})
+    D._validate_codex_reasoning_effort(
+        args,
+        {"HOME": str(home.parent / "host-home"), "CODEX_HOME": str(home)},
+    )
 
 
 @pytest.fixture
@@ -353,6 +356,50 @@ def test_cache_fallback(codex_home, cache):
     validate(codex_home, effort="high")
     with pytest.raises(D.DispatchUsageError, match="supported levels: high, low, medium, xhigh; using fallback static set"):
         validate(codex_home)
+
+
+def test_resume_catalog_without_max_is_refused_and_missing_cache_uses_static_set(
+    tmp_path
+):
+    launch_home = tmp_path / "resume-home"
+    launch_home.mkdir()
+    canonical_home = tmp_path / "host-home"
+    codex_home = canonical_home / ".codex"
+    codex_home.mkdir(parents=True)
+    cache_path = codex_home / "models_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "high"},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    env = {"HOME": str(canonical_home), "CODEX_HOME": str(launch_home)}
+    args = SimpleNamespace(
+        agent="codex", model="gpt-5.6", reasoning_effort="max"
+    )
+
+    with pytest.raises(
+        D.DispatchUsageError,
+        match="'gpt-5.6'; supported levels: high, low$",
+    ):
+        D._validate_codex_reasoning_effort(args, env)
+
+    cache_path.unlink()
+    args.model = "gpt-6-luna"
+    with pytest.raises(
+        D.DispatchUsageError,
+        match="supported levels: high, low, medium, xhigh; using fallback static set",
+    ):
+        D._validate_codex_reasoning_effort(args, env)
 
 
 def test_unknown_model_and_unreadable_cache(codex_home):

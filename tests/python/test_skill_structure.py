@@ -275,14 +275,14 @@ KNOWN_SKILL_ALIGNMENT_GAPS = {
         "fix_chunk": "review-types taxonomy migration",
         "kind": "literal",
         "pattern": "default gstack `/review`",
-        "current_substitute": "On chunk completion, dispatch gstack `/review` before committing",
+        "current_substitute": "On chunk completion, dispatch gstack `/review` before commit",
         "current_substitute_section": "## Review layers",
     },
     "gstack-review-and-challenge-canonical": {
         "fix_chunk": "review-types taxonomy migration",
         "kind": "literal",
         "pattern": "Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts",
-        "current_substitute": "`/challenge` as the canonical adversarial frame; never hand-roll review prompts",
+        "current_substitute": "use `/challenge` as the canonical adversarial frame; never hand-roll review prompts",
         "current_substitute_section": "## Review layers",
     },
     "review-layers-three-distinct": {
@@ -878,7 +878,10 @@ def test_runner_invokes_skill_structure() -> None:
     run_sh = read_repo_text("tests/run.sh")
     assert_true("tests/run.sh lists test_skill_structure", "tests/python/test_skill_structure.py" in run_sh)
     assert_true("tests/run.sh uses recursive python discovery", "find tests/python -type f -name 'test_*.py'" in run_sh)
-    assert_true("tests/run.sh delegates python execution to pytest", "python3 -m pytest tests/python -q" in run_sh)
+    assert_true(
+        "tests/run.sh delegates Python execution to the isolated runner",
+        "python3 tests/run_python.py" in run_sh,
+    )
     assert_true("tests/run.sh has observed collection sentinel", "skill_structure_collected" in run_sh)
     assert_true("tests/run.sh does not hardcode collection success", "skill_structure_collected=1" not in run_sh)
     assert_true(
@@ -923,6 +926,7 @@ def test_runner_invokes_skill_structure() -> None:
             ROOT / "tests/python/support.py",
             fake_root / "tests/python/support.py",
         )
+        shutil.copy2(ROOT / "tests/run_python.py", fake_root / "tests/run_python.py")
         shutil.copy2(
             ROOT / "tests/python/test_script_style_modules.py",
             fake_root / "tests/python/test_script_style_modules.py",
@@ -963,6 +967,7 @@ def test_runner_invokes_skill_structure() -> None:
             ROOT / "tests/python/support.py",
             fake_root / "tests/python/support.py",
         )
+        shutil.copy2(ROOT / "tests/run_python.py", fake_root / "tests/run_python.py")
         shutil.copy2(
             ROOT / "tests/python/test_script_style_modules.py",
             fake_root / "tests/python/test_script_style_modules.py",
@@ -999,6 +1004,7 @@ def test_runner_invokes_skill_structure() -> None:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=collection_env,
             check=False,
         )
         assert_true(

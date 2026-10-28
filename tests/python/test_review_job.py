@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_review_job
 import goalflight_rate_pressure
 import goalflight_capacity
+import goalflight_journal
 
 
 def isolate_state_env(env: dict[str, str], state_dir: Path) -> dict[str, str]:
@@ -85,19 +86,71 @@ def skipif(condition: bool, reason: str):
     return _decorator
 
 
-def ps_pgid_available() -> bool:
+def ps_pgid_unavailable_reason() -> str | None:
+    if os.name == "nt":
+        return "POSIX process-group kill test"
     try:
-        subprocess.check_output(
+        result = subprocess.run(
             ["ps", "-A", "-o", "pgid="],
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=2.0,
+            check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return True
+    except PermissionError:
+        return "sandbox denies exec of ps"
+    except FileNotFoundError:
+        return "ps is not installed on this host"
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("ps process-table capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"ps process-table capability probe failed: {exc}") from exc
+    if result.returncode == 0 and any(
+        line.strip() == str(os.getpgid(os.getpid()))
+        for line in result.stdout.splitlines()
+    ):
+        return None
+    if result.returncode == 0:
+        raise AssertionError(
+            "ps process-table probe omitted the current process group: "
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if "operation not permitted" in output or "permission denied" in output:
+        return "sandbox denies ps process-table access"
+    raise AssertionError(
+        "ps process-table capability probe failed without a sandbox refusal: "
+        f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+
+
+PS_PGID_UNAVAILABLE_REASON = ps_pgid_unavailable_reason()
+
+
+def test_ps_probe_skips_permission_refusal_and_fails_on_other_errors() -> None:
+    current_pgid = str(os.getpgid(os.getpid()))
+    with patch.object(os, "name", "posix"):
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["ps"], 0, f"{current_pgid}\n", ""),
+        ):
+            assert ps_pgid_unavailable_reason() is None
+        with patch.object(subprocess, "run", side_effect=PermissionError("denied")):
+            assert ps_pgid_unavailable_reason() == "sandbox denies exec of ps"
+        with patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(["ps"], 1, "", "invalid ps option"),
+        ):
+            try:
+                ps_pgid_unavailable_reason()
+            except AssertionError as exc:
+                assert "without a sandbox refusal" in str(exc)
+            else:
+                raise AssertionError("an unexpected ps failure was treated as unavailable")
 
 
 def pgroup_has_processes(pgid: int) -> bool:
@@ -788,7 +841,10 @@ def test_prompt_write_cannot_block_monitor_before_timeout() -> None:
         assert_true("stdin-block reason recorded", status["timeout_reason"] == "no_progress_timeout")
 
 
-@skipif(os.name == "nt" or not ps_pgid_available(), reason="POSIX process-group kill test requires ps pgid listing")
+@skipif(
+    PS_PGID_UNAVAILABLE_REASON is not None,
+    reason=PS_PGID_UNAVAILABLE_REASON or "POSIX process-group kill test requires ps pgid listing",
+)
 def test_parent_exit_with_live_child_refuses_unknown_leader_identity() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1015,6 +1071,41 @@ def test_missing_prompt_after_capacity_commits_terminal_outbox() -> None:
         )
 
 
+def test_early_terminal_routes_to_active_controller_owner() -> None:
+    with tempfile.TemporaryDirectory(prefix="review-owner-route-") as raw:
+        tmp = Path(raw)
+        project = tmp / "project"
+        project.mkdir()
+        env = capacity_test_env(tmp / "state")
+        env["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-a"
+        with patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            owners = {}
+            for label in ("controller-a", "controller-b"):
+                claim = authority.claim_or_renew_lease(
+                    label, principal={"principal_id": label}
+                )
+                assert claim.committed and claim.value is not None
+                owners[label] = claim.value
+            owner = owners["controller-a"]
+            assert owner is not None
+            os.environ["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = owner.nonce
+            dispatch_id = "review-early-terminal-owner-route"
+            goalflight_review_job._commit_early_terminal(
+                {"dispatch_id": dispatch_id, "state": "failed", "error": "early failure"},
+                project_root=str(project),
+            )
+            authority.project_terminal_outbox(
+                messages_dir=Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+            )
+            recipients = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? AND withdrawn_at IS NULL""",
+                (dispatch_id,),
+            )
+            assert [str(row["recipient_label"]) for row in recipients] == ["controller-a"]
+
+
 def main() -> None:
     tests = [
         test_review_finalizer_only_surrenders_finished_worker,
@@ -1037,6 +1128,7 @@ def main() -> None:
         test_failed_stdout_rate_limit_is_classified_and_recorded,
         test_complete_review_does_not_copy_stderr_to_error_fields,
         test_missing_prompt_after_capacity_commits_terminal_outbox,
+        test_early_terminal_routes_to_active_controller_owner,
     ]
     for test in tests:
         test()

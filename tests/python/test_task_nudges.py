@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -68,7 +71,10 @@ def _write_active_notes(project: Path) -> None:
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_FLEET_DIR"] = str(tmp / "fleet")
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "state" / "dispatch")
+    env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = ""
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
@@ -88,7 +94,10 @@ def _task_store_nudges(env: dict[str, str], project: Path, kind: str) -> list[di
 
 _ISOLATED_ENV_KEYS = (
     "GOALFLIGHT_MESSAGES_DIR",
+    "GOALFLIGHT_FLEET_DIR",
     "GOALFLIGHT_STATE_DIR",
+    "GOALFLIGHT_DISPATCH_DIR",
+    "GOALFLIGHT_QUESTION_OUTBOX_DIR",
     "GOALFLIGHT_TASK_STORE_DIR",
     "GOALFLIGHT_JOURNAL_DIR",
     "GOALFLIGHT_WAKE_LEDGER_DIR",
@@ -249,6 +258,184 @@ def test_resume_nudge_posts_on_text_only_and_coalesces() -> None:
         assert_eq("added ready item keeps one standing resume nudge", len(nudges), 1)
         assert_eq("same top does not rewrite frontier ids", nudges[0]["payload"]["frontier_ids"], ["t-001", "t-002"])
         assert_eq("same top does not journal a second event", len(_user_need_deliveries(env, project)), 1)
+
+
+def test_worker_task_nudges_use_the_dispatch_journal_outbox() -> None:
+    import goalflight_journal as J
+    import goalflight_watch as W
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_items(project, [_item("t-001", "Ready A"), _item("t-002", "Ready B")])
+        dispatch_id = T._next_nudge_dispatch_id(project)
+        worker_dispatch_id = "worker-task-nudge"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{worker_dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        label = "task-nudge-projection-controller"
+        with _applied_env(env), mock.patch.dict(
+            os.environ, {"GOALFLIGHT_DISPATCH_ID": ""}, clear=False
+        ):
+            authority = J.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "task-nudge-projection-test"},
+            )
+            assert_true("task nudge controller lease claimed", claimed.committed)
+            previous = M.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_need",
+                payload={
+                    "text": "old next frontier",
+                    "nudge_kind": T.NEXT_NUDGE_KIND,
+                    "project_root": str(project.resolve()),
+                },
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "task-store", "transport": "next-frontier"},
+                replace_if=lambda item: (item.get("payload") or {}).get("nudge_kind") == T.NEXT_NUDGE_KIND,
+            )
+            old_event_uuid = previous["envelope"]["id"]
+
+        with _applied_env(env), mock.patch.dict(
+            os.environ, {"GOALFLIGHT_DISPATCH_ID": worker_dispatch_id}, clear=False
+        ), mock.patch.object(
+            J,
+            "open_or_create_journal",
+            side_effect=J.JournalIOError("journal access denied"),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            T._post_next_nudge(T.TaskStore(project).next_frontier(), project)
+            T.post_resume_nudge(project)
+            T.post_done_suggest_nudge(["t-001"], project, worker_dispatch_id)
+
+        queued = sorted((outbox / "journal").glob("journal-*.delivery"))
+        assert_eq("each denied task nudge is in this worker's outbox", len(queued), 3)
+        assert_eq(
+            "outbox sequence is monotonic",
+            [json.loads(path.read_text())["sequence"] for path in queued],
+            [1, 2, 3],
+        )
+
+        with _applied_env(env):
+            projected = W.consume_worker_journal_outbox(
+                outbox,
+                worker_dispatch_id,
+                budget_s=5.0,
+            )
+            assert_eq("watcher projects each queued task nudge", projected, 3)
+            authority = J.Journal(project)
+            rows = authority.read_all(
+                "SELECT event_uuid, projected_at, withdrawn_at FROM delivery_events "
+                "WHERE project_root = ? ORDER BY stream_seq, event_uuid",
+                (str(project.resolve()),),
+            )
+            by_event = {str(row["event_uuid"]): row for row in rows}
+            assert_true("replacement withdraws prior task nudge", by_event[old_event_uuid]["withdrawn_at"] is not None)
+            assert_eq("the three task-store nudges are projected", len(rows), 4)
+            assert_true(
+                "new task nudge projections are complete",
+                all(
+                    row["projected_at"] is not None
+                    for event_id, row in by_event.items()
+                    if event_id != old_event_uuid
+                ),
+            )
+
+
+def test_replaced_worker_task_nudge_is_projected_exactly_once() -> None:
+    import goalflight_journal as J
+    import goalflight_watch as W
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        project.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+        with _applied_env(env):
+            J.open_or_create_journal(project)
+        _write_items(project, [_item("t-001", "Ready A"), _item("t-002", "Ready B")])
+        old_worker = "old-task-nudge-worker"
+        new_worker = "new-task-nudge-worker"
+        old_outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{old_worker}.questions"
+        new_outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{new_worker}.questions"
+        old_outbox.mkdir(parents=True)
+        new_outbox.mkdir(parents=True)
+
+        with _applied_env(env), mock.patch.dict(
+            os.environ,
+            {
+                "GOALFLIGHT_DISPATCH_ID": old_worker,
+                "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(old_outbox),
+            },
+            clear=False,
+        ), mock.patch.object(
+            J,
+            "open_or_create_journal",
+            side_effect=J.JournalIOError("journal access denied"),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            T._post_next_nudge(T.TaskStore(project).next_frontier(), project)
+
+        old_nudge = _task_store_nudges(env, project, T.NEXT_NUDGE_KIND)[0]
+        _write_items(
+            project,
+            [
+                _item("t-001", "Ready A"),
+                _item("t-002", "Ready B"),
+                _item("t-003", "Ready C"),
+            ],
+        )
+        with _applied_env(env), mock.patch.dict(
+            os.environ,
+            {
+                "GOALFLIGHT_DISPATCH_ID": new_worker,
+                "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(new_outbox),
+            },
+            clear=False,
+        ), mock.patch.object(
+            J,
+            "open_or_create_journal",
+            side_effect=J.JournalIOError("journal access denied"),
+        ), contextlib.redirect_stderr(io.StringIO()):
+            T._post_next_nudge(T.TaskStore(project).next_frontier(), project)
+
+        live_nudges = _task_store_nudges(env, project, T.NEXT_NUDGE_KIND)
+        assert_eq("task store retains only the replacement nudge", len(live_nudges), 1)
+        replacement = live_nudges[0]
+        assert_true("replacement has a new event identity", replacement["id"] != old_nudge["id"])
+        with _applied_env(env):
+            assert_eq(
+                "replacement outbox projects once",
+                W.consume_worker_journal_outbox(new_outbox, new_worker, budget_s=2.0),
+                1,
+            )
+        for index in range(20):
+            M.post_message(
+                dispatch_id=str(replacement["dispatch_id"]),
+                msg_type="status",
+                payload={"text": f"carrier filler {index}"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "peer", "adapter": "pytest", "transport": "worker"},
+                deliver_to_worker=True,
+                project_journal_delivery=False,
+            )
+
+        with _applied_env(env):
+            old_projection = sum(
+                W.consume_worker_journal_outbox(old_outbox, old_worker, budget_s=2.0)
+                for _ in range(4)
+            )
+            assert_eq("superseded outbox event is skipped", old_projection, 0)
+            authority = J.Journal(project)
+            rows = authority.read_all(
+                "SELECT event_uuid, projected_at FROM delivery_events "
+                "WHERE project_root = ? ORDER BY stream_seq",
+                (str(project.resolve()),),
+            )
+            assert_eq("only one nudge delivery row exists", len(rows), 1)
+            assert_eq("the replacement is the projected event", rows[0]["event_uuid"], replacement["id"])
+            assert_true("replacement delivery is projected", rows[0]["projected_at"] is not None)
 
 
 def test_resume_nudge_count_drift_same_top_is_one_journal_event() -> None:
@@ -444,6 +631,7 @@ def test_done_suggest_new_task_still_posts() -> None:
 
 def main() -> None:
     test_resume_nudge_posts_on_text_only_and_coalesces()
+    test_worker_task_nudges_use_the_dispatch_journal_outbox()
     test_resume_nudge_count_drift_same_top_is_one_journal_event()
     test_resume_nudge_new_top_still_posts()
     test_resume_nudge_silent_on_empty_frontier()

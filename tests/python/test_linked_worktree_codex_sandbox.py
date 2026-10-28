@@ -296,6 +296,108 @@ def case_non_linked_and_non_write_profiles_are_unchanged() -> None:
         assert not any("writable_roots=" in part for part in grok_argv), grok_argv
 
 
+def case_remote_ci_spool_grant_is_exact() -> None:
+    spool = Path("/var/tmp/goal-flight-sandbox-test/remote-ci/spool")
+    requests = spool / "requests"
+    results = spool / "results"
+    question_outbox = Path("/var/tmp/goal-flight-sandbox-test/dispatch-x.questions")
+    environment = {
+        **os.environ,
+        "GOALFLIGHT_REMOTE_CI_SPOOL_DIR": str(spool),
+        "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(question_outbox),
+    }
+    codex_roots = {
+        Path(value).resolve()
+        for value in sandbox.worker_channel_roots(environment)
+    }
+    assert requests.resolve() in codex_roots
+    assert spool.resolve() not in codex_roots
+    assert results.resolve() not in codex_roots
+    assert spool.parent.resolve() not in codex_roots
+    assert question_outbox.resolve() in codex_roots
+    assert question_outbox.parent.resolve() not in codex_roots
+    codex_args = sandbox.codex_workspace_write_args(
+        str(REPO_ROOT), "workspace-write", environment=environment
+    )
+    configured_codex_roots = {
+        Path(value).resolve() for value in _configured_roots(codex_args)
+    }
+    assert requests.resolve() in configured_codex_roots
+    assert spool.resolve() not in configured_codex_roots
+    assert results.resolve() not in configured_codex_roots
+    assert spool.parent.resolve() not in configured_codex_roots
+    assert question_outbox.resolve() in configured_codex_roots
+    assert question_outbox.parent.resolve() not in configured_codex_roots
+    read_only_args = sandbox.codex_workspace_write_args(
+        str(REPO_ROOT), "read-only", environment=environment
+    )
+    expected_read_only_roots = list(
+        dict.fromkeys(
+            (requests, question_outbox, requests.resolve(), question_outbox.resolve())
+        )
+    )
+    expected_read_only_args = [
+        arg for root in expected_read_only_roots for arg in ("--add-dir", str(root))
+    ]
+    assert read_only_args == expected_read_only_args
+    read_only_roots = {
+        Path(read_only_args[index + 1]).resolve()
+        for index, value in enumerate(read_only_args) if value == "--add-dir"
+    }
+    assert requests.resolve() in read_only_roots
+    assert spool.resolve() not in read_only_roots
+    assert results.resolve() not in read_only_roots
+    assert spool.parent.resolve() not in read_only_roots
+    assert question_outbox.resolve() in read_only_roots
+    assert question_outbox.parent.resolve() not in read_only_roots
+    seatbelt_roots = os_sandbox.macos_write_roots(
+        str(REPO_ROOT), "workspace-write", agent="cursor", command="cursor",
+        environment=environment,
+    )
+    resolved = {Path(value).resolve() for value in seatbelt_roots}
+    assert requests.resolve() in resolved
+    assert spool.resolve() not in resolved
+    assert results.resolve() not in resolved
+    assert spool.parent.resolve() not in resolved
+    assert question_outbox.resolve() in resolved
+    assert question_outbox.parent.resolve() not in resolved
+    with tempfile.TemporaryDirectory(prefix="gf-spool-grant-") as scratch:
+        scratch_dir = Path(scratch)
+        private_tmp = scratch_dir / "tmp"
+        private_tmp.mkdir()
+        account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
+        grok_read_only_env = {
+            **environment,
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(account_home / ".config"),
+            "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+            "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+            "TMPDIR": str(private_tmp),
+            "GOALFLIGHT_SCRATCH_DIR": str(scratch_dir),
+        }
+        seatbelt_read_only = os_sandbox.macos_write_roots(
+            str(REPO_ROOT), "read-only", agent="grok", command="grok",
+            environment=grok_read_only_env,
+        )
+        resolved_read_only = {Path(value).resolve() for value in seatbelt_read_only}
+        assert requests.resolve() in resolved_read_only
+        assert spool.resolve() not in resolved_read_only
+        assert results.resolve() not in resolved_read_only
+        assert question_outbox.resolve() in resolved_read_only
+        assert question_outbox.parent.resolve() not in resolved_read_only
+    grok_roots = os_sandbox.macos_write_roots(
+        str(REPO_ROOT), "workspace-write", agent="grok", command="grok",
+        environment=environment,
+    )
+    resolved_grok = {Path(value).resolve() for value in grok_roots}
+    assert requests.resolve() in resolved_grok
+    assert spool.resolve() not in resolved_grok
+    assert results.resolve() not in resolved_grok
+    assert spool.parent.resolve() not in resolved_grok
+    assert question_outbox.resolve() in resolved_grok
+    assert question_outbox.parent.resolve() not in resolved_grok
+
+
 def case_doctor_releases_worktree_seat() -> None:
     original_run = doctor.run
     original_subprocess_run = doctor.subprocess.run
@@ -366,6 +468,7 @@ def case_doctor_releases_worktree_seat() -> None:
 def main() -> None:
     case_linked_worktree_argv_is_narrow()
     case_non_linked_and_non_write_profiles_are_unchanged()
+    case_remote_ci_spool_grant_is_exact()
     case_doctor_releases_worktree_seat()
     print("test_linked_worktree_codex_sandbox: all cases passed")
 

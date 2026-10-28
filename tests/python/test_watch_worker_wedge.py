@@ -24,11 +24,14 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
 from typing import Callable
 from unittest.mock import patch
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -43,6 +46,16 @@ import goalflight_watch as watch  # noqa: E402
 THRESHOLD_S = 300.0
 POLL_SECS = 0.125
 DISPATCH_ID = "b229-wedge-detect"
+
+
+@pytest.fixture(autouse=True)
+def _clear_active_worker_probe_after_test():
+    yield
+    probe = watch._ACTIVE_WORKER_PROCESS_PROBE
+    if probe is not None:
+        probe.close()
+        if watch._ACTIVE_WORKER_PROCESS_PROBE is probe:
+            watch._ACTIVE_WORKER_PROCESS_PROBE = None
 
 
 def _isolate_env(tmp: Path) -> dict[str, str]:
@@ -85,6 +98,38 @@ def test_true_positive_all_three_legs_is_stall_candidate() -> None:
     assert evidence["sample_interval_s"] == 5.0
     assert evidence["threshold_s"] == THRESHOLD_S
     assert evidence["tail_bytes_grown"] == 0
+
+
+def test_worktree_evidence_refuses_relative_worker_cwd(tmp_path, monkeypatch):
+    seat = tmp_path / "relative-seat"
+    seat.mkdir()
+    subprocess.run(["git", "init", "-q", str(seat)], check=True)
+    (seat / "changed.txt").write_text("uncommitted work", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="worker_cwd is not absolute"):
+        watch.worktree_work_evidence("relative-seat")
+
+
+def test_worktree_evidence_names_missing_worker_cwd():
+    with pytest.raises(ValueError, match="dispatch record is missing worker_cwd"):
+        watch.worktree_work_evidence(None)
+
+
+def test_wedge_tree_leg_does_not_resolve_relative_recorded_cwd_against_process_cwd(
+    tmp_path, monkeypatch
+):
+    seat = tmp_path / "relative-seat"
+    seat.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    leg = watch.resolve_wedge_tree_leg(
+        {"worker_cwd": "relative-seat", "project_root": str(tmp_path)}
+    )
+
+    assert leg["kind"] == watch.WEDGE_TREE_LEG_INDETERMINATE
+    assert leg["reason"] == "worker_cwd_not_absolute"
+    assert leg["scan_root"] is None
 
 
 def test_default_sustain_is_fifteen_minutes_not_five() -> None:
@@ -333,6 +378,14 @@ def _run_wedge_watcher(
             raise ProcessLookupError(pid)
         raise AssertionError("watcher must not kill a wedged worker")
 
+    def confirm_final_marker_cleanup(*_args, **_kwargs):
+        return {
+            "worker_alive": False,
+            "worker_termination_confirmed": True,
+            "worker_disposition": "terminated_after_final_marker",
+            "worker_termination_signals": ["SIGTERM"],
+        }
+
     stdout = io.StringIO()
     with patch.dict(os.environ, env, clear=False), patch.object(
         sys, "argv", monkeypatch_argv
@@ -344,6 +397,8 @@ def _run_wedge_watcher(
         watch.signal, "signal", lambda *_args: None
     ), patch.object(
         watch, "worker_alive", lambda pid, _identity: (True, "live", {"pid": pid})
+    ), patch.object(
+        watch, "terminate_indeterminate_worker", confirm_final_marker_cleanup
     ), patch.object(
         watch, "process_group_id", lambda pid: pid
     ), patch.object(
@@ -395,7 +450,7 @@ def test_watcher_loop_true_positive_emits_once_and_stays_alive() -> None:
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
-            "999999",
+            "2",
             "--wedge-idle-secs",
             "300",
             "--project-root",
@@ -467,7 +522,7 @@ def test_watcher_loop_recent_tree_write_never_wedges() -> None:
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
-            "999999",
+            "2",
             "--wedge-idle-secs",
             "300",
             "--project-root",
@@ -674,7 +729,7 @@ def test_watcher_loop_quiet_worktree_flags_despite_busy_canonical_root() -> None
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
-            "999999",
+            "2",
             "--wedge-idle-secs",
             "300",
             "--project-root",
@@ -751,7 +806,7 @@ def test_watcher_loop_root_rooted_record_is_indeterminate() -> None:
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
-            "999999",
+            "2",
             "--wedge-idle-secs",
             "300",
             "--project-root",
@@ -836,7 +891,7 @@ def test_watcher_restart_does_not_reannounce_candidate() -> None:
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
-            "999999",
+            "2",
             "--wedge-idle-secs",
             "300",
             "--project-root",

@@ -265,6 +265,10 @@ status remain owned.
 Blocking waits are for short scripted synchronous needs. Prefer default detached
 dispatch plus the background listener; use `goalflight_status.py --dispatch <id>`
 for a snapshot or background bounded `--wait <ids>` for an unclaimed fixed join.
+Read the worker's terminal marker and final assistant message with
+`python3 <skill-root>/scripts/goalflight_dispatch.py final <id>` (or add
+`--json` for the same fields as JSON); it reads the dispatch's own tail and
+reports its recorded head against the local `origin/main` ref.
 The `--wait` default is 1800 seconds and reports still-pending ids with a nonzero
 exit; `--wait-timeout 0` is explicit unbounded waiting. `goalflight_dispatch.py
 --foreground` blocks until terminal state and should stay rare because it locks
@@ -714,6 +718,7 @@ Three delivery forms, in order of preference by situation:
   ```shell
   CODEX_HOME=~/.goal-flight/dispatch-homes/<home-owner-dispatch-id> \
     codex exec --sandbox workspace-write -c approval_policy=never \
+    -c features.plugins=false \
     resume <session-id> - < revisions.md
   ```
 

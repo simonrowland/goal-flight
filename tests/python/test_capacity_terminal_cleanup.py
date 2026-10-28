@@ -355,40 +355,57 @@ def test_normal_release_preserves_unknown_and_releases_dead(tmp_path, monkeypatc
         assert "held" not in leases
 
 
-def test_remote_lease_is_never_probed_or_reclaimed(tmp_path, monkeypatch):
-    monkeypatch.setattr(cap, "machine_id", lambda: "local-machine")
-
-    def fail_probe(_pid):
-        raise AssertionError("remote worker identity was probed locally")
-
-    monkeypatch.setattr(cap, "_probe_pid_liveness", fail_probe)
-    lease = {
-        "lease_id": "remote-holder",
-        "state": "active",
-        "agent": "codex",
-        "machine_id": "remote-machine",
-        "worker_pid": 4242,
-        "worker_identity": {"pid": 4242, "start_token": "remote"},
-        "expires_at": cap.iso(cap.utc_now() - dt.timedelta(hours=1)),
+def test_machine_id_is_informational_but_worker_liveness_still_gates_reclaim(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    liveness = {
+        4242: False,
+        4243: False,
+        4244: False,
+        4245: True,
+        4246: None,
     }
-    data = {"machine_id": "local-machine", "leases": {lease["lease_id"]: lease}, "cooldowns": {}}
-    assert cap.reclaim_stale_leases(data) == []
-    cap.prune_state(data)
-    assert data["leases"][lease["lease_id"]]["state"] == "active"
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda pid: liveness[pid])
+    monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: True)
+    machine_ids = {
+        "dead-old-host": "SimonMaookProM5:arm64",
+        "dead-short-host": "Mac:arm64",
+        "dead-arbitrary-host": "another-machine:arm64",
+        "live-worker": "different-machine:arm64",
+        "unmeasurable-worker": "unrecognized-machine:arm64",
+    }
+    leases = {
+        lease_id: {
+            "lease_id": lease_id,
+            "state": "active",
+            "agent": "codex",
+            "machine_id": machine_id,
+            "worker_pid": pid,
+            "worker_identity": {"pid": pid, "start_token": lease_id},
+            "claimant_pid": 5252,
+            "controller_pid": 5253,
+        }
+        for (lease_id, machine_id), pid in zip(machine_ids.items(), liveness)
+    }
+    state = {
+        "machine_id": "Simon-MacBookPro-M5.local:arm64",
+        "leases": leases,
+        "cooldowns": {},
+    }
+    cap.state_path().write_text(json.dumps(state))
 
-
-def test_hostname_drift_keeps_own_leases_local(monkeypatch):
-    # The state file was stamped when this machine had another hostname.
-    monkeypatch.setattr(cap, "machine_id", lambda: "SimonMaookProM5:arm64")
-    data = {"machine_id": "Simon-MacBookPro-M5.local:arm64", "leases": {}, "cooldowns": {}}
-    legacy = {"lease_id": "legacy", "state": "active"}
-    stamped = {"lease_id": "old-name", "state": "active", "machine_id": "Simon-MacBookPro-M5.local:arm64"}
-    current = {"lease_id": "new-name", "state": "active", "machine_id": "SimonMaookProM5:arm64"}
-    remote = {"lease_id": "studio", "state": "active", "machine_id": "Mac-Studio-256-1:arm64"}
-    assert cap._lease_is_local(legacy, data)
-    assert cap._lease_is_local(stamped, data)
-    assert cap._lease_is_local(current, data)
-    assert not cap._lease_is_local(remote, data)
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.main(["release-stale", "--keep"])
+    payload = json.loads(output.getvalue())
+    saved = cap.load_state()["leases"]
+    assert rc == 0
+    assert set(payload["released"]) == {
+        "dead-old-host", "dead-short-host", "dead-arbitrary-host"
+    }
+    assert saved["live-worker"]["state"] == "active"
+    assert saved["unmeasurable-worker"]["state"] == "active"
 
 
 def test_release_does_not_free_unattached_live_worker(tmp_path, monkeypatch):

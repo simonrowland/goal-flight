@@ -33,7 +33,6 @@ cannot answer yields `known=False` and the caller kills nothing:
 
 from __future__ import annotations
 
-import ctypes
 import os
 from pathlib import Path
 import shlex
@@ -59,80 +58,8 @@ _LISTENER_COMMANDS = frozenset({"listen", "listen-auto", "follow", "supervise"})
 
 
 def _process_argv(pid: int) -> list[str] | None:
-    """Read one process's argv without flattening argument boundaries."""
-    if sys.platform.startswith("linux"):
-        try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except FileNotFoundError:
-            return []
-        except OSError:
-            return None
-        if not raw:
-            return None
-        fields = raw.split(b"\0")
-        if fields and fields[-1] == b"":
-            fields.pop()
-        try:
-            return [os.fsdecode(field) for field in fields]
-        except UnicodeDecodeError:
-            return None
-
-    if sys.platform == "darwin":
-        # KERN_PROCARGS2 returns: argc, executable path, NUL padding, argv[0..argc-1],
-        # followed by the environment. Unlike ps(1)'s args column, this keeps
-        # every argument as a distinct value, including roots containing spaces.
-        try:
-            libc = ctypes.CDLL(None, use_errno=True)
-            sysctl = libc.sysctl
-            sysctl.argtypes = [
-                ctypes.POINTER(ctypes.c_int),
-                ctypes.c_uint,
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_size_t),
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-            ]
-            sysctl.restype = ctypes.c_int
-            mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
-            # A short buffer can succeed with only the TAIL of argv/environment.
-            # Query the required capacity first; an ENOMEM retry cannot fix that.
-            size = ctypes.c_size_t()
-            if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
-                return None
-            buffer = (ctypes.c_ubyte * size.value)()
-            actual = ctypes.c_size_t(size.value)
-            if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) != 0:
-                return None
-            if not 4 <= actual.value <= size.value:
-                return None
-            raw = bytes(buffer[: actual.value])
-            argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
-            if not 0 < argc < 65536:
-                return None
-            exec_end = raw.find(b"\0", 4)
-            if exec_end < 0:
-                return None
-            argv_start = exec_end + 1
-            while argv_start < len(raw) and raw[argv_start] == 0:
-                argv_start += 1
-            # Padding and an empty argv[0] are indistinguishable. If skipping
-            # them leaves fewer than argc terminated strings, refuse the
-            # ambiguous result rather than returning shifted/incomplete argv.
-            fields = raw[argv_start:].split(b"\0")
-            if len(fields) - 1 < argc:
-                return None
-            argv = [os.fsdecode(field) for field in fields[:argc]]
-            # Candidates are pre-filtered to Python interpreters, so a real
-            # argv[0] names Python. Anything else means the padding skip ate an
-            # empty argv[0] and shifted the list: refuse it as unknown.
-            if not argv or "python" not in os.path.basename(argv[0]).lower():
-                return None
-            return argv
-        except (OSError, AttributeError, TypeError, ValueError):
-            return None
-        return None
-
-    return None
+    """Read one process argv through the shared boundary-preserving helper."""
+    return goalflight_compat.process_argv(pid, expected_basename="python")
 
 
 def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, object]]] | None:

@@ -112,6 +112,93 @@ def _follow_command(
     ]
 
 
+def _cpu_sampled_bootstrap(
+    tmp_path: Path,
+    name: str,
+    command: list[str],
+    samples_path: Path,
+    *,
+    extra_setup: tuple[str, ...] = (),
+    materialization_counter_path: Path | None = None,
+) -> Path:
+    materialization_setup: tuple[str, ...] = ()
+    if materialization_counter_path is not None:
+        materialization_setup = (
+            "import os",
+            "from pathlib import Path",
+            f"materialization_counter_path = Path({str(materialization_counter_path)!r})",
+            "materialization_count = 0",
+            "def observe_materialization(original):",
+            "    def counted(*args, **kwargs):",
+            "        global materialization_count",
+            "        materialization_count += 1",
+            "        temp = materialization_counter_path.with_name(",
+            "            f'{materialization_counter_path.name}.{os.getpid()}.tmp'",
+            "        )",
+            "        temp.write_text(str(materialization_count), encoding='utf-8')",
+            "        temp.replace(materialization_counter_path)",
+            "        return original(*args, **kwargs)",
+            "    return counted",
+            "goalflight_messages._envelopes_with_rows = observe_materialization(",
+            "    goalflight_messages._envelopes_with_rows",
+            ")",
+        )
+    bootstrap = tmp_path / f"{name}.py"
+    bootstrap.write_text(
+        "\n".join(
+            [
+                "import sys, time",
+                f"sample_path = {str(samples_path)!r}",
+                f"args = {command[2:]!r}",
+                "last_cpu = time.process_time()",
+                "original_sleep = time.sleep",
+                "def measured_sleep(seconds):",
+                "    global last_cpu",
+                "    now = time.process_time()",
+                "    with open(sample_path, 'a', encoding='utf-8') as out:",
+                "        out.write(f'{now - last_cpu:.9f}\\n')",
+                "    last_cpu = now",
+                "    return original_sleep(seconds)",
+                "time.sleep = measured_sleep",
+                f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                "import goalflight_messages",
+                *materialization_setup,
+                *extra_setup,
+                "raise SystemExit(goalflight_messages.main(args))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return bootstrap
+
+
+def _materialization_count(path: Path) -> int:
+    try:
+        return int(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return 0
+
+
+def _post_pending_backlog(
+    project: Path,
+    env: dict[str, str],
+    lease: journal.LeaseIdentity,
+    *,
+    prefix: str,
+    count: int = 250,
+) -> None:
+    for index in range(count):
+        messages.post_message(
+            dispatch_id=f"{prefix}-{index:03d}",
+            msg_type="controller-notice",
+            payload={"text": f"pending {index}"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+            event_ts="2020-01-01T00:00:00Z",
+        )
+
+
 class _JsonLineReader:
     def __init__(self, stream) -> None:
         self.stream = stream
@@ -141,7 +228,11 @@ def _spawn_follow(
     *,
     heartbeat_s: float,
     poll_s: float = 0.01,
+    mode: str | None = None,
 ) -> subprocess.Popen[bytes]:
+    child_env = dict(env)
+    if mode is not None:
+        child_env["GOALFLIGHT_WAKE_MODE"] = mode
     return subprocess.Popen(
         _follow_command(
             project,
@@ -150,7 +241,7 @@ def _spawn_follow(
             poll_s=poll_s,
         ),
         cwd=project,
-        env=env,
+        env=child_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -252,6 +343,574 @@ def _wait_for_monitor_slot(project: Path, label: str, pid: int) -> None:
     _wait_for_waiter_kind(project, label, wake.MONITOR_KIND, pid)
 
 
+@pytest.mark.parametrize("mode", ["poll", "gated", "notify"])
+def test_follow_reader_preserves_row_order_and_cursor_cas(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    mode: str,
+) -> None:
+    project, env, lease = isolated
+    writer = journal.Journal(project)
+    for index in range(3):
+        messages.post_message(
+            dispatch_id=f"reader-equivalence-{index}",
+            msg_type="controller-notice",
+            payload={"text": f"row {index}"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+    before = writer.cursor_peek(lease.label, nonce=lease.nonce)
+    expected = [
+        (str(item["stream_id"]), int(item["stream_seq"]))
+        for item in before.items
+        if item.get("wake_class") == "waking"
+    ]
+    assert len(expected) == 3
+
+    proc = _spawn_follow(
+        project,
+        env,
+        lease,
+        heartbeat_s=30,
+        poll_s=0.1,
+        mode=mode,
+    )
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    observed: list[tuple[str, int]] = []
+    try:
+        deadline = time.monotonic() + 5
+        while len(observed) < len(expected):
+            _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+            if record["kind"] == "event":
+                payload = record["payload"]
+                observed.append((str(payload["stream_id"]), int(payload["stream_seq"])))
+        assert observed == expected
+
+        after_delivery = writer.cursor_peek(lease.label, nonce=lease.nonce)
+        assert after_delivery.cursor_version == before.cursor_version
+        assert [
+            (str(item["stream_id"]), int(item["stream_seq"]))
+            for item in after_delivery.items
+        ] == expected
+
+        advances = {stream: seq for stream, seq in expected}
+        advanced = writer.advance_cursor(
+            lease.label,
+            nonce=lease.nonce,
+            expected_cursor_version=before.cursor_version,
+            expected_stream_snapshots={
+                stream: before.stream_snapshots[stream] for stream in advances
+            },
+            advances=advances,
+            actor=f"{mode}-equivalence-test",
+        )
+        assert advanced.committed
+        assert writer.cursor_peek(lease.label, nonce=lease.nonce).items == ()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("mode", "persistent"),
+    [("poll", False), ("gated", True), ("notify", True)],
+)
+def test_follow_reader_mode_matches_wake_mode(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    persistent: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, env, lease = isolated
+    monkeypatch.setenv("GOALFLIGHT_WAKE_MODE", mode)
+    messages.post_message(
+        dispatch_id="persistent-reader-event",
+        msg_type="controller-notice",
+        payload={"text": "read through one persistent connection"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    open_reader = journal.Journal.open_reader
+    persistent_modes: list[bool] = []
+
+    def track_reader(cls, project_root, **kwargs):
+        persistent_modes.append(bool(kwargs.get("persistent", False)))
+        return open_reader(project_root, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "open_reader", classmethod(track_reader))
+    original_connect = journal.Journal._connect
+    connections: list[sqlite3.Connection] = []
+    persistent_connection_ids: set[int] = set()
+
+    def track_connect(self, *args, **kwargs):
+        connection = original_connect(self, *args, **kwargs)
+        connections.append(connection)
+        if getattr(self, "_persistent_reader", False):
+            persistent_connection_ids.add(id(connection))
+        return connection
+
+    monkeypatch.setattr(journal.Journal, "_connect", track_connect)
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(
+        messages,
+        "_write_follow_record",
+        lambda record, **_kwargs: record.get("kind") != "event",
+    )
+    monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
+    assert messages.main(_follow_argv(project, lease)) == 0
+    assert "stdout must be owned" not in capsys.readouterr().err
+    assert persistent_modes == [persistent]
+    if persistent:
+        assert len(persistent_connection_ids) == 1
+    else:
+        assert not persistent_connection_ids
+        assert len(connections) > 1
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="native kqueue is unavailable")
+def test_follow_notify_wakes_on_wal_write_before_safety_poll(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    proc = _spawn_follow(
+        project,
+        env,
+        lease,
+        heartbeat_s=30,
+        poll_s=5,
+        mode="notify",
+    )
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    try:
+        _raw, first = reader.read()
+        assert first["kind"] == "heartbeat"
+        _wait_for_monitor_slot(project, lease.label, proc.pid)
+        started = time.monotonic()
+        messages.post_message(
+            dispatch_id="notify-wal-wake",
+            msg_type="controller-notice",
+            payload={"text": "the WAL write wakes follow"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        while True:
+            _raw, record = reader.read(timeout_s=1.5)
+            if record["kind"] == "event":
+                break
+        assert record["payload"]["dispatch_id"] == "notify-wal-wake"
+        assert time.monotonic() - started < 1.5
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+def test_follow_poll_delivers_after_wal_inode_replacement(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    proc = _spawn_follow(
+        project,
+        env,
+        lease,
+        heartbeat_s=30,
+        poll_s=0.05,
+        mode="poll",
+    )
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    try:
+        _raw, first = reader.read()
+        assert first["kind"] == "heartbeat"
+        _wait_for_monitor_slot(project, lease.label, proc.pid)
+
+        wal = Path(f"{journal.resolve_journal_path(project)}-wal")
+        connection = sqlite3.connect(
+            journal.resolve_journal_path(project),
+            timeout=5,
+            isolation_level=None,
+        )
+        try:
+            checkpoint = tuple(
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            )
+        finally:
+            connection.close()
+        assert checkpoint[0] == 0, checkpoint
+        wal.touch(exist_ok=True)
+        prior = wal.stat()
+        replacement = wal.with_name(f"{wal.name}.replacement")
+        replacement.write_bytes(b"")
+        os.replace(replacement, wal)
+        replaced = wal.stat()
+        assert (prior.st_dev, prior.st_ino) != (replaced.st_dev, replaced.st_ino)
+
+        messages.post_message(
+            dispatch_id="poll-wal-replacement-event",
+            msg_type="controller-notice",
+            payload={"text": "deliver after replacing the live WAL inode"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        while True:
+            _raw, record = reader.read(timeout_s=5)
+            if record.get("kind") == "event":
+                break
+        assert record["payload"]["dispatch_id"] == "poll-wal-replacement-event"
+        assert proc.poll() is None, proc.stderr.read().decode(errors="replace")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+def test_follow_gated_reader_reopens_once_after_wal_replacement(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setenv("GOALFLIGHT_WAKE_MODE", "gated")
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    monkeypatch.setattr(
+        messages,
+        "_follow_frontier_snapshot",
+        lambda _store: {"kind": "frontier"},
+    )
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        messages,
+        "_write_follow_record",
+        lambda record, **_kwargs: records.append(record) or True,
+    )
+    messages.post_message(
+        dispatch_id="gated-wal-replacement-recovery",
+        msg_type="controller-notice",
+        payload={"text": "keep the live WAL present for replacement"},
+        messages_dir=Path(_env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+
+    wal = Path(f"{journal.resolve_journal_path(project)}-wal")
+    peek_calls = 0
+
+    def fail_cursor_peek(authority, *args, **kwargs):
+        nonlocal peek_calls
+        peek_calls += 1
+        if peek_calls == 1:
+            before = wal.stat()
+            replacement = wal.with_name(f"{wal.name}.replacement")
+            replacement.write_bytes(b"")
+            os.replace(replacement, wal)
+            after = wal.stat()
+            assert (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(journal.Journal, "cursor_peek", fail_cursor_peek)
+    original_reset = messages._reset_persistent_journal_reader
+    resets = []
+
+    def track_reset(authority):
+        resets.append(authority)
+        original_reset(authority)
+
+    monkeypatch.setattr(messages, "_reset_persistent_journal_reader", track_reset)
+    sleep_calls: list[float] = []
+    original_sleep = time.sleep
+
+    def track_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        original_sleep(seconds)
+
+    monkeypatch.setattr(time, "sleep", track_sleep)
+    assert messages.main(_follow_argv(project, lease)) == 2
+    assert peek_calls == 2
+    assert len(resets) == 1
+    assert sleep_calls and sleep_calls[0] > 0
+    assert any(record.get("kind") == "heartbeat" for record in records)
+    assert any(
+        record.get("payload", {}).get("type") == "listener-fault"
+        for record in records
+    )
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="native kqueue is unavailable")
+def test_listen_notify_wakes_on_wal_write_before_safety_poll(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    child_env = dict(env)
+    child_env["GOALFLIGHT_WAKE_MODE"] = "notify"
+    command = _backup_command(project, lease, timeout_s=8)
+    command[command.index("--poll-secs") + 1] = "5"
+    proc = subprocess.Popen(
+        command,
+        cwd=project,
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", proc.pid)
+        # Let the arm snapshot complete so this measures the steady-state wait.
+        time.sleep(0.25)
+        started = time.monotonic()
+        messages.post_message(
+            dispatch_id="notify-listen-wal-wake",
+            msg_type="controller-notice",
+            payload={"text": "the WAL write wakes listen"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        assert proc.wait(timeout=2) == 0
+        assert time.monotonic() - started < 2
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+def test_listen_gated_keeps_delivery_on_the_existing_poll_cadence(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    child_env = dict(env)
+    child_env["GOALFLIGHT_WAKE_MODE"] = "gated"
+    command = _backup_command(project, lease, timeout_s=8)
+    command[command.index("--poll-secs") + 1] = "0.2"
+    proc = subprocess.Popen(
+        command,
+        cwd=project,
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", proc.pid)
+        time.sleep(0.25)
+        messages.post_message(
+            dispatch_id="gated-listen-poll-wake",
+            msg_type="controller-notice",
+            payload={"text": "gated listen preserves poll latency"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        assert proc.wait(timeout=2) == 0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="native kqueue is unavailable")
+def test_wal_notifier_rearms_after_replacement_and_deletion(tmp_path: Path) -> None:
+    database = tmp_path / "journal.sqlite"
+    database.write_bytes(b"database")
+    wal = Path(f"{database}-wal")
+    wal.write_bytes(b"old wal")
+    notifier = messages._JournalChangeNotifier(database)
+    try:
+        old_identity = notifier._wal_identity
+        replacement = tmp_path / "replacement-wal"
+        replacement.write_bytes(b"new wal")
+        os.replace(replacement, wal)
+        assert notifier.wait(1.0)
+        assert notifier._wal_identity != old_identity
+        assert notifier.take_wal_replacement()
+        assert not notifier.take_wal_replacement()
+
+        with wal.open("ab") as stream:
+            stream.write(b"commit")
+        assert notifier.wait(1.0)
+
+        wal.unlink()
+        assert notifier.wait(1.0)
+        assert notifier._wal_fd is None
+        wal.write_bytes(b"recreated wal")
+        assert notifier.wait(1.0)
+        assert notifier._wal_fd is not None
+    finally:
+        notifier.close()
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="native kqueue is unavailable")
+def test_wal_notifier_failure_disables_notify_and_logs_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = tmp_path / "journal.sqlite"
+    database.write_bytes(b"database")
+    notifier = messages._JournalChangeNotifier(database)
+
+    class BrokenQueue:
+        def control(self, *_args, **_kwargs):
+            raise OSError("injected kqueue failure")
+
+        def close(self) -> None:
+            pass
+
+    notifier._queue = BrokenQueue()
+    try:
+        assert not notifier.wait(0.01)
+        assert not notifier.active
+        first_error = capsys.readouterr().err
+        assert first_error.count("poll mode") == 1
+        assert not notifier.wait(0.01)
+        assert capsys.readouterr().err == ""
+    finally:
+        notifier.close()
+
+
+def test_journal_change_gate_uses_file_stats_with_unchanged_data_version(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "journal.sqlite"
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    database.write_bytes(b"database")
+    wal.write_bytes(b"first")
+    gate = messages._JournalChangeGate(database)
+
+    assert gate.changed(7)
+    assert not gate.changed(7)
+    shm.write_bytes(b"first lock metadata")
+    assert not gate.changed(7)
+    shm.write_bytes(b"changed lock metadata")
+    assert not gate.changed(7)
+    first_wal = wal.stat().st_ino
+    replacement = tmp_path / "replacement-wal"
+    replacement.write_bytes(b"replacement")
+    os.replace(replacement, wal)
+    assert wal.stat().st_ino != first_wal
+    assert gate.changed(7)
+    assert gate.wal_replaced
+    assert not gate.changed(7)
+    assert not gate.wal_replaced
+    wal.write_bytes(b"second version")
+    assert gate.changed(7)
+    assert not gate.changed(7)
+
+
+def test_journal_change_gate_resets_when_reader_connection_changes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "journal.sqlite"
+    database.write_bytes(b"database")
+    gate = messages._JournalChangeGate(database)
+    first_reader = object()
+    replacement_reader = object()
+
+    assert gate.changed(7, reader_connection=first_reader)
+    assert not gate.changed(7, reader_connection=first_reader)
+    assert gate.changed(7, reader_connection=replacement_reader)
+    assert not gate.changed(7, reader_connection=replacement_reader)
+
+
+def test_gated_follow_retries_a_lost_ring_claim_without_a_journal_write(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, env, lease = isolated
+    monkeypatch.setenv(messages.WAKE_MODE_ENV, "gated")
+    claim_calls: list[float] = []
+    real_claim_ring = wake.claim_ring
+
+    def claim_ring(*args, **kwargs):
+        claim_calls.append(time.monotonic())
+        if len(claim_calls) == 1:
+            return False
+        return real_claim_ring(*args, **kwargs)
+
+    monkeypatch.setattr(wake, "claim_ring", claim_ring)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(_follow_argv(project, lease))
+    try:
+        cap.await_count(_is_heartbeat, 1)
+        messages.post_message(
+            dispatch_id="gated-ring-claim-retry",
+            msg_type="controller-notice",
+            payload={"text": "retry on the listener poll deadline"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        cap.await_count(
+            lambda record: _is_follow_event(record, "controller-notice"),
+            1,
+        )
+        assert len(claim_calls) >= 2, "the failed ring claim was not retried"
+        assert claim_calls[1] - claim_calls[0] <= 0.25
+    finally:
+        _release_lease(project, lease)
+        thread.join(5)
+    cap.pump()
+    assert not thread.is_alive(), cap.stderr
+    assert results == [3]
+
+
+def test_wal_notifier_rearms_before_returning_signal_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal_filter = object()
+    directory_fd = 23
+    notifier = messages._JournalChangeNotifier.__new__(messages._JournalChangeNotifier)
+    notifier.active = True
+    notifier._queue = type(
+        "Queue",
+        (),
+        {
+            "control": lambda _self, *_args: [
+                type("Event", (), {"filter": signal_filter, "ident": 2})(),
+                type("Event", (), {"filter": 999, "ident": directory_fd})(),
+            ],
+        },
+    )()
+    notifier._signal_filter = signal_filter
+    notifier._directory_fd = directory_fd
+    notifier._wal_fd = 24
+    rearmed: list[bool] = []
+    monkeypatch.setattr(notifier, "_rearm_wal", lambda: rearmed.append(True) or True)
+
+    assert notifier.wait(0.1)
+    assert rearmed == [True]
+
+
+def test_poll_wake_mode_is_default_and_does_not_create_notifier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_WAKE_MODE", raising=False)
+    assert messages._wake_mode() == "poll"
+
+    def unexpected_notifier(*_args, **_kwargs):
+        pytest.fail("poll mode must not create a notifier")
+
+    monkeypatch.setattr(messages, "_JournalChangeNotifier", unexpected_notifier)
+    assert messages._new_journal_notifier("poll", tmp_path / "journal.sqlite") is None
+    monkeypatch.setenv("GOALFLIGHT_WAKE_MODE", "gated")
+    assert messages._wake_mode() == "gated"
+    assert messages._new_journal_notifier("gated", tmp_path / "journal.sqlite") is None
+
+
 def test_live_lines_flush_before_exit_and_heartbeat_cadence_carries_mail(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
@@ -315,6 +974,114 @@ def test_live_lines_flush_before_exit_and_heartbeat_cadence_carries_mail(
         if proc.poll() is None:
             proc.terminate()
         proc.wait(timeout=3)
+
+
+def test_follow_hides_terminal_behind_stuck_until_carrier_repair(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    stream_id = "follow-stuck-prefix"
+    addressee = messages.controller_addressee(lease.label, project_root=project)
+    source = {"node": "peer", "adapter": "pytest", "transport": "controller"}
+    first = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="controller-notice",
+        payload={"text": "unreadable head"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    terminal = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="result",
+        payload={"complete": True, "text": "terminal behind stuck row"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    carrier = Path(first["path"])
+    original_lines = carrier.read_text(encoding="utf-8").splitlines()
+    assert len(original_lines) == 2
+    carrier.write_text("{invalid head\n" + original_lines[1] + "\n", encoding="utf-8")
+
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.1, poll_s=0.02)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    observed: list[dict[str, object]] = []
+    try:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+            observed.append(record)
+            payload = record.get("payload")
+            if (
+                isinstance(payload, dict)
+                and payload.get("reason") == "pending_behind_stuck"
+            ):
+                break
+        else:
+            pytest.fail("follow did not report the row behind the stuck head")
+
+        assert any(
+            isinstance(record.get("payload"), dict)
+            and record["payload"].get("type") == "listener-fault"
+            and record["payload"].get("reason") == "carrier-corrupt"
+            and record["payload"].get("stream_id") == stream_id
+            and record["payload"].get("stream_seq") == 1
+            and str(record["payload"].get("stuck_reason") or "").startswith("STUCK:")
+            for record in observed
+        ), observed
+        pending = [
+            record["payload"]["pending_behind_stuck"]
+            for record in observed
+            if isinstance(record.get("payload"), dict)
+            and record["payload"].get("reason") == "pending_behind_stuck"
+        ]
+        assert pending == [
+            {
+                "id": terminal["envelope"]["id"],
+                "stream_id": stream_id,
+                "stream_seq": 2,
+                "type": "result",
+            }
+        ]
+
+        def terminal_was_emitted(records: list[dict[str, object]]) -> bool:
+            return any(
+                isinstance(record.get("payload"), dict)
+                and record["payload"].get("dispatch_id") == stream_id
+                and record["payload"].get("stream_seq") == 2
+                and record["payload"].get("type") == "result"
+                for record in records
+            )
+
+        until = time.monotonic() + 0.15
+        while time.monotonic() < until:
+            if b"\n" in reader.buffer:
+                _raw, record = reader.read(timeout_s=0.01)
+                observed.append(record)
+                continue
+            readable, _, _ = select.select(
+                [proc.stdout.fileno()], [], [], max(0.0, until - time.monotonic())
+            )
+            if not readable:
+                break
+            _raw, record = reader.read(timeout_s=0.1)
+            observed.append(record)
+        assert not terminal_was_emitted(observed), observed
+
+        carrier.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not terminal_was_emitted(observed):
+            _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+            observed.append(record)
+        assert terminal_was_emitted(observed), observed
+        assert sum(terminal_was_emitted([record]) for record in observed) == 1
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
 
 
 def test_follow_does_not_replay_advanced_streams_across_polls_and_restart(
@@ -468,6 +1235,126 @@ def test_live_follow_redelivers_after_explicit_rewind_only(
         proc.wait(timeout=3)
 
 
+@pytest.mark.parametrize(
+    "event_type", ["result", "user_confirm", "user_need", "blocked"]
+)
+def test_follow_hides_terminal_behind_unprojected_head_until_projection(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    event_type: str,
+) -> None:
+    project, env, lease = isolated
+    stream_id = "follow-unprojected-prefix"
+    addressee = messages.controller_addressee(lease.label, project_root=project)
+    source = {"node": "peer", "adapter": "pytest", "transport": "controller"}
+    first = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type=event_type,
+        payload={"complete": event_type == "result", "text": "unprojected head"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    terminal = messages.post_message(
+        dispatch_id=stream_id,
+        msg_type="result",
+        payload={"complete": True, "text": "terminal behind unprojected row"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source=source,
+        addressee=addressee,
+    )
+    authority = journal.open_or_create_journal(project)
+    projected_at = authority.read_all(
+        "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+        (first["envelope"]["id"],),
+    )[0]["projected_at"]
+    connection = authority._connect()
+    try:
+        connection.execute(
+            "UPDATE delivery_events SET projected_at = NULL WHERE event_uuid = ?",
+            (first["envelope"]["id"],),
+        )
+    finally:
+        connection.close()
+
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.1, poll_s=0.02)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    observed: list[dict[str, object]] = []
+    try:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and not any(
+            record.get("kind") == "heartbeat" for record in observed
+        ):
+            _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+            observed.append(record)
+        else:
+            if not any(record.get("kind") == "heartbeat" for record in observed):
+                pytest.fail("follow did not reach the pending-projection heartbeat")
+        assert not any(
+            isinstance(record.get("payload"), dict)
+            and record["payload"].get("dispatch_id") == stream_id
+            and record["payload"].get("stream_seq") == 2
+            and record["payload"].get("type") == "result"
+            for record in observed
+        ), observed
+        assert any(
+            isinstance(record.get("payload"), dict)
+            and record["payload"].get("type") == "pending-projection"
+            and record["payload"].get("reason") == "pending-projection"
+            and record["payload"].get("pending_projection") == {
+                "stream_id": stream_id,
+                "stream_seq": 1,
+            }
+            for record in observed
+        ), observed
+        assert any(record.get("kind") == "heartbeat" for record in observed), observed
+        assert any(
+            isinstance(record.get("payload"), dict)
+            and record["payload"].get("reason") == "pending_behind_stuck"
+            for record in observed
+        ), observed
+        assert not any(
+            isinstance(record.get("payload"), dict)
+            and record["payload"].get("type") == "listener-fault"
+            for record in observed
+        ), observed
+
+        if event_type == "result":
+            repaired_at = len(observed)
+            connection = authority._connect()
+            try:
+                connection.execute(
+                    "UPDATE delivery_events SET projected_at = ? WHERE event_uuid = ?",
+                    (projected_at, first["envelope"]["id"]),
+                )
+            finally:
+                connection.close()
+            emitted: list[tuple[int, str]] = []
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and len(emitted) < 2:
+                _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+                observed.append(record)
+                payload = record.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("dispatch_id") == stream_id
+                    and payload.get("stream_seq") in {1, 2}
+                    and payload.get("type") in {"controller-notice", "result"}
+                ):
+                    emitted.append((int(payload["stream_seq"]), str(payload["type"])))
+            assert emitted == [(1, "result"), (2, "result")], observed
+            assert not any(
+                isinstance(record.get("payload"), dict)
+                and record["payload"].get("type") == "pending-projection"
+                for record in observed[repaired_at:]
+            ), observed[repaired_at:]
+            assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_follow_rewind_between_evidence_read_and_peek_releases_ring(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
@@ -482,9 +1369,19 @@ def test_follow_rewind_between_evidence_read_and_peek_releases_ring(
     )
     authority = journal.Journal(project)
     original = journal.Journal._cursor_rewinds
+    original_gate_changed = messages._JournalChangeGate.changed
     observed = []
     rewound = False
+    forced_scan = False
     beats = 0
+
+    def force_scan_after_first_event(gate, data_version, **kwargs):
+        nonlocal forced_scan
+        changed = original_gate_changed(gate, data_version, **kwargs)
+        if observed and not forced_scan:
+            forced_scan = True
+            return True
+        return changed
 
     def rewind_after_read(self, label):
         nonlocal rewound
@@ -505,6 +1402,7 @@ def test_follow_rewind_between_evidence_read_and_peek_releases_ring(
 
     _pin_listener_resolution(monkeypatch, lease)
     monkeypatch.setattr(journal.Journal, "_cursor_rewinds", rewind_after_read)
+    monkeypatch.setattr(messages._JournalChangeGate, "changed", force_scan_after_first_event)
     monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
     monkeypatch.setattr(messages, "_write_follow_record", write)
     monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
@@ -525,7 +1423,7 @@ def test_follow_batch_escalation_collision_then_exact_repeat(
         project, authority=journal.Journal(project), controller_label=lease.label,
         cursor_version=77, visible=[(row, routine), (row, escalation), (row, escalation)],
         delivered=set(), emit=lambda record: emitted.append(record["payload"]["type"]) or True,
-    ) == (True, True)
+    ) == (True, True, True)
     assert emitted == ["controller-notice", event_type]
 
 
@@ -954,7 +1852,7 @@ def test_epipe_before_first_event_releases_ring_for_replacement(
             },
         )
     ]
-    alive, emitted = messages._emit_claimed_follow_events(
+    alive, emitted, ring_claimed = messages._emit_claimed_follow_events(
         project,
         authority=journal.Journal(project),
         controller_label=lease.label,
@@ -962,7 +1860,7 @@ def test_epipe_before_first_event_releases_ring_for_replacement(
         visible=visible,
         emit=lambda _record: False,
     )
-    assert (alive, emitted) == (False, False)
+    assert (alive, emitted, ring_claimed) == (False, False, True)
     assert wake.claim_ring(
         project,
         controller_label=lease.label,
@@ -970,8 +1868,44 @@ def test_epipe_before_first_event_releases_ring_for_replacement(
     ), "the replacement listener must be able to deliver the same cursor"
 
 
+def test_follow_does_not_retry_ring_already_claimed_for_delivered_rows(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, _env, lease = isolated
+    visible = [
+        (
+            {"stream_id": "already-rung", "stream_seq": 1},
+            {
+                "dispatch_id": "already-rung",
+                "type": "controller-notice",
+                "payload": {"text": "this row was emitted by the current owner"},
+            },
+        )
+    ]
+    delivered: set[tuple[str, int, str]] = set()
+    authority = journal.Journal(project)
+    assert messages._emit_claimed_follow_events(
+        project,
+        authority=authority,
+        controller_label=lease.label,
+        cursor_version=78,
+        visible=visible,
+        emit=lambda _record: True,
+        delivered=delivered,
+    ) == (True, True, True)
+    assert messages._emit_claimed_follow_events(
+        project,
+        authority=authority,
+        controller_label=lease.label,
+        cursor_version=78,
+        visible=visible,
+        emit=lambda _record: pytest.fail("already delivered row was emitted again"),
+        delivered=delivered,
+    ) == (True, False, True)
+
+
 @pytest.mark.parametrize("failure", ["false", "partial", "exception"])
-def test_partial_follow_batch_is_replayable_without_acknowledgement(
+def test_partial_follow_batch_is_replayable_by_replacement_owner(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     failure: str,
 ) -> None:
@@ -999,15 +1933,107 @@ def test_partial_follow_batch_is_replayable_without_acknowledgement(
         with pytest.raises(BrokenPipeError):
             messages._emit_claimed_follow_events(**kwargs, emit=emit)
     else:
-        assert messages._emit_claimed_follow_events(**kwargs, emit=emit) == (False, False)
+        assert messages._emit_claimed_follow_events(**kwargs, emit=emit) == (
+            False,
+            False,
+            True,
+        )
     assert len([item for item in output if isinstance(item, dict)]) == 3
-    assert delivered == set(), "a partial batch must not establish delivery memory"
+    assert delivered == {
+        ("peer", seq, "") for seq in range(1, 4)
+    }
     replacement = []
+    replacement_kwargs = {**kwargs, "delivered": set()}
+    wake.release_ring_claim(
+        project,
+        controller_label=lease.label,
+        cursor_version=77,
+    )
     assert messages._emit_claimed_follow_events(
-        **kwargs, emit=lambda record: replacement.append(record) or True,
-    ) == (True, True)
+        **replacement_kwargs,
+        emit=lambda record: replacement.append(record) or True,
+    ) == (True, True, True)
     assert [r["payload"]["stream_seq"] for r in replacement] == list(range(1, 11))
     assert journal.Journal(project).cursor_status(lease.label)["positions"] == {}
+
+
+def test_partial_follow_recovery_does_not_reemit_successful_rows(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    messages.post_message(
+        dispatch_id="partial-batch-wal-replacement",
+        msg_type="controller-notice",
+        payload={"text": "keep the live WAL present for replacement"},
+        messages_dir=Path(_env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    visible = [
+        (
+            {"stream_id": "peer", "stream_seq": seq},
+            {
+                "dispatch_id": "peer",
+                "type": "controller-notice",
+                "payload": {"text": f"notice {seq}"},
+            },
+        )
+        for seq in range(1, 4)
+    ]
+    authority = journal.Journal(project)
+    delivered: set[tuple[str, int, str]] = set()
+    first_output: list[dict[str, object]] = []
+    original_positions = messages._journal_cursor_positions
+    position_reads = 0
+    wal = Path(f"{journal.resolve_journal_path(project)}-wal")
+    wal.touch(exist_ok=True)
+
+    def fail_after_first_emit(authority, controller_label: str):
+        nonlocal position_reads
+        position_reads += 1
+        if position_reads == 2:
+            before = wal.stat()
+            replacement = wal.with_name(f"{wal.name}.replacement")
+            replacement.write_bytes(b"")
+            os.replace(replacement, wal)
+            after = wal.stat()
+            assert (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            raise sqlite3.OperationalError("disk I/O error after WAL replacement")
+        return {}
+
+    monkeypatch.setattr(messages, "_journal_cursor_positions", fail_after_first_emit)
+    with pytest.raises(sqlite3.OperationalError):
+        messages._emit_claimed_follow_events(
+            project,
+            authority=authority,
+            controller_label=lease.label,
+            cursor_version=79,
+            visible=visible,
+            emit=lambda record: first_output.append(record) or True,
+            delivered=delivered,
+        )
+    assert [record["payload"]["stream_seq"] for record in first_output] == [1]
+    assert delivered == {("peer", 1, "")}
+
+    monkeypatch.setattr(messages, "_journal_cursor_positions", original_positions)
+    resumed_output: list[dict[str, object]] = []
+    assert messages._emit_claimed_follow_events(
+        project,
+        authority=authority,
+        controller_label=lease.label,
+        cursor_version=79,
+        visible=visible,
+        emit=lambda record: resumed_output.append(record) or True,
+        delivered=delivered,
+    ) == (True, True, True)
+    assert [record["payload"]["stream_seq"] for record in resumed_output] == [
+        2,
+        3,
+    ]
+    assert delivered == {
+        ("peer", seq, "") for seq in range(1, 4)
+    }
 
 
 @pytest.mark.parametrize("partial", [False, True])
@@ -1068,10 +2094,22 @@ def test_new_follow_owner_recovers_batch_lost_after_child_pipe_flush(
     first = FailingHost(scripts=plan(first_pipe), stop_after_waits=20)
     _run(first, _items("backup"))
     assert first.accepted == 3
-    replacement = FakeHost(scripts=plan(child_pipe()), stop_after_waits=20)
+    assert journal.Journal(project).cursor_status(lease.label)["positions"] == {}, (
+        "the failed delivery did not acknowledge any cursor positions"
+    )
+    replacement_pipe = child_pipe()
+    replacement_source = [json.loads(line) for line in replacement_pipe]
+    assert [record["payload"]["stream_seq"] for record in replacement_source] == list(
+        range(1, 11)
+    ), "follow must expose the full batch while the journal cursor is empty"
+    replacement = FakeHost(scripts=plan(replacement_pipe), stop_after_waits=20)
     _run(replacement, _items("backup"))
     events = [r for r in _records(replacement) if r.get("kind") == "event"]
     assert [r["payload"]["stream_seq"] for r in events] == list(range(1, 11))
+    assert all(
+        record.get("replay") is True and record["payload"].get("replay") is True
+        for record in events
+    ), f"replacement events were not marked as replays: {events}"
     assert journal.Journal(project).cursor_status(lease.label)["positions"] == {}
 
 
@@ -1336,7 +2374,7 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
     frontier = messages._follow_frontier_record(
         {
             "id": "t-very-long-frontier",
-            "title": "regolith 🚀 " * 10_000,
+            "title": "sample project 🚀 " * 10_000,
             "derived_status": "pending",
         }
     )
@@ -1880,7 +2918,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
     _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
     _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
     backup = subprocess.Popen(
-        _backup_command(project, lease),
+        _backup_command(project, lease, timeout_s=300),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
@@ -2045,7 +3083,7 @@ def test_backup_wakes_when_watchdog_is_sigkilled_with_stream_alive(
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
     backup = subprocess.Popen(
-        _backup_command(project, lease),
+        _backup_command(project, lease, timeout_s=300),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
@@ -2126,7 +3164,7 @@ def test_backup_wakes_when_watchdog_never_arms_after_grace(
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
     backup = subprocess.Popen(
-        _backup_command(project, lease),
+        _backup_command(project, lease, timeout_s=300),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
@@ -2161,7 +3199,7 @@ def test_backup_witnesses_correlated_stream_and_watchdog_death(
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
     backup = subprocess.Popen(
-        _backup_command(project, lease),
+        _backup_command(project, lease, timeout_s=300),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
@@ -2515,6 +3553,7 @@ def test_follow_rejects_regular_file_stdout_before_claiming_monitor(
         )
     assert refused.returncode == 2
     assert "stdout is a regular file" in refused.stderr
+    assert "stdout must be owned" in refused.stderr
     assert not wake.live_waiters(
         project,
         controller_label=lease.label,
@@ -2602,10 +3641,13 @@ def test_direct_watchdog_beside_detected_supervisor_omits_backup_command(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
+    listed_supervisor = shlex.join(
+        [*shlex.split(supervisor), "--lease-nonce", lease.nonce]
+    )
     shim_dir = tmp_path / "running-supervisor-process-listing"
     shim_dir.mkdir()
     ps_shim = shim_dir / "ps"
-    process_row = f"4242 {supervisor}"
+    process_row = f"4242 {listed_supervisor}"
     ps_shim.write_text(
         "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(process_row) + "\n",
         encoding="utf-8",
@@ -2646,6 +3688,9 @@ def test_detached_watchdog_uses_detected_supervisor_ownership(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
+    listed_supervise_command = shlex.join(
+        [*shlex.split(supervise_command), "--lease-nonce", lease.nonce]
+    )
     monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
     monkeypatch.setattr(messages.os, "getppid", lambda: 1)
     monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
@@ -2654,7 +3699,7 @@ def test_detached_watchdog_uses_detected_supervisor_ownership(
         monkeypatch.setattr(
             wake,
             "_process_listing",
-            lambda **_kwargs: [(4242, supervise_command)],
+            lambda **_kwargs: [(4242, listed_supervise_command)],
         )
     else:
         monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
@@ -3380,7 +4425,7 @@ def test_pending_ring_retries_after_failed_claim(
     assert not thread.is_alive(), stderr.getvalue()
     assert result == [0], stderr.getvalue()
     assert len(claim_calls) == 2, claim_calls
-    assert claim_calls[1] - claim_calls[0] <= poll_secs * 2, claim_calls
+    assert claim_calls[0] < claim_calls[1], claim_calls
     assert json.loads(stdout.getvalue())["kind"] == "ring"
 
 
@@ -3864,11 +4909,13 @@ def test_non_json_ring_materializes_attention_before_ring_claim(
 
 
 @pytest.mark.parametrize("busy_stage", ("connect", "query"))
+@pytest.mark.parametrize("mode", ("poll", "gated"))
 def test_follow_survives_transient_journal_busy_and_recovers(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     busy_stage: str,
+    mode: str,
 ) -> None:
     """A busy spell must degrade the follower, never kill it."""
     project, _env, lease = isolated
@@ -3881,12 +4928,30 @@ def test_follow_survives_transient_journal_busy_and_recovers(
     monkeypatch.setattr(
         messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05, raising=False
     )
+    monkeypatch.setenv(messages.WAKE_MODE_ENV, mode)
     gate = threading.Event()
     hits = (
         _gate_journal_connects(monkeypatch, project, gate)
         if busy_stage == "connect"
         else _gate_journal_queries(monkeypatch, project, gate)
     )
+    if busy_stage == "connect":
+        real_read_all = journal.Journal.read_all
+
+        def reconnect_reader_before_read_all(authority, *args, **kwargs):
+            if gate.is_set():
+                connection = getattr(authority, "_reader_connection", None)
+                if connection is not None:
+                    connection.close()
+                    authority._reader_connection = None
+                    authority._reader_pid = None
+            return real_read_all(authority, *args, **kwargs)
+
+        monkeypatch.setattr(
+            journal.Journal,
+            "read_all",
+            reconnect_reader_before_read_all,
+        )
     cap = _LiveCapture(capsys)
 
     thread, results = _run_in_thread(_follow_argv(project, lease))
@@ -4042,11 +5107,13 @@ def test_watchdog_survives_transient_journal_busy(
 
 
 @pytest.mark.parametrize("busy_stage", ("connect", "query"))
+@pytest.mark.parametrize("mode", ("poll", "gated"))
 def test_listen_survives_transient_journal_busy(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     busy_stage: str,
+    mode: str,
 ) -> None:
     """A doorbell may exit after a ring — never from a transient busy."""
     project, _env, lease = isolated
@@ -4056,6 +5123,7 @@ def test_listen_survives_transient_journal_busy(
     monkeypatch.setattr(
         messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05, raising=False
     )
+    monkeypatch.setenv(messages.WAKE_MODE_ENV, mode)
     gate = threading.Event()
     hits = (
         _gate_journal_connects(monkeypatch, project, gate)
@@ -4154,3 +5222,538 @@ def test_listen_emits_structured_exit_when_journal_disappears(
     assert exits[-1]["reason"] == "journal-unavailable"
     assert "coverage_exit_error" in exits[-1]
     assert "rearm_error" in exits[-1]
+
+
+def test_idle_listener_pass_cpu_stays_small_with_large_backlog(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    project, env, lease = isolated
+    _post_pending_backlog(project, env, lease, prefix="idle-backlog")
+
+    for mode in ("listen-report", "listen", "follow", "watch-follow"):
+        if mode == "follow":
+            follow_cursor_version = journal.open_or_create_journal(project).cursor_peek(
+                lease.label,
+                nonce=lease.nonce,
+                limit=1000,
+            ).cursor_version
+            command = _follow_command(project, lease, heartbeat_s=60, poll_s=0.01)
+            waiter_kind = wake.MONITOR_KIND
+        elif mode == "watch-follow":
+            wake.activate_monitor_state(
+                project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+                heartbeat_s=60,
+                dead_after_s=300,
+            )
+            command = _watch_command(project, lease, timeout_s=60)
+            waiter_kind = wake.WATCHDOG_KIND
+        else:
+            command = [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                lease.label,
+                "--lease-nonce",
+                lease.nonce,
+                "--listener-slots",
+                "1",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "60",
+            ]
+            if mode == "listen-report":
+                command.append("--report-pending")
+            waiter_kind = "listener"
+
+        samples_path = tmp_path / f"{mode}.cpu"
+        extra_setup: tuple[str, ...] = ()
+        if mode == "follow":
+            ready = tmp_path / "follow-ring-ready"
+            external_claim = tmp_path / "external-ring-claimed"
+            claim_result = tmp_path / "follow-ring-result"
+            extra_setup = (
+                "from pathlib import Path",
+                "import goalflight_wake",
+                f"ready_path = {str(ready)!r}",
+                f"claim_path = {str(external_claim)!r}",
+                f"result_path = {str(claim_result)!r}",
+                "original_claim_ring = goalflight_wake.claim_ring",
+                "first_claim = True",
+                "def wait_for_external_claim(*args, **kwargs):",
+                "    global first_claim",
+                "    if first_claim:",
+                "        first_claim = False",
+                "        Path(ready_path).write_text('ready')",
+                "        deadline = time.monotonic() + 30",
+                "        while not Path(claim_path).exists() and time.monotonic() < deadline:",
+                "            time.sleep(0.01)",
+                "        if not Path(claim_path).exists():",
+                "            raise TimeoutError('test did not reserve the competing ring')",
+                "        claimed = original_claim_ring(*args, **kwargs)",
+                "        result_temp = Path(result_path + '.tmp')",
+                "        result_temp.write_text(str(claimed), encoding='utf-8')",
+                "        result_temp.replace(result_path)",
+                "        return claimed",
+                "    return original_claim_ring(*args, **kwargs)",
+                "goalflight_wake.claim_ring = wait_for_external_claim",
+            )
+        materialization_count_path = tmp_path / f"{mode}.materializations"
+        bootstrap = _cpu_sampled_bootstrap(
+            tmp_path,
+            f"{mode}-listener",
+            command,
+            samples_path,
+            extra_setup=extra_setup,
+            materialization_counter_path=materialization_count_path,
+        )
+        child_env = {**env, "GOALFLIGHT_WAKE_MODE": "poll"}
+        captured_stdout = bytearray()
+        proc = subprocess.Popen(
+            [sys.executable, str(bootstrap)],
+            cwd=project,
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=(tmp_path / f"{mode}.stderr").open("wb"),
+        )
+        assert proc.stdout is not None
+
+        def drain_stdout() -> None:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    return
+                captured_stdout.extend(chunk)
+
+        output_thread = threading.Thread(target=drain_stdout, daemon=True)
+        output_thread.start()
+        try:
+            _wait_for_waiter_kind(
+                project,
+                lease.label,
+                waiter_kind,
+                proc.pid,
+                timeout_s=15,
+            )
+            sample_floor = 0
+            if mode != "follow":
+                warmup_deadline = time.monotonic() + 30
+                while time.monotonic() < warmup_deadline:
+                    try:
+                        if samples_path.read_text(encoding="utf-8").splitlines():
+                            break
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.02)
+                else:
+                    raise AssertionError(f"{mode} did not complete its first pass")
+            materialization_floor = _materialization_count(materialization_count_path)
+            if mode == "follow":
+                assert wait_until(ready.exists, timeout_s=10, interval_s=0.01)
+                assert wake.claim_ring(
+                    project,
+                    controller_label=lease.label,
+                    cursor_version=follow_cursor_version,
+                )
+                external_claim.touch()
+                assert wait_until(claim_result.exists, timeout_s=10, interval_s=0.01)
+                assert claim_result.read_text(encoding="utf-8") == "False"
+                materialization_floor = _materialization_count(
+                    materialization_count_path
+                )
+                sample_floor = (
+                    len(samples_path.read_text().splitlines())
+                    if samples_path.exists()
+                    else 0
+                )
+            deadline = time.monotonic() + 30
+            samples: list[float] = []
+            while time.monotonic() < deadline:
+                try:
+                    samples = [float(line) for line in samples_path.read_text().splitlines()]
+                except FileNotFoundError:
+                    samples = []
+                if len(samples) >= sample_floor + 8:
+                    break
+                time.sleep(0.02)
+            assert len(samples) >= sample_floor + 8, (
+                f"{mode} did not record enough passes: {samples}"
+            )
+            assert max(samples[-5:]) < 0.1, f"{mode} idle pass CPU spiked: {samples[-5:]}"
+            assert _materialization_count(materialization_count_path) == materialization_floor, (
+                f"{mode} rematerialized an unchanged candidate"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            output_thread.join(timeout=2)
+        if mode == "listen-report":
+            assert b"pending backlog: count=250 oldest_age_s=" in captured_stdout
+
+
+def test_contending_report_pending_listeners_retry_cached_snapshot(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    project, env, lease = isolated
+    _post_pending_backlog(project, env, lease, prefix="contention-backlog")
+
+    processes: list[subprocess.Popen[bytes]] = []
+    output_threads: list[threading.Thread] = []
+    stderr_handles = []
+    samples_paths: list[Path] = []
+    materialization_paths: list[Path] = []
+    claim_lost_paths: list[Path] = []
+    stdout_buffers: list[bytearray] = []
+    try:
+        for index in range(2):
+            samples_path = tmp_path / f"contender-{index}.cpu"
+            samples_paths.append(samples_path)
+            materialization_path = tmp_path / f"contender-{index}.materializations"
+            materialization_paths.append(materialization_path)
+            claim_lost_path = tmp_path / f"contender-{index}.claim-lost"
+            claim_lost_paths.append(claim_lost_path)
+            retry_pause_requested = tmp_path / f"contender-{index}.pause-requested"
+            retry_pause_ready = tmp_path / f"contender-{index}.pause-ready"
+            retry_pause_release = tmp_path / f"contender-{index}.pause-release"
+            command = [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                lease.label,
+                "--lease-nonce",
+                lease.nonce,
+                "--listener-slots",
+                "2",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "60",
+            ]
+            extra_setup = (
+                "import goalflight_wake",
+                f"claim_lost_path = Path({str(claim_lost_path)!r})",
+                "original_claim_ring = goalflight_wake.claim_ring",
+                "def record_claim_loss(*args, **kwargs):",
+                "    claimed = original_claim_ring(*args, **kwargs)",
+                "    if not claimed:",
+                "        temp = claim_lost_path.with_suffix('.tmp')",
+                "        temp.write_text('lost', encoding='utf-8')",
+                "        temp.replace(claim_lost_path)",
+                "    return claimed",
+                "goalflight_wake.claim_ring = record_claim_loss",
+                f"retry_pause_requested = Path({str(retry_pause_requested)!r})",
+                f"retry_pause_ready = Path({str(retry_pause_ready)!r})",
+                f"retry_pause_release = Path({str(retry_pause_release)!r})",
+                "pause_base_sleep = time.sleep",
+                "def pause_at_retry_boundary(seconds):",
+                "    if retry_pause_requested.exists() and not retry_pause_ready.exists():",
+                "        temp = retry_pause_ready.with_suffix('.tmp')",
+                "        temp.write_text('ready', encoding='utf-8')",
+                "        temp.replace(retry_pause_ready)",
+                "        deadline = time.monotonic() + 45",
+                "        while not retry_pause_release.exists() and time.monotonic() < deadline:",
+                "            pause_base_sleep(0.01)",
+                "        if not retry_pause_release.exists():",
+                "            raise TimeoutError('test did not release the ring retry pause')",
+                "    return pause_base_sleep(seconds)",
+                "time.sleep = pause_at_retry_boundary",
+            )
+            bootstrap = _cpu_sampled_bootstrap(
+                tmp_path,
+                f"contender-{index}",
+                command,
+                samples_path,
+                extra_setup=extra_setup,
+                materialization_counter_path=materialization_path,
+            )
+            stderr_handle = (tmp_path / f"contender-{index}.stderr").open("wb")
+            stderr_handles.append(stderr_handle)
+            proc = subprocess.Popen(
+                [sys.executable, str(bootstrap)],
+                cwd=project,
+                env={**env, "GOALFLIGHT_WAKE_MODE": "poll"},
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+            )
+            processes.append(proc)
+            assert proc.stdout is not None
+
+            stdout_buffer = bytearray()
+            stdout_buffers.append(stdout_buffer)
+
+            def drain_stdout(stream=proc.stdout, buffer=stdout_buffer) -> None:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        return
+                    buffer.extend(chunk)
+
+            output_thread = threading.Thread(target=drain_stdout, daemon=True)
+            output_thread.start()
+            output_threads.append(output_thread)
+            _wait_for_waiter_kind(
+                project, lease.label, "listener", proc.pid, timeout_s=15
+            )
+
+        deadline = time.monotonic() + 30
+        counts_before: list[int] = []
+        while time.monotonic() < deadline:
+            counts_before = [
+                len(path.read_text().splitlines()) if path.exists() else 0
+                for path in samples_paths
+            ]
+            if min(counts_before) >= 8:
+                break
+            time.sleep(0.02)
+        assert min(counts_before) >= 8, (
+            f"listeners did not settle before contention: {counts_before}; "
+            f"polls={[proc.poll() for proc in processes]}; "
+            f"stderr={[path.read_bytes() for path in (tmp_path / f'contender-{i}.stderr' for i in range(2))]}"
+        )
+
+        messages.post_message(
+            dispatch_id="contention-trigger",
+            msg_type="controller-notice",
+            payload={"text": "force the listeners to contend for one cursor ring"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not any(
+            proc.poll() is not None for proc in processes
+        ):
+            time.sleep(0.02)
+        winners = [proc for proc in processes if proc.poll() is not None]
+        assert len(winners) == 1, [proc.poll() for proc in processes]
+        winner = winners[0]
+        assert winner.returncode == 0
+        loser_index = next(index for index, proc in enumerate(processes) if proc is not winner)
+        loser = processes[loser_index]
+        assert wait_until(
+            claim_lost_paths[loser_index].exists, timeout_s=30, interval_s=0.01
+        )
+        deadline = time.monotonic() + 30
+        samples: list[float] = []
+        while time.monotonic() < deadline:
+            try:
+                samples = [float(line) for line in samples_paths[loser_index].read_text().splitlines()]
+            except FileNotFoundError:
+                samples = []
+            if len(samples) >= counts_before[loser_index] + 8:
+                break
+            time.sleep(0.02)
+        assert len(samples) >= counts_before[loser_index] + 8, samples
+        assert max(samples[-5:]) < 0.1, f"ring loser rescanned the backlog: {samples[-5:]}"
+        # The winner's exit changes journal coverage and pending-report
+        # ownership. Let those transitions settle, then require eight full idle
+        # passes with no further materialization.
+        observed_materializations = _materialization_count(
+            materialization_paths[loser_index]
+        )
+        stable_pass_floor = len(samples)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                samples = [
+                    float(line)
+                    for line in samples_paths[loser_index].read_text().splitlines()
+                ]
+            except FileNotFoundError:
+                samples = []
+            current_materializations = _materialization_count(
+                materialization_paths[loser_index]
+            )
+            if current_materializations != observed_materializations:
+                observed_materializations = current_materializations
+                stable_pass_floor = len(samples)
+            if len(samples) >= stable_pass_floor + 8:
+                break
+            time.sleep(0.02)
+        assert len(samples) >= stable_pass_floor + 8, samples
+        assert max(samples[-5:]) < 0.1, f"ring loser rescanned the backlog: {samples[-5:]}"
+        assert loser.poll() is None
+        (tmp_path / f"contender-{loser_index}.pause-requested").touch()
+        assert wait_until(
+            (tmp_path / f"contender-{loser_index}.pause-ready").exists,
+            timeout_s=30,
+            interval_s=0.01,
+        )
+        assert _materialization_count(materialization_paths[loser_index]) == (
+            observed_materializations
+        ), "ring loser rematerialized an unchanged candidate"
+
+        messages.post_message(
+            dispatch_id="contention-between-retries",
+            msg_type="controller-notice",
+            payload={"text": "change the journal while the loser has a cached candidate"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        refreshed = journal.open_or_create_journal(project).cursor_peek(
+            lease.label, nonce=lease.nonce, limit=1000
+        )
+        new_stream = "contention-between-retries"
+        new_rows = [
+            row for row in refreshed.items if str(row.get("stream_id") or "") == new_stream
+        ]
+        assert len(new_rows) == 1, new_rows
+        new_seq = int(new_rows[0]["stream_seq"])
+        (tmp_path / f"contender-{loser_index}.pause-release").touch()
+
+        try:
+            loser.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("ring loser did not deliver the journal change")
+        output_threads[loser_index].join(timeout=2)
+        assert _materialization_count(materialization_paths[loser_index]) > (
+            observed_materializations
+        ), "journal change did not refresh the cached candidate"
+        output_lines = [
+            json.loads(line)
+            for line in stdout_buffers[loser_index].decode("utf-8").splitlines()
+            if line
+        ]
+        rings = [line for line in output_lines if line.get("kind") == "ring"]
+        assert len(rings) == 1, output_lines
+        ring = rings[0]
+        command_args = shlex.split(ring["advance_command"])
+        position_index = command_args.index("--position")
+        position_args = [
+            value
+            for value in command_args[position_index + 1 :]
+            if not value.startswith("--")
+        ]
+        assert sum(value.startswith(f"{new_stream}=") for value in position_args) == 1
+        assert f"{new_stream}={new_seq}" in position_args, position_args
+        advanced = subprocess.run(
+            command_args,
+            cwd=project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert advanced.returncode == 0, advanced.stderr
+        after_advance = journal.open_or_create_journal(project).cursor_peek(
+            lease.label, nonce=lease.nonce, limit=1000
+        )
+        assert not any(
+            str(row.get("stream_id") or "") == new_stream
+            for row in after_advance.items
+        )
+    finally:
+        for index in range(2):
+            (tmp_path / f"contender-{index}.pause-release").touch()
+        for proc in processes:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+        for proc in processes:
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        for thread in output_threads:
+            thread.join(timeout=2)
+        for handle in stderr_handles:
+            handle.close()
+
+
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGHUP"])
+def test_follow_signal_deadline_covers_slow_notifier_close(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+    signal_name: str,
+) -> None:
+    project, env, lease = isolated
+    signum = getattr(signal, signal_name)
+    marker = tmp_path / f"notifier-close-started-{signal_name}"
+    handlers_ready = tmp_path / f"handlers-installed-{signal_name}"
+    bootstrap = tmp_path / "slow-notifier-close.py"
+    bootstrap.write_text(
+        "\n".join(
+            [
+                "import sys, time",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                "import goalflight_messages",
+                "original_install = goalflight_messages._ListenerDeathWatch.install",
+                "def install_and_mark_ready(watch):",
+                "    original_install(watch)",
+                "    marker = Path(__import__('os').environ['HANDLERS_INSTALLED_MARKER'])",
+                "    temp = marker.with_suffix('.tmp')",
+                "    temp.write_text('installed', encoding='utf-8')",
+                "    temp.replace(marker)",
+                "goalflight_messages._ListenerDeathWatch.install = install_and_mark_ready",
+                "class SlowNotifier:",
+                "    active = False",
+                "    def close(self):",
+                "        Path(__import__('os').environ['SLOW_CLOSE_MARKER']).write_text('started')",
+                "        time.sleep(10)",
+                "goalflight_messages._new_journal_notifier = lambda *_args: SlowNotifier()",
+                "raise SystemExit(goalflight_messages.main(sys.argv[1:]))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(bootstrap),
+            *_follow_command(project, lease, heartbeat_s=60, poll_s=0.01)[2:],
+        ],
+        cwd=project,
+        env={
+            **env,
+            "HANDLERS_INSTALLED_MARKER": str(handlers_ready),
+            "SLOW_CLOSE_MARKER": str(marker),
+            "GOALFLIGHT_WAKE_MODE": "poll",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, proc.pid, timeout_s=10)
+        assert wait_until(handlers_ready.exists, timeout_s=10, interval_s=0.01)
+        started = time.monotonic()
+        proc.send_signal(signum)
+        assert wait_until(marker.exists, timeout_s=3, interval_s=0.01)
+        assert wake.live_waiters(
+            project, controller_label=lease.label, kinds={wake.MONITOR_KIND}
+        ) == []
+        try:
+            stdout, stderr = proc.communicate(
+                timeout=messages.LISTENER_SHUTDOWN_BOUND_S + 1
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=2)
+            raise AssertionError(
+                f"follow exceeded shutdown bound stdout={stdout!r} stderr={stderr!r}"
+            )
+        assert proc.returncode == messages.listener_posix_signal_exit_code(signum)
+        assert time.monotonic() - started <= messages.LISTENER_SHUTDOWN_BOUND_S + 1
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)

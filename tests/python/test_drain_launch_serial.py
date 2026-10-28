@@ -22,7 +22,9 @@ queue at /tmp/goal-flight-501/dispatch-queue.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import subprocess
@@ -42,6 +44,7 @@ sys.path.insert(0, str(ROOT))
 import goalflight_capacity as cap  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
+import goalflight_worktree_pool as seats  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(
@@ -509,6 +512,40 @@ def test_launch_timeout_includes_capacity_and_seat_preparation_window(
     )
 
 
+def test_child_receives_remaining_queue_launch_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_entry(
+        queue,
+        "deadline-child",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    launch = _launched_run_factory(tmp_path)
+    captured = {}
+
+    def capture_deadline(argv, *args, **kwargs):
+        if _is_drain_child(list(argv)):
+            captured["started"] = time.monotonic()
+            captured["deadline"] = float(
+                kwargs["env"][D.DRAIN_LAUNCH_DEADLINE_ENV]
+            )
+            captured["timeout"] = float(kwargs["timeout"])
+        return launch(argv, *args, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, "run", capture_deadline)
+    payload = D._drain_queue_once(
+        _drain_args(queue, launch_budget_s=2.0)
+    )
+
+    remaining = captured["deadline"] - captured["started"]
+    assert 0 < remaining <= captured["timeout"]
+    assert payload["launched"] == 1, payload
+
+
 def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
@@ -579,6 +616,358 @@ def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
         if item.get("dispatch_id") == dispatch_id
     ]
     assert attention and attention[-1]["attention"] == "launch_attempt_limit_exceeded", attention
+
+
+@pytest.mark.parametrize(
+    "trailing_line",
+    [
+        "NOT LAUNCHED: launch refused or failed without publishing a dispatch id",
+        "LAUNCH STATE UNKNOWN: no id; check: python3 goalflight_status.py --json",
+        'DISPATCH-BLOCKED {"state":"blocked_capacity"}',
+        "hint: run goalflight_dispatch.py status --dispatch example",
+    ],
+)
+def test_pre_spawn_failure_keeps_dispatcher_diagnostic_ahead_of_cli_markers(
+    trailing_line: str,
+) -> None:
+    proc = subprocess.CompletedProcess(
+        ["goalflight_dispatch.py", "launch"],
+        returncode=2,
+        stdout=f"{trailing_line}\n",
+        stderr="goalflight_dispatch: prompt file not found: request.md\n",
+    )
+
+    assert D._pre_spawn_launch_failure_reason(proc) == (
+        "launch_refused_pre_spawn:2:prompt file not found: request.md"
+    )
+
+
+@pytest.mark.parametrize(
+    "trailing_line",
+    [
+        "NOT LAUNCHED: launch refused or failed without publishing a dispatch id",
+        "LAUNCH STATE UNKNOWN: no id; check: python3 goalflight_status.py --json",
+        'DISPATCH-BLOCKED {"state":"blocked_capacity"}',
+        "!STATUS: running",
+        "!STEER-ACK: 8",
+        "!RESULT: codex-dispatch — result",
+        "!USER-NEED: codex-dispatch — input needed",
+        "!USER-CONFIRM: codex-dispatch — confirm",
+        "!BLOCKED: codex-dispatch — wait",
+        "!FAILED: codex-dispatch — failed",
+        "!COMPLETE: dispatch-id — summary",
+        "!READY: codex-dispatch — findings.md",
+        "!PERMISSION-OK-PROCEEDED: permission workaround",
+        "hint: run goalflight_dispatch.py status --dispatch example",
+    ],
+)
+def test_pre_spawn_failure_falls_back_to_unprefixed_diagnostic(
+    trailing_line: str,
+) -> None:
+    proc = subprocess.CompletedProcess(
+        ["goalflight_dispatch.py", "launch"],
+        returncode=2,
+        stdout=f"{trailing_line}\n",
+        stderr="slow-fail\n",
+    )
+
+    assert D._pre_spawn_launch_failure_reason(proc) == (
+        "launch_refused_pre_spawn:2:slow-fail"
+    )
+
+
+@pytest.mark.parametrize(
+    ("refusal", "ledger_write_fails"),
+    [("dispatch_branch_in_use", False), ("seat_preparation_failed", False),
+     ("seat_preparation_failed", True)],
+)
+def test_named_seat_refusals_fail_queue_claim_permanently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    ledger_write_fails: bool,
+) -> None:
+    queue = _queue_dir(tmp_path)
+    repo = tmp_path / "seat-repo"
+    repo.mkdir()
+
+    def git(cwd: Path, *args: str) -> str:
+        result = _REAL_SUBPROCESS_RUN(
+            ["git", *args], cwd=cwd, text=True, capture_output=True
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "goalflight-test@example.invalid")
+    git(repo, "config", "user.name", "Goal Flight Test")
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    dispatch_id = f"drain-{refusal}-{'ledger-fail' if ledger_write_fails else 'ok'}"
+    monkeypatch.setenv("GOALFLIGHT_WORKTREES_PER_REPO", "1")
+
+    if refusal == "dispatch_branch_in_use":
+        stale = seats.acquire_worktree_seat(repo, dispatch_id, base=base)
+        stale_path = stale.path
+        stale_branch = stale.branch
+        stale_head = git(stale_path, "rev-parse", "HEAD")
+        stale.release()
+    else:
+        prior = seats.acquire_worktree_seat(repo, "prior-holder", base=base)
+        prior_path = prior.path
+        prior.release()
+        ledger.write_record(
+            {
+                "dispatch_id": "prior-holder",
+                "state": "complete",
+                "prelaunch_failure": True,
+            }
+        )
+        target_branch = seats.seat_branch_name(dispatch_id)
+        real_assert = seats._assert_seat_on_named_branch
+
+        def refuse_after_switch(path: Path, *, seat_name: str, branch: str) -> str:
+            if path == prior_path and branch == target_branch:
+                raise seats.WorktreeSeatError("injected preparation refusal")
+            return real_assert(path, seat_name=seat_name, branch=branch)
+
+        monkeypatch.setattr(seats, "_assert_seat_on_named_branch", refuse_after_switch)
+
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=repo,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    argv = entry["dispatch_argv"]
+    argv = [
+        part
+        for index, part in enumerate(argv)
+        if part != "--cwd" and (index == 0 or argv[index - 1] != "--cwd")
+    ]
+    separator = argv.index("--")
+    argv[separator:separator] = ["--worktree", base]
+    entry["dispatch_argv"] = argv
+    D._write_json_atomic(path, entry)
+    _write_queued_ledger(path)
+
+    if ledger_write_fails:
+        def fail_terminal_ledger(*_args, **_kwargs):
+            raise OSError("simulated terminal ledger write failure")
+
+        monkeypatch.setattr(D, "_finish_ledger", fail_terminal_ledger)
+
+    monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
+    monkeypatch.setattr(D, "_acquire_capacity", lambda *_args, **_kwargs: "test-lease")
+    monkeypatch.setattr(D, "_release_capacity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        D.goalflight_capacity, "mark_lease_spawn_failed", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        D.goalflight_capacity, "mark_lease_spawning", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        D,
+        "_install_capacity_lease_signal_guard",
+        lambda _lease: lambda: None,
+    )
+    monkeypatch.setattr(D, "_stamp_controller_session", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        D, "_prepare_attempt_controller_registration", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        D.goalflight_cursor, "cleanup_dispatch_data", lambda *_args, **_kwargs: None
+    )
+
+    attempts: list[str] = []
+    children: list[subprocess.CompletedProcess] = []
+
+    def inline_dispatch(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if not _is_drain_child(argv_list):
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        attempts.append(argv_list[argv_list.index("--dispatch-id") + 1])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        previous_cwd = Path.cwd()
+        child_cwd = Path(kwargs.get("cwd") or previous_cwd)
+        os.chdir(child_cwd)
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = D.main(argv_list[2:])
+        finally:
+            os.chdir(previous_cwd)
+        result = subprocess.CompletedProcess(
+            argv_list, code, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+        )
+        children.append(result)
+        return result
+
+    monkeypatch.setattr(D.subprocess, "run", inline_dispatch)
+    payload = D._drain_queue_once(_drain_args(queue))
+
+    assert payload["failed"] == 1, payload
+    assert attempts == [dispatch_id]
+    assert not path.exists()
+    failed_paths = list(queue.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert len(failed_paths) == 1, failed_paths
+    failed = json.loads(failed_paths[0].read_text(encoding="utf-8"))
+    reason = str(failed.get("reason") or "")
+    assert refusal in reason, failed
+    if refusal == "seat_preparation_failed":
+        assert "injected preparation refusal" in reason, failed
+    assert D._permanent_pre_spawn_refusal_reason(children[0]) == reason
+    record = ledger.read_record(dispatch_id)
+    if ledger_write_fails:
+        assert record and ledger.terminal_state_for(
+            record.get("state"), record.get("reason")
+        ) in {"", "unknown", "watcher_stopped"}, record
+    else:
+        assert record and record.get("state") == "failed_worktree", record
+        assert record.get("reason") == reason, record
+
+    again = D._drain_queue_once(_drain_args(queue))
+    assert attempts == [dispatch_id]
+    assert again["launched"] == 0, again
+    if ledger_write_fails:
+        with pytest.raises(seats.WorktreeSeatUnavailable):
+            seats.acquire_worktree_seat(repo, "must-stay-held", base=base)
+
+
+@pytest.mark.parametrize(
+    ("reason", "state", "detached"),
+    [
+        (
+            "seat_preparation_failed:s-1; original preparation refusal: injected ACP refusal",
+            "failed_worktree",
+            True,
+        ),
+        (
+            "dispatch_branch_in_use:s-1; dispatch again under a new id",
+            "failed_worktree",
+            True,
+        ),
+        ("codex_home_missing: retry home could not be rebuilt", "failed", False),
+        (
+            "codex_home_account_mismatch: recorded home belongs to another account",
+            "failed",
+            False,
+        ),
+    ],
+    ids=("seat-preparation", "branch-in-use", "home-missing", "account-mismatch"),
+)
+def test_acp_refusals_permanently_fail_through_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    state: str,
+    detached: bool,
+) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "acp-project"
+    project.mkdir()
+    dispatch_id = "acp-permanent-refusal"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    argv = entry["dispatch_argv"]
+    argv[argv.index("--agent") + 1] = "codex"
+    argv = [
+        part
+        for index, part in enumerate(argv)
+        if part != "--cwd" and (index == 0 or argv[index - 1] != "--cwd")
+    ]
+    separator = argv.index("--")
+    argv[separator:separator] = ["--shape", "acp", "--prompt", "ACP refusal test"]
+    entry["dispatch_argv"] = argv
+    entry["agent"] = "codex"
+    entry["shape"] = "acp"
+    entry["request"]["agent"] = "codex"
+    D._write_json_atomic(path, entry)
+    _write_queued_ledger(path)
+
+    monkeypatch.setattr(D, "_resolve_account_env", lambda _args: None)
+    monkeypatch.setattr(D, "_recorded_codex_dispatch_home", lambda _args: (None, None, None))
+    monkeypatch.setattr(D, "_refuse_static_account_configuration", lambda _args: None)
+    monkeypatch.setattr(
+        D, "_pre_resolve_pinned_codex_account", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(D, "_prepare_attempt_controller_registration", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(D, "_commit_task_redispatch_and_release", lambda _args: None)
+    monkeypatch.setattr(D, "_release_redispatch_store_lock", lambda _args: None)
+    monkeypatch.setattr(D.goalflight_compat, "pid_alive", lambda _pid: False)
+
+    spawn_calls: list[bool] = []
+
+    def spawn_detached(argv, **_kwargs):
+        argv = list(argv)
+        spawn_calls.append(True)
+        assert "--acp-detached-child" in argv, argv
+        status_json = Path(argv[argv.index("--status-json") + 1])
+        status_json.write_text(
+            json.dumps({"state": state, "error": reason}), encoding="utf-8"
+        )
+        return 987654
+
+    monkeypatch.setattr(D, "_spawn_daemonized_process", spawn_detached)
+    if detached:
+        monkeypatch.setattr(D, "_resolve_launch_account_env", lambda _args: {})
+    else:
+        def refuse_account_home(_args):
+            raise D.DispatchUsageError(reason)
+
+        monkeypatch.setattr(D, "_resolve_launch_account_env", refuse_account_home)
+    attempts: list[str] = []
+    children: list[subprocess.CompletedProcess] = []
+
+    def inline_dispatch(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if not _is_drain_child(argv_list):
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        attempts.append(argv_list[argv_list.index("--dispatch-id") + 1])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        previous_cwd = Path.cwd()
+        child_cwd = Path(kwargs.get("cwd") or previous_cwd)
+        os.chdir(child_cwd)
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = D.main(argv_list[2:])
+        finally:
+            os.chdir(previous_cwd)
+        result = subprocess.CompletedProcess(
+            argv_list, code, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+        )
+        children.append(result)
+        return result
+
+    monkeypatch.setattr(D.subprocess, "run", inline_dispatch)
+    payload = D._drain_queue_once(_drain_args(queue))
+
+    assert payload["failed"] == 1, payload
+    assert attempts == [dispatch_id]
+    assert bool(spawn_calls) is detached
+    assert not path.exists()
+    failed_paths = list(queue.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert len(failed_paths) == 1, failed_paths
+    failed = json.loads(failed_paths[0].read_text(encoding="utf-8"))
+    assert failed.get("reason") == reason, failed
+    assert D._permanent_pre_spawn_refusal_reason(children[0]) == reason
+    record = ledger.read_record(dispatch_id)
+    assert record and record.get("state") == state, record
+    assert record.get("reason") == reason, record
+    assert record.get("prelaunch_failure") is True, record
+
+    again = D._drain_queue_once(_drain_args(queue))
+    assert attempts == [dispatch_id]
+    assert again["launched"] == 0, again
 
 
 def test_legacy_launch_timeout_count_does_not_spend_new_failure_budget(

@@ -87,7 +87,7 @@ def test_exact_renewal_refuses_without_state_change(startup, mismatch):
     assert snapshot(authority) == before
 
 
-def test_exact_renewal_changes_only_deadline(startup):
+def test_exact_renewal_changes_deadline_and_roster_heartbeat(startup):
     authority, lease, _args, _holders = startup
     before = snapshot(authority)
     result = authority.renew_active_lease(
@@ -95,9 +95,14 @@ def test_exact_renewal_changes_only_deadline(startup):
     )
     assert result.committed and result.value is not None
     assert result.value.renew_deadline_at > lease.renew_deadline_at
+    assert result.value.renewed_at > lease.renewed_at
     after = snapshot(authority)
-    assert tuple(line.replace(result.value.renew_deadline_at, lease.renew_deadline_at)
-                 for line in after) == before
+    assert tuple(
+        line.replace(result.value.renew_deadline_at, lease.renew_deadline_at).replace(
+            result.value.renewed_at, lease.renewed_at
+        )
+        for line in after
+    ) == before
 
 
 def test_supervise_refuses_lost_generation_at_write(startup, monkeypatch, capsys):
@@ -134,7 +139,8 @@ def test_refused_start_does_not_renew(startup, monkeypatch, refusal):
             ),
         )
     before = snapshot(authority)
-    assert supervise.cmd_supervise(args, on_startup_probe=callback) == supervise.SUPERVISE_START_EXIT
+    expected_exit = 0 if refusal == "duplicate" else supervise.SUPERVISE_START_EXIT
+    assert supervise.cmd_supervise(args, on_startup_probe=callback) == expected_exit
     assert snapshot(authority) == before
 
 

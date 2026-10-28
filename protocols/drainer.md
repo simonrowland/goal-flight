@@ -7,9 +7,10 @@ D007/D008 worker-death family: a controller exits, the host reaper tears down
 the loop, and queued dispatch rows stop launching.
 For dead-worker rows that already have tail bytes, run `protocols/dispatched-worker-recovery.md` §"Worker death with tail bytes present (tail harvest)" before treating the work as lost.
 
-`com.goalflight.drain` avoids that failure mode. Launchd starts a fresh short
-`goalflight_dispatch.py drain --json` pass every 60 seconds, outside any Claude,
-Codex, or other controller session. Each pass normally runs for about one
+`com.goalflight.drain` avoids that failure mode. Launchd starts the log wrapper
+every 60 seconds; it starts the retention sweep detached, rotates logs, then
+execs a fresh short `goalflight_dispatch.py drain --cross-project --json` pass,
+outside any Claude, Codex, or other controller session. Each pass normally runs for about one
 second, tops up available capacity, and exits. Session end does not remove the
 launchd agent, so queue draining survives compaction, shell exit, and harness
 reaping.
@@ -22,7 +23,7 @@ The canonical macOS drainer is a per-user LaunchAgent:
 - plist: `~/Library/LaunchAgents/com.goalflight.drain.plist`
 - template: `scripts/templates/com.goalflight.drain.plist.tmpl`
 - installer: `scripts/install-drainer.sh`
-- command: `python3 <skill-root>/scripts/goalflight_dispatch.py drain --json`
+- command: `python3 <skill-root>/scripts/goalflight_daemon_logs.py ~/.goal-flight/drain-launchd.log python3 <skill-root>/scripts/goalflight_dispatch.py drain --cross-project --json`
 - cadence: `StartInterval` 60 plus `RunAtLoad`
 - log: `~/.goal-flight/drain-launchd.log`
 
@@ -32,11 +33,14 @@ values at install time so repository files stay portable.
 
 ## Daemon log retention (macOS)
 
-The drainer's launchd command first runs `goalflight_daemon_logs.py`, then execs
-the same drain command. Each 60-second tick checks six explicit log paths with
-the built-in `/usr/sbin/newsyslog`; a retention error is reported to stderr and
-does not prevent the drain pass. The existing `GOALFLIGHT_DRAIN_LOG` override
-still selects the drainer log. The other five paths are under `~/.goal-flight`.
+The drainer's launchd command first runs `goalflight_daemon_logs.py`. The wrapper
+starts `goalflight_reap_dispatch_homes.py --delete` in a detached session and
+writes its output to `dispatch-retention.log` beside the configured drain log,
+then checks seven explicit log paths with the built-in `/usr/sbin/newsyslog`; a
+retention error is reported to stderr and does not prevent the drain pass. The
+existing `GOALFLIGHT_DRAIN_LOG` override
+still selects the drainer log. The fleet and seat daemon logs are under
+`~/.goal-flight`.
 No root installation, extra daemon, or Python logging framework is required.
 The wrapper skips any requested log path that is itself a symlink rather than
 passing it to `newsyslog`.
@@ -51,11 +55,15 @@ their newest bytes are never trimmed to fit. Those archives expire through
 subsequent size-triggered rotations, so initial disk use need not fall immediately.
 Old manually named archives are outside this policy.
 
+The dispatch disk-space floor is checked once when each launch path starts;
+space that drops below the floor while it waits for capacity does not cancel it.
+
 Writer inventory verified on the affected host (2026-09-13):
 
 | Log | Writer and lifecycle |
 | --- | --- |
 | `drain-launchd.log` | `com.goalflight.drain`, one drain pass every 60 s |
+| `dispatch-retention.log` (beside drain log) | Detached retention sweep, launched by `goalflight_daemon_logs.py` |
 | `fleet-console-fleet-launchd.log` | `com.goalflight.fleet-console.fleet`, one producer tick every 60 s, 30 s budget |
 | `fleet-console-attention-launchd.log` | `com.goalflight.fleet-console.attention`, one producer tick every 20 s, 10 s budget |
 | `codex-accountd.log` | Installed provider-account rotator, external `scripts/ext/codex_seatd.py tick`, one pass every 300 s |

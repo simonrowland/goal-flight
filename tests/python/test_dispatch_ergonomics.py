@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -122,7 +123,7 @@ def test_read_only_review_artifact_guard() -> None:
     with tempfile.TemporaryDirectory() as td:
         prompt = Path(td) / "review.md"
         prompt.write_text(
-            "Run review. Write the findings to docs-private/reviews/x/codex-review.final.md.\n",
+            "Run review. Write the findings to reviews/x/codex-review.final.md.\n",
             encoding="utf-8",
         )
         args = _args(read_only=True, prompt=None, prompt_file=str(prompt))
@@ -131,6 +132,10 @@ def test_read_only_review_artifact_guard() -> None:
         except D.DispatchUsageError as exc:
             text = str(exc)
             check("read-only write prompt is refused", "cannot write review files" in text)
+            check(
+                "read-only refusal includes the matched span",
+                "Write the findings to reviews/x/codex-review.final.md" in text,
+            )
             check("guard points to inline return", "return findings inline" in text)
             check("guard points to writable sandbox", "writable sandbox/worktree" in text)
         else:
@@ -150,9 +155,89 @@ def test_read_only_review_artifact_guard() -> None:
     else:
         check("inline read-only review prompt is allowed", True)
 
+    persistence_probes = (
+        ("Create a detailed review at docs-private/x.md.", "docs-private/x.md", True),
+        (
+            "Append the final findings to docs-private/x.md, then deliver the verdict in chat.",
+            "docs-private/x.md",
+            True,
+        ),
+        ("Update the existing review file with findings.", "review file", True),
+        ("Write the review findings to reviews/x.md.", "reviews/x.md", True),
+        ("Save `findings` to `docs-private/x.md`.", "docs-private/x.md", True),
+        ("Write findings into the review log file.", "review log file", True),
+        ("Append each finding from the review to the file.", "to the file", True),
+        ("Write the review\nto docs-private/x.md.", "docs-private/x.md", True),
+        ("Save the findings to\n`reviews/x.md`.", "reviews/x.md", True),
+        ("Append findings to the\nreview log file.", "review log file", True),
+        ("Write a review of v1.2 to docs-private/x.md.", "docs-private/x.md", True),
+        (
+            "Write the review to docs-private/x.md; cite src/main.py:12.",
+            "docs-private/x.md",
+            True,
+        ),
+        ("Write the review to docs-private/x.md:12.", "docs-private/x.md", True),
+        ("Save the findings to `reviews/x.md:12`.", "reviews/x.md", True),
+    )
+    citation_probes = (
+        ("Append-then-deliver the verdict in chat; findings cite `file:line`.", True),
+        ("Append each finding to the verdict summary with a `file:line` citation.", True),
+        ("Append the final findings to the verdict in chat; return findings inline and cite docs-private/x.md:line.", True),
+        ("Update the verdict summary with a file:123 citation.", True),
+        ("Write the review file:12.", True),
+    )
+    corpus_false_positive_probes = (
+        "write seat deduplication (goal-flight 1.7.x). Findings INLINE in your final message. base: f9a79011",
+        "write NO code and NO files; report INLINE",
+        "write them out in pieces; otherwise skip it and report the numbers. Gates and hazards as before",
+    )
+    probe_table = tuple(
+        (prompt_text, destination, old_refuses, False, True)
+        for prompt_text, destination, old_refuses in persistence_probes
+    ) + tuple(
+        (prompt_text, None, old_refuses, True, False)
+        for prompt_text, old_refuses in citation_probes
+    ) + tuple(
+        (prompt_text, None, False, False, False)
+        for prompt_text in corpus_false_positive_probes
+    )
+    for index, (prompt_text, destination, old_refuses, is_citation, expected_refusal) in enumerate(
+        probe_table, 1
+    ):
+        args = _args(read_only=True, prompt=prompt_text)
+        reason = D._read_only_write_prompt_reason(args)
+        actually_refuses = reason is not None
+        if old_refuses and not is_citation:
+            check(
+                f"probe {index} preserves old matcher refusal",
+                actually_refuses,
+            )
+        if is_citation:
+            check(f"probe {index} citation exemption applies", not actually_refuses)
+        check(
+            f"probe {index} has expected write-intent result",
+            actually_refuses is expected_refusal,
+        )
+        try:
+            D._guard_read_only_write_prompt(args)
+        except D.DispatchUsageError as exc:
+            check(f"probe {index} refusal matches table", expected_refusal)
+            if reason is not None:
+                check(
+                    f"probe {index} reports its matched span",
+                    f"matched {reason[0]}: {reason[1]!r}" in str(exc),
+                )
+                if destination is not None:
+                    check(
+                        f"probe {index} reports its destination",
+                        destination in reason[1],
+                    )
+        else:
+            check(f"probe {index} refusal matches table", not expected_refusal)
+
     args = _args(
         read_only=True,
-        prompt="Review the staged diff. Write your review to docs-private/reviews/x/review.md.",
+        prompt="Review the staged diff. Write your review to reviews/x/review.md.",
     )
     try:
         D._guard_read_only_write_prompt(args)
@@ -163,9 +248,41 @@ def test_read_only_review_artifact_guard() -> None:
 
     args = _args(
         read_only=True,
+        prompt="Save your verdict to reviews/x/verdict.md.",
+    )
+    try:
+        D._guard_read_only_write_prompt(args)
+    except D.DispatchUsageError as exc:
+        text = str(exc)
+        check("read-only verdict path prompt is refused", "cannot write review files" in text)
+        check(
+            "verdict refusal includes the matched span",
+            "Save your verdict to reviews/x/verdict.md" in text,
+        )
+    else:
+        check("read-only verdict path prompt is refused", False)
+
+    args = _args(read_only=True, prompt="Write the review file.")
+    try:
+        D._guard_read_only_write_prompt(args)
+    except D.DispatchUsageError as exc:
+        text = str(exc)
+        check(
+            "read-only review file destination is refused",
+            "cannot write review files" in text,
+        )
+        check(
+            "file destination refusal includes the matched span",
+            "Write the review file" in text,
+        )
+    else:
+        check("read-only review file destination is refused", False)
+
+    args = _args(
+        read_only=True,
         prompt=(
             "Review the staged diff. Write your review to "
-            "docs-private/reviews/x/review.md and return inline in the final response."
+            "reviews/x/review.md and return inline in the final response."
         ),
     )
     try:
@@ -607,7 +724,11 @@ def test_windows_acp_warnings_written_to_tail() -> None:
         orig_build_acp_cfg = D._build_acp_cfg
         orig_refuse_reused = D._refuse_reused_nonterminal_dispatch_id
         orig_run_acp_dispatch = ACP.run_acp_dispatch
+        old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+        old_dispatch_dir = os.environ.get("GOALFLIGHT_DISPATCH_DIR")
         try:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(base / "state")
+            os.environ["GOALFLIGHT_DISPATCH_DIR"] = str(base / "dispatch")
             D.goalflight_compat.is_windows = lambda: True
             # Signature mirrors the real _build_acp_cfg (base= added with the
             # persisted-prompt work); extra kwargs are absorbed so this double
@@ -634,6 +755,14 @@ def test_windows_acp_warnings_written_to_tail() -> None:
             D._build_acp_cfg = orig_build_acp_cfg
             D._refuse_reused_nonterminal_dispatch_id = orig_refuse_reused
             ACP.run_acp_dispatch = orig_run_acp_dispatch
+            if old_state_dir is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+            if old_dispatch_dir is None:
+                os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_DISPATCH_DIR"] = old_dispatch_dir
 
         tail_text = tail.read_text(encoding="utf-8")
         check("windows ACP refusal keeps exit code", code == 2)
@@ -704,6 +833,21 @@ def test_dispatch_end_hint() -> None:
           ) is None)
 
 
+def test_cross_engine_account_refusal_names_valid_accounts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        accounts = home / ".goal-flight" / "accounts"
+        (accounts / "grok-seat" / "grok").mkdir(parents=True)
+        (accounts / "codex-seat" / "codex").mkdir(parents=True)
+        with patch.object(Path, "home", return_value=home):
+            error = D._static_account_configuration_error(
+                SimpleNamespace(agent="codex"), "grok-seat"
+            )
+        check("wrong-engine account names its owning engine", "belongs to grok, not codex" in error)
+        check("wrong-engine account lists requested-engine account", "configured codex accounts: codex-seat" in error)
+        check("wrong-engine refusal does not disclose account paths", ".goal-flight" not in error and "auth.json" not in error)
+
+
 def test_codex_reasoning_effort_flag() -> None:
     """The effort flag must reach the worker command, and only when asked for.
 
@@ -760,6 +904,7 @@ def main() -> int:
     test_windows_acp_warnings_written_to_tail()
     test_reused_nonterminal_dispatch_id_guard()
     test_dispatch_end_hint()
+    test_cross_engine_account_refusal_names_valid_accounts()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

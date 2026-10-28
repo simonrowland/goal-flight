@@ -33,7 +33,7 @@ EXT_LIST_PATH = EXT_MODULE_REL.as_posix()
 
 _RUNNER_FRAGMENTS = textwrap.dedent(
     """\
-    # python3 -m pytest tests/python -q
+    # python3 tests/run_python.py
     # find tests/python -type f -name 'test_*.py'
     # $skip skipped
     # skill_structure_collected

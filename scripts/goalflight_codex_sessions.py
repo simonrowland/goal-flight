@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import goalflight_terminal
+
 
 _SESSION_ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -52,6 +54,18 @@ def rollout_path(home: Path, session_id: str) -> Path | None:
     return None
 
 
+def rollout_index(home: Path) -> dict[str, Path]:
+    sessions = home / "sessions"
+    if not sessions.is_dir():
+        return {}
+    found: dict[str, Path] = {}
+    for path in sessions.rglob("rollout-*.jsonl"):
+        match = _ROLLOUT_NAME_RE.fullmatch(path.name)
+        if match and path.is_file():
+            found.setdefault(match.group(1).lower(), path)
+    return found
+
+
 def discover_session_id(home: Path) -> str | None:
     """Return the sole recorded rollout UUID; never guess among multiple sessions."""
     sessions = home / "sessions"
@@ -67,7 +81,9 @@ def discover_session_id(home: Path) -> str | None:
     return next(iter(found), None)
 
 
-def session_id_from_tail(home: Path, tail: Path) -> str | None:
+def session_id_from_tail(
+    home: Path, tail: Path, *, rollout_index: dict[str, Path] | None = None
+) -> str | None:
     """Return this dispatch's banner UUID after its rollout exists in ``home``.
 
     Canonical account homes are shared by concurrent dispatches, so their
@@ -77,7 +93,7 @@ def session_id_from_tail(home: Path, tail: Path) -> str | None:
     matching rollout file exists.
     """
     try:
-        with Path(tail).open("rb") as stream:
+        with goalflight_terminal.open_tail_reader(tail) as stream:
             prefix = stream.read(_BANNER_READ_LIMIT).decode(
                 "utf-8", errors="replace"
             )
@@ -92,5 +108,8 @@ def session_id_from_tail(home: Path, tail: Path) -> str | None:
         session_id = valid_session_id(match.group(1))
         if session_id is None:
             return None
-        return session_id if rollout_path(Path(home), session_id) else None
+        if rollout_index is None:
+            return session_id if rollout_path(Path(home), session_id) else None
+        rollout = rollout_index.get(session_id)
+        return session_id if rollout is not None and rollout.is_file() else None
     return None

@@ -552,9 +552,52 @@ def test_corrupt_assigned_carrier_surfaces_warning_without_advancing(
         handle.write(b"{broken\n")
     before = authority.cursor_status("notice")
     summary = messages.controller_mail_summary(task_store_project_root=root)
-    assert summary["count"] == 0
+    assert summary["count"] == 1
+    assert summary["needs"][0]["type"] == "controller-notice"
     assert len(summary["carrier_errors"]) == 1
     assert authority.cursor_status("notice") == before
+
+
+def test_summary_does_not_list_user_confirm_behind_stuck_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, _authority = _mail(monkeypatch, tmp_path)
+    messages_dir = tmp_path / "messages"
+    first = messages.post_message(
+        dispatch_id="summary-stuck-stream",
+        msg_type="controller-notice",
+        payload={"text": "stuck head"},
+        messages_dir=messages_dir,
+        source={"node": "test-node", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee("notice", project_root=root),
+    )
+    confirm = messages.post_message(
+        dispatch_id="summary-stuck-stream",
+        msg_type="user_confirm",
+        payload={"text": "confirm behind stuck head"},
+        messages_dir=messages_dir,
+        source={"node": "test-node", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee("notice", project_root=root),
+    )
+    carrier = Path(first["path"])
+    lines = carrier.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    carrier.write_text("{invalid stuck head\n" + lines[1] + "\n", encoding="utf-8")
+
+    summary = messages.controller_mail_summary(task_store_project_root=root)
+
+    assert summary["count"] == 0
+    assert summary["needs"] == []
+    assert summary["carrier_errors"][0]["delivery_id"] == first["envelope"]["id"]
+    assert confirm["envelope"]["id"] not in str(summary["needs"])
+
+    carrier.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    repaired = messages.controller_mail_summary(task_store_project_root=root)
+    assert repaired["count"] == 2
+    assert [item["type"] for item in repaired["needs"]] == [
+        "controller-notice",
+        "user_confirm",
+    ]
 
 
 def test_live_monitor_with_stale_nonce_warns_orphaned(
@@ -720,7 +763,137 @@ def test_live_monitor_with_unreadable_journal_reports_unknown(
     assert "ORPHANED" not in output
 
 
-def test_live_monitor_with_invalid_journal_reports_unknown(
+def test_materialization_journal_busy_degrades_mail_summary_and_notice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _mail(monkeypatch, tmp_path)
+    active = authority.active_lease("notice")
+    assert active is not None
+    _stub_live_monitor(
+        monkeypatch,
+        root,
+        label="notice",
+        nonce=active.nonce,
+    )
+    messages.post_message(
+        dispatch_id="busy-materialization",
+        msg_type="controller-notice",
+        payload={"text": "pending"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test-node", "adapter": "test", "transport": "controller"},
+        addressee=messages.controller_addressee("notice", project_root=root),
+    )
+
+    def busy(*_args: object, **_kwargs: object) -> list[tuple[dict, dict]]:
+        raise journal.JournalBusy("held by materialization test")
+
+    with monkeypatch.context() as transient:
+        transient.setattr(messages, "_deliverable_rows", busy)
+        summary = messages.controller_mail_summary(task_store_project_root=root)
+        assert "count" not in summary
+        assert summary["monitor_lease"]["state"] == "unknown"
+        assert summary["monitor_lease"]["reason"] == "JournalBusy"
+        stream = io.StringIO()
+        assert messages.emit_controller_mail_notice(
+            project_root=root,
+            owned_dispatch_ids=set(),
+            stream=stream,
+        ) is None
+        assert "UNKNOWN" in stream.getvalue()
+        assert "new mail" not in stream.getvalue()
+
+    healthy = messages.controller_mail_summary(task_store_project_root=root)
+    assert healthy["count"] == 1
+    assert healthy["needs"][0]["dispatch_id"] == "busy-materialization"
+    stream = io.StringIO()
+    notice = messages.emit_controller_mail_notice(
+        project_root=root,
+        owned_dispatch_ids=set(),
+        stream=stream,
+    )
+    assert notice == "1 new mail; peek: goalflight_messages.py relay --new"
+    assert "1 new mail" in stream.getvalue()
+
+
+def test_materialization_integrity_fails_closed_across_mail_surfaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _mail(monkeypatch, tmp_path)
+    active = authority.active_lease("notice")
+    assert active is not None
+    _stub_live_monitor(monkeypatch, root, label="notice", nonce=active.nonce)
+    messages.post_message(
+        dispatch_id="integrity-materialization",
+        msg_type="controller-notice",
+        payload={"text": "pending"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test-node", "adapter": "test", "transport": "controller"},
+        addressee=messages.controller_addressee("notice", project_root=root),
+    )
+
+    def integrity(*_args: object, **_kwargs: object) -> list[tuple[dict, dict]]:
+        raise journal.JournalIntegrityError("integrity fault during materialization")
+
+    monkeypatch.setattr(messages, "_deliverable_rows", integrity)
+    with pytest.raises(journal.JournalIntegrityError, match="integrity fault"):
+        messages.controller_mail_summary(task_store_project_root=root)
+    with pytest.raises(journal.JournalIntegrityError, match="integrity fault"):
+        messages.emit_controller_mail_notice(
+            project_root=root,
+            owned_dispatch_ids=set(),
+            stream=io.StringIO(),
+        )
+
+    # CLI entrypoints report fatal integrity failures with a nonzero exit.
+    from contextlib import redirect_stderr
+
+    drain_err = io.StringIO()
+    with redirect_stderr(drain_err):
+        drain_rc = messages.main(
+            [
+                "--messages-dir", str(tmp_path / "messages"),
+                "relay", "--project-root", str(root),
+                "--controller-label", "notice", "--drain", "--json",
+            ]
+        )
+    assert drain_rc == 1
+    assert "JournalIntegrityError" in drain_err.getvalue()
+
+    holder = wake.register_lease_holder(
+        root, controller_label="notice", lease_nonce=active.nonce
+    )
+    monkeypatch.setattr(
+        messages,
+        "_resolve_listen_auto_lease",
+        lambda *_args, **_kwargs: {
+            "claimed": True,
+            "label": "notice",
+            "nonce": active.nonce,
+        },
+    )
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setenv("GOALFLIGHT_TEST_LISTENER_START_TOKEN", "integrity-listener-token")
+    listener_err = io.StringIO()
+    from contextlib import redirect_stderr
+
+    try:
+        with redirect_stderr(listener_err):
+            listener_rc = messages.main(
+                [
+                    "--messages-dir", str(tmp_path / "messages"),
+                    "listen", "--project-root", str(root),
+                    "--controller-label", "notice", "--lease-nonce", active.nonce,
+                    "--poll-secs", "0.01", "--timeout-s", "1", "--json",
+                ]
+            )
+    finally:
+        holder.close()
+    assert listener_rc == 1
+    assert "JournalIntegrityError" in listener_err.getvalue()
+    assert "integrity fault during materialization" in listener_err.getvalue()
+
+
+def test_live_monitor_with_invalid_journal_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority = _mail(monkeypatch, tmp_path)
@@ -732,12 +905,14 @@ def test_live_monitor_with_invalid_journal_reports_unknown(
         raise journal.JournalIntegrityError("invalid test journal")
 
     monkeypatch.setattr(journal.Journal, "open_reader", invalid)
-    summary, output = _summary_and_notice(root)
-
-    assert summary["monitor_lease"]["state"] == "unknown"
-    assert summary["monitor_lease"]["reason"] == "JournalIntegrityError"
-    assert "UNKNOWN" in output
-    assert "ORPHANED" not in output
+    with pytest.raises(journal.JournalIntegrityError, match="invalid test journal"):
+        messages.controller_mail_summary(task_store_project_root=root)
+    with pytest.raises(journal.JournalIntegrityError, match="invalid test journal"):
+        messages.emit_controller_mail_notice(
+            project_root=root,
+            owned_dispatch_ids=set(),
+            stream=io.StringIO(),
+        )
 
 
 def test_live_monitor_with_pending_journal_upgrade_propagates_refusal(

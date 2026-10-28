@@ -9,6 +9,7 @@ skip_posix_on_native_windows("fleet dispatch fixtures use POSIX /tmp paths")
 
 import io
 import base64
+import datetime as dt
 import json
 import os
 import re
@@ -28,9 +29,10 @@ import goalflight_fleet_preflight as fleet_preflight
 import goalflight_fleet_status as status
 import goalflight_ledger as ledger
 import goalflight_agent_limits as agent_limits
+import goalflight_journal as journal
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -180,6 +182,7 @@ def test_explicit_dry_run_preview() -> None:
             prompt="chunk.md",
             dispatch_id="acp-dispatch-explicit",
             base_sha=BASE_SHA,
+            attempt_id="queued-attempt-token",
         )
         payload = preview.to_dict()
         assert_true("node", payload["node"] == "localhost")
@@ -202,10 +205,14 @@ def test_explicit_dry_run_preview() -> None:
         launch = next(c for c in payload["remote_commands"] if c["command_class"] == "launch_detached")
         assert_true("launch has no preselected cwd", "--cwd" not in launch["argv"])
         assert_true("launch base sha", launch["argv"][launch["argv"].index("--base-sha") + 1] == BASE_SHA)
+        attempt_status_path = fleet_dispatch.remote_status_path_for_dispatch(
+            "/tmp/goal-flight-dispatch-test",
+            "acp-dispatch-explicit",
+            attempt_id="queued-attempt-token",
+        )
         assert_true(
-            "launch status json",
-            "/tmp/goal-flight-dispatch-test/dispatches/acp-dispatch-explicit/status.json"
-            in launch["argv"],
+            "launch status json is attempt scoped",
+            attempt_status_path in launch["argv"],
         )
         assert_true(
             "launch billing account",
@@ -407,6 +414,77 @@ def test_preview_ignores_live_ssh_env() -> None:
             payload = json.loads(stdout.getvalue())
             assert_true("preview ok", code == 0)
             assert_true("dry run", payload["dry_run"] is True)
+
+
+def test_remote_status_path_is_scoped_to_queue_attempt() -> None:
+    dispatch_id = "queued-remote-attempt"
+    ordinary = fleet_dispatch.remote_status_path_for_dispatch(
+        "/home/dev/.goal-flight", dispatch_id
+    )
+    attempt = fleet_dispatch.remote_status_path_for_dispatch(
+        "/home/dev/.goal-flight", dispatch_id, attempt_id="queue-token-late"
+    )
+    assert_true("ordinary path preserved", ordinary.endswith(f"/{dispatch_id}/status.json"))
+    assert_true("attempt path differs", attempt != ordinary)
+    assert_true("attempt path is under dispatch", f"/{dispatch_id}/attempts/" in attempt)
+    assert_true("attempt path ends at status", attempt.endswith("/status.json"))
+
+
+def test_attempt_scoped_launch_uses_attempt_scoped_tail() -> None:
+    dispatch_id = "queued-remote-tail"
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        status_json = Path(
+            fleet_dispatch.remote_status_path_for_dispatch(
+                str(state_dir), dispatch_id, attempt_id="queue-token-late"
+            )
+        )
+        args = Args(
+            repo_root=str(ROOT),
+            state_dir=str(state_dir),
+            dispatch_id=dispatch_id,
+            node_id="localhost",
+            agent="codex-acp",
+            prompt_b64=base64.b64encode(b"attempt scoped launch").decode("ascii"),
+            cwd=str(ROOT),
+            status_json=str(status_json),
+            read_only=False,
+            recover_unconfirmed=False,
+            base_sha=BASE_SHA,
+        )
+        captured: list[list[str]] = []
+
+        class FakeProcess:
+            pid = 4242
+            returncode = None
+
+            def poll(self):
+                return None
+
+        old_popen = fleet_launch.subprocess.Popen
+        old_identity = fleet_launch._process_identity
+        fleet_launch.subprocess.Popen = lambda argv, **_kwargs: (
+            captured.append(list(argv)) or FakeProcess()
+        )
+        fleet_launch._process_identity = lambda pid: {
+            "pid": pid,
+            "lstart": "Thu Jun 11 12:00:00 2026",
+            "comm": "python3",
+        }
+        try:
+            with redirect_stdout(io.StringIO()):
+                code = fleet_launch._launch(args)
+        finally:
+            fleet_launch.subprocess.Popen = old_popen
+            fleet_launch._process_identity = old_identity
+
+        assert_true("launch succeeds", code == 0)
+        child_argv = captured[0]
+        tail_index = child_argv.index("--tail")
+        assert_true(
+            "tail follows attempt status directory",
+            child_argv[tail_index + 1] == str(status_json.with_name("worker.tail")),
+        )
 
 
 def test_preflight_passthrough_refuse_and_override_cli_flow() -> None:
@@ -938,6 +1016,73 @@ def test_stub_terminal_projects_journal_time() -> None:
                     os.environ[key] = value
 
 
+def test_stub_terminal_routes_to_active_controller_owner() -> None:
+    keys = (
+        "GOALFLIGHT_STATE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_TASK_STORE",
+        "GOALFLIGHT_WAKE_LEDGER",
+        "GOALFLIGHT_PIDFILE_DIR",
+        "GOALFLIGHT_CAPACITY_CONF",
+        "GOALFLIGHT_CONTROLLER_LABEL",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+    )
+    old_env = {key: os.environ.get(key) for key in keys}
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        try:
+            for key in keys[:6]:
+                os.environ[key] = str(tmp / key.lower())
+            os.environ["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+            authority = journal.open_or_create_journal(ROOT)
+            owners = {}
+            for label in ("controller-a", "controller-b"):
+                claim = authority.claim_or_renew_lease(
+                    label, principal={"principal_id": label}
+                )
+                assert_true(f"{label} lease", claim.committed and claim.value is not None)
+                owners[label] = claim.value
+            owner = owners["controller-a"]
+            assert owner is not None
+            os.environ["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-a"
+            os.environ["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = owner.nonce
+
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            preview = fleet_dispatch.preview_dispatch(
+                fleet_dir,
+                node_id="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                dispatch_id="fleet-terminal-owner-route",
+                base_sha=BASE_SHA,
+            )
+            result = fleet_dispatch.execute_dispatch(
+                fleet_dir, preview, runner=receipt_runner, stub_terminal=True
+            )
+            assert_true("fleet terminal committed", result["ok"] is True)
+            authority.project_terminal_outbox(
+                messages_dir=Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+            )
+            recipients = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? AND withdrawn_at IS NULL""",
+                (preview.dispatch_id,),
+            )
+            assert_true(
+                "fleet terminal reaches only its owner",
+                [str(row["recipient_label"]) for row in recipients] == ["controller-a"],
+            )
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 def test_launch_unconfirmed_keeps_account_lock() -> None:
     def fail_launch(argv: list[str]) -> tuple[int, str, str]:
         joined = " ".join(argv)
@@ -1386,6 +1531,99 @@ def test_lock_chain_never_removes_pooled_seat_on_midchain_failure() -> None:
         assert_true("account lock released too", lock is None or lock.get("state") == "released")
 
 
+def test_wake_expired_account_lock_reprobes_live_holder() -> None:
+    import goalflight_fleet_store as fleet_store
+    import goalflight_fleet_watch as fleet_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        preview = fleet_dispatch.preview_dispatch(
+            fleet_dir,
+            node_id="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="new dispatch",
+            dispatch_id="acp-after-wake",
+            base_sha=BASE_SHA,
+        )
+        owner_id = "acp-sleeping-holder"
+        lock = fleet.acquire_account_lock(
+            fleet_dir,
+            account_key="openai/default",
+            owner_dispatch_id=owner_id,
+            ttl_s=30,
+        )
+        meta_path = fleet_watch.dispatch_meta_path(fleet_dir, owner_id)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({
+            "dispatch_id": owner_id,
+            "node_id": "localhost",
+            "remote_status_path": fleet_dispatch.remote_status_path_for_dispatch(
+                "/tmp/goal-flight-dispatch-test", owner_id,
+            ),
+        }), encoding="utf-8")
+
+        issued_at = fleet_store.utc_now()
+        monotonic_at_issue = fleet_store.time.monotonic()
+
+        class FrozenMonotonic:
+            @staticmethod
+            def monotonic():
+                return monotonic_at_issue
+
+        original_utc_now, original_time = fleet_store.utc_now, fleet_store.time
+        fleet_store.utc_now = lambda: issued_at + dt.timedelta(hours=2)
+        fleet_store.time = FrozenMonotonic
+        status_reads: list[list[str]] = []
+
+        def probe_runner(argv: list[str]) -> tuple[int, str, str]:
+            status_reads.append(list(argv))
+            return 0, '{"state":"running"}\n', ""
+
+        try:
+            try:
+                fleet_dispatch.acquire_lock_chain(
+                    fleet_dir, preview, runner=probe_runner,
+                )
+                assert_true("live sleeping holder must retain its account lock", False)
+            except fleet_dispatch.DispatchError as exc:
+                assert_true("holder status is explained", "remains held" in str(exc))
+            assert_true("remote holder was checked", len(status_reads) == 1)
+            lock_after = fleet.load_account_lock(
+                fleet.account_lock_path(fleet_dir, "openai/default"),
+            )
+            assert_true(
+                "lock remains with the live holder",
+                lock_after["state"] == "active"
+                and lock_after["owner_dispatch_id"] == owner_id
+                and lock_after["fencing_token"] == lock["fencing_token"],
+            )
+
+            def changed_holder_runner(argv: list[str]) -> tuple[int, str, str]:
+                fresh_lock = dict(lock_after, fencing_token="replacement-holder")
+                fleet_store._atomic_write_json(
+                    fleet.account_lock_path(fleet_dir, "openai/default"), fresh_lock,
+                )
+                return 0, '{"state":"complete"}\n', ""
+
+            try:
+                fleet_dispatch.acquire_lock_chain(
+                    fleet_dir, preview, runner=changed_holder_runner,
+                )
+                assert_true("changed fencing token must refuse acquisition", False)
+            except fleet_dispatch.DispatchError as exc:
+                assert_true("fencing change is explained", "changed during" in str(exc))
+            assert_true(
+                "replacement holder remains fenced",
+                fleet.load_account_lock(fleet.account_lock_path(
+                    fleet_dir, "openai/default",
+                ))["fencing_token"] == "replacement-holder",
+            )
+        finally:
+            fleet_store.utc_now, fleet_store.time = original_utc_now, original_time
+
+
 def main() -> None:
     test_explicit_dry_run_preview()
     test_fleet_cursor_without_model_refuses_before_fleet_bootstrap()
@@ -1394,6 +1632,8 @@ def main() -> None:
     test_goal_exec_reports_tool_smoke_before_live_ssh_refusal()
     test_exec_with_live_ssh_env_uses_runner()
     test_preview_ignores_live_ssh_env()
+    test_remote_status_path_is_scoped_to_queue_attempt()
+    test_attempt_scoped_launch_uses_attempt_scoped_tail()
     test_preflight_passthrough_refuse_and_override_cli_flow()
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_before_remote_capacity()
@@ -1414,11 +1654,13 @@ def main() -> None:
     test_exec_runner_uses_node_ssh_identity()
     test_stub_e2e_terminal_clears_locks()
     test_stub_terminal_projects_journal_time()
+    test_stub_terminal_routes_to_active_controller_owner()
     test_async_launch_receipt_persisted_and_locks_remain()
     test_ledger_launch_receipt_roundtrip()
     test_tool_smoke_skip_is_authoritative_even_in_goal_mode()
     test_git_verify_commit_failure_hints_unpushed_base()
     test_lock_chain_never_removes_pooled_seat_on_midchain_failure()
+    test_wake_expired_account_lock_reprobes_live_holder()
     print("OK: fleet dispatch tests pass")
 
 

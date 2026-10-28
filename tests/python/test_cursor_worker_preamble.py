@@ -24,6 +24,30 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_dispatch as gd  # noqa: E402
 
 
+WORKER_ONLY_RULE = (
+    "If `GOALFLIGHT_DISPATCH_ID` is set you are a dispatched worker: do your "
+    "brief only; do not run `/goal-flight resume`, claim or renew controller "
+    "leases, arm supervise/listeners, read RESUME-NOTES for direction, or pick "
+    "queue items."
+)
+
+
+def test_worker_only_rule_is_in_docs_and_every_worker_preamble() -> None:
+    docs = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    quote_start = docs.index("> If `GOALFLIGHT_DISPATCH_ID`")
+    quote_lines = docs[quote_start:].splitlines()
+    docs_quote = " ".join(line.removeprefix("> ").strip() for line in quote_lines[:4])
+    assert_true(
+        "AGENTS.md pins the worker-only rule",
+        " ".join(WORKER_ONLY_RULE.split()) in docs_quote,
+    )
+    for agent in ("codex", "cursor", "grok-code", "moonshot", None):
+        assert_true(
+            f"{agent}: worker-only rule is in dispatch preamble",
+            WORKER_ONLY_RULE in gd._worker_prompt_preamble(agent),
+        )
+
+
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
         raise AssertionError(name)
@@ -126,7 +150,7 @@ def test_cursor_prompt_carries_the_dispatch_id_marker_contract() -> None:
 
     The watcher binds COMPLETE/READY/RESULT to the dispatch id and ignores a
     success marker without it. Cursor was never told the id, and a live
-    cursor worker signed off `COMPLETE: b-5856 landed on ...` (its task id,
+    cursor worker signed off `COMPLETE: b-0001 landed on ...` (its task id,
     not its dispatch id). The run succeeded and was recorded `worker_dead`.
     """
     for agent in ("cursor", "cursor-agent"):
@@ -167,6 +191,7 @@ def test_genuine_acp_agents_still_skip_the_text_marker_contract() -> None:
 
 
 def main() -> None:
+    test_worker_only_rule_is_in_docs_and_every_worker_preamble()
     test_cursor_is_not_told_to_read_the_prompt_file_env_var()
     test_non_cursor_agents_keep_the_prompt_file_instruction()
     test_cursor_is_told_not_to_retry_refusals()

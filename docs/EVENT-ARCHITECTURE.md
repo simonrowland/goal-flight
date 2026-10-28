@@ -527,3 +527,45 @@ An `EPIPE` before the first event rolls it back, leaving unread mail deliverable
 the replacement. `EAGAIN`/`EWOULDBLOCK` retries the buffered line without spinning,
 but a 60-second stall records durable fault state and releases the monitor flock so
 the watchdog can surface it and re-arm.
+
+## 10. Listener wake modes
+
+`GOALFLIGHT_WAKE_MODE` controls the existing `listen` and `follow` processes.
+`poll` is the default and keeps their current child topology and poll cadence.
+`gated` keeps those same loops and cadence while checking the persistent reader's
+`PRAGMA data_version` and the database, WAL, and SHM file size, modification time,
+and inode before a full journal pass. `follow` still checks its lease every current
+poll (1 second by default); cursor rewind scans, peeks, and carrier materialization
+run only after a journal change or while `ring_retry_pending`, retrying a carrier,
+or handling a busy journal. `listen`
+still checks coverage and watchdog state every current poll (5 seconds by default),
+and retries ring claims and carriers on their existing poll or busy-recovery
+cadence. A commit that lands after the gate sample can wait until the next pass,
+so gated mode adds at most one extra poll interval of delivery latency.
+
+`poll` opens a read-only journal connection for each operation, matching its
+existing poll loop. `gated` and `notify` use the persistent read-only reader.
+`notify` adds an in-process kqueue watch on the journal WAL file and its parent
+directory; a change only wakes the existing loop to reread the durable cursor.
+WAL creation, replacement, rotation, and deletion are detected through the
+directory watch and re-armed. `notify` remains experimental: a missed hint can
+add up to 30 seconds of delivery latency before its safety poll. Unsupported
+kqueue or any notifier error logs once and falls back to poll mode in that
+process. No backup-listener or supervisor child topology changes with this
+switch.
+
+Set `GOALFLIGHT_WAKE_MODE=gated` or `GOALFLIGHT_WAKE_MODE=notify` in the controller
+environment before starting or restarting `supervise`. To roll back either mode,
+set `GOALFLIGHT_WAKE_MODE=poll` and restart `supervise` once so its children inherit
+the value.
+
+Run the isolated wake-mode soak with
+`python3 tests/manual/listener_wake_soak.py --controllers N --events M`.
+It reports commit-to-wake p50/p99, missed and duplicate event IDs, and CPU seconds
+per process for poll, gated, and notify. It restarts a real `supervise` process and
+verifies delivery after restart, checkpoints and replaces the live WAL inode while
+readers are running, holds an exclusive lock against an auxiliary rollback-mode
+listener until it reports degraded and recovered, and makes one notify child miss a
+WAL hint so delivery must arrive by the safety poll. Gated and notify modes verify
+delivery after the live WAL replacement. Gated results should have zero missed or
+duplicate event IDs and poll-equivalent delivery latency.

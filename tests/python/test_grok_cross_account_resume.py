@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import subprocess
@@ -16,7 +17,7 @@ import goalflight_ledger as L
 import goalflight_wake as wake
 
 
-SESSION = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+SESSION = "00000000-0000-4000-8000-000000000034"
 CWD_NAME = "worker-tree"
 
 
@@ -408,6 +409,56 @@ def test_reconstruction_does_not_refuse_with_healthy_account(
 
     assert _option(argv, "--account") == "new"
     assert _option(argv, "--resume-mode") == "reconstructed"
+
+
+def test_grok_reconstruction_deduplicates_remote_ci_guidance(
+    tmp_path: Path,
+) -> None:
+    record = _record(tmp_path)
+    instruction = (
+        'Remote CI: run test suites and other heavy CPU through '
+        '"$GOALFLIGHT_REMOTE_RUN" --kind gate --cmd-id project-gate -- <command>. '
+        'Use the Studio runner by default.'
+    )
+    original = Path(record["prompt_path"])
+    original.write_text(f"Original task.\n\n{instruction}\n", encoding="utf-8")
+    controller_prompt = tmp_path / "controller-resume.md"
+    controller_prompt.write_text(f"Continue this task.\n\n{instruction}\n", encoding="utf-8")
+
+    reconstructed = D._build_grok_reconstruction_prompt(
+        record,
+        parent_dispatch_id="grok-parent",
+        child_dispatch_id="grok-child",
+        session_id=SESSION,
+        cwd=Path(record["worker_cwd"]),
+        controller_prompt=controller_prompt,
+    )
+
+    text = reconstructed.read_text(encoding="utf-8")
+    assert text.count("Remote CI: run test suites and other heavy CPU") == 1
+
+
+def test_grok_reconstruction_reads_compressed_parent_tail(tmp_path: Path) -> None:
+    record = _record(tmp_path)
+    tail = Path(record["stdout_path"])
+    with gzip.open(Path(str(tail) + ".gz"), "wb") as stream:
+        stream.write(b"last worker turn: compressed output\n")
+    tail.unlink()
+    controller_prompt = tmp_path / "controller-resume.md"
+    controller_prompt.write_text("Continue the task.\n", encoding="utf-8")
+
+    reconstructed = D._build_grok_reconstruction_prompt(
+        record,
+        parent_dispatch_id="grok-parent",
+        child_dispatch_id="grok-child",
+        session_id=SESSION,
+        cwd=Path(record["worker_cwd"]),
+        controller_prompt=controller_prompt,
+    )
+
+    text = reconstructed.read_text(encoding="utf-8")
+    assert "last worker turn: compressed output" in text
+    assert "(no dispatch tail available)" not in text
 
 
 def test_fallback_uses_measured_selector_not_configured_order(

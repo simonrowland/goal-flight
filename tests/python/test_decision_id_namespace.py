@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,7 +12,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
-NODE = shutil.which("node")
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -109,9 +107,6 @@ def test_legacy_q_rows_round_trip_with_new_d_minting() -> None:
 
 
 def main() -> None:
-    if not NODE:
-        print("SKIP: test_decision_id_namespace.py: node not found on PATH")
-        return
     test_legacy_q_rows_round_trip_with_new_d_minting()
     print("OK: decision id namespace tests pass")
 

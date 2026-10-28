@@ -470,7 +470,7 @@ def _is_supervise_restart_action(value: str) -> bool:
         argv = shlex.split(value)
     except ValueError:
         return False
-    if len(argv) != 9:
+    if len(argv) != 7:
         return False
     advertised = goalflight_compat.advertised_script(
         "goalflight_messages.py",
@@ -483,14 +483,14 @@ def _is_supervise_restart_action(value: str) -> bool:
         and argv[2:4] == ["supervise", "--project-root"]
         and Path(argv[4]).is_absolute()
         and argv[5] == "--controller-label"
-        and argv[7] == "--lease-nonce"
     ):
         return False
-    return value == goalflight_wake.coverage_supervise_command(
+    command = goalflight_wake.coverage_supervise_command(
         argv[4],
         controller_label=argv[6],
-        lease_nonce=argv[8],
+        lease_nonce="",
     )
+    return value == command
 
 
 def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:

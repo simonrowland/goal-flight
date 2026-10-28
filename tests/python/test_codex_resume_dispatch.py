@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import errno
+import gzip
 import json
 import multiprocessing as mp
 import os
@@ -24,14 +27,15 @@ import goalflight_codex_sessions as S  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_reap_dispatch_homes as R  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_watch as W  # noqa: E402
 import goalflight_worktree_pool as WP  # noqa: E402
 
 
-SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
-CANONICAL_SESSION_ID = "01a09067-25ec-7250-9872-3a277abe5716"
-OTHER_CANONICAL_SESSION_ID = "01a09093-d6c7-7d72-b548-faaf31824d3f"
+SESSION_ID = "00000000-0000-4000-8000-000000000033"
+CANONICAL_SESSION_ID = "00000000-0000-4000-8000-000000000009"
+OTHER_CANONICAL_SESSION_ID = "00000000-0000-4000-8000-000000000034"
 
 
 pytestmark = pytest.mark.skipif(
@@ -47,6 +51,7 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state = tmp_path / "state"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(state / "dispatch"))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
@@ -224,6 +229,7 @@ def _stub_detached_runtime(
             {
                 "argv": list(argv),
                 "env": dict(kwargs.get("env") or {}),
+                "cwd": kwargs.get("cwd"),
                 "stdin_path": kwargs.get("stdin_path"),
                 "label": kwargs["label"],
             }
@@ -361,7 +367,7 @@ def test_handle_harvest_never_guesses_among_multiple_rollouts(
 ) -> None:
     home = _dispatch_home(tmp_path, "ambiguous-sessions")
     _write_rollout(home)
-    _write_rollout(home, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    _write_rollout(home, "00000000-0000-4000-8000-000000000036")
 
     assert S.discover_session_id(home) is None
 
@@ -393,7 +399,7 @@ def test_shared_home_harvest_uses_this_dispatch_banner_not_newest_rollout(
         "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
         "reasoning effort: xhigh\n"
         "reasoning summaries: none\n"
-        "session id: 01a09067-25ec-7250-9872-3a277abe5716\n"
+        "session id: 00000000-0000-4000-8000-000000000009\n"
         "--------\n"
         "user\n",
         encoding="utf-8",
@@ -403,11 +409,24 @@ def test_shared_home_harvest_uses_this_dispatch_banner_not_newest_rollout(
     tail.write_text(
         tail.read_text(encoding="utf-8").replace(
             CANONICAL_SESSION_ID,
-            "01a09094-ffff-7d72-b548-faaf31824d3f",
+            "00000000-0000-4000-8000-000000000035",
         ),
         encoding="utf-8",
     )
     assert S.session_id_from_tail(home, tail) is None
+
+
+def test_shared_home_harvest_reads_compressed_dispatch_tail(tmp_path: Path) -> None:
+    home = _canonical_codex_home(tmp_path, "d78343")
+    _write_measured_rollout(home, CANONICAL_SESSION_ID, "2026-09-11T08-17-54")
+    tail = tmp_path / "compressed-dispatch.tail"
+    with gzip.open(Path(str(tail) + ".gz"), "wb") as stream:
+        stream.write(
+            f"session id: {CANONICAL_SESSION_ID}\n".encode("utf-8")
+        )
+
+    assert not tail.exists()
+    assert S.session_id_from_tail(home, tail) == CANONICAL_SESSION_ID
 
 
 def test_canonical_home_launch_harvests_handle_and_validates_resume(
@@ -482,7 +501,7 @@ def test_canonical_home_launch_harvests_handle_and_validates_resume(
         "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
         "reasoning effort: xhigh\n"
         "reasoning summaries: none\n"
-        "session id: 01a09067-25ec-7250-9872-3a277abe5716\n"
+        "session id: 00000000-0000-4000-8000-000000000009\n"
         "--------\n"
         "user\n",
         encoding="utf-8",
@@ -645,6 +664,81 @@ def test_canonical_home_resume_uses_shared_source_without_rebuilding_it(
     assert child["codex_session_id"] == OTHER_CANONICAL_SESSION_ID
 
 
+def test_resume_preflight_uses_canonical_cache_for_gpt_6_luna_max(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "luna-max-resume-parent"
+    child_id = "luna-max-resume-child"
+    source_home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source_home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source_home)
+    record.update(model="gpt-6-luna", reasoning_effort="max")
+    L.write_record(record)
+
+    canonical_home = Path(os.environ["HOME"]) / ".codex"
+    canonical_home.mkdir(parents=True)
+    (canonical_home / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    target_home = _dispatch_home(tmp_path, child_id)
+    target_home.mkdir(parents=True)
+    prompt = tmp_path / "luna-max-resume.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
+    monkeypatch.setattr(D, "_validate_resume_worktree_source", lambda *_args: None)
+    monkeypatch.setattr(
+        D, "_refuse_launch_blocked_by_completion_authority", lambda *_args: None
+    )
+    monkeypatch.setattr(D, "_mark_spawn_intent", lambda *_args: None)
+    monkeypatch.setattr(D, "_refuse_walled_codex_account", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        D,
+        "resolve_codex_home",
+        lambda *_args, **_kwargs: (str(target_home), "resume-seat"),
+    )
+    monkeypatch.setattr(D, "_revalidate_codex_resume_claim", lambda **_kwargs: None)
+
+    plan = D._preflight_resume_dispatch(
+        {
+            "record": record,
+            "engine": "codex",
+            "session_id": SESSION_ID,
+            "codex_home": source_home,
+            "codex_home_owner_dispatch_id": parent_id,
+        },
+        candidate_argv=[
+            "--agent", "codex",
+            "--shape", "bash",
+            "--dispatch-id", child_id,
+            "--cwd", str(tmp_path),
+            "--prompt-file", str(prompt),
+            "--parent-dispatch-id", parent_id,
+            "--codex-session-id", SESSION_ID,
+            "--account", "resume-seat",
+            "--model", "gpt-6-luna",
+            "--reasoning-effort", "max",
+        ],
+        dispatch_id=child_id,
+    )
+
+    assert plan["args"].model == "gpt-6-luna"
+    assert plan["args"].reasoning_effort == "max"
+    assert plan["account_env"] == {}
+    assert not (target_home / "models_cache.json").exists()
+
+
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes | None]]:
     """Every path under ``root`` mapped to (mode, bytes); directories carry None."""
     snapshot: dict[str, tuple[int, bytes | None]] = {}
@@ -662,7 +756,8 @@ def _canonical_resume_argv(
     child_id: str,
     home: Path,
     prompt: Path,
-    session_id: str,
+    session_id: str | None,
+    engine_session_id: str | None = None,
     account: str | None = None,
 ) -> list[str]:
     argv = [
@@ -684,17 +779,133 @@ def _canonical_resume_argv(
         str(tmp_path / f"{child_id}.status.json"),
         "--parent-dispatch-id",
         parent_id,
-        "--codex-session-id",
-        session_id,
         "--codex-resume-home",
         str(home),
         "--codex-home-owner-dispatch-id",
         parent_id,
         "--launch-detached",
     ]
+    if engine_session_id is not None:
+        argv += ["--engine-session-id", engine_session_id]
+    if session_id is not None:
+        argv += ["--codex-session-id", session_id]
     if account is not None:
         argv += ["--account", account]
     return argv
+
+
+@pytest.mark.parametrize(
+    ("engine_session_id", "codex_session_id"),
+    [
+        (SESSION_ID, OTHER_CANONICAL_SESSION_ID),
+        (None, OTHER_CANONICAL_SESSION_ID),
+        (OTHER_CANONICAL_SESSION_ID, None),
+    ],
+    ids=("engine-parent-codex-other", "codex-only-other", "engine-other-codex-absent"),
+)
+def test_direct_parent_codex_launch_rejects_each_mismatched_handle_before_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    engine_session_id: str | None,
+    codex_session_id: str | None,
+) -> None:
+    parent_id = "mismatched-session-parent"
+    child_id = "mismatched-session-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home, SESSION_ID)
+    _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        session_id=SESSION_ID,
+        home=home,
+    )
+    prompt = tmp_path / "mismatched-session.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        D,
+        "_validate_resume_worktree_source",
+        lambda *_args, **_kwargs: pytest.fail(
+            "session mismatch must be refused before worktree validation"
+        ),
+    )
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=home,
+            prompt=prompt,
+            session_id=codex_session_id,
+            engine_session_id=engine_session_id,
+        )
+    )
+
+    assert rc == 64
+    assert "supplied Codex session does not match parent dispatch" in capsys.readouterr().err
+    assert L.read_record(child_id) is None
+    assert not (tmp_path / f"{child_id}.status.json").exists()
+    assert not _dispatch_home(tmp_path, child_id).exists()
+
+
+def test_direct_parent_codex_launches_when_both_handles_match(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "matching-session-parent"
+    child_id = "matching-session-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home, SESSION_ID)
+    _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        session_id=SESSION_ID,
+        home=home,
+    )
+    prompt = tmp_path / "matching-session.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+
+    assert D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=home,
+            prompt=prompt,
+            session_id=SESSION_ID,
+            engine_session_id=SESSION_ID,
+        )
+    ) == 0
+    assert len(spawn_calls) == 2
+    assert "resume" in spawn_calls[0]["argv"]
+    assert SESSION_ID in spawn_calls[0]["argv"]
+
+
+def _assert_prelaunch_failed(dispatch_id: str) -> dict:
+    record = L.read_record(dispatch_id)
+    assert record is not None
+    assert record["state"] == "prelaunch_failed"
+    assert record["prelaunch_failure"] is True
+    assert record["worker_still_alive"] is False
+    assert record.get("worker_pid") is None
+    assert record.get("worker_cwd") is None
+    assert not any(
+        record.get(key)
+        for key in (
+            "worktree_id",
+            "worktree_path",
+            "worktree_reclaimed_dispatch_id",
+        )
+    )
+    status = json.loads(Path(record["status_path"]).read_text(encoding="utf-8"))
+    assert status["state"] == "prelaunch_failed"
+    assert status["prelaunch_failure"] is True
+    assert status["worker_alive"] is False
+    assert status.get("worktree_path") is None
+    return record
 
 
 def _write_canonical_parent(
@@ -805,6 +1016,147 @@ def test_cross_account_resume_copies_rollout_out_of_canonical_home(
     assert owner == child_id
     # The new account's own canonical home is not written either.
     assert _tree_snapshot(target_account_home) == target_account_before
+    original_rollout = rollout.read_bytes()
+    with copied.open("ab") as child_rollout:
+        child_rollout.write(b'{"type":"child_append"}\n')
+    assert rollout.read_bytes() == original_rollout
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS clonefile")
+def test_clone_or_copy_uses_clonefile_on_apfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "destination.jsonl"
+    source.write_bytes(b'{"type":"session_meta"}\n')
+    native_clonefile = D.goalflight_task._clonefile
+    attempts: list[tuple[Path, Path]] = []
+    successes: list[tuple[Path, Path]] = []
+
+    def tracked_clonefile(src: Path, dst: Path) -> None:
+        pair = (Path(src), Path(dst))
+        attempts.append(pair)
+        native_clonefile(src, dst)
+        successes.append(pair)
+
+    monkeypatch.setattr(D.goalflight_task, "_clonefile", tracked_clonefile)
+    D.goalflight_task._clone_or_copy(
+        source, destination, darwin_clone_only=True
+    )
+    if not successes:
+        pytest.skip("the test filesystem does not support APFS clonefile")
+
+    assert attempts == [(source, destination)]
+    assert destination.read_bytes() == source.read_bytes()
+    source_bytes = source.read_bytes()
+    with destination.open("ab") as child_rollout:
+        child_rollout.write(b'{"type":"child_append"}\n')
+    assert source.read_bytes() == source_bytes
+    assert not os.path.samefile(source, destination)
+
+
+@pytest.mark.parametrize("clone_errno", [errno.ENOTSUP, errno.EXDEV])
+def test_clone_or_copy_falls_back_when_clonefile_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clone_errno: int,
+) -> None:
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "destination.jsonl"
+    source.write_bytes(b'{"type":"session_meta"}\n')
+    monkeypatch.setattr(
+        D.goalflight_task, "sys", SimpleNamespace(platform="darwin")
+    )
+    clone_calls: list[tuple[Path, Path]] = []
+    copy_calls: list[tuple[Path, Path]] = []
+    real_copy2 = shutil.copy2
+
+    def unsupported_clone(src: Path, dst: Path) -> None:
+        clone_calls.append((Path(src), Path(dst)))
+        raise OSError(clone_errno, os.strerror(clone_errno), str(dst))
+
+    def tracked_copy2(src: Path, dst: Path) -> str:
+        copy_calls.append((Path(src), Path(dst)))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(D.goalflight_task, "_clonefile", unsupported_clone)
+    monkeypatch.setattr(D.shutil, "copy2", tracked_copy2)
+    D.goalflight_task._clone_or_copy(
+        source, destination, darwin_clone_only=True
+    )
+
+    assert clone_calls == [(source, destination)]
+    assert copy_calls == [(source, destination)]
+    assert destination.read_bytes() == source.read_bytes()
+
+
+def test_clone_or_copy_uses_copy2_off_darwin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.jsonl"
+    destination = tmp_path / "destination.jsonl"
+    source.write_bytes(b'{"type":"session_meta"}\n')
+    monkeypatch.setattr(
+        D.goalflight_task, "sys", SimpleNamespace(platform="linux")
+    )
+    monkeypatch.setattr(
+        D.goalflight_task,
+        "_clonefile",
+        lambda *_args: pytest.fail("clonefile must not be called off Darwin"),
+    )
+    copy_calls: list[tuple[Path, Path]] = []
+    real_copy2 = shutil.copy2
+
+    def tracked_copy2(src: Path, dst: Path) -> str:
+        copy_calls.append((Path(src), Path(dst)))
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(D.shutil, "copy2", tracked_copy2)
+    D.goalflight_task._clone_or_copy(
+        source, destination, darwin_clone_only=True
+    )
+
+    assert copy_calls == [(source, destination)]
+    assert destination.read_bytes() == source.read_bytes()
+
+
+def test_resume_seed_removes_partial_after_clone_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_id = "partial-clone-parent"
+    child_id = "partial-clone-child"
+    source_home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(source_home)
+    target_home = _dispatch_home(tmp_path, child_id)
+    target_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        D.goalflight_task, "sys", SimpleNamespace(platform="darwin")
+    )
+    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
+
+    def create_partial_then_fail(_source: Path, partial: Path) -> None:
+        partial.write_bytes(b"incomplete rollout")
+        raise OSError(errno.EIO, "clone failed", str(partial))
+
+    monkeypatch.setattr(
+        D.goalflight_task, "_clonefile", create_partial_then_fail
+    )
+    with pytest.raises(OSError, match="clone failed"):
+        D._seed_codex_resume_home_from_canonical(
+            tmp_path,
+            parent_id,
+            source_home,
+            SESSION_ID,
+            dispatch_id=child_id,
+            account="new-seat",
+            pre_resolved={"home": str(target_home), "account": "new-seat"},
+        )
+
+    assert list(target_home.rglob("*.partial-*")) == []
+    assert S.rollout_path(target_home, SESSION_ID) is None
 
 
 def test_failed_cross_account_resume_removes_only_its_new_home(
@@ -927,7 +1279,9 @@ def test_resume_command_unpinned_canonical_home_uses_effective_account(
         return str(target), "healthy-seat"
 
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
-    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(
+        D, "_codex_seat_api", lambda: SimpleNamespace(resolve_codex_seat=resolve)
+    )
     monkeypatch.setattr(
         D,
         "select_codex_account",
@@ -1008,6 +1362,9 @@ def test_resume_explicit_host_account_uses_the_normal_codex_resolver(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        D, "_codex_seat_admission_reason", lambda _account: None, raising=False
+    )
     parent_id = "host-login-parent"
     child_id = "host-login-child"
     home = _dispatch_home(tmp_path, parent_id)
@@ -1135,69 +1492,100 @@ def test_resume_command_reuses_one_effective_account_preflight(
     assert S.rollout_path(target, SESSION_ID) is not None
 
 
-def test_preflight_lock_failure_removes_its_new_codex_home(
+def test_sweep_between_resume_validation_and_publication_refuses_cleanly(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    parent_id = "preflight-lock-parent"
-    child_id = "preflight-lock-child"
-    source_home = _dispatch_home(tmp_path, parent_id)
-    _write_rollout(source_home)
-    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=source_home)
-    target_home = _dispatch_home(tmp_path, child_id)
-    source = {
-        "record": record,
-        "engine": "codex",
-        "agent": "codex",
-        "shape": "bash",
-        "session_id": SESSION_ID,
-        "codex_home": source_home,
-        "codex_home_owner_dispatch_id": parent_id,
-    }
-    prompt = tmp_path / "preflight-lock.md"
-    prompt.write_text("Resume after the lock failure.\n", encoding="utf-8")
-
-    def resolve(_root: str, _account: str, dispatch_id: str):
-        assert dispatch_id == child_id
-        target_home.mkdir(parents=True)
-        return str(target_home), "new-seat"
-
-    class FailingLock:
-        def __enter__(self):
-            raise OSError("lock unavailable")
-
+    parent_id = "sweep-resume-race-parent"
+    child_id = "sweep-resume-race-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record["ended_at"] = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+    ).isoformat().replace("+00:00", "Z")
+    L.write_record(record)
+    prompt = tmp_path / "sweep-resume-race.md"
+    prompt.write_text("Resume this source.", encoding="utf-8")
+    _stub_forked_runtime(monkeypatch, tmp_path, home)
+    monkeypatch.setattr(D, "_admit_dispatch_disk_floor", lambda: True)
+    monkeypatch.setattr(D, "_default_dispatch_id", lambda *_args: child_id)
+    monkeypatch.setattr(R, "DISPATCH_ARTIFACT_BUDGET_BYTES", 0)
+    legacy_scratch = tmp_path / "legacy-claude-scratch"
+    legacy_scratch.mkdir()
     monkeypatch.setattr(
-        D,
-        "_codex_seat_api",
-        lambda: SimpleNamespace(
-            resolve_codex_seat=resolve,
-            cleanup_dispatch_home=lambda dispatch_id: shutil.rmtree(
-                _dispatch_home(tmp_path, dispatch_id), ignore_errors=True
-            ),
-        ),
+        R,
+        "_legacy_scratch_process_snapshot",
+        lambda paths, *, deadline=None: {
+            os.path.abspath(path): (True, "test-clear") for path in paths
+        },
     )
-    monkeypatch.setattr(D, "_validate_before_side_effects", lambda *_args: {})
-    monkeypatch.setattr(D, "_validate_resume_worktree_source", lambda *_args: None)
-    monkeypatch.setattr(D, "_refuse_launch_blocked_by_completion_authority", lambda *_args: None)
-    monkeypatch.setattr(D, "_validate_codex_reasoning_effort", lambda *_args: None)
-    monkeypatch.setattr(D, "_codex_resume_lock", lambda *_args: FailingLock())
 
-    with pytest.raises(OSError, match="lock unavailable"):
-        D._preflight_resume_dispatch(
-            source,
-            candidate_argv=[
-                "--agent", "codex", "--shape", "bash", "--dispatch-id", child_id,
-                "--parent-dispatch-id", parent_id, "--cwd", str(tmp_path),
-                "--prompt-file", str(prompt), "--account", "new-seat",
-                "--codex-session-id", SESSION_ID, "--codex-resume-home", str(source_home),
-                "--codex-home-owner-dispatch-id", parent_id,
-            ],
-            dispatch_id=child_id,
-        )
-    assert not target_home.exists()
+    def stamp_controller(args, _project_root):
+        args.controller_label = "home-owner-refusal-controller"
+        args.controller_session_id = "home-owner-refusal-session"
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
+
+    def sweep_validated_source(source_home, session_id, dispatch_id) -> None:
+        assert source_home == home
+        assert session_id == SESSION_ID
+        assert dispatch_id == parent_id
+        ctx = mp.get_context("fork")
+        reports = ctx.Queue()
+
+        def sweep() -> None:
+            reports.put(
+                R._run_dispatch_retention(
+                    homes_dir=Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
+                    / "dispatch-homes",
+                    ledger_dir=L.runs_dir(create=True),
+                    dispatch_dir=D._dispatch_base_dir(),
+                    pidfile_dir=D.goalflight_dispatch_paths.pidfile_dir(),
+                    legacy_scratch_dir=legacy_scratch,
+                    now=(
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(hours=3)
+                    ),
+                    identity_probe=lambda _row: (False, "dead"),
+                )
+            )
+
+        process = ctx.Process(target=sweep)
+        process.start()
+        try:
+            report = reports.get(timeout=5)
+        finally:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        assert process.exitcode == 0
+        reports.close()
+        reports.join_thread()
+        assert report["deleted_count"] >= 1
+
+    monkeypatch.setattr(D, "_CODEX_RESUME_CLAIM_VALIDATED_HOOK", sweep_validated_source)
+
+    result = D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    )
+
+    assert result == 64
+    assert "resume source no longer exists" in capsys.readouterr().err
+    assert not home.exists()
+    _assert_prelaunch_failed(child_id)
+    child = L.read_record(child_id)
+    assert child is not None
+    assert child["controller_label"] == "home-owner-refusal-controller"
+    assert child["controller_session_id"] == "home-owner-refusal-session"
+    assert child["controller_pid"] == os.getpid()
 
 
-def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
+def test_resume_account_refusal_rolls_back_auto_id_and_stamps_controller(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1229,13 +1617,13 @@ def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
         lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
     )
     monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", child_id)
-    monkeypatch.setattr(
-        D,
-        "_stamp_controller_session",
-        lambda *_args, **_kwargs: pytest.fail(
-            "account refusal must precede controller stamping"
-        ),
-    )
+    def stamp_controller(args, _project_root):
+        args.controller_label = "resume-refusal-controller"
+        args.controller_session_id = "resume-refusal-session"
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
 
     rc = D._cmd_resume(
         [
@@ -1251,7 +1639,12 @@ def test_resume_account_refusal_rolls_back_auto_id_and_skips_controller_stamp(
     assert "missing-seat" in capsys.readouterr().err
     reservations = D._dispatch_base_dir() / ".dispatch-ids"
     assert not (reservations / f"{child_id}.json").exists()
-    assert not L.record_path(child_id).exists()
+    _assert_prelaunch_failed(child_id)
+    record = L.read_record(child_id)
+    assert record is not None
+    assert record["controller_label"] == "resume-refusal-controller"
+    assert record["controller_session_id"] == "resume-refusal-session"
+    assert record["controller_pid"] == os.getpid()
     assert not _dispatch_home(tmp_path, child_id).exists()
 
 
@@ -1420,8 +1813,88 @@ def test_resume_account_resolution_refuses_before_ledger_or_seat_mutation(
 
     assert rc == 64
     assert "missing-seat" in capsys.readouterr().err
-    assert not L.record_path(child_id).exists()
+    _assert_prelaunch_failed(child_id)
     assert not (tmp_path / "worktrees").exists()
+
+
+def test_unpinned_resume_resolves_account_before_seat_then_reuses_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parent_id = "snapshot-failure-parent"
+    failed_child = "snapshot-failure-child"
+    resumed_child = "snapshot-retry-child"
+    source, _rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="source-account"
+    )
+    prompt = tmp_path / "snapshot-resume.md"
+    prompt.write_text("Continue in the current checkout.\n", encoding="utf-8")
+    phase = {"retry": False}
+    admissions: list[str] = []
+    _stub_detached_runtime(monkeypatch)
+
+    def select_account(*, exclude_accounts=None, **_kwargs):
+        candidates = ["healthy"] if phase["retry"] else ["broken"]
+        selected = next(
+            (account for account in candidates if account not in (exclude_accounts or set())),
+            None,
+        )
+        return selected, []
+
+    def resolve_seat(_project_root: str, account: str | None, dispatch_id: str):
+        if account == "broken":
+            raise ValueError("short access horizon")
+        if account is None:
+            return None, None
+        target = _dispatch_home(tmp_path, dispatch_id)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "auth.json").write_text("test account", encoding="utf-8")
+        return str(target), account
+
+    monkeypatch.setattr(D, "select_codex_account", select_account)
+    monkeypatch.setattr(
+        D, "_codex_seat_api", lambda: SimpleNamespace(resolve_codex_seat=resolve_seat)
+    )
+    monkeypatch.setattr(
+        D,
+        "_admit_dispatch_worktree",
+        lambda args: admissions.append(str(args.cwd)) or None,
+    )
+
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", failed_child)
+    failed = D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    )
+
+    assert failed == 64
+    assert "broken" in capsys.readouterr().err
+    assert admissions == []
+    failed_record = L.read_record(failed_child)
+    assert failed_record is not None
+    assert failed_record["state"] == "prelaunch_failed"
+    assert failed_record["prelaunch_failure"] is True
+    assert failed_record["worker_still_alive"] is False
+    assert failed_record.get("worker_pid") is None
+    assert failed_record.get("worker_cwd") is None
+    assert failed_record.get("worktree_path") is None
+    failed_status = json.loads(
+        Path(failed_record["status_path"]).read_text(encoding="utf-8")
+    )
+    assert failed_status["state"] == "prelaunch_failed"
+    assert failed_status["prelaunch_failure"] is True
+    assert failed_status["worker_alive"] is False
+    assert failed_status.get("worktree_path") is None
+
+    phase["retry"] = True
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_ID_SEED", resumed_child)
+    succeeded = D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    )
+
+    assert succeeded == 0
+    assert admissions == [str(tmp_path)]
+    assert L.record_path(resumed_child).is_file()
 
 
 def test_launch_without_recordable_codex_home_warns_not_resumable(
@@ -1948,6 +2421,12 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
 ) -> None:
     parent_id = "tracked-parent"
     child_id = "tracked-child"
+    config = tmp_path / ".goal-flight" / "remote-ci.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"runner": {
+        "heavy_command_ids": ["resume-project-gate"]
+    }}), encoding="utf-8")
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
     _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
@@ -1997,6 +2476,12 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
     watcher = next(call for call in spawn_calls if call["label"] == "watcher")
     assert worker["env"]["CODEX_HOME"] == str(home)
     assert worker["stdin_path"] is not None  # prompt fed from file, not argv
+    assembled_prompt = Path(worker["stdin_path"]).read_text(encoding="utf-8")
+    assert f"exact dispatch id `{child_id}`" in assembled_prompt
+    assert assembled_prompt.count(
+        "Remote CI: run test suites and other heavy CPU"
+    ) == 1
+    assert '"$GOALFLIGHT_REMOTE_RUN" --kind gate --cmd-id resume-project-gate' in assembled_prompt
     assert worker["argv"][worker["argv"].index("resume") + 1] == SESSION_ID
     assert worker["argv"].count("--model") == 1
     assert worker["argv"][worker["argv"].index("--model") + 1] == "gpt-5.6"
@@ -2042,7 +2527,7 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Two processes pass the old check; one claims and holds the replace lock."""
+    """Concurrent preflight passes; only one publishes a child row."""
     parent_id = "concurrent-parent"
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
@@ -2053,19 +2538,24 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     ctx = mp.get_context("fork")
 
     original_validate = D._validate_codex_resume_source
-    initial_barrier = ctx.Barrier(2)
     claim_entries = ctx.Value("i", 0)
+    validation_owner_pid = ctx.Value("i", 0)
     first_claim_validation = ctx.Event()
     second_claim_validation = ctx.Event()
+    second_process_validation = ctx.Event()
     release_first_claim = ctx.Event()
-    validation_calls = 0
+    release_second_claim = ctx.Event()
+    durable_claimed = ctx.Event()
+    release_durable_claim = ctx.Event()
 
     def synchronized_validate(*args, **kwargs):
-        nonlocal validation_calls
+        pid = os.getpid()
+        with validation_owner_pid.get_lock():
+            if validation_owner_pid.value == 0:
+                validation_owner_pid.value = pid
+            elif validation_owner_pid.value != pid:
+                second_process_validation.set()
         result = original_validate(*args, **kwargs)
-        validation_calls += 1
-        if validation_calls == 1:
-            initial_barrier.wait(timeout=5)
         return result
 
     def claim_validated(*_args) -> None:
@@ -2077,9 +2567,19 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
             assert release_first_claim.wait(timeout=5)
         else:
             second_claim_validation.set()
+            assert release_second_claim.wait(timeout=5)
+
+    def pause_after_durable_claim(*_args) -> None:
+        durable_claimed.set()
+        assert release_durable_claim.wait(timeout=5)
 
     monkeypatch.setattr(D, "_validate_codex_resume_source", synchronized_validate)
     monkeypatch.setattr(D, "_CODEX_RESUME_CLAIM_VALIDATED_HOOK", claim_validated)
+    monkeypatch.setattr(D, "_CODEX_RESUME_DURABLE_CLAIM_HOOK", pause_after_durable_claim)
+    # This test isolates session-claim serialization. The parent record gives
+    # both resumes the same project root, so leave occupancy admission to its
+    # dedicated tests instead of allowing the first child to preempt the race.
+    monkeypatch.setattr(D, "_prepare_attempt_worktree_occupancy", lambda _args: None)
     monkeypatch.setattr(
         D,
         "_reserve_resume_dispatch_id",
@@ -2110,7 +2610,17 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     for process in processes:
         process.start()
     assert first_claim_validation.wait(timeout=5)
-    claim_is_interprocess = not second_claim_validation.wait(timeout=0.5)
+    assert second_claim_validation.wait(timeout=5)
+    assert second_process_validation.is_set()
+
+    release_first_claim.set()
+    assert durable_claimed.wait(timeout=5)
+    durable_id = next(
+        path.stem
+        for path in L.runs_dir(create=False).glob("*.json")
+        if path.stem.startswith("resume-child-")
+    )
+    assert L.record_path(durable_id).is_file()
 
     probe_results = ctx.Queue()
 
@@ -2126,31 +2636,55 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
     except queue.Empty:
         claim_was_locked = True
 
-    release_first_claim.set()
-    loser_pid, loser_rc = results.get(timeout=5)
+    release_second_claim.set()
+    release_durable_claim.set()
+    completed = [results.get(timeout=5), results.get(timeout=5)]
+    loser_pid, loser_rc = next(result for result in completed if result[1] == 64)
     assert loser_rc == 64
-    winner_pid, winner_rc = results.get(timeout=5)
+    winner_pid, winner_rc = next(result for result in completed if result[1] == 0)
     assert winner_rc == 0
     assert probe_results.get(timeout=5) == "acquired"
     for process in [*processes, probe]:
         process.join(timeout=5)
         assert not process.is_alive()
         assert process.exitcode == 0
+    for result_queue in (results, probe_results):
+        result_queue.close()
+        result_queue.join_thread()
 
-    assert claim_is_interprocess, (
-        "owner-home/session claim validation must use an inter-process lock"
-    )
+    assert second_process_validation.is_set(), "both resumes reached preflight before publication"
     assert claim_was_locked, "the owner-home/session lock must cover the claim"
     assert winner_pid != loser_pid
-    assert len(list(markers.glob("*-capacity"))) == 1
+    assert len(list(markers.glob("*-capacity"))) == 2
     assert len(list(markers.glob("*-worker"))) == 1
     assert len(list(markers.glob("*-watcher"))) == 1
     child_records = [
-        path
-        for path in (L.record_path(f"resume-child-{process.pid}") for process in processes)
-        if path.exists()
+        L.read_record(f"resume-child-{process.pid}") for process in processes
     ]
-    assert len(child_records) == 1
+    child_records = [record for record in child_records if record is not None]
+    assert len(child_records) == 2
+    refused = [
+        record
+        for record in child_records
+        if record["state"] in {"failed_worktree", "prelaunch_failed"}
+    ]
+    assert len(refused) == 1
+    refused_record = refused[0]
+    assert refused_record["prelaunch_failure"] is True
+    assert refused_record.get("worker_pid") is None
+    assert refused_record.get("worker_cwd") is None
+    assert not any(
+        refused_record.get(key)
+        for key in ("worktree_id", "worktree_path", "worktree_reclaimed_dispatch_id")
+    )
+    if refused_record["state"] == "failed_worktree":
+        assert refused_record["terminal_state"] == "error"
+        assert "worktree" in str(refused_record.get("reason", "")).casefold()
+    else:
+        assert refused_record["terminal_state"] == "prelaunch_failed"
+        assert "non-terminal resume child" in str(
+            refused_record.get("reason", "")
+        )
 
 
 def test_dead_preclaim_is_reconciled_before_retry(
@@ -2272,7 +2806,216 @@ def test_live_occupancy_holder_still_blocks_resume(
     assert rc == 64
     err = capsys.readouterr().err
     assert "already owned" in err
-    assert not L.record_path("live-occ-child").exists()
+    record = L.read_record("live-occ-child")
+    assert record is not None
+    assert record["state"] == "failed_worktree"
+    assert record["terminal_state"] == "error"
+    assert record["prelaunch_failure"] is True
+    assert record.get("worker_pid") is None
+    assert record.get("worker_cwd") is None
+    assert not any(
+        record.get(key)
+        for key in ("worktree_id", "worktree_path", "worktree_reclaimed_dispatch_id")
+    )
+    status = json.loads(Path(record["status_path"]).read_text(encoding="utf-8"))
+    assert status["state"] == "failed_worktree"
+    assert status["terminal_state"] == "error"
+    assert status["prelaunch_failure"] is True
+    assert status.get("worktree_path") is None
+
+
+@pytest.mark.parametrize(
+    "census_mode",
+    ("mount_warning_rc0", "process_warning_rc1", "other_stderr_rc0", "empty_rc0"),
+)
+def test_completed_writer_resume_uses_its_recorded_seat_census(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    census_mode: str,
+) -> None:
+    """lsof's mount stat() warnings leave the census usable; anything else stays unknown.
+
+    The mount warning family is what smbfs volumes under /Volumes produce
+    (measured 2026-10-27): exit status 0, three stderr lines, complete -F
+    records. A process lsof could not read (exit 1), any other diagnostic, or
+    an empty inventory could hide a process using the seat, so resume refuses.
+    """
+    parent_id = "completed-seat-parent"
+    child_id = "completed-seat-child"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for git_args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "goalflight-test@example.invalid"),
+        ("config", "user.name", "Goal Flight Test"),
+    ):
+        result = subprocess.run(
+            ["git", *git_args],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (git_args, result.stderr)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for git_args in (("add", "tracked.txt"), ("commit", "-q", "-m", "base")):
+        result = subprocess.run(
+            ["git", *git_args],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (git_args, result.stderr)
+
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    monkeypatch.chdir(repo)
+    parent_lease = WP.acquire_worktree_seat(repo, parent_id)
+    seat = parent_lease.path
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=seat,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=seat,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    ).stdout.strip()
+    parent_lease.release()
+
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "project_root": str(repo),
+            "worker_cwd": str(seat),
+            "worktree_id": seat.name,
+            "worktree_path": str(seat),
+            "worktree_branch": branch,
+            "worktree_head": head,
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_pid": 2147483647,
+            "worker_identity": {
+                "pid": 2147483647,
+                "start_token": "exited-test-worker",
+            },
+            "terminal_marker": {
+                "kind": "COMPLETE",
+                "dispatch_id": parent_id,
+                "attempt_id": "completed-seat-attempt",
+            },
+            "dispatch_argv": [
+                "--agent",
+                "codex",
+                "--shape",
+                "bash",
+                "--dispatch-id",
+                parent_id,
+                "--cwd",
+                str(seat),
+                "--worktree",
+                "HEAD",
+                "--prompt-file",
+                str(tmp_path / "original.md"),
+            ],
+        }
+    )
+    L.write_record(record)
+    lock_path = WP.worktree_seat_lock_path(repo, seat.name)
+    with lock_path.open("r+", encoding="utf-8") as lock_file:
+        metadata = WP._lock_metadata(lock_file)
+        metadata.update(pid=2147483647, start_token="exited-test-worker")
+        lock_file.seek(0)
+        lock_file.truncate()
+        json.dump(metadata, lock_file, sort_keys=True)
+        lock_file.write("\n")
+        lock_file.flush()
+
+    census_calls: list[dict] = []
+    original_census_runner = WP.goalflight_subprocess.run_with_deadline
+
+    def run_census(args, **kwargs):
+        if args != ["lsof", "-nP", "-d", "cwd", "-Fpfn"]:
+            return original_census_runner(args, **kwargs)
+        census_calls.append(dict(kwargs))
+        time.sleep(0.05)
+        stdout = "" if census_mode == "empty_rc0" else (
+            f"p{os.getpid()}\nfcwd\nn{repo}\n"
+        )
+        stderr = {
+            "mount_warning_rc0": (
+                "lsof: WARNING: can't stat() smbfs file system /Volumes/warpx-data\n"
+                "      Output information may be incomplete.\n"
+                '      assuming "dev=36000007" from mount table\n'
+            ),
+            "process_warning_rc1": (
+                "lsof: WARNING: can't stat() process 424242: Permission denied\n"
+            ),
+            "other_stderr_rc0": "lsof: unexpected diagnostic\n",
+            "empty_rc0": "",
+        }[census_mode]
+        return subprocess.CompletedProcess(
+            args,
+            1 if census_mode == "process_warning_rc1" else 0,
+            stdout,
+            stderr,
+        )
+
+    monkeypatch.setattr(WP.goalflight_subprocess, "run_with_deadline", run_census)
+    monkeypatch.setattr(
+        WP.goalflight_compat, "process_identity_matches", lambda *_args: False
+    )
+
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue in this seat.\n", encoding="utf-8")
+    _configure_account(tmp_path, "resume-seat")
+
+    def resolve_resume_home(
+        _project_root: Path, account: str, dispatch_id: str
+    ) -> tuple[str, str]:
+        target = _dispatch_home(tmp_path, dispatch_id)
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target), account
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve_resume_home)
+    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(D, "_default_dispatch_id", lambda _agent: child_id)
+
+    resume_argv = [
+        parent_id,
+        "--prompt-file",
+        str(prompt),
+        "--account",
+        "resume-seat",
+        "--unregistered-forced",
+    ]
+    if census_mode != "mount_warning_rc0":
+        assert D._cmd_resume(resume_argv) != 0
+        assert "pool_reason=worker_cwd_unknown" in capsys.readouterr().err
+        assert not any(call["label"] == "worker" for call in spawn_calls)
+    else:
+        assert D._cmd_resume(resume_argv) == 0
+
+        worker = next(call for call in spawn_calls if call["label"] == "worker")
+        assert leases == ["lease-resume"]
+        assert Path(worker["cwd"]).resolve() == seat.resolve()
+        child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+        assert child["state"] == "running"
+        assert Path(child["worker_cwd"]).resolve() == seat.resolve()
+        assert child["parent_dispatch_id"] == parent_id
+    assert len(census_calls) == 1
+    assert census_calls[0]["timeout"] == WP.PROCESS_CWD_SNAPSHOT_TIMEOUT_S == 30.0
+    assert census_calls[0]["deadline"] is None
 
 
 def test_capacity_refused_resume_does_not_bind_recorded_seat(
@@ -2350,13 +3093,13 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
         raise SystemExit(2)
 
     monkeypatch.setattr(D, "_acquire_capacity", deny_capacity)
-    monkeypatch.setattr(
-        D,
-        "_stamp_controller_session",
-        lambda *_args, **_kwargs: pytest.fail(
-            "capacity refusal must precede controller stamping"
-        ),
-    )
+    def stamp_controller(args, _project_root):
+        args.controller_label = "capacity-refusal-controller"
+        args.controller_session_id = "capacity-refusal-session"
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
     bind_calls: list[str] = []
     original_record = D._record_dispatch_worktree
 
@@ -2375,7 +3118,11 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
     assert bind_calls == []
     assert resolver_calls == []
     assert not target.exists()
-    assert not L.record_path(child_id).exists()
+    record = L.read_record(child_id)
+    assert record is not None
+    assert record["controller_label"] == "capacity-refusal-controller"
+    assert record["controller_session_id"] == "capacity-refusal-session"
+    assert record["controller_pid"] == os.getpid()
     assert not (
         D._dispatch_base_dir() / ".dispatch-ids" / f"{child_id}.json"
     ).exists()
@@ -2758,6 +3505,14 @@ def test_queued_resume_envelope_launches_when_only_nonterminal_child_is_itself(
     assert rc == 0
     assert leases == ["lease-resume"]
     assert any(call["label"] == "worker" for call in spawn_calls)
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    scratch = Path(worker["env"]["GOALFLIGHT_SCRATCH_DIR"])
+    assert scratch == (
+        Path(worker["env"]["GOALFLIGHT_DISPATCH_DIR"])
+        / f"{child_id}.scratch"
+    )
+    assert scratch.is_dir()
+    assert worker["env"]["TMPDIR"] == str(scratch)
     ledger = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
     assert ledger["state"] == "running"
     assert ledger["parent_dispatch_id"] == parent_id
@@ -3083,6 +3838,9 @@ def test_resume_of_quota_exhausted_dispatch_honors_account(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        D, "_codex_seat_admission_reason", lambda _account: None, raising=False
+    )
     parent_id = "quota-parent"
     home = _dispatch_home(tmp_path, parent_id)
     _write_rollout(home)
@@ -3153,7 +3911,7 @@ def test_resume_of_plan_approval_pause_reuses_worktree(
 ) -> None:
     """Plan-approval / !READY pause: resume is the continue, not a sibling tree."""
     parent_id = "plan-parent"
-    worktree = tmp_path / "worktrees" / "b-3374"
+    worktree = tmp_path / "worktrees" / "b-0001"
     worktree.mkdir(parents=True)
     (worktree / "PLAN.md").write_text("# plan awaiting approval\n", encoding="utf-8")
     home = _dispatch_home(tmp_path, parent_id)
@@ -3244,9 +4002,14 @@ def test_unpinned_codex_selection_skips_recently_exhausted_seat(
         json.dumps(
             {
                 "version": 1,
+                "updated_at": time.time(),
                 "seats": {
-                    "4c9435": {"cooldown_until": "2033-09-07T02:18:00+00:00"},
-                    "25ca6b": {},
+                    "4c9435": {
+                        "healthy": True,
+                        "worst_used": 100,
+                        "cooldown_until": "2033-09-07T02:18:00+00:00",
+                    },
+                    "25ca6b": {"healthy": True, "worst_used": 20},
                 },
             }
         )
@@ -3318,6 +4081,9 @@ def test_explicit_account_is_honored_even_when_not_first(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        D, "_codex_seat_admission_reason", lambda _account: None, raising=False
+    )
     seen: list[str | None] = []
 
     def resolve_seat(_project_root, explicit_account, _dispatch_id):

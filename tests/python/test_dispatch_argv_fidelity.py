@@ -29,9 +29,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_task as T  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_dispatch_paths as dispatch_paths  # noqa: E402
+import goalflight_steer_mailbox as steer  # noqa: E402
+import goalflight_watch as W  # noqa: E402
 
 
-SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
+SESSION_ID = "00000000-0000-4000-8000-000000000033"
 CURSOR_HELP_FIXTURE = """                               including write and shell. (default: false)
   --output-format <format>     Output format (only works with --print): text |
                                json | stream-json (default: "text")
@@ -125,29 +128,47 @@ def test_cursor_read_only_argv_uses_native_read_only_mode_and_sandbox(
 
     monkeypatch.setattr(D.subprocess, "run", fake_help)
     monkeypatch.setattr(D, "_wrap_cursor_os_sandbox", lambda argv, _args: argv)
-    argv, stdin_path = D.build_worker(
-        _cursor_worker_args(read_only=True), "/tmp/prompt.md", []
-    )
+    args = _cursor_worker_args(read_only=True)
+    args._account_env = {
+        "GOALFLIGHT_REMOTE_CI_SPOOL_DIR": "/state/goal-flight/remote-ci/spool",
+        "GOALFLIGHT_QUESTION_OUTBOX_DIR": "/state/goal-flight/dispatch/cursor-argv-test.questions",
+    }
+    argv, stdin_path = D.build_worker(args, "/tmp/prompt.md", [])
 
     assert argv[:2] == ["cursor-agent", "-p"]
     assert argv[argv.index("--mode") + 1] in {"ask", "plan"}
     assert argv[argv.index("--sandbox") + 1] == "enabled"
+    add_dir = argv.index("--add-dir")
+    assert argv[add_dir + 1] == "/state/goal-flight/remote-ci/spool/requests"
+    assert argv[argv.index("--add-dir", add_dir + 2) + 1] == (
+        "/state/goal-flight/dispatch/cursor-argv-test.questions"
+    )
     assert not {"--force", "-f", "--yolo"}.intersection(argv)
     assert stdin_path == "/tmp/prompt.md"
 
 
 def test_cursor_writer_argv_keeps_justified_force_flag() -> None:
-    argv, stdin_path = D.build_worker(
-        _cursor_worker_args(read_only=False), "/tmp/prompt.md", []
-    )
+    args = _cursor_worker_args(read_only=False)
+    args._account_env = {
+        "GOALFLIGHT_QUESTION_OUTBOX_DIR": "/state/goal-flight/dispatch/cursor-argv-test.questions",
+    }
+    argv, stdin_path = D.build_worker(args, "/tmp/prompt.md", [])
 
-    assert argv[:6] == [
+    assert argv[:8] == [
         "cursor-agent",
         "-p",
         "--force",
+        "--add-dir",
+        "/state/goal-flight/dispatch/cursor-argv-test.questions",
         "--trust",
         "--output-format",
         "text",
+    ]
+    assert argv[8:] == [
+        "--workspace",
+        "/repo/worktrees/s-1",
+        "--model",
+        "grok-4.7-high",
     ]
     assert "--mode" not in argv
     assert "--sandbox" not in argv
@@ -610,14 +631,26 @@ def test_installed_cursor_help_advertises_read_only_flags_when_available() -> No
     binary = shutil.which("cursor-agent")
     if binary is None:
         pytest.skip("cursor-agent is not installed")
-    assert D._cursor_read_only_mode() in {"ask", "plan"}
-    result = subprocess.run(
-        [binary, "--help"],
-        capture_output=True,
-        text=True,
-        timeout=3,
-        check=False,
-    )
+    try:
+        mode = D._cursor_read_only_mode()
+    except D.DispatchUsageError as exc:
+        message = str(exc).lower()
+        if "permissionerror" in message and (
+            "operation not permitted" in message or "permission denied" in message
+        ):
+            pytest.skip("sandbox denies exec of cursor-agent")
+        raise
+    assert mode in {"ask", "plan"}
+    try:
+        result = subprocess.run(
+            [binary, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except PermissionError:
+        pytest.skip("sandbox denies exec of cursor-agent")
 
     assert result.returncode == 0, result.stderr
     help_text = " ".join((result.stdout + "\n" + result.stderr).split())
@@ -692,6 +725,46 @@ def test_daemon_spawn_uses_file_backed_spec_stdin(
 
     assert pid == 123
     assert observed["spec"]["argv"] == ["worker", prompt]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "filter_stdout", "expected"),
+    [
+        ({}, True, True),
+        ({"output_redaction_filter": True}, True, True),
+        ({"output_redaction_filter": False}, True, False),
+        ({"output_redaction_filter": False}, False, False),
+    ],
+)
+def test_daemon_spawn_redaction_filter_uses_machine_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    overrides: dict,
+    filter_stdout: bool,
+    expected: bool,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        spec_file = kwargs["stdin"]
+        spec_file.seek(0)
+        observed["spec"] = json.loads(spec_file.read().decode("utf-8"))
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"pid": 123}\n', stderr=""
+        )
+
+    monkeypatch.setattr(D, "LOCAL_OVERRIDES", overrides)
+    monkeypatch.setattr(D.subprocess, "run", fake_run)
+    D._spawn_daemonized_process(
+        ["worker"],
+        env={},
+        stdout_path=tmp_path / "worker.tail",
+        serialize_stdout=True,
+        filter_stdout=filter_stdout,
+        label="worker",
+    )
+
+    assert observed["spec"]["redact_stdout"] is expected
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -945,6 +1018,195 @@ def test_resume_preserves_os_sandbox_and_cwd(
     assert "--status-json" not in launch
     assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
     assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
+
+    child_id = launch[launch.index("--dispatch-id") + 1]
+    wait_id = "parent-late-reply"
+    question = "authorize the guarded action?"
+    parent_mailbox = dispatch_paths.steer_file(parent_id)
+    parent_outbox = dispatch_paths.worker_question_outbox_dir(
+        parent_id,
+        dispatch_dir=parent_mailbox.parent,
+    )
+    parent_outbox.mkdir(parents=True, exist_ok=True)
+    request = steer.write_worker_question_request(
+        parent_outbox,
+        dispatch_id=parent_id,
+        attempt_id="parent-attempt",
+        wait_id=wait_id,
+        question_kind="USER-CONFIRM",
+        question=question,
+        timeout_s=30,
+    )
+    arm = steer.append_worker_wait_started(
+        parent_mailbox,
+        dispatch_id=parent_id,
+        timeout_secs=30,
+        question_kind="USER-CONFIRM",
+        question_text=question,
+        wait_id=wait_id,
+        attempt_id="parent-attempt",
+        waiter_pid=os.getpid(),
+    )
+    steer.append_worker_wait_ended(
+        parent_mailbox,
+        arm,
+        decision="timeout",
+        context={"reason": "parent wait timed out"},
+    )
+    late = steer.append_worker_wait_reply(
+        parent_mailbox,
+        dispatch_id=parent_id,
+        wait_id=wait_id,
+        text="approved after timeout",
+        decision="yes",
+    )
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": child_id,
+            "parent_dispatch_id": parent_id,
+            "project_root": str(main),
+            "state": "running",
+            "attempt_id": "child-attempt",
+        }
+    )
+    child_mailbox = dispatch_paths.steer_file(child_id)
+    child_mailbox.parent.mkdir(parents=True, exist_ok=True)
+    child_mailbox.touch()
+    child_outbox = dispatch_paths.worker_question_outbox_dir(
+        child_id,
+        dispatch_dir=child_mailbox.parent,
+    )
+    child_outbox.mkdir(parents=True, exist_ok=True)
+    child_tail = tmp_path / "child.tail"
+    child_tail.write_text(f"!STEER-ACK: {late['seq']}\n", encoding="utf-8")
+    child_env = os.environ.copy()
+    child_env.update(
+        {
+            "GOALFLIGHT_DISPATCH_ID": child_id,
+            "GOALFLIGHT_ATTEMPT_ID": "child-attempt",
+            "GOALFLIGHT_STEER_FILE": str(child_mailbox),
+            "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(child_outbox),
+            "GOALFLIGHT_WORKER_TAIL_FILE": str(child_tail),
+        }
+    )
+    child_env["PYTHONPATH"] = str(ROOT / "scripts") + os.pathsep + child_env.get(
+        "PYTHONPATH", ""
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "goalflight_dispatch.py"),
+            "steer",
+            child_id,
+            "--wait",
+            "--question-kind",
+            "USER-CONFIRM",
+            "--resume-wait-id",
+            wait_id,
+            question,
+        ],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"text": "approved after timeout"' in proc.stdout, proc.stdout
+    assert late["context"]["attempt_id"] == "parent-attempt"
+    child_receipt = steer.read_worker_question_settlement(
+        child_outbox,
+        {
+            "dispatch_id": parent_id,
+            "attempt_id": "parent-attempt",
+            "wait_id": wait_id,
+            "deadline_at": request["deadline_at"],
+        },
+    )
+    assert child_receipt and child_receipt["state"] == "reply", child_receipt
+
+    # The resumed child's receipt is first sandboxed in its own outbox. The
+    # unsandboxed watcher promotes it to the parent's wait record so sibling
+    # resumes observe the same durable consumed-reply identity.
+    child_identity = W.goalflight_compat.process_start_identity(os.getpid()) or {}
+    W.consume_worker_question_outbox(
+        child_outbox,
+        child_mailbox,
+        child_id,
+        worker_pid=os.getpid(),
+        worker_start_token=child_identity.get("start_token"),
+        worker_pgid=os.getpgrp(),
+        active_attempt_id="child-attempt",
+        publish_func=lambda _event: None,
+    )
+    parent_receipt = steer.read_worker_question_settlement(parent_outbox, {
+        "dispatch_id": parent_id,
+        "attempt_id": "parent-attempt",
+        "wait_id": wait_id,
+        "deadline_at": request["deadline_at"],
+    })
+    assert parent_receipt and parent_receipt["state"] == "reply", parent_receipt
+    assert parent_receipt["reply_seq"] == late["seq"], parent_receipt
+
+    sibling_id = "codex-resume-sibling"
+    sibling_captured = _capture_resume(monkeypatch, sibling_id)
+    assert (
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+        == 0
+    )
+    sibling_launch = sibling_captured[0]
+    assert sibling_launch[sibling_launch.index("--dispatch-id") + 1] == sibling_id
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": sibling_id,
+            "parent_dispatch_id": parent_id,
+            "project_root": str(main),
+            "state": "running",
+            "attempt_id": "sibling-attempt",
+        }
+    )
+    sibling_mailbox = dispatch_paths.steer_file(sibling_id)
+    sibling_mailbox.parent.mkdir(parents=True, exist_ok=True)
+    sibling_mailbox.touch()
+    sibling_outbox = dispatch_paths.worker_question_outbox_dir(
+        sibling_id,
+        dispatch_dir=sibling_mailbox.parent,
+    )
+    sibling_outbox.mkdir(parents=True, exist_ok=True)
+    sibling_env = dict(child_env)
+    sibling_env.update(
+        {
+            "GOALFLIGHT_DISPATCH_ID": sibling_id,
+            "GOALFLIGHT_ATTEMPT_ID": "sibling-attempt",
+            "GOALFLIGHT_STEER_FILE": str(sibling_mailbox),
+            "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(sibling_outbox),
+            "GOALFLIGHT_WORKER_TAIL_FILE": str(tmp_path / "sibling.tail"),
+        }
+    )
+    sibling_proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "goalflight_dispatch.py"),
+            "steer",
+            sibling_id,
+            "--wait",
+            "--question-kind",
+            "USER-CONFIRM",
+            "--resume-wait-id",
+            wait_id,
+            question,
+        ],
+        env=sibling_env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert sibling_proc.returncode == 64, sibling_proc.stdout + sibling_proc.stderr
+    assert "approved after timeout" not in sibling_proc.stdout, sibling_proc.stdout
+    assert not steer.worker_question_settlement_path(sibling_outbox, wait_id).exists()
 
 
 def test_legacy_resume_replays_recorded_model(tmp_path: Path) -> None:
@@ -1225,7 +1487,10 @@ def test_synthesized_grok_resume_preserves_legacy_read_only_record(
         # is independent of the temporary fixture path.
         parsed.cwd = str(ROOT)
         parsed.account = "probe"
+        scratch_dir = tmp_path / "dispatch-scratch"
+        scratch_dir.mkdir()
         parsed._account_env = _grok_read_only_account_env()
+        parsed._account_env["GOALFLIGHT_SCRATCH_DIR"] = str(scratch_dir)
     worker_argv, _stdin = D.build_worker(parsed, prompt, [])
     if D.goalflight_compat.is_macos():
         assert Path(worker_argv[0]).name == "sandbox-exec", worker_argv
@@ -1591,6 +1856,78 @@ def test_inert_os_sandbox_is_refused_per_combination() -> None:
         assert f"shape={shape}" in message, (agent, shape, profile, message)
         # Names a working alternative without pinning a canned vendor sentence.
         assert "--read-only" in message, (agent, shape, profile, message)
+
+
+def test_grok_read_only_posture_records_the_preset_wrapper(monkeypatch) -> None:
+    args = argparse.Namespace(
+        agent="grok-code",
+        shape="bash",
+        os_sandbox=None,
+        read_only=True,
+        worker=["--"],
+        model=None,
+        reasoning_effort=None,
+        cwd=None,
+    )
+    monkeypatch.setattr(D.goalflight_compat, "is_macos", lambda: True)
+    wrapped = []
+
+    def record_wrapper(argv, _args):
+        wrapped.append(list(argv))
+        return ["sandbox-exec", "-p", "(version 1)", *argv]
+
+    monkeypatch.setattr(D, "_wrap_grok_read_only_os_sandbox", record_wrapper)
+    raw = D._raw_worker_args(args)
+
+    assert raw == []
+    D.build_worker(args, "/tmp/prompt.md", raw)
+    assert wrapped, "the delimiter-only launch must use the Grok preset wrapper"
+    assert D._os_sandbox_posture(args, worker_pid=123) == {
+        "shape": "bash",
+        "requested_profile": "read-only",
+        "supported_profile": "read-only",
+        "enforced_profile": "read-only",
+    }
+    assert D._enforced_os_sandbox_profile(args, worker_pid=None) is None
+
+    args.worker = ["--", "grok", "--prompt-file", "/tmp/prompt.md"]
+    raw = D._raw_worker_args(args)
+    assert raw == ["grok", "--prompt-file", "/tmp/prompt.md"]
+    assert D._supported_os_sandbox_profile(args) is None
+    assert D._enforced_os_sandbox_profile(args, worker_pid=123) is None
+
+
+def test_raw_cursor_sandbox_wrapper_is_recorded(monkeypatch) -> None:
+    import goalflight_adapter_readiness
+
+    monkeypatch.setattr(
+        goalflight_adapter_readiness,
+        "validate_os_sandbox_request",
+        lambda _agent, _profile: None,
+    )
+    wrapped = []
+
+    def record_wrapper(argv, _args):
+        wrapped.append(list(argv))
+        return ["sandbox-exec", "-p", "(version 1)", *argv]
+
+    monkeypatch.setattr(D, "_wrap_cursor_os_sandbox", record_wrapper)
+    args = argparse.Namespace(
+        agent="cursor",
+        shape="bash",
+        os_sandbox="workspace-write",
+        read_only=False,
+        worker=["--", "/bin/echo", "sandboxed"],
+    )
+    raw = D._raw_worker_args(args)
+
+    argv, stdin_path = D.build_worker(args, None, raw)
+    assert wrapped == [["/bin/echo", "sandboxed"]]
+    assert argv[:3] == ["sandbox-exec", "-p", "(version 1)"]
+    assert stdin_path is None
+    posture = D._os_sandbox_posture(args, worker_pid=123)
+    assert posture["supported_profile"] == "workspace-write"
+    assert posture["enforced_profile"] == "workspace-write"
 
 
 def test_honored_os_sandbox_and_read_only_still_launch() -> None:

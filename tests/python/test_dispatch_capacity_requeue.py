@@ -340,7 +340,9 @@ def test_detached_capacity_refusal_is_visible_and_not_queued() -> None:
 
         assert refused.returncode == 2, (refused.stdout, refused.stderr)
         assert "DISPATCH-BLOCKED" in refused.stdout, refused.stdout
-        assert _read_json(status_path).get("state") == "blocked_capacity"
+        status = _read_json(status_path)
+        assert status.get("state") == "blocked_capacity", status
+        assert status.get("dispatch_id") == dispatch_id, status
         assert not queue_path.exists(), "capacity refusal silently created a queue entry"
 
 
@@ -679,6 +681,7 @@ def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
 def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+        repo = _make_repo(tmp)
         env = _env(tmp)
         held_lease = _hold_capacity(tmp, env, "held-for-queue-regression")
         dispatch_id = "preexisting-queue-capacity-regression"
@@ -691,13 +694,20 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
             "    stream.write(str(time_ns()) + '\\n')\n"
             f"print('COMPLETE: {dispatch_id} — restored queue entry ran', flush=True)\n"
         )
-        replay_argv = _dispatch_command(tmp, dispatch_id, worker_code)[2:]
+        replay_argv = _dispatch_command(
+            tmp,
+            dispatch_id,
+            worker_code,
+            extra=["--in-place"],
+            cwd=repo,
+        )[2:]
         queue_path = _write_queue_entry(
             tmp,
             dispatch_id=dispatch_id,
             agent="test-dispatch",
             shape="bash",
             replay_argv=replay_argv,
+            project_root=repo,
         )
 
         old_env = os.environ.copy()
@@ -745,6 +755,10 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
             [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
             env,
             cwd=tmp,
+            timeout=D._drain_launch_timeout_s(
+                SimpleNamespace(capacity_wait_s=0.0)
+            )
+            + 5.0,
         )
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         launched_payload = json.loads(launched.stdout)
@@ -903,6 +917,84 @@ def test_detached_default_wait_matches_foreground_and_keeps_overrides() -> None:
             os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = old
 
 
+def test_stale_capacity_status_does_not_preserve_unrelated_queued_prelaunch_failure() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        dispatch_id = "stale-capacity-status"
+        status_path = tmp / f"{dispatch_id}.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "blocked_capacity",
+                    "reason": {"reason": "machine_worker_cap"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        claim_path = tmp / f"{dispatch_id}.claimed"
+        token = "fresh-queue-attempt"
+        claim_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "queue_launch_token": token,
+                    "dispatch_argv": ["worker"],
+                    "request": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        prelaunch_failures: list[dict] = []
+        finalizations: list[tuple] = []
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            with (
+                patch.object(D, "_acquire_capacity", side_effect=SystemExit(2)),
+                patch.object(
+                    D,
+                    "_record_prelaunch_failure",
+                    side_effect=lambda _args, **kwargs: prelaunch_failures.append(kwargs),
+                ),
+                patch.object(
+                    D,
+                    "_finish_ledger",
+                    side_effect=lambda *args, **kwargs: finalizations.append(
+                        (args, kwargs)
+                    ),
+                ),
+            ):
+                with pytest.raises(SystemExit):
+                    D.main(
+                        _dispatch_command(
+                            tmp,
+                            dispatch_id,
+                            "raise SystemExit('must not run')",
+                            extra=[
+                                "--in-place",
+                                "--foreground",
+                                "--from-queue",
+                                "--queue-launch-token",
+                                token,
+                                "--queue-claim-path",
+                                str(claim_path),
+                                "--capacity-wait-s",
+                                "0",
+                            ],
+                        )[2:]
+                    )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        assert prelaunch_failures, "stale capacity status suppressed the fresh prelaunch failure"
+        assert prelaunch_failures[0].get("state") == "prelaunch_failed"
+        assert not finalizations, finalizations
+
+
 def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -942,6 +1034,49 @@ def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
             )
             assert cfg.capacity_wait_s == 600.0
             assert cfg.preserve_capacity_refusal_attempt is False
+
+            def assert_parent_budget(
+                wait_argument: float | None,
+                expected_wait: float,
+                expected_loop_s: float,
+                status_name: str,
+            ) -> None:
+                args.capacity_wait_s = wait_argument
+                args.billing = "sub"
+                args.tail = str(tmp / f"{status_name}.tail")
+                args.status_json = str(tmp / f"{status_name}.status.json")
+                args.launch_detached = True
+                args.acp_detached_child = False
+                cfg = D._build_acp_cfg(
+                    args,
+                    status_json=Path(args.status_json),
+                    base=tmp,
+                )
+                assert cfg.capacity_wait_s == expected_wait
+                launcher_calls: list[dict] = []
+                with (
+                    patch.object(D, "_refuse_reused_dispatch_id_for_launch"),
+                    patch.object(
+                        D,
+                        "_prepare_worker_scratch_dir",
+                        return_value=tmp / "scratch",
+                    ),
+                    patch.object(D, "_emit_dispatch_warnings"),
+                    patch.object(
+                        D,
+                        "_run_acp_detached_launcher",
+                        side_effect=lambda *_args, **kwargs: (
+                            launcher_calls.append(kwargs) or 0
+                        ),
+                    ),
+                ):
+                    assert D._run_acp_shape(args, base=tmp, account_env={}) == 0
+
+                parent_sum = launcher_calls[0]["capacity_wait_s"]
+                assert parent_sum == expected_wait
+                assert max(20.0, parent_sum + 20.0) == expected_loop_s
+
+            assert_parent_budget(None, 600.0, 620.0, "acp-parent-default")
             args.from_queue = True
             args.queue_launch_token = "queue-token"
             args.queue_claim_path = str(tmp / "queued.claimed")
@@ -969,6 +1104,9 @@ def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
                 base=tmp,
             )
             assert overridden.capacity_wait_s == 4.5
+            assert_parent_budget(None, 4.5, 24.5, "acp-parent-env")
+            os.environ.pop("GOALFLIGHT_CAPACITY_WAIT_S")
+            assert_parent_budget(7.0, 7.0, 27.0, "acp-parent-explicit")
         finally:
             if old_state is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)

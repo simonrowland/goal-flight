@@ -512,7 +512,7 @@ def test_cli_controller_notice_without_to_controller_writes_nothing(
         check=False,
     )
     assert posted.returncode == 2, posted.stderr
-    assert "post: refused:" in posted.stderr
+    assert "NOT RECORDED:" in posted.stderr
     assert "--to-controller LABEL" in posted.stderr
     assert "--type controller-notice" in posted.stderr
     assert "ok" not in posted.stdout

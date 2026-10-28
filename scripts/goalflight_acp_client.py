@@ -3544,6 +3544,7 @@ async def spawn_acp_connection(
         cwd=cwd,
         os_sandbox=os_sandbox,
         agent=agent,
+        environment=child_env,
     )
     # Inject a DEDICATED goal-flight provenance marker into the spawned shim's
     # environment. This GUARANTEES every goal-flight-launched shim is positively

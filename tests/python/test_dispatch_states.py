@@ -24,6 +24,8 @@ def test_dispatch_state_aliases_and_lifecycle() -> None:
     assert states.normalize_dispatch_state("liveness_indeterminate") == "liveness_indeterminate"
     assert states.is_terminal_state("blocked_capacity") is True
     assert states.is_terminal_state("blocked_os_sandbox") is True
+    assert states.is_terminal_state("prelaunch_failed") is True
+    assert states.terminal_state_for("prelaunch_failed") == "prelaunch_failed"
     assert states.is_running_state("watcher_stopped") is True
     assert states.is_terminal_state("watcher_stopped") is False
     assert states.is_terminal_state("controller_dead") is True

@@ -5,16 +5,15 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from support import skip_if_node_unavailable
 
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-NODE = shutil.which("node")
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -39,7 +38,7 @@ def run_checker(project_root: Path) -> subprocess.CompletedProcess:
     # Post-layout-change convention (lane B): store in docs-private/, browser
     # mirror in dashboard/ — the checker takes both roots.
     return subprocess.run(
-        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
+        ["node", str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
         env={**os.environ, "GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"},
         cwd=str(ROOT),
         text=True,
@@ -64,6 +63,10 @@ def read_data_js_items(project_root: Path) -> list[dict]:
 
 
 def test_append_single_and_batch() -> None:
+    if skip_if_node_unavailable(
+        "test_append_single_and_batch", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         first = run_task(project, "new", "First task", "--by", "tester").stdout.strip()
@@ -102,6 +105,10 @@ def test_append_single_and_batch() -> None:
 
 
 def test_append_unknown_id_is_atomic() -> None:
+    if skip_if_node_unavailable(
+        "test_append_unknown_id_is_atomic", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         item_id = run_task(project, "new", "Only task", "--by", "tester").stdout.strip()
@@ -113,6 +120,10 @@ def test_append_unknown_id_is_atomic() -> None:
 
 
 def test_append_duplicate_ids_rejected_before_mutation() -> None:
+    if skip_if_node_unavailable(
+        "test_append_duplicate_ids_rejected_before_mutation", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         item_id = run_task(project, "new", "Only task", "--by", "tester").stdout.strip()
@@ -124,9 +135,6 @@ def test_append_duplicate_ids_rejected_before_mutation() -> None:
 
 
 def main() -> None:
-    if not NODE:
-        print("SKIP: test_append_verb.py: node not found on PATH")
-        return
     test_append_single_and_batch()
     test_append_unknown_id_is_atomic()
     test_append_duplicate_ids_rejected_before_mutation()

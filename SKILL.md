@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.7.4
+version: 1.7.6
 description: "Use when the user invokes /goal-flight or asks for Goal Flight to plan, dispatch, review, recover, or resume a long-running orchestrated repository run from file-backed state."
 when_to_use: "User invoked /goal-flight, or asked to start, resume, or recover a Goal Flight orchestrated run. Not for generic coding or one-off edits."
 disable-model-invocation: true
@@ -14,26 +14,26 @@ This checked-in `SKILL.md` is compiled from `docs/controller-behaviours.md` and 
 
 ## Activation Check
 
-**Is goal-flight active in this project?** Run
-`python3 <skill-root>/scripts/goalflight_session_status.py --text` before
-auto-loading the rest of this skill. Verdict "no active goal-flight session"
-→ you are NOT in a goal-flight run; do regular coding without loading the
-back half. Load end-to-end only when the verdict is "active" or the user
-explicitly invokes `/goal-flight <command>`.
+**Is goal-flight active here?** Before auto-loading, run
+`python3 <skill-root>/scripts/goalflight_session_status.py --text`. If verdict
+is "no active goal-flight session", you are NOT in a goal-flight run; do
+regular coding without the back half.
+Load end-to-end only for an "active" verdict or when the user invokes
+`/goal-flight <command>`.
 
 `<skill-root>` = this repo when working in goal-flight itself; for downstream projects it is the installed skill checkout (see per-host pointers) — resolve it before running scripts.
 
-**Skill-freshness + designated-controller check.** If a previous-invocation
-reminder exists but you can't quote this preamble verbatim, reload via State's
-canonical resume order before acting; then compare
+**Skill-freshness + designated-controller check.** If a prior-invocation
+reminder exists and you cannot quote this preamble verbatim, reload State's
+canonical resume order before acting. Compare
 `scripts/goalflight_session_status.py --ensure-session` with the active queue's
-`current_session.id`: match → you are the designated orchestrator; mismatch →
-surface to the user before claiming.
+`current_session.id`: match means you are designated orchestrator; mismatch
+means surface to the user before claiming.
 Extended: `protocols/guidance-extended.md` §activation-check
 
 ## Per-host pointers
 
-Per-host pointers tell non-native orchestrators where their installed wrapper lives.
+Installed wrapper paths for non-native orchestrators:
 If you are a non-Claude orchestrator (codex, grok, grok-bot, cursor, opencode), load your
 host wrapper first, then root `SKILL.md` as canonical workflow:
 
@@ -57,8 +57,8 @@ see `docs/hosts/windows.md`.
 Load order: `AGENTS.md` -> installed host wrapper -> repository `SKILL.md` ->
 only the invoked `commands/*.md` plus referenced `protocols/*.md`.
 Companion tools: gstack `/review` is the canonical chunk reviewer; gstack
-`/challenge` is the adversarial frame; fall back to `prompts/gstack-*.md` only
-when gstack is absent. context-mode stores large outputs and searches them.
+`/challenge` is the adversarial frame. Use `prompts/gstack-*.md` only if gstack is absent.
+context-mode stores and searches large outputs.
 Orchestrator behaviour probes run through portable host adapters, not host-specific print-mode shortcuts.
 
 ## Navigation map: behaviour -> SKILL anchor -> protocol/script
@@ -95,11 +95,10 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 
 ## Orchestrator Contract
 
-Use this wrapper for work too large for one uninterrupted session: decomposed
-implementation, long refactors, review flights, resumable queues, or unattended
-dispatch. The orchestrator manages context and verification; it does not hoard
-every file, log, or worker transcript in conversation.
-Orchestrator context is scarce; delegate iteration so only the converged conclusion returns.
+Use this wrapper for decomposed implementation, long refactors, review flights,
+resumable queues, or unattended dispatch. The orchestrator manages context and
+verification; keep files, logs, and worker transcripts out of conversation.
+Context is scarce: delegate iteration so only converged conclusions return.
 
 Always:
 - read the invoked command file and only its referenced protocols
@@ -116,6 +115,8 @@ Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <patte
 Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
 `$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
 For a file outside your worktree, use its known path.
+Use `$TMPDIR` for scratch files, separate clones, logs and browser profiles; it is the dispatch scratch directory or a private child, is retention-managed and removed after dispatch ends. Do not create `/tmp/<name>` or `/private/tmp/<name>` entries.
+Start headless Chrome or Chromium with `--use-mock-keychain` and `--user-data-dir` under `$TMPDIR`; Grok and Cursor account homes have no keychain, so Chrome may show a dialog on the owner's screen.
 
 ## Session Pre-Flight
 
@@ -199,44 +200,30 @@ review, Type-2 milestone review; Type 3 sweeps class predicates.
 | Type 2 — milestone review | 5 chunks, `[milestone]`, or pre-push | `protocols/milestone-review.md`; milestone/QA bug sweep; adversarial verify; disjoint fix groups |
 | Type 3 — dictionary deep-sweep | Each class mint; under-searched predicates | predicate bug sweep; exit at marginal_real_yield ≈ 0 |
 
-On chunk completion, dispatch gstack `/review` before committing; use
-`/challenge` as the canonical adversarial frame; never hand-roll review prompts.
-Controller re-takes the null stance with ≥2 concern-diverse lenses, scaling by complexity. Review routing follows `protocols/review-types.md`; non-code flights use `prompts/gstack-*.md`. [RT-005]
+On chunk completion, dispatch gstack `/review` before commit; use `/challenge` as the canonical adversarial frame; never hand-roll review prompts. Controller
+re-takes the null stance with ≥2 concern-diverse lenses, scaled by complexity.
+Review routing follows `protocols/review-types.md`; non-code flights use
+`prompts/gstack-*.md`. [RT-005]
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
-Review results are saved durably under `docs-private/reviews/` or the chunk research dir; /tmp-only verdicts cannot be mined.
-Each NEW bug class triggers MINT-generalize (`protocols/review-mining.md`): mint, sweep backwards over code + saved reviews, record no-hits, encode the lens. One catch, one class, one sweep.
+Save reviews durably under `docs-private/reviews/` or the chunk research dir;
+never mine /tmp-only verdicts.
+Each NEW bug class triggers MINT-generalize (`protocols/review-mining.md`):
+mint, sweep backwards over code and saved reviews, record no-hits, encode the lens.
+One catch, one class, one sweep.
 Reviews are one-shot; fixes loop to green and re-review; substantive closures get a refutation pass.
 Diversify reviewer concern, not just model; scale perspectives by complexity/stakes. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review; status prints chunks since last sweep; skipped due sweep = open liability.
 
 ## Nested Review Invocation
 
-Canonical nested review shape (full rationale + flags: `protocols/chunk-review.md`):
+Nested gstack reviews run controller-side with the read-only sandbox,
+`approval_policy=never`, and closed stdin; never use
+`--dangerously-bypass-approvals-and-sandbox`. Apply P3-safe-easy findings inline;
+fix P0/P1/P2 before commit. Exact command and output handling: `protocols/chunk-review.md`.
 
-```bash
-codex exec --sandbox read-only \
-  -c approval_policy=never \
-  -c 'model_reasoning_effort="xhigh"' \
-  --enable web_search_cached \
-  "$REVIEW_PROMPT" \
-  < /dev/null \
-  > docs-private/reviews/<date>-<slug>/codex-review.final.md \
-  2> docs-private/reviews/<date>-<slug>/codex-review.stderr.log
-```
-
-**`< /dev/null` is load-bearing** — without it, `codex exec` reads stdin to EOF
-and bash-tail wedges (observed 2026-05-27). **`-c approval_policy=never`** is
-the canonical non-interactive form (`protocols/legacy/bash-tail.md`). Do NOT
-substitute `--dangerously-bypass-approvals-and-sandbox` — classifiers reject
-it; `adapters/codex.json` `forbidden_args` forbids it. Apply P3-safe-easy
-findings inline; fix P0/P1/P2 before commit.
-
-**Reasoning effort is opt-in per dispatch.** The worker CLI config sets the
-default, so ordinary implementation dispatches inherit it and nothing in
-goal-flight overrides it. Raise it where the extra thinking pays: reviews,
-adversarial passes, and hard debugging. The review recipe above already pins
-`xhigh` explicitly; for a worker dispatch use the flag, which validates the
-level at the parser and checks model support before launching:
+**Reasoning effort is opt-in per dispatch.** Workers inherit the CLI default.
+Raise it for reviews, adversarial passes, and hard debugging; the flag checks
+the level and model support before launch:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex \
@@ -266,15 +253,15 @@ Other agents, shapes, `--interactive`, or raw commands refuse it.
   ~5KB MUST write findings to
   `docs-private/research/<date>-<slug>/findings.md` and return a TL;DR +
   severity count, then `READY: <path>` as the **last**
-  non-empty line (terminal marker — emit TL;DR/findings before it). The
-  orchestrator reads the TL;DR and opens the file only when it signals real action.
+  non-empty line (terminal marker — emit TL;DR/findings before it). Open findings
+  only when the TL;DR signals real action.
 - Host subagents that cannot write return findings to the controller, which
   persists the file.
 - Read >5KB without an expected Edit follow-up within 2 turns → use
   `Agent`/Explore with a defined prompt; do not pull recon bodies into
   controller context.
-- The host Agent / Task / Explore tool is for recon, analysis, and review ONLY
-  — NEVER a code executor. Code-writing chunks use
+- Host Agent / Task / Explore are for recon, analysis, and review ONLY — NEVER
+  code execution. Code-writing chunks use
   `scripts/goalflight_dispatch.py`, or controller-direct only with held context
   and no fleet stall (Axis 2).
 - Out-of-scope findings go to the store's `deferred` lane via `goalflight_task.py capture`.
@@ -311,7 +298,7 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 
 ## Capacity and rate limits
 
-Consider capacity before any worker spawn. Defaults come from
+Check capacity before spawning. Defaults come from
 `scripts/goalflight_agent_limits.py` (`DEFAULT_AGENT_CAPS`, imported by
 `goalflight_capacity.py`).
 Capacity acquire waits on machine, agent, RSS, or cooldown pressure.
@@ -346,11 +333,13 @@ Extended: `protocols/guidance-extended.md` §autonomous-throughput
 
 ## Chat as requirements
 
-Orchestrator chat is requirements input, not an inline editor command. Mid-session
-asks are steering/architecture/scope input. Append them to the active goal queue
-or promote them to a plan revision plus re-review when they change scope.
+Treat orchestrator chat as requirements, not inline-edit commands. Mid-session
+asks steer architecture or scope: append them to the active goal queue, or
+promote scope changes to a plan revision and re-review.
 
-Do not task-pivot or inline-edit on receipt. Plan before editing when scope is unsettled. Prepare ambiguous questions before asking the user. Relay USER-NEED through orchestrator, not worker chat. chat alone is not the backlog.
+Do not pivot tasks or inline-edit on receipt. Plan first if scope is unsettled;
+prepare ambiguous questions before asking. Relay USER-NEED through the
+orchestrator, not worker chat. Chat alone is not the backlog.
 
 ### In-flight steer mailbox
 
@@ -398,17 +387,14 @@ the configured number of *concurrent* writers indefinitely. Exhaustion refuses
 and names the oldest holders; it never silently falls back to `git worktree add`.
 
 **★ THE WORKTREE COUNT IS NOT A PARALLELISM CAP. Do not treat it as one.**
-Wide fan-out is wanted — parallelism is how this tool earns its keep. What is
-being prevented is **worktree sprawl**: disk exhaustion and codedb
-over-indexing, both of which scale with the number of checkout ROOTS, not with
-how many workers you run. Twenty sessions through reused worktrees is healthy;
+Wide fan-out is wanted; parallelism is how this tool earns its keep. Prevent
+**worktree sprawl**: disk exhaustion and codedb over-indexing scale with checkout
+ROOTS, not worker count. Twenty sessions through reused worktrees is healthy;
 twenty ad-hoc checkout roots is the problem.
 
-**The failure mode is well documented and recurs:** a controller treats the
-worktree count as a worker cap, decides it needs more concurrency, and
-hand-rolls `git worktree add` for the excess. That bypass is how one repo
-reached **210 ad-hoc worktrees of 211, 202GB, and a machine at 100% disk**. If
-you genuinely need more concurrent worktrees, raise
+**The failure recurs:** a controller treats the count as a worker cap and
+hand-rolls `git worktree add` for concurrency. One repo reached **210 ad-hoc
+worktrees of 211, 202GB, and 100% disk**. To add concurrency, raise
 `GOALFLIGHT_WORKTREES_PER_REPO` (deprecated alias:
 `GOALFLIGHT_WORKTREE_SEATS`) — **never** work around the pool, and never lower
 the count to shape provider/account fan-out.
@@ -423,12 +409,11 @@ an exclusive writer worktree; writable dispatches remain exclusive by default.
 
 ### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
 
-**A worker that stopped to ASK YOU something is always a resume, never a fresh
-brief.** Quota wall, `BLOCKED:`, a clarification, a USER-NEED / `!READY` plan
-pause — answer it and resume. A redispatch is a NEW engine session that re-reads
-the corpus and re-derives every dead end the original already ruled out; you pay
-for all of it again to deliver one sentence. This is the main way worker tokens
-get burnt here.
+**If a worker stopped to ASK YOU, always resume it; never rebrief.** Quota wall,
+`BLOCKED:`, a clarification, or a USER-NEED / `!READY` plan pause: answer and
+resume. Redispatch starts a NEW engine session that rereads the corpus and
+re-derives ruled-out dead ends, paying again to deliver one sentence. This is
+the main way worker tokens get burnt here.
 
 Resume RE-READS `--prompt-file` as authoritative over the worker's own memory,
 so do NOT point it at a short answer-only file — that replaces the brief.
@@ -451,7 +436,12 @@ a corrected policy) or the session is unrecoverable. See
 
 A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.
 
-**Before deciding, look at the worktree** — `git -C <worktree> status --short`.
+**Before deciding, look at the worktree.** Read `worktree_path` from the
+dispatch status record and require a nonempty absolute path to an existing
+directory before running Git. If it is absent, stop and report that the
+dispatch record has no `worktree_path`; do not let Git use the current
+directory. Then run
+`git -C "$worktree" status --short`.
 A throttled worker very often left uncommitted work that is complete or nearly
 so. Discarding it is the expensive mistake, and a clean-looking worktree is NOT
 proof the worker did nothing: it may simply not have reached its first commit.
@@ -468,8 +458,11 @@ Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks 
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).
 
-Fabricated approval rejected: Never invent user approval for a gated step.
-Orchestrator dispatch waits for declared readiness requirements. Orchestrator live gate requires supported capability and ready local state. Worker live gate also requires requested transport verified. Discovery probes do not use network or model calls. Discovery probes stay within manifest budget caps.
+Never invent user approval for a gated step.
+Dispatch waits for declared readiness. Orchestrator live gate requires supported
+capability and ready local state; worker live gate also requires verified
+requested transport. Discovery probes use neither network nor model calls and
+stay within manifest budget caps.
 
 ## Worker Routing
 
@@ -556,7 +549,11 @@ Bash-tail recipes live in `protocols/legacy/bash-tail.md`; forking lives in
 
 ## Verification and test gates
 
-Before each chunk commit: focused tests green. Background tests are pending until results are read. `./tests/run.sh` is the repo-wide gate when scope or risk justifies it. `./scripts/autoreview.sh` is a complementary parallel option, never the default; gstack `/review` remains default. GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path.
+Before each chunk commit, focused tests must be green; background tests stay
+pending until read. `./tests/run.sh` is the repo-wide gate when scope or risk
+justifies it. `./scripts/autoreview.sh` is a complementary parallel option, not
+the default; gstack `/review` remains default. GOALFLIGHT_AUTOREVIEW=1 is an
+optional maintainer tier, not the default review path.
 
 For each Golden Master entry, SKILL.md contains the entry's compressed-form text. Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog, context-load-order. Build corpus eagerly; it audits source truth. Use primary sources, not precis, for corpus slices. Specialize self-review bullets to project nouns. Check source-truth contradictions before corpus build. Preflight noninteractive workers for MCP approval stalls. No remote dispatch before phase gate is green.
 

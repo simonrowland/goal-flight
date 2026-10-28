@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -45,6 +45,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
 import goalflight_cursor  # noqa: E402
 import goalflight_dispatch_paths  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 from goalflight_watch import (  # noqa: E402
@@ -278,7 +279,7 @@ from goalflight_adapter_readiness import (
     validate_os_sandbox_request,
 )
 from goalflight_acp_boundaries import permission_boundary_warning
-from goalflight_codex_sandbox import codex_workspace_write_args
+from goalflight_codex_sandbox import codex_plugins_off_args, codex_workspace_write_args
 from goalflight_acp_client import (
     ACP_SDK_IMPORTABLE,
     ACP_SDK_REEXEC,
@@ -588,6 +589,7 @@ from goalflight_liveness import (
     resolve_indeterminate_timeout_s,
     system_sleep_pause_note,
     system_sleep_pause_s,
+    status_write_lock,
     write_status,
 )
 from goalflight_os_sandbox import (
@@ -603,13 +605,34 @@ from goalflight_startup_gate import StartupGate
 from acp_runner import PromptResult, extract_markers, has_actionable_marker_values, run_prompt
 
 
-def _commit_prelaunch_terminal(payload: dict, *, project_root: Path | str) -> None:
+def _commit_prelaunch_terminal(
+    payload: dict,
+    *,
+    project_root: Path | str,
+    dispatch_record: dict | None = None,
+    ambient_is_dispatcher: bool = False,
+) -> dict[str, str]:
     """Commit ACP refusals/failures that occur before the normal ledger setup."""
     state = str(payload.get("state") or "failed")
+    attribution = (
+        goalflight_ledger.controller_attribution_from_active_lease(
+            project_root,
+            dispatch_id=str(payload["dispatch_id"]),
+            dispatch_record=dispatch_record,
+            ambient_is_dispatcher=ambient_is_dispatcher,
+        )
+        if dispatch_record is not None
+        else {
+            "controller_label": payload.get("controller_label"),
+            "controller_session_id": payload.get("controller_session_id"),
+            "controller_pid": payload.get("controller_pid"),
+        }
+    )
     result = goalflight_ledger.commit_terminal_authority(
         {
             "dispatch_id": str(payload["dispatch_id"]),
             "project_root": str(project_root),
+            **attribution,
         },
         state=state,
         reason=payload.get("reason") or payload.get("error"),
@@ -619,12 +642,126 @@ def _commit_prelaunch_terminal(payload: dict, *, project_root: Path | str) -> No
         payload["attempt_id"] = result.value.attempt_id
         payload["transition_id"] = result.value.transition_id
         payload["terminal_event_uuid"] = result.value.event_uuid
-        return
+        return attribution
     payload["terminal_pending_state"] = state
     payload["state"] = "terminal_pending"
     payload["terminal_commit_error"] = (
         f"journal terminal emitter returned {result.disposition.value}: {result.reason}"
     )
+    return attribution
+
+
+def _finalize_prepared_attempt_after_early_exit(
+    cfg: argparse.Namespace,
+    *,
+    result: dict | None,
+    failure: BaseException | None,
+    started_at: float,
+) -> None:
+    """Settle a prepared attempt if setup exited before its inner finalizer."""
+    if not getattr(cfg, "_acp_attempt_may_be_prepared", False):
+        return
+    if result and result.get("status_launch_admission_deferred"):
+        return
+    interrupted = isinstance(failure, (asyncio.CancelledError, KeyboardInterrupt)) or (
+        isinstance(result, dict)
+        and result.get("terminated_by_signal") == "SIGTERM"
+    )
+    if failure is None and not interrupted and not (
+        isinstance(result, dict) and result.get("state") == "terminal_pending"
+    ):
+        return
+    if (
+        getattr(cfg, "_acp_preserve_prepared_attempt", False)
+        and not interrupted
+    ):
+        return
+
+    dispatch_id = str(cfg.dispatch_id)
+    project_root = Path(getattr(cfg, "project_root", None) or cfg.cwd).resolve()
+    authority = goalflight_journal.open_or_create_journal(project_root)
+    attempt = authority.attempt_for_dispatch(dispatch_id)
+    if (
+        attempt is None
+        or attempt.lifecycle_state != goalflight_journal.ATTEMPT_PREPARED
+    ):
+        return
+
+    import goalflight_dispatch
+
+    status_path = _resolve_status_json_path(
+        getattr(cfg, "status_json", None), dispatch_id
+    )
+    with status_write_lock(status_path) as lock:
+        existing_status = lock.read()
+
+    state = "failed"
+    terminal_state = "error"
+    if isinstance(failure, asyncio.CancelledError):
+        reason = {"code": -1, "message": "cancelled"}
+    elif isinstance(failure, KeyboardInterrupt):
+        reason = {
+            "code": -int(signal.SIGINT),
+            "message": "keyboard_interrupt",
+        }
+    elif isinstance(result, dict):
+        reason = result.get("error") or result.get("reason")
+    else:
+        reason = (
+            f"{type(failure).__name__}: {failure}"
+            if failure
+            else "prelaunch failure"
+        )
+        terminal_state = None
+
+    # Read status with its shared lock, then release it before cmd_finish so
+    # the ledger/status lock order cannot cycle.
+    if goalflight_dispatch._status_payload_is_terminal(existing_status):
+        for candidate in (
+            existing_status.get("terminal_state"),
+            existing_status.get("state"),
+        ):
+            if not goalflight_dispatch._is_status_terminal(candidate):
+                continue
+            resolved = goalflight_ledger.terminal_state_for(
+                str(candidate),
+                existing_status.get("error") or existing_status.get("reason"),
+            )
+            if resolved != "unknown":
+                state = str(candidate)
+                reason = existing_status.get("error") or existing_status.get("reason")
+                terminal_state = resolved
+                break
+
+    finish_args = argparse.Namespace(
+        dispatch_id=dispatch_id,
+        state=state,
+        reason=reason,
+        terminal_state=terminal_state,
+        elapsed_s=round(max(0.0, time.time() - started_at), 3),
+        worker_still_alive=False,
+        prelaunch_failure=True,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        terminal_code = goalflight_ledger.cmd_finish(finish_args)
+    if terminal_code != 0:
+        return
+
+    with status_write_lock(status_path) as lock:
+        current = lock.read()
+        if goalflight_dispatch._status_payload_is_terminal(current):
+            return
+        updated = dict(current or {})
+        updated.update(
+            state=state,
+            terminal_state=terminal_state,
+            worker_alive=False,
+            worker_still_alive=False,
+            updated_at=_now(),
+        )
+        if reason is not None:
+            updated["error"] = reason
+        lock.write(updated)
 
 
 def _record_acp_ledger_state(
@@ -655,17 +792,10 @@ def _record_acp_ledger_state(
 
     spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
     recorded_worker_cwd = (
-        None
-        if state in {"queued", "waiting_capacity", "submitted", "claimed"}
-        else str(worker_cwd or getattr(cfg, "cwd", None) or project_root)
+        str(worker_cwd or getattr(cfg, "cwd", None) or project_root)
+        if spawn_state != "none"
+        else None
     )
-    if (
-        recorded_worker_cwd is None
-        and getattr(cfg, "parent_dispatch_id", None)
-        and bool(getattr(cfg, "read_only", False))
-        and worker_cwd
-    ):
-        recorded_worker_cwd = str(worker_cwd)
     recorded_worktree_path = getattr(cfg, "_worktree_path", None)
     recorded_worktree_base = getattr(cfg, "_worktree_base_commit", None)
 
@@ -696,14 +826,21 @@ def _record_acp_ledger_state(
                     worker_cwd=recorded_worker_cwd,
                     worktree_path=recorded_worktree_path,
                     worktree_base=recorded_worktree_base,
+                    lock_holder=payload.get("lock_holder"),
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
                     controller_label=controller_label,
                     worker_pid=worker_pid if spawn_state == "spawned" else None,
-                    acp_session_id=cfg.session_id,
+                    acp_session_id=(
+                        cfg.session_id if spawn_state == "spawned" else None
+                    ),
                     logical_session_id=cfg.session_id,
-                    engine_session_id=getattr(cfg, "engine_session_id", None)
-                    or cfg.session_id,
+                    engine_session_id=(
+                        getattr(cfg, "engine_session_id", None) or cfg.session_id
+                        if spawn_state == "spawned"
+                        else None
+                    ),
+                    parent_dispatch_id=getattr(cfg, "parent_dispatch_id", None),
                     resume_mode=getattr(cfg, "resume_mode", None),
                     lease_id=lease_id,
                     stdout_path=None,
@@ -736,6 +873,10 @@ def _record_acp_ledger_state(
             timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
         )
     if record_code == 0:
+        if state == "waiting_capacity":
+            # This is the durable PREPARED commit. Mark it before any later
+            # bookkeeping callback can fail and bypass the inner finalizer.
+            cfg._acp_attempt_may_be_prepared = True
         release_redispatch_lock = getattr(cfg, "redispatch_lock_release", None)
         if callable(release_redispatch_lock):
             release_redispatch_lock()
@@ -1041,7 +1182,45 @@ def _worker_spawn_env(cfg: argparse.Namespace, original_prompt_file: str | None)
         spawn_env[PROMPT_FILE_ENV] = original_prompt_file
     else:
         spawn_env.pop(PROMPT_FILE_ENV, None)
+    scratch_dir = getattr(cfg, "_worker_scratch_dir", None)
+    if scratch_dir:
+        spawn_env["GOALFLIGHT_SCRATCH_DIR"] = str(scratch_dir)
+        spawn_env["TMPDIR"] = str(scratch_dir)
+    spawn_env.pop("GOALFLIGHT_REMOTE_RUN", None)
+    spawn_env.update(
+        goalflight_dispatch_paths.remote_ci_worker_environment(
+            getattr(cfg, "project_root", None)
+            or getattr(cfg, "cwd", None)
+            or Path.cwd()
+        )
+    )
+    dispatch_id = str(getattr(cfg, "dispatch_id", None) or "").strip()
+    if dispatch_id:
+        outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(dispatch_id)
+        outbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        spawn_env["GOALFLIGHT_DISPATCH_ID"] = dispatch_id
+        spawn_env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox_dir)
     return spawn_env
+
+
+def _project_worker_journal_outbox(
+    dispatch_id: str,
+    spawn_env: Mapping[str, str],
+    *,
+    final: bool = False,
+) -> int:
+    outbox_dir = str(spawn_env.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or "").strip()
+    if not dispatch_id or not outbox_dir:
+        return 0
+    import goalflight_messages
+
+    return goalflight_messages.project_worker_journal_outbox(
+        dispatch_id,
+        outbox_dir=Path(outbox_dir),
+        messages_dir=goalflight_messages.default_messages_dir(),
+        max_records=64 if final else 16,
+        budget_s=0.2,
+    )
 
 
 def _prompt_with_original_prompt_file_preamble(base_prompt: str, original_prompt_file: str | None) -> str:
@@ -1751,6 +1930,8 @@ def agent_command(
         model = _DEFAULT_STRONG_MODEL.get(agent_key)
     if model:
         args = _acp_model_args(agent, args, str(model))
+    if agent_key in {"codex", "codex-acp"}:
+        args = [*codex_plugins_off_args(), *args]
     return binary, args
 
 
@@ -1760,10 +1941,11 @@ def _codex_workspace_write_acp_args(
     *,
     cwd: str | None,
     os_sandbox: str | None,
+    environment: Mapping[str, str] | None = None,
 ) -> list[str]:
     if str(agent).strip().lower() not in {"codex", "codex-acp"}:
         return args
-    return [*codex_workspace_write_args(cwd, os_sandbox), *args]
+    return [*codex_workspace_write_args(cwd, os_sandbox, environment=environment), *args]
 
 
 def _compact_tool_call_summaries(tool_calls: list[Any], limit: int = 50) -> list[dict[str, object]]:
@@ -2127,6 +2309,7 @@ async def spawn_and_handshake_with_retry(
     stderr_capture: AgentStderrCapture | None = None,
     resume_session_id: str | None = None,
     pass_fds: tuple[int, ...] = (),
+    launch_admission: Callable[[], Any] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -2147,24 +2330,32 @@ async def spawn_and_handshake_with_retry(
     """
     last_err: AcpError | None = None
     for attempt in range(max(1, attempts)):
-        conn = await spawn_acp_connection(
-            command,
-            acp_args,
-            agent=agent,
-            session_id=session_id,
-            cwd=cwd,
-            auto_allow_tools=auto_allow_tools,
-            activity=activity,
-            context_mode=context_mode,
-            permission_mode=permission_mode,
-            permission_dir=permission_dir,
-            permission_inline_timeout_s=permission_inline_timeout_s,
-            permission_user_timeout_s=permission_user_timeout_s,
-            permission_policy=permission_policy,
-            os_sandbox=os_sandbox,
-            env=env,
-            pass_fds=pass_fds,
+        admission = (
+            launch_admission()
+            if launch_admission is not None
+            else contextlib.nullcontext(object())
         )
+        with admission as status_lock:
+            if status_lock is None:
+                raise AcpError("terminal status prevents worker launch")
+            conn = await spawn_acp_connection(
+                command,
+                acp_args,
+                agent=agent,
+                session_id=session_id,
+                cwd=cwd,
+                auto_allow_tools=auto_allow_tools,
+                activity=activity,
+                context_mode=context_mode,
+                permission_mode=permission_mode,
+                permission_dir=permission_dir,
+                permission_inline_timeout_s=permission_inline_timeout_s,
+                permission_user_timeout_s=permission_user_timeout_s,
+                permission_policy=permission_policy,
+                os_sandbox=os_sandbox,
+                env=env,
+                pass_fds=pass_fds,
+            )
         proc = conn.proc
         retry_error: AcpError | None = None
         try:
@@ -2228,12 +2419,17 @@ async def run_acp_dispatch(
     awake_clock: Callable[[], float] | None = None,
 ) -> dict:
     """Run one ACP dispatch with a SIGTERM bridge that preserves finalizers."""
+    if not getattr(cfg, "dispatch_id", None):
+        cfg.dispatch_id = _default_dispatch_id(cfg.agent)
     if goalflight_compat.is_windows():
         payload, _status_path = write_windows_refusal_status(cfg)
         return payload
     bridge = _SigtermCancelBridge(asyncio.get_running_loop(), asyncio.current_task())
     bridge.install()
+    cfg._acp_attempt_may_be_prepared = False
+    cfg._acp_preserve_prepared_attempt = False
     result: dict | None = None
+    started_at = time.time()
     try:
         result = await _run_acp_dispatch_impl(
             cfg,
@@ -2245,7 +2441,7 @@ async def run_acp_dispatch(
         return result
     except asyncio.CancelledError:
         if bridge.received:
-            dispatch_id = cfg.dispatch_id or _default_dispatch_id(cfg.agent)
+            dispatch_id = cfg.dispatch_id
             result = {
                 "schema": "goalflight.acp-run.v1",
                 "dispatch_id": dispatch_id,
@@ -2264,6 +2460,19 @@ async def run_acp_dispatch(
         raise
     finally:
         bridge.restore()
+        try:
+            _finalize_prepared_attempt_after_early_exit(
+                cfg,
+                result=result,
+                failure=sys.exc_info()[1],
+                started_at=started_at,
+            )
+        except BaseException as exc:
+            print(
+                "goalflight_acp_run: prepared-attempt finalization warning: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         reservation = getattr(cfg, "_read_only_resume_reservation", None)
         if reservation is not None:
             try:
@@ -2278,6 +2487,10 @@ async def run_acp_dispatch(
                 )
         if (
             getattr(cfg, "_codex_dispatch_home_resolved", False)
+            and getattr(cfg, "_codex_home_spawn_checked", False)
+            and getattr(cfg, "_codex_dispatch_home_created", False)
+            and not getattr(cfg, "session_id", None)
+            and not getattr(cfg, "resume_session_id", None)
             and not (isinstance(result, dict) and result.get("worker_still_alive") is True)
         ):
             try:
@@ -2391,7 +2604,7 @@ async def _run_acp_dispatch_impl(
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
     if remote_turn_cancel_grace_s < 0:
         remote_turn_cancel_grace_s = DEFAULT_REMOTE_TURN_CANCEL_GRACE_S
-    dispatch_id = cfg.dispatch_id or _default_dispatch_id(cfg.agent)
+    dispatch_id = cfg.dispatch_id
     steer_file, steer_file_source = _resolve_steer_file(cfg, dispatch_id)
     original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
@@ -2401,8 +2614,11 @@ async def _run_acp_dispatch_impl(
     cfg._controller_registration_script = "goalflight_acp_run.py"
     registration_error: str | None = None
     registration_warning: str | None = None
+    dispatch_module = None
     try:
         import goalflight_dispatch as controller_dispatch
+
+        dispatch_module = controller_dispatch
 
         controller_claim = controller_dispatch._stamp_controller_session(
             cfg,
@@ -2643,10 +2859,11 @@ async def _run_acp_dispatch_impl(
         cfg.agent,
         model=getattr(cfg, "model", None),
     )
-    acp_args = _codex_workspace_write_acp_args(
-        cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile
-    )
     spawn_env = _worker_spawn_env(cfg, original_prompt_file)
+    acp_args = _codex_workspace_write_acp_args(
+        cfg.agent, acp_args, cwd=worker_cwd, os_sandbox=os_sandbox_profile,
+        environment=spawn_env,
+    )
     native_launch = goalflight_native_launch.prepare_codex_launch_for_command(
         command,
         acp_args,
@@ -2702,6 +2919,7 @@ async def _run_acp_dispatch_impl(
                 os_sandbox_profile,
                 agent=cfg.agent,
                 command=command if isinstance(command, str) else "",
+                environment=spawn_env,
             )
         except OsSandboxError as e:
             payload.update({"state": "blocked_os_sandbox", "error": str(e)})
@@ -2715,13 +2933,23 @@ async def _run_acp_dispatch_impl(
     # Explicit Codex pins must resolve before capacity and ledger admission. The
     # dispatcher performs this preflight for normal launches; keep the runner
     # boundary equally safe for direct ACP callers and detached children.
-    if goalflight_ledger.infer_engine(cfg.agent) == "codex":
+    if (
+        goalflight_ledger.infer_engine(cfg.agent) == "codex"
+        and not getattr(cfg, "_codex_retry_home", None)
+    ):
         import goalflight_dispatch
 
         goalflight_dispatch._pre_resolve_pinned_codex_account(
             cfg,
             project_root=project_root,
             dispatch_id=dispatch_id,
+        )
+    elif getattr(cfg, "account", None) and getattr(cfg, "_codex_retry_home", None):
+        import goalflight_dispatch
+
+        goalflight_dispatch._refuse_walled_codex_account(
+            str(cfg.account),
+            allow_unknown=bool(getattr(cfg, "occupied_worktree_forced", False)),
         )
 
     # Lease TTL covers the worst-case run length. Derive from idle-timeout.
@@ -2806,6 +3034,7 @@ async def _run_acp_dispatch_impl(
     preserve_capacity_refusal_attempt = bool(
         getattr(cfg, "preserve_capacity_refusal_attempt", False)
     )
+    attempt_prepared = False
     if (
         effective_account is None
         and goalflight_ledger.infer_engine(cfg.agent) == "codex"
@@ -2816,24 +3045,60 @@ async def _run_acp_dispatch_impl(
     # direct launches as well as claimed backlog entries. Only the latter keep
     # their journal attempt PREPARED after a refusal; the queue claim is their
     # durable retry carrier.
-    _record_acp_ledger_state(
-        cfg,
-        dispatch_id=dispatch_id,
-        project_root=project_root,
-        controller_pid=controller_pid,
-        controller_session_id=controller_session_id,
-        controller_label=controller_label,
-        status_path=status_path,
-        payload=payload,
-        effective_account=effective_account,
-        lease_id=None,
-        worker_pid=None,
-        state="waiting_capacity",
-        worker_cwd=worker_cwd,
-    )
-    if getattr(cfg, "_read_only_resume_reservation", None) is not None:
-        import goalflight_dispatch
+    import goalflight_dispatch
 
+    try:
+        with goalflight_dispatch._resume_publication_lock(cfg):
+            _record_acp_ledger_state(
+                cfg,
+                dispatch_id=dispatch_id,
+                project_root=project_root,
+                controller_pid=controller_pid,
+                controller_session_id=controller_session_id,
+                controller_label=controller_label,
+                status_path=status_path,
+                payload=payload,
+                effective_account=effective_account,
+                lease_id=None,
+                worker_pid=None,
+                state="waiting_capacity",
+                worker_cwd=worker_cwd,
+            )
+        attempt_prepared = True
+    except goalflight_dispatch.DispatchUsageError as exc:
+        message = str(exc)
+        payload.update(
+            state="failed_worktree",
+            ok=False,
+            error=message,
+            dispatch_refused=True,
+            updated_at=_now(),
+        )
+        if goalflight_ledger.read_record(dispatch_id) is not None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                terminal_code = goalflight_ledger.cmd_finish(
+                    argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state="failed_worktree",
+                        reason=message,
+                        terminal_state="error",
+                        elapsed_s=round(time.time() - run_started, 3),
+                        worker_still_alive=False,
+                        prelaunch_failure=True,
+                    )
+                )
+            if terminal_code != 0:
+                payload["terminal_pending_state"] = "failed_worktree"
+                payload["state"] = "terminal_pending"
+                payload["terminal_commit_error"] = (
+                    f"journal terminal emitter exited {terminal_code}"
+                )
+        else:
+            _commit_prelaunch_terminal(payload, project_root=project_root)
+        print(f"goalflight_acp_run: {message}", file=sys.stderr, flush=True)
+        write_status(status_path, payload)
+        return payload
+    if getattr(cfg, "_read_only_resume_reservation", None) is not None:
         goalflight_dispatch._release_read_only_resume_reservation(cfg)
     wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
         lane=acquire_args.priority,
@@ -2897,6 +3162,8 @@ async def _run_acp_dispatch_impl(
         write_status(status_path, payload)
         return payload
     except Exception as exc:
+        if preserve_capacity_refusal_attempt:
+            cfg._acp_preserve_prepared_attempt = True
         if not preserve_capacity_refusal_attempt:
             payload.update(
                 {
@@ -2934,6 +3201,8 @@ async def _run_acp_dispatch_impl(
             )
             acquire_payload.setdefault("attempts", int(last_capacity_wait["attempt"]) + 1)
         payload.update({"state": "blocked_capacity", "reason": acquire_payload})
+        if preserve_capacity_refusal_attempt:
+            cfg._acp_preserve_prepared_attempt = True
         if not preserve_capacity_refusal_attempt:
             _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
@@ -2942,12 +3211,19 @@ async def _run_acp_dispatch_impl(
     lease_id = acquire_payload.get("lease", {}).get("lease_id")
 
     proc: asyncio.subprocess.Process | None = None
+    worker_spawn_attempted = False
     conn: AcpConnection | None = None
     termination_result: AcpTerminationResult | None = None
     worktree_seat: goalflight_worktree_pool.WorktreeSeatLease | None = None
     read_only_seat_hold = None
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
+    terminal_status_refused = False
+    status_launch_admission_deferred = False
+    terminal_refusal_payload: dict[str, object] | None = None
+    terminal_refusal_state: str | None = None
+    terminal_refusal_terminal_state: str | None = None
+    interrupted_terminal_state: str | None = None
     state = "failed"
     activity = AcpLivenessActivity()
     heartbeat_outcome: str | None = None
@@ -3709,6 +3985,8 @@ async def _run_acp_dispatch_impl(
             if proc is None or proc.returncode is not None:
                 return
             await relay_inline_permissions()
+            with contextlib.suppress(Exception):
+                _project_worker_journal_outbox(dispatch_id, spawn_env)
             wall_now = time.time()
             active_now = active_monotonic()
             freeze_s = system_sleep_pause_s(
@@ -4146,6 +4424,8 @@ async def _run_acp_dispatch_impl(
             pgid=payload.get("pgid"),
             worker_alive=(proc.returncode is None) if proc else False,
         )
+        with contextlib.suppress(Exception):
+            _project_worker_journal_outbox(dispatch_id, spawn_env)
         if runaway_error is not None:
             runaway_terminal_error = runaway_error
             await mark_runaway_terminal(runaway_error)
@@ -4234,8 +4514,9 @@ async def _run_acp_dispatch_impl(
         return keep_waiting
 
     async def mark_attempt(attempt: int, p: asyncio.subprocess.Process) -> None:
-        nonlocal proc
+        nonlocal proc, worker_spawn_attempted
         proc = p  # publish to heartbeat/note_event/on_idle closures + finally
+        worker_spawn_attempted = True
         pgid = process_group_id(p.pid) or p.pid
         # Capacity attachment is the admission truth and must precede RUNNING.
         # Any failure propagates to spawn_and_handshake_with_retry, whose
@@ -4274,15 +4555,14 @@ async def _run_acp_dispatch_impl(
         # Codex environment only after capacity succeeds and immediately before
         # the starting-ledger/spawn block.
         spawn_env = dict(spawn_env)
-        dispatch_module = None
-        try:
-            import goalflight_dispatch as dispatch_module
-        except BaseException:
-            dispatch_module = None
         codex_home = None
 
     try:
         if is_local_codex and dispatch_module is not None:
+            expected_home = (
+                dispatch_module._codex_dispatch_homes_dir() / dispatch_id
+            ).resolve(strict=False)
+            per_dispatch_home_existed_before = expected_home.is_dir()
             post_capacity_account = (
                 dispatch_module.revalidate_codex_account_after_capacity(
                     cfg,
@@ -4298,17 +4578,48 @@ async def _run_acp_dispatch_impl(
                 effective_account = getattr(
                     cfg, "_codex_pre_resolved_account", None
                 ) or effective_account
-            else:
-                codex_home, effective_account = dispatch_module.resolve_codex_home(
-                    project_root,
-                    getattr(cfg, "_codex_selected_account", None)
-                    or getattr(cfg, "account", None),
-                    dispatch_id,
-                    model=getattr(cfg, "model", None),
+            elif (
+                getattr(cfg, "_codex_retry_home", None)
+                and Path(cfg._codex_retry_home).is_dir()
+            ):
+                codex_home = cfg._codex_retry_home
+                effective_account = (
+                    effective_account
+                    or getattr(cfg, "_codex_selected_account", None)
+                    or getattr(cfg, "_capacity_account", None)
+                    or getattr(cfg, "_codex_recorded_account", None)
                 )
+            else:
+                try:
+                    codex_home, effective_account = dispatch_module.resolve_codex_home(
+                        project_root,
+                        getattr(cfg, "_codex_selected_account", None)
+                        or getattr(cfg, "account", None),
+                        dispatch_id,
+                        model=getattr(cfg, "model", None),
+                    )
+                except Exception as exc:
+                    recorded_home = getattr(cfg, "_codex_recorded_home", None)
+                    if recorded_home and not Path(recorded_home).is_dir():
+                        raise dispatch_module.DispatchUsageError(
+                            "codex_home_missing: could not rebuild recorded "
+                            f"per-dispatch home: {exc}"
+                        ) from exc
+                    raise
             if codex_home is not None:
                 spawn_env["CODEX_HOME"] = codex_home
                 setattr(cfg, "_codex_dispatch_home_resolved", True)
+            setattr(
+                cfg,
+                "_codex_dispatch_home_created",
+                bool(
+                    codex_home
+                    and Path(codex_home).expanduser().resolve(strict=False)
+                    == expected_home.resolve(strict=False)
+                    and getattr(cfg, "_codex_retry_home", None) is None
+                    and not per_dispatch_home_existed_before
+                ),
+            )
             if getattr(cfg, "context_mode", "enabled") == "disabled":
                 try:
                     context_mode_defined = dispatch_module.codex_context_mode_defined(
@@ -4325,6 +4636,15 @@ async def _run_acp_dispatch_impl(
             # Every ACP shape binds only after account/capacity admission. The
             # central hook also handles in-place launches and occupancy locking.
             worktree_seat = goalflight_dispatch._admit_dispatch_worktree(cfg)
+            # This snapshot predates occupancy admission. Refresh its marker
+            # from the post-admission environment so a rejected fd is not
+            # forwarded.
+            occupancy_fd_env = goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+            spawn_env.pop(occupancy_fd_env, None)
+            occupancy_fd = os.environ.get(occupancy_fd_env)
+            if occupancy_fd:
+                spawn_env[occupancy_fd_env] = occupancy_fd
+            worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
             read_only_seat_hold = getattr(cfg, "_worktree_read_only_hold", None)
             occupancy_warning = getattr(cfg, "_worktree_occupancy_warning", None)
             if occupancy_warning is not None:
@@ -4340,11 +4660,6 @@ async def _run_acp_dispatch_impl(
                 spawn_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
                     worktree_seat.fileno()
                 )
-                occupancy_fd = os.environ.get(
-                    goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
-                )
-                if occupancy_fd:
-                    spawn_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = occupancy_fd
                 worker_cwd = str(worktree_seat.path)
                 attach_worktree_to_lease(worktree_seat.path)
             elif read_only_seat_hold is not None:
@@ -4356,6 +4671,7 @@ async def _run_acp_dispatch_impl(
             elif worktree_mode == "shared-read-only":
                 worker_cwd = str(getattr(cfg, "cwd", None) or worker_cwd)
 
+            await update_status(worker_cwd=worker_cwd)
             if (
                 worktree_seat is not None
                 or read_only_seat_hold is not None
@@ -4390,19 +4706,24 @@ async def _run_acp_dispatch_impl(
                     ),
                     worktree_read_only=(worktree_seat is None),
                 )
-            record_ledger_state(worker_pid=None, state="starting")
-            ledger_recorded = True
+            scratch_dir = getattr(cfg, "_worker_scratch_dir", None)
+            if scratch_dir:
+                Path(str(scratch_dir)).mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
         except Exception as e:
-            if getattr(cfg, "_worktree_seat_refused", False):
-                goalflight_dispatch._discard_preworker_ledger(cfg)
+            # waiting_capacity already committed this attempt. Keep its ledger
+            # row so the finalizer can terminalize it instead of leaving a
+            # PREPARED journal attempt behind after an admission refusal.
             if getattr(cfg, "_worktree_occupancy_refused", False):
-                goalflight_dispatch._discard_preworker_ledger(cfg)
                 payload["reason"] = "worktree_occupied"
                 print(f"goalflight_acp_run: {e}", file=sys.stderr, flush=True)
             if getattr(cfg, "_worktree_admission_refused", False):
                 payload["dispatch_refused"] = True
             if worktree_seat is not None:
-                worktree_seat.release()
+                goalflight_dispatch._release_unlaunched_worktree_seat(
+                    worktree_seat, dispatch_id
+                )
                 worktree_seat = None
             if read_only_seat_hold is not None:
                 read_only_seat_hold.release()
@@ -4424,15 +4745,35 @@ async def _run_acp_dispatch_impl(
                     cwd=worker_cwd,
                     os_sandbox=os_sandbox_profile,
                     agent=cfg.agent,
+                    environment=spawn_env,
                 )
         except OsSandboxError as e:
             await update_status(state="blocked_os_sandbox", error=str(e))
             return payload
-        attempt_record = json.loads(
-            goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
+        owner_controller_label = (
+            controller_label
+            if controller_session_id and controller_pid is not None
+            else None
         )
+        prepared_attempt = goalflight_journal.open_or_create_journal(
+            project_root
+        ).prepare_attempt(
+            dispatch_id,
+            launch_token=getattr(cfg, "queue_launch_token", None),
+            owner_controller_label=owner_controller_label,
+            owner_session_nonce=(
+                controller_session_id if owner_controller_label is not None else None
+            ),
+            effective_account=effective_account,
+            engine=goalflight_ledger.infer_engine(cfg.agent),
+        )
+        if not prepared_attempt.committed or prepared_attempt.value is None:
+            raise RuntimeError(
+                "could not prepare ACP attempt before launch admission: "
+                f"{prepared_attempt.disposition.value}: {prepared_attempt.reason}"
+            )
         for required_key in ("attempt_id", "launch_token", "launch_epoch"):
-            if attempt_record.get(required_key) in (None, ""):
+            if getattr(prepared_attempt.value, required_key) in (None, ""):
                 raise RuntimeError(
                     f"prepared attempt identity missing for {dispatch_id}: {required_key}"
                 )
@@ -4484,6 +4825,21 @@ async def _run_acp_dispatch_impl(
             # Read-only is a hard posture: title allowlists must not re-enable
             # located edits after the OS sandbox has been removed.
             permission_policy = _read_only_permission_policy
+        sandbox_preamble = goalflight_dispatch._sandbox_worker_preamble(
+            spawn_os_sandbox_profile,
+            agent=cfg.agent,
+            shape="acp",
+            cwd=worker_cwd,
+            command=command if isinstance(command, str) else "",
+            environment=spawn_env,
+            acp_permission_fallback=(
+                sandbox_fallback is not None
+                and spawn_os_sandbox_profile == OS_SANDBOX_OFF
+            ),
+        )
+        if sandbox_preamble:
+            prompt = f"{sandbox_preamble}\n\n{prompt}"
+            _persist_watcher_prompt_turn(cfg, prompt)
 
         try:
             async with StartupGate(cfg.agent):
@@ -4502,41 +4858,114 @@ async def _run_acp_dispatch_impl(
                         raise RuntimeError(
                             f"capacity lease {lease_id} lost before worker spawn"
                         )
-                    proc, conn = await spawn_and_handshake_with_retry(
-                        command,
-                        acp_args,
-                        agent=cfg.agent,
-                        session_id=cfg.session_id,
-                        attempts=1,
-                        cwd=worker_cwd,
-                        activity=activity,
-                        on_attempt=mark_attempt,
-                        context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
-                        permission_mode=getattr(cfg, "permission_mode", "auto"),
-                        permission_dir=resolved_permission_dir,
-                        permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
-                        permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
-                        permission_policy=permission_policy,
-                        os_sandbox=spawn_os_sandbox_profile,
-                        session_model=getattr(cfg, "model", None),
-                        env=spawn_env,
-                        stderr_capture=agent_stderr_capture,
-                        resume_session_id=getattr(cfg, "resume_session_id", None),
-                        pass_fds=tuple(
-                            dict.fromkeys(
-                                (
-                                    *goalflight_worktree_pool.inherited_worktree_lock_fds(),
-                                    *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
-                                    *((read_only_seat_hold.fileno(),) if read_only_seat_hold is not None else ()),
-                                )
-                            )
-                        ),
+                    if is_local_codex and dispatch_module is not None:
+                        dispatch_module._validate_codex_worker_home(
+                            dispatch_id,
+                            codex_home,
+                            effective_account,
+                            getattr(cfg, "_codex_recorded_account", None),
+                            recorded_home=getattr(cfg, "_codex_recorded_home", None),
+                            retry_home=getattr(cfg, "_codex_retry_home", None),
+                        )
+                        setattr(cfg, "_codex_home_spawn_checked", True)
+                # Prepare leaves the token durable if status admission defers;
+                # STARTING is written only after admission succeeds. At the
+                # spawn boundary take locks in status -> ledger order. The
+                # ledger lock fences replacement against the quick process
+                # creation call, then releases before callbacks and handshake
+                # status writes.
+                if dispatch_module is None:
+                    raise RuntimeError(
+                        "dispatch launch admission is unavailable"
                     )
+                launch_admission_token = str(
+                    getattr(cfg, "queue_launch_token", None)
+                    or uuid.uuid4().hex
+                )
+
+                @contextlib.contextmanager
+                def acp_launch_admission():
+                    nonlocal ledger_recorded, terminal_refusal_payload
+                    with dispatch_module._status_launch_admission(
+                        status_path,
+                        launch_admission_token,
+                        deadline_s=(
+                            time.monotonic()
+                            + dispatch_module.RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
+                        ),
+                    ) as status_lock:
+                        if status_lock is None:
+                            try:
+                                observed = json.loads(
+                                    status_path.read_text(encoding="utf-8")
+                                )
+                            except (OSError, ValueError, TypeError):
+                                observed = None
+                            if (
+                                isinstance(observed, dict)
+                                and observed.get("dispatch_id") == dispatch_id
+                            ):
+                                terminal_refusal_payload = observed
+                            raise dispatch_module.TerminalStatusLaunchRefused(
+                                "terminal status prevents ACP worker launch"
+                            )
+                        if not ledger_recorded:
+                            record_ledger_state(worker_pid=None, state="starting")
+                            ledger_recorded = True
+                        spawn_lock_factory = getattr(
+                            cfg, "redispatch_spawn_lock", None
+                        )
+                        spawn_lock = (
+                            spawn_lock_factory()
+                            if callable(spawn_lock_factory)
+                            else contextlib.nullcontext()
+                        )
+                        with spawn_lock:
+                            spawn_guard = getattr(
+                                cfg, "redispatch_spawn_guard", None
+                            )
+                            if callable(spawn_guard):
+                                spawn_guard()
+                            yield status_lock
+
+                proc, conn = await spawn_and_handshake_with_retry(
+                    command,
+                    acp_args,
+                    agent=cfg.agent,
+                    session_id=cfg.session_id,
+                    attempts=1,
+                    cwd=worker_cwd,
+                    activity=activity,
+                    on_attempt=mark_attempt,
+                    context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
+                    permission_mode=getattr(cfg, "permission_mode", "auto"),
+                    permission_dir=resolved_permission_dir,
+                    permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
+                    permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
+                    permission_policy=permission_policy,
+                    os_sandbox=spawn_os_sandbox_profile,
+                    session_model=getattr(cfg, "model", None),
+                    env=spawn_env,
+                    stderr_capture=agent_stderr_capture,
+                    resume_session_id=getattr(cfg, "resume_session_id", None),
+                    launch_admission=acp_launch_admission,
+                    pass_fds=tuple(
+                        dict.fromkeys(
+                            (
+                                *goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                                *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+                                *((read_only_seat_hold.fileno(),) if read_only_seat_hold is not None else ()),
+                            )
+                        )
+                    ),
+                )
+                worker_spawn_attempted = True
         except AcpTerminationUnconfirmed as exc:
             # Pre-connection and handshake cleanup can return on a reap
             # deadline. Carry that live/unknown scope into the shared finalizer;
             # otherwise proc=None would release its lease and hide the worker.
             proc = exc.proc
+            worker_spawn_attempted = True
             termination_result = exc.result
             _attach_worker_state_before_running(
                 attach_worker_to_lease,
@@ -5106,6 +5535,7 @@ async def _run_acp_dispatch_impl(
             payload.pop("tool_calls", None)
         payload.update(final_updates)
     except asyncio.CancelledError:
+        interrupted_terminal_state = "error"
         if sigterm_received is not None and sigterm_received():
             payload.update(
                 {
@@ -5116,7 +5546,24 @@ async def _run_acp_dispatch_impl(
                 }
             )
         else:
+            payload.update(
+                {
+                    "state": "failed",
+                    "ok": False,
+                    "error": {"code": -1, "message": "cancelled"},
+                }
+            )
             raise
+    except KeyboardInterrupt:
+        interrupted_terminal_state = "error"
+        payload.update(
+            {
+                "state": "failed",
+                "ok": False,
+                "error": {"code": -int(signal.SIGINT), "message": "keyboard_interrupt"},
+            }
+        )
+        raise
     except _AcpWorkerDetached:
         if payload.get("state") not in {"stalled", LIVENESS_INDETERMINATE_STATE}:
             payload.update(
@@ -5127,10 +5574,33 @@ async def _run_acp_dispatch_impl(
                 }
             )
     except Exception as e:
-        if getattr(cfg, "_codex_post_capacity_pinned_refusal", False):
-            with contextlib.suppress(Exception):
-                if dispatch_module is not None:
-                    dispatch_module._discard_preworker_ledger(cfg)
+        terminal_status_refused = (
+            dispatch_module is not None
+            and isinstance(e, dispatch_module.TerminalStatusLaunchRefused)
+        )
+        status_launch_admission_deferred = (
+            dispatch_module is not None
+            and isinstance(e, dispatch_module.StatusLaunchAdmissionDeferred)
+        )
+        if terminal_status_refused:
+            worker_spawn_attempted = False
+            if isinstance(terminal_refusal_payload, dict):
+                for key in ("terminal_state", "state"):
+                    candidate = terminal_refusal_payload.get(key)
+                    if not dispatch_module._is_status_terminal(candidate):
+                        continue
+                    candidate_state = str(candidate)
+                    resolved_terminal = goalflight_ledger.terminal_state_for(
+                        candidate_state,
+                        terminal_refusal_payload.get("error")
+                        or terminal_refusal_payload.get("reason"),
+                    )
+                    if resolved_terminal != "unknown":
+                        terminal_refusal_state = candidate_state
+                        terminal_refusal_terminal_state = resolved_terminal
+                        break
+        if status_launch_admission_deferred:
+            worker_spawn_attempted = False
         async with status_lock:
             terminal_by_heartbeat = heartbeat_outcome or (getattr(conn, "heartbeat_outcome", None) if conn else None)
             terminal_error = heartbeat_error
@@ -5142,6 +5612,28 @@ async def _run_acp_dispatch_impl(
                 "killed_by_heartbeat": True,
                 "wedged_by_heartbeat": (terminal_by_heartbeat or "wedged") == "wedged",
             })
+        elif status_launch_admission_deferred:
+            payload.update(
+                {
+                    "state": "queued",
+                    "ok": False,
+                    "dispatch_refused": True,
+                    "status_launch_admission_deferred": True,
+                    "error": str(e),
+                }
+            )
+        elif terminal_status_refused and terminal_refusal_state is not None:
+            payload.update(
+                {
+                    "state": terminal_refusal_state,
+                    "terminal_state": terminal_refusal_terminal_state,
+                    "ok": terminal_refusal_terminal_state == "complete",
+                    "error": (
+                        terminal_refusal_payload.get("error")
+                        or terminal_refusal_payload.get("reason")
+                    ),
+                }
+            )
         else:
             payload.update({"state": "failed", "error": f"{type(e).__name__}: {e}"})
     finally:
@@ -5198,6 +5690,8 @@ async def _run_acp_dispatch_impl(
             )
             payload["worker_still_alive"] = payload.get("worker_alive")
             payload["pgroup_cpu_pct"] = pgroup_cpu_pct(payload.get("pgid"))
+        with contextlib.suppress(Exception):
+            _project_worker_journal_outbox(dispatch_id, spawn_env, final=True)
         # Capacity state is part of terminal truth. Persist release only for
         # confirmed group death, or the visible retained third state, before a
         # terminal ledger row can advertise the attempt as finished.
@@ -5212,18 +5706,77 @@ async def _run_acp_dispatch_impl(
             state=str(payload.get("state", state)),
             reason=payload.get("error"),
         )
-        if ledger_recorded:
-            with contextlib.redirect_stdout(io.StringIO()):
-                terminal_code = goalflight_ledger.cmd_finish(
-                    argparse.Namespace(
-                        dispatch_id=dispatch_id,
-                        state=payload.get("state", state),
-                        reason=payload.get("error"),
-                        terminal_state="stalled" if payload.get("state") == "stalled" else None,
-                        elapsed_s=round(time.time() - run_started, 3),
-                        worker_still_alive=payload.get("worker_still_alive"),
+        # The first terminal observation is authoritative, so carry the same
+        # spawn-attempt fact the bash finalizer records before later cleanup.
+        prelaunch_failure = not worker_spawn_attempted
+        terminal_reason = payload.get("error")
+        if is_local_codex and dispatch_module is not None:
+            terminal_reason = (
+                dispatch_module._permanent_dispatch_refusal_reason(terminal_reason)
+                or terminal_reason
+            )
+        finish_args = None
+        if (
+            (ledger_recorded or attempt_prepared)
+            and not status_launch_admission_deferred
+        ):
+            if terminal_status_refused:
+                if (
+                    terminal_refusal_state is not None
+                    and terminal_refusal_terminal_state is not None
+                ):
+                    # The status is already terminal. Reconcile a still-PREPARED
+                    # attempt to that same outcome; if the journal already has
+                    # a winner, cmd_finish projects it idempotently without a
+                    # second terminal event.
+                    authority = goalflight_journal.open_or_create_journal(
+                        project_root
                     )
+                    existing_attempt = authority.attempt_for_dispatch(dispatch_id)
+                    already_terminal = (
+                        existing_attempt is not None
+                        and existing_attempt.lifecycle_state
+                        in goalflight_journal.ATTEMPT_FINAL_STATES
+                    )
+                    finish_args = argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state=terminal_refusal_state,
+                        reason=(
+                            terminal_refusal_payload.get("error")
+                            or terminal_refusal_payload.get("reason")
+                        ),
+                        terminal_state=(
+                            None
+                            if already_terminal
+                            else terminal_refusal_terminal_state
+                        ),
+                        elapsed_s=round(time.time() - run_started, 3),
+                        worker_still_alive=False,
+                        prelaunch_failure=True,
+                        headline=(
+                            terminal_refusal_payload.get("result_text")
+                            if isinstance(
+                                terminal_refusal_payload.get("result_text"), str
+                            )
+                            else None
+                        ),
+                    )
+            else:
+                finish_args = argparse.Namespace(
+                    dispatch_id=dispatch_id,
+                    state=payload.get("state", state),
+                    reason=terminal_reason,
+                    terminal_state=(
+                        interrupted_terminal_state
+                        or ("stalled" if payload.get("state") == "stalled" else None)
+                    ),
+                    elapsed_s=round(time.time() - run_started, 3),
+                    worker_still_alive=payload.get("worker_still_alive"),
+                    prelaunch_failure=prelaunch_failure,
                 )
+        if finish_args is not None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                terminal_code = goalflight_ledger.cmd_finish(finish_args)
             if terminal_code != 0:
                 pending_state = str(payload.get("state", state))
                 payload["terminal_pending_state"] = pending_state
@@ -5232,12 +5785,17 @@ async def _run_acp_dispatch_impl(
                     f"journal terminal emitter exited {terminal_code}"
                 )
         if worktree_seat is not None:
-            worktree_seat.release()
+            if worker_spawn_attempted:
+                worktree_seat.release()
+            else:
+                goalflight_dispatch._release_unlaunched_worktree_seat(
+                    worktree_seat, dispatch_id
+                )
         if read_only_seat_hold is not None:
             read_only_seat_hold.release()
         if not detach_worker and (proc is None or (termination_result is not None and termination_result.confirmed)):
             goalflight_cursor.cleanup_dispatch_data(
-                dispatch_id, launcher_finished=True, prelaunch_failure=proc is None,
+                dispatch_id, launcher_finished=True, prelaunch_failure=prelaunch_failure,
             )
     _attach_agent_stderr_tail(payload, agent_stderr_capture)
     write_status(status_path, payload)
@@ -5332,7 +5890,55 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
         "updated_at": _now(),
         "model": getattr(args, "model", None),
     }
-    _commit_prelaunch_terminal(payload, project_root=project_root)
+    for field in ("controller_label", "controller_session_id", "controller_pid"):
+        value = getattr(args, field, None)
+        if value not in (None, ""):
+            payload[field] = value
+    request_record = getattr(args, "request_envelope", None)
+    queue_bound_record = (
+        isinstance(request_record, dict)
+        and request_record.get("dispatch_id") == dispatch_id
+    )
+    if (
+        isinstance(request_record, dict)
+        and request_record.get("dispatch_id") == dispatch_id
+        and str(request_record.get("project_root") or "") == str(project_root)
+    ):
+        dispatch_record = dict(request_record)
+    else:
+        try:
+            status_record = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            status_record = None
+        dispatch_record = (
+            status_record
+            if isinstance(status_record, dict)
+            and status_record.get("dispatch_id") == dispatch_id
+            else None
+        )
+    if dispatch_record is None:
+        dispatch_record = {
+            "dispatch_id": dispatch_id,
+            "controller_label": getattr(args, "controller_label", None),
+            "controller_session_id": getattr(args, "controller_session_id", None),
+        }
+    attribution = _commit_prelaunch_terminal(
+        payload,
+        project_root=project_root,
+        dispatch_record=dispatch_record,
+        ambient_is_dispatcher=not queue_bound_record,
+    )
+    for field in ("controller_label", "controller_session_id", "controller_pid"):
+        payload.pop(field, None)
+    payload.update(attribution)
+    if (
+        attribution
+        and dispatch_record.get("controller_label") == attribution.get("controller_label")
+        and dispatch_record.get("controller_session_id")
+        == attribution.get("controller_session_id")
+        and dispatch_record.get("controller_pid") not in (None, "")
+    ):
+        payload["controller_pid"] = dispatch_record["controller_pid"]
     write_status(status_path, payload)
     return payload, status_path
 
@@ -5633,10 +6239,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from goalflight_dispatch import (
             DispatchUsageError,
+            _admit_dispatch_disk_floor,
             _emit_permanent_dispatch_refusal,
             _refuse_configured_model,
         )
 
+        if not _admit_dispatch_disk_floor():
+            return 75
         _refuse_configured_model(args.model, args.agent)
     except DispatchUsageError as exc:
         _emit_permanent_dispatch_refusal(args.dispatch_id, exc)

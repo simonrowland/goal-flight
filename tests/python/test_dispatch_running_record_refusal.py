@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_run as A  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
+import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 import goalflight_review_job as R  # noqa: E402
 
@@ -267,6 +268,212 @@ def test_worker_spawn_state_none_is_not_unknown() -> None:
     assert L.worker_spawn_state(0) == "unknown"
     assert L.worker_spawn_state(-1) == "unknown"
     assert L.worker_spawn_state(True) == "unknown"
+
+
+def test_wait_and_prelaunch_finish_clear_inherited_worker_evidence(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "prelaunch-child-session-cleanup"
+    args = _dispatch_args(project, dispatch_id)
+    args.parent_dispatch_id = "parent-dispatch"
+    args.engine_session_id = "inherited-engine-session"
+    args.codex_session_id = "inherited-codex-session"
+
+    _record(args, project, tmp_path, worker_pid=None, state="waiting_capacity")
+    waiting = _ledger_record(dispatch_id)
+    assert "engine_session_id" not in waiting
+    assert "codex_session_id" not in waiting
+    assert "worker_cwd" not in waiting
+
+    waiting["engine_session_id"] = args.engine_session_id
+    waiting["codex_session_id"] = args.codex_session_id
+    waiting["worker_cwd"] = str(project)
+    L.write_record(waiting)
+    D._record_prelaunch_failure(
+        args,
+        error="worktree admission refused before spawn",
+        allow_existing_record=True,
+    )
+
+    finished = _ledger_record(dispatch_id)
+    assert finished["prelaunch_failure"] is True
+    assert "engine_session_id" not in finished
+    assert "codex_session_id" not in finished
+    assert "worker_cwd" not in finished
+
+
+@pytest.mark.parametrize("existing_record", [False, True], ids=("new", "queued"))
+def test_prelaunch_refusal_stamps_owner_before_blocked_event_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    existing_record: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    authority = J.open_or_create_journal(project)
+    label = "prelaunch-controller"
+    lease = authority.claim_or_renew_lease(
+        label,
+        principal={"pid": os.getpid(), "start_token": "prelaunch-controller"},
+    )
+    assert lease.committed and lease.value is not None
+    args = _dispatch_args(project, "prelaunch-owned-refusal")
+
+    def stamp_controller(args, root):
+        assert root == project
+        args.controller_label = label
+        args.controller_session_id = lease.value.nonce
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
+    if existing_record:
+        L.write_record(
+            {
+                "schema": L.SCHEMA,
+                "dispatch_id": args.dispatch_id,
+                "agent": "codex",
+                "engine": "codex",
+                "shape": "bash",
+                "transport": "dispatch",
+                "project_root": str(project),
+                "worker_pid": None,
+                "state": "queued",
+                "terminal_state": "unknown",
+            }
+        )
+    D._finish_permanent_prelaunch_refusal(
+        args.dispatch_id,
+        "seat_preparation_failed: capacity unavailable",
+        state="failed",
+        args=args,
+    )
+
+    record = _ledger_record(args.dispatch_id)
+    assert record["controller_label"] == label
+    assert record["controller_session_id"] == lease.value.nonce
+    assert record["controller_pid"] == os.getpid()
+    attempt = authority.read_all(
+        "SELECT owner_controller_label FROM dispatch_attempts WHERE dispatch_id = ?",
+        (args.dispatch_id,),
+    )[0]
+    assert attempt["owner_controller_label"] == label
+    delivery = authority.read_all(
+        "SELECT recipient_label, event_type FROM delivery_events WHERE stream_id = ?",
+        (args.dispatch_id,),
+    )
+    assert [(row["recipient_label"], row["event_type"]) for row in delivery] == [
+        (label, "blocked")
+    ]
+
+
+def test_reparented_prelaunch_keeps_explicit_label_without_roster_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "example-sim-engine"
+    project.mkdir()
+    authority = J.open_or_create_journal(project)
+    for label in ("example-sim-physics", "example-sim-bugs", "example-sim-train"):
+        claimed = authority.claim_or_renew_lease(
+            label,
+            principal={"pid": os.getpid(), "start_token": label},
+        )
+        assert claimed.committed
+    args = _dispatch_args(project, "reparented-explicit-owner")
+    args.controller_label = "example-sim-engine"
+    args._requested_controller_label = "example-sim-engine"
+
+    def reparented_stamp(args, _root):
+        # A nohup-reparented launcher cannot prove ancestry, but its explicit
+        # launch label remains the terminal event's address.
+        args.controller_label = None
+        args.controller_session_id = None
+        args._controller_beacon_pid = None
+        return {"claimed": False, "reason": "not_in_ancestry"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", reparented_stamp)
+    D._record_prelaunch_failure(
+        args,
+        error="synthetic prelaunch refusal",
+        reason="blocked_os_sandbox",
+        state="blocked_os_sandbox",
+    )
+
+    record = _ledger_record(args.dispatch_id)
+    assert record["controller_label"] == "example-sim-engine"
+    delivery = authority.read_all(
+        "SELECT recipient_label, event_type FROM delivery_events WHERE stream_id = ?",
+        (args.dispatch_id,),
+    )
+    assert [(row["recipient_label"], row["event_type"]) for row in delivery] == [
+        ("example-sim-engine", "blocked")
+    ]
+    envelope = json.loads(
+        (tmp_path / "messages" / f"{args.dispatch_id}.jsonl").read_text().splitlines()[0]
+    )
+    assert envelope["addressee"]["label"] == "example-sim-engine"
+    assert envelope["addressee"]["project_root"] == str(project.resolve())
+
+
+def test_acp_prelaunch_refusal_uses_the_same_controller_stamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    args = _dispatch_args(project, "acp-prelaunch-refusal")
+    args.status_json = str(tmp_path / "acp-prelaunch-refusal.status.json")
+    label = "acp-prelaunch-controller"
+
+    def stamp_controller(args, _root):
+        args.controller_label = label
+        args.controller_session_id = "acp-session"
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
+    assert D._record_acp_prelaunch_refusal(
+        args,
+        error="account refused",
+        reason="account_refused",
+        state="failed",
+    ) == 64
+
+    record = _ledger_record(args.dispatch_id)
+    assert record["controller_label"] == label
+    assert record["controller_session_id"] == "acp-session"
+    assert record["controller_pid"] == os.getpid()
+
+
+def test_unsupported_sandbox_refusal_stamps_controller_before_recording(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    args = _dispatch_args(project, "unsupported-sandbox-refusal")
+    args.status_json = str(tmp_path / "unsupported-sandbox-refusal.status.json")
+    args.tail = str(tmp_path / "unsupported-sandbox-refusal.tail")
+
+    def stamp_controller(args, _root):
+        args.controller_label = "sandbox-refusal-controller"
+        args.controller_session_id = "sandbox-refusal-session"
+        args._controller_beacon_pid = os.getpid()
+        return {"reason": "test-stamp"}
+
+    monkeypatch.setattr(D, "_stamp_controller_session", stamp_controller)
+    assert D._record_unsupported_sandbox_rejection(
+        args,
+        D.UnsupportedAgentSandboxRequest("inert sandbox request"),
+    ) == 64
+
+    record = _ledger_record(args.dispatch_id)
+    assert record["controller_label"] == "sandbox-refusal-controller"
+    assert record["controller_session_id"] == "sandbox-refusal-session"
+    assert record["controller_pid"] == os.getpid()
 
 
 def test_running_refusal_payload_is_structured_and_retryable(
@@ -598,19 +805,38 @@ def test_no_worker_spawned_refusal_still_raises(
     export_calls: list[str],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """No worker + refusal: unchanged behaviour — raise, no status file."""
+    """No worker + refusal: raise and keep the parsed cause in status."""
     project = tmp_path / "project"
     project.mkdir()
     args = _dispatch_args(project, "t377-no-worker")
-    _prepare_starting_attempt(args, project, tmp_path)
+    args.status_json = str(tmp_path / f"{args.dispatch_id}.status.json")
+    args.tail = str(tmp_path / f"{args.dispatch_id}.tail")
+    _record(args, project, tmp_path, worker_pid=None, state="waiting_capacity")
     export_calls.clear()
     capsys.readouterr()
 
-    args.queue_launch_token = "bogus-token"
-    with pytest.raises(RuntimeError, match="journal attempt transition refused"):
-        _record(args, project, tmp_path, worker_pid=None, state="running")
+    # A separate same-id launcher has already crossed PREPARED -> STARTING.
+    # The loser must still be refused, and now the actual CAS reason is kept.
+    authority = J.open_or_create_journal(project)
+    attempt = authority.attempt_for_dispatch(args.dispatch_id)
+    assert attempt is not None
+    assert authority.start_attempt(
+        attempt.attempt_id,
+        attempt.launch_token,
+        expected_launch_epoch=attempt.launch_epoch,
+    ).committed
+    with pytest.raises(
+        RuntimeError, match="cas_lost.*PREPARED -> STARTING lost"
+    ) as refusal:
+        _record(args, project, tmp_path, worker_pid=None, state="starting")
 
-    assert not (tmp_path / f"{args.dispatch_id}.status.json").exists()
+    D._record_prelaunch_failure(
+        args, error=refusal.value, allow_existing_record=True
+    )
+    status = _status_payload(tmp_path, args.dispatch_id)
+    assert status["state"] == "prelaunch_failed"
+    assert "cas_lost" in status["reason"]
+    assert "PREPARED -> STARTING lost" in status["reason"]
     assert export_calls == []
     assert "DISPATCH-LEDGER-WARN" not in capsys.readouterr().err
 

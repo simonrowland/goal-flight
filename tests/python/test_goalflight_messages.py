@@ -9,6 +9,7 @@ import io
 import json
 import sqlite3
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -266,6 +267,7 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
             )
             lease = authority.active_lease(label)
             assert_true("drain controller lease readable", lease is not None)
+            heartbeat_before_drain = lease.renewed_at
             before_drain = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
 
             stdout = io.StringIO()
@@ -273,8 +275,13 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 drained_rc = _carrier_messages.main(argv)
             after_drain = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+            heartbeat_after_drain = authority.active_lease(label).renewed_at
             drained_lines = stdout.getvalue().splitlines()
             assert_true("drain backlog succeeds", drained_rc == 0)
+            assert_true(
+                "successful drain refreshes controller heartbeat",
+                heartbeat_after_drain != heartbeat_before_drain,
+            )
             assert_true("drain backlog writes no stderr", stderr.getvalue() == "")
             assert_true("drain backlog emits headline then receipt", len(drained_lines) == 2)
             assert_true(
@@ -293,9 +300,15 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
 
             stdout = io.StringIO()
             stderr = io.StringIO()
+            heartbeat_before_empty_drain = heartbeat_after_drain
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 empty_rc = _carrier_messages.main(argv)
+            heartbeat_after_empty_drain = authority.active_lease(label).renewed_at
             assert_true("empty drain succeeds", empty_rc == 0)
+            assert_true(
+                "empty drain refreshes controller heartbeat",
+                heartbeat_after_empty_drain != heartbeat_before_empty_drain,
+            )
             assert_true("empty drain is exact one-line no-op", stdout.getvalue() == "no mail\n")
             assert_true("empty drain writes no stderr", stderr.getvalue() == "")
 
@@ -403,6 +416,8 @@ def test_relay_drain_ambiguous_identity_refuses_instead_of_no_mail() -> None:
             "ambiguous drain names the ambiguity",
             "ambiguous ACTIVE controller leases:" in stderr,
         )
+        assert_true("ambiguous drain writes one line", len(stderr.splitlines()) == 1)
+        assert_true("ambiguous drain uses NOT RECORDED", stderr.startswith("NOT RECORDED:"))
         assert_true(
             "ambiguous drain lists every ACTIVE label",
             "ghard, pm2, pm2-main" in stderr,
@@ -944,7 +959,11 @@ def test_messages_main_trap_is_one_actionable_line_mutation_pair() -> None:
     assert_true("top-level trap writes no stdout", stdout.getvalue() == "")
     assert_true("top-level trap emits one line", len(lines) == 1)
     assert_true("top-level trap names error class", "RuntimeError" in lines[0])
-    assert_true("top-level trap is actionable", "next: run" in lines[0])
+    assert_true("top-level trap uses NOT RECORDED", lines[0].startswith("NOT RECORDED:"))
+    assert_true(
+        "top-level trap is actionable",
+        "; next: python3 scripts/goalflight_messages.py relay --new --json" in lines[0],
+    )
     assert_true("top-level trap suppresses traceback", "Traceback" not in lines[0])
     assert_true("mutation half exposes the raw exception", "forced" in str(mutant_error))
 
@@ -999,6 +1018,18 @@ def test_unknown_marker_monitor() -> None:
     assert_true("unknown payload", envelopes[0]["payload"]["unknown_marker"] == "CUSTOM")
 
 
+def test_follow_wait_timeout_respects_heartbeat_deadline() -> None:
+    delay = _carrier_messages._follow_wait_timeout(
+        _carrier_messages.WAKE_NOTIFY_SAFETY_POLL_S,
+        now=10.0,
+        next_heartbeat=130.0,
+    )
+    assert_true(
+        "notify wait wakes for heartbeat",
+        delay == min(_carrier_messages.WAKE_NOTIFY_SAFETY_POLL_S, 120.0),
+    )
+
+
 def test_acp_runner_wrapper() -> None:
     text = "USER-CONFIRM: approve risky change\n"
     envelopes = extract_message_envelopes(text, "d3", source={"transport": "bash-tail"})
@@ -1024,6 +1055,46 @@ def test_inbox_append_read_order() -> None:
         assert_true("two lines", len(loaded) == 2)
         assert_true("order preserved", loaded[0]["seq"] == 1 and loaded[1]["seq"] == 2)
         assert_true("last one", read_envelopes(path, last_n=1)[0]["type"] == "user_need")
+
+
+def test_read_resolves_explicit_controller_context_like_relay(monkeypatch) -> None:
+    import types
+
+    root = Path.cwd() / "read-controller-project"
+    authority = mock.Mock()
+    authority.active_lease.return_value = object()
+    journal_module = types.SimpleNamespace(
+        Journal=types.SimpleNamespace(open_reader=mock.Mock(return_value=authority)),
+        JournalBusy=RuntimeError,
+        JournalDisappeared=RuntimeError,
+        JournalIOError=RuntimeError,
+    )
+    task_module = types.SimpleNamespace(
+        resolve_project_root=mock.Mock(return_value=root)
+    )
+    monkeypatch.setitem(sys.modules, "goalflight_journal", journal_module)
+    monkeypatch.setitem(sys.modules, "goalflight_task", task_module)
+    monkeypatch.setattr(_carrier_messages, "_require_relay_controller_label", lambda auth, label: "main")
+    monkeypatch.setattr(_carrier_messages, "collect_inbox_paths", lambda *args, **kwargs: [])
+    monkeypatch.setattr(_carrier_messages, "logical_envelopes_for_paths", lambda *args, **kwargs: [])
+    monkeypatch.setattr(_carrier_messages, "_current_project_root", lambda: None)
+    monkeypatch.setattr(_carrier_messages, "_explicit_controller_label", lambda: None)
+
+    args = mock.Mock(
+        project_root=str(root),
+        controller_label="main",
+        dispatch_id="worker-1",
+        messages_dir=root / "messages",
+        fleet_dir=root / "fleet",
+        last=None,
+        json=True,
+    )
+    with contextlib.redirect_stdout(io.StringIO()) as output:
+        assert _carrier_messages.cmd_read(args) == 0
+    task_module.resolve_project_root.assert_called_once_with(str(root))
+    journal_module.Journal.open_reader.assert_called_once_with(root)
+    authority.active_lease.assert_called_once_with("main")
+    assert output.getvalue().strip() == "[]"
 
 
 def test_inbox_corrupt_line_fails_closed() -> None:
@@ -1104,7 +1175,7 @@ def test_corrupt_carrier_is_reported_once_while_relay_delivers_healthy_mail() ->
                 any(item.get("dispatch_id") == "healthy-carrier" for item in payload["items"]),
             )
             assert_true(
-                "readable row remains visible",
+                "readable assignment remains visible despite sibling corruption",
                 any(item.get("dispatch_id") == "corrupt-carrier" for item in payload["items"]),
             )
             assert_true(
@@ -1160,8 +1231,34 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
                     project_root=project,
                 ),
             )
+            same_stream_later = _carrier_messages.post_message(
+                dispatch_id="corrupt-drain",
+                msg_type="controller-notice",
+                payload={"text": "must remain behind the stuck row"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+            healthy = _carrier_messages.post_message(
+                dispatch_id="healthy-drain-stream",
+                msg_type="controller-notice",
+                payload={"text": "healthy stream still drains"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
             carrier = Path(bad["path"])
-            carrier.write_text("{corrupt carrier row\n", encoding="utf-8")
+            carrier_lines = carrier.read_text(encoding="utf-8").splitlines()
+            carrier.write_text(
+                "{corrupt carrier row\n" + carrier_lines[1] + "\n",
+                encoding="utf-8",
+            )
 
             stdout = io.StringIO()
             stderr = io.StringIO()
@@ -1179,10 +1276,37 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
                 )
 
             payload = json.loads(stdout.getvalue())
-            assert_true("corrupt drain is blocked", rc == 3)
-            assert_true("corrupt drain reports blocked", payload["status"] == "blocked")
+            assert_true("healthy stream drains beside corrupt stream", rc == 0)
+            assert_true("corrupt drain reports committed prefix", payload["status"] == "drained")
+            assert_true("drained count contains only committed prefix", payload["drained"] == 1)
+            assert_true(
+                "drain items contain only committed prefix",
+                [item["id"] for item in payload["items"]] == [healthy["envelope"]["id"]],
+            )
+            assert_true(
+                "same-stream followup is pending behind stuck row",
+                payload["pending_behind_stuck"]
+                == [
+                    {
+                        "id": same_stream_later["envelope"]["id"],
+                        "stream_id": "corrupt-drain",
+                        "stream_seq": 2,
+                        "type": "controller-notice",
+                    }
+                ],
+            )
+            assert_true(
+                "stuck row is separately reported with its reason",
+                len(payload["stuck"]) == 1
+                and payload["stuck"][0]["delivery_id"] == bad["envelope"]["id"]
+                and payload["stuck"][0]["stream_seq"] == 1
+                and "invalid JSON" in payload["stuck"][0]["reason"],
+            )
             errors = payload.get("carrier_errors") or []
-            assert_true("corrupt drain reports one stuck delivery", len(errors) == 1)
+            assert_true(
+                f"corrupt drain reports one stuck delivery: {errors!r}",
+                len(errors) == 1,
+            )
             stuck = errors[0]
             assert_true("stuck status is explicit", stuck.get("status") == "STUCK")
             assert_true(
@@ -1210,6 +1334,37 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
             )
             assert_true("stuck warning is emitted", "STUCK:" in stderr.getvalue())
 
+            retry_stdout = io.StringIO()
+            with contextlib.redirect_stdout(retry_stdout):
+                retry_rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "--fleet-dir",
+                        env["GOALFLIGHT_FLEET_DIR"],
+                        "relay",
+                        "--drain",
+                        "--json",
+                    ]
+                )
+            retry_payload = json.loads(retry_stdout.getvalue())
+            retry_errors = retry_payload.get("carrier_errors") or []
+            assert_true("stuck retry remains blocked", retry_rc == 3)
+            assert_true(
+                "stuck retry remains visible with its reason",
+                retry_payload["status"] == "blocked"
+                and len(retry_errors) == 1
+                and retry_errors[0].get("status") == "STUCK"
+                and "invalid JSON" in retry_errors[0].get("reason", ""),
+            )
+            assert_true(
+                "stuck retry does not present the later row as drained",
+                retry_payload["drained"] == 0
+                and retry_payload["items"] == []
+                and retry_payload["pending_behind_stuck"][0]["id"]
+                == same_stream_later["envelope"]["id"],
+            )
+
             # A valid envelope for the same carrier can still be the wrong
             # journal event. It is stuck mail, not a reason to withdraw the
             # assignment or advance its stream.
@@ -1236,13 +1391,10 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
                         "--json",
                     ]
                 )
-            payload = json.loads(stdout.getvalue())
-            assert_true("mismatched drain is blocked", rc == 3)
-            assert_true("mismatched drain reports blocked", payload["status"] == "blocked")
-            errors = payload.get("carrier_errors") or []
-            assert_true("mismatched drain reports one stuck delivery", len(errors) == 1)
-            assert_true("mismatched carrier is explicit STUCK", errors[0].get("status") == "STUCK")
-            assert_true("mismatched carrier names event", "does not match" in errors[0]["reason"])
+            mismatched_result = json.loads(stdout.getvalue())
+            assert_true("mismatched drain reports blocked", rc == 3)
+            assert_true("mismatched drain status is blocked", mismatched_result["status"] == "blocked")
+            assert_true("mismatched drain reports STUCK", "STUCK:" in stderr.getvalue())
             assignment = authority.read_all(
                 "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
                 (bad["envelope"]["id"],),
@@ -1254,9 +1406,370 @@ def test_drain_corrupt_assigned_carrier_stays_pending() -> None:
                 and assignment[0]["withdrawn_at"] is None,
             )
             assert_true(
-                "mismatched drain cursor remains pending",
-                authority.cursor_peek(label, nonce=lease.nonce).items,
+                "mismatched drain leaves unreportable row pending",
+                bool(authority.cursor_peek(label, nonce=lease.nonce).items),
             )
+
+            _carrier_messages.post_message(
+                dispatch_id="healthy-drain-conflict",
+                msg_type="controller-notice",
+                payload={"text": "visible while another carrier is corrupt"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=_carrier_messages.controller_addressee(
+                    label,
+                    project_root=project,
+                ),
+            )
+
+            def lose_conflict_cas(*_args, **_kwargs):
+                raise goalflight_journal.CASMismatch("cursor moved")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    goalflight_journal.Journal,
+                    "advance_cursor",
+                    lose_conflict_cas,
+                ),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                conflict_rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "--fleet-dir",
+                        env["GOALFLIGHT_FLEET_DIR"],
+                        "relay",
+                        "--drain",
+                        "--json",
+                    ]
+                )
+            conflict = json.loads(stdout.getvalue())
+            assert_true("conflicted corrupt drain returns CAS loss", conflict_rc == 3)
+            assert_true("conflicted drain reports conflict", conflict["status"] == "conflict")
+            assert_true(
+                f"conflicted drain retains the stuck delivery: {conflict!r}",
+                any(
+                    item.get("delivery_id") == bad["envelope"]["id"]
+                    and item.get("status") == "STUCK"
+                    for item in conflict["carrier_errors"]
+                ),
+            )
+
+
+def test_drain_snapshot_is_the_safe_prefix_and_retries_after_carrier_repair() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "prefix-snapshot-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+            clear=False,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "prefix-snapshot-test"},
+            )
+            assert_true("prefix snapshot lease claimed", claimed.committed)
+            addressee = _carrier_messages.controller_addressee(
+                label,
+                project_root=project,
+            )
+
+            def post(dispatch_id: str, text: str):
+                return _carrier_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="controller-notice",
+                    payload={"text": text},
+                    messages_dir=messages_dir,
+                    source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                    addressee=addressee,
+                )
+
+            prefix = post("prefix-stream", "readable prefix")
+            stuck = post("prefix-stream", "stuck row")
+            later = post("prefix-stream", "readable successor")
+            sibling = post("healthy-prefix-sibling", "healthy sibling")
+            carrier = Path(stuck["path"])
+            original_lines = carrier.read_text(encoding="utf-8").splitlines()
+            assert len(original_lines) == 3
+            carrier.write_text(
+                original_lines[0] + "\n{invalid row\n" + original_lines[2] + "\n",
+                encoding="utf-8",
+            )
+
+            expected_prefix_token, _ = authority._read_with_retry(
+                "test selected cursor prefix",
+                lambda connection: authority._cursor_stream_snapshot(
+                    connection,
+                    project_root=str(project.resolve()),
+                    recipient_label=label,
+                    stream_id="prefix-stream",
+                    requested_position=1,
+                ),
+            )
+
+        view = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "relay",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--json",
+            ],
+        )
+        view_payload = json.loads(view.stdout)
+        assert view.returncode == 0, (view.stdout, view.stderr)
+        assert view_payload["positions"] == {
+            "prefix-stream": 1,
+            "healthy-prefix-sibling": 1,
+        }
+        assert view_payload["stream_snapshots"]["prefix-stream"] == expected_prefix_token
+
+        drain = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "relay",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--drain",
+                "--json",
+            ],
+        )
+        payload = json.loads(drain.stdout)
+        assert drain.returncode == 0, (drain.stdout, drain.stderr)
+        assert payload["drained"] == 2
+        assert {item["id"] for item in payload["items"]} == {
+            prefix["envelope"]["id"],
+            sibling["envelope"]["id"],
+        }
+        assert payload["stuck"][0]["delivery_id"] == stuck["envelope"]["id"]
+        assert payload["stuck"][0]["stream_seq"] == 2
+        assert payload["pending_behind_stuck"][0]["id"] == later["envelope"]["id"]
+        assert authority.cursor_status(label)["positions"] == {
+            "prefix-stream": 1,
+            "healthy-prefix-sibling": 1,
+        }
+
+        carrier.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+        repaired = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "relay",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--drain",
+                "--json",
+            ],
+        )
+        repaired_payload = json.loads(repaired.stdout)
+        assert repaired.returncode == 0, (repaired.stdout, repaired.stderr)
+        assert repaired_payload["drained"] == 2
+        assert [item["id"] for item in repaired_payload["items"]] == [
+            stuck["envelope"]["id"],
+            later["envelope"]["id"],
+        ]
+        assert not authority.cursor_peek(
+            label,
+            nonce=authority.active_lease(label).nonce,
+        ).items
+
+
+def test_relay_new_hides_later_result_until_stuck_head_is_repaired() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "safe-relay-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+            clear=False,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "safe-relay-test"},
+            )
+            assert_true("safe relay lease claimed", claimed.committed)
+            addressee = _carrier_messages.controller_addressee(
+                label,
+                project_root=project,
+            )
+
+            def post(msg_type: str, text: str):
+                return _carrier_messages.post_message(
+                    dispatch_id="safe-relay-stream",
+                    msg_type=msg_type,
+                    payload={"complete": msg_type == "result", "text": text},
+                    messages_dir=messages_dir,
+                    source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                    addressee=addressee,
+                )
+
+            stuck = post("controller-notice", "unreadable head")
+            result = post("result", "terminal result behind the head")
+            carrier = Path(stuck["path"])
+            original_lines = carrier.read_text(encoding="utf-8").splitlines()
+            assert len(original_lines) == 2
+            carrier.write_text("{invalid stuck head\n" + original_lines[1] + "\n", encoding="utf-8")
+
+        relay = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "relay",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--new",
+                "--json",
+            ],
+        )
+        payload = json.loads(relay.stdout)
+        assert relay.returncode == 0, (relay.stdout, relay.stderr)
+        assert payload["items"] == []
+        assert payload["stuck"][0]["delivery_id"] == stuck["envelope"]["id"]
+        assert payload["pending_behind_stuck"] == [
+            {
+                "id": result["envelope"]["id"],
+                "stream_id": "safe-relay-stream",
+                "stream_seq": 2,
+                "type": "result",
+            }
+        ]
+
+        carrier.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+        repaired = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "relay",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--new",
+                "--json",
+            ],
+        )
+        repaired_payload = json.loads(repaired.stdout)
+        assert repaired.returncode == 0, (repaired.stdout, repaired.stderr)
+        results = [item for item in repaired_payload["items"] if item["type"] == "result"]
+        assert [item["id"] for item in results] == [result["envelope"]["id"]]
+
+
+def test_relay_new_treats_unprojected_head_as_barrier_until_projection() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "unprojected-relay-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+            clear=False,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "unprojected-relay-test"},
+            )
+            assert_true("unprojected relay lease claimed", claimed.committed)
+            addressee = _carrier_messages.controller_addressee(
+                label,
+                project_root=project,
+            )
+
+            def post(msg_type: str, text: str):
+                return _carrier_messages.post_message(
+                    dispatch_id="unprojected-relay-stream",
+                    msg_type=msg_type,
+                    payload={"complete": msg_type == "result", "text": text},
+                    messages_dir=messages_dir,
+                    source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                    addressee=addressee,
+                )
+
+            first = post("controller-notice", "unprojected head")
+            second = post("result", "terminal behind unprojected head")
+            projected_at = authority.read_all(
+                "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+                (first["envelope"]["id"],),
+            )[0]["projected_at"]
+            connection = authority._connect()
+            try:
+                connection.execute(
+                    "UPDATE delivery_events SET projected_at = NULL WHERE event_uuid = ?",
+                    (first["envelope"]["id"],),
+                )
+            finally:
+                connection.close()
+
+        command = [
+            "relay", "--project-root", str(project), "--controller-label", label,
+            "--new", "--json",
+        ]
+        blocked = run_messages_cli(
+            messages_dir, Path(env["GOALFLIGHT_FLEET_DIR"]), command
+        )
+        payload = json.loads(blocked.stdout)
+        assert blocked.returncode == 0, (blocked.stdout, blocked.stderr)
+        assert payload["items"] == []
+        assert payload["stuck"][0]["delivery_id"] == first["envelope"]["id"]
+        assert payload["pending_behind_stuck"] == [
+            {
+                "id": second["envelope"]["id"],
+                "stream_id": "unprojected-relay-stream",
+                "stream_seq": 2,
+                "type": "result",
+            }
+        ]
+
+        connection = authority._connect()
+        try:
+            connection.execute(
+                "UPDATE delivery_events SET projected_at = ? WHERE event_uuid = ?",
+                (projected_at, first["envelope"]["id"]),
+            )
+        finally:
+            connection.close()
+        recovered = run_messages_cli(
+            messages_dir, Path(env["GOALFLIGHT_FLEET_DIR"]), command
+        )
+        recovered_payload = json.loads(recovered.stdout)
+        assert recovered.returncode == 0, (recovered.stdout, recovered.stderr)
+        assert [item["id"] for item in recovered_payload["items"]] == [
+            first["envelope"]["id"], second["envelope"]["id"]
+        ]
 
 
 def test_duplicate_carrier_sequence_is_quarantined_without_hiding_valid_rows() -> None:
@@ -1317,6 +1830,49 @@ def test_post_refuses_case_variant_dispatch_id_before_writing() -> None:
         assert_true("case collision writes nothing", after == before)
 
 
+def test_post_refuses_placeholder_stream_ids_and_accepts_ordinary_ids() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        messages_dir = Path(td) / "messages"
+        for dispatch_id in ("None", "none", "null", "NULL", "undefined", "", " ", "\t"):
+            try:
+                _carrier_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="status",
+                    payload={"text": "must refuse"},
+                    messages_dir=messages_dir,
+                    project_journal_delivery=False,
+                )
+                assert_true(f"placeholder stream id {dispatch_id!r} is refused", False)
+            except _carrier_messages.MessageError as exc:
+                assert_true(
+                    f"placeholder stream id {dispatch_id!r} explains the fix",
+                    "dispatch id is unset; pass a real stream id" in str(exc),
+                )
+        assert_true("placeholder posts create no message directory", not messages_dir.exists())
+
+        ordinary = _carrier_messages.post_message(
+            dispatch_id="ordinary-stream",
+            msg_type="status",
+            payload={"text": "accepted"},
+            messages_dir=messages_dir,
+            project_journal_delivery=False,
+        )
+        assert_true("ordinary stream id remains accepted", Path(ordinary["path"]).is_file())
+
+        legacy = dict(ordinary["envelope"])
+        legacy["dispatch_id"] = "None"
+        legacy_path = messages_dir / "None.jsonl"
+        legacy_path.write_text(
+            _carrier_messages.serialize_envelope_line(legacy),
+            encoding="utf-8",
+        )
+        loaded = _carrier_messages.read_envelopes(legacy_path)
+        assert_true(
+            "legacy placeholder stream remains readable",
+            len(loaded) == 1 and loaded[0]["dispatch_id"] == "None",
+        )
+
+
 def test_concurrent_case_variant_posts_have_one_winner() -> None:
     with tempfile.TemporaryDirectory() as td:
         messages_dir = Path(td) / "messages"
@@ -1372,6 +1928,235 @@ def test_concurrent_case_variant_posts_have_one_winner() -> None:
         assert_true("case-variant race leaves one carrier", len(carriers) == 1)
 
 
+def test_stream_owner_sidecar_adopts_legacy_and_refuses_cross_project_post() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        init_git_project(project_a)
+        init_git_project(project_b)
+        messages_dir = base / "messages"
+        dispatch_id = "shared-stream"
+        owner_path = messages_dir / f"{dispatch_id}.owner.json"
+
+        with mock.patch.object(
+            _carrier_messages, "_current_project_root", return_value=project_a.resolve()
+        ):
+            first = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "first project"},
+                messages_dir=messages_dir,
+                source={
+                    "node": "test",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                    "controller_label": "project-a-controller",
+                },
+                project_journal_delivery=False,
+            )
+            _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "same project"},
+                messages_dir=messages_dir,
+                project_journal_delivery=False,
+            )
+
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        assert_true("owner sidecar stores canonical project", owner["project_root"] == str(project_a.resolve()))
+        assert_true(
+            "owner sidecar stores known controller label",
+            owner["controller_label"] == "project-a-controller",
+        )
+
+        try:
+            with mock.patch.object(
+                _carrier_messages, "_current_project_root", return_value=project_b.resolve()
+            ):
+                _carrier_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="status",
+                    payload={"text": "must refuse"},
+                    messages_dir=messages_dir,
+                    project_journal_delivery=False,
+                )
+            assert_true("cross-project post is refused", False)
+        except _carrier_messages.MessageError as exc:
+            detail = str(exc)
+            assert_true("owner project is named", str(project_a.resolve()) in detail)
+            assert_true("posting project is named", str(project_b.resolve()) in detail)
+            assert_true("project-distinct id is suggested", "project-distinct" in detail)
+        assert_true(
+            "refused post does not append",
+            len(_carrier_messages.read_envelopes(first["path"])) == 2,
+        )
+
+        # A pre-fix stream has no owner record. The first post after the fix
+        # adopts it, even when earlier envelopes cannot identify their project.
+        legacy_id = "legacy-stream"
+        with mock.patch.object(
+            _carrier_messages, "_current_project_root", return_value=project_a.resolve()
+        ):
+            _carrier_messages.post_message(
+                dispatch_id=legacy_id,
+                msg_type="status",
+                payload={"text": "legacy record"},
+                messages_dir=messages_dir,
+                project_journal_delivery=False,
+            )
+        legacy_owner = messages_dir / f"{legacy_id}.owner.json"
+        legacy_owner.unlink()
+        with mock.patch.object(
+            _carrier_messages, "_current_project_root", return_value=project_b.resolve()
+        ):
+            _carrier_messages.post_message(
+                dispatch_id=legacy_id,
+                msg_type="status",
+                payload={"text": "first post after fix"},
+                messages_dir=messages_dir,
+                project_journal_delivery=False,
+            )
+        adopted = json.loads(legacy_owner.read_text(encoding="utf-8"))
+        assert_true("legacy stream adopts first post project", adopted["project_root"] == str(project_b.resolve()))
+
+
+def test_concurrent_first_posts_from_different_projects_have_one_winner() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        init_git_project(project_a)
+        init_git_project(project_b)
+        messages_dir = base / "messages"
+        thread_project = threading.local()
+        start_barrier = threading.Barrier(2)
+        successes: list[dict] = []
+        failures: list[BaseException] = []
+
+        def post(project: Path) -> None:
+            thread_project.root = project.resolve()
+            try:
+                start_barrier.wait(timeout=2)
+                successes.append(
+                    _carrier_messages.post_message(
+                        dispatch_id="concurrent-shared-stream",
+                        msg_type="status",
+                        payload={"text": str(project)},
+                        messages_dir=messages_dir,
+                        project_journal_delivery=False,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                failures.append(exc)
+
+        with mock.patch.object(
+            _carrier_messages,
+            "_current_project_root",
+            side_effect=lambda: thread_project.root,
+        ):
+            threads = [
+                threading.Thread(target=post, args=(project_a,)),
+                threading.Thread(target=post, args=(project_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert_true("concurrent first-post threads finish", all(not thread.is_alive() for thread in threads))
+        assert_true("one project wins initial ownership", len(successes) == 1)
+        assert_true("other project is refused", len(failures) == 1)
+        detail = str(failures[0])
+        assert_true("race refusal names project A", str(project_a.resolve()) in detail)
+        assert_true("race refusal names project B", str(project_b.resolve()) in detail)
+        owner = json.loads(
+            (messages_dir / "concurrent-shared-stream.owner.json").read_text(encoding="utf-8")
+        )
+        assert_true(
+            "race owner is exactly one candidate project",
+            owner["project_root"] in {str(project_a.resolve()), str(project_b.resolve())},
+        )
+        assert_true(
+            "only winning first post is appended",
+            len(_carrier_messages.read_envelopes(messages_dir / "concurrent-shared-stream.jsonl")) == 1,
+        )
+
+
+def test_fleet_wide_quota_stream_accepts_posts_from_multiple_projects() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project_a = base / "project-a"
+        project_b = base / "project-b"
+        init_git_project(project_a)
+        init_git_project(project_b)
+        messages_dir = base / "messages"
+
+        for project in (project_a, project_b):
+            with mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project.resolve(),
+            ):
+                _carrier_messages.post_message(
+                    dispatch_id="controller-quota-advisory",
+                    msg_type="advisory",
+                    payload={"text": f"quota pressure from {project.name}"},
+                    messages_dir=messages_dir,
+                    project_journal_delivery=False,
+                )
+
+        stream = messages_dir / "controller-quota-advisory.jsonl"
+        assert_true(
+            "both project advisories share the fleet-wide stream",
+            len(_carrier_messages.read_envelopes(stream)) == 2,
+        )
+        assert_true(
+            "fleet-wide stream does not receive a project owner sidecar",
+            not (messages_dir / "controller-quota-advisory.owner.json").exists(),
+        )
+
+
+def test_worker_owned_stream_owner_uses_dispatch_project() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "worker-project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "worker-owned-owner"
+        write_ledger_record(
+            base,
+            dispatch_id,
+            project,
+            controller_session_id="owner-test-session",
+            controller_label="worker-project-controller",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+            clear=False,
+        ):
+            _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "worker-owned post"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "test", "adapter": "pytest", "transport": "worker"},
+                project_journal_delivery=False,
+            )
+
+        owner = json.loads(
+            (Path(env["GOALFLIGHT_MESSAGES_DIR"]) / f"{dispatch_id}.owner.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert_true("worker stream owner uses dispatch project", owner["project_root"] == str(project.resolve()))
+        assert_true(
+            "worker stream owner keeps known controller label",
+            owner["controller_label"] == "worker-project-controller",
+        )
+
+
 def test_post_normalizes_controller_project_root_alias() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -1394,6 +2179,33 @@ def test_post_normalizes_controller_project_root_alias() -> None:
         assert_true(
             "post stores canonical project root",
             result["envelope"]["addressee"]["project_root"] == str(root.resolve()),
+        )
+
+
+def test_post_allows_controller_addressee_on_blocked_event() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        root = base / "project-root"
+        root.mkdir()
+        result = _carrier_messages.post_message(
+            dispatch_id="blocked-controller-address",
+            msg_type="blocked",
+            payload={"text": "prelaunch refusal"},
+            messages_dir=base / "messages",
+            addressee={
+                "kind": "controller",
+                "label": "main",
+                "project_root": str(root),
+            },
+            project_journal_delivery=False,
+        )
+
+        assert_true("blocked post is recorded", result["recorded"] is True)
+        assert_true(
+            "blocked post retains controller address",
+            result["envelope"]["addressee"]["label"] == "main",
         )
 
 
@@ -1540,7 +2352,7 @@ def test_same_id_different_envelopes_both_survive_and_later_need_reopens() -> No
         fleet_dir = base / "fleet"
         dispatch_id = "d-shared-envelope-id"
 
-        shared_id = messages.uuid.UUID("00000000-0000-0000-0000-000000000122")
+        shared_id = messages.uuid.UUID("00000000-0000-4000-8000-000000000001")
         with patch.object(messages.uuid, "uuid4", return_value=shared_id):
             messages.post_message(
                 dispatch_id=dispatch_id,
@@ -1593,11 +2405,230 @@ def test_read_returns_fleet_only_message_body() -> None:
             payload={"text": "fleet-only body"},
         )
 
-        read = run_messages_cli(messages_dir, fleet_dir, ["read", "--dispatch-id", dispatch_id])
+        project = base / "project"
+        init_git_project(project)
+        read = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "read",
+                "--dispatch-id",
+                dispatch_id,
+            ],
+        )
         assert_true("fleet-only read succeeds", read.returncode == 0)
         envelopes = json.loads(read.stdout)
         assert_true("fleet-only read returns one envelope", len(envelopes) == 1)
         assert_true("fleet-only read returns body", envelopes[0]["payload"]["text"] == "fleet-only body")
+
+
+def test_advance_to_latest_derives_one_stream_snapshot() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        label = "latest-controller"
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "latest-controller-test"},
+            )
+            assert_true("latest test lease claimed", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="latest-mail",
+            )
+            lease = authority.active_lease(label)
+            peek = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+            stream = peek.items[0]["stream_id"]
+
+        advanced = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "advance",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--lease-nonce",
+                lease.nonce,
+                "--to-latest",
+                stream,
+            ],
+        )
+        assert_true("to-latest advance succeeds", advanced.returncode == 0)
+        assert_true("to-latest reports cursor advancement", "cursor advanced" in advanced.stdout)
+        after = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+        assert_true("to-latest acknowledges only selected stream", not after.items)
+
+
+def test_advance_derived_positions_stop_at_unreadable_user_confirm() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        label = "stuck-advance-controller"
+        stream = "stuck-confirm-stream"
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "stuck-advance-test"},
+            )
+            assert_true("stuck advance lease claimed", claimed.committed)
+            addressee = _carrier_messages.controller_addressee(
+                label,
+                project_root=project,
+            )
+            unreadable = _carrier_messages.post_message(
+                dispatch_id=stream,
+                msg_type="user_confirm",
+                payload={
+                    "text": "confirm this action",
+                    "question": "confirm this action",
+                    "question_kind": "USER-CONFIRM",
+                    "wait_id": "confirm-wait",
+                },
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=addressee,
+            )
+            later = _carrier_messages.post_message(
+                dispatch_id=stream,
+                msg_type="result",
+                payload={"text": "visible result behind confirm"},
+                messages_dir=messages_dir,
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=addressee,
+            )
+            carrier = Path(unreadable["path"])
+            carrier_lines = carrier.read_text(encoding="utf-8").splitlines()
+            assert len(carrier_lines) == 2
+            carrier.write_text("{invalid USER-CONFIRM\n" + carrier_lines[1] + "\n", encoding="utf-8")
+            lease = authority.active_lease(label)
+            assert lease is not None
+
+        to_latest = run_messages_cli(
+            messages_dir,
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            [
+                "advance",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                label,
+                "--lease-nonce",
+                lease.nonce,
+                "--to-latest",
+                stream,
+            ],
+        )
+        assert_true(
+            f"to-latest refuses unsafe prefix: rc={to_latest.returncode} "
+            f"stdout={to_latest.stdout!r} stderr={to_latest.stderr!r}",
+            to_latest.returncode == 2,
+        )
+        assert_true("to-latest reports stuck USER-CONFIRM", "STUCK:" in to_latest.stderr)
+        pending = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+        assert_true(
+            "to-latest leaves cursor at zero across stuck seq 1 and result seq 2",
+            [(item["stream_seq"], item["event_uuid"]) for item in pending.items]
+            == [(1, unreadable["envelope"]["id"]), (2, later["envelope"]["id"])],
+        )
+
+        for session_id, description in (("", "without session"), ("stuck-session", "without display")):
+            with mock.patch.dict(os.environ, {"GOALFLIGHT_CONTROLLER_SESSION_ID": session_id}):
+                fallback = run_messages_cli(
+                    messages_dir,
+                    Path(env["GOALFLIGHT_FLEET_DIR"]),
+                    [
+                        "advance",
+                        "--project-root",
+                        str(project),
+                        "--controller-label",
+                        label,
+                        "--lease-nonce",
+                        lease.nonce,
+                        "--acked",
+                    ],
+                )
+            assert_true(f"--acked {description} refuses", fallback.returncode == 2)
+            assert_true(f"--acked {description} reports stuck row", "STUCK:" in fallback.stderr)
+            assert_true(
+                f"--acked {description} does not offer seq 2",
+                f"{stream}=2" not in fallback.stderr,
+            )
+
+
+def test_advance_refusal_is_one_actionable_not_recorded_line() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        refused = run_messages_cli(
+            Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            Path(env["GOALFLIGHT_FLEET_DIR"]),
+            ["advance", "--project-root", str(project), "--controller-label", "missing", "--acked"],
+        )
+        assert_true("advance refusal exits nonzero", refused.returncode != 0)
+        assert_true("advance refusal has one stderr line", len(refused.stderr.splitlines()) == 1)
+        assert_true("advance refusal says NOT RECORDED", refused.stderr.startswith("NOT RECORDED:"))
+        assert_true("advance refusal has a check command", "; next: python3 scripts/goalflight_messages.py relay" in refused.stderr)
+
+
+def test_relay_dead_lease_prints_takeover_command() -> None:
+    import goalflight_journal
+    import socket
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "dead-controller"
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={
+                    "pid": os.getpid(),
+                    "start_token": "test",
+                    "hostname": socket.gethostname(),
+                },
+            )
+            assert_true("dead-lease test lease claimed", claimed.committed)
+            lease = authority.active_lease(label)
+            with (
+                mock.patch.object(_carrier_messages.goalflight_wake, "lease_holder_alive", return_value=False),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
+                rc = _carrier_messages.main(
+                    [
+                        "--messages-dir", env["GOALFLIGHT_MESSAGES_DIR"],
+                        "--fleet-dir", env["GOALFLIGHT_FLEET_DIR"],
+                        "relay", "--project-root", str(project),
+                        "--controller-label", label,
+                    ]
+                )
+        assert_true("dead relay lease refuses", rc != 0)
+        assert_true("dead relay names exact takeover options", "--takeover --controller-pid-from-ancestry" in stderr.getvalue())
+        assert_true("dead relay fills label", f"--session-label {label}" in stderr.getvalue())
+        assert_true("dead relay fills project root", f"--project-root {project}" in stderr.getvalue())
+        assert_true("dead relay prints no pending success line", stdout.getvalue() == "")
 
 
 def test_last_steering_uses_controller_ingestion_order_across_clock_skew() -> None:
@@ -1901,7 +2932,7 @@ def test_post_type_steer_to_dispatch_id_refuses_and_names_steer_command() -> Non
             )
             assert_true(
                 f"{msg_type} uses refused prefix",
-                "post: refused:" in posted.stderr,
+                posted.stderr.startswith("NOT RECORDED:"),
             )
             assert_true(
                 f"{msg_type} names dispatch.steer",
@@ -2066,6 +3097,24 @@ def test_resolved_controller_post_reports_projected_journal_delivery() -> None:
             assert_true(f"resolved controller post succeeds: {posted.stderr}", posted.returncode == 0)
             result = json.loads(posted.stdout)
             delivery = result["controller_delivery"]
+            envelope = _carrier_messages.read_envelopes(
+                _carrier_messages.inbox_path(messages_dir, "controller-report")
+            )[0]
+            assert_true(
+                "controller mail records its addressee label",
+                envelope["addressee"]["label"] == label,
+            )
+            assert_true(
+                "controller mail records its addressee project",
+                envelope["addressee"]["project_root"] == str(project.resolve()),
+            )
+            owner = json.loads(
+                (messages_dir / "controller-report.owner.json").read_text(encoding="utf-8")
+            )
+            assert_true(
+                "controller stream owner is the addressed project",
+                owner["project_root"] == str(project.resolve()),
+            )
             assert_true("controller channel requested", delivery["requested"] is True)
             assert_true("controller channel delivered", delivery["delivered"] is True)
             assert_true("controller delivery status is explicit", delivery["status"] == "delivered_to_controller")
@@ -2080,6 +3129,1565 @@ def test_resolved_controller_post_reports_projected_journal_delivery() -> None:
             assert_true("journal recipient matches report", rows[0]["recipient_label"] == label)
             assert_true("journal event UUID matches report", rows[0]["event_uuid"] == delivery["event_uuid"])
             assert_true("journal delivery is projected", rows[0]["projected_at"] is not None)
+
+
+def test_controller_post_projection_exception_keeps_recorded_result() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        label = "projection-error-controller"
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "post-projection-error-test"},
+            )
+            assert_true("projection error controller lease claimed", claimed.committed)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = [
+                "--messages-dir", str(messages_dir),
+                "--fleet-dir", str(fleet_dir),
+                "post", "--dispatch-id", "controller-projection-error",
+                "--type", "controller-answer", "--text", "projection failed",
+                "--to-controller", label, "--controller-project-root", str(project),
+            ]
+            with mock.patch.object(
+                _carrier_messages,
+                "_mark_journal_delivery",
+                side_effect=_carrier_messages.MessageError("projection unavailable"),
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = _carrier_messages.main(args)
+
+            result = json.loads(stdout.getvalue())
+            delivery = result["controller_delivery"]
+            assert_true("projection failure keeps post exit", exit_code == 1)
+            assert_true("projection failure remains recorded", result["recorded"] is True)
+            assert_true("projection failure is explicit", delivery["status"] == "controller_projection_failed")
+            assert_true("projection reason is preserved", "projection unavailable" in delivery["detail"])
+            assert_true(
+                "post-append projection failure has one recorded-not-delivered line",
+                stderr.getvalue().splitlines()
+                == [
+                    "RECORDED, NOT DELIVERED: "
+                    f"{delivery['detail']}; next: python3 scripts/goalflight_messages.py read "
+                    "--dispatch-id controller-projection-error --json"
+                ],
+            )
+            carrier = _carrier_messages.read_envelopes(
+                _carrier_messages.inbox_path(messages_dir, "controller-projection-error")
+            )
+            assert_true("projection failure leaves envelope durable", len(carrier) == 1)
+
+
+def test_worker_post_survives_denied_journal_and_watcher_projects_once() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        label = "worker-projection-controller"
+        dispatch_id = "worker-journal-denied"
+        env = _journal_test_env(base)
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "worker-projection-test"},
+            )
+            assert_true("worker projection controller lease claimed", claimed.committed)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = [
+                "--messages-dir", str(messages_dir),
+                "--fleet-dir", str(fleet_dir),
+                "post", "--dispatch-id", dispatch_id,
+                "--type", "user_need",
+                "--payload", json.dumps({"text": "worker needs help", "project_root": str(project)}),
+                "--json",
+            ]
+            with mock.patch.dict(
+                os.environ, {"GOALFLIGHT_DISPATCH_ID": dispatch_id}, clear=False
+            ), mock.patch.object(
+                goalflight_journal,
+                "open_or_create_journal",
+                side_effect=goalflight_journal.JournalIOError("journal access denied"),
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = _carrier_messages.main(args)
+
+            result = json.loads(stdout.getvalue())
+            carrier = _carrier_messages.inbox_path(messages_dir, dispatch_id)
+            envelopes = _carrier_messages.read_envelopes(carrier)
+            assert_true("worker post is nonfatal", exit_code == 0)
+            assert_true("worker post reports durable carrier", result["recorded"] is True)
+            assert_true("worker post keeps its carrier despite journal denial", len(envelopes) == 1)
+            event_uuid = envelopes[0]["id"]
+            assert_true(
+                "worker post explains pending projection",
+                result["controller_delivery"]["status"] == "controller_projection_failed",
+            )
+            assert_true("worker projection denial emits no failure", stderr.getvalue() == "")
+            assert_true(
+                "worker post stages its dispatch outbox record",
+                len(list((outbox / "journal").glob("journal-*.delivery"))) == 1,
+            )
+
+            projected = goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id)
+            assert_true("watcher projects the staged event", projected == 1)
+            rows = authority.read_all(
+                """SELECT projected_at, withdrawn_at FROM delivery_events
+                   WHERE event_uuid = ?""",
+                (event_uuid,),
+            )
+            assert_true(
+                "watcher creates one projected journal event",
+                len(rows) == 1 and rows[0]["projected_at"] is not None,
+            )
+
+            repeated_projection = goalflight_watch.consume_worker_journal_outbox(
+                outbox,
+                dispatch_id,
+            )
+            assert_true("watcher restart does not project the event twice", repeated_projection == 0)
+            rows = authority.read_all(
+                "SELECT event_uuid FROM delivery_events WHERE event_uuid = ?",
+                (event_uuid,),
+            )
+            assert_true("repeat watcher leaves one journal event", len(rows) == 1)
+
+
+def test_denied_worker_post_is_nonfatal_and_stages_dispatch_outbox() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "worker-outbox-post"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            "--messages-dir", env["GOALFLIGHT_MESSAGES_DIR"],
+            "--fleet-dir", env["GOALFLIGHT_FLEET_DIR"],
+            "post", "--dispatch-id", dispatch_id, "--type", "user_need",
+            "--payload", json.dumps({"text": "wake from outbox", "project_root": str(project)}),
+            "--json",
+        ]
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_prepare_journal_delivery",
+                side_effect=goalflight_journal.JournalIOError("journal access denied"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result_code = _carrier_messages.main(argv)
+        result = json.loads(stdout.getvalue())
+        assert_true("denied worker post is a documented nonfatal result", result_code == 0)
+        assert_true(
+            "carrier was appended before the denied journal projection",
+            _carrier_messages.inbox_path(Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id).is_file(),
+        )
+        assert_true(
+            "one sequenced record was staged",
+            len(list((outbox / "journal").glob("journal-*.delivery"))) == 1,
+        )
+
+
+def test_worker_outbox_carrier_membership_and_setup_obey_pass_budget() -> None:
+    dispatch_id = "bounded-outbox-carrier-membership"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+            clear=False,
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("worker journal denied")),
+        ):
+            posted = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "current carrier record", "project_root": str(project)},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+            )
+
+        carrier_path = _carrier_messages.inbox_path(
+            Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id
+        )
+        filler = []
+        for sequence in range(2, 2502):
+            envelope = {
+                "schema": "goalflight.message.v1",
+                "schema_version": 1,
+                "id": str(_carrier_messages.uuid.uuid4()),
+                "dispatch_id": dispatch_id,
+                "seq": sequence,
+                "ts": _carrier_messages.utc_now(),
+                "source": {"node": "test", "adapter": "pytest", "transport": "worker"},
+                "type": "status",
+                "payload": {"text": "x" * 2048},
+            }
+            filler.append(
+                json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                + b"\n"
+            )
+        with carrier_path.open("ab") as handle:
+            handle.write(b"".join(filler))
+
+        storage = outbox / "journal"
+        for entry in tuple(storage.iterdir()):
+            entry.replace(outbox / entry.name)
+        storage.rmdir()
+
+        observed_lock_timeouts: list[float] = []
+        observed_membership_reads: list[tuple[int, float | None]] = []
+        original_read_slice = _carrier_messages.CarrierTransaction.read_recovery_slice
+
+        @contextlib.contextmanager
+        def no_wait_mail_lock(_path, *, timeout_secs=2.0):
+            observed_lock_timeouts.append(float(timeout_secs))
+            yield
+
+        def tracked_read_slice(transaction, offset, **kwargs):
+            observed_membership_reads.append(
+                (int(kwargs["max_bytes"]), kwargs.get("deadline"))
+            )
+            return original_read_slice(transaction, offset, **kwargs)
+
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages, "mail_lock", no_wait_mail_lock
+        ), mock.patch.object(
+            _carrier_messages.CarrierTransaction,
+            "read_bytes",
+            side_effect=AssertionError("membership validation must not read the whole carrier"),
+        ), mock.patch.object(
+            _carrier_messages.CarrierTransaction,
+            "read_recovery_slice",
+            tracked_read_slice,
+        ), mock.patch.object(
+            _carrier_messages, "_prepare_journal_delivery", return_value=()
+        ):
+            projected = _carrier_messages.project_worker_journal_outbox(
+                dispatch_id,
+                outbox_dir=outbox,
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                budget_s=0.2,
+            )
+
+        assert_true("outbox membership projected within its byte budget", projected == 1)
+        assert_true(
+            "layout migration and all pass locks use the remaining deadline",
+            bool(observed_lock_timeouts)
+            and all(0 < timeout <= 0.2 for timeout in observed_lock_timeouts),
+        )
+        assert_true(
+            "carrier membership read is bounded and deadline-aware",
+            len(observed_membership_reads) == 1
+            and observed_membership_reads[0][0] <= 4 * 1024 * 1024
+            and isinstance(observed_membership_reads[0][1], float),
+        )
+        assert_true(
+            "matching envelope is found without reading the 5 MB carrier",
+            observed_membership_reads[0][0] < carrier_path.stat().st_size,
+        )
+        assert_true("outbox event identity stays stable", posted["envelope"]["id"])
+
+
+def test_worker_outbox_recovery_appends_missing_wait_before_listener_delivery() -> None:
+    import goalflight_journal
+
+    dispatch_id = "example-dispatch-recovery"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        write_ledger_record(base, dispatch_id, project)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.Journal.create(project)
+            lease = authority.claim_or_renew_lease(
+                "controller", principal={"principal_id": "resume-outbox-recovery"}
+            ).value
+        assert_true("controller lease claimed", lease is not None)
+
+        with mock.patch.dict(
+            os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id}, clear=False
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("worker journal denied")),
+        ):
+            question = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_confirm",
+                payload={"text": "continue?", "project_root": str(project)},
+                messages_dir=messages_dir,
+                source={
+                    "node": "local",
+                    "adapter": "goalflight-dispatch",
+                    "transport": "steer-wait",
+                },
+            )["envelope"]
+
+        carrier = _carrier_messages.inbox_path(messages_dir, dispatch_id)
+        carrier.unlink()
+        prepared = authority.prepare_attempt(
+            dispatch_id, owner_controller_label="controller"
+        )
+        assert_true("terminal attempt prepared", prepared.committed and prepared.value)
+        terminal = authority.commit_terminal(
+            prepared.value.attempt_id,
+            terminal_state="complete",
+            observation={"state": "complete", "text": "finished"},
+        )
+        assert_true("terminal attempt committed", terminal.committed)
+        authority.project_terminal_outbox(messages_dir=messages_dir)
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            projected = _carrier_messages.project_worker_journal_outbox(
+                dispatch_id,
+                outbox_dir=outbox,
+                messages_dir=messages_dir,
+                budget_s=1.0,
+            )
+        assert_true("missing wait envelope repaired and projected", projected == 1)
+        raw = _carrier_messages.read_envelopes(carrier)
+        assert [(item["type"], item["seq"]) for item in raw] == [
+            ("result", 1),
+            ("user_confirm", 2),
+        ]
+        snapshot = authority.cursor_peek("controller", nonce=lease.nonce)
+        delivered = _carrier_messages._envelopes_with_rows(
+            authority, list(snapshot.items), controller_label="controller"
+        )
+        assert [envelope["type"] for _, envelope in delivered] == [
+            "result",
+            "user_confirm",
+        ]
+
+
+def test_example_carrier_delivers_all_three_projected_events() -> None:
+    import goalflight_journal
+
+    dispatch_id = "example-dispatch-carrier"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        write_ledger_record(base, dispatch_id, project)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.Journal.create(project)
+            lease = authority.claim_or_renew_lease(
+                "controller", principal={"principal_id": "sol-carrier-projection"}
+            ).value
+        assert_true("controller lease claimed", lease is not None)
+        with mock.patch.dict(
+            os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id}, clear=False
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("worker journal denied")),
+        ):
+            _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_confirm",
+                payload={"text": "continue?", "project_root": str(project)},
+                messages_dir=messages_dir,
+                source={
+                    "node": "local",
+                    "adapter": "goalflight-dispatch",
+                    "transport": "steer-wait",
+                },
+            )
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label="controller",
+                dispatch_id=dispatch_id,
+            )
+        prepared = authority.prepare_attempt(
+            dispatch_id, owner_controller_label="controller"
+        )
+        assert_true("terminal attempt prepared", prepared.committed and prepared.value)
+        terminal = authority.commit_terminal(
+            prepared.value.attempt_id,
+            terminal_state="complete",
+            observation={"state": "complete", "text": "finished"},
+        )
+        assert_true("terminal attempt committed", terminal.committed)
+        authority.project_terminal_outbox(messages_dir=messages_dir)
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            assert_true(
+                "wait question delivery projected",
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=messages_dir,
+                    budget_s=1.0,
+                ) == 1,
+            )
+        carrier = _carrier_messages.inbox_path(messages_dir, dispatch_id)
+        raw = _carrier_messages.read_envelopes(carrier)
+        assert [(item["type"], item["seq"]) for item in raw] == [
+            ("user_confirm", 1),
+            ("controller-notice", 2),
+            ("result", 3),
+        ]
+        snapshot = authority.cursor_peek("controller", nonce=lease.nonce)
+        delivered = _carrier_messages._envelopes_with_rows(
+            authority, list(snapshot.items), controller_label="controller"
+        )
+        assert [(item["type"], item["seq"]) for _, item in delivered] == [
+            ("user_confirm", 1),
+            ("controller-notice", 2),
+            ("result", 3),
+        ]
+
+
+def test_worker_outbox_assignment_uses_carrier_row_sequence() -> None:
+    import goalflight_journal
+
+    dispatch_id = "resumed-carrier-sequence"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        write_ledger_record(base, dispatch_id, project)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.Journal.create(project)
+            lease = authority.claim_or_renew_lease(
+                "controller", principal={"principal_id": "carrier-sequence"}
+            ).value
+        assert_true("controller lease claimed", lease is not None)
+        with mock.patch.dict(
+            os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id}, clear=False
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("worker journal denied")),
+        ):
+            question = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="user_confirm",
+                payload={"text": "continue?", "project_root": str(project)},
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "goalflight-dispatch", "transport": "steer-wait"},
+            )["envelope"]
+
+        carrier = _carrier_messages.inbox_path(messages_dir, dispatch_id)
+        filler = [
+            {
+                **question,
+                "id": str(_carrier_messages.uuid.uuid4()),
+                "seq": sequence,
+                "source": {"node": "other", "adapter": "pytest", "transport": "worker"},
+                "type": "status",
+                "payload": {"text": f"prior {sequence}", "project_root": str(project)},
+            }
+            for sequence in (1, 2)
+        ]
+        resequenced = {**question, "seq": 3}
+        _carrier_messages.update_envelopes(
+            carrier, lambda _existing: (filler + [resequenced], None)
+        )
+        captured: list[dict] = []
+        original_prepare = _carrier_messages._prepare_journal_delivery
+
+        def capture(envelope, path, **kwargs):
+            captured.append(dict(envelope))
+            return original_prepare(envelope, path, **kwargs)
+
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages, "_prepare_journal_delivery", capture
+        ):
+            projected = _carrier_messages.project_worker_journal_outbox(
+                dispatch_id,
+                outbox_dir=outbox,
+                messages_dir=messages_dir,
+                budget_s=1.0,
+            )
+        assert_true("resequenced outbox event projected", projected == 1)
+        assert_true("journal assignment uses authoritative carrier seq", captured[0]["seq"] == 3)
+
+
+def test_worker_outbox_timeouts_do_not_quarantine_deliverable_head() -> None:
+    dispatch_id = "outbox-timeout-not-poison"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+            clear=False,
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("worker journal denied")),
+        ):
+            posted = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "current carrier record", "project_root": str(project)},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+            )
+
+        carrier_path = _carrier_messages.inbox_path(
+            Path(env["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id
+        )
+        original_transaction = _carrier_messages.carrier_transaction
+
+        @contextlib.contextmanager
+        def busy_carrier_transaction(path, **kwargs):
+            if Path(path) == carrier_path:
+                raise TimeoutError("mailbox lock busy for bounded projection pass")
+            with original_transaction(path, **kwargs) as transaction:
+                yield transaction
+
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages,
+            "carrier_transaction",
+            busy_carrier_transaction,
+        ), mock.patch.object(
+            _carrier_messages,
+            "_WORKER_JOURNAL_OUTBOX_RETRY_BASE_S",
+            0.0,
+        ):
+            results = [
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=0.2,
+                )
+                for _ in range(3)
+            ]
+
+        record = outbox / "journal" / "journal-00000000000000000001.delivery"
+        assert_true("lock timeouts leave the deliverable head pending", results == [0, 0, 0])
+        assert_true("the deliverable head remains available", record.is_file())
+        assert_true(
+            "lock timeouts do not publish a poison marker",
+            not record.with_suffix(".published").exists(),
+        )
+        assert_true(
+            "lock timeouts do not quarantine the head",
+            not (record.with_suffix(".jsonl").with_suffix(".quarantine.jsonl")).exists(),
+        )
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages,
+            "_journal_delivery_targets",
+            side_effect=TimeoutError("carrier recovery pass budget expired"),
+        ), mock.patch.object(
+            _carrier_messages,
+            "_WORKER_JOURNAL_OUTBOX_RETRY_BASE_S",
+            0.0,
+        ):
+            timed_out = [
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=0.2,
+                )
+                for _ in range(3)
+            ]
+        assert_true("preparation timeouts preserve the pending head", timed_out == [0, 0, 0])
+        quarantine = _carrier_messages.quarantine_path(record.with_suffix(".jsonl"))
+        assert_true("preparation timeouts do not quarantine", not quarantine.exists())
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages,
+            "_prepare_journal_delivery",
+            side_effect=_carrier_messages.MessageError("persistent projection failure"),
+        ), mock.patch.object(
+            _carrier_messages,
+            "_WORKER_JOURNAL_OUTBOX_RETRY_BASE_S",
+            0.0,
+        ):
+            for _ in range(3):
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=0.2,
+                )
+        assert_true("real projection errors still quarantine after three attempts", quarantine.exists())
+        assert_true("outbox event identity stays stable", posted["envelope"]["id"])
+
+
+def test_journal_write_timeouts_do_not_quarantine_outbox_head() -> None:
+    import goalflight_journal
+    import goalflight_task
+
+    def fixture(base: Path, dispatch_id: str):
+        project = base / f"project-{dispatch_id}"
+        init_git_project(project)
+        env = _journal_test_env(base / dispatch_id)
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+            clear=False,
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("journal denied")),
+        ):
+            posted = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "retryable write", "project_root": str(project)},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+            )
+        return project, env, outbox, posted["envelope"]["id"]
+
+    def passes(dispatch_id: str, env: dict, outbox: Path) -> list[int]:
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            _carrier_messages,
+            "_WORKER_JOURNAL_OUTBOX_RETRY_BASE_S",
+            0.0,
+        ):
+            return [
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=0.2,
+                )
+                for _ in range(3)
+            ]
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project, env, outbox, event_id = fixture(base, "journal-lock-timeout")
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+        record = outbox / "journal" / "journal-00000000000000000001.delivery"
+        with goalflight_task.FileLock(goalflight_journal.journal_write_lock_path(authority.path)):
+            assert_true("held journal write lock retries", passes("journal-lock-timeout", env, outbox) == [0, 0, 0])
+        assert_true("lock timeout head remains pending", record.is_file())
+        assert_true(
+            "lock timeout head is not quarantined",
+            not record.with_suffix(".published").exists(),
+        )
+        assert_true(
+            "lock timeout has no quarantine sidecar",
+            not record.with_suffix(".jsonl").with_suffix(".quarantine.jsonl").exists(),
+        )
+        with mock.patch.dict(os.environ, env, clear=False):
+            assert_true(
+                "pending event projects after journal lock release",
+                _carrier_messages.project_worker_journal_outbox(
+                    "journal-lock-timeout",
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=1.0,
+                ) == 1,
+            )
+        rows = authority.read_all(
+            "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+            (event_id,),
+        )
+        assert_true("released lock projects the event", len(rows) == 1 and rows[0]["projected_at"] is not None)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project, env, outbox, event_id = fixture(base, "journal-budget-timeout")
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+        original_journal = goalflight_journal.Journal
+
+        def exhausted_journal(root, **kwargs):
+            return original_journal(
+                root,
+                **{**kwargs, "transaction_budget_s": 1e-12},
+            )
+
+        with mock.patch.object(goalflight_journal, "Journal", exhausted_journal):
+            assert_true("transaction budget retries", passes("journal-budget-timeout", env, outbox) == [0, 0, 0])
+        record = outbox / "journal" / "journal-00000000000000000001.delivery"
+        assert_true("transaction timeout head remains pending", record.is_file())
+        assert_true(
+            "transaction timeout head is not quarantined",
+            not record.with_suffix(".published").exists(),
+        )
+        assert_true(
+            "transaction timeout has no quarantine sidecar",
+            not record.with_suffix(".jsonl").with_suffix(".quarantine.jsonl").exists(),
+        )
+        with mock.patch.dict(os.environ, env, clear=False):
+            assert_true(
+                "pending event projects after restoring the transaction budget",
+                _carrier_messages.project_worker_journal_outbox(
+                    "journal-budget-timeout",
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=1.0,
+                ) == 1,
+            )
+        rows = authority.read_all(
+            "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+            (event_id,),
+        )
+        assert_true("restored budget projects the event", len(rows) == 1 and rows[0]["projected_at"] is not None)
+
+
+def test_journal_write_timeout_is_a_message_error_for_controller_and_mcp() -> None:
+    import goalflight_journal
+    import goalflight_task
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+        payload = json.dumps(
+            {"text": "retryable controller post", "project_root": str(project)}
+        )
+        with goalflight_task.FileLock(goalflight_journal.journal_write_lock_path(authority.path)):
+            controller = run_messages_cli(
+                messages_dir,
+                Path(env["GOALFLIGHT_FLEET_DIR"]),
+                [
+                    "post",
+                    "--dispatch-id",
+                    "controller-retryable-post",
+                    "--type",
+                    "status",
+                    "--payload",
+                    payload,
+                ],
+            )
+            assert_true(
+                "controller post gets the normal refusal exit",
+                controller.returncode == 2,
+            )
+            assert_true(
+                "controller post reports the retryable journal failure",
+                "write budget" in controller.stderr,
+            )
+
+            request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "goalflight_post_message",
+                    "arguments": {
+                        "dispatch_id": "mcp-retryable-post",
+                        "type": "status",
+                        "payload": {
+                            "text": "retryable MCP post",
+                            "project_root": str(project),
+                        },
+                    },
+                },
+            }
+            ping = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+            stdio = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "goalflight_mcp_messages.py"),
+                    "stdio",
+                ],
+                input=json.dumps(request) + "\n" + json.dumps(ping) + "\n",
+                env={**dict(os.environ), **env},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        assert_true("MCP stdio process stays alive", stdio.returncode == 0)
+        responses = [json.loads(line) for line in stdio.stdout.splitlines()]
+        assert_true(
+            "MCP returns its normal JSON-RPC error",
+            "error" in responses[0],
+        )
+        assert_true(
+            "MCP stdio handles the following request",
+            responses[1] == {"jsonrpc": "2.0", "id": 2, "result": {}},
+        )
+
+
+def test_invalid_worker_journal_outbox_cursor_fails_closed() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "invalid-outbox-cursor"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with mock.patch.dict(
+            os.environ,
+            {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id},
+            clear=False,
+        ), mock.patch.object(
+            _carrier_messages,
+            "_worker_journal_projection",
+            return_value=((), RuntimeError("journal denied")),
+        ):
+            posted = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "already projected", "project_root": str(project)},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+            )
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            assert_true(
+                "first projection succeeds",
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=1.0,
+                ) == 1,
+            )
+        cursor = outbox / "journal" / ".journal-cursor"
+        cursor.write_text("{corrupt cursor\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, env, clear=False):
+            try:
+                _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    budget_s=1.0,
+                )
+            except _carrier_messages.MessageError as exc:
+                assert_true("cursor failure is reported clearly", "cursor" in str(exc))
+            else:
+                raise AssertionError("invalid cursor should stop outbox projection")
+        rows = authority.read_all(
+            "SELECT event_uuid, recipient_label, projected_at "
+            "FROM delivery_events WHERE event_uuid = ?",
+            (posted["envelope"]["id"],),
+        )
+        assert_true("invalid cursor does not create a duplicate delivery row", len(rows) == 1)
+        assert_true("existing delivery remains projected", rows[0]["projected_at"] is not None)
+
+
+def test_controller_to_worker_steer_does_not_enter_journal_outbox() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        env = _journal_test_env(base)
+        dispatch_id = "steer-outbox-exclusion"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_DISPATCH_ID": ""},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_deliver_message_to_worker",
+                return_value={"requested": True, "delivered": True},
+            ),
+        ):
+            _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "steer the worker"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"},
+                deliver_to_worker=True,
+                project_journal_delivery=False,
+            )
+        assert_true(
+            "steer has no journal delivery record",
+            list((outbox / "journal").glob("journal-*.delivery")) == [],
+        )
+
+
+def test_concurrent_workers_project_only_to_their_own_projects() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        env = _journal_test_env(base)
+        script = base / "post_worker.py"
+        script.write_text(
+            "\n".join(
+                (
+                    "import json, os, sys",
+                    "from pathlib import Path",
+                    "from unittest import mock",
+                    f"sys.path.insert(0, {str(ROOT / 'scripts')!r})",
+                    "import goalflight_messages as messages",
+                    "dispatch_id = os.environ['GOALFLIGHT_DISPATCH_ID']",
+                    "with mock.patch.object(messages, '_worker_journal_projection', return_value=((), RuntimeError('journal denied'))):",
+                    "    result = messages.post_message(",
+                    "        dispatch_id=dispatch_id, msg_type='user_need',",
+                    "        payload={'text': dispatch_id, 'project_root': os.environ['TEST_PROJECT']},",
+                    "        messages_dir=Path(os.environ['GOALFLIGHT_MESSAGES_DIR']),",
+                    "        source={'node': 'local', 'adapter': 'pytest', 'transport': 'worker'},",
+                    "    )",
+                    "print(result['envelope']['id'])",
+                )
+            ),
+            encoding="utf-8",
+        )
+        projects = [base / "project-a", base / "project-b"]
+        dispatch_ids = ["worker-project-a", "worker-project-b"]
+        for project in projects:
+            init_git_project(project)
+        with mock.patch.dict(os.environ, env, clear=False):
+            for project in projects:
+                goalflight_journal.open_or_create_journal(project)
+        outboxes = []
+        processes = []
+        for project, dispatch_id in zip(projects, dispatch_ids):
+            outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+            outbox.mkdir(parents=True)
+            outboxes.append(outbox)
+            worker_env = os.environ.copy()
+            worker_env.update(env)
+            worker_env.update(
+                {
+                    "GOALFLIGHT_DISPATCH_ID": dispatch_id,
+                    "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(outbox),
+                    "TEST_PROJECT": str(project),
+                }
+            )
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, str(script)],
+                    cwd=str(ROOT),
+                    env=worker_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        event_ids = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=10)
+            assert_true(f"concurrent worker post succeeds: {stderr}", process.returncode == 0)
+            event_ids.append(stdout.strip())
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            for outbox, dispatch_id in zip(outboxes, dispatch_ids):
+                assert_true(
+                    f"{dispatch_id} watcher drains its own outbox",
+                    goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id) == 1,
+                )
+            for index, project in enumerate(projects):
+                authority = goalflight_journal.Journal(project)
+                own = authority.read_all(
+                    "SELECT event_uuid, projected_at FROM delivery_events WHERE event_uuid = ?",
+                    (event_ids[index],),
+                )
+                other = authority.read_all(
+                    "SELECT event_uuid FROM delivery_events WHERE event_uuid = ?",
+                    (event_ids[1 - index],),
+                )
+                assert_true(
+                    f"{dispatch_ids[index]} reaches its own project",
+                    len(own) == 1 and own[0]["projected_at"] is not None,
+                )
+                assert_true("one project's outbox never crosses to the other", other == [])
+
+
+def test_outbox_repairs_partial_multi_controller_projection() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "worker-multi-controller"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(outbox)
+        write_ledger_record(base, dispatch_id, project)
+        with mock.patch.dict(os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": dispatch_id}, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            for label in ("outbox-controller-a", "outbox-controller-b"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": label},
+                )
+                assert_true(f"{label} lease claimed", claimed.committed)
+            with mock.patch.object(
+                _carrier_messages,
+                "_worker_journal_projection",
+                return_value=((), RuntimeError("journal denied")),
+            ):
+                posted = _carrier_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="result",
+                    payload={"text": "one result", "project_root": str(project)},
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                    source={"node": "local", "adapter": "pytest", "transport": "worker"},
+                )
+            original_mark = _carrier_messages._mark_journal_delivery
+            marked_assignments = 0
+            injected = False
+
+            def fail_last_recipient(assignments):
+                nonlocal marked_assignments, injected
+                assignments = tuple(assignments)
+                marked_assignments += len(assignments)
+                if not injected and marked_assignments > 1:
+                    injected = True
+                    raise goalflight_journal.JournalIOError("second recipient temporarily denied")
+                return original_mark(assignments)
+
+            clock = [time.time()]
+            with mock.patch.object(_carrier_messages.time, "time", lambda: clock[0]):
+                with mock.patch.object(
+                    _carrier_messages,
+                    "_mark_journal_delivery",
+                    side_effect=fail_last_recipient,
+                ):
+                    goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id)
+                rows = authority.read_all(
+                    "SELECT recipient_label, projected_at FROM delivery_events "
+                    "WHERE event_uuid = ? ORDER BY recipient_label",
+                    (posted["envelope"]["id"],),
+                )
+                assert_true("both recipient assignments are durable", len(rows) == 2)
+                assert_true(
+                    "one recipient was delivered before the injected failure",
+                    sum(row["projected_at"] is not None for row in rows) == 1,
+                )
+                clock[0] += 2
+                projected = goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id)
+
+            assert_true("retry repairs the remaining recipient", projected == 1)
+            rows = authority.read_all(
+                "SELECT recipient_label, projected_at FROM delivery_events "
+                "WHERE event_uuid = ? ORDER BY recipient_label",
+                (posted["envelope"]["id"],),
+            )
+            assert_true("each controller has one delivery row", len(rows) == 2)
+            assert_true("both controller deliveries complete", all(row["projected_at"] is not None for row in rows))
+
+
+
+def test_outbox_replacement_projection_ignores_superseded_carrier_event() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        dispatch_id = "replacement-race-carrier"
+        worker_a = "replacement-race-a"
+        worker_b = "replacement-race-b"
+        outbox_a = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{worker_a}.questions"
+        outbox_b = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{worker_b}.questions"
+        outbox_a.mkdir(parents=True)
+        outbox_b.mkdir(parents=True)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+
+        def deny_projection(*_args, **_kwargs):
+            return (), goalflight_journal.JournalIOError("worker journal denied")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                **env,
+                "GOALFLIGHT_DISPATCH_ID": worker_a,
+                "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(outbox_a),
+            },
+            clear=False,
+        ), mock.patch.object(_carrier_messages, "_worker_journal_projection", deny_projection):
+            original = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "old", "project_root": str(project), "replaceable": True},
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+            )["envelope"]
+        with mock.patch.dict(
+            os.environ,
+            {
+                **env,
+                "GOALFLIGHT_DISPATCH_ID": worker_b,
+                "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(outbox_b),
+            },
+            clear=False,
+        ), mock.patch.object(_carrier_messages, "_worker_journal_projection", deny_projection):
+            replacement = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="status",
+                payload={"text": "new", "project_root": str(project)},
+                messages_dir=messages_dir,
+                source={"node": "local", "adapter": "pytest", "transport": "worker"},
+                replace_if=lambda item: item.get("payload", {}).get("replaceable") is True,
+            )["envelope"]
+
+        with mock.patch.dict(os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": ""}, clear=False):
+            projected_b = goalflight_watch.consume_worker_journal_outbox(outbox_b, worker_b)
+            retry = outbox_b / "journal" / "journal-00000000000000000001.retry"
+            assert projected_b == 1, (
+                retry.read_text(encoding="utf-8") if retry.exists() else "no retry record"
+            )
+            assert goalflight_watch.consume_worker_journal_outbox(outbox_a, worker_a) == 0
+
+        old_rows = authority.read_all(
+            "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+            (original["id"],),
+        )
+        new_rows = authority.read_all(
+            "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+            (replacement["id"],),
+        )
+        assert_true(
+            "superseded outbox event is never live after replacement projects first",
+            not old_rows or all(row["withdrawn_at"] is not None for row in old_rows),
+        )
+        assert_true(
+            "current replacement is projected",
+            len(new_rows) == 1 and new_rows[0]["projected_at"] is not None,
+        )
+
+
+def test_worker_journal_outbox_migrates_legacy_root_records() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "legacy-journal-outbox"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+        envelope = {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "id": str(_carrier_messages.uuid.uuid4()),
+            "dispatch_id": dispatch_id,
+            "seq": 1,
+            "ts": _carrier_messages.utc_now(),
+            "source": {"node": "test", "adapter": "pytest", "transport": "worker"},
+            "type": "status",
+            "payload": {"project_root": str(project), "text": "legacy record"},
+        }
+        legacy_record = outbox / "journal-00000000000000000001.delivery"
+        legacy_record.write_text(
+            json.dumps(
+                {
+                    "schema": _carrier_messages._WORKER_JOURNAL_OUTBOX_SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "sequence": 1,
+                    "project_journal_delivery": True,
+                    "envelope": envelope,
+                    "replaced_envelopes": [],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (outbox / ".journal-sequence").write_text("1\n", encoding="ascii")
+        _carrier_add(
+            _carrier_messages.inbox_path(
+                Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                dispatch_id,
+            ),
+            envelope,
+        )
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            assert goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id) == 1
+
+        current_record = outbox / "journal" / legacy_record.name
+        assert current_record.is_file()
+        assert not legacy_record.exists()
+        rows = authority.read_all(
+            "SELECT event_uuid, projected_at FROM delivery_events WHERE event_uuid = ?",
+            (envelope["id"],),
+        )
+        assert len(rows) == 1 and rows[0]["projected_at"] is not None
+
+
+def test_worker_journal_outbox_layout_migration_is_lazy_and_resumes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        outbox = Path(td) / "outbox"
+        outbox.mkdir()
+        for index in range(401):
+            (outbox / f"question-{index:04d}.json").write_text("retained", encoding="utf-8")
+        for index in range(401):
+            (outbox / f"journal-{index:020d}.delivery").write_bytes(b"legacy\n")
+        storage = outbox / "journal"
+        storage.mkdir()
+
+        original_scandir = os.scandir
+
+        class SlowEntry:
+            def __init__(self, entry):
+                self._entry = entry
+                self.name = entry.name
+                self.path = entry.path
+
+            def is_file(self, *, follow_symlinks=True):
+                time.sleep(0.002)
+                return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+        class SlowEntries:
+            def __init__(self, path):
+                self._entries = original_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._entries.close()
+
+            def __iter__(self):
+                yield from (
+                    SlowEntry(entry)
+                    for entry in sorted(
+                        self._entries,
+                        key=lambda item: (not item.name.startswith("question-"), item.name),
+                    )
+                )
+
+        calls = 0
+        migrated_any = False
+        def slow_scandir(path):
+            if Path(path) == outbox:
+                return SlowEntries(path)
+            return original_scandir(path)
+
+        with mock.patch.object(os, "scandir", side_effect=slow_scandir), mock.patch.object(
+            _carrier_messages,
+            "_WORKER_JOURNAL_OUTBOX_PASS_BUDGET_S",
+            0.1,
+        ):
+            while not (storage / ".layout-v1").exists():
+                before = sum(
+                    path.name.endswith(".delivery")
+                    for path in storage.iterdir()
+                )
+                started = time.monotonic()
+                _carrier_messages._worker_journal_outbox_storage_dir(
+                    outbox,
+                    deadline=started + _carrier_messages._WORKER_JOURNAL_OUTBOX_PASS_BUDGET_S,
+                )
+                elapsed = time.monotonic() - started
+                after = sum(
+                    path.name.endswith(".delivery")
+                    for path in storage.iterdir()
+                )
+                migrated_any = migrated_any or after > before
+                assert_true("migration pass stays near its deadline", elapsed < 0.2)
+                calls += 1
+                assert_true("migration finishes in several bounded passes", calls < 100)
+        assert_true("migration makes progress", migrated_any)
+        assert_true(
+            "all legacy records migrate",
+            sum(path.name.endswith(".delivery") for path in storage.iterdir()) == 401,
+        )
+
+
+def test_worker_journal_outbox_maximum_dispatch_id_resumes_carrier_scan() -> None:
+    import goalflight_journal
+
+    dispatch_id = "a" + "b" * 253 + "c"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        import goalflight_dispatch_paths
+
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / "bounded.questions"
+        carrier_dispatch_id = "bounded-carrier"
+        carrier = _carrier_messages.inbox_path(messages_dir, carrier_dispatch_id)
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+            goalflight_dispatch_paths,
+            "worker_question_outbox_dir",
+            return_value=outbox,
+        ):
+            outbox.mkdir(parents=True)
+        filler = {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "dispatch_id": carrier_dispatch_id,
+            "source": {"node": "test", "adapter": "pytest", "transport": "worker"},
+            "type": "status",
+            "payload": {"text": "x" * 20000, "project_root": str(project)},
+        }
+        envelopes = [
+            {**filler, "id": str(_carrier_messages.uuid.uuid4()), "seq": seq,
+             "ts": _carrier_messages.utc_now()}
+            for seq in range(1, 251)
+        ]
+        target = {
+            **filler,
+            "id": str(_carrier_messages.uuid.uuid4()),
+            "seq": 251,
+            "ts": _carrier_messages.utc_now(),
+            "payload": {"text": "target", "project_root": str(project)},
+        }
+        envelopes.append(target)
+        _carrier_messages.update_envelopes(carrier, lambda _old: (envelopes, None))
+        storage = _carrier_messages._worker_journal_outbox_storage_dir(outbox)
+        record = {
+            "schema": _carrier_messages._WORKER_JOURNAL_OUTBOX_SCHEMA,
+            "dispatch_id": dispatch_id,
+            "sequence": 1,
+            "project_journal_delivery": True,
+            "envelope": target,
+            "replaced_envelopes": [],
+        }
+        (storage / "journal-00000000000000000001.delivery").write_text(
+            json.dumps(record, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (storage / ".journal-sequence").write_text("1\n", encoding="ascii")
+        with mock.patch.dict(os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": ""}, clear=False), mock.patch.object(
+            goalflight_dispatch_paths,
+            "worker_question_outbox_dir",
+            return_value=outbox,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            projected = 0
+            passes = 0
+            while not (storage / "journal-00000000000000000001.published").exists():
+                projected += _carrier_messages.project_worker_journal_outbox(
+                    dispatch_id,
+                    outbox_dir=outbox,
+                    messages_dir=messages_dir,
+                    budget_s=0.5,
+                )
+                passes += 1
+                assert_true("multi-slice carrier scan completes", passes < 100)
+        rows = authority.read_all(
+            "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+            (target["id"],),
+        )
+        assert_true("maximum legal dispatch ID target is projected", projected == 1)
+        assert_true("resumed target is projected once", len(rows) == 1 and rows[0]["projected_at"] is not None)
+
+        cursor_path = storage / ".journal-cursor"
+        cursor_path.write_bytes(b" " * (_carrier_messages._WORKER_JOURNAL_OUTBOX_CURSOR_MAX_BYTES + 1))
+        try:
+            _carrier_messages._read_worker_journal_outbox_cursor(cursor_path, dispatch_id)
+        except _carrier_messages.MessageError:
+            pass
+        else:
+            raise AssertionError("over-limit cursor must not silently reset to zero")
+
+
+def test_unowned_terminal_outbox_reader_uses_remaining_pass_deadline() -> None:
+    import goalflight_journal
+
+    envelope = {
+        "dispatch_id": "unowned-terminal-deadline",
+        "type": "result",
+        "payload": {},
+    }
+    reader = mock.Mock()
+    reader.lease_records.return_value = []
+    deadline = time.monotonic() + 0.25
+    with mock.patch.object(
+        _carrier_messages,
+        "_dispatch_record",
+        return_value=({"dispatch_id": envelope["dispatch_id"], "project_root": "/project"}, None),
+    ), mock.patch.object(
+        goalflight_journal.Journal,
+        "open_reader",
+        return_value=reader,
+    ) as open_reader:
+        targets = _carrier_messages._journal_delivery_targets(envelope, deadline=deadline)
+
+    assert targets == ((Path("/project"), "*", False),)
+    kwargs = open_reader.call_args.kwargs
+    assert 0 < kwargs["retry_budget_s"] <= 0.25
+    assert kwargs["open_retry_budget_s"] == kwargs["retry_budget_s"]
+    assert kwargs["transaction_budget_s"] == kwargs["retry_budget_s"]
+
+
+def test_worker_outbox_quarantine_bounds_reason_and_reaches_later_records() -> None:
+    import goalflight_journal
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        dispatch_id = "outbox-quarantine"
+        outbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.questions"
+        outbox.mkdir(parents=True)
+
+        def envelope(sequence: int, payload: dict) -> dict:
+            return {
+                "schema": "goalflight.message.v1",
+                "schema_version": 1,
+                "id": str(_carrier_messages.uuid.uuid4()),
+                "dispatch_id": dispatch_id,
+                "seq": sequence,
+                "ts": _carrier_messages.utc_now(),
+                "source": {"node": "test", "adapter": "pytest", "transport": "worker"},
+                "type": "status",
+                "payload": payload,
+            }
+
+        def outbox_record(sequence: int, value: dict) -> bytes:
+            return (
+                json.dumps(
+                    {
+                        "schema": _carrier_messages._WORKER_JOURNAL_OUTBOX_SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "sequence": sequence,
+                        "project_journal_delivery": True,
+                        "envelope": value,
+                        "replaced_envelopes": [],
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+
+        deep: object = "deep value"
+        for _ in range(_carrier_messages.MAX_JSON_DEPTH + 4):
+            deep = [deep]
+        invalid_long = envelope(
+            1,
+            {"project_root": str(project), "nested": {"k" * 70_000 + chr(0xD800): deep}},
+        )
+        short_deep: object = "deep value"
+        for _ in range(_carrier_messages.MAX_JSON_DEPTH + 4):
+            short_deep = [short_deep]
+        invalid_surrogate = envelope(
+            2,
+            {"project_root": str(project), "nested": {chr(0xD800): short_deep}},
+        )
+        valid = envelope(3, {"project_root": str(project), "text": "after invalid records"})
+        for sequence, value in ((1, invalid_long), (2, invalid_surrogate), (3, valid)):
+            _carrier_messages._worker_journal_outbox_record_path(outbox, sequence).write_bytes(
+                outbox_record(sequence, value)
+            )
+        _carrier_add(
+            _carrier_messages.inbox_path(
+                Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                dispatch_id,
+            ),
+            valid,
+        )
+        storage = getattr(_carrier_messages, "_worker_journal_outbox_storage_dir", None)
+        sequence_path = (storage(outbox) if storage else outbox) / ".journal-sequence"
+        sequence_path.write_text("3\n", encoding="ascii")
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            for _ in range(3):
+                goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id)
+            delivered = authority.read_all(
+                "SELECT event_uuid, projected_at FROM delivery_events WHERE stream_id = ?",
+                (dispatch_id,),
+            )
+
+        assert_true(
+            "valid row after bounded quarantine reasons is projected",
+            len(delivered) == 1 and delivered[0]["projected_at"] is not None,
+        )
+        quarantine_rows = []
+        storage_dir = storage(outbox) if storage else outbox
+        for sequence in (1, 2):
+            quarantine_file = _carrier_messages.quarantine_path(
+                storage_dir / f"journal-{sequence:020d}.jsonl"
+            )
+            rows = [
+                json.loads(line)
+                for line in quarantine_file.read_text(encoding="utf-8").splitlines()
+            ]
+            assert_true(f"sequence {sequence} quarantined once", len(rows) == 1)
+            quarantine_rows.append(rows[0])
+        assert_true(
+            "long validation reason is truncated at the storage bound",
+            len(quarantine_rows[0]["reason"].encode("utf-8"))
+            == _carrier_messages._CARRIER_RECOVERY_QUARANTINE_REASON_BYTES,
+        )
+        assert_true(
+            "short validation reason replaces the lone surrogate",
+            chr(0xD800) not in quarantine_rows[1]["reason"]
+            and "?" in quarantine_rows[1]["reason"],
+        )
 
 
 def test_unresolved_controller_post_reports_reaching_nobody() -> None:
@@ -2115,7 +4723,8 @@ def test_unresolved_controller_post_reports_reaching_nobody() -> None:
 
             result = json.loads(posted.stdout)
             delivery = result["controller_delivery"]
-            assert_true("unresolved controller post exits nonzero", posted.returncode != 0)
+            assert_true("unresolved controller post keeps its failure exit", posted.returncode == 1)
+            assert_true("unresolved controller post remains recorded", result["recorded"] is True)
             assert_true("unresolved controller channel was requested", delivery["requested"] is True)
             assert_true("unresolved controller is not claimed delivered", delivery["delivered"] is False)
             assert_true(
@@ -2124,7 +4733,24 @@ def test_unresolved_controller_post_reports_reaching_nobody() -> None:
             )
             assert_true("unresolved label is reported", delivery["recipient_label"] == missing_label)
             assert_true("unresolved report says it reached nobody", "reached nobody" in delivery["detail"])
-            assert_true("unresolved stderr reports controller failure", "reached nobody" in posted.stderr)
+            expected_next = (
+                "python3 scripts/goalflight_messages.py read "
+                "--dispatch-id controller-unresolved --json"
+            )
+            assert_true(
+                "durable post failure has one recorded-not-delivered line",
+                posted.stderr.splitlines()
+                == [
+                    "RECORDED, NOT DELIVERED: "
+                    f"{delivery['detail']}; next: {expected_next}"
+                ],
+            )
+            carrier = messages_dir / "controller-unresolved.jsonl"
+            envelopes = _carrier_messages.read_envelopes(carrier)
+            assert_true(
+                "failed post remains in its carrier",
+                len(envelopes) == 1 and envelopes[0]["id"] == delivery["event_uuid"],
+            )
             rows = authority.read_all(
                 "SELECT event_uuid FROM delivery_events WHERE event_uuid = ?",
                 (delivery["event_uuid"],),
@@ -2486,7 +5112,13 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
             assert replay["recorded"] is False, replay
 
             for _ in range(2):
-                with contextlib.redirect_stdout(io.StringIO()):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GOALFLIGHT_PROJECT_ROOT": "",
+                        "GOALFLIGHT_CONTROLLER_LABEL": "",
+                    },
+                ), contextlib.redirect_stdout(io.StringIO()):
                     assert _carrier_messages.cmd_read(mock.Mock(
                         dispatch_id=dispatch_id, messages_dir=messages_dir,
                         fleet_dir=base / "fleet", last=None, json=True,
@@ -2507,7 +5139,13 @@ def test_controller_steer_read_replays_projection_after_commit_failure() -> None
             assert canonical[1]["source"]["project_identity"] == first_identity
 
             for _ in range(2):
-                with contextlib.redirect_stdout(io.StringIO()):
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "GOALFLIGHT_PROJECT_ROOT": "",
+                        "GOALFLIGHT_CONTROLLER_LABEL": "",
+                    },
+                ), contextlib.redirect_stdout(io.StringIO()):
                     assert _carrier_messages.cmd_read(mock.Mock(
                         dispatch_id=dispatch_id, messages_dir=messages_dir,
                         fleet_dir=base / "fleet", last=None, json=True,
@@ -2614,6 +5252,329 @@ def test_detached_controller_dead_record_with_live_worker_still_delivers() -> No
 
         assert_true("detached worker is classified live", result["delivery"]["dispatch_classification"] == "expected_live")
         assert_true("detached live worker receives view", result["delivery"]["delivered"] is True)
+
+
+def test_stuck_listener_row_is_not_advanced_and_does_not_block_other_streams() -> None:
+    stuck = {"stream_id": "same-stream", "stream_seq": 1, "listener_status": "STUCK"}
+    later = {"stream_id": "same-stream", "stream_seq": 2}
+    other = {"stream_id": "other-stream", "stream_seq": 1}
+    positions = _carrier_messages._cursor_positions_for_shown_rows(
+        [stuck, later, other], [(later, {}), (other, {})]
+    )
+    assert positions == {"other-stream": 1}
+    positions = _carrier_messages._cursor_positions_for_shown_rows(
+        [later, stuck, other], [(later, {}), (other, {})]
+    )
+    assert positions == {"other-stream": 1}
+
+    before_stuck = {"stream_id": "same-stream", "stream_seq": 1}
+    stuck_after = {
+        "stream_id": "same-stream",
+        "stream_seq": 2,
+        "listener_status": "STUCK",
+    }
+    later_after = {"stream_id": "same-stream", "stream_seq": 3}
+    positions = _carrier_messages._cursor_positions_for_shown_rows(
+        [before_stuck, stuck_after, later_after, other],
+        [(before_stuck, {}), (later_after, {}), (other, {})],
+    )
+    assert positions == {"same-stream": 1, "other-stream": 1}
+
+    unreported = {"stream_id": "held-stream", "stream_seq": 1}
+    after = {"stream_id": "held-stream", "stream_seq": 2}
+    positions = _carrier_messages._cursor_positions_for_shown_rows(
+        [unreported, after, other], [(after, {}), (other, {})]
+    )
+    assert positions == {"other-stream": 1}
+
+
+def test_listener_repairs_legacy_sequence_mismatches_from_copied_carriers() -> None:
+    import goalflight_journal
+
+    fixtures = ROOT / "tests" / "fixtures" / "journal_outbox_carriers"
+    cases = (
+        ("result-only.jsonl", 1, 2),
+        ("confirm-notice-result.jsonl", 3, 1),
+    )
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            for fixture_name, actual_seq, assigned_seq in cases:
+                carrier_records = [
+                    json.loads(line)
+                    for line in (fixtures / fixture_name).read_text(encoding="utf-8").splitlines()
+                ]
+                for record in carrier_records:
+                    addressee = record.get("addressee")
+                    if isinstance(addressee, dict):
+                        addressee["project_root"] = str(project.resolve())
+                result_record = next(record for record in carrier_records if record["type"] == "result")
+                label = result_record["addressee"]["label"]
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": "legacy-sequence-repair-test"},
+                )
+                assert_true("repair test lease claimed", claimed.committed)
+                carrier = messages_dir / f"{result_record['dispatch_id']}.jsonl"
+                for record in carrier_records:
+                    _carrier_add(carrier, record)
+
+                assigned = authority.record_delivery_event(
+                    recipient_label=label,
+                    origin_node=result_record["source"]["node"],
+                    event_uuid=result_record["id"],
+                    stream_id=result_record["dispatch_id"],
+                    stream_seq=assigned_seq,
+                    carrier_path=carrier,
+                    event_type="result",
+                    wake_class="waking",
+                    created_at=result_record["ts"],
+                )
+                assert_true("legacy assignment recorded", assigned.committed)
+                projected = authority.mark_delivery_projected(
+                    recipient_label=label,
+                    origin_node=result_record["source"]["node"],
+                    event_uuid=result_record["id"],
+                )
+                assert_true("legacy assignment projected", projected.committed)
+
+                row = next(
+                    item
+                    for item in authority.pending_delivery_events(label)
+                    if item["event_uuid"] == result_record["id"]
+                )
+                reader = goalflight_journal.Journal.open_reader(project)
+                repaired_envelope = _carrier_messages._listener_envelope(
+                    reader,
+                    row,
+                    repair_authority=authority,
+                    controller_label=label,
+                )
+                assert_true(
+                    "listener recovers the exact carrier event",
+                    repaired_envelope is not None
+                    and repaired_envelope["id"] == result_record["id"]
+                    and int(repaired_envelope["seq"]) == actual_seq,
+                )
+                assert_true(
+                    "repair invalidates the old cursor snapshot",
+                    _carrier_messages._cursor_positions_for_shown_rows(
+                        [row], [(row, repaired_envelope)]
+                    )
+                    == {},
+                )
+                stored = authority.read_all(
+                    """SELECT stream_seq FROM delivery_events
+                       WHERE recipient_label = ? AND origin_node = ? AND event_uuid = ?""",
+                    (label, result_record["source"]["node"], result_record["id"]),
+                )
+                assert [int(item["stream_seq"]) for item in stored] == [actual_seq]
+
+                # A second repair request is idempotent even when it carries
+                # the stale sequence from the original listener snapshot.
+                repeated = authority._repair_delivery_event_sequence_through_safe_prefix(
+                    recipient_label=label,
+                    origin_node=result_record["source"]["node"],
+                    event_uuid=result_record["id"],
+                    stream_id=result_record["dispatch_id"],
+                    old_stream_seq=assigned_seq,
+                    stream_seq=actual_seq,
+                    carrier_path=carrier,
+                    event_type="result",
+                    wake_class="waking",
+                    created_at=result_record["ts"],
+                )
+                assert_true("repeated repair is idempotent", repeated.committed)
+
+                fresh = authority.cursor_peek(label, nonce=claimed.value.nonce)
+                delivered = _carrier_messages._envelopes_with_rows(
+                    reader,
+                    list(fresh.items),
+                    repair_authority=authority,
+                    controller_label=label,
+                )
+                positions = _carrier_messages._cursor_positions_for_shown_rows(
+                    list(fresh.items), delivered
+                )
+                assert positions == {result_record["dispatch_id"]: actual_seq}
+                advanced = authority.advance_cursor(
+                    label,
+                    nonce=claimed.value.nonce,
+                    expected_cursor_version=fresh.cursor_version,
+                    expected_stream_snapshots=fresh.stream_snapshots,
+                    advances=positions,
+                    actor=label,
+                )
+                assert_true("repaired event can be acknowledged", advanced.committed)
+                assert not authority.cursor_peek(label, nonce=claimed.value.nonce).items
+
+
+def test_listener_tags_carrier_identity_mismatch_as_stuck() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            label = "identity-mismatch-controller"
+            stream_id = "identity-mismatch-dispatch"
+            event_uuid = str(_carrier_messages.uuid.uuid4())
+            carrier = messages_dir / f"{stream_id}.jsonl"
+            created_at = goalflight_journal.utc_now()
+            envelope = {
+                "schema": "goalflight.message.v1",
+                "schema_version": 1,
+                "id": event_uuid,
+                "dispatch_id": stream_id,
+                "seq": 1,
+                "ts": created_at,
+                "source": {
+                    "node": "identity-mismatch-origin",
+                    "adapter": "pytest",
+                    "transport": "worker",
+                },
+                "type": "result",
+                "priority": "normal",
+                "payload": {"text": "carrier result"},
+            }
+            _carrier_add(carrier, envelope)
+            _carrier_messages.update_envelopes(
+                carrier,
+                lambda rows: ([{**rows[0], "type": "controller-notice"}], None),
+            )
+            assigned = authority.record_delivery_event(
+                recipient_label=label,
+                origin_node="identity-mismatch-origin",
+                event_uuid=event_uuid,
+                stream_id=stream_id,
+                stream_seq=1,
+                carrier_path=carrier,
+                event_type="result",
+                wake_class="waking",
+                created_at=created_at,
+            )
+            assert_true("identity-mismatch assignment recorded", assigned.committed)
+            assert_true(
+                "identity-mismatch assignment projected",
+                authority.mark_delivery_projected(
+                    recipient_label=label,
+                    origin_node="identity-mismatch-origin",
+                    event_uuid=event_uuid,
+                ).committed,
+            )
+
+            row = next(
+                item
+                for item in authority.pending_delivery_events(label)
+                if item["event_uuid"] == event_uuid
+            )
+            errors: list[dict[str, object]] = []
+            assert _carrier_messages._envelopes_with_rows(
+                authority,
+                [row],
+                controller_label=label,
+                carrier_errors=errors,
+            ) == []
+            assert row.get("listener_status") == "STUCK"
+            assert errors and errors[0].get("status") == "STUCK"
+            assert _carrier_messages._cursor_positions_for_shown_rows([row], []) == {}
+
+
+def test_projector_repairs_misassigned_sequence_and_rewinds_consumed_position() -> None:
+    import goalflight_journal
+
+    fixture = ROOT / "tests" / "fixtures" / "journal_outbox_carriers" / "result-only.jsonl"
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            records = [
+                json.loads(line)
+                for line in fixture.read_text(encoding="utf-8").splitlines()
+            ]
+            for record in records:
+                if isinstance(record.get("addressee"), dict):
+                    record["addressee"]["project_root"] = str(project.resolve())
+            envelope = next(record for record in records if record["type"] == "result")
+            label = str(envelope["addressee"]["label"])
+            carrier = messages_dir / f"{envelope['dispatch_id']}.jsonl"
+            for record in records:
+                _carrier_add(carrier, record)
+
+            assigned = authority.record_delivery_event(
+                recipient_label=label,
+                origin_node=envelope["source"]["node"],
+                event_uuid=envelope["id"],
+                stream_id=envelope["dispatch_id"],
+                stream_seq=2,
+                carrier_path=carrier,
+                event_type="result",
+                wake_class="waking",
+                created_at=envelope["ts"],
+            )
+            assert_true("legacy sequence assignment recorded", assigned.committed)
+            assert_true(
+                "legacy sequence assignment projected",
+                authority.mark_delivery_projected(
+                    recipient_label=label,
+                    origin_node=envelope["source"]["node"],
+                    event_uuid=envelope["id"],
+                ).committed,
+            )
+            stream_id = str(envelope["dispatch_id"])
+            snapshot, _ = authority._read_with_retry(
+                "test cursor setup snapshot",
+                lambda connection: authority._cursor_stream_snapshot(
+                    connection,
+                    project_root=str(project.resolve()),
+                    recipient_label=label,
+                    stream_id=stream_id,
+                    requested_position=2,
+                ),
+            )
+            with authority._cursor_write_scope():
+                assert authority._set_cursor_raw(
+                    label,
+                    positions={stream_id: 2},
+                    expected_stream_snapshots={stream_id: snapshot},
+                    actor=label,
+                ).committed
+
+            assignments = _carrier_messages._prepare_journal_delivery(envelope, carrier)
+            assert len(assignments) == 1
+            stored = authority.read_all(
+                "SELECT stream_seq FROM delivery_events WHERE event_uuid = ?",
+                (envelope["id"],),
+            )
+            assert [int(row["stream_seq"]) for row in stored] == [1]
+            assert authority.cursor_status(label)["positions"] == {envelope["dispatch_id"]: 0}
+            assert authority._cursor_rewinds(label) == {envelope["dispatch_id"]: 1}
+
+            reader = goalflight_journal.Journal.open_reader(project)
+            pending = authority.pending_delivery_events(label)
+            delivered = _carrier_messages._envelopes_with_rows(
+                reader,
+                pending,
+                repair_authority=authority,
+                controller_label=label,
+            )
+            positions = _carrier_messages._cursor_positions_for_shown_rows(
+                pending, delivered
+            )
+            assert positions == {envelope["dispatch_id"]: 1}
 
 
 def test_terminal_controller_post_is_recorded_and_labelled_record_only() -> None:
@@ -3406,7 +6367,7 @@ def test_drain_bodies_prints_body_before_cursor_advance() -> None:
             assert_true(
                 "conflict is reported after the body",
                 combined.index("UNIQUE-BODY-SENTINEL-9f3a")
-                < combined.index("drain conflict"),
+                < combined.index("drain conflict · retry relay --drain"),
             )
             after = authority.cursor_peek(label, nonce=lease.nonce, limit=10)
             assert_true(

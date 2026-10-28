@@ -9,6 +9,7 @@ from support import (
     ensure_acp_test_interpreter,
     note_skip,
     registered_child_environment,
+    sandbox_exec_unavailable_reason,
     skip_case_posix_on_native_windows,
 )
 
@@ -19,13 +20,13 @@ import io
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,6 +34,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 ensure_acp_test_interpreter("test_os_sandbox")
 
 import goalflight_acp_run  # noqa: E402
+import goalflight_acp_client as acp_client  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
 import goalflight_dispatch  # noqa: E402
 import goalflight_journal  # noqa: E402
@@ -56,30 +58,15 @@ from goalflight_os_sandbox import (  # noqa: E402
 FAKE = ROOT / "tests/fixtures/acp_fake_agent.py"
 
 
-def _sandbox_available() -> bool:
-    if platform.system() != "Darwin" or shutil.which("sandbox-exec") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["sandbox-exec", "-p", "(version 1)\n(allow default)", "/usr/bin/true"],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
 def _skip_unless_posix_shell_case(case_name: str) -> bool:
     return skip_case_posix_on_native_windows(case_name, "requires POSIX shell execution")
 
 
 def _skip_unless_sandbox_exec_case(case_name: str) -> bool:
-    if _sandbox_available():
+    reason = sandbox_exec_unavailable_reason()
+    if reason is None:
         return False
-    note_skip(case_name, "sandbox-exec unavailable")
+    note_skip(case_name, reason)
     return True
 
 
@@ -480,6 +467,60 @@ def case_shell_wrapper_guards_os_sandbox_to_darwin() -> None:
     assert ".*" in darwin_argv, darwin_argv
 
 
+def case_acp_sandbox_uses_child_tmpdir() -> None:
+    custom_tmp = Path.home() / ".goal-flight" / "dispatch-homes" / "custom-scratch"
+    captured: dict[str, object] = {}
+
+    class SpawnReached(Exception):
+        pass
+
+    async def intercept_spawn(*argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs["env"])
+        raise SpawnReached()
+
+    async def run() -> None:
+        with (
+            mock.patch.object(acp_client, "require_acp_sdk", lambda: None),
+            mock.patch.object(
+                goalflight_os_sandbox_mod,
+                "preflight_os_sandbox",
+                lambda _profile: OS_SANDBOX_WORKSPACE_WRITE,
+            ),
+            mock.patch.object(
+                goalflight_os_sandbox_mod.shutil,
+                "which",
+                lambda _name: "/usr/bin/sandbox-exec",
+            ),
+            mock.patch.object(
+                acp_client.asyncio,
+                "create_subprocess_exec",
+                intercept_spawn,
+            ),
+        ):
+            try:
+                await acp_client.spawn_acp_connection(
+                    "/usr/bin/true",
+                    [],
+                    agent="fake",
+                    session_id="child-tmpdir",
+                    cwd=str(Path.home()),
+                    os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
+                    env={
+                        "GOALFLIGHT_SCRATCH_DIR": str(custom_tmp),
+                        "TMPDIR": str(custom_tmp),
+                    },
+                )
+            except SpawnReached:
+                return
+            raise AssertionError("ACP spawn was not reached")
+
+    asyncio.run(run())
+    assert captured["env"]["TMPDIR"] == str(custom_tmp)
+    sandbox_profile = captured["argv"][2]
+    assert f'(subpath "{custom_tmp}")' in sandbox_profile
+
+
 def case_prepare_wrapper_blocks_home_write() -> None:
     if _skip_unless_sandbox_exec_case("case_prepare_wrapper_blocks_home_write"):
         return
@@ -590,6 +631,165 @@ def case_profile_grants_dev_null_write() -> None:
         assert '(subpath "/dev' not in profile_text, (profile, profile_text)
 
 
+def case_spool_grants_requests() -> None:
+    if _skip_unless_sandbox_exec_case("case_spool_grants_requests"):
+        return
+    with tempfile.TemporaryDirectory(prefix="gf-remote-ci-spool-") as spool_dir:
+        spool = Path(spool_dir)
+        requests = spool / "requests"
+        requests.mkdir()
+        request_file = requests / "request.json"
+        code = (
+            "from pathlib import Path\n"
+            f"Path({str(request_file)!r}).write_text('request')\n"
+        )
+        prepared = prepare_os_sandbox_command(
+            sys.executable,
+            ["-c", code],
+            cwd=str(ROOT),
+            os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
+            agent="grok",
+            environment={"GOALFLIGHT_REMOTE_CI_SPOOL_DIR": str(spool)},
+        )
+        result = subprocess.run(
+            [prepared.command, *prepared.args],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result
+        assert request_file.read_text(encoding="utf-8") == "request"
+
+
+def case_sandboxed_worker_question_outbox_is_dispatch_scoped() -> None:
+    reason = sandbox_exec_unavailable_reason()
+    if reason is not None:
+        note_skip("case_sandboxed_worker_question_outbox_is_dispatch_scoped", reason)
+        return
+    with tempfile.TemporaryDirectory(
+        prefix="gf-worker-question-",
+        dir=tempfile.gettempdir(),
+    ) as scratch:
+        base = Path(scratch)
+        scratch_dir = base / "worker-scratch"
+        private_tmp = scratch_dir / "tmp"
+        private_tmp.mkdir(parents=True)
+        dispatch_dir = base / "dispatch"
+        outbox = dispatch_dir / "dispatch-1.questions"
+        sibling_outbox = dispatch_dir / "dispatch-2.questions"
+        steer_file = dispatch_dir / "dispatch-1.steer.jsonl"
+        journal_dir = base / "journal"
+        outbox.mkdir(parents=True)
+        sibling_outbox.mkdir()
+        steer_file.touch()
+        journal_dir.mkdir()
+        account_home = Path.home() / ".goal-flight" / "accounts" / "probe" / "grok"
+        env = {
+            **os.environ,
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(account_home / ".config"),
+            "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+            "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(account_home / ".cache"),
+            "TMPDIR": str(private_tmp),
+            "GOALFLIGHT_SCRATCH_DIR": str(scratch_dir),
+            "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(outbox),
+            "GOALFLIGHT_STEER_FILE": str(steer_file),
+            "PYTHONPATH": os.pathsep.join(
+                [str(ROOT / "scripts"), str(ROOT), os.environ.get("PYTHONPATH", "")]
+            ),
+        }
+        code = (
+            "from pathlib import Path\n"
+            "import os\n"
+            "import goalflight_steer_mailbox as steer\n"
+            "mailbox = Path(os.environ['GOALFLIGHT_STEER_FILE'])\n"
+            "assert steer.read_steer_entries_read_only(mailbox) == []\n"
+            "outbox = Path(os.environ['GOALFLIGHT_QUESTION_OUTBOX_DIR'])\n"
+            "steer.write_worker_question_request(outbox, dispatch_id='dispatch-1', "
+            "attempt_id='attempt-1', wait_id='wait-1', question_kind='USER-NEED', "
+            "question='need a decision', timeout_s=600)\n"
+            "for target, label in ((mailbox, 'mailbox'), "
+            "(Path(os.environ['GOALFLIGHT_QUESTION_OUTBOX_DIR']).parent "
+            "/ 'forbidden.json', 'dispatch-dir'), "
+            "(Path(os.environ['GOALFLIGHT_QUESTION_OUTBOX_DIR']).parent "
+            "/ 'dispatch-2.questions' / 'forbidden.json', 'sibling'), "
+            f"(Path({str(journal_dir)!r}) / 'forbidden.json', 'journal')):\n"
+            "    try:\n"
+            "        target.write_text('forbidden')\n"
+            "    except OSError:\n"
+            "        print(label + '-denied')\n"
+            "    else:\n"
+            "        raise SystemExit(label + ' write unexpectedly allowed')\n"
+        )
+        profile_text, profile_roots = goalflight_os_sandbox_mod.macos_sandbox_profile(
+            str(ROOT),
+            OS_SANDBOX_READ_ONLY,
+            agent="grok-code",
+            command=sys.executable,
+            environment=env,
+        )
+        roots = {
+            Path(value).resolve()
+            for value in goalflight_os_sandbox_mod.macos_write_roots(
+                str(ROOT),
+                OS_SANDBOX_READ_ONLY,
+                agent="grok-code",
+                command=sys.executable,
+                environment=env,
+            )
+        }
+        assert outbox.resolve() in roots, roots
+        assert steer_file.resolve() not in roots, roots
+        assert sibling_outbox.resolve() not in roots, roots
+        assert outbox.parent.resolve() not in roots, roots
+        assert journal_dir.resolve() not in roots, roots
+        assert {Path(value).resolve() for value in profile_roots} == roots
+        assert "cleanup" not in profile_text
+        _broad_profile_text, broad_profile_roots = (
+            goalflight_os_sandbox_mod.macos_sandbox_profile(
+                str(ROOT),
+                OS_SANDBOX_WORKSPACE_WRITE,
+                agent="codex",
+                command=sys.executable,
+                environment=env,
+            )
+        )
+        broad_roots = {Path(value).resolve() for value in broad_profile_roots}
+        assert private_tmp.resolve() in broad_roots, broad_roots
+        assert outbox.resolve() in broad_roots, broad_roots
+        assert dispatch_dir.resolve() not in broad_roots, broad_roots
+        for shared_tmp in (tempfile.gettempdir(), "/tmp", "/private/tmp"):
+            assert Path(shared_tmp).resolve() not in broad_roots, broad_roots
+        prepared = prepare_os_sandbox_command(
+            sys.executable,
+            ["-c", code],
+            cwd=str(ROOT),
+            os_sandbox=OS_SANDBOX_READ_ONLY,
+            agent="grok-code",
+            environment=env,
+        )
+        assert "cleanup" not in prepared.args[1], prepared.args[1]
+        result = subprocess.run(
+            [prepared.command, *prepared.args],
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+            env=env,
+        )
+        assert result.returncode == 0, result
+        assert (outbox / "wait-1.json").is_file(), result
+        assert "sibling-denied" in result.stdout, result
+        assert "dispatch-dir-denied" in result.stdout, result
+        assert "journal-denied" in result.stdout, result
+        assert "mailbox-denied" in result.stdout, result
+        assert not steer_file.read_text(encoding="utf-8")
+        assert not (sibling_outbox / "forbidden.json").exists()
+        assert not (journal_dir / "forbidden.json").exists()
 def case_rejects_cwd_under_temp_root() -> None:
     if _skip_unless_sandbox_exec_case("case_rejects_cwd_under_temp_root"):
         return
@@ -600,6 +800,10 @@ def case_rejects_cwd_under_temp_root() -> None:
                 ["-c", "print('x')"],
                 cwd=tmp,
                 os_sandbox=OS_SANDBOX_READ_ONLY,
+                environment={
+                    "GOALFLIGHT_SCRATCH_DIR": tmp,
+                    "TMPDIR": tmp,
+                },
             )
         except OsSandboxError as e:
             assert "inside allowed temp root" in str(e)
@@ -1428,6 +1632,7 @@ def case_runner_blocks_temp_cwd_before_capacity() -> None:
                         cwd=cwd,
                         session_id="temp-cwd-os-sandbox",
                         dispatch_id=f"test-temp-cwd-os-sandbox-{os.getpid()}",
+                        _worker_scratch_dir=cwd,
                         prompt_id=None,
                         prompt=None,
                         prompt_text="probe",
@@ -1572,6 +1777,7 @@ def case_pool_blocks_alias_undeclared_os_sandbox() -> None:
 def main() -> None:
     case_canonical_profiles()
     case_requested_sandbox_fails_closed_on_unsupported_hosts()
+    case_acp_sandbox_uses_child_tmpdir()
     case_adapter_os_sandbox_is_platform_scoped()
     case_os_sandbox_request_distinguishes_manifest_read_failures()
     case_repo_runner_sandbox_adapters_are_platform_scoped()
@@ -1582,6 +1788,8 @@ def main() -> None:
     case_prepare_wrapper_blocks_home_write()
     case_profile_string_escapes_workspace_path()
     case_profile_grants_dev_null_write()
+    case_spool_grants_requests()
+    case_sandboxed_worker_question_outbox_is_dispatch_scoped()
     case_rejects_cwd_under_temp_root()
     case_agent_state_roots_are_explicit_exception()
     case_rejects_cwd_under_agent_state_root()

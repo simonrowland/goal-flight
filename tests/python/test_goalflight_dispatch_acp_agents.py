@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -25,6 +26,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_acp_run  # noqa: E402
 import goalflight_dispatch as dispatch_mod  # noqa: E402
 import goalflight_journal  # noqa: E402
+import goalflight_liveness  # noqa: E402
+import goalflight_os_sandbox  # noqa: E402
+import goalflight_reap_dispatch_homes as retention  # noqa: E402
 import goalflight_watch  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
@@ -123,6 +127,12 @@ def test_build_acp_cfg_agent_liveness_defaults() -> None:
         cfg = dispatch_mod._build_acp_cfg(args, status_json=tmp / "codex.json")
         assert cfg.agent == "codex-acp"
         assert dispatch_mod.SEARCH_SCOPE_PREAMBLE in cfg.prompt_text
+        assert dispatch_mod.WORKER_ONLY_PREAMBLE in cfg.prompt_text
+        assert dispatch_mod.SCOPE_GUARD_PREAMBLE in cfg.prompt_text
+        assert dispatch_mod.INSTRUCTION_REFUSAL_PREAMBLE in cfg.prompt_text
+        assert "Verification named in the brief" in cfg.prompt_text
+        # ACP's applied sandbox is decided after this config is built.
+        assert "Sandbox limits for this dispatch" not in cfg.prompt_text
         assert cfg.liveness_profile is None
 
         args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="priority-cfg")
@@ -133,6 +143,17 @@ def test_build_acp_cfg_agent_liveness_defaults() -> None:
         assert cfg.priority == "bulk"
         assert cfg.capacity_wait_s == 12.5
         assert cfg.account == "explicit-seat"
+
+        args = _base_acp_args(tmp, agent="codex-acp", dispatch_id="resume-cfg")
+        args.parent_dispatch_id = "parent-dispatch"
+        resumed = dispatch_mod._build_acp_cfg(
+            args, status_json=tmp / "resume.json",
+        )
+        assert resumed.prompt_text.startswith(
+            dispatch_mod.WORKER_ONLY_PREAMBLE
+            + "\n\n"
+            + dispatch_mod.RESUME_CONTRACT_SUPERSESSION_PREAMBLE
+        )
 
 
 def test_macos_codex_acp_read_only_uses_shared_checkout() -> None:
@@ -206,7 +227,7 @@ def test_read_only_acp_resume_rejects_rebound_checkout_before_spawn() -> None:
             "worktree_path": str(recorded_checkout),
             "worktree_branch": f"worktree/{parent_id}",
             "worktree_head": recorded_head,
-            "engine_session_id": "12345678-1234-4abc-8def-1234567890ab",
+            "engine_session_id": "00000000-0000-4000-8000-000000000033",
         }
         args = _base_acp_args(tmp, agent="claude", dispatch_id="acp-rebound-child")
         args.cwd = str(repo)
@@ -252,6 +273,25 @@ def test_acp_help_describes_repository_worktree_pool() -> None:
     assert "wt-1..wt-N" not in proc.stdout, proc.stdout
 
 
+def test_direct_acp_entry_checks_floor_before_runner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    called = []
+    monkeypatch.setattr(dispatch_mod, "_admit_dispatch_disk_floor", lambda: False)
+    monkeypatch.setattr(
+        goalflight_acp_run,
+        "run_acp_dispatch",
+        lambda *_args, **_kwargs: called.append(True),
+    )
+
+    result = goalflight_acp_run.main(
+        ["--agent", "fake-acp", "--cwd", str(tmp_path), "--dispatch-id", "low-space"]
+    )
+
+    assert result == 75
+    assert called == []
+
+
 def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -288,6 +328,10 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
         async def capture_spawn(*spawn_args, **spawn_kwargs):
             runner_spawn["cwd"] = spawn_kwargs["cwd"]
             runner_spawn["pass_fds"] = spawn_kwargs["pass_fds"]
+            runner_spawn["env"] = spawn_kwargs["env"]
+            assert dispatch_mod.goalflight_ledger.record_path(
+                args.dispatch_id
+            ).is_file()
             return await fake_spawn(*spawn_args, **spawn_kwargs)
 
         goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
@@ -318,6 +362,11 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
         assert seat_fd in runner_spawn["pass_fds"]
         assert len(runner_spawn["pass_fds"]) == 2
         assert not (seat.parent / "s-2").exists()
+        worker_env = runner_spawn["env"]
+        assert isinstance(worker_env, dict)
+        scratch = Path(worker_env["GOALFLIGHT_SCRATCH_DIR"])
+        assert scratch.is_dir()
+        assert worker_env["TMPDIR"] == str(scratch)
 
 
 def _assert_acp_runner_hands_off_admitted_seat(worktree_mode: str) -> None:
@@ -395,6 +444,69 @@ def _assert_acp_runner_hands_off_admitted_seat(worktree_mode: str) -> None:
 def test_acp_runner_hands_off_any_admitted_seat() -> None:
     for worktree_mode in ("create", "off"):
         _assert_acp_runner_hands_off_admitted_seat(worktree_mode)
+
+
+def test_acp_runner_uses_checkout_selected_during_read_only_admission() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        old_checkout = tmp / "old-checkout"
+        admitted_checkout = tmp / "admitted-shared-checkout"
+        old_checkout.mkdir()
+        admitted_checkout.mkdir()
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id="acp-read-only-admitted-cwd",
+            status_json=tmp / "acp-read-only-admitted-cwd.status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.cwd = str(old_checkout)
+        cfg.worktree = "off"
+        cfg.in_place = True
+        cfg.read_only = True
+        spawn_details: dict[str, object] = {}
+
+        def admit_read_only_checkout(current) -> None:
+            current.cwd = str(admitted_checkout)
+            current._worktree_id = admitted_checkout.name
+            current._worktree_path = str(admitted_checkout)
+            current._worktree_read_only = True
+            current._worktree_read_only_hold = None
+            return None
+
+        saved = _install_fake_acp_after_capacity()
+        fake_spawn = goalflight_acp_run.spawn_and_handshake_with_retry
+
+        async def capture_spawn(*spawn_args, **spawn_kwargs):
+            spawn_details["cwd"] = spawn_kwargs["cwd"]
+            return await fake_spawn(*spawn_args, **spawn_kwargs)
+
+        goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
+        env = _capacity_env(state_dir)
+        env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+        env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        try:
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch.object(
+                    dispatch_mod,
+                    "_admit_dispatch_worktree",
+                    admit_read_only_checkout,
+                ),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                ledger = json.loads(
+                    dispatch_mod.goalflight_ledger.record_path(
+                        cfg.dispatch_id
+                    ).read_text(encoding="utf-8")
+                )
+        finally:
+            _restore_fake_acp(saved)
+
+        assert payload["state"] == "complete"
+        assert payload["worker_cwd"] == str(admitted_checkout)
+        assert spawn_details["cwd"] == str(admitted_checkout)
+        assert ledger["worker_cwd"] == str(admitted_checkout)
 
 
 def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
@@ -509,7 +621,68 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
         assert args._worktree_seat is None
 
 
-def test_build_acp_cfg_injects_orientation_prompt_text() -> None:
+def test_detached_acp_launcher_propagates_child_dispatch_refusal(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    status_json = tmp_path / "resume.status.json"
+    reason = "resume source no longer exists"
+    args = SimpleNamespace(
+        _original_argv=["--agent", "claude", "--dispatch-id", "resume-child"],
+        _worktree_seat=None,
+        agent="claude",
+        background_default_notice=False,
+        dispatch_id="resume-child",
+        queue_launch_token="queue-token",
+    )
+
+    def spawn(_argv, **_kwargs):
+        status_json.write_text(
+            json.dumps(
+                {
+                    "state": "failed_worktree",
+                    "dispatch_refused": True,
+                    "error": reason,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 424242
+
+    monkeypatch.setattr(dispatch_mod, "_spawn_daemonized_process", spawn)
+    monkeypatch.setattr(dispatch_mod, "_apply_web_qa_env", lambda *_args: None)
+    monkeypatch.setattr(dispatch_mod, "_find_dispatch_record", lambda *_args: None)
+    monkeypatch.setattr(
+        dispatch_mod.goalflight_compat, "pid_alive", lambda _pid: False
+    )
+    monkeypatch.setattr(
+        dispatch_mod, "_release_worktree_occupancy_lock", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        dispatch_mod, "_release_redispatch_store_lock", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_release_read_only_resume_reservation",
+        lambda *_args: None,
+    )
+
+    rc = dispatch_mod._run_acp_detached_launcher(
+        args,
+        status_json=status_json,
+        tail_path=tmp_path / "resume.tail",
+        account_env={},
+        env_remove=[],
+        capacity_wait_s=0,
+    )
+
+    assert rc == 64
+    assert reason in capsys.readouterr().err
+
+
+def test_build_acp_cfg_injects_orientation_prompt_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         prompt = tmp / "prompt.md"
@@ -534,8 +707,40 @@ def test_build_acp_cfg_injects_orientation_prompt_text() -> None:
         args.no_orientation = True
         suppressed = dispatch_mod._build_acp_cfg(args, status_json=tmp / "suppressed.json")
         assert suppressed.prompt is None
-        assert suppressed.prompt_text == f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\nDo ACP work.\n"
+        assert suppressed.prompt_text == (
+            f"{dispatch_mod.WORKER_ONLY_PREAMBLE}\n\n"
+            f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\n"
+            f"{dispatch_mod.SCOPE_GUARD_PREAMBLE}\n\n"
+            f"{dispatch_mod.INSTRUCTION_REFUSAL_PREAMBLE}\n\nDo ACP work.\n"
+        )
         assert suppressed.original_prompt_file == str(prompt.resolve())
+
+
+def test_build_acp_cfg_includes_remote_ci_instruction_from_project_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path
+    config = project_root / ".goal-flight" / "remote-ci.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"runner": {
+        "heavy_command_ids": ["acp-project-gate"]
+    }}), encoding="utf-8")
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Do remote ACP work.\n", encoding="utf-8")
+    args = _base_acp_args(tmp_path, agent="codex-acp", dispatch_id="remote-acp")
+    args.prompt = None
+    args.prompt_file = str(prompt)
+
+    cfg = dispatch_mod._build_acp_cfg(
+        args, status_json=tmp_path / "dispatch" / "remote-acp.status.json"
+    )
+
+    assert cfg.prompt_text.count("Remote CI: run test suites and other heavy CPU") == 1
+    assert '"$GOALFLIGHT_REMOTE_RUN" --kind gate --cmd-id acp-project-gate' in cfg.prompt_text
+    assert "Do remote ACP work." in cfg.prompt_text
 
 
 def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> None:
@@ -568,9 +773,11 @@ def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> Non
         args.status_json = str(status_json)
         args.tail = str(dispatch_dir / "acp-production.tail")
         old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+        old_dispatch_dir = os.environ.get("GOALFLIGHT_DISPATCH_DIR")
         stderr = io.StringIO()
         try:
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+            os.environ["GOALFLIGHT_DISPATCH_DIR"] = str(dispatch_dir)
             goalflight_acp_run.run_acp_dispatch = fake_run
             with contextlib.redirect_stderr(stderr):
                 rc = dispatch_mod._run_acp_shape(
@@ -584,6 +791,10 @@ def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> Non
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
             else:
                 os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+            if old_dispatch_dir is None:
+                os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_DISPATCH_DIR"] = old_dispatch_dir
 
         assert rc == 0
         cfg = captured["cfg"]
@@ -618,7 +829,10 @@ def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> Non
         assert f"--ignore-prompt-file {watcher_prompt}" in hinted
 
 
-def test_acp_inline_prompt_uses_same_assembled_prompt_path() -> None:
+def test_acp_inline_prompt_uses_same_assembled_prompt_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         status_json = tmp / "dispatch" / "inline-acp.status.json"
@@ -637,7 +851,11 @@ def test_acp_inline_prompt_uses_same_assembled_prompt_path() -> None:
         )
         assert watcher_prompt.read_text(encoding="utf-8") == (
             f"{dispatch_mod.PROMPT_FILE_PREAMBLE}\n\n"
-            f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\n{args.prompt}"
+            f"{dispatch_mod.WORKER_ONLY_PREAMBLE}\n\n"
+            f"{dispatch_mod.SEARCH_SCOPE_PREAMBLE}\n\n"
+            f"{dispatch_mod.SCOPE_GUARD_PREAMBLE}\n\n"
+            f"{dispatch_mod.INSTRUCTION_REFUSAL_PREAMBLE}\n\n"
+            f"{args.prompt}"
         )
 
 
@@ -1145,6 +1363,337 @@ def _acp_cfg(tmp: Path, *, dispatch_id: str, status_json: Path, capacity_wait_s:
     )
 
 
+@contextlib.contextmanager
+def _registered_acp_test_controller():
+    def stamp_controller(args, _project_root):
+        args.controller_label = "acp-test"
+        args.controller_session_id = "acp-test-session"
+        args._controller_beacon_pid = 41001
+        return {"claimed": True}
+
+    with (
+        patch.object(dispatch_mod, "_stamp_controller_session", stamp_controller),
+        patch.object(
+            dispatch_mod,
+            "_prepare_attempt_controller_registration",
+            return_value=None,
+        ),
+    ):
+        yield
+
+
+def test_acp_prelaunch_refusals_are_delivered_to_launching_controller() -> None:
+    refusals = (
+        "windows",
+        "prompt_read",
+        "adapter_gate",
+        "sandbox_profile",
+        "sandbox_request",
+        "sandbox_preflight",
+        "sandbox_write_roots",
+        "waiting_capacity_record",
+    )
+    expected_states = {
+        "windows": "blocked_windows_dispatch",
+        "prompt_read": "failed",
+        "adapter_gate": "blocked_adapter_gate",
+        "sandbox_profile": "blocked_os_sandbox",
+        "sandbox_request": "blocked_os_sandbox",
+        "sandbox_preflight": "blocked_os_sandbox",
+        "sandbox_write_roots": "blocked_os_sandbox",
+        "waiting_capacity_record": "failed_worktree",
+    }
+    for refusal in refusals:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state_dir = tmp / "state"
+            dispatch_id = f"acp-{refusal}"
+            cfg = _acp_cfg(
+                tmp,
+                dispatch_id=dispatch_id,
+                status_json=tmp / f"{dispatch_id}.status.json",
+                capacity_wait_s=0.0,
+            )
+            env = _capacity_env(
+                state_dir,
+                GOALFLIGHT_CAPACITY_CONF=os.devnull,
+            )
+            owner_label = "launcher"
+            owner_nonce = "launcher-session"
+            owner_pid = 41001
+            if refusal == "windows":
+                cfg.controller_label = owner_label
+                cfg.controller_session_id = owner_nonce
+                cfg.controller_pid = owner_pid
+                Path(cfg.status_json).write_text(
+                    json.dumps(
+                        {
+                            "schema": "goalflight.acp-run.v1",
+                            "dispatch_id": dispatch_id,
+                            "project_root": cfg.project_root,
+                            "controller_label": owner_label,
+                            "controller_session_id": owner_nonce,
+                            "controller_pid": owner_pid,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with patch.dict(os.environ, env, clear=True):
+                authority = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                )
+                for label, nonce, pid in (
+                    (owner_label, owner_nonce, owner_pid),
+                    ("observer", "observer-session", 41002),
+                ):
+                    claimed = authority.claim_or_renew_lease(
+                        label,
+                        principal={
+                            "pid": pid,
+                            "start_token": f"{label}-start",
+                        },
+                        nonce=nonce,
+                    )
+                    assert claimed.committed and claimed.value is not None
+                active_labels = {
+                    str(row["label"])
+                    for row in authority.read_all(
+                        """SELECT label FROM controller_leases
+                           WHERE project_root = ? AND state = 'ACTIVE'""",
+                        (str(authority.project_root),),
+                    )
+                }
+                assert active_labels == {owner_label, "observer"}, active_labels
+
+                def stamp_controller(args, _project_root):
+                    args.controller_label = owner_label
+                    args.controller_session_id = owner_nonce
+                    args._controller_beacon_pid = owner_pid
+                    return {"claimed": True}
+
+                cfg.prompt = (
+                    str(tmp / "missing-prompt.md")
+                    if refusal == "prompt_read"
+                    else None
+                )
+                if refusal == "sandbox_profile":
+                    cfg.os_sandbox = "invalid-profile"
+                elif refusal in {
+                    "sandbox_request",
+                    "sandbox_preflight",
+                    "sandbox_write_roots",
+                }:
+                    cfg.os_sandbox = "read-only"
+                sandbox_validation = (
+                    [None, "sandbox request refusal"]
+                    if refusal == "sandbox_request"
+                    else None
+                )
+                sandbox_preflight = (
+                    goalflight_acp_run.OsSandboxError("sandbox preflight refusal")
+                    if refusal == "sandbox_preflight"
+                    else None
+                )
+                sandbox_roots = (
+                    goalflight_acp_run.OsSandboxError("sandbox roots refusal")
+                    if refusal == "sandbox_write_roots"
+                    else None
+                )
+                with (
+                    patch.object(
+                        dispatch_mod,
+                        "_stamp_controller_session",
+                        stamp_controller,
+                    ),
+                    patch.object(
+                        dispatch_mod,
+                        "_prepare_attempt_controller_registration",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        goalflight_acp_run.goalflight_compat,
+                        "is_windows",
+                        return_value=refusal == "windows",
+                    ),
+                    patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+                    patch.object(
+                        goalflight_acp_run,
+                        "validate_acp_dispatch_readiness",
+                        return_value=(
+                            "adapter gate refusal"
+                            if refusal == "adapter_gate"
+                            else None
+                        ),
+                    ),
+                    patch.object(
+                        goalflight_acp_run,
+                        "validate_os_sandbox_request",
+                        side_effect=sandbox_validation,
+                        return_value=None,
+                    ),
+                    patch.object(
+                        goalflight_acp_run,
+                        "preflight_os_sandbox",
+                        side_effect=sandbox_preflight,
+                        return_value=None,
+                    ),
+                    patch(
+                        "goalflight_os_sandbox.macos_write_roots",
+                        side_effect=sandbox_roots,
+                        return_value=[],
+                    ),
+                    patch.object(
+                        goalflight_acp_run,
+                        "_record_acp_ledger_state",
+                        side_effect=(
+                            dispatch_mod.DispatchUsageError("waiting record refused")
+                            if refusal == "waiting_capacity_record"
+                            else None
+                        ),
+                    ),
+                ):
+                    payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+                assert payload["dispatch_id"] == dispatch_id, payload
+                assert payload["state"] == expected_states[refusal], payload
+                attempt = authority.attempt_for_dispatch(dispatch_id)
+                assert attempt is not None
+                assert attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES
+                projected = authority.project_terminal_outbox(
+                    messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"])
+                )
+                assert len(projected) == 1, projected
+                deliveries = authority.read_all(
+                    """SELECT event_type, recipient_label FROM delivery_events
+                       WHERE stream_id = ? AND withdrawn_at IS NULL
+                       ORDER BY recipient_label""",
+                    (dispatch_id,),
+                )
+                assert [
+                    (str(row["event_type"]), str(row["recipient_label"]))
+                    for row in deliveries
+                ] == [("blocked", owner_label)], deliveries
+                assert payload["controller_label"] == owner_label, payload
+                assert payload["controller_session_id"] == owner_nonce, payload
+                assert payload["controller_pid"] == owner_pid, payload
+
+
+def test_windows_refusal_keeps_ownerless_queue_entry_from_ambient_controller() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-windows-ownerless"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / f"{dispatch_id}.status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.controller_label = "launcher"
+        cfg.request_envelope = {
+            "dispatch_id": dispatch_id,
+            "project_root": cfg.project_root,
+        }
+        env = _capacity_env(
+            state_dir,
+            GOALFLIGHT_CAPACITY_CONF=os.devnull,
+        )
+        env["GOALFLIGHT_CONTROLLER_LABEL"] = "launcher"
+        env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = "launcher-session"
+        with patch.dict(os.environ, env, clear=True):
+            authority = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            )
+            for label, nonce, pid in (
+                ("launcher", "launcher-session", 41001),
+                ("observer", "observer-session", 41002),
+            ):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"pid": pid, "start_token": f"{label}-start"},
+                    nonce=nonce,
+                )
+                assert claimed.committed and claimed.value is not None
+
+            payload, _status_path = goalflight_acp_run.write_windows_refusal_status(
+                cfg
+            )
+            assert payload["state"] == "blocked_windows_dispatch"
+            assert "controller_label" not in payload
+            assert "controller_session_id" not in payload
+            authority.project_terminal_outbox(
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"])
+            )
+            deliveries = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? AND withdrawn_at IS NULL
+                   ORDER BY recipient_label""",
+                (dispatch_id,),
+            )
+            assert [str(row["recipient_label"]) for row in deliveries] == [
+                "launcher",
+                "observer",
+            ], deliveries
+
+
+def test_windows_refusal_uses_parent_queue_owner_over_ambient_controller() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-windows-parent-queue-owner"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / f"{dispatch_id}.status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.request_envelope = {
+            "dispatch_id": dispatch_id,
+            "project_root": cfg.project_root,
+            "controller_label": "controller-b",
+            "controller_session_id": "controller-b-session",
+            "controller_pid": 41002,
+        }
+        env = _capacity_env(
+            state_dir,
+            GOALFLIGHT_CAPACITY_CONF=os.devnull,
+        )
+        env["GOALFLIGHT_CONTROLLER_LABEL"] = "controller-a"
+        env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = "controller-a-session"
+        with patch.dict(os.environ, env, clear=True):
+            authority = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            )
+            for label, nonce, pid in (
+                ("controller-a", "controller-a-session", 41001),
+                ("controller-b", "controller-b-session", 41002),
+            ):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"pid": pid, "start_token": f"{label}-start"},
+                    nonce=nonce,
+                )
+                assert claimed.committed and claimed.value is not None
+
+            payload, _status_path = goalflight_acp_run.write_windows_refusal_status(
+                cfg
+            )
+            assert payload["controller_label"] == "controller-b", payload
+            assert payload["controller_session_id"] == "controller-b-session", payload
+            authority.project_terminal_outbox(
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"])
+            )
+            deliveries = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? AND withdrawn_at IS NULL""",
+                (dispatch_id,),
+            )
+            assert [str(row["recipient_label"]) for row in deliveries] == [
+                "controller-b"
+            ], deliveries
+
+
 class _FakeAcpConn:
     def __init__(self, proc: subprocess.Popen) -> None:
         self.proc = proc
@@ -1174,11 +1723,16 @@ def _install_fake_acp_after_capacity():
     old_validate = goalflight_acp_run.validate_acp_dispatch_readiness
 
     async def fake_spawn(command, command_args, **kwargs):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            cwd=kwargs.get("cwd"),
-            env=kwargs.get("env"),
-        )
+        admission = kwargs.get("launch_admission")
+        scope = admission() if callable(admission) else contextlib.nullcontext(object())
+        with scope as status_lock:
+            if status_lock is None:
+                raise RuntimeError("fake ACP worker refused at launch admission")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+            )
         return proc, _FakeAcpConn(proc)
 
     async def fake_prompt(_conn, _text, **_kwargs):
@@ -1198,6 +1752,151 @@ def _restore_fake_acp(saved) -> None:
     goalflight_acp_run.spawn_and_handshake_with_retry = old_spawn
     goalflight_acp_run.run_prompt = old_prompt
     goalflight_acp_run.validate_acp_dispatch_readiness = old_validate
+
+
+def _write_grok_resume_parent(
+    repo: Path,
+    *,
+    dispatch_id: str,
+    session_id: str,
+    ended_at: str | None = None,
+) -> Path:
+    session = dispatch_mod._seat_session_dir("seat-g", "grok", str(repo), session_id)
+    assert session is not None
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    (session / "chat_history.jsonl").write_text("{}\n", encoding="utf-8")
+    record = {
+        "schema": dispatch_mod.goalflight_ledger.SCHEMA,
+        "dispatch_id": dispatch_id,
+        "agent": "grok-acp",
+        "engine": "grok",
+        "shape": "acp",
+        "state": "complete",
+        "terminal_state": "complete",
+        "project_root": str(repo),
+        "worker_cwd": str(repo),
+        "worker_pid": None,
+        "account": "seat-g",
+        "effective_account": "seat-g",
+        "engine_session_id": session_id,
+        "dispatch_argv": ["--agent", "grok-acp", "--shape", "acp", "--cwd", str(repo)],
+    }
+    if ended_at is not None:
+        record["ended_at"] = ended_at
+    dispatch_mod.goalflight_ledger.write_record(record)
+    return session
+
+
+def test_acp_resume_completes_above_floor_through_dispatch_main(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    grok_home = home / ".goal-flight" / "accounts" / "seat-g" / "grok" / ".grok"
+    grok_home.mkdir(parents=True)
+    (grok_home / "config.toml").write_text(
+        '[cli]\n\n[ui]\npermission_mode = "always-approve"\n',
+        encoding="utf-8",
+    )
+    (grok_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    state = tmp_path / "state"
+    env = _capacity_env(state)
+    env.update(
+        HOME=str(home),
+        GOALFLIGHT_CAPACITY_CONF=os.devnull,
+        GOAL_FLIGHT_PIDFILE_DIR=str(state / "p"),
+        GOALFLIGHT_CODEX_STATE_DIR=str(state),
+    )
+    parent_id = "acp-resume-parent"
+    child_id = "acp-resume-child"
+    session_id = "00000000-0000-4000-8000-000000000025"
+    prompt = tmp_path / "acp-resume.md"
+    prompt.write_text("Continue the recorded session.", encoding="utf-8")
+    saved = _install_fake_acp_after_capacity()
+    result: list[object] = []
+    build_parser = dispatch_mod._build_launch_parser
+
+    def foreground_launch_parser():
+        parser = build_parser()
+        parser.set_defaults(foreground=True)
+        return parser
+
+    monkeypatch.setattr(dispatch_mod, "_build_launch_parser", foreground_launch_parser)
+
+    monkeypatch.setattr(dispatch_mod, "_configured_account_names", lambda *_args: {"seat-g"})
+    monkeypatch.setattr(dispatch_mod, "_seat_probe_says_usable", lambda *_args, **_kw: True)
+    monkeypatch.setattr(dispatch_mod, "_account_quota_blocked", lambda *_args, **_kw: False)
+    monkeypatch.setattr(dispatch_mod, "_grok_account_admission_reason", lambda *_args, **_kw: None)
+    monkeypatch.setattr(dispatch_mod, "_resolve_launch_account_env", lambda *_args: {})
+    monkeypatch.setattr(dispatch_mod, "_default_dispatch_id", lambda *_args: child_id)
+    monkeypatch.setattr(
+        dispatch_mod.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            free=dispatch_mod.DISK_FREE_SPACE_FLOOR_BYTES + 1
+        ),
+    )
+    monkeypatch.setattr(goalflight_acp_run, "cleanup_ghosts", lambda: 0)
+    monkeypatch.setattr(goalflight_acp_run, "agent_command", lambda *_args, **_kw: (sys.executable, []))
+
+    def resume() -> None:
+        try:
+            result.append(
+                dispatch_mod._cmd_resume(
+                    [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+                )
+            )
+        except BaseException as exc:  # re-raised in the test thread
+            result.append(exc)
+
+    try:
+        with patch.dict(os.environ, env, clear=True):
+            session = dispatch_mod._seat_session_dir(
+                "seat-g", "grok", str(repo), session_id
+            )
+            assert session is not None
+            session.mkdir(parents=True)
+            (session / "summary.json").write_text("{}", encoding="utf-8")
+            (session / "chat_history.jsonl").write_text("{}\n", encoding="utf-8")
+            dispatch_mod.goalflight_ledger.write_record(
+                {
+                    "schema": dispatch_mod.goalflight_ledger.SCHEMA,
+                    "dispatch_id": parent_id,
+                    "agent": "grok-acp",
+                    "engine": "grok",
+                    "shape": "acp",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(repo),
+                    "worker_cwd": str(repo),
+                    "worker_pid": None,
+                    "account": "seat-g",
+                    "effective_account": "seat-g",
+                    "engine_session_id": session_id,
+                    "dispatch_argv": [
+                        "--agent", "grok-acp", "--shape", "acp",
+                        "--cwd", str(repo), "--in-place", "--foreground",
+                    ],
+                }
+            )
+            thread = threading.Thread(target=resume, daemon=True)
+            thread.start()
+            thread.join(timeout=15)
+            assert not thread.is_alive(), "ACP resume blocked while publishing its ledger row"
+            assert result == [0]
+            child = json.loads(
+                dispatch_mod.goalflight_ledger.record_path(child_id).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert child["parent_dispatch_id"] == parent_id
+            assert child["shape"] == "acp"
+            assert child["state"] == "complete"
+            assert session.is_dir()
+    finally:
+        _restore_fake_acp(saved)
 
 
 def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
@@ -1224,12 +1923,14 @@ def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
             real_attach(lease_id, worker_pid, worker_pgid)
 
         async def fake_spawn(_command, _args, **kwargs):
-            events.append("spawn")
-            proc = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(60)"],
-                cwd=kwargs["cwd"],
-                env=kwargs["env"],
-            )
+            with kwargs["launch_admission"]() as status_lock:
+                assert status_lock is not None
+                events.append("spawn")
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=kwargs["cwd"],
+                    env=kwargs["env"],
+                )
             await kwargs["on_attempt"](0, proc)
             return proc, _FakeAcpConn(proc)
 
@@ -1260,6 +1961,100 @@ def test_acp_capacity_handoff_precedes_spawn_and_attaches_immediately() -> None:
 
         assert payload["state"] == "complete", payload
         assert events[:3] == ["spawning", "spawn", "attach"], events
+
+
+def test_acp_spawn_refuses_completion_published_before_admission() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        status_json = tmp / "completed-before-acp-spawn.status.json"
+        dispatch_id = "completed-before-acp-spawn"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        dispatch_mod.write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": dispatch_id,
+                "state": "complete",
+                "terminal_state": "complete",
+                "worker_alive": False,
+            },
+        )
+        spawns: list[object] = []
+
+        class FakeConnection(_FakeAcpConn):
+            async def initialize(self, timeout: float = 60.0) -> None:
+                return None
+
+            async def new_session(self, cwd: str, timeout: float = 60.0) -> str:
+                return "fake-acp-session"
+
+        async def fake_spawn(*_args, **kwargs):
+            spawns.append(kwargs)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+                stderr=subprocess.PIPE,
+            )
+            return FakeConnection(proc)
+
+        async def fake_prompt(_conn, _text, **_kwargs):
+            return goalflight_acp_run.PromptResult(
+                text="COMPLETE: fake ACP done\n",
+                stop_reason="end_turn",
+            )
+
+        with (
+            _registered_acp_test_controller(),
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(
+                goalflight_acp_run,
+                "validate_acp_dispatch_readiness",
+                return_value=None,
+            ),
+            patch.object(goalflight_acp_run, "spawn_acp_connection", fake_spawn),
+            patch.object(goalflight_acp_run, "run_prompt", fake_prompt),
+        ):
+            asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+            authority = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            )
+            attempt = authority.attempt_for_dispatch(dispatch_id)
+            assert attempt is not None, "ACP launch refusal removed its journal attempt"
+            assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+            outbox_count = authority.read_all(
+                "SELECT COUNT(*) AS count FROM terminal_outbox WHERE attempt_id = ?",
+                (attempt.attempt_id,),
+            )[0]["count"]
+            assert outbox_count == 1, outbox_count
+            completion = authority.commit_terminal(
+                attempt.attempt_id,
+                terminal_state="complete",
+                observation={
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "worker_still_alive": False,
+                },
+                event_type="result",
+            )
+            assert completion.committed and completion.value is not None, completion
+            assert completion.value.terminal_state == "complete", completion.value
+            assert completion.value.idempotent, completion.value
+            assert authority.read_all(
+                "SELECT COUNT(*) AS count FROM terminal_outbox WHERE attempt_id = ?",
+                (attempt.attempt_id,),
+            )[0]["count"] == outbox_count
+
+        assert spawns == [], spawns
+        status = json.loads(status_json.read_text(encoding="utf-8"))
+        assert status["state"] == "complete", status
 
 
 def test_acp_occupancy_override_reaches_admission_and_warns() -> None:
@@ -1319,6 +2114,741 @@ def _run_acp_thread(cfg: SimpleNamespace):
     return thread, result
 
 
+def test_task_linked_acp_status_admission_defers_without_holding_ledger() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        _assert_task_linked_acp_status_admission_defers_without_holding_ledger(
+            Path(td)
+        )
+
+
+def _assert_task_linked_acp_status_admission_defers_without_holding_ledger(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    status_path = tmp_path / "status.json"
+    cfg = _acp_cfg(
+        tmp_path,
+        dispatch_id="task-linked-status-admission",
+        status_json=status_path,
+        capacity_wait_s=0.0,
+    )
+    cfg.queue_launch_token = "queue-token"
+    ledger_lock_requested = threading.Event()
+
+    def task_ledger_lock():
+        ledger_lock_requested.set()
+        return dispatch_mod.goalflight_ledger.StateLock()
+
+    cfg.redispatch_spawn_lock = task_ledger_lock
+    cfg.redispatch_spawn_guard = lambda: None
+    deadline_args: list[float | None] = []
+    spawned: list[bool] = []
+    admission_requested = threading.Event()
+    admission_finished = threading.Event()
+    continue_admission = threading.Event()
+    original_admission = dispatch_mod._status_launch_admission
+
+    def observe_admission(path, token, **kwargs):
+        deadline_args.append(kwargs.get("deadline_s"))
+        admission_requested.set()
+        continue_admission.wait(timeout=5.0)
+
+        @contextlib.contextmanager
+        def observed_admission():
+            try:
+                with original_admission(path, token, **kwargs) as status_lock:
+                    yield status_lock
+            finally:
+                admission_finished.set()
+
+        return observed_admission()
+
+    async def unexpected_spawn(*_args, **_kwargs):
+        spawned.append(True)
+        raise RuntimeError("ACP spawned despite status-lock contention")
+
+    class NoStartupGate:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    saved = _install_fake_acp_after_capacity()
+    goalflight_acp_run.spawn_and_handshake_with_retry = saved[0]
+    lock = None
+    thread = None
+    result: dict[str, object] = {}
+    ledger_lock = None
+    try:
+        with (
+            patch.dict(
+                os.environ,
+                _capacity_env(state_dir, GOALFLIGHT_CAPACITY_CONF=os.devnull),
+                clear=True,
+            ),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(goalflight_acp_run, "spawn_acp_connection", unexpected_spawn),
+            patch.object(goalflight_acp_run, "StartupGate", NoStartupGate),
+            patch.object(dispatch_mod, "_status_launch_admission", observe_admission),
+        ):
+            thread, result = _run_acp_thread(cfg)
+            reached_admission = admission_requested.wait(timeout=10.0)
+            if reached_admission:
+                lock = goalflight_liveness.status_write_lock(status_path)
+                lock.__enter__()
+                continue_admission.set()
+                ledger_lock = dispatch_mod.goalflight_ledger.StateLock.try_acquire(
+                    time.monotonic() + 0.5
+                )
+                if ledger_lock is not None:
+                    ledger_lock.release()
+                assert admission_finished.wait(timeout=2.0), (
+                    "ACP did not finish the bounded admission while status was held"
+                )
+    finally:
+        continue_admission.set()
+        if lock is not None:
+            lock.__exit__(None, None, None)
+        if thread is not None:
+            thread.join(timeout=3.0)
+        _restore_fake_acp(saved)
+
+    assert thread is not None and not thread.is_alive(), "ACP admission did not finish"
+    assert deadline_args and admission_requested.is_set(), (
+        "ACP did not reach launch admission; "
+        f"ledger_lock_requested={ledger_lock_requested.is_set()} result={result!r}"
+    )
+    assert ledger_lock is not None, "ACP kept the task ledger while waiting for status"
+    assert deadline_args[0] is not None, "ACP admission used an unbounded status-lock wait"
+    assert spawned == [], spawned
+    payload = result.get("payload")
+    assert isinstance(payload, dict), result
+    assert payload.get("status_launch_admission_deferred") is True, {
+        "state": payload.get("state"),
+        "dispatch_refused": payload.get("dispatch_refused"),
+        "error": payload.get("error"),
+    }
+    assert payload.get("state") == "queued", payload
+    old_env = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(_capacity_env(state_dir, GOALFLIGHT_CAPACITY_CONF=os.devnull))
+        attempt = goalflight_journal.open_or_create_journal(
+            Path(cfg.project_root)
+        ).attempt_for_dispatch(cfg.dispatch_id)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+    assert attempt is not None
+    assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED, attempt
+    assert attempt.launch_token == cfg.queue_launch_token, attempt
+    queue_args = SimpleNamespace(
+        from_queue=True,
+        queue_launch_token="queue-token",
+        queue_claim_path="claim.json",
+    )
+    assert dispatch_mod._is_retryable_queued_refusal(queue_args, payload.get("error"))
+
+
+def test_task_linked_acp_releases_ledger_before_handshake_status_write() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id="task-linked-handshake-status",
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.task_ids = ["task-linked"]
+        cfg.redispatch_spawn_lock = lambda: dispatch_mod.goalflight_ledger.StateLock()
+        cfg.redispatch_spawn_guard = lambda: None
+        ledger_available_during_spawn: list[bool] = []
+        saved = _install_fake_acp_after_capacity()
+
+        async def checking_spawn(_command, _args, **kwargs):
+            with kwargs["launch_admission"]() as status_lock:
+                assert status_lock is not None
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=kwargs.get("cwd"),
+                    env=kwargs.get("env"),
+                )
+            lock = dispatch_mod.goalflight_ledger.StateLock.try_acquire(
+                time.monotonic() + 0.25
+            )
+            ledger_available_during_spawn.append(lock is not None)
+            if lock is not None:
+                lock.release()
+            await kwargs["on_attempt"](0, proc)
+            return proc, _FakeAcpConn(proc)
+
+        goalflight_acp_run.spawn_and_handshake_with_retry = checking_spawn
+        try:
+            with (
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+        finally:
+            _restore_fake_acp(saved)
+
+        assert payload.get("state") == "complete", payload
+        assert ledger_available_during_spawn == [True], ledger_available_during_spawn
+
+
+def test_task_linked_acp_rechecks_supersession_at_spawn() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "task-linked-superseded-at-spawn"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.task_ids = ["task-linked"]
+        cfg.queue_launch_token = "superseded-spawn-token"
+        cfg.redispatch_spawn_lock = lambda: dispatch_mod.goalflight_ledger.StateLock()
+        cfg.redispatch_spawn_guard = lambda: dispatch_mod._redispatch_spawn_guard(cfg)
+        run_env = _capacity_env(state_dir)
+        with dispatch_mod.goalflight_ledger.StateLock():
+            dispatch_mod.goalflight_ledger.write_record(
+                {
+                    "schema": dispatch_mod.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "project_root": cfg.project_root,
+                    "task_ids": cfg.task_ids,
+                    "state": "queued",
+                    "terminal_state": "unknown",
+                    "queue_launch_token": cfg.queue_launch_token,
+                }
+            )
+
+        original_admission = dispatch_mod._status_launch_admission
+        superseded = False
+        spawned: list[bool] = []
+        saved = _install_fake_acp_after_capacity()
+
+        @contextlib.contextmanager
+        def supersede_after_initial_guard(path, token, **kwargs):
+            nonlocal superseded
+            with original_admission(path, token, **kwargs) as status_lock:
+                if status_lock is not None and not superseded:
+                    with dispatch_mod.goalflight_ledger.StateLock():
+                        record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+                        assert record is not None
+                        record["superseded_by"] = "replacement-dispatch"
+                        dispatch_mod.goalflight_ledger.write_record(record)
+                    superseded = True
+                yield status_lock
+
+        async def spawn_at_fenced_boundary(_command, _args, **kwargs):
+            with kwargs["launch_admission"]() as status_lock:
+                assert status_lock is not None
+                spawned.append(True)
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=kwargs.get("cwd"),
+                    env=kwargs.get("env"),
+                )
+            await kwargs["on_attempt"](0, proc)
+            return proc, _FakeAcpConn(proc)
+
+        goalflight_acp_run.spawn_and_handshake_with_retry = spawn_at_fenced_boundary
+        try:
+            with (
+                patch.dict(os.environ, run_env, clear=True),
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+                patch.object(
+                    dispatch_mod,
+                    "_status_launch_admission",
+                    supersede_after_initial_guard,
+                ),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+        finally:
+            _restore_fake_acp(saved)
+
+        assert superseded, "the replacement did not land between initial guard and spawn"
+        assert spawned == [], spawned
+        assert payload.get("state") == "failed", payload
+        assert "superseded by replacement-dispatch" in str(payload.get("error")), payload
+        with patch.dict(os.environ, run_env, clear=True):
+            attempt = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            ).attempt_for_dispatch(dispatch_id)
+        assert attempt is not None
+        assert attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES, attempt
+
+
+def test_task_linked_acp_early_supersession_terminalizes_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "task-linked-superseded-before-spawn-guard"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.task_ids = ["task-linked"]
+        cfg.queue_launch_token = "early-superseded-token"
+        cfg.redispatch_spawn_lock = lambda: dispatch_mod.goalflight_ledger.StateLock()
+        cfg.redispatch_spawn_guard = lambda: dispatch_mod._redispatch_spawn_guard(cfg)
+        run_env = _capacity_env(state_dir)
+        with patch.dict(os.environ, run_env, clear=True):
+            with dispatch_mod.goalflight_ledger.StateLock():
+                dispatch_mod.goalflight_ledger.write_record(
+                    {
+                        "schema": dispatch_mod.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "project_root": cfg.project_root,
+                        "task_ids": cfg.task_ids,
+                        "state": "queued",
+                        "terminal_state": "unknown",
+                        "queue_launch_token": cfg.queue_launch_token,
+                        "superseded_by": "replacement-dispatch",
+                    }
+                )
+
+            spawns: list[bool] = []
+
+            async def unexpected_spawn(*_args, **_kwargs):
+                spawns.append(True)
+                raise AssertionError("superseded ACP attempt spawned")
+
+            with (
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+                patch.object(
+                    goalflight_acp_run,
+                    "validate_acp_dispatch_readiness",
+                    return_value=None,
+                ),
+                patch.object(
+                    goalflight_acp_run,
+                    "spawn_and_handshake_with_retry",
+                    unexpected_spawn,
+                ),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+            assert spawns == [], spawns
+            assert payload.get("state") == "failed", payload
+            attempt = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            ).attempt_for_dispatch(dispatch_id)
+            assert attempt is not None
+            assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+            record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+            assert record is not None
+            assert record.get("prelaunch_failure") is True, record
+
+
+def test_acp_lost_capacity_lease_terminalizes_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-capacity-lease-lost-before-spawn"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        run_env = _capacity_env(state_dir)
+        with patch.dict(os.environ, run_env, clear=True):
+            spawns: list[bool] = []
+            lost_leases: list[str | None] = []
+
+            def lose_capacity_lease(lease_id: str | None) -> bool:
+                lost_leases.append(lease_id)
+                return False
+
+            async def unexpected_spawn(*_args, **_kwargs):
+                spawns.append(True)
+                raise AssertionError("ACP spawned after losing its capacity lease")
+
+            with (
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+                patch.object(
+                    goalflight_acp_run,
+                    "validate_acp_dispatch_readiness",
+                    return_value=None,
+                ),
+                patch.object(
+                    goalflight_acp_run.goalflight_capacity,
+                    "mark_lease_spawning",
+                    lose_capacity_lease,
+                ),
+                patch.object(
+                    goalflight_acp_run,
+                    "spawn_and_handshake_with_retry",
+                    unexpected_spawn,
+                ),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+            assert lost_leases and lost_leases[0], lost_leases
+            assert spawns == [], spawns
+            assert payload.get("state") == "failed", payload
+            attempt = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            ).attempt_for_dispatch(dispatch_id)
+            assert attempt is not None
+            assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+            record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+            assert record is not None
+            assert record.get("prelaunch_failure") is True, record
+
+
+def test_acp_scratch_setup_failure_terminalizes_first_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-scratch-setup-failed"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        scratch_path = tmp / "scratch-is-a-file"
+        scratch_path.write_text("obstruction", encoding="utf-8")
+        cfg._worker_scratch_dir = str(scratch_path)
+        with (
+            _registered_acp_test_controller(),
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(
+                goalflight_acp_run,
+                "validate_acp_dispatch_readiness",
+                return_value=None,
+            ),
+        ):
+            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+        assert payload.get("state") == "failed_worktree", payload
+        with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            authority = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            )
+            attempt = authority.attempt_for_dispatch(dispatch_id)
+            record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+        assert record is not None
+        assert record.get("terminal_state") == "error", record
+        assert record.get("prelaunch_failure") is True, record
+
+
+def test_acp_sandbox_prep_return_terminalizes_first_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-sandbox-prep-failed"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / "status.json",
+            capacity_wait_s=0.0,
+        )
+        cfg.os_sandbox = goalflight_os_sandbox.OS_SANDBOX_WORKSPACE_WRITE
+        with (
+            _registered_acp_test_controller(),
+            patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+            patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+            patch.object(
+                goalflight_acp_run,
+                "validate_acp_dispatch_readiness",
+                return_value=None,
+            ),
+            patch.object(goalflight_acp_run, "preflight_os_sandbox", return_value=None),
+            patch.object(
+                goalflight_acp_run, "validate_os_sandbox_request", return_value=None
+            ),
+            patch.object(
+                goalflight_os_sandbox, "macos_write_roots", return_value=[]
+            ),
+            patch.object(
+                goalflight_acp_run,
+                "prepare_os_sandbox_command",
+                side_effect=goalflight_acp_run.OsSandboxError("sandbox prep failed"),
+            ) as prepare_sandbox,
+        ):
+            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+
+        assert prepare_sandbox.call_count == 1, prepare_sandbox.call_count
+        assert payload.get("state") == "blocked_os_sandbox", payload
+        with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            authority = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            )
+            attempt = authority.attempt_for_dispatch(dispatch_id)
+            record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+        assert record is not None
+        assert record.get("terminal_state") == "blocked_os_sandbox", record
+        assert record.get("prelaunch_failure") is True, record
+
+
+def test_acp_interrupts_terminalize_first_prepared_attempt() -> None:
+    for interruption in (asyncio.CancelledError, KeyboardInterrupt):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            state_dir = tmp / "state"
+            dispatch_id = f"acp-interrupted-{interruption.__name__.lower()}"
+            cfg = _acp_cfg(
+                tmp,
+                dispatch_id=dispatch_id,
+                status_json=tmp / "status.json",
+                capacity_wait_s=0.0,
+            )
+
+            def interrupt_setup(*_args, **_kwargs):
+                raise interruption()
+
+            with (
+                _registered_acp_test_controller(),
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(goalflight_acp_run, "cleanup_ghosts", return_value=0),
+                patch.object(
+                    goalflight_acp_run,
+                    "validate_acp_dispatch_readiness",
+                    return_value=None,
+                ),
+                patch.object(
+                    goalflight_acp_run.goalflight_cursor,
+                    "isolate_context_mode",
+                    side_effect=interrupt_setup,
+                ),
+            ):
+                try:
+                    asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                except BaseException as exc:
+                    assert isinstance(exc, interruption), exc
+                else:
+                    raise AssertionError(f"{interruption.__name__} was swallowed")
+
+            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+                authority = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                )
+                attempt = authority.attempt_for_dispatch(dispatch_id)
+                record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+            assert attempt is not None
+            assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+            assert record is not None
+            assert record.get("state") == "failed", record
+            assert record.get("terminal_state") == "error", record
+            assert record.get("prelaunch_failure") is True, record
+
+
+def test_concurrent_acp_resumes_publish_under_lock_and_both_launch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    home = tmp_path / "home"
+    home.mkdir()
+    grok_home = home / ".goal-flight" / "accounts" / "seat-g" / "grok" / ".grok"
+    grok_home.mkdir(parents=True)
+    (grok_home / "config.toml").write_text(
+        '[cli]\n\n[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    (grok_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    env = _capacity_env(
+        state_dir,
+        HOME=str(home),
+        GOALFLIGHT_CAPACITY_CONF=os.devnull,
+        GO_FLIGHT_PIDFILE_DIR=str(state_dir / "p"),
+        GOALFLIGHT_CODEX_STATE_DIR=str(state_dir),
+    )
+    saved = _install_fake_acp_after_capacity()
+    monkeypatch.setattr(goalflight_acp_run, "cleanup_ghosts", lambda: 0)
+    monkeypatch.setattr(
+        goalflight_acp_run,
+        "agent_command",
+        lambda *_args, **_kwargs: (sys.executable, []),
+    )
+
+    async def allow_capacity(*_args, **_kwargs):
+        return {"decision": "allow", "lease": {"lease_id": None}}
+
+    monkeypatch.setattr(
+        goalflight_acp_run.goalflight_capacity,
+        "acquire_with_wait_async",
+        allow_capacity,
+    )
+    original_lock = dispatch_mod._resume_publication_lock
+    lock_observations: dict[str, bool] = {}
+    both_at_lock = threading.Barrier(2)
+
+    @contextlib.contextmanager
+    def observe_first_publication(args):
+        child_id = str(args.dispatch_id)
+        lock_observations[child_id] = (
+            dispatch_mod.goalflight_ledger.read_record(child_id) is not None
+        )
+        both_at_lock.wait(timeout=10)
+        with original_lock(args):
+            yield
+
+    monkeypatch.setattr(dispatch_mod, "_resume_publication_lock", observe_first_publication)
+    try:
+        with patch.dict(os.environ, env, clear=True):
+            base = _acp_cfg(
+                tmp_path,
+                dispatch_id="acp-resume-child-one",
+                status_json=tmp_path / "child-one.status.json",
+                capacity_wait_s=0.0,
+            )
+            second = SimpleNamespace(**vars(base))
+            second.dispatch_id = "acp-resume-child-two"
+            second.status_json = str(tmp_path / "child-two.status.json")
+            first_session = "00000000-0000-4000-8000-000000000035"
+            second_session = "00000000-0000-4000-8000-000000000024"
+            _write_grok_resume_parent(
+                Path(base.project_root),
+                dispatch_id="acp-resume-parent-one",
+                session_id=first_session,
+            )
+            _write_grok_resume_parent(
+                Path(base.project_root),
+                dispatch_id="acp-resume-parent-two",
+                session_id=second_session,
+            )
+            for cfg, parent_id, session_id in (
+                (base, "acp-resume-parent-one", first_session),
+                (second, "acp-resume-parent-two", second_session),
+            ):
+                cfg.agent = "grok-acp"
+                cfg.account = "seat-g"
+                cfg.parent_dispatch_id = parent_id
+                cfg.engine_session_id = session_id
+
+            threads = [
+                _run_acp_thread(base),
+                _run_acp_thread(second),
+            ]
+            for thread, _result in threads:
+                thread.join(timeout=20)
+            assert all(not thread.is_alive() for thread, _result in threads)
+            assert lock_observations == {
+                "acp-resume-child-one": False,
+                "acp-resume-child-two": False,
+            }
+            for (_thread, result), child_id, parent_id in zip(
+                threads,
+                ("acp-resume-child-one", "acp-resume-child-two"),
+                ("acp-resume-parent-one", "acp-resume-parent-two"),
+            ):
+                assert "exc" not in result, result.get("exc")
+                payload = result["payload"]
+                assert payload["state"] == "complete", payload
+                child = dispatch_mod.goalflight_ledger.read_record(child_id)
+                assert child is not None and child["parent_dispatch_id"] == parent_id
+                assert child["state"] == "complete", child
+    finally:
+        _restore_fake_acp(saved)
+
+
+def test_acp_resume_losing_sweep_race_refuses_and_terminalizes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    home = tmp_path / "home"
+    home.mkdir()
+    grok_home = home / ".goal-flight" / "accounts" / "seat-g" / "grok" / ".grok"
+    grok_home.mkdir(parents=True)
+    (grok_home / "config.toml").write_text(
+        '[cli]\n\n[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    (grok_home / "auth.json").write_text("{}\n", encoding="utf-8")
+    env = _capacity_env(
+        state_dir,
+        HOME=str(home),
+        GOALFLIGHT_CAPACITY_CONF=os.devnull,
+        GO_FLIGHT_PIDFILE_DIR=str(state_dir / "p"),
+        GOALFLIGHT_CODEX_STATE_DIR=str(state_dir),
+    )
+    old_end = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).isoformat()
+    saved = _install_fake_acp_after_capacity()
+    monkeypatch.setattr(goalflight_acp_run, "cleanup_ghosts", lambda: 0)
+    monkeypatch.setattr(
+        goalflight_acp_run,
+        "agent_command",
+        lambda *_args, **_kwargs: (sys.executable, []),
+    )
+    monkeypatch.setattr(retention, "DISPATCH_ARTIFACT_BUDGET_BYTES", 0)
+    legacy_scratch = tmp_path / "legacy-claude-scratch"
+    legacy_scratch.mkdir()
+    original_lock = dispatch_mod._resume_publication_lock
+    reports: list[dict] = []
+
+    @contextlib.contextmanager
+    def sweep_before_first_publication(args):
+        report = retention._run_dispatch_retention(
+            homes_dir=dispatch_mod._codex_dispatch_homes_dir(),
+            ledger_dir=dispatch_mod.goalflight_ledger.runs_dir(create=True),
+            dispatch_dir=dispatch_mod._dispatch_base_dir(),
+            pidfile_dir=dispatch_mod.goalflight_dispatch_paths.pidfile_dir(),
+            legacy_scratch_dir=legacy_scratch,
+            now=dt.datetime.now(dt.timezone.utc),
+            identity_probe=lambda _record: (False, "dead"),
+        )
+        reports.append(report)
+        with original_lock(args):
+            yield
+
+    monkeypatch.setattr(dispatch_mod, "_resume_publication_lock", sweep_before_first_publication)
+    monkeypatch.setattr(
+        goalflight_acp_run,
+        "spawn_and_handshake_with_retry",
+        lambda *_args, **_kwargs: pytest.fail("refused resume must not spawn"),
+    )
+    try:
+        with patch.dict(os.environ, env, clear=True):
+            cfg = _acp_cfg(
+                tmp_path,
+                dispatch_id="acp-sweep-race-child",
+                status_json=tmp_path / "acp-sweep-race.status.json",
+                capacity_wait_s=0.0,
+            )
+            session_id = "00000000-0000-4000-8000-000000000025"
+            session = _write_grok_resume_parent(
+                Path(cfg.project_root),
+                dispatch_id="acp-sweep-race-parent",
+                session_id=session_id,
+                ended_at=old_end,
+            )
+            cfg.agent = "grok-acp"
+            cfg.account = "seat-g"
+            cfg.parent_dispatch_id = "acp-sweep-race-parent"
+            cfg.engine_session_id = session_id
+            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+            assert goalflight_acp_run.acp_dispatch_exit_code(payload) == 64, payload
+            assert payload["error"] == "resume source no longer exists", payload
+            assert reports[0]["deleted_count"] >= 1, reports
+            assert not session.exists()
+            assert dispatch_mod.goalflight_ledger.read_record(cfg.dispatch_id) is None
+            attempt = goalflight_journal.open_or_create_journal(
+                Path(cfg.project_root)
+            ).attempt_for_dispatch(cfg.dispatch_id)
+            assert attempt is not None
+            assert attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES
+    finally:
+        _restore_fake_acp(saved)
+
+
 def test_acp_capacity_wait_queues_until_slot_frees() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1344,6 +2874,9 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
                     )
                 )
                 assert ledger["state"] == "waiting_capacity", ledger
+                assert "worker_cwd" not in ledger
+                assert "engine_session_id" not in ledger
+                assert ledger.get("acp_session_id") in (None, "")
                 attempt = goalflight_journal.open_or_create_journal(
                     Path(cfg.project_root)
                 ).attempt_for_dispatch("queued-acp")
@@ -1450,6 +2983,188 @@ def test_acp_capacity_acquire_error_keeps_queue_attempt_prepared() -> None:
         assert "terminal_state" not in status, status
         assert ledger["state"] == "waiting_capacity", ledger
         assert ledger["terminal_state"] == "unknown", ledger
+
+
+def test_acp_task_cancel_during_capacity_wait_terminalizes_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-task-cancel-during-capacity-wait"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / f"{dispatch_id}.status.json",
+            capacity_wait_s=30.0,
+        )
+        cfg.dispatch_id = None
+        entered_wait = asyncio.Event()
+
+        async def wait_for_capacity(*_args, **_kwargs):
+            entered_wait.set()
+            await asyncio.Event().wait()
+
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                _registered_acp_test_controller(),
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(
+                    goalflight_acp_run.goalflight_capacity,
+                    "acquire_with_wait_async",
+                    side_effect=wait_for_capacity,
+                ),
+                patch.object(
+                    goalflight_acp_run,
+                    "_default_dispatch_id",
+                    side_effect=[dispatch_id, f"{dispatch_id}-wrong-finalizer"],
+                ) as generated_dispatch_id,
+            ):
+                async def cancel_waiting_task() -> None:
+                    task = asyncio.create_task(
+                        goalflight_acp_run.run_acp_dispatch(cfg)
+                    )
+                    await asyncio.wait_for(entered_wait.wait(), timeout=5.0)
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        return
+                    raise AssertionError("Task.cancel() was swallowed")
+
+                asyncio.run(cancel_waiting_task())
+                attempt = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                ).attempt_for_dispatch(dispatch_id)
+                record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+                assert cfg.dispatch_id == dispatch_id
+                assert generated_dispatch_id.call_count == 1
+        finally:
+            _restore_fake_acp(saved)
+
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+        assert record is not None
+        assert record.get("state") == "failed", record
+        assert record.get("terminal_state") == "error", record
+
+
+def test_acp_keyboard_interrupt_during_capacity_wait_terminalizes_prepared_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-keyboard-interrupt-during-capacity-wait"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=tmp / f"{dispatch_id}.status.json",
+            capacity_wait_s=30.0,
+        )
+
+        async def interrupt_wait(*_args, **_kwargs):
+            raise KeyboardInterrupt("capacity wait interrupted")
+
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                _registered_acp_test_controller(),
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(
+                    goalflight_acp_run.goalflight_capacity,
+                    "acquire_with_wait_async",
+                    side_effect=interrupt_wait,
+                ),
+            ):
+                try:
+                    asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                except KeyboardInterrupt as exc:
+                    assert str(exc) == "capacity wait interrupted"
+                else:
+                    raise AssertionError("KeyboardInterrupt was swallowed")
+                attempt = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                ).attempt_for_dispatch(dispatch_id)
+                record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+        finally:
+            _restore_fake_acp(saved)
+
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+        assert record is not None
+        assert record.get("state") == "failed", record
+        assert record.get("terminal_state") == "error", record
+
+
+def test_acp_sigterm_during_initial_lease_status_update_releases_capacity() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-sigterm-initial-lease-status"
+        status_json = tmp / f"{dispatch_id}.status.json"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        real_write_status = goalflight_acp_run.write_status
+        cancelled_initial_update = False
+
+        class ReceivedSigterm:
+            def __init__(self, _loop, _task):
+                self.received = True
+                self.signum = signal.SIGTERM
+
+            def install(self) -> None:
+                pass
+
+            def restore(self) -> None:
+                pass
+
+        def interrupt_initial_lease_update(path: Path, payload: dict) -> None:
+            nonlocal cancelled_initial_update
+            if payload.get("lease_id") and not cancelled_initial_update:
+                cancelled_initial_update = True
+                raise asyncio.CancelledError()
+            real_write_status(path, payload)
+
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                _registered_acp_test_controller(),
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(
+                    goalflight_acp_run, "_SigtermCancelBridge", ReceivedSigterm
+                ),
+                patch.object(
+                    goalflight_acp_run,
+                    "write_status",
+                    side_effect=interrupt_initial_lease_update,
+                ),
+            ):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                attempt = goalflight_journal.open_or_create_journal(
+                    Path(cfg.project_root)
+                ).attempt_for_dispatch(dispatch_id)
+                record = dispatch_mod.goalflight_ledger.read_record(dispatch_id)
+                leases = dispatch_mod.goalflight_capacity.load_state()["leases"]
+                dispatch_leases = [
+                    lease
+                    for lease in leases.values()
+                    if lease.get("dispatch_id") == dispatch_id
+                ]
+        finally:
+            _restore_fake_acp(saved)
+
+        assert payload.get("terminated_by_signal") == "SIGTERM", payload
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL, attempt
+        assert record is not None
+        assert record.get("terminal_state") == "error", record
+        assert len(dispatch_leases) == 1, dispatch_leases
+        assert (
+            dispatch_leases[0].get("state")
+            in dispatch_mod.goalflight_capacity.TERMINAL_LEASE_STATES
+        ), dispatch_leases
 
 
 def test_acp_capacity_wait_deadline_blocks() -> None:
@@ -1720,6 +3435,8 @@ def _run_acp_shape_env_capture(agent: str, env_key: str) -> dict[str, str | None
     captured: dict[str, str | None] = {}
     old_run = goalflight_acp_run.run_acp_dispatch
     old_value = os.environ.get(env_key)
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_dispatch_dir = os.environ.get("GOALFLIGHT_DISPATCH_DIR")
 
     async def fake_run(cfg):
         captured[env_key] = os.environ.get(env_key)
@@ -1735,6 +3452,8 @@ def _run_acp_shape_env_capture(agent: str, env_key: str) -> dict[str, str | None
         tmp = Path(td)
         args = _base_acp_args(tmp, agent=agent, dispatch_id=f"{agent}-env")
         try:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+            os.environ["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
             os.environ[env_key] = "must-not-leak"
             goalflight_acp_run.run_acp_dispatch = fake_run
             rc = dispatch_mod._run_acp_shape(args, base=tmp / "dispatch", account_env={})
@@ -1744,6 +3463,14 @@ def _run_acp_shape_env_capture(agent: str, env_key: str) -> dict[str, str | None
                 os.environ.pop(env_key, None)
             else:
                 os.environ[env_key] = old_value
+            if old_state is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+            if old_dispatch_dir is None:
+                os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_DISPATCH_DIR"] = old_dispatch_dir
     assert rc == 0
     return captured
 
@@ -1753,10 +3480,262 @@ def test_subscription_env_scrub_for_cursor_and_claude_acp() -> None:
     assert _run_acp_shape_env_capture("claude", "ANTHROPIC_API_KEY")["ANTHROPIC_API_KEY"] is None
 
 
+def test_acp_spawn_intent_for_foreground_and_detached_child(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    seen: list[str] = []
+
+    async def fake_run(cfg):
+        assert dispatch_mod._SPAWN_INTENT is True
+        assert dispatch_mod._SPAWN_INTENT_DISPATCH_ID == cfg.dispatch_id
+        seen.append(cfg.dispatch_id)
+        return {
+            "state": "complete",
+            "dispatch_id": cfg.dispatch_id,
+            "agent": cfg.agent,
+            "worker_pid": None,
+            "worker_alive": False,
+        }
+
+    monkeypatch.setattr(goalflight_acp_run, "run_acp_dispatch", fake_run)
+    for dispatch_id, detached_child in (
+        ("acp-spawn-foreground", False),
+        ("acp-spawn-detached-child", True),
+    ):
+        args = _base_acp_args(
+            tmp_path, agent="claude", dispatch_id=dispatch_id,
+        )
+        args.launch_detached = detached_child
+        args.acp_detached_child = detached_child
+        args.dispatch_warnings = []
+        with patch.object(dispatch_mod, "_SPAWN_INTENT", False), patch.object(
+            dispatch_mod, "_SPAWN_INTENT_DISPATCH_ID", None
+        ), contextlib.redirect_stdout(io.StringIO()):
+            assert dispatch_mod._run_acp_shape(
+                args, base=tmp_path / "dispatch", account_env={},
+            ) == 0
+
+    assert seen == ["acp-spawn-foreground", "acp-spawn-detached-child"]
+
+
+def test_acp_worker_preserves_exported_remote_ci_config(tmp_path, monkeypatch) -> None:
+    configured = str(tmp_path / "operator-config.json")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_REMOTE_CI_CONFIG", configured)
+
+    spawn_env = goalflight_acp_run._worker_spawn_env(
+        SimpleNamespace(agent="claude"), None,
+    )
+
+    assert spawn_env["GOALFLIGHT_REMOTE_CI_CONFIG"] == configured
+    remote_run = Path(spawn_env["GOALFLIGHT_REMOTE_RUN"])
+    assert remote_run == (
+        Path(goalflight_acp_run.goalflight_dispatch_paths.__file__).resolve().parent.parent
+        / "bin" / "goalflight-remote-run"
+    ).resolve()
+    assert remote_run.is_file() and os.access(remote_run, os.X_OK)
+
+
+def test_acp_worker_omits_remote_runner_without_project_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_REMOTE_RUN", "/stale/runner")
+
+    spawn_env = goalflight_acp_run._worker_spawn_env(
+        SimpleNamespace(agent="claude", project_root=str(tmp_path)), None,
+    )
+
+    assert "GOALFLIGHT_REMOTE_RUN" not in spawn_env
+
+
+def test_acp_launch_uses_project_remote_ci_config_and_grants_its_spool(
+    tmp_path, monkeypatch,
+) -> None:
+    project_root = tmp_path / "pm2"
+    worker_cwd = project_root / "worktrees" / "s-1"
+    config_path = project_root / ".goal-flight" / "remote-ci.json"
+    spool = tmp_path / "state" / "remote-ci" / "projects" / "pm2" / "spool"
+    worker_cwd.mkdir(parents=True)
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"paths": {
+        "queue_dir": str(spool / "requests"),
+        "result_dir": str(spool / "results"),
+    }}), encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    captured: dict[str, str] = {}
+
+    async def fake_run(cfg):
+        captured.update(goalflight_acp_run._worker_spawn_env(cfg, None))
+        return {
+            "state": "complete",
+            "dispatch_id": cfg.dispatch_id,
+            "agent": cfg.agent,
+            "worker_pid": None,
+            "worker_alive": False,
+        }
+
+    args = _base_acp_args(
+        worker_cwd, agent="claude", dispatch_id="acp-project-remote-ci",
+    )
+    args.project_root = str(project_root)
+    monkeypatch.setattr(goalflight_acp_run, "run_acp_dispatch", fake_run)
+
+    assert dispatch_mod._run_acp_shape(
+        args, base=tmp_path / "dispatch", account_env={},
+    ) == 0
+
+    assert captured["GOALFLIGHT_REMOTE_CI_CONFIG"] == str(config_path)
+    assert Path(captured["GOALFLIGHT_REMOTE_CI_SPOOL_DIR"]) == spool
+    _profile, roots = goalflight_os_sandbox.macos_sandbox_profile(
+        str(Path(sys.executable).resolve().parent),
+        goalflight_os_sandbox.OS_SANDBOX_WORKSPACE_WRITE,
+        agent="claude", command="claude", environment={**os.environ, **captured},
+    )
+    assert (spool / "requests").resolve() in {
+        Path(root).resolve() for root in roots
+    }
+
+
+def test_acp_worker_scratch_is_created_and_exported_for_resume_child() -> None:
+    captured: dict[str, tuple[str, str]] = {}
+    controller_tmpdir: Path | None = None
+
+    async def fake_run(cfg):
+        nonlocal controller_tmpdir
+        spawn_env = goalflight_acp_run._worker_spawn_env(cfg, None)
+        scratch = spawn_env["GOALFLIGHT_SCRATCH_DIR"]
+        Path(scratch).mkdir(parents=True, exist_ok=True, mode=0o700)
+        assert Path(scratch).is_dir()
+        tmpdir = spawn_env["TMPDIR"]
+        assert tmpdir == scratch
+        assert os.environ.get("TMPDIR") == str(controller_tmpdir)
+        tempfile.tempdir = None
+        assert Path(tempfile.gettempdir()) == controller_tmpdir
+        captured[cfg.dispatch_id] = (scratch, tmpdir)
+        return {
+            "state": "complete",
+            "dispatch_id": cfg.dispatch_id,
+            "agent": cfg.agent,
+            "worker_pid": None,
+            "worker_alive": False,
+        }
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        controller_tmpdir = tmp / "controller-temp"
+        controller_tmpdir.mkdir()
+        dispatch = tmp / "dispatch"
+        with patch.dict(
+            os.environ,
+            {
+                "GOALFLIGHT_STATE_DIR": str(tmp / "state"),
+                "GOALFLIGHT_DISPATCH_DIR": str(dispatch),
+                "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journals"),
+                "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+                "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+                "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
+                "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+                "TMPDIR": str(controller_tmpdir),
+            },
+        ):
+            old_tempdir = tempfile.tempdir
+            try:
+                with patch.object(goalflight_acp_run, "run_acp_dispatch", fake_run):
+                    for dispatch_id, parent_id in (
+                        ("claude-scratch-fresh", None),
+                        ("claude-scratch-resume-child", "claude-scratch-parent"),
+                    ):
+                        args = _base_acp_args(tmp, agent="claude", dispatch_id=dispatch_id)
+                        args.parent_dispatch_id = parent_id
+                        parent_env = os.environ.copy()
+                        tempfile.tempdir = None
+                        assert dispatch_mod._run_acp_shape(
+                            args, base=dispatch, account_env={}
+                        ) == 0
+                        assert os.environ == parent_env
+                        assert tempfile.tempdir == str(controller_tmpdir)
+            finally:
+                tempfile.tempdir = old_tempdir
+
+    assert captured == {
+        "claude-scratch-fresh": (
+            str(dispatch / "claude-scratch-fresh.scratch"),
+            str(dispatch / "claude-scratch-fresh.scratch"),
+        ),
+        "claude-scratch-resume-child": (
+            str(dispatch / "claude-scratch-resume-child.scratch"),
+            str(dispatch / "claude-scratch-resume-child.scratch"),
+        ),
+    }
+    assert captured["claude-scratch-fresh"] != captured["claude-scratch-resume-child"]
+
+
+def test_detached_acp_env_uses_created_worker_scratch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp_path = Path(td)
+        dispatch = tmp_path / "state" / "dispatch"
+        args = _base_acp_args(
+            tmp_path, agent="claude", dispatch_id="claude-detached-scratch"
+        )
+        args.launch_detached = True
+        captured: dict[str, object] = {}
+        cfg = SimpleNamespace(
+            agent="claude",
+            capacity_wait_s=0,
+            _worker_scratch_dir=str(
+                dispatch / "claude-detached-scratch.scratch"
+            ),
+        )
+
+        def capture_detached(_args, **kwargs):
+            captured["account_env"] = kwargs["account_env"]
+            Path(cfg._worker_scratch_dir).mkdir(
+                parents=True, exist_ok=True, mode=0o700
+            )
+            captured["worker_env"] = goalflight_acp_run._worker_spawn_env(cfg, None)
+            return 0
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GOALFLIGHT_STATE_DIR": str(tmp_path / "state"),
+                    "GOALFLIGHT_DISPATCH_DIR": str(dispatch),
+                },
+            ),
+            patch.object(
+                dispatch_mod,
+                "_refuse_reused_dispatch_id_for_launch",
+                lambda *_args, **_kwargs: None,
+            ),
+            patch.object(
+                dispatch_mod,
+                "_build_acp_cfg",
+                lambda *_args, **_kwargs: cfg,
+            ),
+            patch.object(dispatch_mod, "_emit_dispatch_warnings", lambda *_args, **_kwargs: None),
+            patch.object(dispatch_mod, "_capacity_wait_seconds", lambda _args: 0),
+            patch.object(dispatch_mod, "_run_acp_detached_launcher", capture_detached),
+        ):
+            assert dispatch_mod._run_acp_shape(args, base=dispatch, account_env={}) == 0
+
+        account_env = captured["account_env"]
+        worker_env = captured["worker_env"]
+        assert isinstance(account_env, dict)
+        assert isinstance(worker_env, dict)
+        assert "TMPDIR" not in account_env
+        scratch = Path(worker_env["GOALFLIGHT_SCRATCH_DIR"])
+        assert scratch.is_dir()
+        assert worker_env["TMPDIR"] == str(scratch)
+
+
 def main() -> None:
     test_normalize_acp_agents()
     test_build_acp_cfg_agent_liveness_defaults()
     test_build_acp_cfg_injects_orientation_prompt_text()
+    test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd()
     test_acp_production_path_persists_and_reminds_with_assembled_prompt()
     test_acp_inline_prompt_uses_same_assembled_prompt_path()
     test_acp_prompt_history_rewrite_remains_private()
@@ -1769,16 +3748,31 @@ def main() -> None:
     test_missing_status_without_nonterminal_record_returns_before_scan()
     test_watcher_prompt_history_retains_original_and_bounded_recent_turns()
     test_capacity_env_ignores_constructed_live_journal()
+    test_acp_prelaunch_refusals_are_delivered_to_launching_controller()
+    test_task_linked_acp_status_admission_defers_without_holding_ledger()
+    test_task_linked_acp_releases_ledger_before_handshake_status_write()
+    test_task_linked_acp_rechecks_supersession_at_spawn()
+    test_task_linked_acp_early_supersession_terminalizes_prepared_attempt()
+    test_acp_lost_capacity_lease_terminalizes_prepared_attempt()
+    test_acp_scratch_setup_failure_terminalizes_first_prepared_attempt()
+    test_acp_sandbox_prep_return_terminalizes_first_prepared_attempt()
+    test_acp_interrupts_terminalize_first_prepared_attempt()
     test_acp_capacity_wait_queues_until_slot_frees()
     test_acp_capacity_acquire_error_terminalizes_direct_attempt()
     test_acp_capacity_acquire_error_keeps_queue_attempt_prepared()
+    test_acp_task_cancel_during_capacity_wait_terminalizes_prepared_attempt()
+    test_acp_keyboard_interrupt_during_capacity_wait_terminalizes_prepared_attempt()
+    test_acp_sigterm_during_initial_lease_status_update_releases_capacity()
     test_acp_capacity_wait_deadline_blocks()
     test_acp_capacity_wait_zero_single_shot()
     test_acp_capacity_wait_sigterm_terminalizes()
+    test_acp_spawn_refuses_completion_published_before_admission()
     test_auto_shape_routes_claude_to_acp_and_cursor_to_bash()
     test_claude_auth_preflight_refuses_before_attempt()
     test_claude_auth_preflight_accepts_logged_in_session()
     test_subscription_env_scrub_for_cursor_and_claude_acp()
+    test_acp_worker_scratch_is_created_and_exported_for_resume_child()
+    test_detached_acp_env_uses_created_worker_scratch()
     print("OK: goalflight_dispatch ACP agent tests pass")
 
 

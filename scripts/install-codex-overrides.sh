@@ -41,7 +41,7 @@
 # can use MCP tools without stalling. Recommended dispatch shape (preserves the
 # hard wall-clock ceiling — codex v0.130.0 has no --timeout flag):
 #
-#   timeout --kill-after=10 300 codex exec '<prompt>' > <tail> 2>&1 &
+#   timeout --kill-after=10 300 codex exec -c features.plugins=false '<prompt>' > <tail> 2>&1 &
 
 set -euo pipefail
 

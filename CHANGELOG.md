@@ -6,6 +6,144 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.7.6] - 2026-10-27
+
+### Added
+
+- Copy-on-write worktree seats. With `seat_cow_templates` enabled for a
+  repository in the machine-local capacity profile, new seats and clean
+  same-base reuses are cloned from a per-repository template with APFS
+  `clonefile` instead of a full checkout, so a warm seat costs little more
+  disk than its own changes. Each seat records how it was populated; a reuse
+  that changes the base commit or has tracked changes skips cloning and says
+  so, and any filesystem problem falls back to an ordinary checkout. Removing
+  the setting reverts new seats immediately. A separate idle-seat pass shares
+  identical clean files between existing seats.
+- Workers route test and CI commands to the remote boxes through
+  `goalflight-remote-run` (exported to workers as `GOALFLIGHT_REMOTE_RUN`).
+  The laptop daemon snapshots the worktree, including modified and untracked
+  non-ignored files, without touching the worker's index or branch, ships an
+  incremental bundle against the box's confirmed basis, and returns a receipt
+  with pass, fail and skip counts and failure details. Sandboxed workers submit
+  through a spool and never contact the boxes directly. Any failure before a
+  verified remote result runs the command locally and records why. When
+  `GOALFLIGHT_REMOTE_RUN` is unset, commands run locally.
+- Matched-pair remote runs: `goalflight-remote-run --pair --base <sha>` runs
+  base and candidate on one box and reports candidate-only failures.
+  `--recheck N` reruns each candidate-only failure and classifies it as a
+  regression, a flake, or failing at base. A pair that cannot finish remotely
+  is refused rather than mixing a remote arm with a local one.
+- Resident remote admission. With `"admission": "box"`, the laptop daemon
+  streams the snapshot to a box and returns to its queue while the box admits
+  and runs the ticket; results are collected on later passes, survive daemon
+  restarts, and an accepted ticket is never re-run locally.
+- Per-project remote CI. Each project gets its own daemon and spool, an
+  optional host allowlist, and opt-in profiles that pin a virtual environment
+  with exact requirements and install base overlays before tests start. A
+  worker can no longer pick up another repository's remote CI configuration.
+- Graceful remote CI daemon drain: writing the daemon's PID to its
+  `drain.request` file makes it stop claiming new requests and finish the ones
+  it owns, so a replacement can be started without dropping work.
+- Workers can ask the controller a question mid-run with
+  `steer --wait --question-kind USER-NEED` from inside their sandbox. The
+  question and its reply are durable: a timed-out wait ends with a `!BLOCKED`
+  marker naming the wait id, and a later reply can be delivered on resume.
+  Codex workers also receive steer messages between turns through a delivery
+  hook.
+- `goalflight_dispatch.py final <id>` prints a dispatch's final assistant
+  message and terminal marker, and reports when the message boundary is
+  uncertain. `release-seat` releases a terminal dispatch's seat once its work
+  has been integrated.
+- Controller cadence. `supervise` prints a short, read-only pulse on startup
+  (lane, ready tasks, capacity, due duties and an idle reminder), and
+  `goalflight_cadence.py due` lists recurring duties such as a remote CI audit
+  and periodic review sweeps. A duty left at twice its period prints a wake
+  line for its owning controller. New templates cover a refactor and duplicate
+  scan, a task-store audit and a tooling friction survey.
+- Opt-in listener wake modes. `GOALFLIGHT_WAKE_MODE=gated` skips full journal
+  passes when the journal has not changed; `notify` (experimental) also wakes
+  on filesystem events. The default `poll` is unchanged.
+- A process census and a conservative orphan reaper for stray listener
+  processes, and `goalflight_reconcile_prelaunch.py` for dispatches that
+  failed before their worker started.
+
+### Changed
+
+- Bounded disk retention. The drainer starts one retention sweep per hour in
+  the background. It removes idle dispatch scratch after six hours (one hour
+  when free space is low), expires inactive resumable scratch after three days,
+  trims caches from worker homes idle for two hours, archives orphaned worker
+  sessions after seven days, and keeps only recent task and dashboard
+  snapshots. Every removal is rechecked against a fresh view of running
+  processes immediately before it happens, and anything whose owner or age
+  cannot be proven is kept.
+- Dispatches refuse to launch when free space is below 20 GB, checked once as
+  each launch path starts.
+- Worker temporary files, clones, logs and browser profiles go into the
+  dispatch's own retention-managed scratch directory (`$TMPDIR`) instead of
+  `/tmp`.
+- The controller message streams are owned per project, so two projects can no
+  longer collide on a stream name. Fleet-wide streams such as the capacity
+  advisory are explicit, and posting to a placeholder stream id is refused.
+- Controller labels are validated when a controller registers and on every
+  write, and the controller roster heartbeat is refreshed whenever the lease is
+  renewed.
+- Reviews of dispatch or watcher changes must name the test modules they
+  affect, and the deploy gate runs exactly that set. The read-only review guard
+  is more precise about what counts as a write.
+- Dispatch prompts state the worker's sandbox limits and whether it is expected
+  to commit, derived from the launch profile actually used.
+- Remote CI runs are pinned to the verified host that accepted them, transient
+  SSH and connection-sharing failures are retried with a bound, and a box whose
+  health cannot be determined is marked unknown and skipped for placement
+  rather than treated as healthy or dead. The remote protocol is now version 5.
+
+### Fixed
+
+- State files survive the macOS temporary-file cleaner. macOS deletes files
+  under `/tmp` that have not been read for about three days, which could remove
+  ledger records and daemon locks during a quiet spell. The drainer now
+  refreshes access times under the state directory once a day without changing
+  modification times, so retention ages are unaffected.
+- Remote CI status and enqueue calls no longer time out behind cleanup. Each
+  node pass reuses one process census, census work and deletions per pass are
+  capped, and a census that returns partial output with harmless warnings is
+  accepted instead of reported as unknown.
+- Resume returns to the dispatch's own seat. A resume is no longer refused as
+  its own holder, the occupancy lock taken before admission is handed through
+  the pool, captive and ACP paths, and a recycled seat can be resumed again.
+- A Codex resume stays on its source session. An unrelated broken session
+  lineage no longer refuses every resume, a mismatched session handle is
+  refused, and parent-linked launches keep their parent session. Session
+  history is cloned rather than copied where the filesystem supports it.
+- Seat reclamation and admission. Stale and legacy seats are reclaimed when
+  their holder is proven gone, seats whose holder cannot be identified are kept,
+  stale worktree registrations are left for cleanup instead of being repaired
+  in place, and seat capacity is enforced the same way on every launch path.
+- Capacity handling. Expired capacity leases are reclaimed only when their
+  worker is proven dead, a capacity refusal is attributed only to the attempt
+  that wrote it, and usage headroom is rechecked after capacity admission, so a
+  launch whose headroom ran out while it waited is refused before it starts.
+- Dispatches that never launched are closed or withdrawn cleanly, terminal
+  outcomes recorded in the journal are reflected in status, and a worker's
+  messages are kept and delivered later when the journal is temporarily
+  unavailable.
+- Dispatch state and liveness checks survive host sleep: deadlines use awake
+  time, and a controller waking from sleep re-verifies holders before sweeping
+  them.
+
+## [1.7.5] - 2026-10-01
+
+### Changed
+
+- Codex workers and reviewers launch with the plugins feature off
+  (`-c features.plugins=false`). A fresh worker home no longer downloads the
+  plugin catalog on every dispatch: measured about 3 MB per home instead of
+  about 28 MB, with no fallback checkout. One shared helper supplies the
+  argument to the dispatcher, the ACP launcher, review jobs and the test
+  spawner, and the documented hand-run review recipes match what the
+  dispatcher runs.
+
 ## [1.7.4] - 2026-09-30
 
 ### Added

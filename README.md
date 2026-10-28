@@ -91,7 +91,8 @@ so far — and work it into an architecture the run can execute: closed chunks (
 CHECKLIST / ACCEPTANCE / FORBIDDEN) with parallelism flagged, plus a reviewer pass over
 the decomposition itself, so the design gets adversarial scrutiny *before* any code is
 written. Disagree with a chunk? Say so in chat; mid-session steering is requirements
-input, and the plan revises.
+input, and the plan revises. (With [gstack](https://github.com/garrytan/gstack) installed,
+`/office-hours` and `/plan-eng-review` add structured interrogation at this step.)
 
 **4. Dispatch the work.**
 
@@ -259,6 +260,17 @@ Unified CLI: `bin/goalflight <domain> <resource> <verb>` (action router over
 - **When speed matters more than rigor.** The review-to-convergence design targets
   reference-quality code — its home domain is scientific programming. For a small one-shot
   task it is slower than just writing the script.
+
+## Companion skills
+
+Optional. Goal-flight runs without them.
+
+- **[gstack](https://github.com/garrytan/gstack)** — goal-flight uses two of its planning
+  skills. `/office-hours` asks forcing questions about a fuzzy goal or plan before it is
+  decomposed, and `/plan-eng-review` gives the decomposition an engineering critique before
+  any code is written. `/goal-flight init` offers to install them. Without them,
+  `/goal-flight ask-questions` surfaces the blocking questions and the decomposition
+  still gets its two-reviewer pass.
 
 ## Host install notes
 

@@ -8,9 +8,11 @@ import atexit
 from collections import deque
 import contextlib
 import ctypes
+from datetime import datetime, timezone
 import io
 import itertools
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -32,14 +34,17 @@ import goalflight_cursor
 import goalflight_codex_sessions
 import goalflight_capacity
 import goalflight_dispatch_states
+import goalflight_dispatch_paths
 import goalflight_engine_sessions
 import goalflight_fs
 import goalflight_ledger
+import goalflight_output_redact
 import goalflight_quota_stuck
+import goalflight_response_boundary
 import goalflight_steer_mailbox
 import goalflight_task
 import goalflight_terminal
-from goalflight_agent_limits import moonshot_family
+from goalflight_agent_limits import LOCAL_OVERRIDES, moonshot_family
 from goalflight_liveness import (
     LIVENESS_INDETERMINATE_STATE,
     LivenessThresholds,
@@ -59,6 +64,48 @@ from goalflight_liveness import (
 )
 import goalflight_tree_events as tree_events
 import goalflight_wedge_watch as wedge_watch
+
+_LOGGER = logging.getLogger(__name__)
+_WORKER_QUESTION_OUTBOX_MAX_SCAN_ENTRIES = 128
+
+
+class _RedactingLogStream:
+    """Redact complete watcher log lines while proxying text stream attributes."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._pending = ""
+
+    def write(self, text: str) -> int:
+        self._pending += text
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            self._stream.write(goalflight_output_redact.redact_text(line + "\n"))
+        return len(text)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        if self._pending:
+            self._stream.write(goalflight_output_redact.redact_text(self._pending))
+            self._pending = ""
+        self._stream.flush()
+
+    def __getattr__(self, name: str):
+        if name == "buffer":
+            raise AttributeError(name)
+        return getattr(self._stream, name)
+
+
+def _redact_log_streams() -> None:
+    if LOCAL_OVERRIDES.get("output_redaction_filter", True) is False:
+        return
+    if not isinstance(sys.stdout, _RedactingLogStream):
+        sys.stdout = _RedactingLogStream(sys.stdout)
+    if not isinstance(sys.stderr, _RedactingLogStream):
+        sys.stderr = _RedactingLogStream(sys.stderr)
 
 # `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
 # etc.; without it the bold marker is never matched and the worker idle-times-out
@@ -659,6 +706,22 @@ def resolve_wedge_tree_leg(
         project_root,
         sidecar.get("project_root"),
     )
+    if cwd is not None and not cwd.is_absolute():
+        return {
+            "kind": WEDGE_TREE_LEG_INDETERMINATE,
+            "reason": "worker_cwd_not_absolute",
+            "scan_root": None,
+            "worker_cwd": str(cwd),
+            "canonical_root": str(_resolved_path(canonical)) if canonical else None,
+        }
+    if canonical is not None and not canonical.is_absolute():
+        return {
+            "kind": WEDGE_TREE_LEG_INDETERMINATE,
+            "reason": "canonical_root_not_absolute",
+            "scan_root": None,
+            "worker_cwd": str(cwd) if cwd is not None else None,
+            "canonical_root": str(canonical),
+        }
     cwd_s = str(_resolved_path(cwd)) if cwd is not None else None
     canonical_s = str(_resolved_path(canonical)) if canonical is not None else None
     if cwd is None:
@@ -1244,20 +1307,31 @@ def post_worker_memory_event(
     post_func=None,
 ) -> None:
     """Tell the worker and controller about one RSS breach; fail open."""
+    previous_role: str | None = None
+    set_watcher_role = post_func is None
     try:
         if post_func is None:
             import goalflight_messages as gm
 
             post_func = gm.post_controller_steer
+            previous_role = os.environ.get("GOALFLIGHT_PROCESS_ROLE")
+            os.environ["GOALFLIGHT_PROCESS_ROLE"] = "watcher"
         detail = (
             f"command={event.get('command')!r} "
             f"peak_rss_mb={event.get('peak_rss_mb')} "
             f"ceiling_mb={event.get('ceiling_mb')}"
         )
-        post_func(
-            dispatch_id,
-            f"worker RSS ceiling exceeded: {detail}; verdict={event.get('verdict')}",
-        )
+        try:
+            post_func(
+                dispatch_id,
+                f"worker RSS ceiling exceeded: {detail}; verdict={event.get('verdict')}",
+            )
+        finally:
+            if set_watcher_role:
+                if previous_role is None:
+                    os.environ.pop("GOALFLIGHT_PROCESS_ROLE", None)
+                else:
+                    os.environ["GOALFLIGHT_PROCESS_ROLE"] = previous_role
     except Exception:
         # Status and watcher output remain authoritative if the optional mail
         # sideband is unavailable; a monitoring failure must not kill the watcher.
@@ -1541,6 +1615,8 @@ class TraceLiveness:
         self.lsof_runner = lsof_runner
         self.ps_runner = ps_runner
         self.path = None
+        self._trace_mtime: float | None = None
+        self._last_trace_change_mono: float | None = None
         self.engine_session_id = None
         self.session_roots = ()
         self._next_resolve_mono: float | None = None
@@ -1562,6 +1638,8 @@ class TraceLiveness:
             return
         self.engine_session_id = session_id
         self.path = None
+        self._trace_mtime = None
+        self._last_trace_change_mono = None
         self.started_mono = active_monotonic()
         self.session_roots = ()
         self._next_resolve_mono = None
@@ -1637,6 +1715,28 @@ class TraceLiveness:
             if self.path is None:
                 return keying
             mtime = self.path.stat().st_mtime
+            if mtime != self._trace_mtime:
+                if self._trace_mtime is None:
+                    # Seed the sleep-excluding clock from the first observed
+                    # trace age; later changes are measured in awake time.
+                    initial_age = max(0.0, now_epoch - mtime)
+                    if initial_age <= max(1.0, idle_threshold):
+                        self._last_trace_change_mono = now_mono
+                    else:
+                        self._last_trace_change_mono = now_mono - initial_age
+                elif mtime > self._trace_mtime:
+                    self._last_trace_change_mono = now_mono
+                else:
+                    # A backwards timestamp is a stale/reset trace, not new
+                    # activity. Preserve the ordinary stale-file verdict.
+                    stale_age = max(0.0, now_epoch - mtime)
+                    self._last_trace_change_mono = now_mono - stale_age
+                self._trace_mtime = mtime
+            trace_age_mono = (
+                now_mono - self._last_trace_change_mono
+                if self._last_trace_change_mono is not None
+                else float("inf")
+            )
             return {
                 **keying,
                 "trace_path": str(self.path),
@@ -1651,8 +1751,8 @@ class TraceLiveness:
                 # harvester already applies.
                 "trace_active": bool(
                     idle_threshold > 0
-                    and 0 <= now_epoch - mtime < idle_threshold
                     and (self.started_epoch is None or mtime >= self.started_epoch)
+                    and 0 <= trace_age_mono < idle_threshold
                 ),
             }
         except (OSError, RuntimeError, ValueError):
@@ -1786,6 +1886,16 @@ def _foreign_wait_owns_question_marker(
     return _worker_wait_marker_matches(marker, live_any_wait, dispatch_id)
 
 
+def _worker_wait_deadline_is_live(wait_state: dict | None, *, now_mono: float) -> bool:
+    deadline_ns = wait_state.get("deadline_awake_mono_ns") if wait_state else None
+    return (
+        isinstance(deadline_ns, int)
+        and not isinstance(deadline_ns, bool)
+        and deadline_ns > 0
+        and int(now_mono * 1_000_000_000) < deadline_ns
+    )
+
+
 def _cached_worker_wait_is_valid(
     wait_state: dict | None,
     *,
@@ -1793,18 +1903,16 @@ def _cached_worker_wait_is_valid(
     worker_pid: int,
     worker_pgid: int | None,
 ) -> bool:
-    """Revalidate cached identity/deadline while the mailbox lock is unavailable."""
+    """Revalidate a cached arm while the mailbox is temporarily unreadable."""
     if not wait_state:
         return False
-    deadline_ns = wait_state.get("deadline_awake_mono_ns")
+    if not _worker_wait_deadline_is_live(wait_state, now_mono=now_mono):
+        return False
     waiter_pid = wait_state.get("waiter_pid")
     waiter_token = wait_state.get("waiter_start_token")
     waiter_pgid = wait_state.get("waiter_pgid")
     if (
-        not isinstance(deadline_ns, int)
-        or isinstance(deadline_ns, bool)
-        or int(now_mono * 1_000_000_000) >= deadline_ns
-        or isinstance(waiter_pid, bool)
+        isinstance(waiter_pid, bool)
         or not isinstance(waiter_pid, int)
         or waiter_pid <= 0
         or not isinstance(waiter_token, str)
@@ -1869,6 +1977,7 @@ def post_worker_wait_attention(
     posted: set[tuple[str, int, str]],
     *,
     post_func=None,
+    published_marker: Path | None = None,
 ) -> None:
     """Bridge a non-terminal waiting question without claiming a listener lease."""
     if (
@@ -1882,6 +1991,9 @@ def post_worker_wait_attention(
         return
     key = (wait_id, line, str(marker["kind"]))
     if not wait_id or line <= 0 or key in posted:
+        return
+    if published_marker is not None and published_marker.exists():
+        posted.add(key)
         return
     try:
         if post_func is None:
@@ -1923,11 +2035,562 @@ def post_worker_wait_attention(
                     )
                 ),
             )
+        if published_marker is not None:
+            goalflight_steer_mailbox.write_worker_question_published_marker(
+                published_marker
+            )
         posted.add(key)
     except Exception:
         # A stable event id makes the next poll an idempotent retry if the
         # carrier write succeeded before a later delivery step failed.
         return
+
+
+def _promote_resumed_worker_reply_settlements(
+    outbox_dir: Path,
+    dispatch_id: str,
+) -> None:
+    """Make a resumed child's reply receipt visible to sibling resumes."""
+    record = goalflight_ledger.read_record(dispatch_id)
+    if (
+        not isinstance(record, dict)
+        or goalflight_ledger.record_is_unreadable(record)
+        or record.get("dispatch_id") != dispatch_id
+    ):
+        return
+    project_root_value = str(record.get("project_root") or "").strip()
+    if not project_root_value:
+        return
+    project_root = str(Path(project_root_value).resolve(strict=False))
+    ancestors: dict[str, dict] = {}
+    visited = {dispatch_id}
+    current = record
+    while True:
+        parent_id = str(current.get("parent_dispatch_id") or "").strip()
+        if not parent_id or parent_id in visited:
+            break
+        visited.add(parent_id)
+        parent = goalflight_ledger.read_record(parent_id)
+        parent_project_root = (
+            str(parent.get("project_root") or "").strip()
+            if isinstance(parent, dict)
+            else ""
+        )
+        if (
+            not isinstance(parent, dict)
+            or goalflight_ledger.record_is_unreadable(parent)
+            or parent.get("dispatch_id") != parent_id
+            or not parent_project_root
+            or str(Path(parent_project_root).resolve(strict=False)) != project_root
+        ):
+            break
+        ancestors[parent_id] = parent
+        current = parent
+
+    for settlement_path in _worker_question_outbox_paths(
+        outbox_dir,
+        suffix=".settled.json",
+    ):
+        wait_id = settlement_path.name[: -len(".settled.json")]
+        try:
+            raw = json.loads(settlement_path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            _LOGGER.warning(
+                "ignoring unreadable resumed worker question settlement %s: %s",
+                settlement_path,
+                exc,
+            )
+            continue
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        parent_id = raw.get("dispatch_id")
+        parent = ancestors.get(parent_id) if isinstance(parent_id, str) else None
+        if (
+            parent is None
+            or raw.get("state") != "reply"
+            or raw.get("wait_id") != wait_id
+        ):
+            continue
+        parent_outbox = goalflight_dispatch_paths.worker_question_outbox_dir(
+            parent_id,
+            dispatch_dir=outbox_dir.parent,
+        )
+        try:
+            request_value = json.loads(
+                (parent_outbox / f"{wait_id}.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        request = goalflight_steer_mailbox.validate_worker_question_request(
+            request_value,
+            dispatch_id=parent_id,
+        )
+        if (
+            request is None
+            or request["wait_id"] != wait_id
+            or request["attempt_id"] != raw.get("attempt_id")
+        ):
+            continue
+        settlement = goalflight_steer_mailbox.read_worker_question_settlement(
+            outbox_dir,
+            request,
+        )
+        if settlement is None or settlement.get("state") != "reply":
+            continue
+        reply_seq = settlement.get("reply_seq")
+        if (
+            isinstance(reply_seq, bool)
+            or not isinstance(reply_seq, int)
+            or reply_seq <= 0
+            or (wait_id, reply_seq)
+            in goalflight_steer_mailbox.worker_question_reply_receipts(parent_outbox)
+        ):
+            continue
+        parent_mailbox = goalflight_dispatch_paths.steer_file(parent_id)
+        entries = goalflight_steer_mailbox.read_steer_entries(
+            parent_mailbox,
+            lock_timeout_secs=0.05,
+            quarantine_errors=False,
+        )
+        recoverable = goalflight_steer_mailbox._recoverable_worker_wait_reply(
+            entries,
+            dispatch_id=parent_id,
+            attempt_id=request["attempt_id"],
+            consumed_reply_receipts=set(),
+            resume_wait_id=wait_id,
+            expected_question_kind=request["question_kind"] or None,
+            question_text=request["question"],
+        )
+        if recoverable is None or recoverable[1].get("seq") != reply_seq:
+            continue
+        goalflight_steer_mailbox.write_worker_question_settlement(
+            parent_outbox,
+            dispatch_id=parent_id,
+            attempt_id=request["attempt_id"],
+            wait_id=wait_id,
+            state="reply",
+            deadline_at=request["deadline_at"],
+            reply_seq=reply_seq,
+        )
+
+
+def consume_worker_question_outbox(
+    outbox_dir: Path,
+    mailbox: Path,
+    dispatch_id: str,
+    *,
+    worker_pid: int,
+    worker_start_token: str | None,
+    worker_pgid: int | None,
+    active_attempt_id: str | None = None,
+    markers: list[dict] | None = None,
+    consumed_reply_receipts: set[tuple[str, int]] | None = None,
+    last_mtime_ns: int | None = None,
+    scan_state: dict[str, object] | None = None,
+    publish_func=None,
+) -> int | None:
+    """Admit current-attempt requests and consume their durable settlements."""
+    try:
+        current_mtime_ns = outbox_dir.stat().st_mtime_ns
+    except OSError:
+        return last_mtime_ns
+    wait_ids = tuple(
+        wait_id
+        for marker in markers or []
+        if (wait_id := _worker_question_wait_id_from_marker(marker)) is not None
+    )
+    if (
+        last_mtime_ns == current_mtime_ns
+        and not wait_ids
+        and not (scan_state or {}).get("more")
+    ):
+        return current_mtime_ns
+    consumed_reply_receipts = consumed_reply_receipts or set()
+    retry_pending = False
+    try:
+        _promote_resumed_worker_reply_settlements(outbox_dir, dispatch_id)
+    except (OSError, RuntimeError, TimeoutError, ValueError):
+        retry_pending = True
+    mailbox_entries: list[dict] | None = None
+    for request_path in _worker_question_outbox_paths(
+        outbox_dir,
+        suffix=".json",
+        exclude_settled=True,
+        wait_ids=wait_ids,
+        scan_state=scan_state,
+    ):
+        marker_path = request_path.with_suffix(".published")
+        rejected_marker_path = request_path.with_suffix(".rejected")
+        if rejected_marker_path.exists():
+            continue
+        try:
+            raw = json.loads(request_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        request = goalflight_steer_mailbox.validate_worker_question_request(
+            raw,
+            dispatch_id=dispatch_id,
+        )
+        if request is None or request_path.name != f"{request['wait_id']}.json":
+            continue
+        if active_attempt_id is not None and request["attempt_id"] != active_attempt_id:
+            continue
+        question_kind = request.get("question_kind") or ""
+        if not question_kind:
+            wait_suffix = f"[wait-id:{request['wait_id']}]"
+            matched_marker = next(
+                (
+                    marker
+                    for marker in reversed(markers or [])
+                    if marker.get("kind") in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS
+                    and wait_suffix in str(marker.get("text") or "")
+                ),
+                None,
+            )
+            question_kind = str((matched_marker or {}).get("kind") or "")
+        if question_kind not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
+            retry_pending = not marker_path.exists()
+            continue
+        settlement = goalflight_steer_mailbox.read_worker_question_settlement(
+            outbox_dir,
+            request,
+        )
+        absolute_deadline = datetime.fromisoformat(
+            request["deadline_at"].replace("Z", "+00:00")
+        )
+        deadline_mono = active_monotonic() + (
+            absolute_deadline - datetime.now(timezone.utc)
+        ).total_seconds()
+        try:
+            with goalflight_steer_mailbox._worker_question_settlement_lock(
+                outbox_dir,
+                request["wait_id"],
+            ):
+                if rejected_marker_path.exists():
+                    continue
+                mailbox_entries = goalflight_steer_mailbox.read_steer_entries(
+                    mailbox,
+                    lock_timeout_secs=0.05,
+                    quarantine_errors=False,
+                )
+                arm = next(
+                    (
+                        entry
+                        for entry in reversed(mailbox_entries)
+                        if entry.get("direction") == goalflight_steer_mailbox.TO_CONTROLLER
+                        and entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND
+                        and entry.get("dispatch_id") == dispatch_id
+                        and entry.get("question_id") == request["wait_id"]
+                        and isinstance(entry.get("context"), dict)
+                        and entry["context"].get("attempt_id") == request["attempt_id"]
+                    ),
+                    None,
+                )
+                if arm is None:
+                    try:
+                        arm = goalflight_steer_mailbox.append_worker_wait_started(
+                            mailbox,
+                            dispatch_id=dispatch_id,
+                            timeout_secs=request["timeout_s"],
+                            question_kind=question_kind,
+                            question_text=request["question"],
+                            wait_id=request["wait_id"],
+                            attempt_id=request["attempt_id"],
+                            # Keep publication and controller replies available for
+                            # a request with a bad deadline, but do not bind its arm
+                            # to this worker or grant it an idle exemption.
+                            waiter_pid=(
+                                worker_pid if request.get("_deadline_at_valid") else 0
+                            ),
+                            waiter_start_token=(
+                                worker_start_token
+                                if request.get("_deadline_at_valid")
+                                else None
+                            ),
+                            waiter_pgid=(
+                                worker_pgid if request.get("_deadline_at_valid") else None
+                            ),
+                            deadline_mono=deadline_mono,
+                            deadline_at=request["deadline_at"],
+                            lock_timeout_secs=0.05,
+                            consumed_reply_receipts=consumed_reply_receipts,
+                        )
+                    except ValueError as exc:
+                        # A live earlier arm is a permanent refusal for this wait
+                        # id. Persist it so worker exit cannot pin the watcher in
+                        # an endless publication retry.
+                        reason = str(exc)
+                        if reason.startswith("worker wait renewal refused:"):
+                            prior = goalflight_steer_mailbox._latest_worker_wait_arm(
+                                mailbox_entries,
+                                dispatch_id,
+                            )
+                            prior_wait_id = str((prior or {}).get("question_id") or "")
+                            prior_context = (prior or {}).get("context")
+                            if (
+                                prior_wait_id
+                                and isinstance(prior_context, dict)
+                                and goalflight_steer_mailbox._worker_wait_settlement(
+                                    mailbox_entries,
+                                    wait_id=prior_wait_id,
+                                    after_seq=int((prior or {}).get("seq") or 0),
+                                )
+                                is None
+                            ):
+                                import goalflight_messages
+
+                                goalflight_messages.post_worker_wait_blocked(
+                                    dispatch_id=dispatch_id,
+                                    wait_id=prior_wait_id,
+                                    rejected_wait_id=request["wait_id"],
+                                    reason=reason,
+                                    reply_command=goalflight_steer_mailbox.worker_wait_reply_command(
+                                        dispatch_id,
+                                        prior_wait_id,
+                                        str(prior_context.get("question_kind") or ""),
+                                    ),
+                                )
+                        goalflight_steer_mailbox.write_worker_question_rejected_marker(
+                            rejected_marker_path,
+                            reason,
+                        )
+                        mailbox_entries = None
+                        continue
+                    mailbox_entries.append(arm)
+            if not marker_path.exists():
+                publish = publish_func or goalflight_steer_mailbox.publish_worker_wait_question
+                publish(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "wait_id": request["wait_id"],
+                        "question_kind": question_kind,
+                        "question_text": request["question"],
+                        "reply_command": goalflight_steer_mailbox.worker_wait_reply_command(
+                            dispatch_id,
+                            request["wait_id"],
+                            question_kind,
+                        ),
+                        "question_marker_text": goalflight_steer_mailbox.worker_wait_question_marker_text(
+                            dispatch_id,
+                            request["question"],
+                            request["wait_id"],
+                            question_kind=question_kind,
+                        ),
+                        "arm": arm,
+                    }
+                )
+                goalflight_steer_mailbox.write_worker_question_published_marker(marker_path)
+            if settlement is not None:
+                arm_seq = int(arm["seq"])
+                if goalflight_steer_mailbox._worker_wait_settlement(
+                    mailbox_entries,
+                    wait_id=request["wait_id"],
+                    after_seq=arm_seq,
+                ) is None:
+                    try:
+                        goalflight_steer_mailbox.append_worker_wait_ended(
+                            mailbox,
+                            arm,
+                            decision=settlement["state"],
+                            reply_seq=(
+                                settlement.get("reply_seq")
+                                if settlement["state"] == "reply"
+                                else None
+                            ),
+                            context={
+                                "reason": "worker_outbox_settlement",
+                                "worker_settled": settlement["state"] == "timeout",
+                            },
+                            lock_timeout_secs=0.05,
+                        )
+                    except goalflight_steer_mailbox.WorkerWaitReplyPending:
+                        pass
+                    except ValueError as exc:
+                        if "already settled" not in str(exc):
+                            raise
+            mailbox_entries = None
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            retry_pending = True
+            continue
+        except Exception as exc:
+            if not goalflight_steer_mailbox.is_carrier_error(exc):
+                raise
+            retry_pending = True
+    # Keep the pre-scan stamp: a request or published marker created during
+    # this pass must be visible to the next poll. Unpublished valid requests
+    # also force a retry after transient lock/carrier failures.
+    return None if retry_pending or (scan_state or {}).get("more") else current_mtime_ns
+
+
+def _worker_question_outbox_paths(
+    outbox_dir: Path,
+    *,
+    suffix: str,
+    exclude_settled: bool = False,
+    wait_ids: tuple[str, ...] = (),
+    scan_state: dict[str, object] | None = None,
+) -> tuple[Path, ...]:
+    """Return direct request paths and one resumable directory slice."""
+    paths = {
+        Path(outbox_dir) / f"{wait_id}{suffix}"
+        for wait_id in wait_ids
+        if wait_id and not any(char in wait_id for char in "\r\n/\\")
+    }
+    if scan_state is None:
+        try:
+            with os.scandir(outbox_dir) as entries:
+                for entry in itertools.islice(
+                    entries,
+                    _WORKER_QUESTION_OUTBOX_MAX_SCAN_ENTRIES,
+                ):
+                    if entry.name.endswith(suffix) and not (
+                        exclude_settled and entry.name.endswith(".settled.json")
+                    ):
+                        paths.add(Path(entry.path))
+        except OSError:
+            pass
+        return tuple(sorted(paths))
+
+    directory_key = str(Path(outbox_dir))
+    if scan_state.get("outbox_dir") != directory_key:
+        prior = scan_state.get("iterator")
+        if prior is not None:
+            with contextlib.suppress(Exception):
+                prior.close()
+        scan_state.clear()
+        scan_state["outbox_dir"] = directory_key
+    try:
+        current_mtime_ns = Path(outbox_dir).stat().st_mtime_ns
+    except OSError:
+        scan_state["more"] = False
+        return tuple(sorted(paths))
+    entries = scan_state.get("iterator")
+    if entries is None:
+        try:
+            entries = os.scandir(outbox_dir)
+        except OSError:
+            scan_state["more"] = False
+            return tuple(sorted(paths))
+        scan_state["iterator"] = entries
+        scan_state["scan_mtime_ns"] = current_mtime_ns
+    scanned = 0
+    exhausted = False
+    while scanned < _WORKER_QUESTION_OUTBOX_MAX_SCAN_ENTRIES:
+        try:
+            entry = next(entries)
+        except StopIteration:
+            exhausted = True
+            break
+        except OSError:
+            exhausted = True
+            break
+        scanned += 1
+        if entry.name.endswith(suffix) and not (
+            exclude_settled and entry.name.endswith(".settled.json")
+        ):
+            paths.add(Path(entry.path))
+    if exhausted:
+        with contextlib.suppress(Exception):
+            entries.close()
+        scan_state.pop("iterator", None)
+        try:
+            current_mtime_ns = Path(outbox_dir).stat().st_mtime_ns
+        except OSError:
+            pass
+        scan_state["more"] = current_mtime_ns != scan_state.pop(
+            "scan_mtime_ns", current_mtime_ns
+        )
+    else:
+        scan_state["more"] = True
+    return tuple(sorted(paths))
+
+
+def _worker_question_wait_id_from_marker(marker: dict | None) -> str | None:
+    if not marker or marker.get("kind") not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
+        return None
+    marker_text = str(marker.get("text") or "")
+    _prefix, separator, suffix = marker_text.rpartition(" [wait-id:")
+    if not separator or not suffix.endswith("]"):
+        return None
+    wait_id = suffix[:-1]
+    if not wait_id or any(char in wait_id for char in "\r\n/\\"):
+        return None
+    return wait_id
+
+
+def consume_worker_journal_outbox(
+    outbox_dir: Path,
+    dispatch_id: str,
+    *,
+    max_records: int = 16,
+    budget_s: float = 0.2,
+) -> int:
+    """Project one bounded slice from this worker's journal delivery outbox."""
+    import goalflight_messages
+
+    return goalflight_messages.project_worker_journal_outbox(
+        dispatch_id,
+        outbox_dir=outbox_dir,
+        messages_dir=goalflight_messages.default_messages_dir(),
+        max_records=max_records,
+        budget_s=budget_s,
+    )
+
+
+def _outbox_question_for_marker(
+    outbox_dir: Path,
+    dispatch_id: str,
+    marker: dict | None,
+    *,
+    active_attempt_id: str | None = None,
+) -> str | None:
+    if not marker or marker.get("kind") not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
+        return None
+    wait_id = _worker_question_wait_id_from_marker(marker)
+    request_paths = (
+        (Path(outbox_dir) / f"{wait_id}.json",)
+        if wait_id is not None
+        else _worker_question_outbox_paths(
+            outbox_dir,
+            suffix=".json",
+            exclude_settled=True,
+        )
+    )
+    for request_path in request_paths:
+        try:
+            raw = json.loads(request_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        request = goalflight_steer_mailbox.validate_worker_question_request(
+            raw,
+            dispatch_id=dispatch_id,
+        )
+        if request is None or request_path.name != f"{request['wait_id']}.json":
+            continue
+        if goalflight_steer_mailbox.worker_question_rejection_path(
+            outbox_dir, request["wait_id"]
+        ).exists():
+            continue
+        if active_attempt_id is not None and request["attempt_id"] != active_attempt_id:
+            continue
+        if request.get("question_kind") and request["question_kind"] != marker.get("kind"):
+            continue
+        expected_text = goalflight_steer_mailbox.worker_wait_question_marker_text(
+            dispatch_id,
+            request["question"],
+            request["wait_id"],
+            question_kind=str(request.get("question_kind") or marker.get("kind") or ""),
+        )
+        if marker.get("text") != expected_text:
+            continue
+        if goalflight_steer_mailbox.read_worker_question_settlement(
+            outbox_dir,
+            request,
+        ) is None:
+            return request["wait_id"]
+    return None
 
 
 def _trace_ledger_account(dispatch_id: str | None) -> str | None:
@@ -2078,7 +2741,10 @@ def _finish_existing_ledger(
     codex_dispatch_home_resolved: bool = False,
     codex_session_id: str | None = None,
     terminal_marker: dict | None = None,
+    attention_marker: dict | None = None,
+    worker_identity_reason: object = None,
     headline: str | None = None,
+    dispatch_record: dict | None = None,
 ) -> dict | None:
     if not dispatch_id or not state:
         return None
@@ -2088,6 +2754,31 @@ def _finish_existing_ledger(
         return None
     if state == "watcher_stopped" and worker_still_alive is True:
         return None
+    worker_liveness = goalflight_terminal.worker_liveness_from_probe(
+        worker_still_alive, worker_identity_reason
+    )
+    if goalflight_terminal.blocked_outcome_is_provisional(
+        {
+            "state": state,
+            "terminal_marker": terminal_marker,
+            "attention_marker": (
+                attention_marker
+                if isinstance(attention_marker, dict)
+                and attention_marker.get("kind") == "BLOCKED"
+                else terminal_marker
+                if isinstance(terminal_marker, dict)
+                and terminal_marker.get("kind") == "BLOCKED"
+                else None
+            ),
+            "reason": reason,
+            "worker_identity_reason": worker_identity_reason,
+        },
+        worker_liveness,
+    ):
+        return {
+            "type": "TerminalCommitDeferred",
+            "message": "blocked outcome remains provisional while worker liveness is not dead",
+        }
     emitter_reason: object = reason
     headline_text = headline.strip() if isinstance(headline, str) else ""
     if (
@@ -2116,10 +2807,22 @@ def _finish_existing_ledger(
     try:
         path = goalflight_ledger.record_path(dispatch_id, create=False)
         if not path.exists():
+            dispatch_project_root = (
+                str(dispatch_record.get("project_root") or "").strip()
+                if isinstance(dispatch_record, dict)
+                and dispatch_record.get("dispatch_id") == dispatch_id
+                else ""
+            )
+            project_root = dispatch_project_root or str(Path.cwd())
             committed = goalflight_ledger.commit_terminal_authority(
                 {
                     "dispatch_id": dispatch_id,
-                    "project_root": str(Path.cwd()),
+                    "project_root": project_root,
+                    **goalflight_ledger.controller_attribution_from_active_lease(
+                        project_root,
+                        dispatch_id=dispatch_id,
+                        dispatch_record=dispatch_record,
+                    ),
                 },
                 state=str(state),
                 reason=emitter_reason,
@@ -2267,6 +2970,10 @@ def _status_snapshot(payload: dict) -> dict:
         "codex_home_owner_dispatch_id",
         "lock_holder",
         "parent_dispatch_id",
+        "prelaunch_failure",
+        "worker_cwd",
+        "worktree_path",
+        "worktree_seat",
         "worktree_branch",
         "worktree_head",
         "worktree_keep_ref",
@@ -2486,6 +3193,29 @@ def _terminal_marker_matches_dispatch(
         marker, expected, require_terminated=require_terminated
     ):
         return True
+    embedded_dispatch_id = str(marker.get("dispatch_id") or "").strip()
+    marker_dispatch_id = embedded_dispatch_id
+    marker_suffix = ""
+    if not marker_dispatch_id:
+        marker_dispatch_id, marker_suffix = _payload_leading_token(
+            _strip_marker_decoration(str(marker.get("text") or "")).strip()
+        )
+    lineage_id_terminated = bool(
+        marker_suffix
+        and (
+            marker_suffix[0].isspace()
+            or marker_suffix[0] in _IDENTITY_PAYLOAD_SEPARATORS
+        )
+    )
+    lineage_termination_ok = (
+        not require_terminated or bool(embedded_dispatch_id) or lineage_id_terminated
+    )
+    if (
+        marker_dispatch_id
+        and lineage_termination_ok
+        and _dispatches_share_resume_lineage(marker_dispatch_id, expected)
+    ):
+        return True
     if marker.get("kind") not in goalflight_terminal.ATTENTION_MARKERS:
         return False
     embedded = str(marker.get("dispatch_id") or "").strip()
@@ -2495,6 +3225,34 @@ def _terminal_marker_matches_dispatch(
         return False
     text = _strip_marker_decoration(str(marker.get("text") or "")).strip()
     return not _attention_payload_names_foreign_dispatch(text, expected)
+
+
+def _dispatches_share_resume_lineage(left_id: str, right_id: str) -> bool:
+    """Accept terminal ids linked by resume ancestry or a shared engine session."""
+    if not left_id or not right_id or left_id == right_id:
+        return left_id == right_id
+    records = {
+        dispatch_id: _load_dispatch_record(dispatch_id)
+        for dispatch_id in (left_id, right_id)
+    }
+    if any(not isinstance(record, dict) for record in records.values()):
+        return False
+
+    def ancestry(dispatch_id: str) -> set[str]:
+        seen: set[str] = set()
+        current = dispatch_id
+        while current and current not in seen:
+            seen.add(current)
+            record = records.get(current) or _load_dispatch_record(current)
+            current = str(record.get("parent_dispatch_id") or "").strip() if record else ""
+        return seen
+
+    if ancestry(left_id) & ancestry(right_id):
+        return True
+    left, right = records[left_id], records[right_id]
+    left_session = str(left.get("codex_session_id") or "").strip()
+    right_session = str(right.get("codex_session_id") or "").strip()
+    return bool(left_session and left_session == right_session)
 
 
 def _final_terminal_marker_from_line(
@@ -2516,7 +3274,7 @@ def _final_terminal_marker_from_line(
     if _is_diff_context_line(raw_line) and not allow_prefixed_marker:
         return None
     stripped = raw_line.strip()
-    if not stripped:
+    if not stripped or len(stripped) > 1000:
         return None
     if allow_prefixed_marker and MARKER_VOCAB_BULLET_RE.match(stripped):
         return None
@@ -2673,9 +3431,11 @@ def _attention_kind_from_last_marker(last_marker: object) -> str | None:
 
 
 def worktree_work_evidence(worker_cwd: object, *, since_epoch: float | None = None) -> str | None:
-    """Did this dispatch leave work in its seat? "dirty" / "committed" / None.
+    """Did this dispatch leave work in its seat?
 
-    None means the question could not be answered -- never "there is none".
+    ``dirty`` / ``committed`` are positive evidence, and ``None`` means a
+    successful probe found no work. ``worker_cwd_unavailable`` and
+    ``worktree_probe_failed`` keep measurement failures distinct from absence.
 
     Why this exists: a terminal marker is only accepted when it carries the
     dispatch id, which is deliberate (a generic marker from any process could
@@ -2692,38 +3452,40 @@ def worktree_work_evidence(worker_cwd: object, *, since_epoch: float | None = No
     the seat's contents can be harvested instead of discarded.
     """
     if not worker_cwd:
-        return None
-    root = Path(worker_cwd)
+        raise ValueError("dispatch record is missing worker_cwd")
+    root = Path(worker_cwd).expanduser()
+    if not root.is_absolute():
+        raise ValueError("recorded worker_cwd is not absolute")
     try:
         if not root.is_dir():
-            return None
+            return "worker_cwd_unavailable"
     except OSError:
-        return None
+        return "worker_cwd_unavailable"
     try:
         dirty = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return "worktree_probe_failed"
     if dirty.returncode != 0:
-        return None
+        return "worktree_probe_failed"
     if dirty.stdout.strip():
         return "dirty"
     if since_epoch is None:
-        return None
+        return "worktree_probe_failed"
     try:
         head = subprocess.run(
             ["git", "-C", str(root), "log", "-1", "--format=%ct"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return "worktree_probe_failed"
     if head.returncode != 0:
-        return None
+        return "worktree_probe_failed"
     stamp = head.stdout.strip()
     if not stamp.isdigit():
-        return None
+        return "worktree_probe_failed"
     # A commit made after this dispatch started is this dispatch's work.
     return "committed" if int(stamp) >= int(since_epoch) else None
 
@@ -2743,7 +3505,14 @@ def _worker_dead_no_marker_reason(
 
     def _no_evidence() -> str:
         """`no_evidence` means we looked in the SEAT too, and found none."""
-        found = worktree_work_evidence(worker_cwd, since_epoch=started_epoch)
+        try:
+            found = worktree_work_evidence(worker_cwd, since_epoch=started_epoch)
+        except ValueError as exc:
+            return f"worker_dead_no_terminal_marker:death_cause={exc}"
+        if found == "worker_cwd_unavailable":
+            return "worker_dead_no_terminal_marker:death_cause=worker_cwd_unavailable"
+        if found == "worktree_probe_failed":
+            return "worker_dead_no_terminal_marker:death_cause=worktree_probe_failed"
         if found:
             return f"worker_dead_no_terminal_marker:death_cause=unharvested_work_{found}"
         return "worker_dead_no_terminal_marker:death_cause=no_evidence"
@@ -2798,6 +3567,10 @@ def _worker_dead_no_marker_reason(
             attention_kind = _attention_kind_from_last_marker(last_marker)
         if attention_kind:
             cause = f"attention_marker:{attention_kind}"
+        else:
+            # A concrete tail cause stands on its own. Only the no-evidence
+            # fallback must inspect the seat before it can claim absence.
+            return _no_evidence()
     return f"worker_dead_no_terminal_marker:death_cause={cause}"
 
 
@@ -3029,7 +3802,7 @@ def verify_indeterminate_worker_scope(
     expected_identity: dict | None,
 ) -> tuple[int | None, str]:
     """Verify a destructive cleanup scope while its fine-identity leader lives."""
-    current_identity = goalflight_ledger.process_identity(pid)
+    current_identity = goalflight_compat.process_start_identity(pid)
     identity_ok, identity_reason = goalflight_ledger.compare_fine_process_identities(
         pid, expected_identity, current_identity
     )
@@ -3063,8 +3836,12 @@ def terminate_indeterminate_worker(
 ) -> dict:
     """Bound an unresolved worker before its managed capacity is released."""
     supplied_pgid = int(pgid or 0)
-    current_identity = goalflight_ledger.process_identity(pid)
-    if current_identity is None:
+    current_pgid, identity_reason = verify_indeterminate_worker_scope(
+        pid,
+        pgid,
+        expected_identity,
+    )
+    if current_pgid is None and identity_reason == "dead":
         if supplied_pgid > 1 and _pgroup_alive(supplied_pgid):
             return {
                 "worker_alive": True,
@@ -3083,10 +3860,6 @@ def terminate_indeterminate_worker(
                 "worker_termination_identity_reason": "dead",
                 "worker_termination_confirmed": True,
             }
-    else:
-        current_pgid, identity_reason = verify_indeterminate_worker_scope(
-            pid, pgid, expected_identity
-        )
     if current_pgid is None:
         return {
             "worker_alive": True,
@@ -3136,25 +3909,25 @@ def terminate_indeterminate_worker(
             "worker_termination_confirmed": True,
         }
 
-    # The successful group TERM established ownership of this still-allocated
-    # PGID while the leader's fine identity matched. If the leader exited, the
-    # same group remains the safe target for TERM-resistant descendants.
-    current_identity = goalflight_ledger.process_identity(pid)
-    leader_ok, leader_reason = goalflight_ledger.compare_fine_process_identities(
-        pid, expected_identity, current_identity
+    # A remembered PGID is never sufficient authority for a second signal.
+    # Recheck both the exact leader incarnation and its current group directly
+    # before SIGKILL; if the leader exited, stop and retain indeterminate state.
+    verified_pgid, leader_reason = verify_indeterminate_worker_scope(
+        pid,
+        current_pgid,
+        expected_identity,
     )
-    leader_gone = current_identity is None or goalflight_compat.pid_is_zombie(pid) is True
-    if not leader_ok and not leader_gone:
+    if verified_pgid is None or verified_pgid != current_pgid:
         return {
             "worker_alive": True,
             "worker_disposition": "indeterminate_cleanup_failed",
             "worker_termination_identity_reason": leader_reason,
             "worker_termination_signal_scope": "verified_process_group",
             "worker_termination_signals": signals_sent,
-            "worker_termination_error": "worker identity changed before SIGKILL",
+            "worker_termination_error": "worker leader identity or process group not reverified before SIGKILL",
         }
     try:
-        os.killpg(current_pgid, signal.SIGKILL)
+        os.killpg(verified_pgid, signal.SIGKILL)
         signals_sent.append("SIGKILL")
     except OSError as exc:
         return {
@@ -3192,8 +3965,9 @@ def release_indeterminate_capacity(
     *,
     worker_disposition: dict,
     reason: str,
+    state: str = LIVENESS_INDETERMINATE_STATE,
 ) -> dict:
-    """Release the durable managed lease only after the worker is gone."""
+    """Release a managed lease after an identity-verified worker is gone."""
     lease_id = dispatch_record.get("lease_id") if isinstance(dispatch_record, dict) else None
     if not lease_id:
         return {"capacity_lease_disposition": "no_managed_lease"}
@@ -3226,14 +4000,14 @@ def release_indeterminate_capacity(
             code = goalflight_capacity.cmd_release(
                 argparse.Namespace(
                     lease_id=str(lease_id),
-                    state=LIVENESS_INDETERMINATE_STATE,
+                    state=state,
                     reason=reason,
                     keep=True,
                 )
             )
         if code == 0:
             result["capacity_lease_disposition"] = "released"
-            result["capacity_lease_state"] = LIVENESS_INDETERMINATE_STATE
+            result["capacity_lease_state"] = state
         else:
             result["capacity_lease_disposition"] = "release_failed"
             result["capacity_lease_release_error"] = f"capacity release exited {code}"
@@ -4117,8 +4891,13 @@ def _scan_final_terminal_marker(
     kimi_output: bool = False,
     expected_dispatch_id: str | None = None,
     rendered_response: bool = False,
-    rendered_response_start: int | None = None,
+    rendered_response_start: int | set[int] | None = None,
 ) -> dict | None:
+    rendered_response_starts = (
+        rendered_response_start
+        if isinstance(rendered_response_start, set)
+        else ({rendered_response_start} if rendered_response_start is not None else set())
+    )
     fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
     last_success: dict | None = None
@@ -4129,7 +4908,7 @@ def _scan_final_terminal_marker(
     previous_stripped = ""
     before_fence = (None, None, None, None, False)
     for idx, line in enumerate(lines, start=1):
-        if idx == rendered_response_start:
+        if idx in rendered_response_starts:
             if fence.in_fence:
                 last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
             fence = goalflight_terminal.MarkdownFenceTracker()
@@ -4245,11 +5024,16 @@ def _stream_final_terminal_marker(
     ignore_fences: bool,
     kimi_output: bool,
     expected_dispatch_id: str,
-    rendered_response_start: int | None = None,
+    rendered_response_start: int | set[int] | None = None,
 ) -> tuple[dict | None, bool]:
     """Scan a completed tail from disk without materializing the whole file."""
 
     prompt_buffer_lines = PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(prompt_prefix)
+    rendered_response_starts = (
+        rendered_response_start
+        if isinstance(rendered_response_start, set)
+        else ({rendered_response_start} if rendered_response_start is not None else set())
+    )
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         line_iter = iter(_iter_bounded_text_lines(handle))
         leading_records: list[tuple[int, str, bool]] = []
@@ -4283,7 +5067,7 @@ def _stream_final_terminal_marker(
             nonlocal last_output_line_no, previous_stripped
             nonlocal before_fence
             nonlocal fence, rendered_response, echo_anchor_found, prefix_unbalanced
-            if line_no == rendered_response_start:
+            if line_no in rendered_response_starts:
                 prefix_unbalanced = fence.in_fence
                 if fence.in_fence:
                     last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
@@ -4369,19 +5153,26 @@ def _stream_final_terminal_marker(
 
         records = itertools.chain(leading_records, line_iter)
         for line_no, line, oversized in records:
-            if line_no == rendered_response_start:
-                # The response is a new prompt-echo search window too. Keep
-                # the same bounded lookahead used at the start of the file.
-                response_records = [(line_no, line, oversized)]
-                response_records.extend(itertools.islice(records, max(0, prompt_buffer_lines - 1)))
-                response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
-                    [item[1] for item in response_records], prompt_prefix
-                )
-                prompt_echo_lines.update(line_no - 1 + idx for idx in response_echoes)
-                for response_line_no, response_line, response_oversized in response_records:
-                    consume(response_line, response_line_no, oversized=response_oversized)
-            else:
+            if line_no not in rendered_response_starts:
                 consume(line, line_no, oversized=oversized)
+                continue
+            # Each unverified candidate starts a possible response context.
+            # Keep the usual bounded prompt-echo scan for each reset point.
+            response_records = [(line_no, line, oversized)]
+            response_records.extend(itertools.islice(records, max(0, prompt_buffer_lines - 1)))
+            for offset, (
+                response_line_no, _response_line, _response_oversized
+            ) in enumerate(response_records):
+                if response_line_no in rendered_response_starts:
+                    echo_records = response_records[offset:offset + prompt_buffer_lines]
+                    response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
+                        [item[1] for item in echo_records], prompt_prefix
+                    )
+                    prompt_echo_lines.update(
+                        response_line_no - 1 + idx for idx in response_echoes
+                    )
+            for response_line_no, response_line, response_oversized in response_records:
+                consume(response_line, response_line_no, oversized=response_oversized)
     return (
         _select_dead_path_terminal(
             last_success, last_attention, last_output_line_no, last_blocked, last_completed
@@ -4397,7 +5188,7 @@ def _full_file_terminal_marker(
     suppress_unfenced_prompt_markers: bool,
     kimi_output: bool,
     expected_dispatch_id: str,
-    rendered_response_start: int | None = None,
+    rendered_response_start: int | set[int] | None = None,
 ) -> dict | None:
     terminal, fence_unbalanced = _stream_final_terminal_marker(
         path,
@@ -4426,7 +5217,13 @@ def _full_file_terminal_marker(
     return terminal
 
 
-def _rendered_response_boundary(records, prompt_prefix: list[str]) -> tuple[int, int] | None:
+def _rendered_response_boundary(
+    records,
+    prompt_prefix: list[str],
+    *,
+    candidate_starts: list[int] | None = None,
+    total_lines: list[int] | None = None,
+) -> tuple[int, int] | None:
     """Locate an unquoted final renderer footer without losing large-tail context."""
     records = iter(records)
     leading = list(itertools.islice(
@@ -4435,7 +5232,7 @@ def _rendered_response_boundary(records, prompt_prefix: list[str]) -> tuple[int,
     echo_lines, _anchor, _prompt_lines = _prompt_echo_scan(
         [line for _number, line, _oversized in leading], prompt_prefix
     )
-    footer = None
+    footer_candidates: list[int] = []
     fenced_footer = None
     fenced_footer_eligible = False
     tool_fence = False
@@ -4443,7 +5240,16 @@ def _rendered_response_boundary(records, prompt_prefix: list[str]) -> tuple[int,
     response_fence = goalflight_terminal.MarkdownFenceTracker()
     previous = ""
     line_no = 0
-    for line_no, line, oversized in itertools.chain(leading, records):
+    retained: deque[tuple[int, str, bool]] = deque()
+    retained_bytes = 0
+    for record in itertools.chain(leading, records):
+        record_line_no, record_line, _record_oversized = record
+        retained.append(record)
+        retained_bytes += len(record_line.encode("utf-8")) + 1
+        while retained and retained_bytes > 16 * 1024 * 1024:
+            removed = retained.popleft()
+            retained_bytes -= len(removed[1].encode("utf-8")) + 1
+        line_no, line, oversized = record
         if line_no - 1 in echo_lines:
             previous = ""
             continue
@@ -4460,17 +5266,53 @@ def _rendered_response_boundary(records, prompt_prefix: list[str]) -> tuple[int,
             if fence.in_fence:
                 if not response_quoted:
                     fenced_footer = line_no
-                    fenced_footer_eligible = footer is None or tool_fence
+                    fenced_footer_eligible = not footer_candidates or tool_fence
                     response_fence = goalflight_terminal.MarkdownFenceTracker()
-            else:
-                footer = line_no
-        previous = stripped if not oversized else ""
+            elif not response_quoted:
+                footer_candidates.append(line_no)
+        previous = line.rstrip("\r\n") if not oversized else ""
     if fenced_footer is not None and fenced_footer_eligible and not response_fence.in_fence:
         # Interpret the suffix independently: a balanced response snippet may
         # use bare fences too. A lone closing delimiter from a quoted example
         # instead leaves this suffix unbalanced, so retain the global footer.
-        footer = fenced_footer
-    return (footer, line_no) if footer is not None else None
+        footer_candidates.append(fenced_footer)
+    if not footer_candidates:
+        if total_lines is not None:
+            total_lines.append(line_no)
+        return None
+
+    retained_lines = list(retained)
+    first_retained_line = retained_lines[0][0]
+    footer_candidates = [
+        candidate for candidate in footer_candidates if candidate >= first_retained_line
+    ]
+    if candidate_starts is not None:
+        candidate_starts.extend(sorted({candidate + 1 for candidate in footer_candidates}))
+    if not footer_candidates:
+        if total_lines is not None:
+            total_lines.append(line_no)
+        return None
+    if total_lines is not None:
+        total_lines.append(line_no)
+    rendered_lines = [line for _number, line, _oversized in retained_lines]
+    rendered_bytes = "\n".join(rendered_lines).encode("utf-8")
+    offsets: dict[int, int] = {}
+    rendered_offset = 0
+    for record_line_no, rendered_line in zip(
+        (number for number, _line, _oversized in retained_lines), rendered_lines
+    ):
+        rendered_offset += len(rendered_line.encode("utf-8")) + 1
+        offsets[record_line_no] = rendered_offset
+
+    def verified(candidate_line: int) -> bool:
+        start = offsets[candidate_line]
+        message = rendered_bytes[start:start + 64 * 1024]
+        return bool(message and rendered_bytes.find(message, 0, start) >= 0)
+
+    selected = goalflight_response_boundary.select_response_footer_candidate(
+        sorted(set(footer_candidates)), verified
+    )
+    return (selected, line_no) if selected is not None else None
 
 
 def _final_terminal_marker(
@@ -4512,20 +5354,38 @@ def _final_terminal_marker(
         f.seek(start)
         text = f.read().decode(errors="replace")
     lines = text.splitlines()
-    response_start = None
+    response_start: int | set[int] | None = None
+    unverified_response_starts: set[int] = set()
+    boundary_verified = False
     if recover_final_response and expected_dispatch_id:
+        candidate_starts: list[int] = []
+        total_lines: list[int] = []
         if start > 0:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 boundary = _rendered_response_boundary(
-                    _iter_bounded_text_lines(handle), prompt_prefix
+                    _iter_bounded_text_lines(handle), prompt_prefix,
+                    candidate_starts=candidate_starts,
+                    total_lines=total_lines,
                 )
         else:
             boundary = _rendered_response_boundary(
                 ((idx, line, False) for idx, line in enumerate(lines, 1)),
                 prompt_prefix,
+                candidate_starts=candidate_starts,
+                total_lines=total_lines,
             )
         if boundary:
             response_start = boundary[0] + 1
+            boundary_verified = True
+        elif len(candidate_starts) > 1:
+            line_offset = (total_lines[0] if total_lines else len(lines)) - len(lines)
+            unverified_response_starts = {
+                line_no for line_no in candidate_starts if line_no > line_offset
+            }
+            if len(unverified_response_starts) > 1:
+                response_start = {
+                    line_no - line_offset for line_no in unverified_response_starts
+                }
     if full_file_fallback and start > 0 and expected_dispatch_id:
         # Every bounded candidate can have lost fence or physical-line context,
         # including COMPLETE/RESULT. Select once with full context restored.
@@ -4535,17 +5395,21 @@ def _final_terminal_marker(
             suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
             kimi_output=kimi_output,
             expected_dispatch_id=expected_dispatch_id,
-            rendered_response_start=response_start,
+            rendered_response_start=(
+                boundary[0] + 1 if boundary_verified
+                else unverified_response_starts or None
+            ),
         )
-    if response_start is not None and start > 0:
-        response_start -= boundary[1] - len(lines)
-        response_start = max(1, response_start)
+    if response_start is not None and boundary_verified and start > 0:
+        response_start = max(1, response_start - (boundary[1] - len(lines)))
     prompt_echo_lines, echo_anchor_found, prompt_line_set = _prompt_echo_scan(lines, prompt_prefix)
     if response_start is not None:
-        response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
-            lines[response_start - 1:], prompt_prefix
-        )
-        prompt_echo_lines.update(response_start - 1 + idx for idx in response_echoes)
+        response_starts = response_start if isinstance(response_start, set) else {response_start}
+        for response_line in response_starts:
+            response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
+                lines[response_line - 1:], prompt_prefix
+            )
+            prompt_echo_lines.update(response_line - 1 + idx for idx in response_echoes)
     terminal = _scan_final_terminal_marker(
         lines,
         prompt_echo_lines=prompt_echo_lines,
@@ -4557,7 +5421,9 @@ def _final_terminal_marker(
         expected_dispatch_id=expected_dispatch_id,
         rendered_response_start=response_start,
     )
-    if response_start is not None or _fence_state_unbalanced(lines, prompt_echo_lines):
+    if (boundary_verified and response_start is not None) or (
+        not recover_final_response and _fence_state_unbalanced(lines, prompt_echo_lines)
+    ):
         fence_agnostic_terminal = _scan_final_terminal_marker(
             lines,
             prompt_echo_lines=prompt_echo_lines,
@@ -4698,6 +5564,7 @@ def _dispatch_record_is_nonterminal(dispatch_id: str) -> bool | None:
 
 def main() -> int:
     global _ACTIVE_WORKER_PROCESS_PROBE
+    _redact_log_streams()
     parser = argparse.ArgumentParser(description="goal-flight compact log watcher")
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--tail", required=True)
@@ -4921,6 +5788,10 @@ def main() -> int:
         for key in (
             "model",
             "reasoning_effort",
+            "prelaunch_failure",
+            "worker_cwd",
+            "worktree_path",
+            "worktree_seat",
             "worktree_branch",
             "worktree_head",
             "worktree_keep_ref",
@@ -4948,6 +5819,10 @@ def main() -> int:
         expected_dispatch_id=args.dispatch_id,
     )
     steer_mailbox = goalflight_steer_mailbox.steer_file(args.dispatch_id)
+    question_outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(
+        args.dispatch_id,
+        dispatch_dir=steer_mailbox.parent,
+    )
     last_size = -1
     watcher_started_epoch = _trace_ledger_started_epoch(args.dispatch_id) or time.time()
     trace_liveness = TraceLiveness(
@@ -5075,6 +5950,7 @@ def main() -> int:
     final_status_written = False
     working_breadcrumb_written = False
     dispatch_retired = False
+    pending_signal: int | None = None
     last_prompt_reload_at: float | None = None
     status_recreation_authorized_at_startup = (
         not status_existed_at_startup
@@ -5345,6 +6221,50 @@ def main() -> int:
             if final_reason not in (None, ""):
                 payload["reason"] = final_reason
             payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
+            if isinstance(terminal_marker, dict) and terminal_marker.get("kind") == "COMPLETE":
+                payload.pop("attention_marker", None)
+        current_attention = payload.get("attention_marker")
+        if terminal_write and not (
+            isinstance(current_attention, dict)
+            and current_attention.get("kind") == "BLOCKED"
+        ):
+            blocked_marker = next(
+                (
+                    candidate
+                    for candidate in (
+                        terminal_marker,
+                        payload.get("last_marker"),
+                        terminal_seen,
+                    )
+                    if isinstance(candidate, dict)
+                    and candidate.get("kind") == "BLOCKED"
+                ),
+                None,
+            )
+            if blocked_marker is not None:
+                payload["attention_marker"] = {
+                    **blocked_marker,
+                    "sequence": blocked_marker.get("sequence", blocked_marker.get("line")),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+        worker_liveness = goalflight_terminal.worker_liveness_from_probe(
+            payload.get("worker_alive"), payload.get("worker_identity_reason")
+        )
+        if terminal_write and goalflight_terminal.blocked_outcome_is_provisional(
+            payload, worker_liveness
+        ):
+            payload.pop("terminal_marker", None)
+            payload["state"] = "watcher_stopped"
+            payload["terminal_pending_state"] = "blocked"
+            payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(
+                payload["state"]
+            )
+            payload["reason"] = reason or "blocked_outcome_provisional"
+            terminal_write = False
+        elif terminal_write and goalflight_dispatch_states.is_terminal_state(
+            payload.get("state")
+        ):
+            payload.pop("attention_marker", None)
         terminal_error = None
         if task_ids:
             payload["task_ids"] = list(task_ids)
@@ -5443,7 +6363,19 @@ def main() -> int:
                 ),
                 codex_session_id=codex_session_id,
                 terminal_marker=blocking_marker,
+                attention_marker=(
+                    payload.get("attention_marker")
+                    if isinstance(payload.get("attention_marker"), dict)
+                    else None
+                ),
+                worker_identity_reason=payload.get("worker_identity_reason"),
                 headline=headline_text,
+                dispatch_record=(
+                    prior_status
+                    if isinstance(prior_status, dict)
+                    and prior_status.get("dispatch_id") == args.dispatch_id
+                    else None
+                ),
             )
             if ledger_error:
                 payload["terminal_pending_state"] = payload.get("state")
@@ -5485,6 +6417,12 @@ def main() -> int:
 
     def flush_terminal_status(reason: str) -> None:
         nonlocal final_status_written
+        with contextlib.suppress(Exception):
+            consume_worker_journal_outbox(
+                question_outbox_dir,
+                args.dispatch_id,
+                max_records=64,
+            )
         if final_status_written:
             return
         now = time.time()
@@ -5497,8 +6435,28 @@ def main() -> int:
         else:
             current_pgid = pgid
             cpu_pct = 0.0
+        worker_liveness = goalflight_terminal.worker_liveness_from_probe(
+            worker_is_alive, identity_reason
+        )
+        live_blocked_pending = bool(
+            terminal_seen
+            and terminal_seen.get("kind") == "BLOCKED"
+            and goalflight_terminal.blocked_outcome_is_provisional(
+                {
+                    "terminal_marker": terminal_seen,
+                    "attention_marker": terminal_seen,
+                    "worker_identity_reason": identity_reason,
+                },
+                worker_liveness,
+            )
+        )
         if terminal_seen and not (
-            args.stay_after_terminal and worker_is_alive and _marker_state(terminal_seen) == "complete"
+            live_blocked_pending
+            or (
+                args.stay_after_terminal
+                and worker_is_alive
+                and _marker_state(terminal_seen) == "complete"
+            )
         ):
             state = _marker_state(terminal_seen)
         elif worker_is_alive:
@@ -5521,10 +6479,30 @@ def main() -> int:
             "expected_worker_identity": _identity_token(expected_identity),
             "pgroup_cpu_pct": cpu_pct,
             "tail_path": str(tail),
-            "terminal_marker": terminal_seen or (payload.get("terminal_marker") if isinstance(payload, dict) else None),
+            "terminal_marker": (
+                None
+                if live_blocked_pending
+                else terminal_seen
+                or (payload.get("terminal_marker") if isinstance(payload, dict) else None)
+            ),
             "state": state,
             "updated_at": int(now),
         })
+        if live_blocked_pending and terminal_seen is not None:
+            payload["terminal_pending_state"] = _marker_state(terminal_seen)
+            previous = payload.get("attention_marker")
+            if not (
+                isinstance(previous, dict)
+                and previous.get("kind") == "BLOCKED"
+                and previous.get("sequence", previous.get("line"))
+                == terminal_seen.get("line")
+            ):
+                payload["attention_marker"] = {
+                    **terminal_seen,
+                    "dispatch_id": args.dispatch_id,
+                    "sequence": terminal_seen.get("line"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
         if state in {"worker_dead", "watcher_stopped"} and not terminal_seen:
             apply_tail_quota_status(payload, previous_state=state, previous_reason=reason)
         write_reason = (
@@ -5547,9 +6525,9 @@ def main() -> int:
                 )
 
     def handle_signal(signum: int, _frame) -> None:
-        name = getattr(signal.Signals(signum), "name", str(signum))
-        flush_terminal_status(f"signal:{name}")
-        raise SystemExit(128 + signum)
+        nonlocal pending_signal
+        if pending_signal is None:
+            pending_signal = signum
 
     for signame in ("SIGTERM", "SIGHUP", "SIGINT"):
         sig = getattr(signal, signame, None)
@@ -5559,7 +6537,19 @@ def main() -> int:
 
     posted_trace_attention: set[str] = set()
     posted_worker_wait_attention: set[tuple[str, int, str]] = set()
+    posted_live_blocked_attention: set[tuple[str, int]] = set()
+    live_blocked_attention_event_ts: dict[tuple[str, int], str] = {}
+    question_outbox_mtime_ns: int | None = None
+    question_outbox_scan_state: dict[str, object] = {}
     while True:
+        if pending_signal is not None:
+            signame = getattr(
+                signal.Signals(pending_signal), "name", str(pending_signal)
+            )
+            exit_reason = f"signal:{signame}"
+            flush_terminal_status(exit_reason)
+            exit_code = 128 + pending_signal
+            break
         if dispatch_retired:
             break
         if ignore_prompt_path is not None:
@@ -5621,6 +6611,29 @@ def main() -> int:
         scan = tail_scanner.scan(kimi_output=moonshot_family(args.agent))
         markers = scan.markers
         size = scan.size
+        question_outbox_mtime_ns = consume_worker_question_outbox(
+            question_outbox_dir,
+            steer_mailbox,
+            args.dispatch_id,
+            worker_pid=args.pid,
+            worker_start_token=(expected_identity or {}).get("start_token"),
+            worker_pgid=tracked_worker_pgid,
+            active_attempt_id=(
+                str(dispatch_record["attempt_id"])
+                if dispatch_record and dispatch_record.get("attempt_id")
+                else None
+            ),
+            markers=markers,
+            consumed_reply_receipts=goalflight_steer_mailbox.consumed_worker_wait_receipts(
+                {},
+                marker_entries=markers,
+            )
+            | goalflight_steer_mailbox.worker_question_reply_receipts(
+                question_outbox_dir
+            ),
+            last_mtime_ns=question_outbox_mtime_ns,
+            scan_state=question_outbox_scan_state,
+        )
         if size != last_size:
             last_size = size
             last_change = active_monotonic()
@@ -5635,7 +6648,32 @@ def main() -> int:
         )
         if wait_read_succeeded:
             if fresh_worker_wait is None:
-                cached_worker_wait = None
+                prior_wait = cached_worker_wait
+                observed_reply = None
+                if prior_wait:
+                    for marker in markers:
+                        if marker.get("kind") != "STEER-REPLY":
+                            continue
+                        try:
+                            payload = json.loads(str(marker.get("text") or ""))
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            continue
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("kind")
+                            == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
+                            and payload.get("reply_to") == prior_wait.get("wait_id")
+                            and isinstance(payload.get("seq"), int)
+                            and not isinstance(payload.get("seq"), bool)
+                            and payload["seq"] > 0
+                        ):
+                            observed_reply = {
+                                **prior_wait,
+                                "phase": "reply_pending",
+                                "reply_seq": payload["seq"],
+                            }
+                            break
+                cached_worker_wait = observed_reply
             else:
                 fresh_wait_id = str(fresh_worker_wait.get("wait_id") or "")
                 same_cached_wait = bool(
@@ -5664,22 +6702,58 @@ def main() -> int:
                     # tracked worker until this watcher observes its exact
                     # wait-id-bound question marker in the tracked tail.
                     cached_worker_wait = None
-        elif not _cached_worker_wait_is_valid(
+        elif (cached_worker_wait or {}).get("phase") != "reply_pending" and not _cached_worker_wait_is_valid(
             cached_worker_wait,
             now_mono=loop_mono,
             worker_pid=args.pid,
             worker_pgid=tracked_worker_pgid,
         ):
             cached_worker_wait = None
-        if cached_worker_wait and any(
-            _worker_wait_reply_output_matches(marker, cached_worker_wait)
-            for marker in markers
-        ):
-            disproved_worker_wait_ids.add(
-                str(cached_worker_wait.get("wait_id") or "")
-            )
-            cached_worker_wait = None
+        reply_output = next(
+            (
+                marker
+                for marker in markers
+                if cached_worker_wait
+                and _worker_wait_reply_output_matches(marker, cached_worker_wait)
+            ),
+            None,
+        )
+        if cached_worker_wait and reply_output:
+            try:
+                wait_arm = {
+                    **cached_worker_wait,
+                    "dispatch_id": args.dispatch_id,
+                    "question_id": cached_worker_wait.get("wait_id"),
+                }
+                goalflight_steer_mailbox.append_worker_wait_ended(
+                    steer_mailbox,
+                    wait_arm,
+                    decision="reply",
+                    reply_seq=int(cached_worker_wait["reply_seq"]),
+                    context={"reason": "watcher_observed_worker_reply"},
+                    lock_timeout_secs=0.05,
+                )
+                reply_settled = True
+            except ValueError as exc:
+                reply_settled = "already settled" in str(exc)
+            except (OSError, RuntimeError, TimeoutError):
+                reply_settled = False
+            except Exception as exc:
+                if not goalflight_steer_mailbox.is_carrier_error(exc):
+                    raise
+                reply_settled = False
+            if reply_settled:
+                disproved_worker_wait_ids.add(
+                    str(cached_worker_wait.get("wait_id") or "")
+                )
+                cached_worker_wait = None
         worker_wait = cached_worker_wait
+        if worker_wait and not _worker_wait_deadline_is_live(
+            worker_wait,
+            now_mono=loop_mono,
+        ):
+            cached_worker_wait = None
+            worker_wait = None
         if worker_wait:
             # Option (a): suspend the idle clock for an explicit, independently
             # bounded reply wait. This represents controller-blocked work without
@@ -6048,6 +7122,10 @@ def main() -> int:
             for key in (
                 "model",
                 "reasoning_effort",
+                "prelaunch_failure",
+                "worker_cwd",
+                "worktree_path",
+                "worktree_seat",
                 "worktree_branch",
                 "worktree_head",
                 "worktree_keep_ref",
@@ -6212,7 +7290,9 @@ def main() -> int:
             if watchlisted and watchlisted_at_epoch is not None
             else None
         )
-        if terminal:
+        if terminal and not (
+            terminal.get("kind") == "BLOCKED" and worker_is_alive
+        ):
             # A sign-off is not a recover event. Leave wedge classification
             # off this payload so the marker path can terminalize cleanly.
             previously_wedged = False
@@ -6313,6 +7393,8 @@ def main() -> int:
                 worker_wait,
                 waiting_marker,
                 posted_worker_wait_attention,
+                published_marker=question_outbox_dir
+                / f"{worker_wait.get('wait_id')}.published",
             )
             if (
                 terminal_seen
@@ -6346,6 +7428,34 @@ def main() -> int:
             terminal_seen_at = None
             terminal_seen_size = None
             payload.pop("terminal_marker", None)
+        outbox_wait_id = None
+        if terminal_seen and worker_is_alive and not intentionally_waiting:
+            outbox_wait_id = _outbox_question_for_marker(
+                question_outbox_dir,
+                args.dispatch_id,
+                terminal_seen,
+                active_attempt_id=(
+                    str(dispatch_record["attempt_id"])
+                    if dispatch_record and dispatch_record.get("attempt_id")
+                    else None
+                ),
+            )
+        with contextlib.suppress(Exception):
+            consume_worker_journal_outbox(
+                question_outbox_dir,
+                args.dispatch_id,
+            )
+        if outbox_wait_id:
+            # The marker is the worker's live ask. Keep the process and
+            # dispatch open while the watcher admits the outbox request, even
+            # when journal projection is temporarily unavailable.
+            terminal_seen = None
+            terminal_seen_at = None
+            terminal_seen_size = None
+            payload.pop("terminal_marker", None)
+            payload["worker_question_wait_id"] = outbox_wait_id
+        if not outbox_wait_id:
+            payload.pop("worker_question_wait_id", None)
         terminal_state = _marker_state(terminal_seen) if terminal_seen else None
         terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
         post_terminal_wait = (
@@ -6366,8 +7476,129 @@ def main() -> int:
         post_terminal_idle_confirmed = (
             post_terminal_quiet_streak >= WEDGE_CONFIRM_SAMPLES
         )
-        if terminal_seen:
+        previous_attention = (
+            last_payload.get("attention_marker")
+            if isinstance(last_payload, dict)
+            else None
+        )
+        if isinstance(previous_attention, dict) and previous_attention.get("kind") == "BLOCKED":
+            payload["attention_marker"] = dict(previous_attention)
+        live_blocked_pending = bool(
+            terminal_seen
+            and terminal_seen.get("kind") == "BLOCKED"
+            and goalflight_terminal.blocked_outcome_is_provisional(
+                {
+                    "terminal_marker": terminal_seen,
+                    "attention_marker": terminal_seen,
+                    "worker_identity_reason": identity_reason,
+                },
+                goalflight_terminal.worker_liveness_from_probe(
+                    worker_is_alive, identity_reason
+                ),
+            )
+        )
+        if terminal_seen and terminal_seen.get("kind") == "COMPLETE":
+            payload.pop("attention_marker", None)
+        if live_blocked_pending and terminal_seen is not None:
+            previous = payload.get("attention_marker")
+            if not (
+                isinstance(previous, dict)
+                and previous.get("kind") == "BLOCKED"
+                and previous.get("sequence", previous.get("line"))
+                == terminal_seen.get("line")
+                and previous.get("dispatch_id", args.dispatch_id)
+                == args.dispatch_id
+            ):
+                payload["attention_marker"] = {
+                    **terminal_seen,
+                    "dispatch_id": args.dispatch_id,
+                    "sequence": terminal_seen.get("line"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            marker_sequence = terminal_seen.get("line")
+            if (
+                isinstance(marker_sequence, int)
+                and not isinstance(marker_sequence, bool)
+                and marker_sequence > 0
+            ):
+                attention_key = (args.dispatch_id, marker_sequence)
+                if attention_key not in posted_live_blocked_attention:
+                    try:
+                        import goalflight_messages as gm
+
+                        event_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                "goalflight:live-blocked:"
+                                f"{args.dispatch_id}:{marker_sequence}",
+                            )
+                        )
+                        messages_dir = gm.default_messages_dir()
+                        event_ts = live_blocked_attention_event_ts.get(attention_key)
+                        if event_ts is None:
+                            existing_event = next(
+                                (
+                                    envelope
+                                    for envelope in gm.read_envelopes_tolerant(
+                                        gm.inbox_path(messages_dir, args.dispatch_id),
+                                        carrier_errors=[],
+                                    )
+                                    if envelope.get("id") == event_id
+                                ),
+                                None,
+                            )
+                            if (
+                                isinstance(existing_event, dict)
+                                and isinstance(existing_event.get("ts"), str)
+                            ):
+                                event_ts = str(existing_event["ts"])
+                        if event_ts is None:
+                            event_ts = datetime.now(timezone.utc).isoformat()
+                        live_blocked_attention_event_ts[attention_key] = event_ts
+                        attention_label = str(
+                            (dispatch_record or {}).get("controller_label")
+                            or controller_label
+                            or ""
+                        ).strip()
+                        attention_root = (
+                            (dispatch_record or {}).get("project_root")
+                            or getattr(args, "project_root", None)
+                        )
+                        if not attention_label or not attention_root:
+                            raise ValueError(
+                                "live BLOCKED attention needs its dispatch controller"
+                            )
+                        gm.post_message(
+                            dispatch_id=args.dispatch_id,
+                            msg_type="controller-notice",
+                            payload={
+                                "text": "worker reported BLOCKED and is still running",
+                                "marker_seq": marker_sequence,
+                                "provisional": True,
+                            },
+                            messages_dir=messages_dir,
+                            source={
+                                "node": "local",
+                                "adapter": "watcher",
+                                "transport": "live-blocked-marker",
+                            },
+                            addressee=gm.controller_addressee(
+                                attention_label,
+                                project_root=attention_root,
+                            ),
+                            priority="urgent",
+                            event_id=event_id,
+                            event_ts=event_ts,
+                        )
+                        posted_live_blocked_attention.add(attention_key)
+                    except Exception:
+                        # Keep BLOCKED provisional and retry this stable event
+                        # on the next poll if publication was unavailable.
+                        pass
+        if terminal_seen and not live_blocked_pending:
             payload["terminal_marker"] = terminal_seen
+        elif live_blocked_pending:
+            payload.pop("terminal_marker", None)
         post_terminal_wait_elapsed = (
             max(0.0, active_monotonic() - terminal_seen_at)
             if post_terminal_wait and terminal_seen_at is not None
@@ -6388,6 +7619,7 @@ def main() -> int:
             )
         if post_terminal_action == "discard":
             discarded_marker = terminal_seen
+            log_marker = dict(discarded_marker or {})
             last_discarded_terminal_evidence = {
                 "kind": str((discarded_marker or {}).get("kind") or ""),
                 "dispatch_id_binding": args.dispatch_id,
@@ -6398,7 +7630,7 @@ def main() -> int:
                 "WATCHER-DISCARD "
                 + json.dumps(
                     {
-                        "marker": discarded_marker,
+                        "marker": log_marker,
                         "reason": "worker_alive_tail_grew_since_marker",
                     },
                     sort_keys=True,
@@ -6424,9 +7656,8 @@ def main() -> int:
             time.sleep(args.poll_secs)
             continue
         if post_terminal_wait and post_terminal_action == "terminalize":
-            # Marker said done; the process did not. That is indeterminate,
-            # not success — even when tree/descendant probes are skipped
-            # (cwd is the canonical root) so classify_liveness never wedges.
+            # Preserve the legacy backstop: report an inconclusive result and
+            # leave a live worker running when it does not exit after RESULT.
             payload["state"] = "inconclusive_timeout"
             payload["terminal_pending_state"] = terminal_state
             if post_terminal_wait_elapsed is not None:
@@ -6447,7 +7678,46 @@ def main() -> int:
             and active_monotonic() - terminal_seen_at
             < max(WORKER_WAIT_ARM_GRACE_SECS, args.poll_secs * 2.0)
         )
-        if terminal_seen and not post_terminal_wait and not reply_wait_arm_grace:
+        if question_outbox_mtime_ns is None and question_outbox_dir.is_dir():
+            # A durable question remains watcher-owned until its controller
+            # event and published marker both complete, even if the worker has
+            # already exited in this poll.
+            payload["state"] = "running_after_terminal" if terminal_seen else (
+                "running" if worker_is_alive else "worker_dead"
+            )
+            payload["worker_question_publication_pending"] = True
+            if terminal_seen:
+                payload.pop("terminal_marker", None)
+                payload["attention_marker"] = terminal_seen
+                payload["terminal_pending_state"] = _marker_state(terminal_seen)
+            write_payload(
+                payload,
+                reason="worker_question_publication_pending",
+                terminal_write=False,
+            )
+            time.sleep(args.poll_secs)
+            continue
+        if (
+            terminal_seen
+            and terminal_seen.get("kind") == "USER-NEED"
+            and isinstance(dispatch_record, dict)
+            and dispatch_record.get("shape") == "acp"
+        ):
+            # ACP v1 asks end the provider turn. Publish the terminal request
+            # and let the controller resume it as a child dispatch; the
+            # bash-tail quiet-worker cleanup must never signal this process.
+            payload["state"] = _marker_state(terminal_seen)
+            payload["terminal_marker"] = terminal_seen
+            exit_reason = "marker:USER-NEED:acp_turn_ended"
+            write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            break
+        if (
+            terminal_seen
+            and not post_terminal_wait
+            and not reply_wait_arm_grace
+            and not live_blocked_pending
+        ):
             payload["state"] = terminal_state
             exit_code = _exit_code_for_state(payload["state"])
             exit_reason = terminal_reason
@@ -6481,12 +7751,17 @@ def main() -> int:
                 )
                 if reconciled:
                     terminal_seen = reconciled
-                    payload["terminal_marker"] = terminal_seen
-                    payload["state"] = _marker_state(terminal_seen)
-                    exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
-                    exit_code = _exit_code_for_state(payload["state"])
-                    write_payload(payload, reason=exit_reason, terminal_write=True)
-                    break
+                    if worker_is_alive and terminal_seen.get("kind") == "BLOCKED":
+                        payload.pop("terminal_marker", None)
+                        payload["state"] = "watcher_stopped"
+                        payload["terminal_pending_state"] = "blocked"
+                    else:
+                        payload["terminal_marker"] = terminal_seen
+                        payload["state"] = _marker_state(terminal_seen)
+                        exit_reason = f"marker:{terminal_seen['kind']}:final_reconciliation"
+                        exit_code = _exit_code_for_state(payload["state"])
+                        write_payload(payload, reason=exit_reason, terminal_write=True)
+                        break
             if worker_is_alive:
                 write_payload(payload, reason="controller_dead_worker_alive")
                 time.sleep(args.poll_secs)
@@ -6545,6 +7820,19 @@ def main() -> int:
                     )
                     if reconciled:
                         terminal_seen = reconciled
+                        if worker_is_alive and terminal_seen.get("kind") == "BLOCKED":
+                            payload["worker_alive"] = True
+                            payload["worker_identity_reason"] = identity_reason
+                            payload["worker_identity"] = _identity_token(current_identity)
+                            payload.pop("terminal_marker", None)
+                            payload["state"] = "watcher_stopped"
+                            payload["terminal_pending_state"] = "blocked"
+                            write_payload(
+                                payload,
+                                reason="pid_resolved_dead_active_trace_reverify",
+                            )
+                            time.sleep(args.poll_secs)
+                            continue
                         payload["terminal_marker"] = terminal_seen
                         payload["state"] = _marker_state(terminal_seen)
                         exit_reason = f"marker:{terminal_seen['kind']}:trace_reconciliation"
@@ -6698,6 +7986,11 @@ def main() -> int:
             write_payload(payload)
         time.sleep(args.poll_secs)
 
+    if pending_signal is not None:
+        signame = getattr(signal.Signals(pending_signal), "name", str(pending_signal))
+        exit_reason = f"signal:{signame}"
+        flush_terminal_status(exit_reason)
+        exit_code = 128 + pending_signal
     if dispatch_retired:
         print(
             "goalflight_watch: dispatch retired; prompt sidecar and status "
@@ -6705,7 +7998,7 @@ def main() -> int:
             flush=True,
         )
         release_worker_probe()
-        return 0
+        return 0 if pending_signal is None else 128 + pending_signal
     print(json.dumps({"state": payload["state"], "reason": exit_reason, "status_path": str(status_path)}, sort_keys=True))
     release_worker_probe()
     return exit_code

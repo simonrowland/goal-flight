@@ -23,7 +23,7 @@ import goalflight_fleet_billing as billing
 import goalflight_fleet_dispatch as fleet_dispatch
 import goalflight_fleet_tool_smoke as tool_smoke
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def assert_true(name: str, condition: bool) -> None:

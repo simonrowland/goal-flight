@@ -14,6 +14,7 @@ import socket
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -200,6 +201,20 @@ def account_lock_expired(doc: dict) -> bool:
     return bool(expires_at and expires_at < utc_now())
 
 
+def account_lock_expired_after_wake(doc: dict) -> bool:
+    """Whether wall expiry crossed a likely host-sleep interval."""
+    if not account_lock_expired(doc):
+        return False
+    renewed_at = parse_iso(doc.get("renewed_at"))
+    renewed_monotonic = doc.get("renewed_monotonic")
+    if (renewed_at is None or isinstance(renewed_monotonic, bool)
+            or not isinstance(renewed_monotonic, (int, float))):
+        return True
+    wall_elapsed = max(0.0, (utc_now() - renewed_at).total_seconds())
+    monotonic_elapsed = time.monotonic() - float(renewed_monotonic)
+    return monotonic_elapsed < 0 or wall_elapsed - monotonic_elapsed > 60.0
+
+
 def acquire_account_lock(
     fleet_dir: Path,
     *,
@@ -227,6 +242,7 @@ def acquire_account_lock(
             "state": "active",
             "expires_at": iso(now + dt.timedelta(seconds=ttl_s)),
             "renewed_at": iso(now),
+            "renewed_monotonic": time.monotonic(),
         }
         _atomic_write_json(path, doc)
         return doc
@@ -256,6 +272,7 @@ def renew_account_lock(
         now = utc_now()
         doc["expires_at"] = iso(now + dt.timedelta(seconds=ttl_s))
         doc["renewed_at"] = iso(now)
+        doc["renewed_monotonic"] = time.monotonic()
         _atomic_write_json(path, doc)
         return doc
     finally:

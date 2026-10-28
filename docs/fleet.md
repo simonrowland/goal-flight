@@ -320,6 +320,83 @@ export GOALFLIGHT_FLEET_NODE=localhost   # or your SSH alias
 ./tests/manual/test_fleet_live_smoke.sh
 ```
 
+## Studio CoW pre-switch soak
+
+Run the candidate daemon beside the production daemons without changing their
+processes or local queue/state files. The v3 and v4 node helpers can share a
+Studio managed root and token pool: both versions lock the same
+`admission/queue.lock`, `admission/tokens/<index>`, and per-project
+`slot-meta/s-NN.lock` files. Copy the production configuration and change only
+the controller-side paths below. Keep each box's `managed_run_directory`,
+`token_pool_size`, `max_concurrent_seats`, and the project id unchanged. A
+separate managed root would create a second token pool and could over-admit the
+Studio.
+
+From the candidate checkout, create an isolated spool, state directory, and
+daemon lock/pid files:
+
+```bash
+SOAK_ROOT="$(mktemp -d "${TMPDIR:?}/goalflight-cow-soak.XXXXXX")"
+SOURCE_CONFIG="${GOALFLIGHT_REMOTE_CI_CONFIG:-.goal-flight/remote-ci.json}"
+cp "$SOURCE_CONFIG" "$SOAK_ROOT/remote-ci.json"
+python3 - "$SOAK_ROOT/remote-ci.json" "$SOAK_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path, root = Path(sys.argv[1]), Path(sys.argv[2])
+config = json.loads(config_path.read_text(encoding="utf-8"))
+config["paths"].update({
+    "queue_dir": str(root / "spool" / "requests"),
+    "result_dir": str(root / "spool" / "results"),
+    "state_dir": str(root / "state"),
+})
+config["daemon"].update({
+    "lock_file": str(root / "daemon.lock"),
+    "pid_file": str(root / "daemon.pid.json"),
+})
+config["fallback"] = "fail"
+config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+python3 scripts/goalflight_remote_ci.py --config "$SOAK_ROOT/remote-ci.json" validate
+export GOALFLIGHT_REMOTE_CI_CONFIG="$SOAK_ROOT/remote-ci.json"
+export GOALFLIGHT_REMOTE_CI_SPOOL_DIR="$SOAK_ROOT/spool"
+python3 scripts/goalflight_remote_ci.py --config "$GOALFLIGHT_REMOTE_CI_CONFIG" daemon \
+  >"$SOAK_ROOT/daemon.log" 2>&1 &
+SOAK_DAEMON_PID=$!
+```
+
+Run the same bounded gate locally and through the isolated daemon. Substitute
+the exact gate command used for the production/local comparison if it differs:
+
+```bash
+python3 -m pytest -q tests/python/test_remote_ci.py tests/python/test_remote_ci_transport.py
+"$GOALFLIGHT_REMOTE_RUN" --kind gate --cmd-id goalflight-remote-ci -- \
+  python3 -m pytest -q tests/python/test_remote_ci.py tests/python/test_remote_ci_transport.py
+```
+
+Confirm the remote result is `GREEN`/`RED` rather than local fallback, record its
+`bundle_bytes`, and inspect `daemon.log`. Inspect the selected box's lease and
+token state with the candidate config:
+
+```bash
+python3 scripts/goalflight_remote_ci.py --config "$GOALFLIGHT_REMOTE_CI_CONFIG" list
+python3 scripts/goalflight_remote_ci.py --config "$GOALFLIGHT_REMOTE_CI_CONFIG" health
+```
+
+On that Studio, check `<managed_run_directory>/repos/<repo>/mirror.git`,
+`bases/current`, and `seats/` with `ls -la`; these are the mirror, current base
+pointer/generations, and CoW seats. Stop only the soak daemon when finished:
+
+```bash
+kill "$SOAK_DAEMON_PID"
+wait "$SOAK_DAEMON_PID" || true
+```
+
+The soak shares the Studio token pool and therefore consumes its normal seat
+capacity while a run is active; schedule it when a seat is available. Its local
+spool, results, daemon lock, and state stay under `SOAK_ROOT`.
+
 ## Failure triage
 
 | Symptom | Check |

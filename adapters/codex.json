@@ -82,14 +82,14 @@
   },
   "invocation": {
     "skill_triggers": ["/goal", "goal-flight", "Codex goal-mode worker"],
-    "commands": ["codex exec --json -C <repo> -"],
+    "commands": ["codex exec --json -c features.plugins=false -C <repo> -"],
     "exec": {
       "kind": "cli",
       "binary": "codex",
       "action_id": "core.dispatch.execute",
-      "args": ["exec", "--json", "-C", "<repo>", "-"],
+      "args": ["exec", "--json", "-c", "features.plugins=false", "-C", "<repo>", "-"],
       "arg_policy": {
-        "required_safe_args": ["exec", "--json", "-C", "<repo>"],
+        "required_safe_args": ["exec", "--json", "-c", "features.plugins=false", "-C", "<repo>"],
         "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
         "requires_explicit_justification": ["--bare", "--auto", "--headless-with-approval-bypass"],
         "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
@@ -251,7 +251,7 @@
           "plugins/goal-flight/skills/goal-flight/SKILL.md",
           "configs/codex/config.toml"
         ],
-        "commands": ["codex exec --json -C <repo> -"],
+        "commands": ["codex exec --json -c features.plugins=false -C <repo> -"],
         "paths": [
           "~/.codex/config.toml",
           "~/.codex/skills/goal-flight/SKILL.md"
@@ -268,7 +268,7 @@
         "default": true,
         "probe_ids": ["codex-path", "codex-version"],
         "install_action_sources": [],
-        "commands": ["codex exec --json -C <repo> -"],
+        "commands": ["codex exec --json -c features.plugins=false -C <repo> -"],
         "paths": ["$(command -v codex)"],
         "requires_restart": false
       }

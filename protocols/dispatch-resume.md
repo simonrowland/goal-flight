@@ -25,9 +25,26 @@ Pin `HEAD` first, even when the tree is clean; this handles a clean tree whose
 latest commits would otherwise become unreachable. Then snapshot tracked and
 untracked (but not ignored) files with a temporary index:
 
+A dispatch record with `prelaunch_failure: true` never started a worker and
+legitimately has no worktree seat. Do not try to salvage a tree for that record.
+For a launched dispatch, a missing `worktree_path` is a broken record and must
+be reported; never substitute the controller's current directory.
+
 ```bash
 repo=<dispatch-repository>
 worktree=<worktree>
+if test -z "$worktree"; then
+  printf '%s\n' 'dispatch record is missing worktree_path' >&2
+  exit 1
+fi
+case "$worktree" in
+  /*) ;;
+  *) printf '%s\n' 'dispatch record worktree_path is not absolute' >&2; exit 1 ;;
+esac
+if test ! -d "$worktree"; then
+  printf '%s\n' 'recorded worktree_path is not an existing directory' >&2
+  exit 1
+fi
 head=$(git -C "$worktree" rev-parse HEAD^{commit})
 git -C "$repo" update-ref "refs/goalflight/keep/<dispatch-id>/head" "$head"
 
@@ -150,12 +167,24 @@ you want to keep, not by what killed the worker.
   displaced; resume checks those refs in hot and archived ledger rows, refuses
   to continue silently, and prints one `git worktree add <recovery-path> <ref>`
   command for recovery. Unrelated historical refs do not block another
-  dispatch. A missing checkout's stale Git registration is pruned only after
-  the path is proven absent.
+  dispatch. A missing checkout whose Git admin directory still points at it
+  is held as possibly in use. Resume leaves that registration in place. The
+  parent branch stays unchecked in any replacement seat. Verify no process
+  from that seat is running (for example after a reboot), then drop that one
+  stale item with `python3 scripts/goalflight_worktree_gc.py <repo>
+  --drop-stale <item>`. `<item>` is the admin directory whose readable gitdir
+  names a checkout path that is absent, or the registry occupancy-lock path
+  whose lock file is missing. A missing, empty, unreadable, or unparsable
+  gitdir, and a symlinked admin entry, are not proven stale: inspect them,
+  and do not pass them to `--drop-stale`. The command removes that one item
+  under the allocation lock, the mutation lock, and the registry mutex and
+  refuses when the checkout cannot be proven missing. A new dispatch id hits
+  the same refusal until that item is gone.
   A branch tip descended from the recorded head is accepted as worker progress
   on that dispatch's own branch; an unrelated or foreign-dispatch tip is still
-  refused. If the recorded checkout was deleted, the same normal replacement
-  allocation path is used after the branch and recovery checks.
+  refused. If the recorded checkout was deleted and Git no longer lists it,
+  the normal replacement allocation path is used after the branch and recovery
+  checks.
   It never resets a seat held by another dispatch. Quota-exhausted, dead-pid,
   stale_dead, and plan-approval pauses (USER-NEED / !READY) are continuable.
   `--account <account>` pins a surviving account; default selection skips

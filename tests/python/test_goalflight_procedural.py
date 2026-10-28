@@ -1084,6 +1084,14 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
         "codex exec --sandbox read-only -c approval_policy=never" in invocation,
     )
     assert_true(
+        "canonical invocation disables plugins exactly once",
+        invocation.count("features.plugins=false") == 1,
+    )
+    assert_true(
+        "canonical invocation omits the remote-plugin fallback flag",
+        "features.remote_plugin=false" not in invocation,
+    )
+    assert_true(
         "canonical invocation does NOT use the deprecated dangerously-bypass flag "
         "(rejected by classifiers; forbidden in adapter manifests)",
         "--dangerously-bypass-approvals-and-sandbox" not in invocation,
@@ -1091,6 +1099,20 @@ def test_chunk_review_canonical_invocation_has_stdin_redirect() -> None:
     assert_true(
         "canonical invocation explicitly redirects stdin from /dev/null",
         "< /dev/null" in invocation,
+    )
+
+    skill = (ROOT / "SKILL.md").read_text()
+    skill_section = skill.split("## Nested Review Invocation", 1)[1]
+    skill_fence = skill_section.find("```bash")
+    skill_end = skill_section.find("```", skill_fence + 7)
+    skill_invocation = skill_section[skill_fence:skill_end]
+    assert_true(
+        "SKILL review invocation disables plugins exactly once",
+        skill_invocation.count("features.plugins=false") == 1,
+    )
+    assert_true(
+        "SKILL review invocation omits remote-plugin fallback flag",
+        "features.remote_plugin=false" not in skill_invocation,
     )
     assert_true(
         "canonical invocation captures stdout to a review final-md path",
@@ -1515,7 +1537,7 @@ def test_session_status_helper_contract() -> None:
             "state: active\n"
             f"last-touched: {gss._now_iso()}\n"
             "current_session:\n"
-            "  id: 11111111-1111-1111-1111-111111111111\n"
+            "  id: 00000000-0000-4000-8000-000000000024\n"
             f"  pid: {os.getpid()}\n"  # alive pid (this test process)
             "  started_at: 2026-05-28T00:00:00Z\n"
             "  hostname: testhost\n"
@@ -1541,7 +1563,7 @@ def test_session_status_helper_contract() -> None:
             "state: active\n"
             f"last-touched: {gss._now_iso()}\n"
             "current_session:\n"
-            "  id: 22222222-2222-2222-2222-222222222222\n"
+            "  id: 00000000-0000-4000-8000-000000000035\n"
             "  pid: 1\n"  # init pid is alive but very unlikely to belong to us;
             # use a high pid that's almost certainly dead instead
             "  process_start_token: stale-generation\n"

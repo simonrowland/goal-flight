@@ -7,8 +7,10 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import lru_cache
 import os
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +19,120 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+
+
+def sandbox_exec_unavailable_reason() -> str | None:
+    """Return why sandbox-exec cannot run here; raise on other probe failures."""
+    if sys.platform != "darwin":
+        return "requires macOS sandbox-exec"
+    executable = shutil.which("sandbox-exec")
+    if executable is None:
+        return "sandbox-exec is not installed on this macOS host"
+    try:
+        result = subprocess.run(
+            [executable, "-p", "(version 1)\n(allow default)", "/usr/bin/true"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except PermissionError:
+        return "sandbox denies exec of sandbox-exec"
+    except FileNotFoundError:
+        raise AssertionError("sandbox-exec disappeared after PATH resolution")
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("sandbox-exec capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"sandbox-exec capability probe failed: {exc}") from exc
+    if result.returncode == 0:
+        return None
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if "operation not permitted" in output or "permission denied" in output:
+        return "sandbox denies exec of sandbox-exec"
+    raise AssertionError(
+        "sandbox-exec capability probe failed without a sandbox refusal: "
+        f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+
+
+def launchctl_unavailable_reason() -> str | None:
+    """Skip launchctl callers only when its recorded sandbox is enforced."""
+    # pytest_configure captures the live worker's ledger before test fixtures
+    # clear its identity. Per-test environment values are not authoritative:
+    # tests often set GOALFLIGHT_DISPATCH_ID to exercise record handling.
+    dispatch_id = _RECORDED_DISPATCH_ID
+    if dispatch_id:
+        if _RECORDED_SANDBOX_ERROR:
+            raise AssertionError(_RECORDED_SANDBOX_ERROR)
+        if _RECORDED_ENFORCED_PROFILE:
+            return (
+                f"enforced {_RECORDED_ENFORCED_PROFILE} sandbox "
+                "prevents launchctl submit"
+            )
+
+    label = f"com.goalflight.capability-probe.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        result = subprocess.run(
+            [
+                "launchctl", "submit", "-l", label,
+                "-o", "/dev/null", "-e", "/dev/null",
+                "--", "/usr/bin/true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except PermissionError:
+        return "sandbox denies exec of launchctl"
+    except FileNotFoundError:
+        return "launchctl is not installed on this host"
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("launchctl capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"launchctl capability probe failed: {exc}") from exc
+    if result.returncode == 0:
+        return None
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+    lowered = output.lower()
+    if "operation not permitted" in lowered or "permission denied" in lowered:
+        return "sandbox denies launchctl submit"
+    raise AssertionError(
+        "launchctl capability probe failed without a sandbox refusal: "
+        f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
+
+
+def node_unavailable_reason() -> str | None:
+    """Probe the Node executable used by tests; unknown failures stay visible."""
+    executable = shutil.which("node")
+    if executable is None:
+        return "Node is not installed on this host"
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except PermissionError:
+        return "sandbox denies exec of Node"
+    except FileNotFoundError:
+        raise AssertionError("Node disappeared after PATH resolution")
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError("Node capability probe timed out") from exc
+    except OSError as exc:
+        raise AssertionError(f"Node capability probe failed: {exc}") from exc
+    if result.returncode == 0:
+        return None
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    if "operation not permitted" in output or "permission denied" in output:
+        return "sandbox denies exec of Node"
+    raise AssertionError(
+        "Node capability probe failed without a sandbox refusal: "
+        f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}"
+    )
 
 
 AMBIENT_IDENTITY_ENV = (
@@ -59,6 +175,107 @@ MACHINE_PATH_ENV = (
     "GOALFLIGHT_FLEET_DIR",
     "XDG_STATE_HOME",
 )
+
+_RECORDED_DISPATCH_ID: str | None = None
+_RECORDED_ENFORCED_PROFILE: str | None = None
+_RECORDED_SANDBOX_ERROR: str | None = None
+
+
+def enforced_sandbox_profile_from_record(record: object) -> str | None:
+    """Normalize the launcher's recorded OS sandbox posture across agent shapes."""
+    from goalflight_os_sandbox import OS_SANDBOX_OFF, OS_SANDBOX_PROFILES
+
+    if not isinstance(record, dict) or record.get("state") == "unreadable":
+        raise AssertionError("dispatch sandbox posture record is absent or unreadable")
+    posture = record.get("os_sandbox")
+    if not isinstance(posture, dict):
+        raise AssertionError("dispatch record has no OS sandbox posture")
+
+    inactive_profiles = (None, "", OS_SANDBOX_OFF, "none", "host-default")
+    active_profiles = set(OS_SANDBOX_PROFILES) - {OS_SANDBOX_OFF}
+    shape = str(record.get("shape") or posture.get("shape") or "bash")
+    agent = str(record.get("agent") or "")
+
+    # ACP stores its effective profile and whether the OS sandbox was enabled;
+    # it does not use the dispatcher's enforced_profile field.
+    if shape == "acp" or "enabled" in posture:
+        profile = posture.get("profile")
+        enabled = posture.get("enabled")
+        if (
+            enabled is True
+            and isinstance(profile, str)
+            and profile in active_profiles
+        ):
+            return profile
+        if enabled is False:
+            requested = posture.get("requested")
+            if profile in ("", "off", "none", "host-default"):
+                return None
+            if profile is None and requested in inactive_profiles:
+                return None
+        raise AssertionError("ACP record has an unknown OS sandbox posture")
+
+    if "enforced_profile" not in posture:
+        raise AssertionError("dispatch record has no enforced OS sandbox profile")
+    profile = posture.get("enforced_profile")
+    if isinstance(profile, str) and profile in active_profiles:
+        return profile
+    if profile not in inactive_profiles:
+        raise AssertionError(
+            "dispatch record has an invalid enforced OS sandbox profile"
+        )
+    if profile is not None:
+        return None
+
+    # The generic dispatcher records null for Grok even after its macOS wrapper
+    # selected Seatbelt. requested + supported distinguish that case from the
+    # known no-sandbox posture.
+    requested = posture.get("requested_profile")
+    supported = posture.get("supported_profile")
+    if agent in {"grok-code", "grok-research"}:
+        if requested == supported == "read-only":
+            return "read-only"
+        if requested in inactive_profiles and supported in inactive_profiles:
+            return None
+        raise AssertionError("Grok record has an unknown OS sandbox posture")
+
+    # Codex, Moonshot, and Cursor use enforced_profile directly. A null value
+    # is only conclusive for Cursor when no profile was requested or supported.
+    if agent in {"codex", "moonshot", "cursor", "cursor-agent"}:
+        if requested in inactive_profiles and supported in inactive_profiles:
+            return None
+    raise AssertionError("dispatch record has an unknown OS sandbox posture")
+
+
+def capture_dispatch_sandbox_posture() -> None:
+    """Snapshot dispatcher enforcement before pytest isolates worker identity."""
+    global _RECORDED_DISPATCH_ID, _RECORDED_ENFORCED_PROFILE, _RECORDED_SANDBOX_ERROR
+    dispatch_id = os.environ.get("GOALFLIGHT_DISPATCH_ID")
+    _RECORDED_DISPATCH_ID = dispatch_id
+    _RECORDED_ENFORCED_PROFILE = None
+    _RECORDED_SANDBOX_ERROR = None
+    if not dispatch_id:
+        return
+    from goalflight_ledger import read_record
+
+    try:
+        record = read_record(dispatch_id)
+    except OSError as exc:
+        _RECORDED_SANDBOX_ERROR = (
+            f"could not read sandbox posture for dispatch {dispatch_id}: {exc}"
+        )
+        return
+    if record is None:
+        _RECORDED_SANDBOX_ERROR = (
+            f"sandbox posture record for dispatch {dispatch_id} is absent"
+        )
+        return
+    try:
+        _RECORDED_ENFORCED_PROFILE = enforced_sandbox_profile_from_record(record)
+    except AssertionError as exc:
+        _RECORDED_SANDBOX_ERROR = (
+            f"sandbox posture for dispatch {dispatch_id} is unknown: {exc}"
+        )
 
 
 def isolated_machine_env(root: Path) -> dict[str, str]:
@@ -184,7 +401,7 @@ def registered_child_environment(
             holder.close()
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
 def _module_tree(test: Path) -> ast.Module:
     return ast.parse(test.read_text(encoding="utf-8"), filename=str(test))
 
@@ -278,7 +495,7 @@ def ensure_acp_test_interpreter(test_name: str) -> None:
     ):
         os.execv(resolution.target_python, [resolution.target_python, *sys.argv])
     print(
-        f"SKIP: {test_name}: ACP SDK requirement unsatisfied: "
+        f"SKIP-FILE: {test_name}: ACP SDK requirement unsatisfied: "
         f"{resolution.reason}"
     )
     raise SystemExit(0)
@@ -311,7 +528,7 @@ def skip_posix_on_native_windows(reason: str) -> None:
     """Exit cleanly on native Windows for tests that require POSIX semantics."""
     if os.name != "nt":
         return
-    print(f"SKIP: {_current_test_name()}: {_posix_on_windows_reason(reason)}")
+    print(f"SKIP-FILE: {_current_test_name()}: {_posix_on_windows_reason(reason)}")
     raise SystemExit(0)
 
 
@@ -323,13 +540,30 @@ def skip_case_posix_on_native_windows(case_name: str, reason: str) -> bool:
     return True
 
 
-def skip_unless_native_windows(reason: str) -> None:
-    """Exit cleanly unless this is a real native-Windows Python process."""
+def skip_unless_native_windows(reason: str) -> bool:
+    """Skip under pytest, or report a skip and return false in script mode."""
     if os.name == "nt":
-        return
-    print(f"SKIP: {_current_test_name()}: {reason}")
-    raise SystemExit(0)
+        return True
+    if "pytest" in sys.modules:
+        import pytest
+
+        pytest.skip(reason, allow_module_level=True)
+    print(f"SKIP-FILE: {_current_test_name()}: {reason}")
+    return False
 
 
 def note_skip(case_name: str, reason: str) -> None:
     print(f"SKIP: {case_name}: {reason}")
+
+
+def skip_if_node_unavailable(case_name: str, *, script_mode: bool) -> bool:
+    """Skip one Node-dependent case while keeping script drivers running."""
+    reason = node_unavailable_reason()
+    if reason is None:
+        return False
+    if script_mode:
+        note_skip(case_name, reason)
+        return True
+    import pytest
+
+    pytest.skip(reason)

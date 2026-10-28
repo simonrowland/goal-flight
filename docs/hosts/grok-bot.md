@@ -168,7 +168,8 @@ not change the global `supervise` / `follow` cadence in this port; 900s
 is a grok-bot wrapper-local default on the listen arm.
 
 **Canonical grok-bot arm** — one tracked
-`goalflight_grok_bot_listen.py --report-pending --timeout-s 900` on the
+`goalflight_grok_bot_listen.py --report-pending --timeout-s 900
+--listener-slots 1` on the
 **user's Mac** (the project checkout), with `--project-root` and
 `--controller-label goalflight-grokbot`. That helper wraps
 `listen --report-pending` and prints the quote-check banner on every
@@ -181,20 +182,19 @@ python3 <skill-root>/scripts/goalflight_grok_bot_listen.py \
   --project-root "$PWD" \
   --controller-label goalflight-grokbot \
   --report-pending \
-  --timeout-s 900
+  --timeout-s 900 \
+  --listener-slots 1
 ```
 
 Every ring (**exit 0**) or timeout (**exit 1**) is a **mini-resume**:
 drain if it rang (`relay --drain`, act), flush RESUME-NOTES (Compaction
 below), quote-check Hard Invariants from a fresh disk read, re-arm,
 then `goalflight_task.py next`. The 900s quiet timeout is this host's
-substitute for Claude's 80% context-meter hint. The portable
-four-listen pool is full depth
-(resilience; see `protocols/controller-mail.md`). One listen is the MVP.
-If you arm more than one listen, put `--timeout-s 900` on a single slot
-and leave the others at `--timeout-s 0` so four quiet timeouts do not
-fire together. Branch on listen exit codes instead of blindly
-restarting:
+substitute for Claude's 80% context-meter hint. Keep one listener live.
+The helper caps this controller at one slot; a duplicate arm reports the
+incumbent PID and exits 3. The pending report includes its count and oldest
+age. Wait for the prior task to exit before re-arming. Branch on listen exit
+codes instead of blindly restarting:
 
 | Code | Meaning for this host | Action |
 |---:|---|---|
@@ -206,9 +206,9 @@ restarting:
 | 5 | Did-not-arm (dead nonce) | Do not re-arm that nonce |
 
 **Do not arm unbounded `supervise` as a Grok Bot background shell** expecting
-per-line wakes. Grok Bot only notifies on job completion. If you add a
-helper, it must wrap `listen` or exit on the first actionable event
-(ignore stream heartbeat / frontier keepalives).
+per-line wakes. Grok Bot only notifies on job completion. Use the tracked
+`goalflight_grok_bot_listen.py` helper above; it wraps `listen`, forwards
+TERM/HUP to its child, and keeps one listener slot live.
 
 A same-turn regex-wait on a live `supervise` process (host AwaitShell-style
 blocking) is a same-turn block, not a session-life monitor. Do not recommend
@@ -279,8 +279,8 @@ If this controller cannot quote `SKILL.md` Hard Invariants from a
 `SKILL.md` → `commands/resume.md`. Then:
 
 1. `goalflight_session_status.py --text`
-2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm listen
-   doorbells (portable pool) instead.
+2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm one tracked
+   `goalflight_grok_bot_listen.py` with `--listener-slots 1` instead.
 3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
 4. newest RESUME-NOTES
 5. `goalflight_task.py next`
@@ -301,7 +301,7 @@ via roster fields already measured — `wake_armed`, `wake_covered`,
 `wake unarmed` / `wake unarmed with N non-terminal dispatches`. Do not
 invent a second reminder channel.
 
-On grok-bot the listen pool is the arm. `supervisor: absent` is expected
+On grok-bot the one tracked listen arm is the wake. `supervisor: absent` is expected
 when no `supervise` process is running; that alone is not the alarm.
 The operator-facing alarm is `wake unarmed` (`wake_armed` false, usually
 with `wake_covered` false).

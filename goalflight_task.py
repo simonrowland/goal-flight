@@ -52,6 +52,7 @@ ITEM_SCHEMA_VERSION = 1
 PROJECT_REGISTRY_INDEX_SCHEMA = "goalflight.projects-index.v1"
 PROJECT_STORE_META_SCHEMA = "goalflight.project-store-meta.v1"
 VIEW_MANIFEST_SCHEMA = "goalflight.view-manifest.v1"
+CONTROLLER_CADENCE_SCHEMA = "goalflight.controller-cadence.v1"
 PROJECT_REGISTRY_THROTTLE_S = 3600
 ALLOW_VOLATILE_PROJECT_ROOT_ENV = "GOALFLIGHT_ALLOW_VOLATILE_PROJECT_ROOT"
 # Decisions mint d-NNN so they cannot collide with a project's ratified q-series.
@@ -745,6 +746,18 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _empty_controller_cadence_state() -> dict[str, Any]:
+    return {
+        "schema": CONTROLLER_CADENCE_SCHEMA,
+        "lanes": {},
+        "registry_order": [],
+        "project_duty_owner": None,
+        "intervals_seconds": {},
+        "last_done": {},
+        "duty_wakes": {},
+    }
 
 
 def _skill_version() -> str | None:
@@ -1962,17 +1975,47 @@ def _write_bytes_fsync(path: Path, data: bytes) -> None:
         os.fsync(fh.fileno())
 
 
-def _clone_or_copy(src: Path, dst: Path) -> None:
+def _clonefile(src: Path, dst: Path) -> None:
+    import ctypes
+
+    clonefile = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).clonefile
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    clonefile.restype = ctypes.c_int
+    if clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(dst))
+
+
+def _clone_or_copy(
+    src: Path,
+    dst: Path,
+    *,
+    darwin_clone_only: bool = False,
+) -> None:
     """Clone file extents where supported, retaining copy2 metadata semantics."""
+    if darwin_clone_only:
+        if sys.platform != "darwin":
+            shutil.copy2(src, dst)
+            return
+        try:
+            _clonefile(src, dst)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                dst.unlink()
+            if exc.errno not in {errno.ENOTSUP, errno.EXDEV}:
+                raise
+            shutil.copy2(src, dst)
+            return
+        try:
+            shutil.copystat(src, dst)
+        except Exception:
+            with contextlib.suppress(OSError):
+                dst.unlink()
+            raise
+        return
     try:
         if sys.platform == "darwin":
-            import ctypes
-
-            clonefile = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).clonefile
-            clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
-            clonefile.restype = ctypes.c_int
-            if clonefile(os.fsencode(src), os.fsencode(dst), 0) != 0:
-                raise OSError(ctypes.get_errno(), "clonefile failed")
+            _clonefile(src, dst)
         elif sys.platform.startswith("linux"):
             import fcntl as native_fcntl
 
@@ -2428,6 +2471,31 @@ def _coerce_query(query: Any = None, **overrides: Any) -> dict[str, Any]:
     return out
 
 
+TASK_STORE_SNAPSHOT_KEEP = 2
+
+
+def prune_task_store_snapshots(log_dir: Path, *, keep: int = TASK_STORE_SNAPSHOT_KEEP) -> int:
+    """Keep the newest task and dashboard snapshots for one store."""
+
+    removed = 0
+    for pattern in ("tasks-*.jsonl", "tasks-data-*.js"):
+        try:
+            snapshots = sorted(
+                log_dir.glob(pattern),
+                key=lambda path: (path.stat().st_mtime, path.name),
+                reverse=True,
+            )
+        except OSError:
+            continue
+        for path in snapshots[keep:]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+    return removed
+
+
 class TaskStore:
     def __init__(self, project_root: Path):
         self.project_root = _strip_managed_worktree(project_root)
@@ -2445,6 +2513,7 @@ class TaskStore:
         self.export_docs_dir = self.project_root / "docs-private"
         self.export_dashboard_dir = self.project_root / "dashboard"
         self.tasks_path = self.docs_dir / "tasks.jsonl"
+        self.controller_cadence_path = self.docs_dir / "controller-cadence.json"
         self.data_js_path = self.dashboard_dir / "tasks-data.js"
         self.task_decomposition_path = self.docs_dir / "task-decomposition.md"
         self.tasks_done_path = self.docs_dir / "tasks-done.md"
@@ -2456,6 +2525,7 @@ class TaskStore:
         self.publish_marker_path = self.docs_dir / ".tasks-publish-incomplete.json"
         self.log_dir = self.docs_dir / "log"
         self._migrated = False
+        self._lock_timeout_s: float | None = None
 
     def _require_state_dir_safe(self, path: Path, label: str, *, base: Path | None = None) -> None:
         root = (base or self.store_dir).resolve(strict=False)
@@ -2504,7 +2574,7 @@ class TaskStore:
     @contextlib.contextmanager
     def store_lock(self):
         self._ensure_docs_dir_for_write()
-        with FileLock(self.store_lock_path):
+        with FileLock(self.store_lock_path, budget_s=self._lock_timeout_s):
             yield
 
     def try_store_lock(self, *, deadline_s: float) -> FileLock | None:
@@ -2672,6 +2742,34 @@ class TaskStore:
         # on a pure read — so read-only consumers of a legacy store keep working.
         items, _ = _parse_jsonl(self._effective_tasks_path())
         return items
+
+    def load_controller_cadence(self) -> dict[str, Any]:
+        path = self.controller_cadence_path
+        self._require_state_dir_safe(path, "controller cadence")
+        if not require_regular_or_absent(path):
+            return _empty_controller_cadence_state()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TaskError(f"{path}: unreadable controller cadence state: {exc}") from exc
+        if not isinstance(state, dict) or state.get("schema") != CONTROLLER_CADENCE_SCHEMA:
+            raise TaskError(f"{path}: unsupported controller cadence schema")
+        return state
+
+    def mutate_controller_cadence(
+        self, update: Callable[[dict[str, Any]], Any]
+    ) -> Any:
+        """Update the project's cadence registry and ledger under the task-store lock."""
+        self._ensure_store_ready()
+        with self.store_lock():
+            state = self.load_controller_cadence()
+            result = update(state)
+            _atomic_write_text(
+                self.controller_cadence_path,
+                json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                prefix=".controller-cadence-",
+            )
+            return result
 
     def items_by_id(self) -> dict[str, dict[str, Any]]:
         return {item["id"]: item for item in self.load_items()}
@@ -2973,12 +3071,8 @@ class TaskStore:
             _clone_or_copy(self.data_js_path, self.log_dir / f"tasks-data-{stamp}.js")
         self._prune_backups()
 
-    def _prune_backups(self, keep: int = 20) -> None:
-        for pattern in ("tasks-*.jsonl", "tasks-data-*.js") if _dashboard_export_enabled() else ("tasks-*.jsonl",):
-            backups = sorted(self.log_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-            for path in backups[keep:]:
-                with contextlib.suppress(OSError):
-                    path.unlink()
+    def _prune_backups(self, keep: int = TASK_STORE_SNAPSHOT_KEEP) -> None:
+        prune_task_store_snapshots(self.log_dir, keep=keep)
 
     def project_ledger_records(
         self, *, include_superseded: bool = False
@@ -3215,13 +3309,16 @@ class TaskStore:
 
         return [row for row in rows if matches(row)]
 
-    def next_frontier(self) -> list[dict[str, Any]]:
+    def next_frontier(self, *, lane: str | None = None) -> list[dict[str, Any]]:
+        if lane is not None:
+            _validate_lane_arg(lane)
         return [
             row
             for row in self.derived_rows()
             if row.get("kind", "task") in {"task", "bug"}
             and row.get("derived_status") == "pending"
             and row.get("lane") not in RESERVED_LANES
+            and (lane is None or row.get("lane") == lane)
             and _latest_dispatch_breadcrumb(row) is None
         ]
 
@@ -4803,6 +4900,79 @@ def _cmd_lane(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_lanes(store: TaskStore, args: argparse.Namespace) -> int:
+    action = args.lanes_action
+    state = store.load_controller_cadence()
+    lanes = state.get("lanes")
+    order = state.get("registry_order")
+    if not isinstance(lanes, dict) or not isinstance(order, LIST_TYPE):
+        raise TaskError(f"{store.controller_cadence_path}: invalid lane registry")
+
+    if action == "show":
+        result = {
+            "lanes": lanes,
+            "project_duty_owner": state.get("project_duty_owner"),
+            "registry_order": order,
+        }
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            for label in order:
+                entry = lanes.get(label)
+                if not isinstance(entry, dict):
+                    continue
+                print(f"{label} lane={entry.get('lane', '')}")
+                charter = entry.get("charter")
+                if isinstance(charter, LIST_TYPE):
+                    for line in charter:
+                        print(f"  {line}")
+            owner = result["project_duty_owner"] or "default"
+            print(f"owner={owner}")
+        return 0
+
+    label = str(args.controller_label or "").strip()
+    if not label or len(label) > 64 or any(ord(char) < 32 for char in label):
+        raise TaskError("controller label must contain 1-64 printable characters")
+
+    if action == "set-charter":
+        lane = str(args.lane).strip()
+        _validate_lane_arg(lane)
+        if lane in RESERVED_LANES:
+            raise TaskError("controller lane must be a non-reserved lane")
+        charter = [line.strip() for line in str(args.charter).splitlines()]
+        if not 3 <= len(charter) <= 5 or any(not line for line in charter):
+            raise TaskError("charter must contain 3-5 non-empty lines")
+
+        def update_charter(current: dict[str, Any]) -> None:
+            registry = current.get("lanes")
+            registry_order = current.get("registry_order")
+            if not isinstance(registry, dict) or not isinstance(registry_order, LIST_TYPE):
+                raise TaskError(f"{store.controller_cadence_path}: invalid lane registry")
+            registry[label] = {"lane": lane, "charter": charter}
+            if label not in registry_order:
+                registry_order.append(label)
+
+        store.mutate_controller_cadence(update_charter)
+        print(f"{label} lane={lane}")
+        return 0
+
+    if action == "set-owner":
+        if label not in lanes:
+            raise TaskError(f"controller has no lane charter: {label}")
+
+        def update_owner(current: dict[str, Any]) -> None:
+            registry = current.get("lanes")
+            if not isinstance(registry, dict) or label not in registry:
+                raise TaskError(f"controller has no lane charter: {label}")
+            current["project_duty_owner"] = label
+
+        store.mutate_controller_cadence(update_owner)
+        print(f"owner={label}")
+        return 0
+
+    raise TaskError(f"unknown lanes action: {action}")
+
+
 def _cmd_set_prompt_path(store: TaskStore, args: argparse.Namespace) -> int:
     """Set/replace an existing item's prompt_path (canonical on-disk dispatch source).
 
@@ -5328,12 +5498,20 @@ def _post_task_store_nudge(
         project_root_text = str(project_root.resolve())
         key = f"{nudge_kind}:{project_slug}:{dedup_suffix}"
         failure_key = key
+        replacement_identity = {
+            "dispatch_id": dispatch_id,
+            "source": {"node": "local", "adapter": "task-store"},
+            "type": "user_need",
+            "payload": {
+                "nudge_kind": nudge_kind,
+                "project_root": project_root_text,
+            },
+        }
+
         def is_current_kind(envelope: dict) -> bool:
-            envelope_payload = envelope.get("payload")
-            return (
-                envelope.get("type") == "user_need"
-                and isinstance(envelope_payload, dict)
-                and envelope_payload.get("nudge_kind") == nudge_kind
+            return gm._is_task_store_nudge_replacement(
+                envelope,
+                replacement_identity,
             )
 
         def is_duplicate(envelope: dict) -> bool:
@@ -5446,7 +5624,7 @@ def post_resume_nudge(project_root: str | Path) -> None:
 
 
 def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
-    rows = store.next_frontier()
+    rows = store.next_frontier(lane=getattr(args, "lane", None))
     _post_next_nudge(rows, store.project_root)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
@@ -5728,6 +5906,24 @@ def build_parser() -> argparse.ArgumentParser:
     lane.add_argument("lane")
     lane.set_defaults(func=_cmd_lane)
 
+    lanes = sub.add_parser(
+        "lanes",
+        help="Manage controller lane charters and the project-duty owner.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    lane_actions = lanes.add_subparsers(dest="lanes_action", required=True)
+    set_charter = lane_actions.add_parser("set-charter")
+    set_charter.add_argument("controller_label")
+    set_charter.add_argument("lane")
+    set_charter.add_argument("--charter", required=True, help="3-5 newline-separated lines.")
+    set_charter.set_defaults(func=_cmd_lanes)
+    set_owner = lane_actions.add_parser("set-owner")
+    set_owner.add_argument("controller_label")
+    set_owner.set_defaults(func=_cmd_lanes)
+    show_lanes = lane_actions.add_parser("show")
+    show_lanes.add_argument("--json", action="store_true")
+    show_lanes.set_defaults(func=_cmd_lanes)
+
     append = sub.add_parser(
         "append",
         help="UPDATE: append a timestamped note to one or more items.",
@@ -5911,10 +6107,11 @@ def build_parser() -> argparse.ArgumentParser:
     next_cmd = sub.add_parser(
         "next",
         help="READ-ONLY (safe, free): print the flat dispatchable frontier. Dispatch items individually with goalflight_dispatch.py.",
-        epilog="example: goalflight_task.py next --json",
+        epilog="examples: goalflight_task.py next --json; goalflight_task.py next --lane ssot",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     next_cmd.add_argument("--by", help=argparse.SUPPRESS)
+    next_cmd.add_argument("--lane", help="Filter the dispatchable frontier by free-text lane.")
     next_cmd.add_argument("--json", action="store_true")
     next_cmd.set_defaults(func=_cmd_next)
 

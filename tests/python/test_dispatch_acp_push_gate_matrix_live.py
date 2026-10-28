@@ -19,7 +19,10 @@ RUNNER = ROOT / "scripts" / "goalflight_acp_push_gate_matrix.py"
 
 def main() -> int:
     if os.environ.get("GOALFLIGHT_ACP_LIVE_MATRIX") != "1":
-        print("SKIP: set GOALFLIGHT_ACP_LIVE_MATRIX=1 to run real ACP push-gate matrix")
+        print(
+            "SKIP-FILE: test_dispatch_acp_push_gate_matrix_live.py: "
+            "set GOALFLIGHT_ACP_LIVE_MATRIX=1 to run real ACP push-gate matrix"
+        )
         return 0
     with tempfile.TemporaryDirectory(prefix="goalflight-acp-matrix-test-") as td:
         tmp = Path(td)

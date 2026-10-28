@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
+import errno
 import getpass
 import io
 import json
@@ -404,6 +405,9 @@ class StateLock:
     holder's write. Today every nesting outer holder only reads.
     """
 
+    def __init__(self, *, timeout_s: float | None = None):
+        self.timeout_s = timeout_s
+
     def __enter__(self):
         depth = getattr(_STATE_LOCK_HELD, "depth", 0)
         if depth:
@@ -414,7 +418,20 @@ class StateLock:
         # lock for a read (status) leaves the lock file's mtime untouched.
         fh = lock_path().open("a")
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX)
+            if self.timeout_s is None:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + max(0.0, self.timeout_s)
+                while True:
+                    try:
+                        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except (BlockingIOError, OSError) as exc:
+                        if isinstance(exc, OSError) and exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("capacity-lock-timeout") from exc
+                        time.sleep(min(0.01, deadline - time.monotonic()))
         except BaseException:
             fh.close()
             raise
@@ -433,7 +450,12 @@ class StateLock:
 
 
 def _empty_state() -> dict:
-    return {"schema": SCHEMA, "machine_id": machine_id(), "leases": {}, "cooldowns": {}}
+    return {
+        "schema": SCHEMA,
+        "machine_id": machine_id(),
+        "leases": {},
+        "cooldowns": {},
+    }
 
 
 def load_state() -> dict:
@@ -485,6 +507,7 @@ def load_state() -> dict:
         )
     data.setdefault("schema", SCHEMA)
     data.setdefault("machine_id", machine_id())
+    data.pop("machine_id_aliases", None)
     data.setdefault("cooldowns", {})
     if not isinstance(data.get("cooldowns"), dict):
         raise CapacityStateUnreadable(
@@ -962,26 +985,6 @@ def worker_identity_liveness(
     return "live", "worker_identity_match"
 
 
-def _lease_is_local(lease: dict, data: dict | None = None) -> bool:
-    """Only probe process identities for leases owned by this host.
-
-    The capacity state file lives in this host's local temp directory, so the
-    machine id stamped on the file was written by this host. macOS hostnames
-    drift (network-assigned names), so ``machine_id()`` can differ from the
-    stamp written earlier by the same machine. A lease is local when it names
-    no machine, names the file's own stamp, or names the current hostname id;
-    only a lease naming some other machine is remote. A state directory shared
-    between machines (GOALFLIGHT_STATE_DIR on shared storage) is not supported.
-    """
-    recorded = lease.get("machine_id")
-    if recorded in (None, ""):
-        return True
-    local_ids = {machine_id()}
-    if data is not None and data.get("machine_id") not in (None, ""):
-        local_ids.add(str(data["machine_id"]))
-    return str(recorded) in local_ids
-
-
 def _pid_holds_capacity(
     pid: object,
     lease: dict,
@@ -1116,7 +1119,6 @@ def unknown_claimant_leases(data: dict) -> list[dict]:
     return [
         lease
         for lease in active_leases(data)
-        if _lease_is_local(lease, data)
         if _pre_attach_claimant_liveness(lease) is None
     ]
 
@@ -1125,7 +1127,7 @@ def legacy_manual_release_leases(data: dict) -> list[dict]:
     """Legacy leases whose worker identity cannot currently be resolved."""
     unresolved: list[dict] = []
     for lease in active_leases(data):
-        if not _lease_is_local(lease, data) or not _lease_is_legacy(lease):
+        if not _lease_is_legacy(lease):
             continue
         record = _dispatch_record_for_lease(lease)
         import goalflight_ledger
@@ -1185,14 +1187,13 @@ def prune_state(data: dict) -> None:
     for lease_id in list(leases):
         lease = leases[lease_id]
         expires_at = parse_iso(lease.get("expires_at"))
-        # TTL expiry is gated on liveness: only local leases with a proven-dead
-        # worker may expire. Remote process identities are never probed here.
+        # TTL expiry is gated on liveness: only leases with a proven-dead worker
+        # may expire. machine_id is informational; this state file is host-local.
         # An active lease past its TTL is otherwise left to liveness-based
         # reclaim (cmd_release-stale / stale_active_leases).
         if (
             expires_at
             and expires_at < now
-            and _lease_is_local(lease, data)
             and _lease_pids_dead(lease)
         ):
             lease["state"] = "expired"
@@ -1482,12 +1483,47 @@ def launch_slot_budget(
     is a TOCTOU on the ledger-read completion gate); this budget is the
     operator/report surface and the cap on "should we even try".
     """
+    return _launch_slot_budget(
+        agent=agent,
+        priority=priority,
+        args=args,
+        account=account,
+        model=model,
+        lock_timeout_s=None,
+    )
+
+
+def _launch_slot_budget(
+    agent: str | None = None,
+    priority: str = "normal",
+    args: argparse.Namespace | None = None,
+    account: str | None = None,
+    model: str | None = None,
+    *,
+    lock_timeout_s: float | None,
+) -> dict:
+    """Read capacity with an optional bounded lock for the supervisor pulse."""
     del priority  # acquire-time lane ceilings stay on the child acquire path
     prof = profile(args)
     operating_cap = int(prof["operating_cap"])
     try:
-        with StateLock():
+        with StateLock(timeout_s=lock_timeout_s):
             data = load_state()
+    except TimeoutError:
+        if lock_timeout_s is not None:
+            raise
+        return {
+            "unreadable": True,
+            "reason": "capacity state lock timed out",
+            "operating_cap": operating_cap,
+            "active": 0,
+            "global_remaining": 0,
+            "by_pool": {},
+            "by_account": {},
+            "agent": agent,
+            "account": account,
+            "agent_remaining": 0,
+        }
     except CapacityStateUnreadable as exc:
         return {
             "unreadable": True,
@@ -2022,9 +2058,6 @@ def cmd_release(args: argparse.Namespace) -> int:
         if not lease:
             print(json.dumps({"ok": False, "reason": "missing_lease", "lease_id": args.lease_id}, sort_keys=True))
             return 1
-        if not _lease_is_local(lease, data):
-            print(json.dumps({"ok": False, "reason": "remote_lease", "lease_id": args.lease_id}, sort_keys=True))
-            return 1
         if lease.get("state") in TERMINAL_LEASE_STATES:
             print(json.dumps({"ok": True, "lease_id": args.lease_id, "state": lease["state"]}, sort_keys=True))
             return 0
@@ -2155,8 +2188,7 @@ def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
             record = None
         candidates = [lease for lease in data.get("leases", {}).values()
                       if lease.get("dispatch_id") == dispatch_id
-                      and lease.get("state") == "active"
-                      and _lease_is_local(lease, data)]
+                      and lease.get("state") == "active"]
         if not candidates:
             return
         changed = False
@@ -2169,11 +2201,13 @@ def release_terminal_dispatch(dispatch_id: str, state: str) -> None:
 
 
 def stale_active_leases(data: dict) -> list[dict]:
-    """Active local leases whose worker identity proves the holder gone."""
+    """Active leases whose worker identity proves the holder gone."""
     stale: list[dict] = []
+    # state_path() resolves this node's file (:382); cmd_acquire stamps leases
+    # from the running host (:2006); fleet starts a node-local dispatcher
+    # (goalflight_fleet_launch_detached.py:697). Shared cross-machine state
+    # dirs are unsupported, so machine_id is informational.
     for lease in active_leases(data):
-        if not _lease_is_local(lease, data):
-            continue
         if retained_live_scope_holds_capacity(lease):
             continue
         record = _dispatch_record_for_lease(lease)

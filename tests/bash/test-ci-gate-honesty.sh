@@ -24,7 +24,7 @@ if goalflight_gate.DEFAULT_CMD != [str(expected_default)] or actual_default != e
 
 runner_text = (root / "tests" / "run.sh").read_text(encoding="utf-8")
 required_fragments = (
-    "python3 -m pytest tests/python -q",
+    "python3 tests/run_python.py",
     "find tests/python -type f -name 'test_*.py'",
     "$skip skipped",
     "skill_structure_collected",
@@ -35,6 +35,7 @@ required_fragments = (
     'GOALFLIGHT_PIDFILE_DIR="$_GF_PIDFILE_BASE"',
     'XDG_STATE_HOME="$_GF_XDG_BASE"',
     "project-<10-hex>",
+    "passed files had case-level skips",
 )
 for fragment in required_fragments:
     if fragment not in runner_text:

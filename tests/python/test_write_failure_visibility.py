@@ -1301,7 +1301,9 @@ def test_requeue_child_write_distinguishes_contract_from_transient(
 
 def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> None:
     """Restoring the old broad suppress at any nested changed site fails here."""
-    dispatch_source = inspect.getsource(dispatch.main)
+    # Launch and terminal-write handling live in _main_impl; main is the thin
+    # CLI wrapper that emits launch markers.
+    dispatch_source = inspect.getsource(dispatch._main_impl)
     acp_source = inspect.getsource(acp_run._run_acp_dispatch_impl)
     acp_finalize_source = inspect.getsource(acp_run._finalize_capacity_after_cleanup)
     acp_attach_source = inspect.getsource(acp_run._attach_worker_state_before_running)

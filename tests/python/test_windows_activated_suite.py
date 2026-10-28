@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from support import note_skip, skip_unless_native_windows
 
-skip_unless_native_windows("Windows-activated tests run only on native Windows")
+RUN_NATIVE_WINDOWS_SUITE = skip_unless_native_windows(
+    "Windows-activated tests run only on native Windows"
+)
 
 import json
 import os
@@ -284,4 +286,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if RUN_NATIVE_WINDOWS_SUITE:
+        main()

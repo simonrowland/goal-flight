@@ -52,7 +52,7 @@ def test_cursor_is_not_in_the_acp_auto_list() -> None:
     cursor dispatch takes.
     """
     import inspect
-    src = inspect.getsource(gd.main)
+    src = inspect.getsource(gd._main_impl)
     marker = 'shape = "acp" if args.agent in ('
     assert marker in src, "shape auto-resolution moved; update this test"
     line = next(l for l in src.splitlines() if marker in l)

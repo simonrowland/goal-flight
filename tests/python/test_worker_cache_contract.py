@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
@@ -14,12 +15,22 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "scripts" / "hosts" / "codex"))
 
+import bash_tail_controller  # noqa: E402
 import goalflight_codex_sandbox as codex_sandbox  # noqa: E402
 import goalflight_acp_run as acp_run  # noqa: E402
+import goalflight_agent_limits  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
+import goalflight_journal  # noqa: E402
+import goalflight_messages  # noqa: E402
 import goalflight_os_sandbox as os_sandbox  # noqa: E402
 import goalflight_profile  # noqa: E402
+import goalflight_review_job  # noqa: E402
+import goalflight_task  # noqa: E402
+import goalflight_wake  # noqa: E402
+import grok_seats  # noqa: E402
+import grok_usage  # noqa: E402
 
 
 def _shared_cache(home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -57,9 +68,9 @@ def test_codex_worker_grants_shared_cache(
     argv, _stdin = dispatch.build_worker(args, "/tmp/worker.md", [])
     configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-c"]
 
-    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+    # Keep the remote-plugin flag absent; it triggers an 88 MB fallback checkout.
     assert "features.remote_plugin=false" not in configs, argv
-    assert "features.plugins=false" not in configs, configs
+    assert configs.count("features.plugins=false") == 1, configs
     writable_config = next(
         value
         for value in configs
@@ -67,6 +78,17 @@ def test_codex_worker_grants_shared_cache(
     )
     writable_roots = json.loads(writable_config.split("=", 1)[1])
     assert str(cache) in writable_roots, str(writable_roots)
+
+
+def test_codex_raw_argv_is_unchanged() -> None:
+    raw_argv = ["codex", "exec", "--help"]
+
+    argv, stdin_path = dispatch.build_worker(
+        argparse.Namespace(agent="codex"), "/tmp/worker.md", raw_argv
+    )
+
+    assert argv == raw_argv
+    assert stdin_path is None
 
 
 def test_native_codex_read_only_keeps_sandbox_and_shared_cache_env(
@@ -110,8 +132,65 @@ def test_native_codex_read_only_keeps_sandbox_and_shared_cache_env(
 def test_codex_acp_worker_keeps_default_args() -> None:
     _binary, argv = acp_run.agent_command("codex-acp")
 
-    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
+    configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-c"]
     assert "features.remote_plugin=false" not in argv, argv
+    assert configs.count("features.plugins=false") == 1, argv
+
+
+def test_codex_review_job_uses_plugins_off_config(tmp_path: Path) -> None:
+    argv = goalflight_review_job.command_for(
+        argparse.Namespace(
+            agent="codex",
+            codex_bin="codex",
+            output_dir=str(tmp_path),
+            name="review",
+            repo=str(tmp_path),
+        )
+    )
+
+    configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-c"]
+    assert configs.count("features.plugins=false") == 1, argv
+    assert "features.remote_plugin=false" not in configs, argv
+
+
+def test_codex_bash_tail_controller_uses_plugins_off_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("prompt\n", encoding="utf-8")
+    tail_path = tmp_path / "tail.log"
+    captured: dict[str, object] = {}
+    process = object()
+
+    def fake_popen(argv: list[str], **kwargs: object) -> object:
+        captured["argv"] = argv
+        for name in ("stdin", "stdout"):
+            stream = kwargs[name]
+            stream.close()
+        return process
+
+    monkeypatch.setattr(bash_tail_controller.subprocess, "Popen", fake_popen)
+
+    spawned = bash_tail_controller.spawn_codex_worker(
+        tmp_path, prompt_file, tail_path
+    )
+
+    argv = captured["argv"]
+    assert spawned is process
+    assert isinstance(argv, list)
+    configs = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "-c"]
+    assert configs.count("features.plugins=false") == 1, argv
+    assert "features.remote_plugin=false" not in configs, argv
+
+
+def test_codex_adapter_invocation_declares_plugins_off_once() -> None:
+    adapter = json.loads((ROOT / "adapters" / "codex.json").read_text())
+    invocation = adapter["invocation"]["exec"]
+    args = invocation["args"]
+    configs = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-c"]
+
+    assert configs.count("features.plugins=false") == 1, args
+    assert "features.remote_plugin=false" not in configs, args
 
 
 @pytest.mark.parametrize("agent", ["codex", "grok-code", "cursor"])
@@ -134,6 +213,226 @@ def test_direct_dispatch_environment_forces_one_shared_uv_cache(
     env = dispatch._resolve_launch_account_env(SimpleNamespace(agent=agent, account=None))
 
     assert env.get("UV_CACHE_DIR") == str(cache), env.get("UV_CACHE_DIR")
+
+
+@pytest.mark.parametrize("agent", ["grok-code", "cursor"])
+def test_account_worker_state_paths_ignore_account_xdg_redirect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent: str
+) -> None:
+    controller_home = tmp_path / "controller-home"
+    account_home = tmp_path / f"{agent}-account-home"
+    controller_home.mkdir()
+    account_home.mkdir()
+    grok_dir = account_home / ".grok"
+    grok_dir.mkdir()
+    (grok_dir / "auth.json").write_text("{}\n", encoding="utf-8")
+    (grok_dir / "config.toml").write_text(
+        '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    _shared_cache(controller_home, monkeypatch)
+
+    controller_xdg = tmp_path / "controller-xdg"
+    monkeypatch.setenv("HOME", str(controller_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(controller_xdg))
+    for key in (
+        "GOALFLIGHT_TASK_STORE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_WAKE_LEDGER_DIR",
+        "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_CAPACITY_CONF",
+        "GOALFLIGHT_GROK_SEAT_STATE_FILE",
+        "GOALFLIGHT_GROK_ACCOUNTS_DIR",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        dispatch, "_account_home", lambda _account, _engine: account_home
+    )
+    monkeypatch.setattr(
+        dispatch, "_cursor_account_probe", lambda _env: (True, "")
+    )
+    monkeypatch.setattr(dispatch, "_guard_grok_seat_permission_mode", lambda *_args: None)
+    seat_state = controller_home / ".goal-flight" / "grok-seat-states.json"
+    grok_accounts = controller_home / ".goal-flight" / "accounts"
+    monkeypatch.setattr(grok_seats, "STATE_PATH", seat_state)
+    monkeypatch.setattr(grok_usage, "ACCOUNTS_DIR", grok_accounts)
+
+    account_env = dispatch._resolve_launch_account_env(
+        SimpleNamespace(agent=agent, account="probe")
+    )
+    worker_env = os.environ.copy()
+    worker_env.update(account_env)
+
+    assert worker_env["XDG_STATE_HOME"] == str(account_home / ".local" / "state")
+    assert worker_env["GOALFLIGHT_TASK_STORE_DIR"] == str(
+        controller_xdg / "goal-flight"
+    )
+    assert worker_env["GOALFLIGHT_JOURNAL_DIR"] == str(
+        controller_xdg / "goal-flight"
+    )
+    assert worker_env["GOALFLIGHT_MESSAGES_DIR"] == str(
+        controller_home / ".goal-flight" / "messages"
+    )
+    assert worker_env["GOALFLIGHT_WAKE_LEDGER_DIR"] == str(
+        controller_xdg / "goal-flight" / "wake-ledger"
+    )
+    assert worker_env["GOALFLIGHT_FLEET_DIR"] == str(
+        controller_home / ".goal-flight" / "fleet"
+    )
+    assert worker_env["GOALFLIGHT_CAPACITY_CONF"] == str(
+        controller_home / ".goal-flight" / "capacity.local.json"
+    )
+    assert worker_env["GOALFLIGHT_GROK_SEAT_STATE_FILE"] == str(seat_state)
+    assert worker_env["GOALFLIGHT_GROK_ACCOUNTS_DIR"] == str(grok_accounts)
+
+    for key in (
+        "HOME",
+        "XDG_STATE_HOME",
+        "GOALFLIGHT_TASK_STORE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_WAKE_LEDGER_DIR",
+        "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_CAPACITY_CONF",
+    ):
+        monkeypatch.setenv(key, worker_env[key])
+
+    real_store = controller_xdg / "goal-flight"
+    assert goalflight_task.resolve_state_base_dir() == real_store
+    assert goalflight_task.resolve_task_store_dir(ROOT).parents[1] == real_store
+    assert goalflight_journal.journals_index_dir() == real_store / "journals"
+    assert (
+        goalflight_journal.resolve_journal_path(ROOT).parent.parent
+        == real_store / "journals"
+    )
+    assert goalflight_messages.default_messages_dir() == (
+        controller_home / ".goal-flight" / "messages"
+    )
+    assert goalflight_wake.ledger_base_dir() == real_store / "wake-ledger"
+    assert goalflight_messages.default_fleet_dir() == (
+        controller_home / ".goal-flight" / "fleet"
+    )
+    assert goalflight_agent_limits._local_conf_path() == (
+        controller_home / ".goal-flight" / "capacity.local.json"
+    )
+
+
+def test_grok_machine_path_overrides_are_read_at_import_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seat_state = tmp_path / "controller" / "grok-seat-states.json"
+    accounts = tmp_path / "controller" / "accounts"
+    monkeypatch.setenv("GOALFLIGHT_GROK_SEAT_STATE_FILE", str(seat_state))
+    monkeypatch.setenv("GOALFLIGHT_GROK_ACCOUNTS_DIR", str(accounts))
+    monkeypatch.setattr(grok_seats, "STATE_PATH", grok_seats.STATE_PATH)
+    monkeypatch.setattr(grok_usage, "ACCOUNTS_DIR", grok_usage.ACCOUNTS_DIR)
+
+    importlib.reload(grok_seats)
+    importlib.reload(grok_usage)
+
+    assert grok_seats.STATE_PATH == seat_state
+    assert grok_usage.ACCOUNTS_DIR == accounts
+
+
+def test_account_worker_state_pins_respect_controller_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    controller_home = tmp_path / "controller-home"
+    account_home = tmp_path / "cursor-account-home"
+    controller_home.mkdir()
+    account_home.mkdir()
+    monkeypatch.setenv("HOME", str(controller_home))
+    monkeypatch.setattr(
+        dispatch, "_account_home", lambda _account, _engine: account_home
+    )
+    monkeypatch.setattr(dispatch, "_cursor_account_probe", lambda _env: (True, ""))
+    expected = {
+        "GOALFLIGHT_TASK_STORE_DIR": tmp_path / "task-store",
+        "GOALFLIGHT_JOURNAL_DIR": tmp_path / "journal",
+        "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
+        "GOALFLIGHT_WAKE_LEDGER_DIR": tmp_path / "wake-ledger",
+        "GOALFLIGHT_FLEET_DIR": tmp_path / "fleet",
+        "GOALFLIGHT_CAPACITY_CONF": tmp_path / "capacity.json",
+        "GOALFLIGHT_GROK_SEAT_STATE_FILE": tmp_path / "grok-seat-states.json",
+        "GOALFLIGHT_GROK_ACCOUNTS_DIR": tmp_path / "accounts",
+    }
+    for key, path in expected.items():
+        monkeypatch.setenv(key, str(path))
+
+    account_env = dispatch._resolve_account_env(
+        SimpleNamespace(agent="cursor", account="probe")
+    )
+
+    assert {
+        key: account_env[key] for key in expected
+    } == {key: str(path.resolve()) for key, path in expected.items()}
+
+
+def test_accountless_grok_resume_preflight_pins_controller_state_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    controller_home = tmp_path / "controller-home"
+    account_home = tmp_path / "grok-account-home"
+    controller_home.mkdir()
+    account_home.mkdir()
+    grok_dir = account_home / ".grok"
+    grok_dir.mkdir()
+    (grok_dir / "auth.json").write_text("{}\n", encoding="utf-8")
+    (grok_dir / "config.toml").write_text(
+        '[ui]\npermission_mode = "always-approve"\n', encoding="utf-8"
+    )
+    _shared_cache(controller_home, monkeypatch)
+    controller_xdg = tmp_path / "controller-xdg"
+    monkeypatch.setenv("HOME", str(controller_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(controller_xdg))
+    for key in (
+        "GOALFLIGHT_TASK_STORE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_WAKE_LEDGER_DIR",
+        "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_CAPACITY_CONF",
+        "GOALFLIGHT_GROK_SEAT_STATE_FILE",
+        "GOALFLIGHT_GROK_ACCOUNTS_DIR",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(dispatch, "_select_healthy_grok_account", lambda **_kwargs: "probe")
+    monkeypatch.setattr(
+        dispatch, "_account_home", lambda _account, _engine: account_home
+    )
+    monkeypatch.setattr(
+        grok_seats,
+        "STATE_PATH",
+        controller_home / ".goal-flight" / "grok-seat-states.json",
+    )
+    monkeypatch.setattr(
+        grok_usage,
+        "ACCOUNTS_DIR",
+        controller_home / ".goal-flight" / "accounts",
+    )
+
+    args = dispatch._build_launch_parser().parse_args(
+        ["--agent", "grok-code", "--shape", "bash", "--prompt", "continue"]
+    )
+    resume_env = dispatch._validate_before_side_effects(args, [])
+    worker_env = os.environ.copy()
+    worker_env.update(resume_env)
+
+    assert args.account is None
+    assert worker_env["HOME"] == str(account_home)
+    assert worker_env["XDG_STATE_HOME"] == str(account_home / ".local" / "state")
+    assert worker_env["GOALFLIGHT_TASK_STORE_DIR"] == str(
+        controller_xdg / "goal-flight"
+    )
+    assert worker_env["GOALFLIGHT_JOURNAL_DIR"] == str(
+        controller_xdg / "goal-flight"
+    )
+    assert worker_env["GOALFLIGHT_MESSAGES_DIR"] == str(
+        controller_home / ".goal-flight" / "messages"
+    )
+    assert worker_env["GOALFLIGHT_WAKE_LEDGER_DIR"] == str(
+        controller_xdg / "goal-flight" / "wake-ledger"
+    )
 
 
 @pytest.mark.parametrize("agent", ["codex", "grok-code", "cursor"])
@@ -221,6 +520,10 @@ def test_acp_worker_spawn_keeps_controller_cache_after_account_home_swap(
         _worktree_seat=None,
     )
     account_env = {**controller_env, "HOME": str(account_home)}
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv(
+        "GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "state" / "dispatch")
+    )
 
     assert dispatch._run_acp_shape(args, base=tmp_path, account_env=account_env) == 0
     assert spawned_env["HOME"] == str(account_home), spawned_env
@@ -235,8 +538,8 @@ def test_grok_read_only_wrapper_keeps_private_tmp_and_shared_uv_cache(
     cache = _shared_cache(home, monkeypatch)
     account_home = home / ".goal-flight" / "accounts" / "probe" / "grok"
     account_home.mkdir(parents=True)
-    private_tmp = tmp_path / "private-dispatch-tmp"
-    private_tmp.mkdir()
+    scratch = tmp_path / "dispatch.scratch"
+    scratch.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "task-cache"))
     monkeypatch.setattr(dispatch, "_account_home", lambda _account, _engine: account_home)
@@ -248,6 +551,7 @@ def test_grok_read_only_wrapper_keeps_private_tmp_and_shared_uv_cache(
             "XDG_CONFIG_HOME": str(account_home / ".config"),
             "XDG_STATE_HOME": str(account_home / ".local" / "state"),
             "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+            "GOALFLIGHT_SCRATCH_DIR": str(scratch),
         },
     )
     monkeypatch.setattr(dispatch, "_guard_grok_seat_permission_mode", lambda *_args: None)
@@ -271,7 +575,6 @@ def test_grok_read_only_wrapper_keeps_private_tmp_and_shared_uv_cache(
         cwd=str(ROOT),
         read_only=True,
         os_sandbox="read-only",
-        _grok_read_only_tmpdir=str(private_tmp),
     )
     args._account_env = dispatch._resolve_launch_account_env(args)
 
@@ -279,7 +582,10 @@ def test_grok_read_only_wrapper_keeps_private_tmp_and_shared_uv_cache(
 
     environment = captured["environment"]
     assert environment["UV_CACHE_DIR"] == str(cache), environment["UV_CACHE_DIR"]
-    assert environment["TMPDIR"] == str(private_tmp), environment
+    private_tmp = Path(environment["TMPDIR"])
+    assert private_tmp.parent == scratch, environment
+    assert private_tmp.is_dir()
+    assert Path(environment["GOALFLIGHT_SCRATCH_DIR"]) == scratch
     assert Path(environment["UV_CACHE_DIR"]) != private_tmp / "uv-cache"
 
 
@@ -292,15 +598,20 @@ def test_macos_sandbox_profiles_grant_cache_only_to_writable_workers(
     task_cache = tmp_path / "task-specific-cache"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("UV_CACHE_DIR", str(task_cache))
-    temp_root = Path("/private/tmp").resolve()
-    monkeypatch.setattr(os_sandbox.tempfile, "gettempdir", lambda: str(temp_root))
-    private_tmp = temp_root / f"goalflight-grok-read-only-test-{os.getpid()}"
-    private_tmp.mkdir()
+    scratch = tmp_path / f"goalflight-dispatch-scratch-{os.getpid()}"
+    private_tmp = scratch / f"goalflight-grok-read-only-test-{os.getpid()}"
+    scratch.mkdir()
+    private_tmp.mkdir(parents=True)
     account_home = home / ".goal-flight" / "accounts" / "probe" / "grok"
     try:
         for agent in ("codex", "codex-acp", "grok-code", "cursor"):
             for profile in ("read-only", "workspace-write"):
-                environment = {"HOME": str(home), "UV_CACHE_DIR": str(cache)}
+                environment = {
+                    "HOME": str(home),
+                    "UV_CACHE_DIR": str(cache),
+                    "GOALFLIGHT_SCRATCH_DIR": str(scratch),
+                    "TMPDIR": str(scratch),
+                }
                 command = agent
                 if agent == "grok-code":
                     command = "grok"
@@ -312,6 +623,7 @@ def test_macos_sandbox_profiles_grant_cache_only_to_writable_workers(
                             "XDG_STATE_HOME": str(account_home / ".local" / "state"),
                             "XDG_DATA_HOME": str(account_home / ".local" / "share"),
                             "XDG_CACHE_HOME": str(account_home / ".cache"),
+                            "GOALFLIGHT_SCRATCH_DIR": str(scratch),
                             "TMPDIR": str(private_tmp),
                             "GOALFLIGHT_STEER_FILE": str(tmp_path / "steer.jsonl"),
                         }
@@ -333,7 +645,8 @@ def test_macos_sandbox_profiles_grant_cache_only_to_writable_workers(
                     ), (agent, profile, roots)
                 if agent == "grok-code" and profile == "read-only":
                     assert str(private_tmp.resolve()) in roots, "private TMPDIR grant missing"
-                    assert str(temp_root) not in roots, "shared temp root was granted"
+                assert str(Path("/tmp").resolve()) not in roots, roots
+                assert str(Path("/private/tmp").resolve()) not in roots, roots
 
         cursor_roots = os_sandbox.macos_write_roots(
             str(ROOT),
@@ -347,7 +660,7 @@ def test_macos_sandbox_profiles_grant_cache_only_to_writable_workers(
         ), cursor_roots
         assert str(task_cache.resolve(strict=False)) not in cursor_roots, cursor_roots
     finally:
-        shutil.rmtree(private_tmp, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @pytest.mark.parametrize("symlink_component", [".cache", "uv"])
@@ -371,8 +684,6 @@ def test_macos_sandbox_refuses_symlinked_cache_write_root(
     monkeypatch.setattr(codex_sandbox, "_REAL_USER_HOME", home.resolve(), raising=False)
     monkeypatch.setattr(codex_sandbox, "_SHARED_WORKER_UV_CACHE_DIR", cache, raising=False)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setattr(os_sandbox.tempfile, "gettempdir", lambda: "/tmp")
-
     roots = os_sandbox.macos_write_roots(
         str(ROOT),
         "workspace-write",

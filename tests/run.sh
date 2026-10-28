@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Discover and run test suites:
 #   - tests/bash/test-*.sh — bash tests (installers, codex overrides, fork-detect)
-#   - tests/python/**/test_*.py — isolated Python modules routed by pytest
+#   - tests/python/**/test_*.py — isolated Python modules routed by run_python.py
 #   - tests/js/test_*.js — Node-only hermetic browserless checks
 # One pass/fail per bash/JS file plus one pass/fail for the isolated Python suite.
 # Exit code = number of failed gate entries.
@@ -43,6 +43,7 @@ fail=0
 skip=0
 failed_tests=()
 skill_structure_collected=0
+meta_driver_collection_collected=0
 list_only=0
 if [ "${1:-}" = "--list" ]; then
   list_only=1
@@ -122,39 +123,41 @@ for test in test-*.sh; do
       fi
       ;;
   esac
-  if run_isolated_test_env bash "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+  if run_isolated_test_env bash "$test" > "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" 2>&1; then
     echo "PASS  tests/bash/$test"
     pass=$((pass + 1))
   else
     echo "FAIL  tests/bash/$test"
-    cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
+    cat "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" | sed 's/^/      /'
     fail=$((fail + 1))
     failed_tests+=("tests/bash/$test")
   fi
-  rm -f /tmp/goal-flight-test-$$.out
+  rm -f "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out"
 done
 
-# Python tests. The directory-level pytest driver routes every module in a fresh
-# process: guarded case_* modules run as scripts, native pytest modules run under
-# pytest, and nested modules such as tests/python/ext/ stay visible. Directly
-# executing every file is not equivalent: files without a main guard exit 0
-# without running their test_* functions.
+# Python tests. The isolated runner gives every module a fresh process. The
+# script-style meta-driver's targeted self-checks run in their own pytest lane
+# below so its recursive module fixture never reruns the suite.
 if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
   cd "$REPO_ROOT"
   if [ "$list_only" -eq 1 ]; then
     find tests/python -type f -name 'test_*.py' -print | LC_ALL=C sort
   else
     # Measure collection through the same pytest/conftest contract that owns
-    # execution. Name the state precisely: collection is observed here; the
-    # driver and its regression test separately guarantee execution.
+    # execution. Require both the Golden Master guard and the meta-driver's
+    # directory-collection regression check to remain visible.
     if run_isolated_test_env python3 -m pytest tests/python --collect-only -q \
-        > /tmp/goal-flight-collect-$$.out 2>&1; then
+        > "$_GF_TEST_ENV_BASE/goal-flight-collect-$$.out" 2>&1; then
       skill_structure_collected="$(
         grep -Ec '::test_isolated_test_module\[test_skill_structure\.py\]$' \
-          /tmp/goal-flight-collect-$$.out || true
+          "$_GF_TEST_ENV_BASE/goal-flight-collect-$$.out" || true
+      )"
+      meta_driver_collection_collected="$(
+        grep -Ec '::test_directory_collection_is_visible_and_clean$' \
+          "$_GF_TEST_ENV_BASE/goal-flight-collect-$$.out" || true
       )"
     fi
-    rm -f /tmp/goal-flight-collect-$$.out
+    rm -f "$_GF_TEST_ENV_BASE/goal-flight-collect-$$.out"
 
     # Snapshot live XDG project-<10-hex> journal slugs so a suite leak cannot
     # hide behind incidental TASK_STORE_DIR isolation of the test's own slug.
@@ -177,18 +180,33 @@ if index.is_dir():
             continue
 Path(sys.argv[1]).write_text("\n".join(sorted(names)), encoding="utf-8")
 PY
-    if run_isolated_test_env python3 -m pytest tests/python -q > /tmp/goal-flight-test-$$.out 2>&1; then
-      grep '^FLAKE  ' /tmp/goal-flight-test-$$.out | sed 's/^/      /' || true
-      echo "PASS  tests/python (isolated pytest directory suite)"
-      sed -n '$p' /tmp/goal-flight-test-$$.out | sed 's/^/      /'
+    if run_isolated_test_env python3 tests/run_python.py > "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" 2>&1; then
+      grep '^FLAKE  ' "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" | sed 's/^/      /' || true
+      echo "PASS  tests/python (isolated Python module runner)"
+      grep -E '^===== .* failed =====$|^LOCAL EXTENSION (TESTS|ZONE):|^      [0-9]+ passed files had case-level skips$' \
+        "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" | sed 's/^ */      /'
       pass=$((pass + 1))
     else
-      echo "FAIL  tests/python (isolated pytest directory suite)"
-      cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
+      echo "FAIL  tests/python (isolated Python module runner)"
+      cat "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" | sed 's/^/      /'
       fail=$((fail + 1))
       failed_tests+=("tests/python")
     fi
-    rm -f /tmp/goal-flight-test-$$.out
+    rm -f "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out"
+    if run_isolated_test_env python3 -m pytest \
+        tests/python/test_script_style_modules.py -q -rfE \
+        -k 'test_directory_collection_is_visible_and_clean or test_direct_script_skip_marker_distinguishes_case_skip or test_python_runner_executes_nested_local_extension_tests or test_mixed_case_and_file_skip_evidence_is_a_failure' \
+        > "$_GF_TEST_ENV_BASE/goal-flight-meta-driver-$$.out" 2>&1; then
+      echo "PASS  tests/python/test_script_style_modules.py (targeted meta-driver checks)"
+      sed -n '$p' "$_GF_TEST_ENV_BASE/goal-flight-meta-driver-$$.out" | sed 's/^/      /'
+      pass=$((pass + 1))
+    else
+      echo "FAIL  tests/python/test_script_style_modules.py (targeted meta-driver checks)"
+      cat "$_GF_TEST_ENV_BASE/goal-flight-meta-driver-$$.out" | sed 's/^/      /'
+      fail=$((fail + 1))
+      failed_tests+=("tests/python/test_script_style_modules.py")
+    fi
+    rm -f "$_GF_TEST_ENV_BASE/goal-flight-meta-driver-$$.out"
     # python exits 1 when the operator index gained project-<10-hex> children.
     # `if !` puts that leak on this then-branch; do not move FAIL to else.
     if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR -u XDG_STATE_HOME \
@@ -240,16 +258,16 @@ if [ -d "$REPO_ROOT/tests/js" ]; then
       skip=$((skip + 1))
       continue
     fi
-    if run_isolated_test_env node "$test" > /tmp/goal-flight-test-$$.out 2>&1; then
+    if run_isolated_test_env node "$test" > "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" 2>&1; then
       echo "PASS  $test"
       pass=$((pass + 1))
     else
       echo "FAIL  $test"
-      cat /tmp/goal-flight-test-$$.out | sed 's/^/      /'
+      cat "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out" | sed 's/^/      /'
       fail=$((fail + 1))
       failed_tests+=("$test")
     fi
-    rm -f /tmp/goal-flight-test-$$.out
+    rm -f "$_GF_TEST_ENV_BASE/goal-flight-test-$$.out"
   done
 fi
 
@@ -258,6 +276,13 @@ if [ "$list_only" -ne 1 ] && [ "$skill_structure_collected" -ne 1 ]; then
   echo "      required Golden Master guard was not collected by the pytest driver"
   fail=$((fail + 1))
   failed_tests+=("tests/python/test_skill_structure.py")
+fi
+
+if [ "$list_only" -ne 1 ] && [ "$meta_driver_collection_collected" -ne 1 ]; then
+  echo "FAIL  tests/python/test_script_style_modules.py"
+  echo "      required meta-driver directory collection check was not collected"
+  fail=$((fail + 1))
+  failed_tests+=("tests/python/test_script_style_modules.py")
 fi
 
 if [ "$list_only" -eq 1 ]; then

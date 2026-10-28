@@ -4,29 +4,38 @@ from __future__ import annotations
 
 import base64
 from dataclasses import replace
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import warnings
 
 import pytest
 import goalflight_remote_ci as ci
 from goalflight_remote_ci import (
     ArmOutcome, ArmSpec, BoxConfig, CommandResult, DaemonConfig, GateDaemon,
-    RemoteRunIdentity, RemoteRunner, ReceiptError, build_pair_specs, health_census,
+    RemoteRunner, ReceiptError, build_pair_specs, health_census,
     load_config, matched_pair_verdict, parse_receipt, receipt_from_output,
     run_command, list_remote_leases, submit_request, validate_request,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "remote_ci"
+
+
+@pytest.fixture(autouse=True)
+def fake_ssh_connection(monkeypatch):
+    monkeypatch.setenv("SSH_CONNECTION", "192.0.2.2 51234 192.0.2.10 22")
 
 
 def _raw_config(tmp_path: Path, *, token_pool_size: int = 2) -> dict:
@@ -45,11 +54,15 @@ def _raw_config(tmp_path: Path, *, token_pool_size: int = 2) -> dict:
         "boxes": {
             "box-a": {
                 "host": "ci-worker.example.invalid",
+                "expected_hostname": "measured-node",
+                "python_interpreter": sys.executable,
                 "p_cores": 20,
                 "token_pool_size": token_pool_size,
                 "remote_exec": ["scripted-remote", "{host}", "{script}"],
                 "env": {},
-                "managed_run_directory": str(tmp_path / "fake-node"),
+                # Config-only tests must remain valid when pytest's temp base
+                # is under /tmp, which production correctly rejects.
+                "managed_run_directory": str(ROOT / "tests" / "fixtures" / "remote_ci" / "managed"),
             }
         },
         "admission": {
@@ -77,8 +90,130 @@ def _raw_config(tmp_path: Path, *, token_pool_size: int = 2) -> dict:
 
 def _config(tmp_path: Path, *, token_pool_size: int = 2) -> DaemonConfig:
     path = tmp_path / "remote-ci.json"
-    path.write_text(json.dumps(_raw_config(tmp_path, token_pool_size=token_pool_size)), encoding="utf-8")
-    return load_config(path)
+    raw = _raw_config(tmp_path, token_pool_size=token_pool_size)
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(tmp_path / "fake-node")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return _load_fake_node_config(path)
+
+
+def _queue_daemon_request(config: DaemonConfig, request_id: str) -> Path:
+    config.queue_dir.mkdir(parents=True, exist_ok=True)
+    request_path = config.queue_dir / f"{request_id}.json"
+    request_path.write_text("{}", encoding="utf-8")
+    return request_path
+
+
+def _git(root: Path, *args: str) -> str:
+    env = os.environ.copy()
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                 "GIT_NAMESPACE"):
+        env.pop(name, None)
+    result = subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True,
+        check=False, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.rstrip("\n")
+
+
+def _init_repo(root: Path) -> None:
+    root.mkdir(parents=True)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "Remote CI test")
+    _git(root, "config", "user.email", "remote-ci-test@example.invalid")
+
+
+_TEST_SOURCE_TEMPORARY = None
+_TEST_SOURCE = None
+
+
+def _test_source():
+    """A tiny real Git history for fake-node pool setup."""
+    global _TEST_SOURCE_TEMPORARY, _TEST_SOURCE
+    if _TEST_SOURCE is None:
+        _TEST_SOURCE_TEMPORARY = tempfile.TemporaryDirectory(
+            prefix="remote-ci-source-", dir=os.environ.get("TMPDIR"),
+        )
+        root = Path(_TEST_SOURCE_TEMPORARY.name) / "repo"
+        _init_repo(root)
+        (root / "README").write_text("source snapshot\n", encoding="utf-8")
+        nested = root / "nested"
+        nested.mkdir()
+        (nested / "included.txt").write_text("bundled nested directory\n", encoding="utf-8")
+        _git(root, "add", "README", "nested/included.txt")
+        _git(root, "commit", "-m", "source snapshot")
+        sha = _git(root, "rev-parse", "HEAD")
+        _TEST_SOURCE = (root, sha, Path(_TEST_SOURCE_TEMPORARY.name))
+    return _TEST_SOURCE
+
+
+def _source_bundle_env(record):
+    root, sha, _temporary_root = _test_source()
+    run_dir = Path(record["run_directory"])
+    bundle = run_dir / "source.bundle"
+    _git(root, "bundle", "create", str(bundle), "HEAD")
+    return {
+        "GOALFLIGHT_REMOTE_CI_SHA": sha,
+        "GOALFLIGHT_REMOTE_CI_SOURCE_BUNDLE": str(bundle),
+    }
+
+
+def _load_fake_node_config(path: Path) -> DaemonConfig:
+    """Load an isolated test config whose fake managed root is under tmp_path."""
+    managed_path = ci._managed_path
+    try:
+        ci._managed_path = lambda value, label: (
+            Path(value) if label.endswith("managed_run_directory")
+            and Path(value).is_absolute() else managed_path(value, label)
+        )
+        return load_config(path)
+    finally:
+        ci._managed_path = managed_path
+
+
+def _real_user_home() -> Path:
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _safe_managed_temp_base(path: Path) -> Path:
+    """Keep fake managed roots out of /tmp and the real user's Goal Flight state."""
+    try:
+        base = Path(path).resolve()
+        forbidden = (
+            Path("/tmp").resolve(),
+            (_real_user_home() / ".goal-flight").resolve(),
+        )
+    except (KeyError, OSError):
+        return Path("/var/tmp")
+    if any(base.is_relative_to(root) for root in forbidden):
+        return Path("/var/tmp")
+    return base
+
+
+@pytest.fixture
+def non_tmp_managed_base(tmp_path: Path):
+    """Give tests managed roots outside /tmp and the real user's Goal Flight state."""
+    temp_base = _safe_managed_temp_base(tmp_path)
+    with tempfile.TemporaryDirectory(
+        prefix=".remote-ci-managed-", dir=temp_base,
+    ) as root:
+        yield Path(root)
+
+
+def test_managed_base_rejects_tmpdir_inside_real_home_goalflight(tmp_path, monkeypatch):
+    isolated_home = tmp_path / "isolated-home"
+    fake_real_home = tmp_path / "fake-real-home"
+    managed_tmp = fake_real_home / ".goal-flight" / "remote-ci-managed" / "tmp" / "lease"
+    managed_tmp.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("TMPDIR", str(managed_tmp))
+    monkeypatch.setattr(sys.modules[__name__], "_real_user_home", lambda: fake_real_home)
+
+    assert Path.home() == isolated_home
+    assert (
+        _safe_managed_temp_base(Path(os.environ["TMPDIR"]) / "pytest")
+        == Path("/var/tmp")
+    )
 
 
 def _box(config: DaemonConfig) -> BoxConfig:
@@ -87,32 +222,76 @@ def _box(config: DaemonConfig) -> BoxConfig:
 
 
 _REMOTE_CI_LABEL = "com.goalflight.remote-ci."
-# Coalition ids a test's teardown swept. The autouse fixture checks they
-# have no live member after the launchd job is gone.
+# Coalition ids a test's teardown swept. The opt-in fixture checks these after
+# launch-capable integration cases finish their normal managed-job cleanup.
 _swept_coalitions: list[int] = []
 _sweep_unknown: list[int] = []
 
 
 # Bound before tests replace subprocess.run. Teardown must still see launchctl.
 _launchctl_run = subprocess.run
+_launchd_observation_status = None
+_launchd_unavailable_warning_emitted = False
 
 
 def _remote_ci_launchd_jobs():
-    """label -> pid or None. None if launchctl cannot be listed before the deadline.
+    """label -> pid or None when this session cannot observe launchd."""
+    global _launchd_observation_status
+    if _launchd_observation_status is True:
+        return None
 
-    A single failed listing under load is not proof, and it is not a pass.
-    Wait until a listing arrives. Giving up still fails the test.
-    """
     deadline = time.monotonic() + 60
     listed = None
+    empty_denials = 0
     while True:
         try:
             listed = _launchctl_run(["launchctl", "list"], capture_output=True, text=True)
-        except OSError:
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EPERM, errno.ENOENT):
+                if _launchd_observation_status is False:
+                    raise AssertionError(
+                        "launchctl list failed after being observed; cannot verify leak state") from exc
+                _launchd_observation_status = True
+                return None
             listed = None
+            empty_denials = 0
+        if listed is None:
+            empty_denials = 0
         if listed is not None and listed.returncode == 0:
+            _launchd_observation_status = False
             break
+        if listed is not None:
+            output = f"{listed.stdout or ''}\n{listed.stderr or ''}".lower()
+            denied = any(phrase in output for phrase in (
+                "operation not permitted", "permission denied", "not authorized",
+                "not privileged", "not allowed", "sandbox",
+            ))
+            empty_sandbox_denial = (
+                listed.returncode == 1
+                and not (listed.stdout or "").strip()
+                and not (listed.stderr or "").strip()
+            )
+            # This sandbox emits rc=1 with empty streams, but one identical
+            # failure can be transient. Require two adjacent probes before
+            # caching it; after any successful listing, never disable the guard.
+            if empty_sandbox_denial and _launchd_observation_status is None:
+                empty_denials += 1
+                if empty_denials >= 2:
+                    _launchd_observation_status = True
+                    return None
+            else:
+                empty_denials = 0
+            if denied:
+                if _launchd_observation_status is False:
+                    raise AssertionError(
+                        "launchctl list failed after being observed; cannot verify leak state")
+                _launchd_observation_status = True
+                return None
         if time.monotonic() >= deadline:
+            if _launchd_observation_status is False:
+                raise AssertionError(
+                    "launchctl list failed after being observed; cannot verify leak state")
+            _launchd_observation_status = True
             return None
         time.sleep(0.05)
     jobs = {}
@@ -154,6 +333,11 @@ def _sweep_managed_jobs(managed: Path) -> None:
         if not isinstance(result, dict) or result.get("status") == "unknown":
             if isinstance(cid, int) and not isinstance(cid, bool) and cid > 0:
                 _sweep_unknown.append(cid)
+        label = lease.get("launch_label")
+        if (lease.get("state") == "released" and isinstance(label, str)
+                and label.startswith(_REMOTE_CI_LABEL)):
+            if not node._remove_job(label):
+                raise AssertionError(f"test teardown could not remove launchd job {label}")
 
 
 def _live_coalition_members(coalitions: list[int]):
@@ -173,28 +357,154 @@ def _live_coalition_members(coalitions: list[int]):
     return found, unknown
 
 
-@pytest.fixture(autouse=True)
-def no_leftover_remote_ci_job(request):
-    """Fail if a test leaves a launchd job or a live coalition member.
+def _warn_launchd_guard_unavailable():
+    global _launchd_unavailable_warning_emitted
+    if _launchd_unavailable_warning_emitted:
+        return
+    _launchd_unavailable_warning_emitted = True
+    warnings.warn(
+        "launchd leak assertion skipped: launchctl list is not observable in this session",
+        pytest.PytestWarning,
+        stacklevel=2,
+    )
 
-    Jobs are per-user, not per tmp_path. A later test sees whatever the
-    previous test did not remove.
-    """
-    before = _remote_ci_launchd_jobs()
+
+def _launchd_guard_fixture(nodeid):
+    request = type("Request", (), {
+        "node": type("Node", (), {"nodeid": nodeid})(),
+    })()
+    return no_leftover_remote_ci_job.__wrapped__(request)
+
+
+def test_launchd_guard_fixture_fails_when_a_job_is_left(monkeypatch):
     _swept_coalitions.clear()
     _sweep_unknown.clear()
-    yield
-    after = _remote_ci_launchd_jobs()
-    if before is None or after is None:
-        raise AssertionError(
-            f"{request.node.nodeid}: launchctl list failed; cannot prove jobs were removed")
+    results = iter((
+        subprocess.CompletedProcess(["launchctl", "list"], 0, "PID\tStatus\tLabel\n", ""),
+        subprocess.CompletedProcess(
+            ["launchctl", "list"], 0,
+            "PID\tStatus\tLabel\n4242\t0\tcom.goalflight.remote-ci.leaked\n", ""),
+    ))
+    monkeypatch.setattr(sys.modules[__name__], "_launchctl_run", lambda *_args, **_kwargs: next(results))
+    monkeypatch.setattr(sys.modules[__name__], "_launchd_observation_status", None)
+    guard = _launchd_guard_fixture("designed-red")
+    next(guard)
+    with pytest.raises(AssertionError, match="jobs=.*com.goalflight.remote-ci.leaked"):
+        next(guard)
+
+
+def test_launchd_guard_fixture_passes_when_no_job_is_left(monkeypatch):
+    _swept_coalitions.clear()
+    _sweep_unknown.clear()
+    result = subprocess.CompletedProcess(["launchctl", "list"], 0, "PID\tStatus\tLabel\n", "")
+    monkeypatch.setattr(sys.modules[__name__], "_launchctl_run", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(sys.modules[__name__], "_launchd_observation_status", None)
+    guard = _launchd_guard_fixture("positive-control")
+    next(guard)
+    with pytest.raises(StopIteration):
+        next(guard)
+
+
+def test_launchctl_sandbox_denial_is_cached_for_the_session(monkeypatch):
+    calls = []
+
+    def denied(argv, **kwargs):
+        del kwargs
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(sys.modules[__name__], "_launchctl_run", denied)
+    monkeypatch.setattr(sys.modules[__name__], "_launchd_observation_status", None)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert _remote_ci_launchd_jobs() is None
+    assert _remote_ci_launchd_jobs() is None
+    assert len(calls) == 2
+
+
+def test_launchctl_transient_failure_keeps_retry_window(monkeypatch):
+    calls = []
+
+    def transient_then_success(argv, **kwargs):
+        del kwargs
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 1, "", "temporarily unavailable")
+        return subprocess.CompletedProcess(argv, 0, "PID\tStatus\tLabel\n", "")
+
+    monkeypatch.setattr(sys.modules[__name__], "_launchctl_run", transient_then_success)
+    monkeypatch.setattr(sys.modules[__name__], "_launchd_observation_status", None)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert _remote_ci_launchd_jobs() == {}
+    assert len(calls) == 2
+
+
+def test_observed_launchd_does_not_become_unobservable_after_empty_failure(monkeypatch):
+    calls = []
+
+    def success_empty_success(argv, **kwargs):
+        del kwargs
+        calls.append(argv)
+        if len(calls) == 2:
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return subprocess.CompletedProcess(argv, 0, "PID\tStatus\tLabel\n", "")
+
+    monkeypatch.setattr(sys.modules[__name__], "_launchctl_run", success_empty_success)
+    monkeypatch.setattr(sys.modules[__name__], "_launchd_observation_status", None)
+    monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert _remote_ci_launchd_jobs() == {}
+    assert _remote_ci_launchd_jobs() == {}
+    assert _launchd_observation_status is False
+    assert len(calls) == 3
+
+
+def test_launchd_unavailable_warning_is_emitted_once(monkeypatch):
+    monkeypatch.setattr(
+        sys.modules[__name__], "_launchd_unavailable_warning_emitted", False)
+    with pytest.warns(pytest.PytestWarning, match="launchd leak assertion skipped") as caught:
+        _warn_launchd_guard_unavailable()
+        _warn_launchd_guard_unavailable()
+    assert len(caught) == 1
+
+
+def _assert_no_leftover_remote_ci_state(nodeid: str, before, after) -> None:
     leaked = {label: pid for label, pid in after.items() if label not in before}
     members, unknown = _live_coalition_members(list(_swept_coalitions))
     unknown = list(dict.fromkeys([*unknown, *_sweep_unknown]))
     if leaked or members or unknown:
         raise AssertionError(
-            f"{request.node.nodeid} left remote CI state behind: "
+            f"{nodeid} left remote CI state behind: "
             f"jobs={leaked} members={members} unknown={unknown}")
+
+
+@pytest.fixture
+def no_leftover_remote_ci_job(request):
+    """Guard only tests that can start a launchd job or live coalition member.
+
+    Jobs are per-user, not per tmp_path. A later test sees whatever the
+    previous test did not remove. Tests opt in when they use an unmocked start
+    path; tests that mock _submit_workload do not need a host-global guard.
+    """
+    _swept_coalitions.clear()
+    _sweep_unknown.clear()
+    before = _remote_ci_launchd_jobs()
+    if before is None:
+        _warn_launchd_guard_unavailable()
+        yield
+        return
+    yield
+    after = _remote_ci_launchd_jobs()
+    if after is None:
+        _warn_launchd_guard_unavailable()
+        return
+    _assert_no_leftover_remote_ci_state(request.node.nodeid, before, after)
+
+
+@pytest.fixture
+def requires_live_launchd(no_leftover_remote_ci_job):
+    if _launchd_observation_status is True:
+        pytest.skip("requires live launchd; launchctl list is not observable in this session")
 
 
 class ScriptedExecutor:
@@ -205,6 +515,8 @@ class ScriptedExecutor:
         self.calls = []
         self.remote_scripts = []
         self.load1 = 0
+        self.cpu_busy_fraction = 0.0
+        self.hostname = "measured-node"
         self.before = None
         self._short_command_window = None
 
@@ -212,7 +524,14 @@ class ScriptedExecutor:
         """Install a test copy with a short command window for expiry cases."""
         # The executor launches another interpreter and forks its holder, so seed a hash-matched test copy.
         source = (ROOT / "scripts" / "goalflight_remote_ci_node.py").read_bytes()
-        window = b"    return max(30.0, 2.0 * controller_poll_seconds + 10.0)\n"
+        window = (
+            b"    return (\n"
+            b"        BUNDLE_BASIS_TIMEOUT_SECONDS\n"
+            b"        + BUNDLE_PREPARATION_TIMEOUT_SECONDS\n"
+            b"        + BUNDLE_TRANSFER_TIMEOUT_SECONDS\n"
+            b"        + max(30.0, 2.0 * controller_poll_seconds + 10.0)\n"
+            b"    )\n"
+        )
         assert source.count(window) == 1
         source = source.replace(window, f"    return {seconds!r}\n".encode())
         digest = hashlib.sha256(source).hexdigest()
@@ -223,9 +542,37 @@ class ScriptedExecutor:
         helper.chmod(0o600)
         self._short_command_window = (digest, len(source))
 
-    def __call__(self, argv, env, timeout):
-        assert argv[:2] == ["scripted-remote", "ci-worker.example.invalid"]
+    def __call__(self, argv, env, timeout, input_data=None, input_stream=None):
+        assert argv[0] == "scripted-remote"
+        assert isinstance(argv[1], str) and argv[1]
         shell = shlex.split(argv[2])
+        if input_data is not None and shell[:2] == ["cat", ">"]:
+            transfer = shlex.split(argv[2])
+            assert transfer[:2] == ["cat", ">"]
+            Path(transfer[2]).write_bytes(input_data)
+            return CommandResult(0)
+        if input_stream is not None:
+            assert shell[3] == "--stream-submit"
+            self.remote_scripts.append(shlex.join(shell))
+            self.calls.append("submit")
+            shell[0] = sys.executable
+            authority = str(self.root / "authority.json")
+            idle = max(0.0, min(100.0, 100.0 * (1.0 - self.cpu_busy_fraction)))
+            top_output = f"CPU usage: 0.0% user, 0.0% sys, {idle:.1f}% idle"
+            shell[2] = (
+                "import builtins,os,socket,subprocess,shutil;"
+                "builtins._GOALFLIGHT_REMOTE_CI_AUTHORITY = " + repr(authority) + ";"
+                "builtins._goalflight_test_subprocess_run=subprocess.run\n"
+                "def _goalflight_test_run(argv,*args,**kwargs):\n"
+                " if argv and argv[0]=='/usr/bin/top': return subprocess.CompletedProcess(argv,0," + repr(top_output) + ", '')\n"
+                " return builtins._goalflight_test_subprocess_run(argv,*args,**kwargs)\n"
+                "subprocess.run=_goalflight_test_run;"
+                "shutil.which=lambda name:'/fake/'+name;"
+                "os.getloadavg=lambda:(" + repr(self.load1) + ",0,0);"
+                "socket.gethostname=lambda:" + repr(self.hostname) + ";"
+                "exec(compile(" + repr(shell[2]) + ",' <remote-ci-launcher>','exec'))"
+            )
+            return run_command(shell, timeout=timeout, input_stream=input_stream)
         payload = json.loads(base64.b64decode(shell[3]))
         if self._short_command_window is not None:
             payload["helper_sha256"], payload["helper_size_bytes"] = self._short_command_window
@@ -239,7 +586,7 @@ class ScriptedExecutor:
             installed = hashlib.sha256(helper.read_bytes()).hexdigest() == expected
         except OSError:
             installed = False
-        uploading = len(shell) > 4
+        uploading = input_data is not None or len(shell) > 4
         runs_helper = installed or uploading
         if runs_helper:
             self.calls.append(payload["operation"])
@@ -249,14 +596,25 @@ class ScriptedExecutor:
                                                sort_keys=True).encode()).decode()
         shell[0] = sys.executable
         authority = str(self.root / "authority.json")
+        idle = max(0.0, min(100.0, 100.0 * (1.0 - self.cpu_busy_fraction)))
+        top_output = f"CPU usage: 0.0% user, 0.0% sys, {idle:.1f}% idle"
         shell[2] = (
-            "import builtins,os,socket;"
+            "import builtins,os,socket,subprocess,shutil;"
             "builtins._GOALFLIGHT_REMOTE_CI_AUTHORITY = " + repr(authority) + ";"
+            "builtins._goalflight_test_subprocess_run=subprocess.run\n"
+            "def _goalflight_test_run(argv,*args,**kwargs):\n"
+            " if argv and argv[0]=='/usr/bin/top': return subprocess.CompletedProcess(argv,0," + repr(top_output) + ", '')\n"
+            " return builtins._goalflight_test_subprocess_run(argv,*args,**kwargs)\n"
+            "subprocess.run=_goalflight_test_run;"
+            "shutil.which=lambda name:'/fake/'+name;"
             "os.getloadavg=lambda:(" + repr(self.load1) + ",0,0);"
-            "socket.gethostname=lambda:'measured-node';"
+            "socket.gethostname=lambda:" + repr(self.hostname) + ";"
             "exec(compile(" + repr(shell[2]) + ",' <remote-ci-launcher>','exec'))"
         )
-        return run_command(shell, timeout=timeout)
+        return run_command(
+            shell, timeout=timeout, input_data=input_data,
+            env={**env, "SSH_CONNECTION": "192.0.2.2 51234 192.0.2.10 22"},
+        )
 
     def close(self, config):
         node = RemoteRunner(config, executor=self).nodes["box-a"]
@@ -297,6 +655,15 @@ def spec(request_id="request-1"):
                    request_id, "box-a", False)
 
 
+def pool_spec(request_id="request-1"):
+    root, sha, temporary_root = _test_source()
+    bundle_path = temporary_root / f"bundle-{time.time_ns()}.bundle"
+    return ArmSpec("candidate", sha, sha, sha,
+                   ("tests/test_one.py",), ("tests/test_one.py", "-v"),
+                   request_id, "box-a", False, bundle_path=bundle_path,
+                   snapshot_root=root, snapshot_ref="HEAD")
+
+
 def enqueue(node, request_id="request-1", owner=None):
     return node.call("enqueue", request_id=request_id, arm="candidate",
                      owner=owner or RemoteRunner._owner())
@@ -318,7 +685,17 @@ def wait_state(node, record, states):
 
 def start(node, record, code="import time; time.sleep(3)"):
     return node.call("start", **key(record),
-                     command={"argv": [sys.executable, "-c", code], "env": {}, "timeout": 10})
+                     command={"argv": [sys.executable, "-c", code],
+                              "env": _source_bundle_env(record), "timeout": 10})
+
+
+def cancel_admitted(node, record):
+    owner = {name: record.get(name) for name in
+             ("owner_host", "owner_pid", "owner_start_token", "owner_identity")}
+    identity = record.get("remote_run")
+    if identity is None:
+        return node.call("release", **key(record), expected_owner=owner)
+    return node.call("cancel", **key(record), identity=identity, expected_owner=owner)
 
 
 def test_config_validation_rejects_ad_hoc_managed_run_directory(tmp_path: Path) -> None:
@@ -330,11 +707,187 @@ def test_config_validation_rejects_ad_hoc_managed_run_directory(tmp_path: Path) 
         load_config(path)
 
 
+@pytest.mark.parametrize(("length", "valid"), [(64, True), (65, False)])
+def test_config_repo_id_fits_node_namespace(tmp_path: Path, length: int, valid: bool) -> None:
+    raw = _raw_config(tmp_path)
+    raw["repo"] = "p" * length
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(
+        ROOT / "tests" / "fixtures" / "remote_ci" / "managed"
+    )
+    path = tmp_path / "repo-id-length.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    if valid:
+        assert load_config(path).repo == "p" * length
+    else:
+        with pytest.raises(ci.ConfigError, match="repo.*64"):
+            load_config(path)
+        import goalflight_remote_ci_node as node
+        with pytest.raises(ValueError, match="repo.*64"):
+            node.safe_repo("p" * length)
+
+
+def test_wrapper_does_not_stamp_skill_project_for_another_git_repo(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    caller = tmp_path / "project-a"
+    _init_repo(caller)
+    (caller / ".goal-flight").mkdir()
+    (caller / ".goal-flight" / "remote-ci.json").write_text(
+        '{"repo": "project-a"}\n', encoding="utf-8",
+    )
+    (caller / "README").write_text("fixture\n", encoding="utf-8")
+    _git(caller, "add", ".goal-flight/remote-ci.json", "README")
+    _git(caller, "commit", "-m", "fixture")
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_SPOOL_DIR", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CPU_ROUTE", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+
+    raw = _raw_config(tmp_path / "skill-config")
+    raw["repo"] = "goal-flight"
+    raw["fallback"] = "fail"
+    config_path = tmp_path / "skill-config" / "remote-ci.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(config_path)
+    loaded_paths = []
+
+    def load_config(path):
+        loaded_paths.append(path)
+        return config
+
+    monkeypatch.setattr(ci, "_load_local_config", load_config)
+    monkeypatch.setattr(ci, "daemon_is_running", lambda _config: False)
+
+    result = ci.wrapper_main([
+        "--cmd-id", "foreign-project-check", "--", sys.executable, "-c", "pass",
+    ])
+
+    output = capsys.readouterr()
+    assert result == 2
+    assert output.out == ""
+    assert "--config <path>" in output.err
+    assert "GOALFLIGHT_REMOTE_CI_CONFIG" in output.err
+    assert not loaded_paths
+
+
+def test_wrapper_config_defaults_to_skill_repository_only(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    skill_root = tmp_path / "skill-repository"
+    _init_repo(skill_root)
+    skill_scripts = skill_root / "scripts"
+    skill_scripts.mkdir()
+    skill_config = skill_root / ".goal-flight" / "remote-ci.json"
+    skill_config.parent.mkdir()
+    skill_config.write_text('{"repo": "goal-flight"}\n', encoding="utf-8")
+    monkeypatch.setattr(ci, "__file__", str(skill_scripts / "goalflight_remote_ci.py"))
+
+    default_path, caller_repo = ci._resolve_wrapper_config(None, skill_root, skill_root)
+
+    assert default_path == skill_config
+    assert caller_repo == "goal-flight"
+    with pytest.raises(ci.ConfigError, match="--config.*GOALFLIGHT_REMOTE_CI_CONFIG"):
+        ci._resolve_wrapper_config(None, tmp_path, None)
+
+    unrelated = tmp_path / "goal-flight"
+    _init_repo(unrelated)
+    (unrelated / "README").write_text("fixture\n", encoding="utf-8")
+    _git(unrelated, "add", "README")
+    _git(unrelated, "commit", "-m", "fixture")
+    with pytest.raises(ci.ConfigError, match="--config.*GOALFLIGHT_REMOTE_CI_CONFIG"):
+        ci._resolve_wrapper_config(None, unrelated, unrelated)
+
+
+@pytest.mark.parametrize("via_environment", [False, True])
+def test_wrapper_explicit_config_sources_are_preserved(
+    tmp_path: Path, monkeypatch, via_environment: bool,
+) -> None:
+    caller = tmp_path / "project-a"
+    _init_repo(caller)
+    (caller / "README").write_text("fixture\n", encoding="utf-8")
+    _git(caller, "add", "README")
+    _git(caller, "commit", "-m", "fixture")
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_SPOOL_DIR", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_REMOTE_CPU_ROUTE", "local")
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+
+    raw = _raw_config(tmp_path / "explicit-config")
+    raw["repo"] = "project-a"
+    config_path = tmp_path / "explicit-config" / "remote-ci.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(config_path)
+    loaded_paths = []
+
+    def load_config(path):
+        loaded_paths.append(path)
+        return config
+
+    monkeypatch.setattr(ci, "_load_local_config", load_config)
+    monkeypatch.setattr(
+        ci, "_run_local_command",
+        lambda *_args, **_kwargs: (0, {}),
+    )
+    args = ["--cmd-id", "explicit-config-control", "--", sys.executable, "-c", "pass"]
+    if via_environment:
+        monkeypatch.setenv("GOALFLIGHT_REMOTE_CI_CONFIG", str(config_path))
+    else:
+        args = ["--config", str(config_path), *args]
+
+    assert ci.wrapper_main(args) == 0
+    assert loaded_paths == [config_path]
+
+
+def test_wrapper_refuses_config_whose_repo_differs_from_caller(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    caller = tmp_path / "project-a"
+    _init_repo(caller)
+    (caller / ".goal-flight").mkdir()
+    (caller / ".goal-flight" / "remote-ci.json").write_text(
+        '{"repo": "project-a"}\n', encoding="utf-8",
+    )
+    (caller / "README").write_text("fixture\n", encoding="utf-8")
+    _git(caller, "add", ".goal-flight/remote-ci.json", "README")
+    _git(caller, "commit", "-m", "fixture")
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_SPOOL_DIR", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+
+    raw = _raw_config(tmp_path / "mismatched-config")
+    raw["repo"] = "goal-flight"
+    config_path = tmp_path / "mismatched-config" / "remote-ci.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(config_path)
+    monkeypatch.setattr(ci, "_load_local_config", lambda _path: config)
+
+    result = ci.wrapper_main([
+        "--config", str(config_path), "--cmd-id", "mismatch-check", "--",
+        sys.executable, "-c", "pass",
+    ])
+
+    output = capsys.readouterr()
+    assert result == 2
+    assert output.out == ""
+    assert "config repo 'goal-flight' does not match caller repository 'project-a'" in output.err
+    assert "--config <path>" in output.err
+    assert "GOALFLIGHT_REMOTE_CI_CONFIG" in output.err
+
+
 def test_config_validation_rejects_unknown_selection_option(tmp_path: Path) -> None:
     config = _config(tmp_path)
     request = {
         "schema": "goalflight.remote-ci.request.v1",
         "request_id": "request-1",
+        "project_id": config.repo,
         "kind": "targeted",
         "tip_sha": "a" * 40,
         "candidate_sha": "b" * 40,
@@ -343,6 +896,39 @@ def test_config_validation_rejects_unknown_selection_option(tmp_path: Path) -> N
     }
     with pytest.raises(Exception, match="option is not allowed"):
         validate_request(request, config)
+
+
+def test_command_request_defers_tree_metadata_to_daemon(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    request = validate_request({
+        "schema": ci.REQUEST_SCHEMA,
+        "request_id": "command-1",
+        "project_id": config.repo,
+        "kind": "gate",
+        "command_id": "full-gate",
+        "command": ["./tests/run.sh"],
+        "repo_root": str(tmp_path / "repo"),
+        "cwd_relative": "tests",
+        "caller_env": {"CI": "1"},
+        "receipt_metadata": {
+            "dispatch_id": "dispatch-ci-2", "controller_label": "beta",
+        },
+    }, config)
+    assert request["repo_root"] == str((tmp_path / "repo").resolve())
+    assert request["cwd_relative"] == "tests"
+    assert request["receipt_metadata"] == {
+        "dispatch_id": "dispatch-ci-2", "controller_label": "beta",
+    }
+    assert not {"head_sha", "snapshot_sha", "candidate_sha", "tip_sha", "bundle_path"} & request.keys()
+
+
+def test_git_snapshot_timeout_fails_as_a_remote_ci_error(tmp_path: Path, monkeypatch) -> None:
+    def expire(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(ci.subprocess, "run", expire)
+    with pytest.raises(ci.RemoteCIError, match="git status exceeded 0.01s"):
+        ci._git_output(tmp_path, ["status"], timeout=0.01)
 
 
 def test_base_import_error_is_red_even_when_exit_and_summary_are_green(tmp_path: Path) -> None:
@@ -359,10 +945,101 @@ def test_base_import_error_is_red_even_when_exit_and_summary_are_green(tmp_path:
     assert verdict["measured_hostnames"]["base"] == "ci-worker.example.invalid"
 
 
+def test_informational_failure_fields_do_not_change_gate_verdict() -> None:
+    baseline = {
+        "schema": ci.RECEIPT_SCHEMA, "hostname": "studio.example.invalid",
+        "status": "fail", "returncode": 1, "passed": 2, "failed": 1,
+        "errors": 0, "skipped": 0, "failing_node_ids": ["tests/test.py::test_x"],
+        "collection_import_errors": [], "first_error_lines": [],
+    }
+    detailed = {
+        **baseline,
+        "failure_summary": {
+            "failing_node_ids": ["tests/test.py::test_x"],
+            "collection_import_errors": [],
+        },
+        "failure_excerpt": ["E   assertion failed"],
+        "failure_summary_complete": True,
+        "stdout_path": "/remote/run/stdout",
+    }
+    base = parse_receipt(FIXTURES / "receipt-pass.json")
+    plain_verdict = matched_pair_verdict(
+        ArmOutcome("base", "green", 0, base),
+        ArmOutcome("candidate", "red", 1, parse_receipt(baseline)),
+    )
+    detailed_verdict = matched_pair_verdict(
+        ArmOutcome("base", "green", 0, base),
+        ArmOutcome("candidate", "red", 1, parse_receipt(detailed)),
+    )
+    assert parse_receipt(detailed).to_dict()["failure_summary"] == detailed["failure_summary"]
+    decision_fields = (
+        "status", "base_red", "candidate_red",
+        "new_failure_node_ids", "fixed_failure_node_ids",
+    )
+    assert tuple(detailed_verdict[field] for field in decision_fields) == tuple(
+        plain_verdict[field] for field in decision_fields
+    )
+    assert ci._remote_returncode(detailed_verdict) == ci._remote_returncode(plain_verdict)
+
+
+def test_red_pair_exit_uses_nonzero_base_status_or_one_for_receipt_red() -> None:
+    assert ci._remote_returncode({
+        "status": "RED", "base": {"returncode": 9},
+        "candidate": {"returncode": 0},
+    }) == 9
+    assert ci._remote_returncode({
+        "status": "RED", "base": {"returncode": 0},
+        "candidate": {"returncode": 0},
+    }) == 1
+
+
+def test_remote_returncode_reconciles_receipts_with_green_status() -> None:
+    receipt = {
+        "schema": ci.RECEIPT_SCHEMA,
+        "hostname": "studio.example.invalid",
+        "status": "pass",
+        "returncode": 0,
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "errors": 0,
+        "failing_node_ids": [],
+        "collection_import_errors": [],
+        "first_error_lines": [],
+    }
+    green = {
+        "status": "GREEN",
+        "candidate": {"status": "green", "returncode": 0, "receipt": receipt},
+    }
+    red_receipt = {
+        **receipt,
+        "passed": 0,
+        "failed": 1,
+        "failing_node_ids": ["tests/test_one.py::test_red"],
+    }
+    false_green = {
+        "status": "GREEN",
+        "candidate": {"status": "green", "returncode": 0, "receipt": red_receipt},
+    }
+    no_nodes = {
+        "status": "GREEN",
+        "candidate": {
+            "status": "green", "returncode": 0,
+            "receipt": {**receipt, "passed": 0},
+        },
+    }
+
+    assert ci._remote_returncode(green) == 0
+    assert ci._remote_returncode(false_green) == 1
+    assert ci._remote_returncode(no_nodes) == 1
+    assert ci._zero_test_node_arms(no_nodes) == ["candidate"]
+
+
 def test_receipt_parser_uses_measured_hostname_and_rejects_alias_only() -> None:
     receipt = parse_receipt(FIXTURES / "receipt-pass.json")
     assert receipt.hostname == "ci-worker.example.invalid"
     assert receipt.duration_seconds == 18.4
+    assert "dispatch_id" not in receipt.to_dict()
     with pytest.raises(ReceiptError, match="answering hostname"):
         parse_receipt({"status": "pass", "passed": 1})
     assert receipt_from_output("noise\n" + json.dumps(receipt.to_dict())).hostname == receipt.hostname
@@ -376,6 +1053,7 @@ def test_submit_request_is_validated_and_queue_file_is_atomic(tmp_path: Path) ->
             {
                 "schema": "goalflight.remote-ci.request.v1",
                 "request_id": "request-1",
+                "project_id": config.repo,
                 "kind": "targeted",
                 "tip_sha": "a" * 40,
                 "candidate_sha": "b" * 40,
@@ -388,6 +1066,224 @@ def test_submit_request_is_validated_and_queue_file_is_atomic(tmp_path: Path) ->
     queued = submit_request(source, config)
     assert queued == config.queue_dir / "request-1.json"
     assert json.loads(queued.read_text())["request_id"] == "request-1"
+
+
+def test_daemon_snapshots_complete_worktree_without_touching_worker_index(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / ".gitignore").write_text("tests/ignored.py\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests/test_changed.py").write_text("BASE = 1\n", encoding="utf-8")
+    (repo / "tests/test_removed.py").write_text("REMOVE = 1\n", encoding="utf-8")
+    (repo / "src").mkdir()
+    executable = repo / "src/run.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (repo / "src/old.txt").write_text("rename me\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "config", "core.filemode", "false")
+    index_before = (repo / ".git/index").read_bytes()
+
+    (repo / "tests/test_changed.py").write_text("CANDIDATE = 2\n", encoding="utf-8")
+    (repo / "tests/test_removed.py").unlink()
+    (repo / "tests/test_added.py").write_text("ADDED = 3\n", encoding="utf-8")
+    (repo / "tests/ignored.py").write_text("IGNORED = 4\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (repo / "src/old.txt").rename(repo / "src/new.txt")
+    (repo / "src/link").symlink_to("new.txt")
+    whitespace_name = repo / "src/trailing "
+    whitespace_name.write_text("preserve filename\n", encoding="utf-8")
+
+    daemon_root = tmp_path / "daemon"
+    daemon_root.mkdir()
+    config = _config(daemon_root)
+    config.queue_dir.mkdir(parents=True)
+    daemon = GateDaemon(config)
+    request = {
+        "request_id": "snapshot-1", "command_id": "full-gate",
+        "command": ["./tests/run.sh"], "kind": "gate",
+        "repo_root": str(repo), "cwd_relative": "",
+        "caller_env": {"CI": "1"},
+    }
+    request, snapshot = daemon._snapshot_command_request(request)
+    try:
+        assert request["head_sha"] == base_sha
+        assert request["snapshot_sha"] != base_sha
+        assert request["dirty"] is True
+        assert (repo / ".git/index").read_bytes() == index_before
+        assert _git(repo, "rev-parse", snapshot["ref"]) == snapshot["snapshot_sha"]
+        bundle = ci._create_snapshot_bundle(
+            snapshot["root"], snapshot["ref"], snapshot["bundle_path"],
+            snapshot["snapshot_sha"], None,
+        )
+        assert subprocess.run(
+            ["git", "-C", str(repo), "bundle", "verify", str(bundle)],
+            capture_output=True, text=True, check=False,
+        ).returncode == 0
+        entries = _git(repo, "ls-tree", "-r", "-z", snapshot["snapshot_sha"]).split("\0")
+        modes = {entry.partition("\t")[2]: entry.split(" ", 1)[0]
+                 for entry in entries if entry}
+        assert "tests/ignored.py" not in modes
+        assert "src/trailing " in modes
+        assert modes["src/run.sh"] == "100755"
+        assert modes["src/link"] == "120000"
+        assert "src/old.txt" not in modes and "src/new.txt" in modes
+        assert "tests/test_removed.py" not in modes
+        assert _git(repo, "show", f"{snapshot['snapshot_sha']}:tests/test_changed.py") == "CANDIDATE = 2"
+    finally:
+        ci._release_snapshot(Path(snapshot["root"]), snapshot["ref"],
+                             snapshot["snapshot_sha"], snapshot["bundle_path"])
+
+
+def test_daemon_snapshot_includes_staged_only_new_file(tmp_path: Path) -> None:
+    repo = tmp_path / "staged-only-repo"
+    _init_repo(repo)
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-m", "base")
+    new_file = repo / "tests" / "test_staged.py"
+    new_file.parent.mkdir()
+    new_file.write_text("VALUE = 1\n", encoding="utf-8")
+    _git(repo, "add", "tests/test_staged.py")
+    index_before = (repo / ".git" / "index").read_bytes()
+
+    daemon_root = tmp_path / "daemon"
+    daemon_root.mkdir()
+    config = _config(daemon_root)
+    config.queue_dir.mkdir(parents=True)
+    snapshot = ci._snapshot_worktree(
+        repo, "staged-only", config.queue_dir, cwd_relative="", caller_env={},
+    )
+    try:
+        paths = _git(
+            repo, "ls-tree", "-r", "--name-only", snapshot["snapshot_sha"],
+        ).splitlines()
+        assert "tests/test_staged.py" in paths
+        assert snapshot["dirty"] is True
+        assert (repo / ".git" / "index").read_bytes() == index_before
+    finally:
+        ci._release_snapshot(
+            Path(snapshot["root"]), snapshot["ref"],
+            snapshot["snapshot_sha"], snapshot["bundle_path"],
+        )
+
+
+def test_daemon_snapshot_excludes_untracked_nested_checkout(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "README").write_text("repo\n", encoding="utf-8")
+    _git(repo, "add", "README")
+    _git(repo, "commit", "-m", "base")
+
+    nested = repo / "deps" / "nested"
+    _init_repo(nested)
+    (nested / "source.txt").write_text("nested\n", encoding="utf-8")
+    _git(nested, "add", "-A")
+    _git(nested, "commit", "-m", "nested")
+    assert ci._unsupported_snapshot_reason(repo) is None
+
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    config = _config(config_root)
+    config.queue_dir.mkdir(parents=True)
+    snapshot = ci._snapshot_worktree(
+        repo, "nested-checkout", config.queue_dir,
+        cwd_relative="", caller_env={},
+    )
+    try:
+        entries = _git(repo, "ls-tree", "-r", "-z", snapshot["snapshot_sha"]).split("\0")
+        paths = {entry.partition("\t")[2] for entry in entries if entry}
+        assert "README" in paths
+        assert not any(path == "deps/nested" or path.startswith("deps/nested/")
+                       for path in paths)
+        assert not any(entry.startswith("160000 ") for entry in entries if entry)
+    finally:
+        ci._release_snapshot(Path(snapshot["root"]), snapshot["ref"],
+                             snapshot["snapshot_sha"], snapshot["bundle_path"])
+
+
+@pytest.mark.parametrize(("kind", "expected"), [
+    ("lfs", "Git LFS"),
+    ("submodule", "submodules"),
+    ("absolute-symlink", "absolute symlink"),
+])
+def test_daemon_falls_back_for_unsupported_snapshot_content(tmp_path: Path, kind, expected) -> None:
+    repo = tmp_path / kind
+    _init_repo(repo)
+    (repo / "README").write_text("repo\n", encoding="utf-8")
+    if kind == "lfs":
+        (repo / ".gitattributes").write_text(
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
+        (repo / "large.bin").write_text(
+            "version https://git-lfs.github.com/spec/v1\n"
+            "oid sha256:" + "a" * 64 + "\nsize 5\n", encoding="utf-8")
+    elif kind == "absolute-symlink":
+        (repo / "absolute-link").symlink_to(str(repo / "target"))
+        _git(repo, "add", "-A")
+    else:
+        _git(repo, "add", "README")
+        _git(repo, "update-index", "--add", "--cacheinfo",
+             "160000," + "a" * 40 + ",deps/submodule")
+    if kind == "lfs":
+        _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    config = _config(config_root)
+    config.queue_dir.mkdir(parents=True)
+    request_path = config.queue_dir / f"{kind}.json"
+    request_path.write_text(json.dumps({
+        "schema": ci.REQUEST_SCHEMA,
+        "request_id": kind,
+        "project_id": config.repo,
+        "kind": "gate",
+        "command_id": "full-gate",
+        "command": ["./tests/run.sh"],
+        "repo_root": str(repo),
+        "cwd_relative": "",
+        "caller_env": {},
+    }), encoding="utf-8")
+    result = GateDaemon(config)._process_request(request_path)
+    assert result["status"] == "LOCAL_FALLBACK_REQUIRED"
+    assert expected in result["error"]
+
+
+def test_candidate_test_overlay_applies_to_a_base_checkout(tmp_path: Path) -> None:
+    import goalflight_remote_ci_node as node
+
+    source = tmp_path / "source"
+    _init_repo(source)
+    tests_dir = source / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_changed.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    (tests_dir / "test_removed.py").write_text("OLD = True\n", encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "base")
+    base_sha = _git(source, "rev-parse", "HEAD")
+
+    (tests_dir / "test_changed.py").write_text("VALUE = 'candidate'\n", encoding="utf-8")
+    (tests_dir / "test_removed.py").unlink()
+    (tests_dir / "test_added.py").write_text("NEW = True\n", encoding="utf-8")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "candidate")
+    candidate_sha = _git(source, "rev-parse", "HEAD")
+
+    slot = tmp_path / "slot"
+    subprocess.run(["git", "clone", "--no-hardlinks", str(source), str(slot)],
+                   capture_output=True, text=True, check=True)
+    _git(slot, "checkout", "--detach", base_sha)
+    assert (slot / "tests/test_changed.py").read_text(encoding="utf-8") == "VALUE = 'base'\n"
+    assert (slot / "tests/test_removed.py").is_file()
+
+    assert node.overlay_candidate_tests(
+        slot, candidate_sha,
+        ["tests/test_added.py", "tests/test_changed.py", "tests/test_removed.py"],
+    )
+    assert (slot / "tests/test_changed.py").read_text(encoding="utf-8") == "VALUE = 'candidate'\n"
+    assert (slot / "tests/test_added.py").read_text(encoding="utf-8") == "NEW = True\n"
+    assert not (slot / "tests/test_removed.py").exists()
 
 
 def test_run_command_starts_driver_in_its_own_session() -> None:
@@ -465,6 +1361,57 @@ def test_config_requires_v2_remote_exec_and_preserves_node_paths(tmp_path):
         DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
 
 
+def test_command_override_config_is_validated_without_echoing_values(tmp_path, capsys):
+    raw = _raw_config(tmp_path)
+    raw["runner"]["command_overrides"] = {
+        "example-command-isolated": {
+            "env_set": {"PYTHONPATH": "src", "TOKEN": "secret-value"},
+            "env_unset": ["EXAMPLE_DEP_ROOT", "EXAMPLE_DEP_EXTRACT_ROOT"],
+        }
+    }
+    config = DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
+    override = config.runner.command_overrides["example-command-isolated"]
+    assert override.env_set == {"PYTHONPATH": "src", "TOKEN": "secret-value"}
+    assert override.env_unset == ("EXAMPLE_DEP_ROOT", "EXAMPLE_DEP_EXTRACT_ROOT")
+    raw["runner"]["command_overrides"]["example-command-isolated"]["profile"] = False
+    with pytest.raises(ci.ConfigError, match="unknown keys") as error:
+        DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
+    assert "secret-value" not in str(error.value)
+    assert capsys.readouterr().out == ""
+
+
+def test_command_override_rejects_invalid_environment_names(tmp_path):
+    raw = _raw_config(tmp_path)
+    raw["runner"]["command_overrides"] = {
+        "gate": {"env_set": {"BAD-NAME": "do-not-print"}}
+    }
+    with pytest.raises(ci.ConfigError, match="environment names") as error:
+        DaemonConfig.from_mapping(raw, path=tmp_path / "config.json")
+    assert "do-not-print" not in str(error.value)
+
+
+def test_local_env_must_cover_box_environment_keys_across_boxes(tmp_path):
+    raw = _raw_config(tmp_path)
+    raw["boxes"]["box-a"]["env"] = {"PATH": "/remote/bin", "PYTHONPATH": "/remote/python"}
+    raw["boxes"]["box-b"] = {
+        **raw["boxes"]["box-a"],
+        "host": "second-ci-worker.example.invalid",
+        "expected_hostname": "second-measured-node",
+        "env": {"EXAMPLE_DEP_ROOT": "/remote/pm2"},
+    }
+    raw["local_env"] = {"PATH": None, "PYTHONPATH": "local-python"}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ci.ConfigError, match=r"profile-env-unavailable-locally.*EXAMPLE_DEP_ROOT"):
+        _load_fake_node_config(path)
+
+    raw["local_env"]["EXAMPLE_DEP_ROOT"] = "/local/pm2"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(path)
+    assert config.local_env["PATH"] is None
+
+
 @pytest.mark.parametrize("field", ["chunk_size", "verbose_option", "cancel_command",
                                    "watch_command", "collect_command"])
 def test_obsolete_runner_settings_are_not_silently_ignored(tmp_path, field):
@@ -524,38 +1471,106 @@ def test_shared_fifo_between_project_daemons_and_stale_ticket_cleanup(node_env):
     older = enqueue(node, "zzz-older")
     younger = enqueue(other, "aaa-younger")
     assert older["ticket"] < younger["ticket"]
-    node.call("release", **key(first))
+    cancel_admitted(node, first)
     wait_state(node, older, {"admitted"})
     assert other.call("status", **key(younger))["state"] == "queued"
-    node.call("release", **key(older))
-    wait_state(other, younger, {"admitted"})
+    cancel_admitted(node, older)
+    younger_admitted = wait_state(other, younger, {"admitted"})
+    cancel_admitted(other, younger_admitted)
+    wait_state(other, younger_admitted, {"released"})
 
 
 def test_unsafe_load_and_live_caps_do_not_admit(node_env):
     config, executor, runner, node = node_env
     executor.load1 = 21
-    queued = enqueue(node)
-    time.sleep(0.05)
-    assert node.call("status", **key(queued))["state"] == "queued"
-    assert node.call("health")["tokens"]["in_use"] == 0
-    node.call("release", **key(queued))
-    wait_state(node, queued, {"released"})
+    executor.cpu_busy_fraction = 0.0
+    load_only = enqueue(node, "load-only-high")
+    assert wait_state(node, load_only, {"admitted"})["sample"]["cpu_busy_fraction"] == 0.0
+    cancel_admitted(node, load_only)
+    wait_state(node, load_only, {"released"})
+
+    executor.cpu_busy_fraction = 0.99
     executor.load1 = 3
+    cpu_only = enqueue(node, "cpu-only-high")
+    assert wait_state(node, cpu_only, {"admitted"})["sample"]["cpu_busy_fraction"] == 0.99
+    cancel_admitted(node, cpu_only)
+    wait_state(node, cpu_only, {"released"})
+
+    executor.load1 = 41
+    saturated = enqueue(node, "both-signals-high")
+    time.sleep(0.05)
+    assert node.call("status", **key(saturated))["state"] == "queued"
+    node.call("release", **key(saturated))
+    wait_state(node, saturated, {"released"})
+
     (executor.root / "admission" / "caps.json").write_text(json.dumps({"p_cores": 2}))
     limited = enqueue(node, "limited")
     time.sleep(0.05)
     assert node.call("status", **key(limited))["state"] == "queued"
-    (executor.root / "admission" / "caps.json").write_text(json.dumps({"p_cores": 20, "self_cap": 2}))
-    admitted = wait_state(node, limited, {"admitted"})
-    assert admitted["sample"]["load1"] == 3
+    node.call("release", **key(limited))
+    wait_state(node, limited, {"released"})
+    (executor.root / "admission" / "caps.json").write_text(json.dumps({"p_cores": 4}))
+    executor.load1 = 3
+    executor.cpu_busy_fraction = 0.99
+    admitted = enqueue(node, "admitted-with-headroom")
+    assert wait_state(node, admitted, {"admitted"})["sample"]["load1"] == 3
+    cancel_admitted(node, admitted)
+    wait_state(node, admitted, {"released"})
 
 
+@pytest.mark.parametrize(
+    ("load1", "busy", "should_admit"),
+    [
+        (55.999, 0.95, True),  # Just below 2x 28 physical cores.
+        (56, 0.949, True),     # Busy just below the 95% threshold.
+        (56, 0.95, False),     # Both thresholds are inclusive.
+        (40, 0.93, True),      # High load still has CPU headroom.
+    ],
+)
+def test_node_saturation_threshold_boundaries(node_env, load1, busy, should_admit):
+    config, executor, _, _ = node_env
+    box = replace(config.boxes["box-a"], p_cores=28)
+    config = replace(config, boxes={**config.boxes, "box-a": box})
+    node = RemoteRunner(config, executor=executor).nodes["box-a"]
+    executor.load1 = load1
+    executor.cpu_busy_fraction = busy
+    queued = enqueue(node, f"saturation-{load1}-{busy}")
+    policy = json.loads((executor.root / "admission" / "policy.json").read_text())
+    assert set(policy) == {"p_cores", "token_pool_size"}
+
+    if should_admit:
+        admitted = wait_state(node, queued, {"admitted"})
+        cancel_admitted(node, admitted)
+        wait_state(node, admitted, {"released"})
+    else:
+        time.sleep(0.05)
+        assert node.call("status", **key(queued))["state"] == "queued"
+        node.call("release", **key(queued))
+        wait_state(node, queued, {"released"})
+
+
+def test_client_and_node_saturation_constants_match():
+    import goalflight_remote_ci_node as node
+
+    assert ci.SATURATION_LOAD_FACTOR == node.SATURATION_LOAD_FACTOR == 2
+    assert ci.SATURATION_BUSY_FRACTION == node.SATURATION_BUSY_FRACTION == 0.95
+
+
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_run_persists_identity_before_start_and_receipt_is_measured(node_env):
     config, executor, runner, node = node_env
+    caller_env = {"TEST_WORKERS": "4"}
+    receipt_metadata = {
+        "dispatch_id": "dispatch-ci-1",
+        "controller_label": "alpha-main",
+    }
     receipt = (FIXTURES / "receipt-pass.json").read_text().replace("ci-worker.example.invalid", "measured-node")
     config = replace(config, runner=replace(config.runner, command=(
         sys.executable, "-c", "import os,json; r=json.loads(os.environ['GOALFLIGHT_REMOTE_CI_LEASE_RECORD_JSON']);"
         "assert r['remote_run']['pid']; assert os.environ['TEST_WORKERS']=='4'; "
+        "assert 'GOALFLIGHT_DISPATCH_ID' not in os.environ; "
+        "assert 'GOALFLIGHT_CONTROLLER_LABEL' not in os.environ; "
         "import base64;print(base64.b64decode(" + repr(base64.b64encode(receipt.encode()).decode()) + ").decode())")))
     runner = RemoteRunner(config, executor=executor)
     def before(payload):
@@ -567,13 +1582,193 @@ def test_run_persists_identity_before_start_and_receipt_is_measured(node_env):
             assert durable["remote_run"]["start_token"]
             assert durable["remote_run"]["run_dir"] == payload["run_dir"]
     executor.before = before
-    outcome = runner.run_arm(spec())
+    outcome = runner.run_arm(replace(
+        pool_spec(), caller_env=caller_env, receipt_metadata=receipt_metadata,
+    ))
     assert outcome.status == "green"
     assert outcome.receipt.hostname == "measured-node"
+    metadata = outcome.receipt.to_dict()
+    assert metadata["dispatch_id"] == "dispatch-ci-1"
+    assert metadata["controller_label"] == "alpha-main"
+    assert len(metadata["command_sha"]) == 64
+    parsed_receipt = parse_receipt(metadata)
+    assert parsed_receipt.to_dict()["dispatch_id"] == "dispatch-ci-1"
     assert executor.calls.index("enqueue") < executor.calls.index("start")
     assert outcome.to_dict()["lease"]["lease_token"]
 
 
+def test_post_enqueue_and_verification_status_use_full_transport_budget(
+    tmp_path, monkeypatch,
+):
+    config = _green_config(_config(tmp_path, token_pool_size=1))
+    config = replace(
+        config, admission=replace(config.admission, max_wait_seconds=0.1),
+    )
+    runner = RemoteRunner(config, executor=lambda *_args, **_kwargs: None)
+    node = runner.nodes["box-a"]
+    clock = [100.0]
+    admission_deadline = 100.1
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        runner, "choose_box", lambda requested=None, **_kwargs:
+        ci.BoxPlacement(requested or "box-a", "measured-node", "192.0.2.10"),
+    )
+
+    receipt = (FIXTURES / "receipt-pass.json").read_text(encoding="utf-8").replace(
+        "ci-worker.example.invalid", "measured-node",
+    )
+    run_dir = str(tmp_path / "remote-run")
+    admitted_record = {
+        "run_directory": run_dir,
+        "lease_token": "lease-token",
+        "lease_id": "lease-id",
+        "measured_hostname": "measured-node",
+        "destination_address": "192.0.2.10",
+        "owner_identity": "owner-identity",
+        "state": "admitted",
+        "sample": {"hostname": "measured-node", "self_cap": 4},
+        "slot": str(tmp_path / "slot"),
+        "checkout_dir": str(tmp_path / "slot"),
+        "token_index": "0",
+    }
+    queued_record = {
+        "run_directory": run_dir,
+        "lease_token": "lease-token",
+        "lease_id": "lease-id",
+        "measured_hostname": "measured-node",
+        "destination_address": "192.0.2.10",
+        "owner_identity": "owner-identity",
+        "state": "queued",
+    }
+    started = False
+    pre_start_statuses = 0
+    operations = []
+    enqueue_waits = []
+    enqueue_transport_timeouts = []
+    status_transport_timeouts = []
+
+    def call(operation, **kwargs):
+        nonlocal pre_start_statuses, started
+        operations.append(operation)
+        if operation == "enqueue":
+            enqueue_waits.append(kwargs.get("queue_wait_seconds"))
+            enqueue_transport_timeouts.append(kwargs.get("_transport_timeout"))
+            clock[0] = admission_deadline + 1
+            return dict(queued_record)
+        if operation == "start":
+            started = True
+            clock[0] = admission_deadline + 1
+            return {"status": "started"}
+        if operation == "status":
+            status_transport_timeouts.append(kwargs.get("_transport_timeout"))
+            if not started:
+                pre_start_statuses += 1
+                return {**admitted_record, "result": None}
+            return {
+                "state": "released",
+                "holder_alive": True,
+                "measured_hostname": "measured-node",
+                "destination_address": "192.0.2.10",
+                "remote_run": {
+                    "host": "measured-node",
+                    "address": "192.0.2.10",
+                    "pid": "123", "start_token": "token", "run_dir": run_dir,
+                    "lease_id": "lease-id", "lease_token": "lease-token",
+                },
+                "sample": {"hostname": "measured-node"},
+                "result": {
+                    "status": "completed", "exit_known": True,
+                    "command_started": True, "returncode": 0,
+                    "streams": {
+                        "stdout": {"tail": {"text": receipt, "truncated": False}},
+                        "stderr": {"tail": {"text": "", "truncated": False}},
+                    },
+                },
+            }
+        if operation == "release":
+            return {"status": "releasing"}
+        raise AssertionError(f"unexpected remote operation: {operation}")
+
+    monkeypatch.setattr(node, "call", call)
+
+    result = ci.run_remote_command({
+        "request_id": "long-status-verification",
+        "box": "box-a",
+        "candidate_sha": "b" * 40,
+        "head_sha": "a" * 40,
+        "snapshot_sha": "b" * 40,
+        "dirty": False,
+        "command_id": "heavy-gate",
+        "command": [sys.executable, "-c", "pass"],
+        "route_reason": "heavy-command-allowlist",
+        "caller_env": {},
+        "_admission_deadline": admission_deadline,
+    }, runner)
+
+    assert clock[0] > admission_deadline
+    assert started
+    assert result["status"] == "GREEN"
+    assert result["candidate"]["status"] == "green"
+    assert enqueue_waits == [pytest.approx(config.admission.max_wait_seconds)]
+    assert enqueue_transport_timeouts == [pytest.approx(
+        enqueue_waits[0] + ci.REMOTE_TRANSPORT_ALLOWANCE_SECONDS,
+    )]
+    assert enqueue_transport_timeouts[0] > enqueue_waits[0]
+    assert status_transport_timeouts == [
+        ci.REMOTE_STATUS_TIMEOUT_SECONDS,
+        ci.REMOTE_STATUS_TIMEOUT_SECONDS,
+    ]
+    assert operations[:3] == ["enqueue", "status", "start"]
+    assert "release" not in operations
+
+
+def test_late_enqueue_withdraws_when_deadline_status_is_still_queued(tmp_path, monkeypatch):
+    config = _green_config(_config(tmp_path, token_pool_size=1))
+    config = replace(
+        config, admission=replace(config.admission, max_wait_seconds=0.1),
+    )
+    runner = RemoteRunner(config, executor=lambda *_args, **_kwargs: None)
+    node = runner.nodes["box-a"]
+    clock = [100.0]
+    admission_deadline = 100.1
+    monkeypatch.setattr(ci.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        runner, "choose_box", lambda requested=None, **_kwargs:
+        ci.BoxPlacement(requested or "box-a", "measured-node", "192.0.2.10"),
+    )
+    run_dir = str(tmp_path / "remote-run")
+    queued_record = {
+        "run_directory": run_dir,
+        "lease_token": "lease-token",
+        "lease_id": "lease-id",
+        "measured_hostname": "measured-node",
+        "destination_address": "192.0.2.10",
+        "owner_identity": "owner-identity",
+        "state": "queued",
+    }
+    operations = []
+
+    def call(operation, **_kwargs):
+        operations.append(operation)
+        if operation == "enqueue":
+            clock[0] = admission_deadline + 1
+            return dict(queued_record)
+        if operation == "status":
+            return {**queued_record, "result": None}
+        if operation == "release":
+            return {"status": "releasing"}
+        raise AssertionError(f"unexpected remote operation: {operation}")
+
+    monkeypatch.setattr(node, "call", call)
+    outcome = runner.run_arm(spec("late-queued"), admission_deadline=admission_deadline)
+
+    assert outcome.status == "capacity"
+    assert operations[:3] == ["enqueue", "status", "release"]
+    assert "start" not in operations
+
+
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_crash_reaper_reads_node_identity_without_local_running_record(node_env, monkeypatch):
     config, executor, runner, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -590,16 +1785,19 @@ def test_crash_reaper_reads_node_identity_without_local_running_record(node_env,
 
 
 @pytest.mark.parametrize("unknown", ["start_token", "pid", "run_dir"])
-def test_cancel_and_attach_refuse_unproven_identity(node_env, unknown):
+def test_cancel_refuses_unproven_identity(node_env, unknown):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
     identity = dict(held["remote_run"], **{unknown: "wrong"})
-    for operation in ("cancel", "attach"):
-        with pytest.raises(ci.RemoteCIError, match="identity"):
-            node.call(operation, **key(held), identity=identity, owner=RemoteRunner._owner())
+    with pytest.raises(ci.RemoteCIError, match="identity"):
+        node.call("cancel", **key(held), identity=identity,
+                  expected_owner=RemoteRunner._owner())
     assert node.call("health")["tokens"]["in_use"] == 1
 
 
+# Round 3 removed reattach and request dedupe: an ambiguous outcome is rerun
+# locally, so reattach-only ownership-transfer cases no longer apply. Cancel
+# still requires the current owner, covered by test_cancel_requires_expected_owner.
 def test_reaper_retains_unknown_owner(node_env, monkeypatch):
     _, executor, runner, node = node_env
     wait_state(node, enqueue(node), {"admitted"})
@@ -608,24 +1806,17 @@ def test_reaper_retains_unknown_owner(node_env, monkeypatch):
     assert "cancel" not in executor.calls
 
 
-def test_stale_reaper_cannot_cancel_after_reattach_transfers_owner(node_env):
-    _, _, _, node = node_env
-    old_owner = dict(RemoteRunner._owner(), owner_pid=99999999)
-    held = wait_state(node, enqueue(node, owner=old_owner), {"admitted"})
-    node.call("attach", **key(held), identity=held["remote_run"], owner=RemoteRunner._owner())
-    result = node.call("cancel", **key(held), identity=held["remote_run"], expected_owner=old_owner)
-    assert result["status"] == "owned"
-    assert node.call("health")["tokens"]["in_use"] == 1
-    assert not (Path(held["run_directory"]) / "cancel.json").exists()
-
-
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_receipt_with_alias_instead_of_measured_hostname_is_red(node_env):
     config, executor, _, _ = node_env
     encoded = base64.b64encode((FIXTURES / "receipt-pass.json").read_bytes()).decode()
     config = replace(config, runner=replace(config.runner, command=(
         sys.executable, "-c", "import base64;print(base64.b64decode(" + repr(encoded) + ").decode())")))
-    outcome = RemoteRunner(config, executor=executor).run_arm(spec())
-    assert outcome.status == "red"
+    outcome = RemoteRunner(config, executor=executor).run_arm(pool_spec())
+    # A hostname mismatch is an unverified remote run, so the daemon falls
+    # back locally and never treats the receipt as a remote test verdict.
+    assert outcome.status == "setup-failed"
     assert "measured node" in outcome.error
 
 
@@ -643,55 +1834,63 @@ def test_health_counts_distinct_token_locks(node_env):
         other_executor.close(config)
 
 
-def test_reattach_inherits_original_token_and_never_starts_twice(node_env):
-    config, executor, runner, node = node_env
-    held = wait_state(node, enqueue(node), {"admitted"})
-    receipt = (FIXTURES / "receipt-pass.json").read_text().replace("ci-worker.example.invalid", "measured-node")
-    start(node, held, "import time;time.sleep(.5);print(" + repr(receipt) + ")")
-    identity = RemoteRunIdentity.from_mapping(held["remote_run"])
-    waiting = enqueue(node, "request-2")
-    def before(payload):
-        if payload["operation"] == "attach":
-            assert json.loads((Path(waiting["run_directory"]) / "lease.json").read_text())["state"] == "queued"
-    executor.before = before
-    log = Path(held["run_directory"]) / "launch.log"
-    assert ci.parse_launch_identity(log.read_text()) == identity
-    result = runner.reattach_launch_log(log, spec())
-    assert result.status == "green"
-    assert executor.calls.count("start") == 1
-    assert executor.calls.count("enqueue") == 2
-    assert "attach" in executor.calls
+def test_box_choice_uses_headroom_then_spreads_ties(tmp_path, monkeypatch):
+    raw = _raw_config(tmp_path)
+    second = dict(raw["boxes"]["box-a"])
+    second.update(host="worker-b.example.invalid", expected_hostname="measured-b",
+                  managed_run_directory=str(tmp_path / "node-b"))
+    raw["boxes"]["box-b"] = second
+    path = tmp_path / "two-boxes.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(path)
+    samples = {
+        "box-a": {"hostname": "measured-node", "load1": 15, "cpu_busy_fraction": 0.8},
+        "box-b": {"hostname": "measured-b", "load1": 2, "cpu_busy_fraction": 0.2},
+    }
+
+    def health(node, operation, **kwargs):
+        assert operation == "health"
+        return {"load": samples[node.box.name], "tokens": {"free": 28}}
+
+    monkeypatch.setattr(ci.RemoteNode, "call", health)
+    runner = RemoteRunner(config, executor=lambda *args, **kwargs: None)
+    assert runner.choose_box() == "box-b"
+    samples["box-a"].update(load1=2, cpu_busy_fraction=0.2)
+    assert runner.choose_box() == "box-a"
+    assert runner.choose_box() == "box-b"
 
 
-def test_reattach_rejects_queued_holder_without_token(node_env):
-    _, _, runner, node = node_env
-    held = wait_state(node, enqueue(node), {"admitted"})
-    queued = enqueue(node, "queued")
-    deadline = time.monotonic() + 5
-    while not queued.get("remote_run") and time.monotonic() < deadline:
-        queued = node.call("status", **key(queued))
-    with pytest.raises(ci.RemoteCIError, match="no admission"):
-        runner.reattach(spec(), RemoteRunIdentity.from_mapping(queued["remote_run"]))
-    assert node.call("status", **key(held))["state"] == "admitted"
-
-
-def test_lost_launch_response_cancels_proven_run_before_freeing_token(node_env):
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_lost_launch_response_requires_local_fallback_and_cancels_best_effort(node_env):
+    """An uncertain start has no remote verdict; do not reattach and reuse it."""
     config, executor, _, node = node_env
     config = replace(config, runner=replace(config.runner,
-        command=(sys.executable, "-c", "import time;time.sleep(20)")))
-    def losing_executor(argv, env, timeout):
-        result = executor(argv, env, timeout)
-        if executor.calls and executor.calls[-1] == "start":
+        command=(sys.executable, "-c", "import time;time.sleep(.3)")))
+    def losing_executor(argv, env, timeout, input_data=None):
+        result = executor(argv, env, timeout, input_data=input_data)
+        if input_data is None and executor.calls and executor.calls[-1] == "start":
             return CommandResult(2, stderr="lost response")
         return result
     runner = RemoteRunner(config, executor=losing_executor)
-    with pytest.raises(ci.RemoteCIError, match="lost response"):
-        runner.run_arm(spec())
-    assert node.call("health")["tokens"]["in_use"] == 0
-    assert "release" not in executor.calls
+    try:
+        outcome = runner.run_arm(pool_spec())
+    except ci.AmbiguousRemoteError as exc:
+        assert "no clean verified outcome" in str(exc)
+    else:
+        pytest.fail(
+            "expected an ambiguous start; "
+            f"got {outcome.status}: {outcome.error}; calls={executor.calls}"
+        )
+    assert executor.calls.count("start") == 1
     assert "cancel" in executor.calls
+    deadline = time.monotonic() + 5
+    while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert node.call("health")["tokens"]["in_use"] == 0
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
 def test_duplicate_start_cannot_execute_twice(node_env):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -700,31 +1899,173 @@ def test_duplicate_start_cannot_execute_twice(node_env):
         start(node, held)
 
 
-def test_released_admission_rejects_a_delayed_launch(node_env):
+def test_release_on_admitted_lease_withdraws_before_start(node_env):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
-    node.call("release", **key(held))
-    with pytest.raises(ci.RemoteCIError, match="release is pending|does not hold admission"):
-        start(node, held)
+    released = node.call("release", **key(held))
+    assert released == {"status": "releasing"}
+    assert (Path(held["run_directory"]) / "release.json").exists()
     assert not (Path(held["run_directory"]) / "command.json").exists()
+    assert wait_state(node, held, {"released"})["state"] == "released"
 
 
-def test_reattach_cannot_inherit_released_by_dead_holder(node_env):
-    config, executor, runner, node = node_env
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_node_runs_command_in_forwarded_working_directory(node_env):
+    _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
-    os.kill(int(held["remote_run"]["pid"]), signal.SIGKILL)
-    deadline = time.monotonic() + 5
-    while node.call("status", **key(held))["holder_alive"] and time.monotonic() < deadline:
-        time.sleep(.01)
-    with pytest.raises(ci.RemoteCIError, match="holder is gone"):
-        runner.reattach(spec(), RemoteRunIdentity.from_mapping(held["remote_run"]))
+    cwd = Path(held["slot"]) / "nested"
+    node.call("start", **key(held), command={
+        "argv": [sys.executable, "-c",
+                 "import os;assert os.path.isfile('included.txt');print(os.getcwd())"],
+        "env": _source_bundle_env(held), "timeout": 10, "cwd": str(cwd),
+    })
+    deadline = time.monotonic() + 10
+    current = None
+    while time.monotonic() < deadline:
+        current = node.call("status", **key(held))
+        if current.get("result") is not None:
+            break
+        time.sleep(0.02)
+    assert current is not None and current.get("result") is not None
+    assert current["result"]["status"] == "completed"
+    assert current["result"]["streams"]["stdout"]["tail"]["text"].strip().startswith(str(cwd))
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_command_override_env_is_applied_on_node(node_env):
+    _, _, _, node = node_env
+    held = wait_state(node, enqueue(node), {"admitted"})
+    command = {
+        "argv": [sys.executable, "-c",
+                 "import os;print(os.getenv('PYTHONPATH'));"
+                 "print(os.getenv('EXAMPLE_DEP_ROOT', 'absent'));"
+                 "print(os.getenv('EXAMPLE_DEP_EXTRACT_ROOT', 'absent'))"],
+        "env": {
+            **_source_bundle_env(held),
+            "PYTHONPATH": "box-path",
+            "EXAMPLE_DEP_ROOT": "/box/pm2",
+            "EXAMPLE_DEP_EXTRACT_ROOT": "/box/extract",
+            "GOALFLIGHT_REMOTE_CI_PROFILE_ENABLED": "0",
+            "GOALFLIGHT_REMOTE_CI_COMMAND_OVERRIDE_ID": "example-command-isolated",
+        },
+        "env_set": {"PYTHONPATH": "src"},
+        "env_unset": ["EXAMPLE_DEP_ROOT", "EXAMPLE_DEP_EXTRACT_ROOT"],
+        "timeout": 10,
+    }
+    node.call("start", **key(held), command=command)
+    deadline = time.monotonic() + 10
+    current = None
+    while time.monotonic() < deadline:
+        current = node.call("status", **key(held))
+        if current.get("result") is not None:
+            break
+        time.sleep(0.02)
+    assert current is not None and current.get("result") is not None
+    assert current["result"]["status"] == "completed"
+    stdout = current["result"]["streams"]["stdout"]["tail"]["text"]
+    assert stdout.splitlines()[:3] == ["src", "absent", "absent"]
+
+
+def test_runner_routes_command_override_by_id_and_receipt(node_env, monkeypatch):
+    config, executor, _, _ = node_env
+    override_id = "example-command-isolated"
+    command_override = ci.CommandOverride(
+        {"PYTHONPATH": "src"},
+        ("EXAMPLE_DEP_ROOT", "EXAMPLE_DEP_EXTRACT_ROOT"),
+    )
+    runner_config = replace(
+        config.runner,
+        command_overrides={override_id: command_override},
+    )
+    config = replace(config, runner=runner_config, profile_enabled=True)
+    monkeypatch.setattr(ci, "_profile_command_files", lambda *_args, **_kwargs: ())
+    seen = {}
+
+    def capture_start(payload):
+        if payload["operation"] == "start":
+            seen.update(payload["command"])
+
+    executor.before = capture_start
+    runner = RemoteRunner(config, executor=executor)
+    monkeypatch.setattr(
+        runner, "choose_box", lambda requested=None, **_kwargs:
+        ci.BoxPlacement(requested or "box-a", "measured-node", "192.0.2.10"),
+    )
+    node = runner.nodes["box-a"]
+    original_call = node.call
+    monkeypatch.setattr(
+        node, "call",
+        lambda operation, *args, **kwargs: (
+            seen.update(kwargs["command"]) or {}
+            if operation == "start" else original_call(operation, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        runner, "_watch",
+        lambda spec, *_args: ci.ArmOutcome(
+            spec.arm, "completed", 0,
+            ci.parse_receipt({
+                "hostname": "measured-node", "status": "pass", "returncode": 0,
+                "command_override_id": override_id,
+            }),
+        ),
+    )
+    run_spec = replace(
+        pool_spec("override-run"),
+        command=("python3", "-m", "pytest", "tests/test_one.py"),
+        command_id=override_id,
+    )
+    outcome = runner.run_arm(run_spec)
+    assert outcome.status == "completed", outcome.error
+    assert seen["env"]["GOALFLIGHT_REMOTE_CI_PROFILE_ENABLED"] == "1"
+    assert seen["env"]["GOALFLIGHT_REMOTE_CI_COMMAND_OVERRIDE_ID"] == override_id
+    assert seen["env_set"] == {"PYTHONPATH": "src"}
+    assert seen["env_unset"] == ["EXAMPLE_DEP_ROOT", "EXAMPLE_DEP_EXTRACT_ROOT"]
+    assert "profile_isolated" not in seen
+    assert seen["emit_receipt"] is True
+    assert outcome.receipt is not None
+    assert outcome.receipt.metadata["command_override_id"] == override_id
+
+    ordinary = replace(pool_spec("ordinary-run"), command_id="ordinary-command")
+    ordinary_config = replace(config, profile_enabled=False)
+    ordinary_seen = {}
+    executor.before = lambda payload: ordinary_seen.update(payload["command"]) \
+        if payload["operation"] == "start" else None
+    ordinary_runner = RemoteRunner(ordinary_config, executor=executor)
+    monkeypatch.setattr(
+        ordinary_runner, "choose_box",
+        lambda requested=None, **_kwargs:
+        ci.BoxPlacement(requested or "box-a", "measured-node", "192.0.2.10"),
+    )
+    ordinary_node = ordinary_runner.nodes["box-a"]
+    ordinary_call = ordinary_node.call
+    monkeypatch.setattr(
+        ordinary_node, "call",
+        lambda operation, *args, **kwargs: (
+            ordinary_seen.update(kwargs["command"]) or {}
+            if operation == "start" else ordinary_call(operation, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        ordinary_runner, "_watch",
+        lambda spec, *_args: ci.ArmOutcome(spec.arm, "completed", 0, None),
+    )
+    ordinary_outcome = ordinary_runner.run_arm(ordinary)
+    assert ordinary_outcome.status == "completed"
+    assert "env_set" not in ordinary_seen
+    assert "env_unset" not in ordinary_seen
+    assert "GOALFLIGHT_REMOTE_CI_COMMAND_OVERRIDE_ID" not in ordinary_seen["env"]
+
+
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_timeout_cancels_node_group_and_frees_token(node_env):
     config, executor, runner, node = node_env
     config = replace(config, runner=replace(config.runner, timeout_seconds=.2,
         command=(sys.executable, "-c", "import time;time.sleep(20)")))
-    result = RemoteRunner(config, executor=executor).run_arm(spec())
+    result = RemoteRunner(config, executor=executor).run_arm(pool_spec())
     assert result.timed_out and result.cancelled
     deadline = time.monotonic() + 5
     while node.call("health")["tokens"]["in_use"] and time.monotonic() < deadline:
@@ -761,12 +2102,53 @@ def test_corrected_cap_can_list_and_reap(node_env, monkeypatch):
 
 def test_base_overlay_selection_contract(node_env):
     config, _, _, _ = node_env
-    request = {"request_id": "r", "tip_sha": "a"*40, "candidate_sha": "b"*40,
-               "test_files": ["tests/test_one.py"], "selection": ["tests/test_one.py", "-q"]}
+    # Pair specs require the daemon's box pin before either arm is constructed.
+    request = {"request_id": "r", "box": "box-a",
+               "tip_sha": "a"*40, "candidate_sha": "b"*40,
+               "test_files": ["tests/test_one.py"], "selection": ["tests/test_one.py", "-q"],
+               "receipt_metadata": {
+                   "dispatch_id": "dispatch-ci-3", "controller_label": "beta",
+               }}
     base, candidate = build_pair_specs(request, config)
     assert base.overlay and not candidate.overlay
     assert base.sha == request["tip_sha"]
+    assert base.box == candidate.box == "box-a"
+    assert base.test_files == candidate.test_files == ("tests/test_one.py",)
     assert "--continue-on-collection-errors" in base.selection
+    assert base.receipt_metadata == candidate.receipt_metadata == request["receipt_metadata"]
+
+
+def test_matched_pair_pins_both_arms_to_one_box(tmp_path):
+    config = _config(tmp_path)
+    config.queue_dir.mkdir(parents=True)
+    queued = config.queue_dir / "pair-pin.json"
+    queued.write_text("{}", encoding="utf-8")
+    receipt = parse_receipt(FIXTURES / "receipt-pass.json")
+
+    class Runner:
+        def __init__(self):
+            self.config = config
+            self.boxes = []
+
+        def choose_box(self, requested=None, *, excluding=(), deadline=None):
+            assert not excluding
+            assert deadline is not None
+            return "box-a"
+
+        def run_arm(self, arm, *, admission_deadline=None):
+            assert admission_deadline is not None
+            self.boxes.append(arm.box)
+            return ArmOutcome(arm.arm, "green", 0, receipt)
+
+    runner = Runner()
+    result = ci.run_matched_pair({
+        "request_id": "pair-pin", "project_id": config.repo, "tip_sha": "a" * 40,
+        "candidate_sha": "b" * 40, "test_files": ["tests/test_one.py"],
+        "selection": ["tests/test_one.py", "-q"],
+    }, runner)
+    assert result["status"] == "GREEN"
+    assert runner.boxes == ["box-a", "box-a"]
+    assert json.loads(queued.read_text())["box"] == "box-a"
 
 
 def test_queue_order_is_stable(tmp_path):
@@ -796,18 +2178,20 @@ def _free_tokens(node):
     assert node.call("health")["tokens"]["in_use"] == 0
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_dropped_enqueue_response_does_not_stick_the_token(node_env):
     config, executor, _, node = node_env
     config = _green_config(config)
 
-    def transport(argv, env, timeout):
-        result = executor(argv, env, timeout)
-        if executor.calls and executor.calls[-1] == "enqueue":
+    def transport(argv, env, timeout, input_data=None):
+        result = executor(argv, env, timeout, input_data=input_data)
+        if input_data is None and executor.calls and executor.calls[-1] == "enqueue":
             return CommandResult(255, stdout=result.stdout, stderr="connection reset by peer")
         return result
 
-    outcome = RemoteRunner(config, executor=transport).run_arm(spec())
-    assert outcome.status == "green"
+    outcome = RemoteRunner(config, executor=transport).run_arm(pool_spec())
+    assert outcome.status == "green", outcome.error
     _free_tokens(node)
 
 
@@ -828,24 +2212,28 @@ def test_live_owner_reaps_admission_whose_release_never_landed(node_env):
 
     runner = RemoteRunner(config, executor=transport)
     with pytest.raises(ci.RemoteCIError, match="no route to host"):
-        runner.run_arm(spec())
+        runner.run_arm(pool_spec())
     assert node.call("health")["tokens"]["in_use"] == 1
     drop["on"] = False
     assert runner.reap()[0]["status"] == "releasing"
     _free_tokens(node)
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_next_arm_recovers_a_forgotten_token(node_env):
     config, executor, _, node = node_env
     config = _green_config(config)
     node.call("health")  # Exercise lost calls after the first install handshake.
     drop = {"on": True}
 
-    def transport(argv, env, timeout):
+    def transport(argv, env, timeout, input_data=None):
+        if input_data is not None:
+            return executor(argv, env, timeout, input_data=input_data)
         payload = json.loads(base64.b64decode(shlex.split(argv[2])[3]))
         if drop["on"] and payload["operation"] in {"status", "release", "cancel"}:
             return CommandResult(255, stderr="no route to host")
-        result = executor(argv, env, timeout)
+        result = executor(argv, env, timeout, input_data=input_data)
         if drop["on"] and payload["operation"] == "enqueue":
             wait_state(node, json.loads(result.stdout)["result"], {"admitted"})
         return result
@@ -859,11 +2247,11 @@ def test_next_arm_recovers_a_forgotten_token(node_env):
 
     runner = RemoteRunner(config, executor=transport, sleeper=sleeper)
     with pytest.raises(ci.RemoteCIError, match="no route to host"):
-        runner.run_arm(spec())
+        runner.run_arm(pool_spec())
     assert node.call("health")["tokens"]["in_use"] == 1
     drop["on"] = False
-    outcome = runner.run_arm(spec("request-2"))
-    assert outcome.status == "green"
+    outcome = runner.run_arm(pool_spec("request-2"))
+    assert outcome.status == "green", outcome.error
     assert sleeps and max(sleeps) <= 1
     _free_tokens(node)
 
@@ -880,8 +2268,27 @@ def test_admitted_holder_releases_when_the_command_never_arrives(node_env):
     assert admitted["lease_id"] != forgotten["lease_id"]
     released = wait_state(node, forgotten, {"released"})
     assert released.get("release_reason") == "command-wait"
+    assert released.get("result", {}).get("status") == "setup-failed"
+    assert released["result"].get("command_started") is False
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_real_admitted_holder_survives_bundle_preparation_delay(node_env):
+    _, executor, _, node = node_env
+    executor.use_short_command_window(1.5)
+    held = wait_state(node, enqueue(node, "bundle-delay"), {"admitted"})
+
+    # Model local bundle creation and upload while the real node holder waits.
+    time.sleep(1.0)
+    start(node, held, "pass")
+    released = wait_state(node, held, {"released"})
+    assert released["result"]["status"] == "completed"
+    assert released["result"]["command_started"] is True
+
+
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -926,8 +2333,11 @@ def test_sigkill_of_holder_keeps_the_token_while_the_workload_runs(node_env, tmp
             time.sleep(0.01)
 
 
-def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path, non_tmp_managed_base):
     raw = _raw_config(tmp_path, token_pool_size=1)
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(non_tmp_managed_base / "fake-node")
     raw["admission"]["queue_wait_seconds"] = 30
     raw["daemon"]["poll_seconds"] = 0.05
     path = tmp_path / "remote-ci.json"
@@ -943,7 +2353,7 @@ def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
             raise AssertionError(f"admission slept {seconds}s, parking a free token")
         if not released["ok"]:
             released["ok"] = True
-            node.call("release", **key(blocker))
+            cancel_admitted(node, blocker)
 
     runner = RemoteRunner(config, executor=executor, sleeper=sleeper)
     node = runner.nodes["box-a"]
@@ -953,7 +2363,7 @@ def test_admission_poll_does_not_park_for_the_queue_wait(tmp_path):
             enqueue(node, "blocker", owner=dict(RemoteRunner._owner(), owner_pid=os.getpid() + 1)),
             {"admitted"},
         )
-        outcome = runner.run_arm(spec())
+        outcome = runner.run_arm(pool_spec())
         assert outcome.status == "green"
         assert sleeps and max(sleeps) <= 1
         assert released["ok"]
@@ -1020,11 +2430,11 @@ def test_two_managed_roots_do_not_create_two_pools(tmp_path):
     raw["boxes"]["box-a"]["managed_run_directory"] = str(root_a)
     path_a = tmp_path / "a.json"
     path_a.write_text(json.dumps(raw), encoding="utf-8")
-    config_a = load_config(path_a)
+    config_a = _load_fake_node_config(path_a)
     raw["boxes"]["box-a"]["managed_run_directory"] = str(root_b)
     path_b = tmp_path / "b.json"
     path_b.write_text(json.dumps(raw), encoding="utf-8")
-    config_b = load_config(path_b)
+    config_b = _load_fake_node_config(path_b)
     executor = ScriptedExecutor(tmp_path / "box-authority")
     node_a = RemoteRunner(config_a, executor=executor).nodes["box-a"]
     node_b = RemoteRunner(config_b, executor=executor).nodes["box-a"]
@@ -1048,55 +2458,8 @@ def test_cancel_requires_expected_owner(node_env):
     assert node.call("health")["tokens"]["in_use"] == 1
 
 
-def test_stale_controller_cannot_cancel_after_reattach(node_env, tmp_path):
-    config, executor, _, node = node_env
-    node.call("health")  # Keep this recovery test on the steady-state path.
-    pidfile = tmp_path / "stale.pid"
-    config = replace(config, runner=replace(config.runner, command=(
-        sys.executable, "-c",
-        "import os,time\n"
-        f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
-        "time.sleep(30)\n",
-    )))
-    owner_b = dict(RemoteRunner._owner(), owner_pid=os.getpid() + 1, owner_identity="other-controller")
-    seen = {}
-    phase = {"watch": False}
-
-    def transport(argv, env, timeout):
-        payload = json.loads(base64.b64decode(shlex.split(argv[2])[3]))
-        operation = payload["operation"]
-        if operation == "start":
-            result = executor(argv, env, timeout)
-            phase["watch"] = True
-            return result
-        if operation == "status" and phase["watch"]:
-            result = executor(argv, env, timeout)
-            if result.returncode == 0 and result.stdout.strip():
-                record = json.loads(result.stdout)["result"]
-                if record.get("state") == "running":
-                    phase["watch"] = False
-                    node.call("attach", **key(record), identity=record["remote_run"], owner=owner_b)
-                    seen["run_dir"] = record["run_directory"]
-                    return CommandResult(255, stderr="lost status")
-            return result
-        result = executor(argv, env, timeout)
-        if operation == "cancel" and result.returncode == 0 and result.stdout.strip():
-            seen["cancel_owner"] = payload.get("expected_owner")
-            seen["cancel_status"] = json.loads(result.stdout)["result"].get("status")
-        return result
-
-    runner = RemoteRunner(config, executor=transport)
-    with pytest.raises(ci.RemoteCIError, match="lost status"):
-        runner.run_arm(spec())
-    assert seen["cancel_status"] == "owned"
-    assert seen["cancel_owner"]["owner_pid"] == os.getpid()
-    child = _child_pid(pidfile)
-    os.kill(child, 0)
-    assert not (Path(seen["run_dir"]) / "cancel.json").exists()
-    assert node.call("health")["tokens"]["in_use"] == 1
-    os.kill(child, signal.SIGKILL)
-
-
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
     _, _, runner, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1106,7 +2469,7 @@ def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
                  "import os,time\n"
                  f"open({str(pidfile)!r},'w').write(str(os.getpid()))\n"
                  "time.sleep(30)\n"],
-        "env": {},
+        "env": _source_bundle_env(held),
         "timeout": 30,
     })
     child = _child_pid(pidfile, node, held)
@@ -1119,6 +2482,7 @@ def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
         lease_path = Path(held["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
         lease["deadline_epoch"] = time.time() - 1
+        lease["phase_deadline_epoch"] = time.time() - 1
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert runner.reap()[0]["status"] == "cancelled"
         _wait_dead(child, node, held)
@@ -1130,6 +2494,8 @@ def test_reap_kills_orphaned_workload_after_its_deadline(node_env, tmp_path):
             pass
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_operator_clear_audits_a_dead_holder(node_env, tmp_path):
     _, executor, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1160,6 +2526,8 @@ def test_operator_clear_audits_a_dead_holder(node_env, tmp_path):
             pass
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_released_run_bodies_are_pruned(node_env):
     _, executor, _, node = node_env
     finished = wait_state(node, enqueue(node, "done"), {"admitted"})
@@ -1167,8 +2535,19 @@ def test_released_run_bodies_are_pruned(node_env):
     wait_state(node, finished, {"released"})
     dry = node.call("gc", apply=False, retain_max_count=0, retain_max_age_seconds=0,
                     retain_failure_count=0, retain_failure_age_seconds=0)
-    assert any(row["class"] == "ELIGIBLE" and row["path"] == finished["run_directory"] for row in dry)
+    assert not any(row.get("class") == "ELIGIBLE" and row["path"] == finished["run_directory"]
+                   for row in dry)
     assert Path(finished["run_directory"]).exists()
+    # The retention floor is measured from terminal completion (59ae8ea9),
+    # so age the result row only after verifying a fresh completion is kept.
+    result_index = executor.root / "results" / "index.jsonl"
+    aged_rows = []
+    for raw in result_index.read_text(encoding="utf-8").splitlines():
+        row = json.loads(raw)
+        if row.get("run_id") == finished["lease_id"]:
+            row["finish"] = 0
+        aged_rows.append(json.dumps(row))
+    result_index.write_text("\n".join(aged_rows) + "\n", encoding="utf-8")
     tokens = executor.root / "admission" / "tokens"
     (tokens / "sentinel").write_text("keep", encoding="utf-8")
     unknown = wait_state(node, enqueue(node, "unknown"), {"admitted"})
@@ -1192,6 +2571,7 @@ def test_released_run_bodies_are_pruned(node_env):
             pass
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
 def test_checkout_directory_stays_inside_the_managed_root(node_env):
     config, executor, _, _ = node_env
     seen = {}
@@ -1202,14 +2582,14 @@ def test_checkout_directory_stays_inside_the_managed_root(node_env):
             seen["run_dir"] = payload["run_dir"]
 
     executor.before = before
-    RemoteRunner(_green_config(config), executor=executor).run_arm(spec())
+    RemoteRunner(_green_config(config), executor=executor).run_arm(pool_spec())
     slot = seen["checkout"]
     assert Path(slot).is_dir()
-    assert slot == str(Path(executor.root) / "repos" / "default" / "slots" / "s-01")
+    assert slot == str(Path(executor.root) / "repos" / "default" / "seats" / "s-01")
     assert str(executor.root) in slot
-    assert not slot.startswith(str(Path.home()))
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
 def test_poll_once_does_not_write_a_request_mirror(tmp_path):
     config = _config(tmp_path, token_pool_size=1)
     executor = ScriptedExecutor(tmp_path / "fake-node")
@@ -1240,6 +2620,8 @@ def _cancel(node, record):
                                       "owner_identity")})
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_cancel_kills_background_grandchildren_before_releasing_the_token(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1269,6 +2651,8 @@ def test_cancel_kills_background_grandchildren_before_releasing_the_token(node_e
     _free_tokens(node)
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_cancel_kills_a_setsid_descendant_before_releasing_the_token(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1289,9 +2673,9 @@ def test_cancel_kills_a_setsid_descendant_before_releasing_the_token(node_env, t
     _free_tokens(node)
 
 
-def _two_token(tmp_path):
+def _two_token(tmp_path, non_tmp_managed_base):
     raw = _raw_config(tmp_path, token_pool_size=2)
-    root = tmp_path / "two-token-node"
+    root = non_tmp_managed_base / "two-token-node"
     raw["boxes"]["box-a"]["managed_run_directory"] = str(root)
     path = tmp_path / "two-token.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
@@ -1318,6 +2702,8 @@ def _wait_dead(pid, node=None, record=None):
         f"pid {pid} still alive\n" + _diagnose_launch(node, record))
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_cancel_kills_a_child_that_setsid_chdirs_and_closes_fds(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1335,6 +2721,8 @@ def test_cancel_kills_a_child_that_setsid_chdirs_and_closes_fds(node_env, tmp_pa
     _free_tokens(node)
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_reap_holds_capacity_until_the_escaped_child_is_dead(node_env, tmp_path):
     _, _, runner, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1346,7 +2734,7 @@ def test_reap_holds_capacity_until_the_escaped_child_is_dead(node_env, tmp_path)
                  " cwd='/', close_fds=True)\n"
                  f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
                  "time.sleep(60)\n"],
-        "env": {},
+        "env": _source_bundle_env(held),
         "timeout": 30,
     })
     child = _child_pid(pidfile, node, held)
@@ -1355,6 +2743,7 @@ def test_reap_holds_capacity_until_the_escaped_child_is_dead(node_env, tmp_path)
         lease_path = Path(held["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
         lease["deadline_epoch"] = time.time() - 1
+        lease["phase_deadline_epoch"] = time.time() - 1
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert node.call("health")["tokens"]["in_use"] == 1
         assert runner.reap()[0]["status"] == "cancelled"
@@ -1394,8 +2783,18 @@ def test_draining_lease_reserves_a_token_with_no_flock(node_env):
     assert node.call("health")["tokens"]["in_use"] == 1
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_unresolved_slot_stays_reserved_for_the_successor(tmp_path):
-    config, executor, runner, node = _two_token(tmp_path)
+    raw = _raw_config(tmp_path, token_pool_size=2)
+    root = tmp_path / "two-token-node"
+    raw["boxes"]["box-a"]["managed_run_directory"] = str(root)
+    path = tmp_path / "two-token.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = _load_fake_node_config(path)
+    executor = ScriptedExecutor(root)
+    runner = RemoteRunner(config, executor=executor)
+    node = runner.nodes["box-a"]
     child_b = None
     try:
         first = wait_state(node, enqueue(node, "run-a"), {"admitted"})
@@ -1412,6 +2811,7 @@ def test_unresolved_slot_stays_reserved_for_the_successor(tmp_path):
         lease_path = Path(running["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
         lease["deadline_epoch"] = time.time() - 1
+        lease["phase_deadline_epoch"] = time.time() - 1
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         # A different controller host keeps reap from treating B as forgotten.
         other = dict(RemoteRunner._owner(), owner_host="not-this-host")
@@ -1435,8 +2835,10 @@ def test_unresolved_slot_stays_reserved_for_the_successor(tmp_path):
         executor.close(config)
 
 
-def test_stale_clear_does_not_signal_the_slots_current_occupant(tmp_path):
-    config, executor, _, node = _two_token(tmp_path)
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_stale_clear_does_not_signal_the_slots_current_occupant(tmp_path, non_tmp_managed_base):
+    config, executor, _, node = _two_token(tmp_path, non_tmp_managed_base)
     sleeper = None
     try:
         first = wait_state(node, enqueue(node, "run-a"), {"admitted"})
@@ -1473,13 +2875,16 @@ def test_stale_clear_does_not_signal_the_slots_current_occupant(tmp_path):
         executor.close(config)
 
 
-def test_clean_git_slot_is_reused_instead_of_quarantined(node_env):
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_seat_is_recloned_from_base_between_runs(node_env):
     _, executor, _, node = node_env
     held = wait_state(node, enqueue(node, "init"), {"admitted"})
     start(node, held,
           "import pathlib, subprocess\n"
           "subprocess.check_call(['git', 'init'])\n"
           "pathlib.Path('README').write_text('x')\n"
+          "pathlib.Path('run-residue').write_text('dirty')\n"
           "subprocess.check_call(['git', 'add', 'README'])\n"
           "subprocess.check_call(['git', '-c', 'user.email=t@example.com',"
           " '-c', 'user.name=t', 'commit', '-m', 'init'])\n")
@@ -1489,11 +2894,13 @@ def test_clean_git_slot_is_reused_instead_of_quarantined(node_env):
     assert not (slot / "SLOT.json").exists()
     assert not (slot / "slot.lock").exists()
     again = wait_state(node, enqueue(node, "reuse"), {"admitted"})
-    start(node, again, "import os, sys\nsys.exit(0 if os.path.isdir('.git') else 3)\n")
+    start(node, again,
+          "import pathlib, sys\n"
+          "sys.exit(0 if (pathlib.Path('.git').is_dir() and "
+          "not pathlib.Path('run-residue').exists() and "
+          "pathlib.Path('README').read_text() == 'source snapshot\\n') else 3)\n")
     done = wait_state(node, again, {"released"})
     assert done["result"]["returncode"] == 0
-    quarantine = executor.root / "quarantine"
-    assert not quarantine.exists() or not any(quarantine.iterdir())
     assert (Path(again["slot"]) / ".git").is_dir()
 
 
@@ -1556,10 +2963,12 @@ def test_legacy_admission_runs_remain_recoverable(node_env):
     wait_state(node, waiting, {"admitted"})
 
 
-def test_controller_repo_reaches_the_slot_and_the_result(tmp_path):
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
+def test_controller_repo_reaches_the_slot_and_the_result(tmp_path, non_tmp_managed_base):
     raw = _raw_config(tmp_path, token_pool_size=1)
     raw["repo"] = "goal-flight"
-    root = tmp_path / "repo-node"
+    root = non_tmp_managed_base / "repo-node"
     raw["boxes"]["box-a"]["managed_run_directory"] = str(root)
     path = tmp_path / "repo.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
@@ -1574,9 +2983,9 @@ def test_controller_repo_reaches_the_slot_and_the_result(tmp_path):
     executor.before = before
     try:
         runner = RemoteRunner(config, executor=executor)
-        outcome = runner.run_arm(spec())
+        outcome = runner.run_arm(pool_spec())
         assert seen["repo"] == "goal-flight"
-        assert outcome.lease["slot"].endswith("/repos/goal-flight/slots/s-01")
+        assert outcome.lease["slot"].endswith("/repos/goal-flight/seats/s-01")
         # The watch returns when result.json appears, before the holder fsyncs
         # the index and marks the lease released.
         wait_state(runner.nodes["box-a"], outcome.lease, {"released"})
@@ -1585,8 +2994,8 @@ def test_controller_repo_reaches_the_slot_and_the_result(tmp_path):
         kiln = replace(config, repo="kiln")
         executor.before = None
         kiln_runner = RemoteRunner(kiln, executor=executor)
-        second = kiln_runner.run_arm(spec("request-2"))
-        assert second.lease["slot"].endswith("/repos/kiln/slots/s-01")
+        second = kiln_runner.run_arm(pool_spec("request-2"))
+        assert second.lease["slot"].endswith("/repos/kiln/seats/s-01")
         wait_state(kiln_runner.nodes["box-a"], second.lease, {"released"})
         assert '"repo": "kiln"' in (root / "results" / "index.jsonl").read_text(encoding="utf-8")
     finally:
@@ -1604,7 +3013,7 @@ def test_capacity_refusal_is_not_reported_as_death(node_env):
             floor.write_text(json.dumps({"refuse": "capacity"}), encoding="utf-8")
 
     executor.before = before
-    outcome = RemoteRunner(config, executor=executor).run_arm(spec())
+    outcome = RemoteRunner(config, executor=executor).run_arm(pool_spec())
     assert outcome.status == "capacity"
     assert outcome.returncode == 75
     assert outcome.status != "died"
@@ -1629,6 +3038,8 @@ def test_unreachable_keep_machinery_is_gone():
     assert "allowed_pgid" not in source
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
     """Parent exit reparents the child to launchd. The coalition still names it."""
     _, _, runner, node = node_env
@@ -1641,7 +3052,7 @@ def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
                  " cwd='/', close_fds=True)\n"
                  f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
                  "time.sleep(60)\n"],
-        "env": {},
+        "env": _source_bundle_env(held),
         "timeout": 30,
     })
     child = _child_pid(pidfile)
@@ -1662,6 +3073,7 @@ def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
         lease_path = Path(running["run_directory"]) / "lease.json"
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
         lease["deadline_epoch"] = time.time() - 1
+        lease["phase_deadline_epoch"] = time.time() - 1
         lease_path.write_text(json.dumps(lease), encoding="utf-8")
         assert node.call("health")["tokens"]["in_use"] == 1
         assert runner.reap()[0]["status"] == "cancelled"
@@ -1674,6 +3086,8 @@ def test_reap_kills_a_setsid_orphan_after_its_parent_exits(node_env, tmp_path):
             pass
 
 
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_sigterm_grandchild_is_killed_with_the_coalition(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -1826,10 +3240,10 @@ def test_kill_escalation_rechecks_coalition_before_sigkill(monkeypatch):
     assert signal.SIGKILL not in signals
 
 
-def test_legacy_checkout_slot_is_not_granted_to_the_next_run(tmp_path):
+def test_new_seat_pool_does_not_reuse_legacy_full_copy_slots(tmp_path, non_tmp_managed_base):
     import fcntl
 
-    config, executor, _, node = _two_token(tmp_path)
+    config, executor, _, node = _two_token(tmp_path, non_tmp_managed_base)
     managed = executor.root
     slot = managed / "repos" / "default" / "slots" / "s-01"
     slot.mkdir(parents=True)
@@ -1857,8 +3271,7 @@ def test_legacy_checkout_slot_is_not_granted_to_the_next_run(tmp_path):
         json.dumps({"p_cores": 20, "token_pool_size": 2}), encoding="utf-8")
     try:
         fresh = wait_state(node, enqueue(node, "after-upgrade"), {"admitted"})
-        assert not str(fresh["slot"]).endswith("/slots/s-01")
-        assert str(fresh["slot"]).endswith("/slots/s-02")
+        assert str(fresh["slot"]).endswith("/seats/s-01")
         assert fresh["token_index"] == 1
     finally:
         lock.close()
@@ -2002,11 +3415,33 @@ def test_exited_job_without_holder_proof_can_release_an_empty_tree(tmp_path, mon
         "launch_label": "com.goalflight.remote-ci.abc",
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 42, "start": [10, 20],
+    }), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: ("exited", None, 19))
-    monkeypatch.setattr(node, "_remove_job", lambda label: True)
+    removed = []
+    monkeypatch.setattr(node, "_remove_job", lambda label: removed.append(label) or True)
+    # The launcher exited before command-started, so there is no workload tree.
+    assert not node._workload_released(run, state)
     assert node.clear_tree(tmp_path, state, run) is True
     assert state["exit_code"] == 19
     assert state["exit_known"] is True
+    assert removed == [state["launch_label"]]
+
+    started = tmp_path / "started"
+    started.mkdir()
+    started_state = {
+        "lease_id": "started", "state": "draining",
+        "launch_label": "com.goalflight.remote-ci.started",
+    }
+    (started / "lease.json").write_text(json.dumps(started_state), encoding="utf-8")
+    (started / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 42, "start": [10, 20],
+    }), encoding="utf-8")
+    (started / "workload-go").touch()
+    assert node._workload_released(started, started_state)
+    assert node.clear_tree(tmp_path, started_state, started) is False
+    assert removed == [state["launch_label"]]
 
 
 def test_gate_stays_closed_without_a_durable_coalition_id(tmp_path, monkeypatch):
@@ -2186,31 +3621,39 @@ def test_exit_status_is_stored_before_the_job_is_removed(tmp_path, monkeypatch):
         tmp_path,
         launch_label="com.goalflight.remote-ci.abc",
         coalition_id=100,
+        coalition_boot_session="boot-a",
         holder_coalition_id=5,
+        holder_coalition_boot_session="boot-a",
         workload_pid="40",
         workload_start=[1, 2],
     )
-    order = []
-
-    def view(label):
-        del label
-        order.append("view")
-        return ("exited", None, 19)
+    (run / "wrapper-identity.json").write_text(json.dumps({
+        "pid": 40, "start": [1, 2], "coalition_id": 100,
+        "boot_session": "boot-a",
+    }), encoding="utf-8")
+    (run / "command-started").touch()
+    (run / "exit.json").write_text(json.dumps({
+        "pid": 40, "returncode": 19, "signal": None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
+    monkeypatch.setattr(node, "_coalition_id", lambda _pid: 5)
+    monkeypatch.setattr(node, "_verify_incarnation", lambda *_args: False)
+    monkeypatch.setattr(node, "_coalition_members", lambda _cid: [])
+    removed = []
 
     def remove(label):
-        del label
-        order.append("remove")
+        lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
+        assert (run / "exit.json").is_file()
+        assert lease["exit_known"] is True
+        assert lease["exit_code"] == 19
+        removed.append(label)
         return True
 
-    monkeypatch.setattr(node, "_job_view", view)
     monkeypatch.setattr(node, "_remove_job", remove)
-    monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     assert node.clear_tree(tmp_path, state, run) is True
+    assert removed == [state["launch_label"]]
     assert state["exit_known"] is True
     assert state["exit_code"] == 19
-    assert order[0] == "view"
-    assert "remove" in order
-    assert order.index("view") < order.index("remove")
     lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
     assert lease["exit_code"] == 19
     assert node._terminal_result({"exit_known": False})["status"] == "died"
@@ -2382,7 +3825,8 @@ def test_draining_lease_without_launch_identity_keeps_capacity(tmp_path, monkeyp
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     (run / "owner.json").write_text(json.dumps(owner), encoding="utf-8")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [os.getpid()])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [os.getpid()])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     result = node.dispatch({
         "operation": "cancel", "managed_root": str(managed), "box": "b",
         "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
@@ -2391,7 +3835,8 @@ def test_draining_lease_without_launch_identity_keeps_capacity(tmp_path, monkeyp
     assert result["status"] == "unknown"
     lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
     assert lease["state"] == "draining"
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: None)
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: None)
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     again = node.dispatch({
         "operation": "cancel", "managed_root": str(managed), "box": "b",
         "p_cores": 4, "token_pool_size": 1, "run_dir": str(run),
@@ -2536,7 +3981,8 @@ def test_live_wrapper_outside_an_empty_cwd_keeps_the_slot(tmp_path, monkeypatch)
         {"pid": 4242, "start": [1, 2], "coalition_id": 100,
          "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     monkeypatch.setattr(node, "_same_process", lambda pid, started: True)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
     monkeypatch.setattr(node, "_remove_job", lambda label: True)
@@ -2557,7 +4003,8 @@ def test_absent_submit_without_a_wrapper_identity_is_not_released(tmp_path, monk
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     assert node.clear_tree(tmp_path, state, run) is False
     lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
     assert lease["state"] != "released"
@@ -2580,7 +4027,8 @@ def test_ambiguous_launch_failure_is_not_an_empty_tree(tmp_path, monkeypatch):
     }
     (run / "lease.json").write_text(json.dumps(state), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     assert node.clear_tree(tmp_path, state, run) is False
     lease = json.loads((run / "lease.json").read_text(encoding="utf-8"))
     assert lease.get("identity_status") == "unproven"
@@ -2653,7 +4101,8 @@ def test_dead_wrapper_with_an_empty_coalition_can_release(tmp_path, monkeypatch)
         {"pid": 4242, "start": [1, 2], "coalition_id": 100,
          "boot_session": "boot-a"}), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
     monkeypatch.setattr(node, "_boot_session_id", lambda: "boot-a")
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
@@ -2675,7 +4124,8 @@ def test_dead_wrapper_with_an_unreadable_coalition_is_not_empty(tmp_path, monkey
     (run / "wrapper-identity.json").write_text(json.dumps(
         {"pid": 4242, "start": [1, 2], "coalition_id": 100}), encoding="utf-8")
     monkeypatch.setattr(node, "_job_view", lambda label: "absent")
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     monkeypatch.setattr(node, "_same_process", lambda pid, started: False)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: None)
     assert node.clear_tree(tmp_path, state, run) is False
@@ -2786,7 +4236,8 @@ def test_unlisted_submit_is_not_an_empty_tree(tmp_path, monkeypatch):
     assert state.get("launch_submitted") is True
     assert not state.get("launch_seen")
     # The job was never listed. A live cwd is not an empty tree.
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [os.getpid()])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [os.getpid()])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     assert node.clear_tree(tmp_path, state, run) is False
 
 
@@ -2930,27 +4381,79 @@ def test_deadline_kill_of_a_dead_holder_records_deadline(tmp_path, monkeypatch):
     assert body["returncode"] == 9
 
 
-def test_unreadable_lease_holds_capacity(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("marker_state", "expected_indexes", "expected_reason"),
+    [
+        ("indexed", {0}, None),
+        ("legacy", None, "unknown-token-ownership"),
+        ("unreadable", None, "unknown-token-ownership"),
+        ("missing", None, "unknown-token-ownership"),
+    ],
+)
+def test_unreadable_admitted_lease_reserves_token_ownership(
+        tmp_path, monkeypatch, marker_state, expected_indexes, expected_reason):
     import builtins
     import goalflight_remote_ci_node as node
 
     monkeypatch.setattr(
         builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
         str(tmp_path / "auth.json"), raising=False)
+    monkeypatch.setattr(node, "sample", lambda *_args: {
+        "hostname": "test-node", "load1": 0.0, "load_average": [0.0, 0.0, 0.0],
+        "cpu_busy_fraction": 0.0, "p_cores": 8, "token_pool_size": 2,
+        "self_cap": 4, "tools": {"python": True, "node": True, "git": True},
+    })
     managed = tmp_path / "managed"
     run = managed / "runs" / "bad"
     run.mkdir(parents=True)
+    (run / "lease.json").write_text(json.dumps({
+        "lease_id": "bad", "state": "admitted", "token_index": 0,
+    }), encoding="utf-8")
+    marker = managed / "repos" / "project-a" / "slot-meta" / "s-01.json"
+    marker.parent.mkdir(parents=True)
+    if marker_state == "indexed":
+        marker.write_text(json.dumps({
+            "state": "leased", "lease_id": "bad", "token_index": 0,
+            "run_dir": str(run),
+        }), encoding="utf-8")
+    elif marker_state == "legacy":
+        marker.write_text(json.dumps({
+            "state": "leased", "lease_id": "bad", "run_dir": str(run),
+        }), encoding="utf-8")
+    elif marker_state == "unreadable":
+        marker.write_text(json.dumps({
+            "state": "leased", "lease_id": "bad", "token_index": 0,
+            "run_dir": str(run),
+        }), encoding="utf-8")
+    token_path = managed / "admission" / "tokens" / "0"
+    token_path.parent.mkdir(parents=True)
+    token = node.try_lock(token_path)
+    assert token is not None
+    token.close()  # the holder exited while its launchd workload remains
     (run / "lease.json").write_text("{", encoding="utf-8")
-    assert node.reserved_token_indexes(managed) is None
+    if marker_state == "unreadable":
+        read_json = node.read_json
+
+        def unreadable_marker(path):
+            if Path(path) == marker:
+                raise PermissionError("slot marker is unreadable")
+            return read_json(path)
+
+        monkeypatch.setattr(node, "read_json", unreadable_marker)
+    reserved, reason = node.reserved_token_indexes(managed, token_pool_size=2)
+    assert reserved == expected_indexes
+    assert reason == expected_reason
+    assert node.admission_queue_state(managed) == ({}, {})
     report = node.dispatch({
         "operation": "health", "managed_root": str(managed), "box": "b",
-        "p_cores": 8, "token_pool_size": 2,
+        "p_cores": 8, "token_pool_size": 2, "python_interpreter": sys.executable,
     })
-    assert report["tokens"]["in_use"] == 2
-    assert report["tokens"]["free"] == 0
+    assert report["tokens"].get("reservation_reason") == expected_reason
+    assert report["tokens"]["in_use"] == (1 if expected_reason is None else 2)
+    assert report["tokens"]["free"] == (1 if expected_reason is None else 0)
     listed = node.dispatch({
         "operation": "list", "managed_root": str(managed), "box": "b",
-        "p_cores": 8, "token_pool_size": 2,
+        "p_cores": 8, "token_pool_size": 2, "python_interpreter": sys.executable,
     })
     unread = [row for row in listed if row.get("state") == "UNREADABLE"]
     assert len(unread) == 1
@@ -2990,7 +4493,7 @@ def test_wait_dead_dumps_state_when_the_pid_survives(monkeypatch):
     ("capacity-refused", "capacity", 75, {}),
     ("cancelled", "cancelled", 130, {}),
     ("deadline", "timeout", 124, {"timed_out": True}),
-    ("died", "died", 9, {}),
+    ("died", "setup-failed", 2, {"returncode": 9}),
 ])
 def test_structured_outcome_ignores_stdout(tmp_path, kind, status, code, extra):
     config = _config(tmp_path)
@@ -3013,19 +4516,74 @@ def test_structured_outcome_ignores_stdout(tmp_path, kind, status, code, extra):
     }
 
     class Node:
+        box = config.boxes["box-a"]
+
         def call(self, operation, **kwargs):
             assert operation == "status"
             return record
 
     outcome = runner._watch(
         spec(), Node(), {"run_dir": "/runs/abc", "lease_token": "lease"}, {})
+    # A `died` status without exit_known is not a command verdict, so it falls back.
     assert outcome.status == status
     assert outcome.returncode == code
 
 
-# HOST-ONLY TESTS
-# These start real launchd jobs. The regressions above do not.
+def test_requirement_hash_inputs_follow_attached_and_spaced_includes(tmp_path):
+    import goalflight_remote_ci_node as node
 
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    (slot / "requirements-test.txt").write_text(
+        "-rshared.txt\n-c constraints.txt\n-r=attached.txt\n-cconstraints-extra.txt\n",
+        encoding="utf-8")
+    for name in ("shared.txt", "constraints.txt", "attached.txt", "constraints-extra.txt"):
+        (slot / name).write_text(name + "==1\n", encoding="utf-8")
+    inputs = node._requirement_inputs(slot.resolve(), Path("requirements-test.txt"))
+    assert {path.name for path, _ in inputs} == {
+        "requirements-test.txt", "shared.txt", "constraints.txt",
+        "attached.txt", "constraints-extra.txt",
+    }
+
+
+def test_incomplete_cached_venv_is_rebuilt_without_completion_marker(tmp_path, monkeypatch):
+    import goalflight_remote_ci_node as node
+
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    (slot / "requirements-test.txt").write_text("pytest==9.0.3\n", encoding="utf-8")
+    calls = []
+
+    def setup(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1:3] == ["-m", "venv"]:
+            target = Path(argv[3])
+            (target / "bin").mkdir(parents=True)
+            python = target / "bin/python"
+            python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            python.chmod(0o755)
+        stdout = "Python 3.14.5\n" if argv[-1] == "--version" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(node, "_run_setup", setup)
+    managed = tmp_path / "managed"
+    venv, digest = node.prepare_venv(
+        managed, "repo", slot, "requirements-test.txt", sys.executable)
+    marker = venv / ".goalflight-complete"
+    assert marker.read_text().strip() == digest
+    marker.unlink()
+    calls.clear()
+    rebuilt, rebuilt_digest = node.prepare_venv(
+        managed, "repo", slot, "requirements-test.txt", sys.executable)
+    assert rebuilt == venv and rebuilt_digest == digest
+    assert sum(call[1:3] == ["-m", "venv"] for call in calls) == 1
+    assert marker.read_text().strip() == digest
+
+
+# This detached-fork case exercises the host's real launchd behavior; earlier
+# unmocked start-path regressions opt into the same leak guard individually.
+@pytest.mark.usefixtures("no_leftover_remote_ci_job")
+@pytest.mark.usefixtures("requires_live_launchd")
 def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_path):
     _, _, _, node = node_env
     held = wait_state(node, enqueue(node), {"admitted"})
@@ -3051,7 +4609,7 @@ def test_fast_exit_keeps_its_status_and_kills_the_detached_child(node_env, tmp_p
                  "        pass\n"
                  "    time.sleep(0.01)\n"
                  "os._exit(19)\n"],
-        "env": {},
+        "env": _source_bundle_env(held),
         "timeout": 30,
     })
     child = _child_pid(pidfile)
@@ -3088,6 +4646,11 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
     monkeypatch.setattr(
         builtins, "_GOALFLIGHT_REMOTE_CI_AUTHORITY",
         str(tmp_path / "auth.json"), raising=False)
+    monkeypatch.setattr(node, "sample", lambda *_args: {
+        "hostname": "test-node", "load1": 0.0, "load_average": [0.0, 0.0, 0.0],
+        "cpu_busy_fraction": 0.0, "p_cores": 100000, "token_pool_size": 1,
+        "self_cap": 4, "tools": {"python": True, "node": True, "git": True},
+    })
     phase = {"n": 0}
 
     def same(pid, started):
@@ -3105,11 +4668,16 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
 
     monkeypatch.setattr(node, "_same_process", same)
     monkeypatch.setattr(node, "clear_tree", clear)
-    monkeypatch.setattr(node, "_submit_workload", lambda *args, **kwargs: (42, (1, 2), 100))
-    monkeypatch.setattr(node, "_await_workload_exec", lambda *args, **kwargs: True)
+    def submit(run, *args, **kwargs):
+        del args, kwargs
+        (run / "command-started").touch()
+        return 42, (1, 2), 100
+
+    monkeypatch.setattr(node, "_submit_workload", submit)
     monkeypatch.setattr(node, "_remove_job", lambda label: True)
     monkeypatch.setattr(node, "_coalition_members", lambda cid: [])
-    monkeypatch.setattr(node, "cwd_intruders", lambda paths: [])
+    monkeypatch.setattr(node, "cwd_intruders", lambda paths, **_kwargs: [])
+    monkeypatch.setattr(node, "cwd_snapshot", lambda: [])
     # dispatch() forks this holder from pytest, so it inherits this test seam.
     monkeypatch.setattr(node, "admission_command_window_seconds", lambda _: 0.3)
     managed = tmp_path / "managed"
@@ -3119,6 +4687,7 @@ def test_unreadable_leader_liveness_does_not_start_cleanup(tmp_path, monkeypatch
         "operation": "enqueue", "managed_root": str(managed), "box": "b",
         "p_cores": 100000, "token_pool_size": 1, "poll_seconds": 0.01,
         "controller_poll_seconds": 0.01,
+        "python_interpreter": sys.executable,
         "request_id": "leader-unknown", "arm": "candidate", "owner": owner,
     })
     holder = None

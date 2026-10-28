@@ -153,6 +153,10 @@ def test_detached_acp_resume_admits_before_spawn(
     monkeypatch.setattr(dispatch, "_build_acp_cfg", build)
     monkeypatch.setattr(dispatch, "_run_acp_detached_launcher", launch)
     monkeypatch.setattr(dispatch, "_emit_dispatch_warnings", lambda *_a, **_k: None)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv(
+        "GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "state" / "dispatch")
+    )
 
     assert dispatch._run_acp_shape(args, base=tmp_path, account_env={}) == 0
     assert order == ["prepare", "build", "spawn"]
@@ -214,6 +218,7 @@ def test_requeue_child_drops_parent_worktree_pin(
         "worktree_path": str(tmp_path / "s-1"),
         "worktree_base_sha": "a" * 40,
         "worktree_pin_holder": "parent-retry",
+        "parent_only_metadata": "drop",
         "dispatch_argv": [
             "--dispatch-id",
             "parent-retry",
@@ -229,6 +234,7 @@ def test_requeue_child_drops_parent_worktree_pin(
         entry,
         child_id="child-retry",
         requeued_from="parent-retry",
+        parent_record={},
         queue_dir=tmp_path / "queue",
         not_before=None,
     )
@@ -237,6 +243,7 @@ def test_requeue_child_drops_parent_worktree_pin(
     assert not any(
         key in child for key in ("worktree_seat", "worktree_path", "worktree_base_sha", "worktree_pin_holder")
     )
+    assert "parent_only_metadata" not in child
     assert "--cwd" not in child["dispatch_argv"]
     assert "--worktree-pin-holder" not in child["dispatch_argv"]
     assert "--skip-seat-reset" not in child["dispatch_argv"]

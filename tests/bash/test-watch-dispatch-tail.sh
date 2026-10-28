@@ -755,7 +755,7 @@ approval: never
 sandbox: workspace-write [workdir, /tmp, $TMPDIR]
 reasoning effort: xhigh
 reasoning summaries: none
-session id: 019eb974-0dee-79d2-b315-8d2910167bf4
+session id: 00000000-0000-4000-8000-000000000008
 --------
 user
 You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK
@@ -791,7 +791,7 @@ approval: never
 sandbox: workspace-write [workdir, /tmp, $TMPDIR]
 reasoning effort: xhigh
 reasoning summaries: none
-session id: 019eb974-0dee-79d2-b315-8d2910167bf4
+session id: 00000000-0000-4000-8000-000000000008
 --------
 user
 You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK

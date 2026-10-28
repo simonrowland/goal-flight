@@ -44,7 +44,10 @@ def _leases(payload: dict, dispatch_id: str) -> list[dict]:
 
 def main() -> int:
     if os.environ.get("GOALFLIGHT_ACP_LIVE") != "1":
-        print("SKIP: set GOALFLIGHT_ACP_LIVE=1 to run real codex-acp dispatch smoke")
+        print(
+            "SKIP-FILE: test_dispatch_acp_live.py: "
+            "set GOALFLIGHT_ACP_LIVE=1 to run real codex-acp dispatch smoke"
+        )
         return 0
     if not shutil.which("codex-acp"):
         print("FAIL: GOALFLIGHT_ACP_LIVE=1 but codex-acp is not on PATH")

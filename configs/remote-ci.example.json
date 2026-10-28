@@ -1,0 +1,88 @@
+{
+  "schema": "goalflight.remote-ci.config.v2",
+  "paths": {
+    "queue_dir": "/Users/REPLACE/.local/state/goal-flight/remote-ci/spool/requests",
+    "state_dir": "/Users/REPLACE/.local/state/goal-flight/remote-ci/state",
+    "result_dir": "/Users/REPLACE/.local/state/goal-flight/remote-ci/spool/results"
+  },
+  "daemon": {
+    "lock_file": "/Users/REPLACE/.local/state/goal-flight/remote-ci/state/daemon.lock",
+    "pid_file": "/Users/REPLACE/.local/state/goal-flight/remote-ci/state/daemon.pid",
+    "poll_seconds": 1,
+    "result_tail_kib": 64
+  },
+  "boxes": {
+    "studio-1": {
+      "host": "studio-1",
+      "expected_hostname": "Studio-1",
+      "python_interpreter": "/opt/homebrew/bin/python3",
+      "p_cores": 28,
+      "token_pool_size": 28,
+      "max_concurrent_seats": 0,
+      "remote_exec": ["ssh", "{host}", "{script}"],
+      "managed_run_directory": "/var/lib/goalflight/remote-ci",
+      "env": {},
+      "required_paths": []
+    },
+    "example-box": {
+      "host": "example-box",
+      "expected_hostname": "example-box",
+      "python_interpreter": "/opt/homebrew/bin/python3",
+      "p_cores": 28,
+      "token_pool_size": 28,
+      "max_concurrent_seats": 2,
+      "remote_exec": ["ssh", "{host}", "{script}"],
+      "managed_run_directory": "/var/lib/goalflight/remote-ci",
+      "env": {},
+      "required_paths": []
+    },
+    "studio-3": {
+      "host": "studio-3",
+      "expected_hostname": "Studio-3",
+      "python_interpreter": "/opt/homebrew/bin/python3",
+      "p_cores": 28,
+      "token_pool_size": 28,
+      "max_concurrent_seats": 2,
+      "remote_exec": ["ssh", "{host}", "{script}"],
+      "managed_run_directory": "/var/lib/goalflight/remote-ci",
+      "env": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+      "required_paths": []
+    }
+  },
+  "repo": "goal-flight",
+  "fallback": "local",
+  "local_env": {"PATH": null},
+  "repo_url": "git@github.com:simonrowland/goal-flight.git",
+  "environment": {
+    "requirements_file": "requirements-test.txt"
+  },
+  "checkout_basename": "",
+  "receipt_probes": {},
+  "never_route": [],
+  "admission": {
+    "queue_wait_seconds": 1,
+    "max_wait_seconds": 30
+  },
+  "runner": {
+    "command": ["/usr/bin/true"],
+    "test_command": ["/opt/homebrew/bin/python3", "-m", "pytest"],
+    "env": {},
+    "timeout_seconds": 7200,
+    "self_cap": 8,
+    "self_cap_env": "GOALFLIGHT_REMOTE_CI_SELF_CAP",
+    "base_collection_option": "--continue-on-collection-errors",
+    "heavy_command_ids": [
+      "goalflight-full-gate",
+      "goalflight-integration-suite",
+      "goalflight-remote-ci"
+    ]
+  },
+  "selection": {
+    "path_prefixes": ["tests/"],
+    "allowed_options": ["-q", "-v", "--continue-on-collection-errors"],
+    "value_options": ["-k", "-m"],
+    "allowed_option_prefixes": [],
+    "require_selector": true,
+    "max_targeted_files": 20
+  }
+}

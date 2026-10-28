@@ -282,12 +282,60 @@ def test_dead_reserved_claimant_with_waiting_row_is_released_and_retained() -> N
     check("release-stale exits cleanly", rc == 0)
 
 
+def test_old_machine_ids_are_reclaimed_from_file_before_first_load() -> None:
+    cap = _capacity_module()
+    dead = _reaped_pid()
+    old_machine_ids = (
+        "SimonMaookProM5:arm64",
+        "Mac:arm64",
+        "another-machine:arm64",
+    )
+    leases = {
+        f"dead-worker-{index}": {
+            "lease_id": f"dead-worker-{index}",
+            "agent": "codex",
+            "state": "active",
+            "machine_id": machine_id,
+            "worker_pid": dead,
+            "claimant_pid": dead,
+            "controller_pid": dead,
+        }
+        for index, machine_id in enumerate(old_machine_ids)
+    }
+    state = {
+        "schema": cap.SCHEMA,
+        "machine_id": "Simon-MacBookPro-M5.local:arm64",
+        "leases": leases,
+        "cooldowns": {},
+    }
+    # This existing file is read only by release-stale below; no alias list is
+    # bootstrapped from its lease contents before the first load.
+    cap.state_path().write_text(json.dumps(state))
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.main(["release-stale", "--keep"])
+    payload = json.loads(output.getvalue())
+    saved = cap.load_state()
+    check(
+        "old hostname and arbitrary machine ids are reclaimed by normal stale path",
+        set(leases) == set(payload["released"]),
+    )
+    check(
+        "state machine stamp remains informational and unchanged",
+        saved["machine_id"] == state["machine_id"],
+    )
+    check("lease contents do not create machine aliases", "machine_id_aliases" not in saved)
+    check("release-stale exits cleanly", rc == 0)
+
+
 def main() -> int:
     test_orphaned_lease_is_stale_while_acquiring_and_working_are_not()
     test_a_live_controller_does_not_change_an_unattached_lease()
     test_unprobeable_claimant_is_not_reclaimed()
     test_aged_unprobeable_claimant_is_not_released_at_any_age()
     test_dead_reserved_claimant_with_waiting_row_is_released_and_retained()
+    test_old_machine_ids_are_reclaimed_from_file_before_first_load()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

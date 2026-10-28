@@ -58,6 +58,7 @@ def test_status_reminder_bash_shape() -> None:
     text, _status_json, tail = _reminder_text("bash", hints=True)
     assert "reminder-dispatch-42" in text
     assert "--dispatch reminder-dispatch-42" in text
+    assert "final reminder-dispatch-42" in text
     assert "--wait reminder-dispatch-42" in text
     assert "--done reminder-dispatch-42" in text
     assert "goalflight_messages.py relay" in text

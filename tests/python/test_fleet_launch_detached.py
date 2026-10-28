@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_fleet_launch_detached as fleet_launch
 import goalflight_liveness
 
-BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+BASE_SHA = "0000000000000000000000000000000201234567"
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -189,6 +189,13 @@ def test_clean_first_launch_creates_marker_and_spawns() -> None:
             "no prebound seat env",
             fleet_launch.goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV not in spawn_kwargs["env"],
         )
+        outbox = state_dir / "dispatch" / f"{dispatch_id}.questions"
+        assert_true(
+            "ACP child is bound to this dispatch's worker channel",
+            spawn_kwargs["env"].get("GOALFLIGHT_DISPATCH_ID") == dispatch_id
+            and Path(spawn_kwargs["env"].get("GOALFLIGHT_QUESTION_OUTBOX_DIR", "")) == outbox,
+        )
+        assert_true("fleet worker question outbox is prepared", outbox.is_dir())
 
 
 def test_launch_forwards_billing_account_to_child_dispatch() -> None:

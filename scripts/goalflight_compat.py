@@ -26,6 +26,7 @@ The Windows branches use stdlib ``ctypes`` / ``msvcrt`` only -- zero new wheels.
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import json
@@ -40,6 +41,7 @@ import sys
 import tempfile
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 __all__ = [
@@ -69,6 +71,7 @@ __all__ = [
     "pid_liveness",
     "pid_alive",
     "pid_is_zombie",
+    "process_argv",
     "darwin_process_snapshot",
     "process_identity_matches",
     "windows_process_identity",
@@ -89,6 +92,7 @@ log = logging.getLogger("goal-flight.compat")
 _WSL_WINDOWS_FS_TYPES = {"drvfs", "9p", "v9fs"}
 
 
+@lru_cache(maxsize=4096)
 def safe_dispatch_filename(dispatch_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in dispatch_id)
     if safe != dispatch_id:
@@ -1388,6 +1392,85 @@ def process_start_identity(pid: int, *, include_ancestry: bool = False) -> dict 
                 )
             return snapshot
         except (IndexError, OSError, ValueError):
+            return None
+
+    return None
+
+
+def process_argv(pid: int, *, expected_basename: str | None = None) -> list[str] | None:
+    """Read one live process's argv without flattening argument boundaries.
+
+    An empty list means the PID exited during the read. ``None`` means argv
+    could not be read reliably. This is intentionally separate from ``ps``'s
+    display string, which cannot prove that argv[1] is an exact script path.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        if not raw:
+            return None
+        fields = raw.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        return [os.fsdecode(field) for field in fields]
+
+    if sys.platform == "darwin":
+        # KERN_PROCARGS2 preserves argv boundaries, unlike ps(1)'s `args`.
+        # Padding and an empty argv[0] are indistinguishable, so validate the
+        # first value against the executable path before trusting its index.
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            sysctl = libc.sysctl
+            sysctl.argtypes = [
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            sysctl.restype = ctypes.c_int
+            mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+            size = ctypes.c_size_t()
+            if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+                return None
+            buffer = (ctypes.c_ubyte * size.value)()
+            actual = ctypes.c_size_t(size.value)
+            if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) != 0:
+                return None
+            if not 4 <= actual.value <= size.value:
+                return None
+            raw = bytes(buffer[: actual.value])
+            argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+            if not 0 < argc < 65536:
+                return None
+            exec_end = raw.find(b"\0", 4)
+            if exec_end < 0:
+                return None
+            executable = os.fsdecode(raw[4:exec_end])
+            argv_start = exec_end + 1
+            while argv_start < len(raw) and raw[argv_start] == 0:
+                argv_start += 1
+            fields = raw[argv_start:].split(b"\0")
+            if len(fields) - 1 < argc:
+                return None
+            argv = [os.fsdecode(field) for field in fields[:argc]]
+            expected = str(expected_basename or "").strip().lower()
+            argv0 = os.path.basename(argv[0]).lower() if argv and argv[0] else ""
+            executable_name = os.path.basename(executable).lower()
+            if not argv0 or (
+                expected and expected not in argv0
+            ) or (not expected and argv0 != executable_name):
+                return None
+            return argv
+        except (OSError, AttributeError, TypeError, ValueError):
             return None
 
     return None

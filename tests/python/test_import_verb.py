@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from support import skip_if_node_unavailable
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -20,7 +20,6 @@ import goalflight_task as task_module
 
 TASK = ROOT / "goalflight_task.py"
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-NODE = shutil.which("node")
 
 
 def run_task(project: Path, *args: str) -> subprocess.CompletedProcess:
@@ -290,13 +289,17 @@ def test_refuses_real_id_fields_and_reports_json_errors() -> None:
 
 
 def test_mirror_pair_consistent_after_import() -> None:
+    if skip_if_node_unavailable(
+        "test_mirror_pair_consistent_after_import", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         source = write_sidecar(project, [draft("draft-one", "One")])
         proc = run_task(project, "import", source.name)
         assert proc.returncode == 0, proc.stderr
         checked = subprocess.run(
-            [NODE, str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
+            ["node", str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
             cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
         )
         assert checked.returncode == 0, checked.stderr

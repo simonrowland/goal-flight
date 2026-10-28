@@ -202,6 +202,17 @@ def test_cursor_rewind_versions_are_backward_only_scoped_and_atomic(
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
+    for stream_id, last_sequence in (("a", 3), ("b", 2)):
+        for sequence in range(1, last_sequence + 1):
+            messages.post_message(
+                dispatch_id=stream_id,
+                msg_type="controller-notice",
+                payload={"text": f"{stream_id} {sequence}"},
+                messages_dir=Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "test-node", "adapter": "pytest", "transport": "controller"},
+                addressee=messages.controller_addressee("owner", project_root=project),
+                seq=sequence,
+            )
     assert authority.set_cursor("owner", positions={"a": 2, "b": 2}, actor="test").committed
     assert authority._cursor_rewinds("owner") == {}
     assert authority.set_cursor("owner", positions={"a": 3, "b": 2}, actor="test").committed
@@ -232,6 +243,16 @@ def test_rewind_table_migration_is_explicit_additive_and_idempotent(
     monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
+    for sequence in (1, 2):
+        messages.post_message(
+            dispatch_id="a",
+            msg_type="controller-notice",
+            payload={"text": f"a {sequence}"},
+            messages_dir=Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "test-node", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee("owner", project_root=project),
+            seq=sequence,
+        )
     assert authority.set_cursor("owner", positions={"a": 2}, actor="test").committed
     with sqlite3.connect(authority.path) as connection:
         connection.execute("DROP TABLE IF EXISTS controller_stream_rewinds")
@@ -486,6 +507,25 @@ def test_prepare_attempt_records_immutable_digested_owner_capability(
         owner_session_nonce="different-capability",
     )
     assert conflicting.cas_lost
+
+    legacy = authority.prepare_attempt(
+        "owner-capability-enrichment",
+        owner_controller_label="legacy-owner",
+    )
+    assert legacy.committed
+    enriched = authority.prepare_attempt(
+        "owner-capability-enrichment",
+        owner_controller_label="legacy-owner",
+        owner_session_nonce="legacy-owner-capability",
+    )
+    assert enriched.committed
+    enriched_row = authority.read_all(
+        "SELECT owner_session_digest FROM dispatch_attempts WHERE dispatch_id = ?",
+        ("owner-capability-enrichment",),
+    )[0]
+    assert enriched_row["owner_session_digest"] == wake.controller_session_digest(
+        "legacy-owner-capability"
+    )
 
 
 def test_prepare_attempt_records_effective_seat_without_defaulting_unknown(
@@ -935,16 +975,41 @@ def test_stream_safe_advance_rejects_unseen_lower_row_mutation_pair(
             assert [int(row["stream_seq"]) for row in emitted.items] == [2]
 
             lower_id = str(uuid.uuid4())
+            lower_created_at = journal.utc_now()
+            lower_carrier = case_root / "late-lower-stream.jsonl"
+            lower_envelope = {
+                "schema": "goalflight.message.v1",
+                "schema_version": 1,
+                "id": lower_id,
+                "dispatch_id": "late-lower-stream",
+                "seq": 1,
+                "ts": lower_created_at,
+                "source": {
+                    "node": "mutation-probe",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                },
+                "type": "controller-notice",
+                "priority": "normal",
+                "payload": {"text": "late lower row"},
+                "addressee": messages.controller_addressee(
+                    "controller", project_root=project
+                ),
+            }
+            lower_carrier.write_text(
+                messages.serialize_envelope_line(lower_envelope),
+                encoding="utf-8",
+            )
             inserted = authority.record_delivery_event(
                 recipient_label="controller",
                 origin_node="mutation-probe",
                 event_uuid=lower_id,
                 stream_id="late-lower-stream",
                 stream_seq=1,
-                carrier_path=case_root / "late-lower.jsonl",
+                carrier_path=lower_carrier,
                 event_type="controller-notice",
                 wake_class="waking",
-                created_at=journal.utc_now(),
+                created_at=lower_created_at,
             )
             assert inserted.committed
             outcome = authority.advance_cursor(
@@ -955,19 +1020,50 @@ def test_stream_safe_advance_rejects_unseen_lower_row_mutation_pair(
                 advances={"late-lower-stream": 2},
                 actor="late-lower-controller",
             )
-            if mutate_safety:
-                assert outcome.committed
-            else:
-                assert outcome.cas_lost
-                assert authority.cursor_status("controller")["positions"] == {}
+            # The carrier-safe choke point catches this even when the older
+            # unseen-row predicate is disabled: the new row is still unprojected.
+            assert outcome.cas_lost
+            assert authority.cursor_status("controller")["positions"] == {}
             assert authority.mark_delivery_projected(
                 recipient_label="controller",
                 origin_node="mutation-probe",
                 event_uuid=lower_id,
             ).committed
+            # The public wrapper's selected-prefix comparison must reject the
+            # old snapshot even after the lower row becomes materializable.
             if mutate_safety:
+                original_snapshots = messages._cursor_snapshots_for_rows
+                snapshot_calls = 0
+
+                def omit_new_lower_row_once(rows, positions):
+                    nonlocal snapshot_calls
+                    snapshot_calls += 1
+                    if snapshot_calls == 1:
+                        return emitted.stream_snapshots
+                    return original_snapshots(rows, positions)
+
+                case_patch.setattr(
+                    messages,
+                    "_cursor_snapshots_for_rows",
+                    omit_new_lower_row_once,
+                )
+            outcome = authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"late-lower-stream": 2},
+                actor="late-projected-lower-controller",
+            )
+            if mutate_safety:
+                assert outcome.committed
+                assert authority.cursor_status("controller")["positions"] == {
+                    "late-lower-stream": 2
+                }
                 assert authority.cursor_peek("controller", nonce=lease.nonce).items == ()
             else:
+                assert outcome.cas_lost
+                assert authority.cursor_status("controller")["positions"] == {}
                 refreshed = authority.cursor_peek("controller", nonce=lease.nonce)
                 assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
                 assert authority.advance_cursor(
@@ -980,8 +1076,8 @@ def test_stream_safe_advance_rejects_unseen_lower_row_mutation_pair(
                 ).committed
 
     run_case("fixed-stream-safety", mutate_safety=False)
-    # Mutation control: removing the unseen-row predicate commits position 2
-    # and makes the later-projected position 1 unreachable.
+    # Mutation control: suppressing the selected-prefix snapshot detects if the
+    # wrapper comparison is removed; the public advance then consumes both rows.
     run_case("mutated-stream-safety", mutate_safety=True)
 
 
@@ -1106,29 +1202,25 @@ def test_stream_snapshot_rejects_projected_rehome_below_position_mutation_pair(
                 advances={"retirement-stream": 2},
                 actor="successor-controller",
             )
-            if mutate_safety:
-                assert outcome.committed
-                assert authority.cursor_peek(
-                    "successor-controller", nonce=successor.nonce
-                ).items == ()
-            else:
-                assert outcome.cas_lost
-                refreshed = authority.cursor_peek(
-                    "successor-controller", nonce=successor.nonce
-                )
-                assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
-                assert authority.advance_cursor(
-                    "successor-controller",
-                    nonce=successor.nonce,
-                    expected_cursor_version=refreshed.cursor_version,
-                    expected_stream_snapshots=refreshed.stream_snapshots,
-                    advances={"retirement-stream": 2},
-                    actor="successor-controller-refreshed",
-                ).committed
+            # The shared cursor choke point rechecks the selected prefix even
+            # if the lower-level unseen-row predicate is disabled.
+            assert outcome.cas_lost
+            refreshed = authority.cursor_peek(
+                "successor-controller", nonce=successor.nonce
+            )
+            assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
+            assert authority.advance_cursor(
+                "successor-controller",
+                nonce=successor.nonce,
+                expected_cursor_version=refreshed.cursor_version,
+                expected_stream_snapshots=refreshed.stream_snapshots,
+                advances={"retirement-stream": 2},
+                actor="successor-controller-refreshed",
+            ).committed
 
     run_case("fixed-projected-rehome", mutate_safety=False)
-    # Mutation control: dropping the stream fingerprint lets a projected row
-    # move into the recipient's lower range after peek and be silently eaten.
+    # Mutation control: the shared choke point rechecks the selected prefix
+    # after rehome, even with the lower-level unseen-row predicate disabled.
     run_case("mutated-projected-rehome", mutate_safety=True)
 
 
@@ -1263,21 +1355,37 @@ def test_waking_only_snapshot_cannot_ack_quiet_lower_row_mutation_pair(
                     "adapter": "test",
                     "transport": "controller",
                 },
-                "addressee": messages.controller_addressee(
-                    "controller", project_root=project
-                ),
             }
             quiet_id = str(uuid.uuid4())
+            quiet_created_at = journal.utc_now()
+            quiet_envelope = {
+                "schema": "goalflight.message.v1",
+                "schema_version": 1,
+                "id": quiet_id,
+                "dispatch_id": "filtered-stream",
+                "seq": 1,
+                "ts": quiet_created_at,
+                "source": common["source"],
+                "type": "status",
+                "priority": "normal",
+                "payload": {"text": "quiet lower row"},
+            }
+            quiet_carrier = case_root / "messages" / "filtered-stream.jsonl"
+            quiet_carrier.parent.mkdir(parents=True, exist_ok=True)
+            quiet_carrier.write_text(
+                messages.serialize_envelope_line(quiet_envelope),
+                encoding="utf-8",
+            )
             assert authority.record_delivery_event(
                 recipient_label="controller",
                 origin_node="test-node",
                 event_uuid=quiet_id,
                 stream_id="filtered-stream",
                 stream_seq=1,
-                carrier_path=case_root / "quiet.jsonl",
+                carrier_path=quiet_carrier,
                 event_type="status",
                 wake_class="quiet",
-                created_at=journal.utc_now(),
+                created_at=quiet_created_at,
             ).committed
             assert authority.mark_delivery_projected(
                 recipient_label="controller",
@@ -1288,6 +1396,9 @@ def test_waking_only_snapshot_cannot_ack_quiet_lower_row_mutation_pair(
                 msg_type="controller-notice",
                 payload={"text": "waking two"},
                 seq=2,
+                addressee=messages.controller_addressee(
+                    "controller", project_root=project
+                ),
                 **common,
             )
             emitted = authority.cursor_peek(
@@ -1558,7 +1669,7 @@ def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
     assert len(authority.read_all("SELECT 1 FROM delivery_events")) == 3
 
 
-def test_terminal_projection_rehomes_retired_owner_to_current_roster(
+def test_terminal_projection_keeps_retired_owner_address_without_fanout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1600,15 +1711,74 @@ def test_terminal_projection_rehomes_retired_owner_to_current_roster(
     )
     assert released.committed
 
-    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    projected = authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+    assert len(projected) == 1, authority.read_all(
+        "SELECT projection_error FROM terminal_outbox WHERE recipient = ?",
+        (dispatch_id,),
+    )
     live = authority.read_all(
         """SELECT recipient_label FROM delivery_events
            WHERE stream_id = ? AND withdrawn_at IS NULL""",
         (dispatch_id,),
     )
-    assert [str(row["recipient_label"]) for row in live] == ["successor-owner"]
+    assert [str(row["recipient_label"]) for row in live] == ["retired-owner"]
     pending = authority.cursor_peek("successor-owner", nonce=successor.nonce)
-    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+    assert [str(row["stream_id"]) for row in pending.items] == []
+
+
+def test_terminal_projection_persists_ledger_owner_before_lease_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    owner = _claim(authority, "legacy-owner")
+    successor = _claim(authority, "successor-owner")
+    dispatch_id = "legacy-terminal-ledger-owner"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project),
+                "state": "running",
+                "controller_label": "legacy-owner",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    stamped = authority.read_all(
+        "SELECT owner_controller_label FROM dispatch_attempts WHERE dispatch_id = ?",
+        (dispatch_id,),
+    )[0]
+    assert stamped["owner_controller_label"] == "legacy-owner"
+
+    released = authority.release_lease(
+        "legacy-owner",
+        nonce=owner.nonce,
+        reason="retired-after-legacy-owner-projection",
+    )
+    assert released.committed
+    live = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in live] == ["legacy-owner"]
+    pending = authority.cursor_peek("successor-owner", nonce=successor.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == []
 
 
 def test_terminal_projection_uses_full_immutable_owner_not_truncated_ledger_label(
@@ -1734,7 +1904,7 @@ def test_terminal_outbox_never_exposes_truncated_carrier_recipient(
     assert [str(row["recipient_label"]) for row in live] == [owner_label]
 
 
-def test_terminal_projection_keeps_wildcard_rehomed_during_projection(
+def test_terminal_projection_keeps_explicit_owner_when_retired_during_projection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1783,9 +1953,116 @@ def test_terminal_projection_keeps_wildcard_rehomed_during_projection(
            WHERE stream_id = ? AND withdrawn_at IS NULL""",
         (dispatch_id,),
     )
-    assert [str(row["recipient_label"]) for row in live] == ["*"]
+    assert [str(row["recipient_label"]) for row in live] == ["retiring-owner"]
     pending = authority.cursor_peek("successor-owner", nonce=successor.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == []
+
+
+def test_battery_transient_throttle_fixture_is_addressed_and_wakes_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "battery-tool-v2"
+    project.mkdir()
+    authority = journal.open_or_create_journal(project)
+    owner = _claim(authority, "battery-engine")
+    _claim(authority, "battery-bugs")
+    _claim(authority, "battery-main")
+    dispatch_id = "synthetic-battery-throttle"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project.resolve()),
+                "state": "transient_throttle",
+                "terminal_state": "transient_throttle",
+                "controller_label": "battery-engine",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label="battery-engine",
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="transient_throttle",
+        observation={"state": "transient_throttle", "outcome": {}},
+    )
+    assert committed.committed
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    envelope = messages.read_envelopes(tmp_path / "messages" / f"{dispatch_id}.jsonl")[0]
+    assert envelope["type"] == "blocked"
+    assert envelope["addressee"] == {
+        "kind": "controller",
+        "label": "battery-engine",
+        "project_root": str(project.resolve()),
+    }
+    rows = authority.read_all(
+        "SELECT recipient_label, event_type, wake_class FROM delivery_events WHERE stream_id = ?",
+        (dispatch_id,),
+    )
+    assert [(row["recipient_label"], row["event_type"], row["wake_class"]) for row in rows] == [
+        ("battery-engine", "blocked", "waking")
+    ]
+    pending = authority.cursor_peek("battery-engine", nonce=owner.nonce)
     assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_unregistered_example_sim_owner_does_not_fan_out(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "example-sim-engine"
+    project.mkdir()
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "example-sim-physics")
+    _claim(authority, "example-sim-bugs")
+    _claim(authority, "example-sim-train")
+    dispatch_id = "synthetic-example-sim-prelaunch"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project.resolve()),
+                "state": "blocked_os_sandbox",
+                "terminal_state": "blocked_os_sandbox",
+                "controller_label": "example-sim-engine",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label="example-sim-engine",
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="blocked_os_sandbox",
+        observation={"state": "blocked_os_sandbox", "outcome": {}},
+    )
+    assert committed.committed
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    envelope = messages.read_envelopes(tmp_path / "messages" / f"{dispatch_id}.jsonl")[0]
+    assert envelope["addressee"]["label"] == "example-sim-engine"
+    rows = authority.read_all(
+        "SELECT recipient_label FROM delivery_events WHERE stream_id = ? AND withdrawn_at IS NULL",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in rows] == ["example-sim-engine"]
+    assert "GOALFLIGHT-UNROUTABLE" in capsys.readouterr().err
 
 
 def test_unowned_terminal_revalidates_retiring_roster_inside_assignment_transaction(
@@ -2381,6 +2658,17 @@ def test_missing_unprojected_carrier_remains_loud(
     assert "carrier row absent" in diagnostic
     assert "projection/withdrawal evidence incomplete" in diagnostic
     assert str(authority.path) in diagnostic
+    row = dict(assigned.value)
+    errors: list[dict[str, object]] = []
+    assert messages._envelopes_with_rows(
+        authority,
+        [row],
+        controller_label="lane-a",
+        carrier_errors=errors,
+    ) == []
+    assert row.get("listener_status") == "STUCK"
+    assert errors and errors[0].get("status") == "STUCK"
+    assert messages._cursor_positions_for_shown_rows([row], []) == {}
 
 
 def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
@@ -2398,16 +2686,38 @@ def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
         event_id: str | None = None,
     ) -> str:
         event_id = event_id or str(uuid.uuid4())
+        created_at = journal.utc_now()
+        carrier_path = tmp_path / f"{stream_id}.jsonl"
+        envelope = {
+            "schema": "goalflight.message.v1",
+            "schema_version": 1,
+            "id": event_id,
+            "dispatch_id": stream_id,
+            "seq": 1,
+            "ts": created_at,
+            "source": {
+                "node": "test-node",
+                "adapter": "pytest",
+                "transport": "controller",
+            },
+            "type": "result",
+            "priority": "normal",
+            "payload": {"text": stream_id},
+        }
+        carrier_path.write_text(
+            messages.serialize_envelope_line(envelope),
+            encoding="utf-8",
+        )
         recorded = authority.record_delivery_event(
             recipient_label=recipient_label,
             origin_node="test-node",
             event_uuid=event_id,
             stream_id=stream_id,
             stream_seq=1,
-            carrier_path=tmp_path / f"{stream_id}.jsonl",
+            carrier_path=carrier_path,
             event_type="result",
             wake_class="waking",
-            created_at=journal.utc_now(),
+            created_at=created_at,
         )
         assert recorded.committed
         projected = authority.mark_delivery_projected(
@@ -2576,7 +2886,10 @@ def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
             stdout, stderr = listener.communicate(timeout=6)
             elapsed = time.monotonic() - started
             assert listener.returncode == 0, stderr
-            assert json.loads(stdout)["reason"] == "event"
+            payloads = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+            assert len(payloads) == 1
+            assert payloads[0].get("kind") == "ring"
+            assert payloads[0].get("reason") == "event"
             assert elapsed < 5.0
             measurements.append(elapsed)
             recipients = authority.read_all(
@@ -2781,6 +3094,7 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
             "coverage_id",
             "cursor_version",
             "kind",
+            "pending_behind_stuck",
             "rearm",
             "reason",
             "registry_generation",

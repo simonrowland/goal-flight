@@ -9,7 +9,7 @@ repo = Path(__file__).resolve().parent.parent  # adjust for your script location
 ## 1. Install ACP Adapters
 Install adapter CLIs on `PATH`: `codex-acp`, `claude-code-cli-acp`, etc.
 ```python
-agents_config = {"codex": {"command": "codex-acp", "acp_args": [], "working_dir": str(repo)}}
+agents_config = {"codex": {"command": "codex-acp", "acp_args": ["-c", "features.plugins=false"], "working_dir": str(repo)}}
 ```
 
 ## 2. Spawn Via Managed Pool

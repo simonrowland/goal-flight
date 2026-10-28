@@ -272,14 +272,14 @@
       "notes": "Verified on the Grok Bot box as the user-created workflows library. Mac-side library roots are not a second invented default; set the override when install does not run on that box."
     },
     "wake": {
-      "path": "goalflight_grok_bot_listen.py --report-pending --timeout-s 900",
+      "path": "goalflight_grok_bot_listen.py --report-pending --timeout-s 900 --listener-slots 1",
       "contract": "exit-as-wake",
       "controller_label": "goalflight-grokbot",
       "arm_on": "user Mac project-root + --controller-label goalflight-grokbot",
       "timeout_s": 900,
       "timeout_purpose": "frontier reminder and 80% hint substitute; host-local listen default, not the 120s Claude follow-stream heartbeat",
       "mvp_depth": 1,
-      "full_depth": 4,
+      "full_depth": 1,
       "on_ring": "drain, act, handoff write, quote-check, re-arm, task next",
       "on_timeout": "handoff write, quote-check, re-arm, task next",
       "detached": "forbidden; listen exit 4",
@@ -295,7 +295,7 @@
         "SessionStart hook"
       ],
       "terminals": ["COMPLETE", "READY", "FAILED", "BLOCKED", "USER-NEED"],
-      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only. Every listen exit is a mini-resume: flush state-handoff Before compact or sleep, then quote-check. The grok-bot listen wrapper prints that quote-check on stdout."
+      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Keep one tracked listener live; duplicate arms report the incumbent PID and exit 3. Every listen exit is a mini-resume: flush state-handoff Before compact or sleep, then quote-check. The grok-bot listen wrapper prints that quote-check on stdout."
     },
     "compaction": {
       "strategy": "autocompact + keep handoff current",
@@ -319,7 +319,7 @@
       "chat_summaries": "hints, not substitutes",
       "advisory_host_memory": ["profile", "update_state", "routines"],
       "canonical_memory": "repo_files",
-      "resume_wake": "skip commands/resume.md STEP 1.5 supervise; arm portable listen pool",
+      "resume_wake": "skip commands/resume.md STEP 1.5 supervise; arm one tracked grok-bot listener",
       "operator_is_compaction_mailman": false,
       "operator_wake_hygiene": "re-arm listen after host update or token-pause",
       "operator_signal": "roster wake unarmed (wake_armed/wake_covered/supervisor)",

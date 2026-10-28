@@ -8,17 +8,16 @@ import contextlib
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from support import skip_if_node_unavailable
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-NODE = shutil.which("node")
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
@@ -349,8 +348,10 @@ def test_next_still_prints_when_mail_import_fails() -> None:
 
 
 def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
-    if not NODE:
-        print("SKIP: test_next_frontier.py mirror checker: node not found on PATH")
+    if skip_if_node_unavailable(
+        "test_check_tasks_mirror_accepts_next_fixture_without_status",
+        script_mode=__name__ == "__main__",
+    ):
         return
     from unittest.mock import patch
     with patch.dict(os.environ, {"GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"}), tempfile.TemporaryDirectory() as td:
@@ -358,7 +359,7 @@ def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
         store = T.TaskStore(project)
         store.save_items_atomic(_frontier_fixture())
         proc = subprocess.run(
-            [NODE, str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
+            ["node", str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
             cwd=str(ROOT),
             text=True,
             stdout=subprocess.PIPE,

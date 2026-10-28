@@ -49,7 +49,7 @@ def gfd():
 
 
 CWD = "/Users/x/Repos/proj/worktrees/label/s-7"
-SID = "c751a12b-7645-4f72-9780-6017f6594b3d"
+SID = "00000000-0000-4000-8000-000000000028"
 
 
 def _seed(gfd, monkeypatch, tmp_path: Path, account: str) -> Path:

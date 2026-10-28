@@ -95,6 +95,7 @@ Canonical invocation (controller-side; see above for why not worker-internal):
 ```bash
 mkdir -p docs-private/reviews/<date>-<slug>   # the redirects below do NOT create it
 codex exec --sandbox read-only -c approval_policy=never \
+  -c features.plugins=false \
   -c 'model_reasoning_effort="xhigh"' \
   --enable web_search_cached \
   "$REVIEW_PROMPT" \
@@ -173,6 +174,13 @@ protocol when a worker blocks on this path before the fix lands.
 structured severity-tagged findings (P0/P1/P2/P3) against the chunk diff and
 is the reference framing this skill is built around.
 
+Every review of a dispatch or watcher change must return a `Blast-radius module
+patterns` field: basename globs for all affected `tests/python/test_*.py`
+modules, including off-prefix modules. If a named group cannot be mapped
+confidently, list it under `UNMAPPED` with the reason. Follow the deploy-gate
+procedure in `AGENTS.md`: pass the complete pattern list in one selector
+invocation, including `--review-pattern UNMAPPED` when that marker is present.
+
 Invoke gstack `/review` through the host's skill-load mechanism. The exact
 invocation is host-specific (each host loads gstack skills its own way — see
 the host's gstack install docs); the protocol invariant is that the gstack
@@ -223,7 +231,12 @@ Reusable reviewer-prompt fragment:
 > accepted earlier-round fixes as first-class refutation targets; (e) require
 > poison-pair proof by default, where the green asserts success semantics and
 > the paired poison proves the named failure category actually fires. Return
-> severity-tagged findings plus CLEAN only when all attacked closures survive.
+> severity-tagged findings and CLEAN only when all attacked closures survive.
+> For dispatch or watcher changes, also return a `Blast-radius module patterns`
+> field with basename globs for every affected `tests/python/test_*.py` module
+> (including off-prefix modules). If a named group cannot be mapped confidently,
+> list it under `UNMAPPED` with the reason; do not omit it or return an empty
+> pattern list.
 
 When gstack is not installed locally, fall back to the bundled prompts:
 `prompts/gstack-claude-review.md` and `prompts/gstack-codex-challenge.md`.

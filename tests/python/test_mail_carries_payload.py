@@ -69,6 +69,72 @@ def _claim(authority: journal.Journal, label: str = "ctl"):
     return claimed.value
 
 
+def test_recovery_terminal_uses_dispatch_owner_not_ambient_controller(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    monkeypatch.chdir(project)
+    authority = journal.open_or_create_journal(project)
+    owner_a = _claim(authority, "controller-a")
+    _claim(authority, "controller-b")
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "controller-b")
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", "controller-b-session")
+
+    dispatch_id = "watch-missing-ledger-owner-route"
+    assert watch._finish_existing_ledger(
+        dispatch_id,
+        "complete",
+        None,
+        worker_still_alive=False,
+        dispatch_record={
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "controller_label": "controller-a",
+            "controller_session_id": owner_a.nonce,
+        },
+    ) is None
+    authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+    recipients = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in recipients] == ["controller-a"]
+
+
+def test_recovery_terminal_without_dispatch_owner_keeps_fanout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    monkeypatch.chdir(project)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "controller-a")
+    _claim(authority, "controller-b")
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "controller-b")
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", "controller-b-session")
+
+    dispatch_id = "watch-missing-ledger-ownerless-fanout"
+    assert watch._finish_existing_ledger(
+        dispatch_id,
+        "complete",
+        None,
+        worker_still_alive=False,
+    ) is None
+    authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+    recipients = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL
+           ORDER BY recipient_label""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in recipients] == [
+        "controller-a",
+        "controller-b",
+    ]
+
+
 def test_outbox_headline_prefers_complete_marker_over_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

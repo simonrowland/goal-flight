@@ -6,7 +6,9 @@ import ctypes
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 import errno
+import inspect
 import json
 import os
 from pathlib import Path
@@ -30,11 +32,19 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
+import goalflight_cadence as cadence  # noqa: E402
+import goalflight_controllers as controllers  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
 import goalflight_task as task  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_state_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
 
 
 @dataclass
@@ -343,6 +353,36 @@ def _records(host: FakeHost) -> list[dict[str, object]]:
     return found
 
 
+def _strip_replay_markers(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_replay_markers(item)
+            for key, item in value.items()
+            if key != "replay"
+        }
+    if isinstance(value, list):
+        return [_strip_replay_markers(item) for item in value]
+    return value
+
+
+def _normalized_line(line: str) -> str:
+    text = line.strip()
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    return json.dumps(
+        _strip_replay_markers(record),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _normalized_lines(host: FakeHost) -> list[str]:
+    return [_normalized_line(line) for line in host.lines]
+
+
 def _run(
     host: FakeHost,
     items: list[tuple[str, str]],
@@ -357,6 +397,7 @@ def _run(
     cursor_rewinds: Callable[[], dict[str, int]] | None = None,
     next_repeat_floor_s: float = supervise.DEFAULT_NEXT_REPEAT_FLOOR_S,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
+    startup_pulse: Callable[[float], dict[str, object]] | None = None,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -374,7 +415,147 @@ def _run(
         cursor_rewinds=cursor_rewinds,
         next_repeat_floor_s=next_repeat_floor_s,
         on_startup_probe=on_startup_probe,
+        startup_pulse=startup_pulse,
     )
+
+
+def test_supervise_spawns_and_forwards_before_a_blocked_pulse_times_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(supervise, "STARTUP_PULSE_DEADLINE_S", 0.03)
+
+    class SlowFakeHost(FakeHost):
+        def wait(self, children: list[FakeChild], timeout_s: float) -> supervise.WaitResult:
+            time.sleep(0.02)
+            return super().wait(children, min(timeout_s, 0.02))
+
+    host = SlowFakeHost(
+        scripts={"stream": [PlannedExit(10, 0, stdout_lines=[(0.01, '{"kind":"stream","type":"heartbeat"}')])]},
+        stop_after_waits=40,
+    )
+    events: list[str] = []
+    spawn = host.spawn
+
+    def record_spawn(kind: str, command: str) -> FakeChild:
+        events.append("spawn")
+        return spawn(kind, command)
+
+    host.spawn = record_spawn
+    def emit_pulse(_deadline: float) -> dict[str, object]:
+        threading.Event().wait(0.1)
+        return {"kind": "pulse", "text": "late"}
+
+    code = _run(
+        host,
+        _items("stream"),
+        emit_depth=True,
+        startup_pulse=emit_pulse,
+        on_startup_probe=lambda *_args: None,
+    )
+
+    records = _records(host)
+    pulses = [record for record in records if record.get("kind") == "pulse"]
+    assert code == 0
+    assert pulses == [{"kind": "pulse", "text": "late"}]
+    assert len(host.spawns) == 1
+    assert events == ["spawn"]
+    assert any('{"kind":"stream","type":"heartbeat"}' in line for line in host.lines)
+    assert len(supervise._supervise_line(pulses[0]).encode("utf-8")) <= supervise.STREAM_LINE_MAX_BYTES
+    assert next(i for i, record in enumerate(records) if record.get("kind") == "pulse") > next(
+        i for i, record in enumerate(records) if record.get("type") == "coverage"
+    )
+
+
+def test_held_task_store_lock_does_not_block_listener_or_event_delivery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "pulse-project"
+    root.mkdir()
+    store = task.TaskStore(root)
+    store.mutate_controller_cadence(lambda state: (
+        state["lanes"].update({"bugs": {"lane": "bugs", "charter": ["Keep bugs moving"]}}),
+        state["registry_order"].append("bugs"),
+    ))
+    class SlowFakeHost(FakeHost):
+        def wait(self, children: list[FakeChild], timeout_s: float) -> supervise.WaitResult:
+            time.sleep(0.01)
+            return super().wait(children, min(timeout_s, 0.01))
+
+    host = SlowFakeHost(
+        scripts={"stream": [PlannedExit(10, 0, stdout_lines=[(0.01, '{"kind":"stream","type":"heartbeat"}')])]},
+        stop_after_waits=100,
+    )
+    with store.store_lock():
+        code = _run(
+            host,
+            _items("stream"),
+            emit_depth=True,
+            startup_pulse=lambda deadline: cadence.build_pulse_record(
+                root, "bugs", deadline=deadline
+            ),
+            on_startup_probe=lambda *_args: None,
+        )
+
+    records = _records(host)
+    pulses = [record for record in records if record.get("kind") == "pulse"]
+    assert code == 0
+    assert len(pulses) == 1
+    assert pulses[0]["kind"] == "pulse"
+    assert "text" in pulses[0]
+    assert len(host.spawns) == 1
+    assert any('{"kind":"stream","type":"heartbeat"}' in line for line in host.lines)
+
+
+def test_supervise_emits_partial_pulse_after_delayed_import_before_optional_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "pulse-project"
+    root.mkdir()
+    store = task.TaskStore(root)
+    store.mutate_controller_cadence(lambda state: (
+        state["lanes"].update({"bugs-main": {"lane": "bugs", "charter": ["Keep bugs moving"]}}),
+        state["registry_order"].append("bugs-main"),
+    ))
+    monkeypatch.setattr(
+        cadence,
+        "_due_for_label",
+        lambda *_args, **_kwargs: ([{"id": "ci-audit"}], []),
+    )
+
+    def slow_frontier(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        time.sleep(4)
+        return []
+
+    monkeypatch.setattr(cadence, "_pulse_frontier", slow_frontier)
+
+    class PacedFakeHost(FakeHost):
+        def wait(
+            self, children: list[FakeChild], timeout_s: float
+        ) -> supervise.WaitResult:
+            time.sleep(min(timeout_s, 0.05))
+            return super().wait(children, min(timeout_s, 0.05))
+
+    host = PacedFakeHost(
+        scripts={"stream": [PlannedExit(10, 0)]},
+        stop_when_lines_contain=("DUE: ci-audit", "LANE bugs:"),
+    )
+
+    def delayed_cadence_import(deadline: float) -> dict[str, object]:
+        time.sleep(1.5)
+        return cadence.build_pulse_record(root, "bugs-main", deadline=deadline)
+
+    code = _run(
+        host,
+        _items("stream"),
+        startup_pulse=delayed_cadence_import,
+    )
+
+    pulses = [record for record in _records(host) if record.get("kind") == "pulse"]
+    assert code == 0
+    assert len(pulses) == 1
+    assert "unavailable" not in pulses[0]
+    assert "DUE: ci-audit" in str(pulses[0].get("text"))
+    assert "LANE bugs:" in str(pulses[0].get("text"))
 
 
 def test_migration_releases_only_after_probe_and_before_child_spawn() -> None:
@@ -549,7 +730,7 @@ def test_stop_records_compute_a_faithful_rearm_from_invocation_inputs() -> None:
             "/tmp/supervise-test"
         ).resolve()
         assert argv[argv.index("--controller-label") + 1] == "bugs"
-        assert argv[argv.index("--lease-nonce") + 1] == "nonce-1"
+        assert "--lease-nonce" not in argv
         assert argv[argv.index("--heartbeat-secs") + 1] == "73"
         assert argv[argv.index("--coverage-secs") + 1] == "91"
 
@@ -608,7 +789,7 @@ def test_production_oversized_exact_rearm_record_remains_valid_json(
     assert argv[:2] == ["env", "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=11"]
     assert Path(argv[argv.index("--project-root") + 1]) == project_root.resolve()
     assert argv[argv.index("--controller-label") + 1] == controller_label
-    assert argv[argv.index("--lease-nonce") + 1] == lease_nonce
+    assert "--lease-nonce" not in argv
     assert argv[-1] == "--debug"
 
 
@@ -1056,6 +1237,7 @@ def test_supervise_start_renews_lease_before_arm(
     )
     assert claimed.committed and claimed.value is not None
     before = claimed.value.renew_deadline_at
+    heartbeat_before = claimed.value.renewed_at
     nonce = claimed.value.nonce
     seen: dict[str, str] = {}
 
@@ -1090,6 +1272,252 @@ def test_supervise_start_renews_lease_before_arm(
     assert after.nonce == nonce
     assert after.generation == claimed.value.generation
     assert after.renew_deadline_at == seen["deadline"]
+    assert after.renewed_at != heartbeat_before
+
+
+def test_supervisor_heartbeats_keep_controller_roster_connected_without_rejoin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Supervised liveness beats keep the roster fresh past its idle threshold."""
+    project = tmp_path / "project"
+    project.mkdir()
+    label = "steady-supervisor"
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        label, principal={"principal_id": label}
+    )
+    assert claimed.committed and claimed.value is not None
+    nonce = claimed.value.nonce
+    start = datetime.now(timezone.utc)
+    wall_now = [start]
+    monkeypatch.setattr(
+        journal,
+        "_next_lease_renewed_at",
+        lambda _previous: wall_now[0].isoformat(timespec="microseconds"),
+    )
+    host = FakeHost(
+        nonce=nonce,
+        lease_nonce=nonce,
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=float("inf"),
+                    returncode=0,
+                    stdout_lines=[
+                        (
+                            float(seconds),
+                            '{"kind":"stream","type":"heartbeat"}',
+                        )
+                        for seconds in range(600, 5 * 60 * 60 + 1, 600)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=30,
+    )
+    parameters = inspect.signature(supervise.run_supervisor).parameters
+    extra: dict[str, object] = {}
+    if "on_heartbeat" in parameters:
+        def refresh(root: Path, controller: str, lease_nonce: str) -> str | None:
+            wall_now[0] = start + timedelta(seconds=host.now)
+            return supervise._renew_controller_lease_before_arm(
+                project_root=root,
+                controller_label=controller,
+                nonce=lease_nonce,
+            )
+
+        extra["on_heartbeat"] = refresh
+
+    def fake_time() -> datetime:
+        wall_now[0] = start + timedelta(seconds=host.now)
+        return wall_now[0]
+
+    with (
+        wake.register_lease_holder(
+            project, controller_label=label, lease_nonce=nonce
+        ),
+        wake.register_supervisor_waiter(
+            project, controller_label=label, generation_key=nonce
+        ),
+    ):
+        assert supervise.run_supervisor(
+            project_root=project,
+            controller_label=label,
+            lease_nonce=nonce,
+            host=host,
+            heartbeat_s=60 * 60,
+            coverage_s=60 * 60,
+            items=[("stream", "fake stream")],
+            **extra,
+        ) == 0
+        assert any(
+            record.get("type") == "arm" for record in _records(host)
+        )
+        measured_now = fake_time()
+        monkeypatch.setattr(
+            sessions,
+            "_wake_supervisor_fields",
+            lambda *_args, **_kwargs: {
+                "supervisor": wake.SUPERVISOR_RUNNING,
+                "wake_covered": True,
+                "wake_armed": True,
+                "wake_alive": True,
+            },
+        )
+        record = sessions.controller_roster(
+            project, now=measured_now, ledger_records=[]
+        )["controllers"][0]
+        fleet_row = controllers.fleet_row(
+            record, canonical=project, idle_hours=controllers.DEFAULT_IDLE_HOURS
+        )
+    assert host.now > sessions.CONTROLLER_HEARTBEAT_RECENCY_S
+    assert record["incarnation_state"] in {"live-lock", "live-overdue"}
+    assert record["idle_seconds"] <= sessions.CONTROLLER_HEARTBEAT_RECENCY_S
+    assert fleet_row["bucket"] == "connected"
+
+
+def test_supervise_without_nonce_claims_controller_from_ancestry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setattr(
+        sessions, "resolve_controller_label", lambda *_args, **_kwargs: "bugs"
+    )
+    monkeypatch.setattr(sessions, "resolve_controller_pid", lambda: None)
+    claims: list[dict[str, object]] = []
+
+    def claim_controller_startup(project_root, **kwargs):  # type: ignore[no-untyped-def]
+        claims.append({"project_root": project_root, **kwargs})
+        return {
+            "claimed": True,
+            "session": {"id": "ancestry-nonce", "label": "bugs"},
+        }
+
+    monkeypatch.setattr(sessions, "claim_controller_startup", claim_controller_startup)
+    monkeypatch.setattr(
+        wake,
+        "supervisor_slot_probe",
+        lambda *_args, **_kwargs: (wake.SUPERVISOR_ABSENT, True),
+    )
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(
+        supervise,
+        "_renew_controller_lease_before_arm",
+        lambda **kwargs: str(kwargs["nonce"]),
+    )
+    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: SimpleNamespace())
+    armed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        supervise,
+        "run_supervisor",
+        lambda **kwargs: armed.append(kwargs) or 0,
+    )
+    journal.Journal.create(tmp_path)
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        heartbeat_secs=60.0,
+        coverage_secs=60.0,
+        debug=False,
+        chatty=False,
+        takeover=False,
+    )
+
+    result = supervise.cmd_supervise(
+        args,
+        on_startup_probe=lambda _root, _label, _nonce: None,
+    )
+
+    assert result == 0
+    assert len(claims) == 1
+    assert claims[0]["pid_from_ancestry"] is True
+    assert claims[0]["hold_lock"] is True
+    assert claims[0]["label"] == "bugs"
+    assert armed[0]["lease_nonce"] == "ancestry-nonce"
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("claim", "expected_reason"),
+    [
+        (
+            {
+                "claimed": False,
+                "reason": "controller_ancestry_unavailable",
+                "message": "no durable host session leader was measurable",
+            },
+            "unknown-retry",
+        ),
+        (
+            {"claimed": False, "reason": "label_in_use", "message": "label in use"},
+            "did-not-arm",
+        ),
+    ],
+)
+def test_supervise_claim_uncertainty_retries_but_label_in_use_stays_terminal(
+    claim: dict[str, object],
+    expected_reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setenv(
+        goalflight_task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, str(tmp_path)
+    )
+    monkeypatch.setattr(
+        sessions, "resolve_controller_label", lambda *_args, **_kwargs: "bugs"
+    )
+    monkeypatch.setattr(sessions, "resolve_controller_pid", lambda: None)
+    if expected_reason == "unknown-retry":
+        # Exercise the real claim path and isolate only the unavailable
+        # ancestry probe that makes the claim uncertain.
+        monkeypatch.setattr(
+            sessions, "_controller_process_ancestry", lambda *_args: ()
+        )
+    else:
+        monkeypatch.setattr(
+            sessions,
+            "claim_controller_startup",
+            lambda *_args, **_kwargs: claim,
+        )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        heartbeat_secs=60.0,
+        coverage_secs=60.0,
+        debug=False,
+        chatty=False,
+        takeover=False,
+    )
+
+    result = supervise.cmd_supervise(args)
+
+    captured = capsys.readouterr()
+    assert result == (
+        supervise.SUPERVISE_STOP_EXIT
+        if expected_reason == "did-not-arm"
+        else supervise.SUPERVISE_START_EXIT
+    )
+    assert len(captured.out.splitlines()) == 1
+    assert json.loads(captured.out)["reason"] == expected_reason
+    if expected_reason == "did-not-arm":
+        assert "supervise: did-not-arm:" in captured.err
+    else:
+        assert "supervise: retry:" in captured.err
+        assert "did-not-arm" not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -1197,7 +1625,7 @@ def test_supervise_start_with_stale_nonce_does_not_renew(
     assert after.nonce == claimed.value.nonce
 
 
-def test_supervise_migration_refuses_second_live_supervisor(
+def test_supervise_migration_is_idempotent_for_a_live_supervisor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1236,6 +1664,11 @@ def test_supervise_migration_refuses_second_live_supervisor(
         lambda: [(os.getpid(), command), (49001, command)],
     )
     monkeypatch.setattr(
+        wake,
+        "coverage_status",
+        lambda *_args, **_kwargs: {"live_waiters": 3, "target_waiters": 4},
+    )
+    monkeypatch.setattr(
         supervise,
         "RealHost",
         lambda **_kwargs: pytest.fail("second supervisor constructed a host"),
@@ -1255,14 +1688,37 @@ def test_supervise_migration_refuses_second_live_supervisor(
         on_startup_probe=lambda _root, _label, _nonce: None,
     )
 
-    assert result == supervise.SUPERVISE_START_EXIT
-    stderr = capsys.readouterr().err
-    assert "existing supervisor remains live" in stderr
-    assert "wake coverage was not verified" in stderr
-    assert "existing wake coverage retained" not in stderr
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "supervise: already live (pid 49001, coverage 3/4); not starting another"
+    ]
 
 
-def test_supervise_unknown_probe_does_not_claim_retained_coverage(
+def test_supervise_cli_accepts_already_live_idempotent_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def already_live(*_args, **_kwargs) -> int:  # type: ignore[no-untyped-def]
+        print(
+            "supervise: already live (pid 49001, coverage 3/4); "
+            "not starting another",
+            file=sys.stderr,
+        )
+        return 0
+
+    monkeypatch.setattr(supervise, "cmd_supervise", already_live)
+
+    assert messages.cmd_supervise(SimpleNamespace()) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "supervise: already live (pid 49001, coverage 3/4); not starting another"
+    ]
+
+
+def test_supervise_slow_unknown_probe_is_retryable_not_did_not_arm(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1287,7 +1743,11 @@ def test_supervise_unknown_probe_does_not_claim_retained_coverage(
         "supervisor_slot_probe",
         lambda *_args, **_kwargs: (wake.SUPERVISOR_ABSENT, False),
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: None)
+    def slow_unknown_process_listing() -> None:
+        time.sleep(0.03)
+        return None
+
+    monkeypatch.setattr(wake, "_process_listing", slow_unknown_process_listing)
     monkeypatch.setattr(
         supervise,
         "RealHost",
@@ -1310,11 +1770,16 @@ def test_supervise_unknown_probe_does_not_claim_retained_coverage(
     )
 
     assert result == supervise.SUPERVISE_START_EXIT
-    stderr = capsys.readouterr().err
-    assert "existing supervisor state is indeterminate" in stderr
-    assert "wake coverage was not verified" in stderr
-    assert "run --list-controllers" in stderr
-    assert "existing wake coverage retained" not in stderr
+    captured = capsys.readouterr()
+    assert "supervise: retry:" in captured.err
+    assert "did-not-arm" not in captured.err
+    assert "absent" not in captured.err
+    status = json.loads(captured.out)
+    assert status["kind"] == "supervise"
+    assert status["type"] == "probe"
+    assert status["reason"] == "unknown-retry"
+    assert "unknown" in status["detail"]
+    assert "absent" not in status["detail"]
     monkeypatch.setattr(
         wake,
         "supervisor_generation_state",
@@ -3039,7 +3504,7 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     assert "goalflight_messages.py" in command
     assert " supervise " in f" {command} "
     assert "--controller-label bugs" in command
-    assert "--lease-nonce nonce-1" in command
+    assert "--lease-nonce" not in command
     help_text = subprocess.run(
         [sys.executable, str(SCRIPTS / "goalflight_messages.py"), "supervise", "--help"],
         check=False,
@@ -5606,6 +6071,128 @@ def _cursor_event_line(version: int, seq: int, *, event_type: str = "controller-
     )
 
 
+def test_supervisor_rearm_after_monitor_cap_replays_unacked_mail_with_marker() -> None:
+    """Unacked mail replays after a cap and is marked for controller deduplication."""
+    max_waits = 8
+    row = {"stream_id": "mail-1", "stream_seq": 1, "event_type": "result"}
+    pending = json.dumps(
+        {
+            "kind": "pending-at-arm",
+            "items": [row],
+            "cursor_version": 100,
+            "advance_command": "relay --advance-cursor",
+        }
+    )
+
+    def rearm(pending_line: str, cursor_version: int) -> FakeHost:
+        host = FakeHost(
+            scripts={
+                "stream": [
+                    PlannedExit(
+                        lifetime_s=80.0,
+                        returncode=0,
+                        armed=True,
+                        stdout_lines=[(0.01, pending_line)],
+                    )
+                ]
+            },
+            stop_when_lines_contain=("cursor_version", str(cursor_version)),
+            stop_after_waits=max_waits,
+        )
+        _run(host, _items("stream"))
+        assert host._waits <= max_waits, "re-arm exceeded its hard wait bound"
+        assert any(
+            record.get("kind") == "pending-at-arm"
+            and record.get("cursor_version") == cursor_version
+            for record in _records(host)
+        ), f"re-arm never emitted cursor version {cursor_version}"
+        return host
+
+    class MonitorDiesAfterPipeWrite(FakeHost):
+        def write_stdout(self, line: str) -> bool:
+            if json.loads(line).get("kind") == "pending-at-arm":
+                self.dropped_lines.append(line)
+                self.stop = True
+                return True
+            return super().write_stdout(line)
+
+    lost_monitor = MonitorDiesAfterPipeWrite(
+        scripts={"stream": [PlannedExit(80.0, 0, armed=True, stdout_lines=[(0.01, pending)])]},
+        stop_after_waits=max_waits,
+    )
+    lost_monitor.dropped_lines = []
+    _run(lost_monitor, _items("stream"))
+    assert lost_monitor._waits <= max_waits, "interrupted monitor exceeded its hard wait bound"
+    replayed = rearm(pending, 100)
+    # The consumer acknowledged the cursor before the next arm, so no item is
+    # eligible for replay from that snapshot.
+    acknowledged = json.dumps(
+        {
+            "kind": "pending-at-arm",
+            "items": [],
+            "cursor_version": 101,
+            "advance_command": "relay --advance-cursor",
+        }
+    )
+    after_ack = rearm(acknowledged, 101)
+    pending_records = [
+        record
+        for host in (replayed, after_ack)
+        for record in _records(host)
+        if record.get("kind") == "pending-at-arm"
+    ]
+
+    assert lost_monitor.dropped_lines
+    assert [record["cursor_version"] for record in pending_records] == [100, 101]
+    assert [len(record["items"]) for record in pending_records] == [1, 0]
+    assert pending_records[0]["replay"] is True
+    assert pending_records[0]["items"][0]["replay"] is True
+    assert "replay" not in pending_records[1]
+    assert pending_records[0]["advance_command"] == "relay --advance-cursor"
+
+
+def test_three_identical_pending_batches_forward_empty_filtered_items() -> None:
+    row = {"stream_id": "mail-1", "stream_seq": 1, "event_type": "result"}
+    report = json.dumps(
+        {
+            "kind": "pending-at-arm",
+            "items": [row],
+            "cursor_version": 100,
+            "advance_command": "relay --advance-cursor",
+        }
+    )
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[(index * 0.01, report)],
+                )
+                for index in range(3)
+            ]
+        },
+        stop_after_waits=16,
+    )
+
+    _run(host, _items("backup", "backup", "backup"))
+
+    records = [
+        record for record in _records(host)
+        if record.get("kind") == "pending-at-arm"
+    ]
+    assert [len(record["items"]) for record in records] == [1, 0, 0], (
+        f"identical batches were not filtered: {records}"
+    )
+    assert records[0]["items"][0]["replay"] is True
+    assert records[0]["replay"] is True
+    assert all(
+        record["advance_command"] == "relay --advance-cursor"
+        for record in records
+    )
+
+
 def test_divergent_cursor_children_deliver_each_envelope_once() -> None:
     """Divergent snapshots preserve new envelopes and discard exact copies."""
     stuck_version = 5220
@@ -5685,7 +6272,8 @@ def test_divergent_cursor_children_deliver_each_envelope_once() -> None:
     assert named == []
     joined = "".join(host.lines)
     assert '"type":"listener-dead"' in joined
-    assert joined.count(_cursor_event_line(stuck_version, 1)) == 1
+    normalized = [_normalized_line(line) for line in host.lines]
+    assert normalized.count(_normalized_line(_cursor_event_line(stuck_version, 1))) == 1
 
 
 def test_same_cursor_distinct_envelopes_all_reach_stdout() -> None:
@@ -5937,7 +6525,10 @@ def test_escalations_reach_stdout_after_195_routine_headlines(wire_kind: str) ->
             for item in record["items"]
         ) for event_type in ("blocked", "user_need", "user_confirm")]
     else:
-        delivered = [output.count(line) for line in escalations]
+        normalized = [_normalized_line(line) for line in output]
+        delivered = [
+            normalized.count(_normalized_line(line)) for line in escalations
+        ]
     assert delivered == [1] * 3, f"{wire_kind}: escalation stdout counts {delivered}"
     withheld = [
         record for record in _records(host) if record.get("type") == "distinct-withheld"
@@ -6029,9 +6620,15 @@ def test_distinct_volume_delivers_every_envelope(
         stop_after_waits=n + 5,
     )
     _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
-    joined = "".join(host.lines)
-    forwarded = [headline for headline in headlines if headline in joined]
-    withheld = [headline for headline in headlines if headline not in joined]
+    normalized = set(_normalized_lines(host))
+    forwarded = [
+        headline for headline in headlines
+        if _normalized_line(headline) in normalized
+    ]
+    withheld = [
+        headline for headline in headlines
+        if _normalized_line(headline) not in normalized
+    ]
     records = _records(host)
     loud = [
         record
@@ -6081,7 +6678,10 @@ def test_one_envelope_across_children_reaches_host_once(children: int, wire_kind
         PlannedExit(80.0, 0, armed=True, stdout_lines=[(0.01, line)]) for line in lines
     ]}, stop_after_waits=3)
     _run(host, _items(*(["backup"] * children)))
-    delivered = [line.strip() for line in host.lines if line.strip() in {event, headline}]
+    delivered = [
+        line for line in _normalized_lines(host)
+        if line in {_normalized_line(event), _normalized_line(headline)}
+    ]
     assert len(delivered) == 1, f"{children} children delivered {len(delivered)} copies"
 
 
@@ -6135,7 +6735,7 @@ def test_unmigrated_rewind_evidence_forwards_unknown_instead_of_crashing(
         80.0, 0, armed=True, stdout_lines=[(0.0, line), (0.01, line)],
     )]}, stop_after_waits=4)
     _run(host, _items("backup"), cursor_rewinds=lambda: reader._cursor_rewinds(lease.label))
-    assert [output.strip() for output in host.lines].count(line) == 2
+    assert _normalized_lines(host).count(_normalized_line(line)) == 2
 
 
 def test_unread_delivery_survives_cursor_bump_and_repeat_floor() -> None:
@@ -6151,9 +6751,45 @@ def test_unread_delivery_survives_cursor_bump_and_repeat_floor() -> None:
     assert identities == [1, 2], f"already delivered unread envelopes replayed: {identities}"
 
 
+def test_stream_event_replay_is_marked_across_rearms_and_deduped_in_process() -> None:
+    event = _cursor_event_line(100, 1)
+
+    def generation() -> list[dict[str, object]]:
+        host = FakeHost(
+            scripts={
+                "stream": [
+                    PlannedExit(
+                        lifetime_s=80.0,
+                        returncode=0,
+                        armed=True,
+                        stdout_lines=[(0.01, event), (0.02, event)],
+                    )
+                ]
+            },
+            stop_after_waits=8,
+        )
+        _run(
+            host,
+            _items("stream"),
+            cursor_rewinds=lambda: {"mail-1": 0},
+        )
+        assert host._waits <= 8, "stream supervisor exceeded its hard wait bound"
+        return [record for record in _records(host) if record.get("kind") == "event"]
+
+    first_generation = generation()
+    second_generation = generation()
+
+    for emitted in (first_generation, second_generation):
+        assert len(emitted) == 1, f"same-process stream duplicate was forwarded: {emitted}"
+        assert emitted[0]["replay"] is True
+        assert emitted[0]["payload"]["replay"] is True
+    assert first_generation[0]["payload"]["stream_seq"] == 1
+    assert second_generation[0]["payload"]["stream_seq"] == 1
+
+
 @pytest.mark.parametrize("partial", [False, True])
 def test_replacement_owner_replays_after_failed_delivery(partial: bool) -> None:
-    incoming = [_cursor_event_line(100, i) for i in range(10)]
+    incoming = [_cursor_event_line(100, i) for i in range(1, 11)]
 
     class FailingHost(FakeHost):
         delivered = 0
@@ -6167,18 +6803,31 @@ def test_replacement_owner_replays_after_failed_delivery(partial: bool) -> None:
                 self.delivered += 1
             return super().write_stdout(line)
 
-    def plan() -> dict[str, list[PlannedExit]]:
+    def plan(rows: list[str]) -> dict[str, list[PlannedExit]]:
         return {"backup": [PlannedExit(80.0, 0, armed=True,
-            stdout_lines=[(i * 0.001, line) for i, line in enumerate(incoming)])]}
+            stdout_lines=[(i * 0.001, line) for i, line in enumerate(rows)])]}
 
-    first = FailingHost(scripts=plan(), stop_after_waits=20)
+    first = FailingHost(scripts=plan(incoming), stop_after_waits=20)
     _run(first, _items("backup"))
     assert first.delivered == 3
-    replacement = FakeHost(scripts=plan(), stop_after_waits=20)
+    # This synthetic supervisor test performs no cursor acknowledgement. The
+    # replacement therefore receives the entire unacknowledged batch again.
+    replacement = FakeHost(scripts=plan(incoming), stop_after_waits=20)
     _run(replacement, _items("backup"))
-    delivered = [r["payload"]["stream_seq"] for r in _records(replacement)
-                 if r.get("kind") == "event"]
-    assert delivered == list(range(10)), f"replacement lost unacknowledged mail: {delivered}"
+    first_records = [r for r in _records(first) if r.get("kind") == "event"]
+    replacement_records = [
+        r for r in _records(replacement) if r.get("kind") == "event"
+    ]
+    first_events = [r["payload"]["stream_seq"] for r in first_records]
+    delivered = [r["payload"]["stream_seq"] for r in replacement_records]
+    assert first_events == list(range(1, 4))
+    assert delivered == list(range(1, 11)), (
+        f"replacement lost unacknowledged mail: {delivered}"
+    )
+    assert all(
+        record.get("replay") is True and record["payload"].get("replay") is True
+        for record in replacement_records
+    ), f"replacement events were not marked as replays: {replacement_records}"
 
 
 @pytest.mark.parametrize("wire_kind", ["event", "headline", "pending-at-arm", "ring"])
@@ -6202,7 +6851,7 @@ def test_escalation_survives_routine_envelope_collision(wire_kind: str, event_ty
     _run(host, _items("backup"))
     # Rings carry no body/identity; both wakes survive. Mail delivers the first
     # escalation despite a routine collision, then suppresses its exact repeat.
-    assert [line.strip() for line in host.lines].count(escalation) == (
+    assert _normalized_lines(host).count(_normalized_line(escalation)) == (
         2 if wire_kind == "ring" else 1
     )
 
@@ -6222,9 +6871,17 @@ def test_overlapping_pending_reports_dedup_items_and_preserve_metadata() -> None
     ]}, stop_after_waits=8)
     _run(host, _items("backup", "backup", "backup", "backup"))
     delivered = [r for r in _records(host) if r.get("kind") == "pending-at-arm"]
-    assert [r["items"] for r in delivered] == [[first], [second], [escalation], []]
-    assert [{k: v for k, v in r.items() if k != "items"} for r in delivered] == [
-        {k: v for k, v in r.items() if k != "items"} for r in reports
+    assert [
+        [{key: value for key, value in row.items() if key != "replay"} for row in r["items"]]
+        for r in delivered
+    ] == [[first], [second], [escalation], []]
+    assert [r.get("replay") is True for r in delivered] == [True, True, True, False]
+    assert [
+        {k: v for k, v in r.items() if k not in {"items", "replay"}}
+        for r in delivered
+    ] == [
+        {k: v for k, v in r.items() if k != "items"}
+        for r in reports
     ]
 
 
@@ -6294,6 +6951,9 @@ def test_altered_display_ids_are_unknown_not_duplicate_envelopes(
         rows = [row for line in host.lines for row in supervise._child_mail_rows(line)]
         assert len(rows) == 1, "a genuine repeat must still deduplicate"
     else:
-        assert all(line in [output.strip() for output in host.lines] for line in lines), (
+        normalized_outputs = _normalized_lines(host)
+        assert all(
+            _normalized_line(line) in normalized_outputs for line in lines
+        ), (
             "an unestablishable identity must preserve both different bodies"
         )

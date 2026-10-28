@@ -65,6 +65,7 @@ PROMPT
 (
   cd "$root"
   codex exec --sandbox read-only -c approval_policy=never \
+    -c features.plugins=false \
     -c 'model_reasoning_effort="xhigh"' \
     --enable web_search_cached \
     "$prompt" \

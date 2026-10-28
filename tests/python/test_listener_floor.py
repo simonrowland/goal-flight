@@ -329,7 +329,12 @@ def test_consumed_slot_with_work_in_flight_emits_floor_and_following_it_restores
             _post(env, project, "floor-ctl", "worker result")
             stdout, stderr = proc.communicate(timeout=30)
             assert proc.returncode == 0, stderr
-            payload = json.loads(stdout)
+            payloads = [
+                json.loads(line) for line in stdout.splitlines() if line.strip()
+            ]
+            rings = [payload for payload in payloads if payload.get("kind") == "ring"]
+            assert len(rings) == 1, payloads
+            payload = rings[0]
             assert payload["kind"] == "ring"
             rearm = payload["rearm"]
             assert rearm["work_in_flight"] is True

@@ -266,6 +266,29 @@ def test_status_banner_and_advisory_mail() -> None:
         }
         lines = status.render_text(payload, 5)
         assert_true("status quota banner", any("quota: xai quota exhausted: 1 agent(s) stuck" in line for line in lines))
+        refused = io.StringIO()
+        multiple_advisories = dict(payload)
+        multiple_pressure = dict(pressure)
+        multiple_pressure["providers_under_pressure"] = [
+            pressure["providers_under_pressure"][0],
+            {
+                **pressure["providers_under_pressure"][0],
+                "provider": "other-provider",
+                "budget_key": "provider:other-provider",
+            },
+        ]
+        multiple_advisories["rate_pressure"] = multiple_pressure
+        with mock.patch.object(
+            messages,
+            "post_message",
+            side_effect=[
+                messages.MessageError("stream is owned by another project"),
+                {"recorded": True},
+            ],
+        ) as post_advisory, contextlib.redirect_stderr(refused):
+            status._post_quota_advisories(multiple_advisories)
+        assert_true("status logs a refused advisory", "quota advisory post failed" in refused.getvalue())
+        assert_eq("status continues after refused advisory", post_advisory.call_count, 2)
         status._post_quota_advisories(payload)
         status._post_quota_advisories(payload)
         inbox = messages.inbox_path(Path(td) / "messages", quota.QUOTA_STUCK_CONTROLLER_DISPATCH_ID)

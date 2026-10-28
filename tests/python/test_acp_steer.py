@@ -23,7 +23,7 @@ DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 FAKE = ROOT / "tests" / "fixtures" / "acp_fake_agent.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_steer_mailbox  # noqa: E402
-from goalflight_dispatch import SEARCH_SCOPE_PREAMBLE  # noqa: E402
+from goalflight_dispatch import PROMPT_FILE_PREAMBLE, SEARCH_SCOPE_PREAMBLE  # noqa: E402
 from goalflight_liveness import active_monotonic  # noqa: E402
 
 
@@ -509,18 +509,19 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         try:
             _wait_for(Path(env["GOALFLIGHT_FAKE_ACP_TURN1_FILE"]), proc=proc)
             _wait_for(fake_argv_path, proc=proc)
-            # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
-            assert "features.remote_plugin=false" not in json.loads(
-                fake_argv_path.read_text(encoding="utf-8")
-            )
+            fake_argv = json.loads(fake_argv_path.read_text(encoding="utf-8"))
+            assert "features.remote_plugin=false" not in fake_argv, fake_argv
+            configs = [
+                fake_argv[i + 1]
+                for i, arg in enumerate(fake_argv[:-1])
+                if arg == "-c"
+            ]
+            assert configs.count("features.plugins=false") == 1, fake_argv
             watcher_prompt = tmp / "status.assembled.prompt"
             _wait_for(watcher_prompt, proc=proc)
             assert watcher_prompt.read_text(encoding="utf-8") == (
-                "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. "
-                "Re-read it after any internal compaction/summarization, at the "
-                "start of each long-run goal-loop iteration, and before final "
-                "commit/exit; the disk file is authoritative over summarized memory."
-                f"\n\n{SEARCH_SCOPE_PREAMBLE}\n\ninitial task"
+                f"{PROMPT_FILE_PREAMBLE}\n\n"
+                f"{SEARCH_SCOPE_PREAMBLE}\n\ninitial task"
             )
             steer_text = (
                 "redirect now; prompt example "

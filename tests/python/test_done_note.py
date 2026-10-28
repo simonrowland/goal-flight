@@ -5,16 +5,15 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from support import skip_if_node_unavailable
 
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-NODE = shutil.which("node")
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -102,6 +101,10 @@ def test_done_note_keeps_resolution_and_rejects_already_done() -> None:
 
 
 def test_done_note_matches_append_shape() -> None:
+    if skip_if_node_unavailable(
+        "test_done_note_matches_append_shape", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         item_id = run_task(project, "new", "Shape check", "--by", "tester").stdout.strip()
@@ -113,17 +116,16 @@ def test_done_note_matches_append_shape() -> None:
         assert_true("both notes present", [note.get("text") for note in notes] == ["via append", "via done"])
         for note in notes:
             assert_true("note has at/actor/text", set(note) >= {"at", "actor", "text"})
-        if NODE:
-            proc = subprocess.run(
-                [NODE, str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
-                cwd=str(ROOT),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                check=False,
-            )
-            assert_true(f"mirror checker accepts done notes: {proc.stderr}", proc.returncode == 0)
+        proc = subprocess.run(
+            ["node", str(CHECKER), str(project / "docs-private"), str(project / "dashboard")],
+            cwd=str(ROOT),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert_true(f"mirror checker accepts done notes: {proc.stderr}", proc.returncode == 0)
 
 
 def main() -> None:

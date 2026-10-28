@@ -84,6 +84,54 @@ def test_a_genuinely_empty_seat_still_reports_no_evidence(tmp_path: Path) -> Non
     assert got.endswith("death_cause=no_evidence"), got
 
 
+def test_an_unreadable_worker_directory_is_reported_as_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seat = _seat(tmp_path)
+    real_is_dir = Path.is_dir
+
+    def unreadable(path: Path) -> bool:
+        if path == seat:
+            raise PermissionError("injected unreadable worker directory")
+        return real_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", unreadable)
+    got = _reason(seat, time.time() - 60)
+    assert got.endswith("death_cause=worker_cwd_unavailable"), got
+
+
+def test_a_failed_git_probe_is_not_reported_as_absent_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seat = _seat(tmp_path)
+    real_run = subprocess.run
+
+    def failed_status(command, *args, **kwargs):
+        if command[:4] == ["git", "-C", str(seat), "status"]:
+            return subprocess.CompletedProcess(command, 128, "", "injected probe failure")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(W.subprocess, "run", failed_status)
+    got = _reason(seat, time.time() - 60)
+    assert got.endswith("death_cause=worktree_probe_failed"), got
+
+
+def test_unknown_tail_classification_still_checks_the_worker_seat(tmp_path: Path) -> None:
+    seat = _seat(tmp_path)
+    (seat / "wip.txt").write_text("the worker's output")
+    tail = tmp_path / "tail.txt"
+    tail.write_text("worker stopped without a diagnostic\n", encoding="utf-8")
+
+    got = W._worker_dead_no_marker_reason(
+        tail,
+        [],
+        prompt_provenance_available=True,
+        worker_cwd=seat,
+        started_epoch=time.time() - 60,
+    )
+    assert got.endswith("death_cause=unharvested_work_dirty"), got
+
+
 @pytest.mark.parametrize(
     "label, seat_factory",
     [
@@ -94,12 +142,21 @@ def test_a_genuinely_empty_seat_still_reports_no_evidence(tmp_path: Path) -> Non
 def test_an_unanswerable_probe_does_not_invent_work(
     tmp_path: Path, label: str, seat_factory
 ) -> None:
-    """Cannot look != found work. It falls back to the prior label, not a claim."""
+    """Missing cwd is invalid input; a failed Git probe is not work evidence."""
     seat = seat_factory(tmp_path)
     if seat is not None:
         seat.mkdir()
+    if label == "no cwd recorded":
+        with pytest.raises(ValueError, match="dispatch record is missing worker_cwd"):
+            W.worktree_work_evidence(seat, since_epoch=time.time() - 60)
+        return
     got = _reason(seat, time.time() - 60)
-    assert got.endswith("death_cause=no_evidence"), f"{label}: {got}"
+    expected_cause = (
+        "worktree_probe_failed"
+        if label == "cwd is not a git tree"
+        else "no_evidence"
+    )
+    assert got.endswith(f"death_cause={expected_cause}"), f"{label}: {got}"
 
 
 def test_the_verdict_is_still_worker_dead_and_the_marker_rule_is_untouched(
@@ -148,8 +205,23 @@ def test_a_missing_seat_path_says_so_rather_than_printing_a_broken_command() -> 
     hint = S._harvest_hint({
         "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_dirty",
     })
-    assert "seat path not recorded" in hint, hint
+    assert "worktree path not recorded" in hint, hint
     assert "git -C" not in hint, "never print a command with a hole in it"
+
+
+def test_status_worktree_path_drives_salvage_hint_and_missing_path_refuses() -> None:
+    status = {
+        "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_dirty",
+        "worktree_seat": "s-5",
+        "worktree_path": "/repo/worktrees/x/s-5",
+    }
+    hint = S._harvest_hint(status)
+    assert "git -C /repo/worktrees/x/s-5" in hint, hint
+
+    status["worktree_path"] = ""
+    missing = S._harvest_hint(status)
+    assert "worktree path not recorded" in missing, missing
+    assert "git -C" not in missing, "an empty recorded path must not target cwd"
 
 
 def test_an_ordinary_dead_dispatch_gets_no_hint() -> None:

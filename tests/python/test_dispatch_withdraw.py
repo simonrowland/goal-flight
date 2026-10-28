@@ -48,11 +48,91 @@ def prepared(tmp_path, monkeypatch):
     return project, authority, result.value, carrier
 
 
-def withdraw(*args):
+def withdraw(*args, dispatch_id="withdraw-test"):
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
-        code = dispatch.main(["withdraw", "withdraw-test", "--reason", "obsolete", "--json", *args])
+        code = dispatch.main(["withdraw", dispatch_id, "--reason", "obsolete", "--json", *args])
     return code, json.loads(output.getvalue())
+
+
+def write_legacy_malformed_record(record: dict) -> None:
+    path = ledger.record_path(record["dispatch_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+def write_never_launched_record(
+    prepared,
+    *,
+    dispatch_id="withdraw-test",
+    controller_label="owner",
+    started_at="2020-01-01T00:00:00Z",
+    worker_pid=None,
+    worker_identity=None,
+    monkeypatch=None,
+):
+    project, _authority, _attempt, _carrier = prepared
+    record = {
+        "dispatch_id": dispatch_id,
+        "project_root": str(project),
+        "state": "running",
+        "terminal_state": "unknown",
+        "started_at": started_at,
+        "status_path": str(project / f"{dispatch_id}.missing.status.json"),
+    }
+    if controller_label is not None:
+        record["controller_label"] = controller_label
+    if worker_pid is not None:
+        record["worker_pid"] = worker_pid
+    if worker_identity is not None:
+        record["worker_identity"] = worker_identity
+    if monkeypatch is None:
+        ledger.write_record(record)
+    else:
+        with monkeypatch.context() as patch:
+            patch.setattr(ledger, "utc_now", lambda: started_at)
+            ledger.write_record(record)
+    carrier = dispatch._queue_entry_path(dispatch_id)
+    carrier.parent.mkdir(parents=True, exist_ok=True)
+    carrier.write_text(json.dumps({
+        "dispatch_id": dispatch_id,
+        "project_root": str(project),
+        "state": "queued",
+        "created_at": started_at,
+        "updated_at": started_at,
+    }))
+    return record
+
+
+def write_retry_child(
+    prepared,
+    dispatch_id,
+    *,
+    controller_label=None,
+    parent_dispatch_id: str | None = "withdraw-test",
+    dispatch_argv: list[str] | None = None,
+):
+    project, authority, _, _ = prepared
+    result = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label=controller_label,
+        owner_session_nonce="retry-session" if controller_label else None,
+    )
+    assert result.committed
+    record = {
+        "dispatch_id": dispatch_id,
+        "controller_label": controller_label,
+        "project_root": str(project),
+        "parent_dispatch_id": parent_dispatch_id,
+        "requeued_from": parent_dispatch_id,
+        "state": "worker_dead",
+        "terminal_state": "worker_dead",
+        "task_ids": ["t-retry"],
+    }
+    if dispatch_argv is not None:
+        record["dispatch_argv"] = dispatch_argv
+    ledger.write_record(record)
+    return record
 
 
 def snapshot(root):
@@ -609,6 +689,356 @@ def test_foreign_controller_refused_and_operator_allowed(prepared):
     assert code == 0 and result["withdrawn_by"] == "operator"
 
 
+def test_parent_owner_can_withdraw_ownerless_retry(prepared):
+    child = write_retry_child(prepared, "withdraw-retry")
+    assert not dispatch._record_proves_never_launched(child, [])
+
+    code, result = withdraw(
+        "--controller-label", "owner", dispatch_id="withdraw-retry"
+    )
+
+    assert code == 0 and result["withdrawn_by"] == "owner", result
+
+
+def test_non_parent_owner_cannot_withdraw_ownerless_retry(prepared):
+    write_retry_child(prepared, "withdraw-retry")
+
+    code, result = withdraw("--controller-label", "foreign", dispatch_id="withdraw-retry")
+
+    assert code == 1 and "dispatch belongs to 'owner'" in result["reason"], result
+
+
+def test_existing_retry_owner_takes_precedence_over_parent(prepared):
+    write_retry_child(
+        prepared, "withdraw-retry", controller_label="retry-owner"
+    )
+
+    code, result = withdraw("--controller-label", "owner", dispatch_id="withdraw-retry")
+    assert code == 1 and "dispatch belongs to 'retry-owner'" in result["reason"], result
+
+    code, result = withdraw(
+        "--controller-label", "retry-owner", dispatch_id="withdraw-retry"
+    )
+    assert code == 0 and result["withdrawn_by"] == "retry-owner", result
+
+
+def test_ownerless_retry_without_owned_parent_accepts_named_controller(prepared):
+    write_retry_child(
+        prepared,
+        "withdraw-orphan",
+        parent_dispatch_id=None,
+        dispatch_argv=["--controller-label", "owner"],
+    )
+
+    code, result = withdraw(
+        "--controller-label", "owner", dispatch_id="withdraw-orphan"
+    )
+
+    assert code == 0 and result["status"] == "withdrawn", result
+    assert result["withdrawn_by"] == "owner"
+
+
+# Legacy out-of-shape labels remain readable for authorization checks; dry-run
+# verifies normalization without rewriting them through the strict writer.
+def test_whitespace_retry_owner_is_treated_as_absent(prepared):
+    write_retry_child(
+        prepared,
+        "withdraw-whitespace-owner",
+        parent_dispatch_id=None,
+    )
+    record = ledger.read_record("withdraw-whitespace-owner")
+    record["controller_label"] = "   "
+    write_legacy_malformed_record(record)
+
+    code, result = withdraw(
+        "--controller-label", "named-controller",
+        "--dry-run",
+        dispatch_id="withdraw-whitespace-owner",
+    )
+
+    assert code == 0 and result["status"] == "dry-run", result
+    assert result["withdrawn_by"] == "named-controller"
+
+
+def test_retry_owner_matching_strips_recorded_label(prepared):
+    write_retry_child(
+        prepared,
+        "withdraw-spaced-owner",
+        controller_label="retry-owner",
+        parent_dispatch_id=None,
+    )
+    record = ledger.read_record("withdraw-spaced-owner")
+    record["controller_label"] = " retry-owner "
+    write_legacy_malformed_record(record)
+
+    code, result = withdraw(
+        "--controller-label", "retry-owner",
+        "--dry-run",
+        dispatch_id="withdraw-spaced-owner",
+    )
+
+    assert code == 0 and result["status"] == "dry-run", result
+    assert result["withdrawn_by"] == "retry-owner"
+
+
+def test_malformed_retry_owner_refuses_named_controller(prepared):
+    project, *_ = prepared
+    write_retry_child(
+        prepared,
+        "withdraw-malformed-owner",
+        parent_dispatch_id=None,
+    )
+    record = ledger.read_record("withdraw-malformed-owner")
+    record["controller_label"] = {}
+    write_legacy_malformed_record(record)
+
+    with pytest.raises(
+        dispatch._WithdrawOwnerMetadataRefusal,
+        match="malformed controller owner metadata",
+    ):
+        dispatch._withdraw_preflight(SimpleNamespace(
+            dispatch_id="withdraw-malformed-owner",
+            project_root=str(project),
+            controller_label="named-controller",
+            operator=False,
+        ))
+
+    code, result = withdraw(
+        "--controller-label", "named-controller",
+        dispatch_id="withdraw-malformed-owner",
+    )
+
+    assert code == 1, result
+    assert "malformed controller owner metadata" in result["reason"], result
+
+
+@pytest.mark.parametrize("ancestor_depth", [1, 2], ids=["parent", "grandparent"])
+@pytest.mark.parametrize(
+    "matching_caller",
+    [True, False],
+    ids=["stringified-label", "other-label"],
+)
+def test_malformed_inherited_owner_refuses_without_leaking(
+    prepared, ancestor_depth, matching_caller,
+):
+    project, *_ = prepared
+    raw_owner = {"secret": "inherited-owner-sentinel"}
+    raw_label = str(raw_owner)
+    parent_id = "withdraw-test"
+    root_record = ledger.read_record(parent_id)
+    root_record["controller_label"] = raw_owner
+    write_legacy_malformed_record(root_record)
+
+    for hop in range(1, ancestor_depth):
+        next_parent_id = f"withdraw-owner-hop-{hop}"
+        ledger.write_record({
+            "dispatch_id": next_parent_id,
+            "project_root": str(project),
+            "controller_label": None,
+            "parent_dispatch_id": parent_id,
+        })
+        parent_id = next_parent_id
+
+    dispatch_id = f"withdraw-inherited-malformed-{ancestor_depth}-{matching_caller}"
+    write_retry_child(
+        prepared,
+        dispatch_id,
+        parent_dispatch_id=parent_id,
+    )
+    caller_label = raw_label if matching_caller else "unrelated-controller"
+
+    code, result = withdraw(
+        "--controller-label", caller_label,
+        dispatch_id=dispatch_id,
+    )
+
+    assert code == 1, result
+    reason = result["reason"]
+    assert "malformed inherited controller owner metadata" in reason, result
+    assert f"ancestor depth {ancestor_depth}" in reason, result
+    assert "dict" in reason, result
+    assert raw_label not in reason, result
+
+
+def test_materialized_child_owner_cannot_bypass_malformed_parent(prepared):
+    project, *_ = prepared
+    raw_owner = {"secret": "materialized-owner-sentinel"}
+    raw_label = str(raw_owner)
+    parent = ledger.read_record("withdraw-test")
+    parent["controller_label"] = raw_owner
+    write_legacy_malformed_record(parent)
+    write_retry_child(
+        prepared,
+        "withdraw-materialized-owner",
+    )
+    child = ledger.read_record("withdraw-materialized-owner")
+    child["controller_label"] = raw_label
+    write_legacy_malformed_record(child)
+
+    code, result = withdraw(
+        "--controller-label", raw_label,
+        dispatch_id="withdraw-materialized-owner",
+    )
+
+    assert code == 1, result
+    reason = result["reason"]
+    assert "malformed inherited controller owner metadata" in reason, result
+    assert "ancestor depth 1" in reason, result
+    assert "dict" in reason, result
+    assert raw_label not in reason, result
+
+
+def test_malformed_nearest_owner_blocks_valid_grandparent(prepared):
+    project, *_ = prepared
+    raw_owner = {"secret": "nearest-owner-sentinel"}
+    raw_label = str(raw_owner)
+    middle_id = "withdraw-malformed-nearest"
+    write_legacy_malformed_record({
+        "dispatch_id": middle_id,
+        "project_root": str(project),
+        "controller_label": raw_owner,
+        "parent_dispatch_id": "withdraw-test",
+    })
+    write_retry_child(
+        prepared,
+        "withdraw-malformed-nearest-child",
+        parent_dispatch_id=middle_id,
+    )
+
+    code, result = withdraw(
+        "--controller-label", raw_label,
+        dispatch_id="withdraw-malformed-nearest-child",
+    )
+
+    assert code == 1, result
+    reason = result["reason"]
+    assert "malformed inherited controller owner metadata" in reason, result
+    assert "ancestor depth 1" in reason, result
+    assert "dict" in reason, result
+    assert raw_label not in reason, result
+
+
+def test_nearest_valid_owner_stops_before_malformed_grandparent(prepared):
+    project, *_ = prepared
+    root_record = ledger.read_record("withdraw-test")
+    root_record["controller_label"] = {"secret": "older-owner-sentinel"}
+    write_legacy_malformed_record(root_record)
+    middle_id = "withdraw-valid-nearest"
+    ledger.write_record({
+        "dispatch_id": middle_id,
+        "project_root": str(project),
+        "controller_label": "nearest-owner",
+        "parent_dispatch_id": "withdraw-test",
+    })
+    write_retry_child(
+        prepared,
+        "withdraw-valid-nearest-child",
+        parent_dispatch_id=middle_id,
+    )
+
+    code, result = withdraw(
+        "--controller-label", "nearest-owner",
+        dispatch_id="withdraw-valid-nearest-child",
+    )
+
+    assert code == 0 and result["status"] == "withdrawn", result
+    assert result["withdrawn_by"] == "nearest-owner"
+
+
+def test_nonempty_carrier_tail_prevents_never_launched_withdraw_shortcut(
+    prepared, tmp_path, monkeypatch,
+):
+    project, _authority, _attempt, _carrier = prepared
+    tail = tmp_path / "partial-worker.tail"
+    tail.write_text("partial worker output\n", encoding="utf-8")
+    carrier = {
+        "dispatch_id": "withdraw-test",
+        "project_root": str(project),
+        "request": {"tail": str(tail)},
+    }
+    record = {
+        "dispatch_id": "withdraw-test",
+        "project_root": str(project),
+        "state": "worker_dead",
+        "terminal_state": "worker_dead",
+    }
+
+    class Reader:
+        def read_all(self, *_args):
+            return [{
+                "lifecycle_state": journal.ATTEMPT_TERMINAL,
+                "launch_epoch": 0,
+                "worker_instance_json": None,
+                "terminal_outcome_json": None,
+            }]
+
+    monkeypatch.setattr(journal.Journal, "open_reader", lambda _root: Reader())
+    assert not dispatch._record_proves_never_launched(record, [carrier])
+
+    with pytest.raises(dispatch._WithdrawPreflightRefusal):
+        dispatch._withdraw_liveness_preflight(
+            dispatch_id="withdraw-test",
+            attempt={"lifecycle_state": journal.ATTEMPT_STARTING},
+            record=record,
+            worker={},
+            carriers={tmp_path / "carrier.json": carrier},
+            status_paths=[],
+        )
+
+
+def test_unproven_retry_refusal_omits_never_launched_withdraw_command(prepared):
+    project, _, _, _ = prepared
+    child = write_retry_child(prepared, "withdraw-retry")
+    assert not dispatch._record_proves_never_launched(child, [])
+
+    with pytest.raises(dispatch.DispatchUsageError) as raised:
+        dispatch._pin_redispatch_wip(child, [])
+
+    command = dispatch._withdraw_recovery_command(
+        "withdraw-retry", str(project), owner="owner"
+    )
+    message = str(raised.value)
+    assert "advanced dispatch withdraw-retry has no worker cwd to pin" in message
+    assert "never-launched record" not in message
+    assert command not in message
+
+
+def test_pin_redispatch_wip_refuses_relative_worker_cwd(prepared, monkeypatch):
+    project, _authority, _attempt, _carrier = prepared
+    seat = project / "relative-seat"
+    seat.mkdir()
+    subprocess.run(["git", "init", "-q", str(seat)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(seat), "-c", "user.email=test@example.com",
+            "-c", "user.name=test", "commit", "--allow-empty", "-q", "-m", "base",
+        ],
+        check=True,
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_worktree_pool,
+        "try_acquire_worktree_path_lock",
+        lambda *_args, **_kwargs: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(dispatch.DispatchUsageError, match="worker_cwd is not absolute"):
+        dispatch._pin_redispatch_wip(
+            {"dispatch_id": "relative-seat", "worker_cwd": "relative-seat"}, []
+        )
+
+
+def test_redispatch_classification_refuses_relative_worker_cwd():
+    with pytest.raises(dispatch.DispatchUsageError, match="worker_cwd is not absolute"):
+        dispatch._redispatch_record_has_no_advanced_work(
+            {
+                "dispatch_id": "relative-seat-classification",
+                "state": "worker_dead",
+                "worker_cwd": "relative-seat",
+                "worktree_base_sha": "a" * 40,
+            }
+        )
+
+
 def test_moved_root_requires_override(prepared):
     project, authority, _, _ = prepared
     path = ledger.record_path("withdraw-test")
@@ -1131,7 +1561,15 @@ def test_main_guidance_reports_ledger_holder_without_liveness_probe(
 
 @pytest.mark.parametrize("terminal_state", ["blocked", "abandoned"])
 def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_state):
-    _, authority, attempt, carrier = prepared
+    project, authority, attempt, carrier = prepared
+    # The attempt reached STARTING, so supply a dead worker identity before
+    # testing final journal projection and carrier archival.
+    record_dead_worker_evidence(project, authority, attempt)
+    status_path = project / "withdraw.status.json"
+    status_path.unlink()
+    record = ledger.read_record("withdraw-test")
+    record.pop("status_path", None)
+    ledger.write_record(record)
     # Include both plain and claimed carriers; all must be archived.
     carrier.write_text(json.dumps(dispatch._sanitize_restore_envelope(
         json.loads(claimed.read_text()), increment_recovery_count=False,
@@ -1162,6 +1600,327 @@ def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_st
     settled = snapshot(tmp_path)
     assert withdraw()[1]["status"] == "settled"
     assert snapshot(tmp_path) == settled
+
+
+def test_dry_run_accepts_proven_never_launched_terminal_record(prepared, monkeypatch):
+    project, authority, attempt, carrier = prepared
+    assert authority.commit_terminal(
+        attempt.attempt_id, terminal_state="worker_dead",
+        observation={"reason": "partial_task_supersession"},
+    ).committed
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        state="worker_dead", terminal_state="worker_dead",
+        status_path=str(project / "missing.status.json"),
+    )
+    ledger.write_record(record)
+    carrier.write_text(json.dumps(record))
+    monkeypatch.setattr(
+        dispatch,
+        "_record_proves_never_launched",
+        lambda _record, _carriers, **_kwargs: True,
+    )
+
+    code, result = withdraw("--dry-run")
+    assert code == 0 and result["status"] == "dry-run", result
+
+
+def test_withdraw_accepts_stale_nonterminal_never_launched_record(
+    prepared, monkeypatch
+):
+    write_never_launched_record(prepared, monkeypatch=monkeypatch)
+
+    code, result = withdraw("--controller-label", "owner")
+
+    assert code == 0 and result["status"] == "withdrawn", result
+
+
+def test_withdraw_accepts_stale_waiting_capacity_without_status(prepared):
+    project, authority, attempt, carrier = prepared
+    record = write_never_launched_record(prepared)
+    stale_claimant = 2**30
+    lease_id = "withdraw-never-launched-lease"
+    record.update(
+        state="waiting_capacity",
+        attempt_id=attempt.attempt_id,
+        launch_token=attempt.launch_token,
+        launch_epoch=0,
+        agent="codex",
+        engine="codex",
+        account="default",
+        transport="dispatch",
+        hostname="fixture-host",
+        claimant_pid=stale_claimant,
+        claimant_identity={"pid": stale_claimant, "start_token": "exited"},
+        logical_session_id="withdraw-test",
+        lease_id=lease_id,
+        remote_lease_id=lease_id,
+        stdout_path=str(project / "withdraw-test.tail"),
+        updated_at="2020-01-01T00:00:00Z",
+    )
+    write_legacy_malformed_record(record)
+    capacity.save_state(
+        {
+            "leases": {
+                lease_id: {
+                    "lease_id": lease_id,
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "claimant_pid": stale_claimant,
+                    "project_root": str(project),
+                    "expires_at": capacity.iso(
+                        capacity.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+    carrier.unlink()
+
+    code, result = withdraw("--controller-label", "owner")
+
+    assert code == 0 and result["status"] == "withdrawn", result
+    assert attempt_row(authority)["terminal_state"] == "withdrawn"
+    assert ledger.read_record("withdraw-test")["state"] == "withdrawn"
+    assert capacity.load_state()["leases"][lease_id]["state"] == "withdrawn"
+    after_withdrawal = snapshot(project)
+
+    code, retry = withdraw("--controller-label", "owner")
+
+    assert code == 0 and retry["status"] == "already withdrawn", retry
+    assert snapshot(project) == after_withdrawal
+
+
+def test_withdraw_projects_matching_terminal_prelaunch_journal(prepared):
+    project, authority, attempt, carrier = prepared
+    lease_id = "terminal-prelaunch-lease"
+    observation = {
+        "reason": "worktree_occupied",
+        "terminal_state": "failed_worktree",
+        "reconciliation": {
+            "source": "goalflight_dispatch.drain",
+            "basis": "inferred_abandonment",
+            "reason": "never_launched_no_final",
+            "process_evidence": "no_recorded_pid",
+            "status_evidence": "status_file_absent",
+            "output_evidence": "no_worker_output",
+            "lease_evidence": "lease_absent",
+            "controller_evidence": "recorded_controller_beacon_absent",
+            "progress_age_s": 7200.0,
+            "checked_output": True,
+            "observed_outcome": False,
+        },
+        "outcome": {"reason": "worktree_occupied"},
+        "prelaunch_failure": True,
+        "state": "failed_worktree",
+        "worker_still_alive": False,
+    }
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="failed_worktree",
+        observation=observation,
+    ).committed
+    attempt_before = attempt_row(authority)
+    outbox_before = authority.read_all("SELECT * FROM terminal_outbox")
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        state="waiting_capacity",
+        terminal_state="unknown",
+        attempt_id=attempt.attempt_id,
+        launch_epoch=0,
+        lease_id=lease_id,
+        status_path=str(project / "missing.status.json"),
+        stdout_path=str(project / "missing.tail"),
+    )
+    proof_record = {
+        "dispatch_id": "withdraw-test",
+        "project_root": str(project),
+        "state": "failed_worktree",
+        "terminal_state": "failed_worktree",
+        "attempt_id": attempt.attempt_id,
+        "status_path": record["status_path"],
+        "stdout_path": record["stdout_path"],
+        "reason": "worktree_occupied",
+        "outcome": {
+            "terminal_state": "failed_worktree",
+            "reason": "worktree_occupied",
+            "prelaunch_failure": True,
+        },
+    }
+    assert dispatch._record_proves_never_launched(proof_record, [])
+    write_legacy_malformed_record(record)
+    carrier.write_text(json.dumps(record))
+    capacity.save_state(
+        {
+            "leases": {
+                lease_id: {
+                    "lease_id": lease_id,
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+
+    code, result = withdraw("--controller-label", "owner")
+
+    assert code == 0 and result["status"] == "settled", result
+    projected = ledger.read_record("withdraw-test")
+    assert projected["state"] == projected["terminal_state"] == "failed_worktree"
+    assert projected["attempt_id"] == attempt.attempt_id
+    assert capacity.load_state()["leases"][lease_id]["state"] == "failed_worktree"
+    assert attempt_row(authority) == attempt_before
+    assert authority.read_all("SELECT * FROM terminal_outbox") == outbox_before
+
+
+def test_withdraw_refuses_terminal_nonzero_epoch_without_worker_identity(prepared):
+    project, authority, attempt, carrier = prepared
+    started = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert started.committed and started.value is not None
+    assert authority.commit_terminal(
+        attempt.attempt_id,
+        terminal_state="failed_worktree",
+        observation={"reason": "worker identity missing", "state": "failed_worktree"},
+    ).committed
+    attempt_before = attempt_row(authority)
+    lease_id = "terminal-unknown-worker-lease"
+    record = ledger.read_record("withdraw-test")
+    record.update(
+        state="waiting_capacity",
+        terminal_state="unknown",
+        attempt_id=attempt.attempt_id,
+        launch_epoch=started.value.launch_epoch,
+        lease_id=lease_id,
+        status_path=str(project / "missing.status.json"),
+    )
+    write_legacy_malformed_record(record)
+    carrier.write_text(json.dumps(record))
+    capacity.save_state(
+        {
+            "leases": {
+                lease_id: {
+                    "lease_id": lease_id,
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+    record_before = ledger.read_record("withdraw-test")
+
+    code, result = withdraw("--controller-label", "owner")
+
+    assert code == 1 and "liveness is indeterminate" in result["reason"], result
+    assert ledger.read_record("withdraw-test") == record_before
+    assert capacity.load_state()["leases"][lease_id]["state"] == "active"
+    assert attempt_row(authority) == attempt_before
+    assert carrier.exists()
+
+
+def test_withdraw_refuses_live_waiting_capacity_claimant_without_status(
+    prepared,
+):
+    _project, authority, _attempt, carrier = prepared
+    record = write_never_launched_record(prepared)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        identity = ledger.process_identity(child.pid)
+        assert identity and identity.get("start_token"), identity
+        record.update(
+            state="waiting_capacity",
+            claimant_pid=child.pid,
+            claimant_identity=identity,
+            updated_at="2020-01-01T00:00:00Z",
+        )
+        write_legacy_malformed_record(record)
+        carrier.unlink()
+
+        code, result = withdraw("--dry-run", "--controller-label", "owner")
+
+        assert code == 1 and "ledger claimant" in result["reason"], result
+        assert "live" in result["reason"]
+        assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_PREPARED
+        assert child.poll() is None
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
+
+
+def test_withdraw_refuses_unknown_worker_pid_without_status(prepared, monkeypatch):
+    _project, authority, _attempt, carrier = prepared
+    record = write_never_launched_record(prepared)
+    record.update(
+        state="waiting_capacity",
+        worker_pid=2**30,
+        worker_identity={"pid": 2**30, "start_token": "unknown"},
+        updated_at="2020-01-01T00:00:00Z",
+    )
+    write_legacy_malformed_record(record)
+    carrier.unlink()
+    monkeypatch.setattr(
+        dispatch,
+        "_queue_claim_identity_status",
+        lambda _pid, _identity: ("indeterminate", "identity_provider_exception:OSError"),
+    )
+
+    code, result = withdraw("--dry-run", "--controller-label", "owner")
+
+    assert code == 1 and "indeterminate" in result["reason"], result
+    assert attempt_row(authority)["lifecycle_state"] == journal.ATTEMPT_PREPARED
+
+
+def test_withdraw_refuses_fresh_nonterminal_never_launched_record(
+    prepared, monkeypatch
+):
+    write_never_launched_record(
+        prepared,
+        started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        monkeypatch=monkeypatch,
+    )
+
+    code, result = withdraw("--dry-run", "--controller-label", "owner")
+
+    assert code == 1 and "claim-stale window" in result["reason"], result
+    assert "status_file_absent" not in result["reason"]
+
+
+def test_withdraw_missing_status_stays_indeterminate_when_worker_pid_is_recorded(
+    prepared, monkeypatch
+):
+    write_never_launched_record(
+        prepared,
+        worker_pid=2**30,
+        worker_identity={"pid": 2**30, "start_token": "exited-test-worker"},
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_queue_claim_identity_status",
+        lambda _pid, _identity: ("dead", "test worker exited"),
+    )
+
+    code, result = withdraw("--dry-run", "--controller-label", "owner")
+
+    assert code == 1 and "status_file_absent" in result["reason"], result
+    assert "worker liveness is indeterminate" in result["reason"], result
 
 
 @pytest.mark.parametrize("alive", [False, True])

@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.7.4
+version: 1.7.6
 description: "Use when the user invokes /goal-flight or asks for long-running grok-bot Goal Flight orchestration: plan, dispatch, review, recover, or resume from file-backed state."
 disable-model-invocation: true
 ---
@@ -109,11 +109,11 @@ Restart this Goal Flight controller session inside Grok Bot. Follow
    prove the holder is dead (`kill -0`) or a sibling of this launch
    before `--takeover`. Ask the owner only when the holder is alive and
    rooted in a different session. Never steal a live foreign lease.
-3. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm the wake on
-   the user's Mac: prefer `goalflight_grok_bot_listen.py` when that
-   helper is on the skill pin; else
-   `goalflight_messages.py listen --report-pending --timeout-s 900
-   --listener-slots 4`.
+3. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm one tracked
+   wake on the user's Mac with
+   `goalflight_grok_bot_listen.py --report-pending --timeout-s 900
+   --listener-slots 1`. Wait for it to exit before re-arming; a duplicate
+   reports the live listener PID and exits 3.
 4. Store baseline (`goalflight_status.py` + `goalflight_task.py list`),
    read newest RESUME-NOTES, then `goalflight_task.py next` only for a
    lane this controller owns.
@@ -138,14 +138,14 @@ Restart this Goal Flight controller session inside Grok Bot. Follow
   outbound wake webhook. The journal on the laptop stays the inbox; mail
   bodies never leave it. Canonical listen arm is one tracked
   `goalflight_grok_bot_listen.py --report-pending --timeout-s 900
-  --controller-label goalflight-grokbot` on the user's Mac (that helper
-  wraps `listen --report-pending` and prints the quote-check banner). Also
+  --listener-slots 1 --controller-label goalflight-grokbot` on the user's
+  Mac (that helper wraps `listen --report-pending`, enforces one live
+  listener, and prints the quote-check banner). Also
   configure `GOALFLIGHT_WAKE_WEBHOOK_URL` (`docs/hosts/grok-bot.md`) so a
   dropped local-exec session does not leave wakes dead. Deafness is both
   listen unarmed and webhook failing. The 900s quiet timeout is this
   host's frontier ping (anti-stall), not Claude's 120s follow-stream
-  heartbeat. Optional full pool (depth 4): 900s on one slot only; others
-  `--timeout-s 0`. Every ring or timeout is a mini-resume: drain if it
+  heartbeat. Every ring or timeout is a mini-resume: drain if it
   rang, flush RESUME-NOTES (`state-handoff.md` Before compact or sleep),
   quote-check Hard Invariants from disk, re-arm, `goalflight_task.py next`.
   Never detach.
@@ -302,19 +302,17 @@ Every ring (exit 0) or timeout (exit 1) is a **mini-resume**: drain if
 it rang (`relay --drain`, act), flush RESUME-NOTES (Compaction below),
 quote-check Hard Invariants from a fresh disk read, re-arm, then
 `goalflight_task.py next`. The 900s quiet timeout is this host's
-substitute for Claude's 80% context-meter hint. The portable four-listen
-pool is full depth; one listen is the MVP. If you arm more than one
-listen, put `--timeout-s 900` on a single slot (the frontier ping) and
-leave the others at `--timeout-s 0` so four quiet timeouts do not fire
-together. Branch on listen exit codes. Exit 1 on this host is the
+substitute for Claude's 80% context-meter hint. Keep one listener live.
+The helper caps this controller at one slot; a duplicate arm reports the
+incumbent PID and exits 3. The pending report starts with a backlog count
+and oldest age. Branch on listen exit codes. Exit 1 on this host is the
 frontier reminder above, not the portable "re-arm only if coverage is
 still required" row. Codes 2–5 follow `protocols/controller-mail.md`;
 exit 5 is did-not-arm (do not re-arm that nonce).
 
 Do **not** arm unbounded `supervise` as a Grok Bot background shell and
-expect per-line wakes. A helper, if added, must wrap `listen` or exit on
-the first actionable event (ignore stream heartbeat / frontier
-keepalives). A same-turn regex-wait on a live `supervise` process is a
+expect per-line wakes. Use the tracked listen helper above. A same-turn
+regex-wait on a live `supervise` process is a
 same-turn block, not a session-life monitor; do not use it as the default.
 
 Missed wake is latency, not data loss. Resume still pulls
@@ -374,8 +372,9 @@ If this controller cannot quote `SKILL.md` Hard Invariants from a
 repository `SKILL.md` → `commands/resume.md`. Then:
 
 1. `goalflight_session_status.py --text`
-2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm listen
-   doorbells (portable pool) instead.
+2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm one tracked
+   `goalflight_grok_bot_listen.py` with `--listener-slots 1`; wait for it
+   to exit before re-arming.
 3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
 4. newest RESUME-NOTES
 5. `goalflight_task.py next`

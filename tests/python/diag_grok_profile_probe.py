@@ -301,7 +301,6 @@ def main() -> int:
             receipts = steer.consumed_worker_wait_receipts(
                 {},
                 marker_entries=[],
-                mailbox_path=steer_file,
             )
             has_end = any(
                 entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND

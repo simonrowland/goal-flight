@@ -9,6 +9,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import goalflight_compat
+
 
 def context_mode_enabled(env: dict[str, str]) -> bool:
     return env.get("GOALFLIGHT_CURSOR_CONTEXT_MODE", "").strip().lower() in {
@@ -54,7 +56,9 @@ def isolate_context_mode(
     for identifier in ("context-mode", "plugin-context-mode-context-mode"):
         if identifier not in disabled:
             disabled.append(identifier)
-    data = Path(tempfile.mkdtemp(prefix="goalflight-cursor-data-"))
+    data = Path(tempfile.mkdtemp(
+        prefix="goalflight-cursor-data-", dir=goalflight_compat.temp_base(),
+    ))
     try:
         # Persist ownership before copying credentials. Unknown legacy dirs are
         # deliberately retained: their workers cannot be proved dead.
@@ -91,7 +95,7 @@ def cleanup_dispatch_data(
     import goalflight_ledger
     import goalflight_dispatch_states
 
-    for data in Path(tempfile.gettempdir()).glob("goalflight-cursor-data-*"):
+    for data in Path(goalflight_compat.temp_base()).glob("goalflight-cursor-data-*"):
         try:
             if data.is_symlink() or not data.is_dir():
                 continue

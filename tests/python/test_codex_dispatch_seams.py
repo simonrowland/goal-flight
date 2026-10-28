@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import builtins
+from contextlib import nullcontext
 import json
 import os
 import subprocess
@@ -18,12 +19,15 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+HOST_HOME = Path.home()
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import goalflight_adapter_readiness as R  # noqa: E402
 import goalflight_acp_run as A  # noqa: E402
 import goalflight_capacity as C  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_os_sandbox as S  # noqa: E402
 import goalflight_watch as W  # noqa: E402
 
 
@@ -42,6 +46,9 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv(
+        "GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "state" / "dispatch")
+    )
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journals"))
     monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
@@ -53,6 +60,29 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CODEX_CONTEXT_MODE", raising=False)
     monkeypatch.setattr(D, "_CODEX_SEAT_API_CACHE", D._CODEX_SEAT_API_UNSET)
+
+
+def test_read_only_worker_prompt_guides_writable_repo_copies(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "review.md"
+    prompt_file.write_text(
+        "Review the repository without making changes.\n", encoding="utf-8"
+    )
+    assembled_path = D._materialize_steer_prompt(
+        str(prompt_file),
+        tmp_path / "dispatch",
+        "grok-research-copy-guidance",
+        agent="grok-research",
+    )
+
+    assert assembled_path
+    assembled = Path(assembled_path).read_text(encoding="utf-8")
+    assert (
+        'For a writable repo copy, use a local clone (`git clone -q <repo> '
+        '"$TMPDIR/<name>"`; it hardlinks objects), or copy files with '
+        '`cp -cR <src> "$TMPDIR/<name>"` on APFS and then delete the copied '
+        '`.git` because a worktree\'s `.git` points back to the source repo. '
+        'Avoid plain `cp -R` and `rsync` of the repo.'
+    ) in assembled
 
 
 def _seat_api(
@@ -86,6 +116,12 @@ def _stub_bash_launch(
     resolver_error: BaseException | None = None,
     capacity_calls: list[argparse.Namespace] | None = None,
     model: str | None = None,
+    dispatch_id: str = "bash-seat-seam",
+    from_queue: bool = False,
+    recorded_home: str | None = None,
+    recorded_account: str | None = None,
+    resolver_account_calls: list[str | None] | None = None,
+    prompt_file: Path | None = None,
 ) -> tuple[dict, list[dict]]:
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
@@ -127,8 +163,12 @@ def _stub_bash_launch(
     def resolve_seat(_project_root, explicit_account, _dispatch_id):
         ordering.append("resolve")
         resolve_accounts.append(explicit_account)
+        if resolver_account_calls is not None:
+            resolver_account_calls.append(explicit_account)
         if resolver_error is not None:
             raise resolver_error
+        if resolved[0]:
+            Path(resolved[0]).mkdir(parents=True, exist_ok=True)
         return resolved
 
     if api_missing:
@@ -172,6 +212,8 @@ def _stub_bash_launch(
                     create=False,
                 ).unlink()
 
+    if not persist_ledger:
+        setattr(record_ledger, "_goalflight_nonpersisting_seam", True)
     monkeypatch.setattr(D, "_record_ledger", record_ledger)
     monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
@@ -219,6 +261,7 @@ def _stub_bash_launch(
             {
                 "argv": list(argv),
                 "env": dict(kwargs.get("env") or {}),
+                "stdin_path": kwargs.get("stdin_path"),
                 "label": kwargs.get("label"),
             }
         )
@@ -226,19 +269,34 @@ def _stub_bash_launch(
         return pid
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", fake_spawn)
+    retry_home_exists_at_start = bool(recorded_home and Path(recorded_home).is_dir())
     argv = [
         "--agent",
         agent,
         "--unregistered-forced",
         "--dispatch-id",
-        "bash-seat-seam",
+        dispatch_id,
         "--cwd",
         str(tmp_path),
+        "--in-place",
         "--tail",
         str(tmp_path / "bash.tail"),
         "--status-json",
         str(tmp_path / "bash.status.json"),
     ]
+    if from_queue:
+        argv.append("--from-queue")
+    if recorded_home is not None:
+        L.write_record(
+            {
+                "dispatch_id": dispatch_id,
+                "state": "queued",
+                "codex_home": recorded_home,
+                "codex_home_owner_dispatch_id": dispatch_id,
+                "effective_account": recorded_account,
+                "account": recorded_account or "default",
+            }
+        )
     if foreground:
         argv.append("--foreground")
     if account is not None:
@@ -247,6 +305,8 @@ def _stub_bash_launch(
         argv.extend(["--account", account])
     if model is not None:
         argv.extend(["--model", model])
+    if prompt_file is not None:
+        argv.extend(["--prompt-file", str(prompt_file)])
     argv.extend(preset_options if preset_options is not None else
                 ["--", sys.executable, "-c", "pass"])
     rc = D.main(argv)
@@ -255,8 +315,14 @@ def _stub_bash_launch(
         assert not spawn_calls
         return {}, ledger_calls
     assert rc == (1 if failure_phase else 0)
-    assert resolve_accounts == ([] if api_missing or agent != "codex" else [account])
-    if not api_missing and agent == "codex":
+    retry_home_exists = retry_home_exists_at_start
+    if resolver_account_calls is not None:
+        assert resolve_accounts == resolver_account_calls
+    else:
+        assert resolve_accounts == (
+            [] if api_missing or agent != "codex" or retry_home_exists else [account]
+        )
+    if not api_missing and agent == "codex" and not retry_home_exists and not from_queue:
         assert ordering.index("resolve") < ordering.index("capacity")
         assert ordering.index("resolve") < ordering.index("ledger:starting")
     else:
@@ -273,6 +339,39 @@ def _stub_bash_launch(
         {},
     )
     return worker_spawn, ledger_calls
+
+
+def test_bash_prompt_guidance_uses_inherited_remote_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_REMOTE_RUN", "/inherited/goalflight-remote-run")
+    prompt = tmp_path / "brief.md"
+    prompt.write_text("Run the requested work.\n", encoding="utf-8")
+    materialized: list[str] = []
+    original_materializer = D._materialize_steer_prompt
+
+    def capture_materialized(*args, **kwargs):
+        result = original_materializer(*args, **kwargs)
+        materialized.append(result)
+        return result
+
+    monkeypatch.setattr(D, "_materialize_steer_prompt", capture_materialized)
+
+    worker, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        dispatch_id="bash-inherited-remote-run",
+        prompt_file=prompt,
+        preset_options=[],
+    )
+
+    assembled_path = Path(materialized[0])
+    assembled = assembled_path.read_text(encoding="utf-8")
+    assert worker["env"]["GOALFLIGHT_REMOTE_RUN"] == "/inherited/goalflight-remote-run"
+    assert "Remote CI: run test suites and other heavy CPU" in assembled
+    assert "--cmd-id <configured-command-id>" in assembled
 
 
 @pytest.mark.parametrize("supports_max", [True, False])
@@ -337,6 +436,187 @@ def test_bash_pin_is_applied_before_capacity_and_reaches_spawn(
     assert row["engine"] == dispatch_start["engine"] == "codex"
 
 
+def test_bash_worker_scratch_is_created_and_exported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    worker, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        dispatch_id="bash-scratch-fresh",
+    )
+
+    scratch = Path(worker["env"]["GOALFLIGHT_SCRATCH_DIR"])
+    dispatch_id = worker["env"]["GOALFLIGHT_DISPATCH_ID"]
+
+    assert scratch == (
+        Path(worker["env"]["GOALFLIGHT_DISPATCH_DIR"])
+        / f"{dispatch_id}.scratch"
+    )
+    assert scratch.is_dir()
+    assert worker["env"]["TMPDIR"] == str(scratch)
+
+
+def test_bash_launch_uses_project_remote_ci_config_and_grants_its_spool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project_root = tmp_path
+    config_path = project_root / ".goal-flight" / "remote-ci.json"
+    spool = tmp_path / "state" / "remote-ci" / "projects" / "pm2" / "spool"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"paths": {
+        "queue_dir": str(spool / "requests"),
+        "result_dir": str(spool / "results"),
+    }}), encoding="utf-8")
+    monkeypatch.delenv("GOALFLIGHT_REMOTE_CI_CONFIG", raising=False)
+
+    worker, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        dispatch_id="bash-project-remote-ci",
+    )
+
+    assert worker["env"]["GOALFLIGHT_REMOTE_CI_CONFIG"] == str(config_path)
+    assert Path(worker["env"]["GOALFLIGHT_REMOTE_CI_SPOOL_DIR"]) == spool
+    environment = {**os.environ, **worker["env"]}
+    _profile, roots = S.macos_sandbox_profile(
+        str(Path(sys.executable).resolve().parent), S.OS_SANDBOX_WORKSPACE_WRITE,
+        agent="codex", command="codex", environment=environment,
+    )
+    assert (spool / "requests").resolve() in {
+        Path(root).resolve() for root in roots
+    }
+
+
+def test_bash_usage_error_does_not_leave_unowned_scratch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "bash-scratch-refused"
+
+    def refuse_build(*_args, **_kwargs):
+        raise D.DispatchUsageError("worker construction refused")
+
+    monkeypatch.setattr(D, "build_worker", refuse_build)
+    _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        dispatch_id=dispatch_id,
+        expected_refusal=True,
+    )
+
+    dispatch_dir = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"])
+    assert not (dispatch_dir / f"{dispatch_id}.scratch").exists()
+
+
+@pytest.mark.parametrize("from_queue", [False, True])
+def test_grok_read_only_build_has_scratch_before_sandbox_and_cleans_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    from_queue: bool,
+) -> None:
+    dispatch_id = f"grok-scratch-before-build-{int(from_queue)}"
+    account_home = D._account_home("probe", "grok")
+    account_env = {
+        "HOME": str(account_home),
+        "XDG_CONFIG_HOME": str(account_home / ".config"),
+        "XDG_STATE_HOME": str(account_home / ".local" / "state"),
+        "XDG_DATA_HOME": str(account_home / ".local" / "share"),
+    }
+    monkeypatch.setattr(
+        D, "_validate_before_side_effects", lambda *_args: dict(account_env)
+    )
+    monkeypatch.setattr(
+        D, "_resolve_launch_account_env", lambda *_args: dict(account_env)
+    )
+    monkeypatch.setattr(D, "_validate_os_sandbox_boundary", lambda *_args: None)
+    monkeypatch.setattr(D, "_worker_cwd", lambda _args: str(HOST_HOME))
+    monkeypatch.setattr(D.goalflight_compat, "is_macos", lambda: True)
+    real_prepare_sandbox = S.prepare_os_sandbox_command
+    monkeypatch.setattr(S, "preflight_os_sandbox", lambda _profile: "read-only")
+    monkeypatch.setattr(S.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+    sandbox_calls: list[tuple[Path, Path]] = []
+
+    def stop_after_profile_build(
+        _command,
+        _argv,
+        *,
+        cwd,
+        os_sandbox,
+        agent,
+        environment,
+    ):
+        scratch = Path(environment["GOALFLIGHT_SCRATCH_DIR"])
+        private_tmp = Path(environment["TMPDIR"])
+        assert scratch.is_dir()
+        assert private_tmp.is_dir() and private_tmp.parent == scratch
+        real_prepare_sandbox(
+            _command,
+            _argv,
+            cwd=cwd,
+            os_sandbox=os_sandbox,
+            agent=agent,
+            environment=environment,
+        )
+        sandbox_calls.append((scratch, private_tmp))
+        raise D.DispatchUsageError("stop after verifying Grok sandbox inputs")
+
+    monkeypatch.setattr(S, "prepare_os_sandbox_command", stop_after_profile_build)
+    scratch = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.scratch"
+    assert not scratch.exists()
+    _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        agent="grok-code",
+        account="probe",
+        dispatch_id=dispatch_id,
+        from_queue=from_queue,
+        preset_options=[
+            "--read-only",
+            "--os-sandbox",
+            "read-only",
+            "--prompt",
+            "Review the change.",
+        ],
+        expected_refusal=True,
+    )
+
+    assert sandbox_calls and sandbox_calls[0][0] == scratch
+    assert not scratch.exists()
+
+
+def test_cursor_bash_sandbox_grants_child_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scratch_root = tmp_path / "dispatch.scratch"
+    custom_tmp = scratch_root / "cursor-tmp"
+    custom_tmp.mkdir(parents=True)
+    args = SimpleNamespace(
+        agent="cursor",
+        os_sandbox="workspace-write",
+        cwd=str(HOST_HOME),
+        _account_env={
+            "GOALFLIGHT_SCRATCH_DIR": str(scratch_root),
+            "TMPDIR": str(custom_tmp),
+        },
+    )
+    monkeypatch.setattr(R, "validate_os_sandbox_request", lambda *_args: None)
+    monkeypatch.setattr(
+        S,
+        "preflight_os_sandbox",
+        lambda profile: S.OS_SANDBOX_WORKSPACE_WRITE,
+    )
+    monkeypatch.setattr(S.shutil, "which", lambda _name: "/usr/bin/sandbox-exec")
+
+    wrapped = D._wrap_cursor_os_sandbox(["cursor-agent", "-p"], args)
+
+    profile = wrapped[2]
+    assert f'(subpath "{custom_tmp}")' in profile, profile
+
+
 def test_bash_pinned_resolution_refusal_leaves_no_admission_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -375,9 +655,10 @@ def test_bash_resolver_only_account_reaches_capacity_before_spawn(
     assert worker_spawn["env"]["CODEX_HOME"] == str(home)
 
 
-def test_bash_launch_survives_missing_starting_ledger_projection(
+def test_bash_launch_refuses_missing_starting_ledger_projection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     worker_spawn, ledger_calls = _stub_bash_launch(
         monkeypatch,
@@ -385,14 +666,21 @@ def test_bash_launch_survives_missing_starting_ledger_projection(
         resolved=(None, None),
         drop_starting_projection=True,
         foreground=True,
+        expected_refusal=True,
     )
 
-    assert worker_spawn["label"] == "worker"
+    assert worker_spawn == {}
+    # Keep the launch projection provisional while the journal terminal event
+    # is written, then expose the prelaunch_failed terminal state.
     assert [call["state"] for call in ledger_calls] == [
         "waiting_capacity",
+        "waiting_capacity",
         "starting",
-        "running",
+        "waiting_capacity",
     ]
+    record = L.read_record("bash-seat-seam")
+    assert record and record["state"] == "prelaunch_failed", record
+    assert "committed STARTING attempt id unavailable" in capsys.readouterr().err
 
 
 def test_bash_launch_preserves_nonpersisting_ledger_injection_seam(
@@ -409,7 +697,9 @@ def test_bash_launch_preserves_nonpersisting_ledger_injection_seam(
     )
 
     assert worker_spawn["argv"] == [sys.executable, "-c", "pass"]
+    assert worker_spawn["env"]["GOALFLIGHT_ATTEMPT_ID"]
     assert [call["state"] for call in ledger_calls] == [
+        "waiting_capacity",
         "waiting_capacity",
         "starting",
         "running",
@@ -476,6 +766,13 @@ def test_attempt_claiming_worker_argv_peeks_through_open_reader(
         expected_launch_epoch=prepared.value.launch_epoch,
     )
     assert started.committed
+    L.write_record(
+        {
+            "dispatch_id": "peek-start",
+            "state": "starting",
+            "attempt_id": prepared.value.attempt_id,
+        }
+    )
     recorded = _forbid_writer_journal(monkeypatch)
     argv, claimed = D._attempt_claiming_worker_argv(
         tmp_path,
@@ -577,6 +874,145 @@ def test_bash_missing_resolver_does_not_charge_selected_account(
     assert all(call.get("effective_account") is None for call in ledger_calls)
 
 
+def test_bash_missing_optional_library_keeps_host_home_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    worker, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        api_missing=True,
+        foreground=True,
+        persist_ledger=False,
+    )
+    assert "CODEX_HOME" not in worker["env"]
+
+
+def test_bash_queue_retry_rebuilds_missing_recorded_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "bash-missing-home-retry"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    assert not home.exists()
+    monkeypatch.setattr(D, "select_codex_account", lambda **_kwargs: (None, []))
+    resolver_accounts: list[str | None] = []
+    worker, _ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-a"),
+        dispatch_id=dispatch_id,
+        from_queue=True,
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        resolver_account_calls=resolver_accounts,
+    )
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    assert home.is_dir()
+    assert resolver_accounts == [None]
+    record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record["effective_account"] == "seat-a"
+
+
+def test_bash_queue_retry_rebuilds_missing_home_for_new_admitted_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "bash-reassigned-home-retry"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    resolver_accounts: list[str | None] = []
+    monkeypatch.setattr(
+        D, "select_codex_account", lambda **_kwargs: ("seat-b", [])
+    )
+    worker, ledger_calls = _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-b"),
+        dispatch_id=dispatch_id,
+        from_queue=True,
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        resolver_account_calls=resolver_accounts,
+    )
+    assert resolver_accounts == ["seat-b"]
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    assert home.is_dir()
+    starting = next(call for call in ledger_calls if call["state"] == "starting")
+    assert starting["effective_account"] == "seat-b"
+    record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record["effective_account"] == "seat-b"
+
+
+def test_bash_queue_retry_refuses_when_recorded_home_cannot_be_rebuilt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "bash-unrebuildable-home"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        dispatch_id=dispatch_id,
+        from_queue=True,
+        recorded_home=str(home),
+        expected_refusal=True,
+    )
+    assert "codex_home_missing" in capsys.readouterr().err
+    assert not home.exists()
+
+
+def test_bash_queue_retry_rejects_non_dispatch_resolver_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "bash-alternate-home-retry"
+    recorded_home = D._codex_dispatch_homes_dir() / dispatch_id
+    alternate_home = tmp_path / "alternate-home"
+    _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(alternate_home), "seat-a"),
+        dispatch_id=dispatch_id,
+        from_queue=True,
+        recorded_home=str(recorded_home),
+        recorded_account="seat-a",
+        expected_refusal=True,
+    )
+    assert "codex_home_missing" in capsys.readouterr().err
+    assert alternate_home.is_dir()
+    assert not recorded_home.exists()
+
+
+def test_bash_queue_home_account_mismatch_keeps_existing_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "bash-account-mismatch"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    rollout = home / "sessions" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("session data\n", encoding="utf-8")
+    monkeypatch.setattr(D, "select_codex_account", lambda **_kwargs: ("seat-b", []))
+    cleanups: list[str] = []
+    _stub_bash_launch(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-b"),
+        account="seat-b",
+        cleanups=cleanups,
+        dispatch_id=dispatch_id,
+        from_queue=True,
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        expected_refusal=True,
+    )
+    assert "codex_home_account_mismatch" in capsys.readouterr().err
+    assert cleanups == []
+    assert rollout.read_text(encoding="utf-8") == "session data\n"
+
+
 @pytest.mark.parametrize("failure_phase", ["pre_spawn", "spawn"])
 def test_bash_failed_launch_cleanup_is_launcher_owned(
     monkeypatch: pytest.MonkeyPatch,
@@ -593,7 +1029,7 @@ def test_bash_failed_launch_cleanup_is_launcher_owned(
         failure_phase=failure_phase,
         cleanups=cleanups,
     )
-    assert cleanups == ["bash-seat-seam"]
+    assert cleanups == []
 
 
 def test_bash_foreground_cleanup_is_launcher_owned_once(
@@ -610,7 +1046,7 @@ def test_bash_foreground_cleanup_is_launcher_owned_once(
         cleanups=cleanups,
         foreground=True,
     )
-    assert cleanups == ["bash-seat-seam"]
+    assert cleanups == []
 
 
 def test_guarded_import_failure_preserves_today_behavior(
@@ -793,6 +1229,7 @@ def _acp_cfg(
     account: str | None,
     agent: str = "codex-acp",
     parent_dispatch_id: str | None = None,
+    cwd: Path | None = None,
 ) -> argparse.Namespace:
     return A.normalized_acp_dispatch_cfg(
         SimpleNamespace(
@@ -801,8 +1238,9 @@ def _acp_cfg(
             install_slot=None,
             account=account,
             parent_dispatch_id=parent_dispatch_id,
-            cwd=str(tmp_path),
+            cwd=str(cwd or tmp_path),
             worktree="off",
+            in_place=True,
             session_id=None,
             dispatch_id=f"acp-seat-{agent}-{account or 'fallback'}",
             task_ids=[],
@@ -863,6 +1301,15 @@ def _run_acp_to_spawn_failure(
     post_capacity_hook=None,
     capacity_lease_id: str | None = None,
     expect_post_capacity_refusal: bool = False,
+    api_missing: bool = False,
+    recorded_home: str | None = None,
+    recorded_account: str | None = None,
+    from_queue: bool = False,
+    expect_home_refusal: bool = False,
+    dispatch_id: str | None = None,
+    project_root: Path | None = None,
+    worktree_mode: str | None = None,
+    spawn_uncertain: bool = False,
 ) -> tuple[argparse.Namespace, dict[str, str], list[str]]:
     cleanups: list[str] = []
     ordering: list[str] = []
@@ -873,16 +1320,21 @@ def _run_acp_to_spawn_failure(
         resolve_accounts.append(explicit_account)
         if resolver_error is not None:
             raise resolver_error
+        if resolved[0]:
+            Path(resolved[0]).mkdir(parents=True, exist_ok=True)
         return resolved
 
-    monkeypatch.setattr(
-        D,
-        "_codex_seat_api",
-        lambda: SimpleNamespace(
-            resolve_codex_seat=resolve_seat,
-            cleanup_dispatch_home=lambda dispatch_id: cleanups.append(dispatch_id),
-        ),
-    )
+    if api_missing:
+        monkeypatch.setattr(D, "_codex_seat_api", lambda: None)
+    else:
+        monkeypatch.setattr(
+            D,
+            "_codex_seat_api",
+            lambda: SimpleNamespace(
+                resolve_codex_seat=resolve_seat,
+                cleanup_dispatch_home=lambda dispatch_id: cleanups.append(dispatch_id),
+            ),
+        )
     resolved_account = resolved[1]
     probe_account = account or resolved_account
     probe_rows = (
@@ -905,6 +1357,10 @@ def _run_acp_to_spawn_failure(
         D,
         "_codex_usage_probe_rows",
         lambda *_args, **_kwargs: list(probe_rows),
+    )
+    monkeypatch.setattr(D, "_stamp_controller_session", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        D, "_prepare_attempt_controller_registration", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(A, "agent_command", lambda *_args, **_kwargs: ("fake", []))
     monkeypatch.setattr(
@@ -951,20 +1407,67 @@ def _run_acp_to_spawn_failure(
     captured: dict[str, str] = {}
 
     async def fail_after_env(*_args, **kwargs):
-        ordering.append("spawn")
-        captured.update(kwargs["env"])
+        admission = kwargs.get("launch_admission")
+        with admission() if callable(admission) else nullcontext():
+            ordering.append("spawn")
+            captured.update(kwargs["env"])
+        if spawn_uncertain:
+            on_attempt = kwargs.get("on_attempt")
+            if callable(on_attempt):
+                await on_attempt(0, SimpleNamespace(pid=2_147_483_000))
         raise RuntimeError("stop after spawn env capture")
 
+    if spawn_uncertain:
+        monkeypatch.setattr(
+            A,
+            "termination_result_for_process",
+            lambda *, pid, pgid, reason: A.AcpTerminationResult(
+                pid=pid,
+                pgid=pgid or pid,
+                confirmed=False,
+                scope_alive=None,
+                reason="test leaves spawned worker death unconfirmed",
+            ),
+        )
     monkeypatch.setattr(A, "spawn_and_handshake_with_retry", fail_after_env)
     cfg = _acp_cfg(
-        tmp_path,
+        project_root or tmp_path,
         account=account,
         agent=agent,
         parent_dispatch_id=parent_dispatch_id,
     )
+    if worktree_mode is not None:
+        cfg.worktree = worktree_mode
+        cfg.in_place = False
+    if dispatch_id is not None:
+        cfg.dispatch_id = dispatch_id
     cfg.model = model
     cfg.request_envelope = request_envelope
+    cfg.from_queue = from_queue
+    cfg._codex_recorded_home = recorded_home
+    cfg._codex_retry_home = (
+        recorded_home if recorded_home and Path(recorded_home).is_dir() else None
+    )
+    cfg._codex_recorded_account = recorded_account
+    cfg._codex_selected_account = (
+        resolved[1] if from_queue or account is not None else None
+    )
+    cfg._capacity_account = cfg._codex_selected_account or recorded_account
+    if recorded_home is not None:
+        L.write_record(
+            {
+                "dispatch_id": cfg.dispatch_id,
+                "state": "queued",
+                "codex_home": recorded_home,
+                "codex_home_owner_dispatch_id": cfg.dispatch_id,
+                "effective_account": recorded_account,
+                "account": recorded_account or "default",
+            }
+        )
     payload = asyncio.run(A.run_acp_dispatch(cfg))
+    cfg._test_payload = payload
+    cfg._test_ordering = ordering
+    cfg._test_resolve_accounts = list(resolve_accounts)
     if block_dispatch_import:
         assert payload["state"] == "blocked_controller_registration"
         assert ordering == []
@@ -977,8 +1480,15 @@ def _run_acp_to_spawn_failure(
         assert "spawn" not in ordering
         assert ordering.index("capacity") < len(ordering)
         return cfg, captured, cleanups
+    if expect_home_refusal:
+        assert "spawn" not in ordering
+        assert captured == {}
+        return cfg, captured, cleanups
     expect_resolve = (
-        L.infer_engine(agent) == "codex" and not block_dispatch_import
+        L.infer_engine(agent) == "codex"
+        and not block_dispatch_import
+        and not api_missing
+        and not cfg._codex_retry_home
     )
     if expect_resolve:
         if getattr(cfg, "_codex_account_pre_resolved", False):
@@ -1030,7 +1540,7 @@ def test_acp_rebuilds_spawn_env_and_writes_truthful_accounts(
     assert record["account"] == "explicit-seat"
     assert record["effective_account"] == "seat-c"
     assert record["request_envelope"] == request_envelope
-    assert cleanups == [cfg.dispatch_id]
+    assert cleanups == []
 
 
 def test_acp_unselectable_seat_preserves_inherited_env_and_labels_host(
@@ -1042,12 +1552,226 @@ def test_acp_unselectable_seat_preserves_inherited_env_and_labels_host(
         resolved=(None, None),
         account=None,
     )
-    assert captured == {"BASE": "captured"}
+    occupancy_fd = "GOALFLIGHT_OCCUPANCY_LOCK_FD"
+    assert captured["BASE"] == "captured"
+    assert set(captured) == {"BASE", occupancy_fd}
+    assert captured[occupancy_fd].isdigit()
     record = json.loads(L.record_path(cfg.dispatch_id).read_text(encoding="utf-8"))
     assert record["account"] == "default"
     assert record["effective_account"] == "host"
     assert cleanups == []
     assert cfg.context_mode == "enabled"
+
+
+def test_acp_queue_retry_rebuilds_missing_recorded_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "acp-seat-codex-acp-fallback"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    cfg, captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-a"),
+        account=None,
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        from_queue=True,
+        dispatch_id=dispatch_id,
+    )
+    assert cfg.dispatch_id == dispatch_id
+    assert captured["CODEX_HOME"] == str(home)
+    assert home.is_dir()
+    assert cfg._test_resolve_accounts == ["seat-a"]
+    record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record["effective_account"] == "seat-a"
+
+
+def test_acp_queue_retry_rebuilds_missing_home_for_new_admitted_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "acp-reassigned-home-retry"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    cfg, captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-b"),
+        account=None,
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        from_queue=True,
+        dispatch_id=dispatch_id,
+    )
+    assert captured["CODEX_HOME"] == str(home)
+    assert home.is_dir()
+    assert cfg._test_resolve_accounts == ["seat-b"]
+    record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record["effective_account"] == "seat-b"
+
+
+def test_acp_queue_retry_refuses_when_recorded_home_cannot_be_rebuilt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "acp-seat-codex-acp-fallback"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    cfg, captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        account=None,
+        recorded_home=str(home),
+        from_queue=True,
+        expect_home_refusal=True,
+    )
+    assert captured == {}
+    assert "codex_home_missing" in json.dumps(cfg._test_payload)
+    assert not home.exists()
+
+
+def test_acp_queue_retry_rejects_non_dispatch_resolver_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "acp-alternate-home-retry"
+    recorded_home = D._codex_dispatch_homes_dir() / dispatch_id
+    alternate_home = tmp_path / "alternate-home"
+    cfg, captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(alternate_home), "seat-a"),
+        account=None,
+        recorded_home=str(recorded_home),
+        recorded_account="seat-a",
+        from_queue=True,
+        dispatch_id=dispatch_id,
+        expect_home_refusal=True,
+    )
+    assert captured == {}
+    assert "codex_home_missing" in json.dumps(cfg._test_payload)
+    assert alternate_home.is_dir()
+    assert not recorded_home.exists()
+
+
+def test_acp_queue_home_account_mismatch_keeps_existing_rollout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dispatch_id = "acp-seat-codex-acp-seat-b"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    rollout = home / "sessions" / "rollout.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text("session data\n", encoding="utf-8")
+    cfg, captured, cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-b"),
+        account="seat-b",
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        from_queue=True,
+        dispatch_id=dispatch_id,
+        expect_home_refusal=True,
+    )
+    assert cfg.dispatch_id == dispatch_id
+    assert captured == {}
+    assert "codex_home_account_mismatch" in json.dumps(cfg._test_payload)
+    assert cleanups == []
+    assert rollout.read_text(encoding="utf-8") == "session data\n"
+
+
+def test_acp_post_admission_home_refusal_releases_captive_seat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tests"], cwd=repo, check=True
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repo, check=True)
+
+    dispatch_id = "acp-home-refusal-holder"
+    home = D._codex_dispatch_homes_dir() / dispatch_id
+    home.mkdir(parents=True)
+    cfg, captured, _cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(str(home), "seat-b"),
+        account="seat-b",
+        recorded_home=str(home),
+        recorded_account="seat-a",
+        dispatch_id=dispatch_id,
+        project_root=repo,
+        worktree_mode="create",
+        expect_home_refusal=True,
+    )
+
+    assert captured == {}
+    assert "spawn" not in cfg._test_ordering
+    assert "codex_home_account_mismatch:" in cfg._test_payload["error"]
+    D._release_worktree_occupancy_lock(cfg)
+    lease = D.goalflight_worktree_pool.acquire_worktree_seat(
+        repo, "acp-home-refusal-reclaimed"
+    )
+    try:
+        assert lease.branch == "worktree/acp-home-refusal-reclaimed"
+        assert lease.path == Path(cfg._worktree_path)
+    finally:
+        lease.release()
+    record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record["prelaunch_failure"] is True
+    assert record["reason"].startswith("codex_home_account_mismatch:")
+
+
+def test_acp_cfg_passes_recorded_codex_home_and_account(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True
+    )
+    monkeypatch.chdir(tmp_path)
+    args = D._build_launch_parser().parse_args(
+        [
+            "--agent", "codex-acp", "--shape", "acp", "--from-queue",
+            "--dispatch-id", "acp-recorded-home", "--cwd", str(tmp_path),
+            "--in-place", "--no-orientation", "--prompt", "launch",
+        ]
+    )
+    args._codex_recorded_home = str(tmp_path / "dispatch-home")
+    args._codex_retry_home = args._codex_recorded_home
+    args._codex_recorded_account = "seat-a"
+    cfg = D._build_acp_cfg(
+        args,
+        status_json=tmp_path / "acp.status.json",
+        base=tmp_path,
+    )
+    assert cfg._codex_recorded_home == args._codex_recorded_home
+    assert cfg._codex_retry_home == args._codex_retry_home
+    assert cfg._codex_recorded_account == "seat-a"
+
+
+def test_acp_missing_optional_library_keeps_inherited_home_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cfg, captured, cleanups = _run_acp_to_spawn_failure(
+        monkeypatch,
+        tmp_path,
+        resolved=(None, None),
+        account=None,
+        api_missing=True,
+    )
+    assert cfg._test_payload["state"] == "failed"
+    occupancy_fd = "GOALFLIGHT_OCCUPANCY_LOCK_FD"
+    assert captured["BASE"] == "captured"
+    assert set(captured) == {"BASE", occupancy_fd}
+    assert captured[occupancy_fd].isdigit()
+    assert "CODEX_HOME" not in captured
+    assert cleanups == []
 
 
 def test_acp_capacity_request_keeps_pinned_account_and_model(
@@ -1070,15 +1794,46 @@ def test_acp_parent_pin_resolves_before_capacity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    home = tmp_path / "acp-parent-home"
-    home.mkdir()
+    parent_dispatch_id = "parent-dispatch"
+    session_id = "00000000-0000-4000-8000-000000000033"
+    home = D._codex_dispatch_homes_dir() / parent_dispatch_id
+    home.mkdir(parents=True)
+    rollout = (
+        home
+        / "sessions"
+        / "2026"
+        / "07"
+        / "28"
+        / f"rollout-2026-07-28T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": parent_dispatch_id,
+            "agent": "codex",
+            "engine": "codex",
+            "shape": "bash",
+            "account": "parent-seat",
+            "effective_account": "parent-seat",
+            "project_root": str(tmp_path),
+            "worker_cwd": str(tmp_path),
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "started_at": L.utc_now(),
+            "codex_session_id": session_id,
+            "codex_home": str(home),
+            "codex_home_owner_dispatch_id": parent_dispatch_id,
+        }
+    )
     capacity_calls: list[argparse.Namespace] = []
     _run_acp_to_spawn_failure(
         monkeypatch,
         tmp_path,
         resolved=(str(home), "parent-seat"),
         account="parent-seat",
-        parent_dispatch_id="parent-dispatch",
+        parent_dispatch_id=parent_dispatch_id,
         expect_pre_resolve=True,
         capacity_calls=capacity_calls,
     )
@@ -1110,7 +1865,7 @@ def test_acp_post_capacity_revalidation_refuses_newly_walled_pinned_account(
     )
 
     assert captured == {}
-    assert cleanups == [cfg.dispatch_id]
+    assert cleanups == []
     assert not L.record_path(cfg.dispatch_id).exists()
     assert C.load_state().get("leases") == {}
 
@@ -1220,6 +1975,55 @@ def test_acp_pinned_resolution_refusal_leaves_no_admission_state(
 
     assert not L.record_path(cfg.dispatch_id).exists()
     assert C.load_state().get("leases") == {}
+
+
+@pytest.mark.parametrize(
+    ("weekly_used", "expected_reason"),
+    [(95.0, "weekly resume reserve"), (80.0, None)],
+)
+def test_post_capacity_usage_refresh_rechecks_full_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    weekly_used: float,
+    expected_reason: str | None,
+) -> None:
+    cfg = SimpleNamespace(agent="codex", account="pinned-seat", model=None)
+    refreshed_rows = [
+        {
+            "provider": "codex",
+            "account": "pinned-seat",
+            "weekly_used_percent": weekly_used,
+        }
+    ]
+    usage_rows = iter(([], refreshed_rows))
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_rows",
+        lambda *_a, **_k: next(usage_rows),
+    )
+    monkeypatch.setattr(
+        D,
+        "_codex_usage_probe_says_usable",
+        lambda _account, *, rows=None, **_kwargs: (
+            True if rows is refreshed_rows else None
+        ),
+    )
+
+    if expected_reason is not None:
+        with pytest.raises(D.DispatchUsageError, match=expected_reason):
+            D.revalidate_codex_account_after_capacity(
+                cfg,
+                project_root=tmp_path,
+                dispatch_id="refresh-then-launch",
+            )
+    else:
+        selected = D.revalidate_codex_account_after_capacity(
+            cfg,
+            project_root=tmp_path,
+            dispatch_id="refresh-then-launch",
+        )
+        assert selected == "pinned-seat"
+        assert cfg._codex_post_capacity_pinned_refusal is False
 
 
 def test_acp_grok_selection_reaches_capacity_before_spawn(
@@ -1484,6 +2288,18 @@ def _install_stub_seat_api(
         entries.append(old_pythonpath)
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(entries))
     monkeypatch.setenv("GOALFLIGHT_TEST_CODEX_HOME", str(home))
+    state_dir = Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "codex-seat-states.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": time.time(),
+                "seats": {"seat-e2e": {"healthy": True, "worst_used": 20.0}},
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         D,
         "_codex_usage_probe_rows",
@@ -1595,11 +2411,12 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
             "--unregistered-forced",
             "--shape",
             "bash",
-            "--dispatch-id",
-            dispatch_id,
-            "--cwd",
-            str(tmp_path),
-            "--task",
+                "--dispatch-id",
+                dispatch_id,
+                "--cwd",
+                str(tmp_path),
+                "--in-place",
+                "--task",
             task_id,
             "--tail",
             str(tail),

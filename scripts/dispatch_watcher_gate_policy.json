@@ -1,0 +1,34 @@
+{
+  "test_root": "tests/python",
+  "module_pattern": "test_*.py",
+  "required_untracked_modules": [
+    "tests/python/ext/test_claude_desktop_backfill.py",
+    "tests/python/ext/test_claude_desktop_sidebar_save.py",
+    "tests/python/ext/test_claude_usage.py",
+    "tests/python/ext/test_codex_fence.py",
+    "tests/python/ext/test_codex_parity_probe.py",
+    "tests/python/ext/test_codex_rotate.py",
+    "tests/python/ext/test_codex_seat_integration.py",
+    "tests/python/ext/test_codex_seat_lib.py",
+    "tests/python/ext/test_codex_seatd.py",
+    "tests/python/ext/test_cursor_usage.py",
+    "tests/python/ext/test_grok_rotate.py",
+    "tests/python/ext/test_kimi_usage.py"
+  ],
+  "prefix_patterns": [
+    "test_dispatch*",
+    "test_goalflight_dispatch*",
+    "test_watch*",
+    "test_terminal*",
+    "test_steer*",
+    "test_worker*",
+    "test_codex_dispatch*",
+    "test_acp*"
+  ],
+  "selection_operator": "union",
+  "revision_targets": ["deployed-baseline", "candidate"],
+  "fallback": {
+    "on": ["missing", "empty", "ambiguous", "unmapped"],
+    "module_set": "all"
+  }
+}

@@ -104,10 +104,39 @@ def test_terminal_state_poison_pairs() -> None:
     )
 
 
+def test_blocked_os_sandbox_terminal_state_reaches_consumers() -> None:
+    state = "blocked_os_sandbox"
+    record = {
+        **_record_for_state(state),
+        # Launcher finish preserves this explicit terminal outcome, although
+        # terminal_state_for() normalizes a derived blocked_* state to blocked.
+        "terminal_state": state,
+    }
+    wait_snapshot = goalflight_status._wait_snapshot(
+        {"dispatch": {"records": [record]}},
+        [record["dispatch_id"]],
+    )[0]
+    fleet_row = fleet_status.classify_dispatch_row(
+        ssh_reachable=True,
+        mirror=_mirror(state),
+        lease_active=True,
+        pid_hint="dead",
+    )
+
+    assert state in dispatch_states.TERMINAL_FAILURE_STATES
+    assert dispatch_states.is_terminal_state(record["terminal_state"])
+    assert goalflight_ledger.classify(record) == state
+    assert chunk_summary.normalize_state({"state": state}, None, None) == "failed"
+    assert fleet_row.state == "terminal"
+    assert wait_snapshot["terminal"] is True
+    assert state in goalflight_capacity.TERMINAL_LEASE_STATES
+
+
 def test_terminal_state_shared_sets_cover_lease_pruning() -> None:
     expanded_states = (
         "released",
         "blocked_capacity",
+        "blocked_os_sandbox",
         "blocked_session_limit",
         "inconclusive_no_final",
         "rate_limited",
@@ -163,6 +192,7 @@ def test_terminal_state_for_preserves_specific_failures() -> None:
 def test_fleet_reconcile_pre_status_uses_shared_failure_states() -> None:
     for state in (
         "blocked_capacity",
+        "blocked_os_sandbox",
         "blocked_session_limit",
         "inconclusive_no_final",
         "rate_limited",
@@ -407,11 +437,81 @@ def test_terminal_marker_dispatch_identity_poison_pairs(
             "state": "running",
         }
     )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-parent",
+            "state": "worker_dead",
+            "codex_session_id": "parent-session",
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-child",
+            "state": "running",
+            "parent_dispatch_id": "resume-parent",
+            "codex_session_id": "child-session",
+        }
+    )
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "resume-sibling",
+            "state": "worker_dead",
+            "codex_session_id": "child-session",
+        }
+    )
     expected = "wake-fold"
     assert_true(
         "exact dispatch marker is bound",
         goalflight_watch._terminal_marker_matches_dispatch(
             {"kind": "COMPLETE", "text": expected}, expected
+        ),
+    )
+    assert_true(
+        "watcher accepts a terminal marker from a shared Codex session",
+        goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "resume-sibling — finished"},
+            "resume-child",
+        ),
+    )
+    assert_true(
+        "watcher accepts a terminal marker from the same resume lineage",
+        goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "resume-parent — finished"},
+            "resume-child",
+        ),
+    )
+    assert_true(
+        "unterminated lineage id is not terminal evidence",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "resume-parent"},
+            "resume-child",
+            require_terminated=True,
+        ),
+    )
+    assert_true(
+        "unterminated exact id is not terminal evidence",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "resume-child"},
+            "resume-child",
+            require_terminated=True,
+        ),
+    )
+    assert_true(
+        "terminated lineage id remains terminal evidence",
+        goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "resume-parent — finished"},
+            "resume-child",
+            require_terminated=True,
+        ),
+    )
+    assert_true(
+        "watcher rejects an unrelated terminal marker",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "other-live-id — finished"},
+            "resume-child",
         ),
     )
     assert_true(
@@ -690,6 +790,18 @@ def test_own_signal_attention_allowlist_and_kept_false_negatives() -> None:
         assert_true(f"allowlist accepts {line!r}", marker is not None)
         assert_eq(f"allowlist kind for {line!r}", marker["kind"], kind)
         assert_eq(f"allowlist text for {line!r}", marker["text"], excerpt)
+
+    oversized = "!BLOCKED: " + "x" * 1000
+    assert_true("oversized attention marker is not final", own(oversized, 8) is None)
+    assert_true(
+        "oversized terminal line is not final",
+        goalflight_watch._final_terminal_marker_from_line(
+            oversized,
+            8,
+            expected_dispatch_id="dispatch",
+        )
+        is None,
+    )
 
     kimi_bullet = own("• BLOCKED: renderer bullet", 3, kimi_output=True)
     assert_true("kimi bullet is own-signal", kimi_bullet is not None)

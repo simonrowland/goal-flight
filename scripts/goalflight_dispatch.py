@@ -49,6 +49,7 @@ import argparse
 import asyncio
 import contextlib
 import datetime as dt
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import errno
@@ -61,6 +62,7 @@ except ImportError:  # pragma: no cover - Windows fallback path
     fcntl = None
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -76,12 +78,13 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import goalflight_compat
 import goalflight_cursor
 import goalflight_output_redact
 import goalflight_capacity
+import goalflight_agent_limits
 import goalflight_codex_sessions
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
@@ -94,12 +97,15 @@ import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
 import goalflight_quota_stuck
+import goalflight_response_boundary
 import goalflight_session_status
 import goalflight_task
 import goalflight_terminal
+import goalflight_wake
 import goalflight_worktree_pool
 from goalflight_agent_limits import (
     CapacityPolicyConfigError,
+    LOCAL_OVERRIDES,
     agent_model_allowlist,
     local_overrides_load_error,
     model_refusal,
@@ -107,6 +113,7 @@ from goalflight_agent_limits import (
     normalize_agent,
 )
 from goalflight_codex_sandbox import (
+    codex_plugins_off_args,
     codex_workspace_write_args,
     shared_worker_uv_cache_dir,
 )
@@ -114,6 +121,7 @@ from goalflight_liveness import (
     active_monotonic,
     process_group_id,
     resolve_indeterminate_timeout_s,
+    status_write_lock,
     write_status,
 )
 from goalflight_watch import (
@@ -134,19 +142,34 @@ WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 # advertised skill root instead (see _status_reminder_lines). Re-adding a
 # SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
-TERMINAL_WORKTREE_GC_TIMEOUT_S = 30.0
+_LAUNCH_MARKER_EMITTED = False
+_NOT_LAUNCHED_MARKER_EMITTED = False
+_SPAWN_INTENT = False
+_SPAWN_INTENT_DISPATCH_ID: str | None = None
+DISK_FREE_SPACE_FLOOR_BYTES = 20_000_000_000
 PINNED_SEAT_WAIT_MAX_S = 120.0
 READ_ONLY_ALLOCATION_LOCK_PATH_ENV = "GOALFLIGHT_READ_ONLY_ALLOCATION_LOCK_PATH"
 # Routed by exact argv[0] match in main(). Kept beside the routes so a new
 # subcommand cannot be added without the misplacement guard learning it.
 _ROUTED_SUBCOMMANDS = (
+    "final",
     "steer",
     "resume",
     "reconcile-abandoned",
+    "release-seat",
     "withdraw",
     "drain",
     "dashboard-refresh",
 )
+
+
+def _mark_spawn_intent(dispatch_id: str | None = None) -> None:
+    global _SPAWN_INTENT, _SPAWN_INTENT_DISPATCH_ID
+    _SPAWN_INTENT = True
+    if dispatch_id:
+        _SPAWN_INTENT_DISPATCH_ID = str(dispatch_id)
+
+
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 DISPATCH_QUEUE_PINNED_SCHEMA = "goalflight.dispatch-queue.v2"
 # The installed macOS drainer is a fresh process every 60 seconds
@@ -167,6 +190,7 @@ DRAIN_LAUNCH_CONFIRM_S = 45.0
 # slow checkout under load is not misclassified as a pre-worker failure.
 DRAIN_LAUNCH_PREPARATION_S = 60.0
 DRAIN_LAUNCH_TIMEOUT_FLOOR_S = 20.0
+DRAIN_LAUNCH_DEADLINE_ENV = "GOALFLIGHT_DRAIN_LAUNCH_DEADLINE_MONOTONIC"
 LAUNCH_BACKOFF_INITIAL_S = 60.0
 LAUNCH_BACKOFF_CAP_S = 900.0
 # Saturate the durable retry cursor once it reaches the capped delay. Capacity
@@ -241,7 +265,7 @@ PRELAUNCH_CANDIDATE_STATES = frozenset(
 # Ledger rows that have not crossed worker spawn. `starting` is excluded:
 # it is recorded after capacity is acquired, immediately before spawn intent.
 PRE_WORKER_LEDGER_STATES = frozenset(
-    {"queued", "waiting_capacity", "submitted", "claimed"}
+    {"queued", "waiting_capacity", "submitted", "claimed", "prelaunch_failed"}
 )
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
@@ -696,12 +720,26 @@ def _requested_os_sandbox(args) -> str | None:
 
 def _supported_os_sandbox_profile(args) -> str | None:
     """Return the posture this concrete bash launch path knows how to support."""
-    if getattr(args, "worker", None):
+    raw_worker = _raw_worker_args(args)
+    if raw_worker is None and getattr(args, "worker", None):
         return None
     agent = str(getattr(args, "agent", ""))
     shape = getattr(args, "shape", "bash")
+    if raw_worker and (
+        agent not in CURSOR_AGENTS
+        or shape == "acp"
+        or _effective_read_only(args)
+    ):
+        return None
     if agent == "codex" and shape != "acp":
         return _effective_os_sandbox(args)
+    if (
+        agent in {"grok-code", "grok-research"}
+        and shape != "acp"
+        and _effective_read_only(args)
+        and goalflight_compat.is_macos()
+    ):
+        return "read-only"
     if agent == "moonshot" and shape != "acp":
         return OS_SANDBOX_OFF
     if agent in CURSOR_AGENTS and shape != "acp":
@@ -718,12 +756,25 @@ def _supported_os_sandbox_profile(args) -> str | None:
 
 def _enforced_os_sandbox_profile(args, *, worker_pid: int | None) -> str | None:
     """Return measured launch posture; pre-launch records must remain unset."""
-    if worker_pid is None or getattr(args, "worker", None):
+    if worker_pid is None:
         return None
     agent = str(getattr(args, "agent", ""))
     shape = getattr(args, "shape", "bash")
+    raw_worker = _raw_worker_args(args)
+    if raw_worker is None and getattr(args, "worker", None):
+        return None
+    if raw_worker and not (
+        agent in CURSOR_AGENTS
+        and shape != "acp"
+        and not _effective_read_only(args)
+    ):
+        return None
     if agent == "codex" and shape != "acp":
         return _effective_os_sandbox(args)
+    if agent in {"grok-code", "grok-research"} and shape != "acp":
+        # A Grok read-only launch reaches this point only after build_worker
+        # successfully prepared the mandatory macOS sandbox-exec wrapper.
+        return _supported_os_sandbox_profile(args)
     if agent == "moonshot" and shape != "acp":
         return OS_SANDBOX_OFF
     if agent in CURSOR_AGENTS and shape != "acp":
@@ -1056,7 +1107,7 @@ READ_ONLY_WRITE_PROMPT_PATTERNS = (
         "write review file",
         re.compile(
             r"\b(?:write|save|create|append|update)\b.{0,80}"
-            r"\b(?:review|findings|report|artifact|verdict)\b.{0,80}\bfile\b",
+            r"\b(?:review|findings|report|artifact|verdict)\b.{0,80}\bfile\b(?!\s*:\s*(?:line\b|\d))",
             re.I | re.S,
         ),
     ),
@@ -1113,14 +1164,19 @@ STEER_PROMPT_PREAMBLE = (
     "you have nothing to do until the controller answers, use `python3 "
     "\"$GOALFLIGHT_DISPATCH_SCRIPT\" steer "
     "\"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED "
-    "--timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question "
-    "and wait under a separate bounded deadline."
+    "--timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to ask and wait "
+    "under a separate bounded deadline (10 minutes by default, capped at 4 hours). "
+    "On timeout it emits `!BLOCKED` with the question and wait id; a late answer "
+    "remains available for resume. ACP is the exception: do not block in this "
+    "command; emit a final `!USER-NEED` and end the turn, then the controller "
+    "starts a child dispatch with the answer because ACP treats USER-NEED as terminal."
 )
 PROMPT_FILE_PREAMBLE = (
-    "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
+    "Your FULL original task brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
     "internal compaction/summarization, at the start of each long-run goal-loop "
-    "iteration, and before final commit/exit; the disk file is authoritative over "
-    "summarized memory."
+    "iteration, and before final commit/exit. That file is authoritative for the "
+    "requested task; it does not contain all dispatch-level contracts. Keep the "
+    "contracts in this assembled prompt in force after compaction."
 )
 # Cursor's CLI auto-reviews shell commands. Reading the prompt-file env var is
 # one of the commands it escalates, and an unattended dispatch has nobody to
@@ -1135,8 +1191,9 @@ PROMPT_FILE_PREAMBLE = (
 # positively and no variable name is offered.
 CURSOR_PROMPT_FILE_PREAMBLE = (
     "Your FULL original brief is delivered inline above. It is complete and "
-    "authoritative -- re-read it there after any internal compaction or "
-    "summarization.\n"
+    "authoritative for the requested task -- re-read it there after any internal "
+    "compaction or summarization. Dispatch-level contracts in this assembled "
+    "prompt remain in force after compaction.\n"
     "- There is no separate copy to fetch and nothing to look up before starting. "
     "Do not run shell commands to locate, print, or inspect your own brief, prompt, "
     "or dispatch environment; those reads are escalated for approval on this "
@@ -1161,8 +1218,10 @@ CURSOR_TOOLING_PREAMBLE = (
     "- NEVER retry a rejected command in a loop. Looping on a refusal is the most "
     "common way a run on this transport dies: it exhausts the event budget and the "
     "run is killed with nothing to show, even when the task was easy. Take the "
-    "refusal as final, use a different tool, or emit `!BLOCKED: <what was refused>` "
-    "and stop."
+    "refusal as final. For an OPTIONAL diagnostic, report the refusal and continue. "
+    "If a refusal prevents completing REQUIRED work or verification, emit the "
+    "dispatch-id-bound blocked marker and stop. Use another tool only if it "
+    "completes that same required step."
 )
 PROJECT_ORIENTATION_RELATIVE = Path("docs-private") / "rag" / "ORIENTATION.md"
 PROJECT_ORIENTATION_SCOPE_RULE = "Read it before starting; orientation only, never scope expansion."
@@ -1180,12 +1239,131 @@ WORKER_EXECUTION_PREAMBLE = (
     "without it still parse); new emissions use it."
 )
 
+INSTRUCTION_REFUSAL_PREAMBLE = (
+    "Instruction status contract:\n"
+    "- A brief may prefix an instruction with `[REQUIRED]` or `[OPTIONAL]`. "
+    "Treat every instruction without a status as REQUIRED; do not decide for "
+    "yourself that an instruction does not matter. Status may also be explicit "
+    "in prose: an exploratory diagnostic requested only for context is OPTIONAL "
+    "unless its result is needed for requested output or named verification. Do "
+    "not infer optional status from a command's shape alone.\n"
+    "- If an OPTIONAL instruction is refused, report the refusal and continue "
+    "with the remaining work; do not retry a rejected command. Verification "
+    "named in the brief, including tests, checks, self-review, or revert-checks, "
+    "is always REQUIRED even if labeled OPTIONAL. If a REQUIRED instruction or "
+    "named verification step cannot be completed after a refusal, stop and emit "
+    "the dispatch-id-bound BLOCKED marker with the refusal."
+)
+RESUME_CONTRACT_SUPERSESSION_PREAMBLE = (
+    "Resume contract: dispatch-level contracts in this launch supersede "
+    "conflicting dispatch preambles in earlier session messages or nested "
+    "prompt text. The current task brief continues to define the requested work."
+)
+
+
+def _sandbox_worker_preamble(
+    profile: str | None,
+    *,
+    agent: str | None = None,
+    shape: str = "bash",
+    cwd: str | None = None,
+    command: str = "",
+    environment: dict[str, str] | None = None,
+    acp_permission_fallback: bool = False,
+) -> str | None:
+    if acp_permission_fallback:
+        return (
+            "Sandbox limits for this dispatch:\n"
+            "- ACP selected its permission-only read-only fallback after the OS "
+            "sandbox gate: the OS profile is off, and ACP applies its read-only "
+            "tool policy. Do not assume macOS Seatbelt filesystem or process "
+            "rules are active."
+        )
+    if profile in (None, "off"):
+        return None
+    if agent == "codex" and shape != "acp":
+        codex_mode = _CODEX_SANDBOX_VALUE[profile]
+        return (
+            "Sandbox limits for this dispatch:\n"
+            f"- Codex is launched with `--sandbox {codex_mode}`. This lane uses "
+            "Codex's sandbox mode; it does not apply the macOS Seatbelt profile "
+            "or its command-specific rules."
+        )
+    if cwd is None:
+        return None
+    from goalflight_os_sandbox import macos_sandbox_profile
+
+    profile_text, _write_roots = macos_sandbox_profile(
+        cwd,
+        profile,
+        agent=agent,
+        command=command,
+        environment=environment,
+    )
+    return (
+        "Sandbox limits for this dispatch:\n"
+        "- This is the exact macOS Seatbelt profile generated for this launch. "
+        "It denies by default; it permits writes only at the allowed roots and "
+        "literal targets in its file-write rules, including any configured "
+        "`$TMPDIR`. Do not infer that "
+        "an individual command is denied from a separate command list.\n"
+        "```scheme\n"
+        f"{profile_text.rstrip()}\n"
+        "```"
+    )
+
+
+COMMIT_CUSTODY_PREAMBLE = (
+    "Commit custody contract:\n"
+    "- Commit in this dispatch's assigned seat/worktree, even if you use a "
+    "throwaway clone or scratch checkout to run work. Never leave the commit "
+    "only in a temporary clone.\n"
+    "- Commit FIRST when the requested chunk is ready; committing is not "
+    "self-review. Do not hold the commit while waiting for review.\n"
+    "- The controller reviews the commit after it lands in the seat."
+)
+
+
+def _prompt_requests_commit(body: str) -> bool:
+    """Detect an implementation/landing request, not a review mention."""
+    normalized = re.sub(r"[\u0060*_~]", "", body).lower()
+    if re.search(r"\b(?:do\s+not|don't|never|no)\s+commit\b", normalized):
+        return False
+
+    # Land and push are in scope when the brief explicitly asks to land or
+    # push a concrete change: both require a commit to have a seat-local home
+    # first. A bare reference to a commit (including pre-commit review) is not
+    # an instruction to create one.
+    return bool(
+        re.search(
+            r"(?<![\w-])commit(?:s|ting|ted)?\s+"
+            r"(?:first|incrementally|the\s+(?:fix|change|chunk|work|patch)|"
+            r"this\s+(?:fix|change|chunk|work|patch)|changes?|work|fix|patch)\b"
+            r"|\b(?:implement|land|push)\s+(?:the\s+|this\s+|your\s+)?"
+            r"(?:fix|change|chunk|work|patch|feature)\b"
+            r"|\bpin\s+(?:the\s+)?sha\b",
+            normalized,
+        )
+    )
+
 
 SEARCH_SCOPE_PREAMBLE = (
     "Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.\n"
     "Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,\n"
     "`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.\n"
-    "For a file outside your worktree, use its known path."
+    "For a file outside your worktree, use its known path.\n"
+    "Use `$TMPDIR` for scratch files, separate clones, logs and browser profiles; "
+    "it is the dispatch scratch directory or a private child, is retention-managed "
+    "and removed after dispatch ends. Do not create `/tmp/<name>` or "
+    "`/private/tmp/<name>` entries.\n"
+    "For a writable repo copy, use a local clone (`git clone -q <repo> "
+    "\"$TMPDIR/<name>\"`; it hardlinks objects), or copy files with "
+    "`cp -cR <src> \"$TMPDIR/<name>\"` on APFS and then delete the copied "
+    "`.git` because a worktree's `.git` points back to the source repo. "
+    "Avoid plain `cp -R` and `rsync` of the repo.\n"
+    "Start headless Chrome or Chromium with `--use-mock-keychain` and "
+    "`--user-data-dir` under `$TMPDIR`; Grok and Cursor account homes have no "
+    "keychain, so Chrome may show a dialog on the owner's screen."
 )
 
 
@@ -1251,6 +1429,14 @@ STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 class DispatchUsageError(Exception):
     pass
+
+
+class TerminalStatusLaunchRefused(DispatchUsageError):
+    """A terminal sidecar refused spawn; do not terminalize its journal row."""
+
+
+class StatusLaunchAdmissionDeferred(DispatchUsageError):
+    """A busy status lock deferred launch admission for a later queue pass."""
 
 
 class ProvenPreWorkerRefusal(DispatchUsageError):
@@ -1320,51 +1506,58 @@ def _cmd_spawn_daemon() -> int:
             if stdout_path:
                 stdout_file = Path(stdout_path)
                 stdout_file.parent.mkdir(parents=True, exist_ok=True)
-                # Redact by secret shape at write time. The filter process
-                # owns the tail flock so reconciliation cannot pass a
-                # COMPLETE still buffered here. Keying redaction on a
-                # resolved seat would skip the capture when lookup failed.
-                filter_argv = [
-                    sys.executable,
-                    "-u",
-                    str(SCRIPT_DIR / "goalflight_output_redact.py"),
-                ]
-                if serialize_stdout:
-                    filter_argv.append("--lock")
-                if "a" in str(stdout_mode):
-                    filter_argv.append("--append")
-                filter_argv.append(str(stdout_file))
-                ready_r, ready_w = os.pipe()
-                filter_env = os.environ.copy()
-                filter_env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
-                filter_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
-                filter_env[goalflight_output_redact.READY_FD_ENV] = str(ready_w)
-                filter_proc = subprocess.Popen(
-                    filter_argv,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=filter_env,
-                    start_new_session=True,
-                    close_fds=True,
-                    pass_fds=(ready_w,),
-                )
-                os.close(ready_w)
-                try:
-                    ready, _wp, _xp = select.select([ready_r], [], [], 5.0)
-                    if not ready or not os.read(ready_r, 1):
-                        raise RuntimeError(
-                            "output redact filter did not become ready"
-                        )
-                except Exception:
-                    if filter_proc.poll() is None:
-                        filter_proc.kill()
-                    raise
-                finally:
-                    os.close(ready_r)
-                if filter_proc.poll() is not None:
-                    raise RuntimeError("output redact filter exited before worker start")
-                worker_stdout = filter_proc.stdin
+                if spec.get("redact_stdout"):
+                    # The eligible worker stream keeps write-time redaction
+                    # and the ready handshake. Keying on a resolved seat
+                    # would skip capture when lookup failed.
+                    filter_argv = [
+                        sys.executable,
+                        "-u",
+                        str(SCRIPT_DIR / "goalflight_output_redact.py"),
+                    ]
+                    if serialize_stdout:
+                        filter_argv.append("--lock")
+                    if "a" in str(stdout_mode):
+                        filter_argv.append("--append")
+                    filter_argv.append(str(stdout_file))
+                    ready_r, ready_w = os.pipe()
+                    filter_env = os.environ.copy()
+                    filter_env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+                    filter_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+                    filter_env[goalflight_output_redact.READY_FD_ENV] = str(ready_w)
+                    filter_proc = subprocess.Popen(
+                        filter_argv,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=filter_env,
+                        start_new_session=True,
+                        close_fds=True,
+                        pass_fds=(ready_w,),
+                    )
+                    os.close(ready_w)
+                    try:
+                        ready, _wp, _xp = select.select([ready_r], [], [], 5.0)
+                        if not ready or not os.read(ready_r, 1):
+                            raise RuntimeError(
+                                "output redact filter did not become ready"
+                            )
+                    except Exception:
+                        if filter_proc.poll() is None:
+                            filter_proc.kill()
+                        raise
+                    finally:
+                        os.close(ready_r)
+                    if filter_proc.poll() is not None:
+                        raise RuntimeError("output redact filter exited before worker start")
+                    worker_stdout = filter_proc.stdin
+                else:
+                    # Direct file output removes the intermediary pipe
+                    # buffer. For serialized worker tails, pass the flock
+                    # through fd 1 so reconciliation waits for writer close.
+                    worker_stdout = stack.enter_context(stdout_file.open(stdout_mode))
+                    if serialize_stdout and fcntl is not None:
+                        fcntl.flock(worker_stdout.fileno(), fcntl.LOCK_EX)
             stderr_f = (
                 subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
             )
@@ -1404,6 +1597,7 @@ def _spawn_daemonized_process(
     stdout_mode: str = "wb",
     stderr: str = "stdout",
     serialize_stdout: bool = False,
+    filter_stdout: bool = False,
     label: str,
     cwd: str | None = None,
     inherit_occupancy_lock: bool = False,
@@ -1416,6 +1610,11 @@ def _spawn_daemonized_process(
         "stdout_mode": stdout_mode,
         "stderr": stderr,
         "serialize_stdout": bool(stdout_path and serialize_stdout),
+        "redact_stdout": bool(
+            stdout_path
+            and filter_stdout
+            and LOCAL_OVERRIDES.get("output_redaction_filter", True) is not False
+        ),
         "cwd": cwd,
     }
     child_env = dict(env)
@@ -1642,7 +1841,31 @@ def _repair_watcher_terminal_status(
             recorded_marker, expected_dispatch_id
         ):
             terminal_marker = recorded_marker
+    worker_liveness = goalflight_terminal.worker_liveness_from_probe(
+        worker_is_alive, identity_reason
+    )
+    attention_marker = payload.get("attention_marker")
+    if not (
+        isinstance(attention_marker, dict)
+        and attention_marker.get("kind") == "BLOCKED"
+        and expected_dispatch_id
+        and _terminal_marker_matches_dispatch(attention_marker, expected_dispatch_id)
+    ):
+        attention_marker = None
+    if terminal_marker and terminal_marker.get("kind") == "COMPLETE":
+        attention_marker = None
+    elif (
+        attention_marker is None
+        and isinstance(terminal_marker, dict)
+        and terminal_marker.get("kind") == "BLOCKED"
+    ):
+        attention_marker = terminal_marker
+    elif terminal_marker is None and attention_marker is not None and worker_liveness == "dead":
+        # The worker is gone; retained attention evidence is now the terminal
+        # BLOCKED marker unless a newer completed marker replaced it above.
+        terminal_marker = attention_marker
     terminal_pending_state = None
+    live_blocked_pending = False
     if terminal_marker and isinstance(terminal_marker, dict):
         marker_state = _marker_state_for_terminal(terminal_marker)
         if marker_state == "complete" and worker_is_alive:
@@ -1654,12 +1877,27 @@ def _repair_watcher_terminal_status(
         state = "watcher_stopped"
     else:
         state = "worker_dead"
+    verdict_state = state
     state, final_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
         state,
         reason,
         tail,
         terminal_marker_present=goalflight_terminal.terminal_marker_present(terminal_marker),
     )
+    if goalflight_terminal.blocked_outcome_is_provisional(
+        {
+            "state": verdict_state,
+            "terminal_marker": terminal_marker,
+            "attention_marker": attention_marker,
+            "terminal_pending_state": payload.get("terminal_pending_state"),
+            "reason": final_reason or reason,
+            "worker_identity_reason": identity_reason,
+        },
+        worker_liveness,
+    ):
+        state = "watcher_stopped"
+        terminal_pending_state = "blocked"
+        live_blocked_pending = True
     payload.update({
         "schema": "goalflight.status.v1",
         "dispatch_id": args.dispatch_id,
@@ -1670,14 +1908,32 @@ def _repair_watcher_terminal_status(
         "worker_identity_reason": identity_reason,
         "expected_worker_identity": _identity_token(worker_identity),
         "tail_path": str(tail),
-        "terminal_marker": terminal_marker if isinstance(terminal_marker, dict) else None,
+        "terminal_marker": (
+            None
+            if live_blocked_pending
+            else terminal_marker if isinstance(terminal_marker, dict) else None
+        ),
         "state": state,
         "reason": final_reason,
         "liveness_state": goalflight_terminal.terminal_liveness_state(state),
         "updated_at": int(time.time()),
     })
+    if live_blocked_pending:
+        if attention_marker is None and isinstance(terminal_marker, dict):
+            attention_marker = {
+                **terminal_marker,
+                "dispatch_id": expected_dispatch_id,
+                "sequence": terminal_marker.get("line"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        if attention_marker is not None:
+            payload["attention_marker"] = attention_marker
+    else:
+        payload.pop("attention_marker", None)
     if terminal_pending_state:
         payload["terminal_pending_state"] = terminal_pending_state
+    else:
+        payload.pop("terminal_pending_state", None)
     try:
         write_status(status_json, payload)
     except Exception as e:
@@ -1969,7 +2225,29 @@ def _record_dispatch_worktree(args, lease) -> None:
             raise goalflight_worktree_pool.WorktreeSeatError("resolved base SHA is null")
     except goalflight_worktree_pool.WorktreeSeatError as exc:
         if getattr(lease, "created", False):
-            with contextlib.suppress(Exception):
+            # Drop the registration this creation just wrote before git
+            # deletes the admin dir. Leaving the key would skip the slot
+            # on every later allocation.
+            keepalive = None
+            try:
+                try:
+                    lock_path = goalflight_worktree_pool.worktree_path_lock_path(
+                        lease.path
+                    )
+                except goalflight_worktree_pool.WorktreeSeatError:
+                    lock_path = None
+                if (
+                    lock_path is not None
+                    and lock_path.name == goalflight_worktree_pool.OCCUPANCY_LOCK_NAME
+                ):
+                    keepalive = (
+                        goalflight_worktree_pool._release_registered_occupancy_for_removal(
+                            lock_path,
+                            registry_root=goalflight_worktree_pool._git_common_dir(
+                                lease.path
+                            ),
+                        )
+                    )
                 goalflight_worktree_pool._git(
                     _project_root(args),
                     "worktree",
@@ -1977,7 +2255,12 @@ def _record_dispatch_worktree(args, lease) -> None:
                     "--force",
                     str(lease.path),
                 )
-        lease.release()
+            except Exception:
+                pass
+            finally:
+                if keepalive is not None:
+                    os.close(keepalive)
+        _release_unlaunched_worktree_seat(lease, str(args.dispatch_id))
         requested = _requested_worktree_base(args)
         request = f"--at {requested!r}" if requested else "--at omitted (project default)"
         raise goalflight_worktree_pool.WorktreeSeatError(
@@ -2003,8 +2286,64 @@ def _record_dispatch_worktree(args, lease) -> None:
         # Do not leave a reset worktree live when its retry carrier could not
         # be pinned. Nearest-base selection is not equivalent.
         args._worktree_seat = None
-        lease.release()
+        _release_unlaunched_worktree_seat(lease, str(args.dispatch_id))
         raise
+    _note_skipped_worktree_seats(args, getattr(lease, "skipped_slots", ()))
+
+
+def _skipped_worktree_seat_rows(skipped) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for item in skipped or ():
+        if isinstance(item, dict):
+            seat = str(item.get("seat") or "")
+            reason = str(item.get("reason") or "")
+        else:
+            try:
+                seat, reason = item
+            except (TypeError, ValueError):
+                continue
+            seat = str(seat)
+            reason = str(reason)
+        if seat and reason:
+            rows.append({"seat": seat, "reason": reason})
+    return rows
+
+
+def _note_skipped_worktree_seats(args, skipped) -> None:
+    """Record seats the allocator skipped so a permanent skip is visible.
+
+    The JSON line is printed here. A later copy of the warning list cannot
+    drop it. The warning text is also appended to the shared warning list.
+    """
+    rows = _skipped_worktree_seat_rows(skipped)
+    if not rows:
+        return
+    args._skipped_worktree_seats = rows
+    warning = "skipped worktree seats: " + ", ".join(
+        f"{row['seat']}={row['reason']}" for row in rows
+    )
+    warnings = getattr(args, "dispatch_warnings", None)
+    if isinstance(warnings, list):
+        if warning not in warnings:
+            warnings.append(warning)
+    else:
+        args.dispatch_warnings = [warning]
+    print(
+        json.dumps({"skipped_worktree_seats": rows}, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _emit_skipped_worktree_seat_failure(exc: BaseException) -> None:
+    rows = _skipped_worktree_seat_rows(getattr(exc, "skipped_slots", ()))
+    if not rows:
+        return
+    print(
+        json.dumps({"skipped_worktree_seats": rows}, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _resume_worktree_ref_context(
@@ -2021,6 +2360,27 @@ def _resume_worktree_ref_context(
 
 def _resume_recovery_command(ref: str) -> str:
     return f"git worktree add <recovery-path> {ref}"
+
+
+def _resume_recovery_refusal(
+    project_root: Path,
+    parent_dispatch_id: str,
+    recovery_refs: list[str] | None = None,
+) -> goalflight_worktree_pool.WorktreeCwdRefused | None:
+    refs = (
+        recovery_refs
+        if recovery_refs is not None
+        else _resume_recovery_refs_for_parent(project_root, parent_dispatch_id)
+    )
+    if not refs:
+        return None
+    return goalflight_worktree_pool.WorktreeCwdRefused(
+        f"resume refused: recycled worktree for {parent_dispatch_id} has "
+        "preserved state in recovery ref(s) "
+        + ", ".join(refs)
+        + "; restore it before resuming with "
+        + _resume_recovery_command(refs[0])
+    )
 
 
 def _resume_worktree_ref_commit(project_root: Path, ref: str) -> str | None:
@@ -2054,13 +2414,14 @@ def _resume_recovery_refs_for_parent(
     project_root: Path,
     parent_dispatch_id: str,
 ) -> list[str]:
-    """Find refs recorded when this dispatch's seat was reclaimed.
-
-    The reclaimer records the abandoned dispatch id at reclaim time. This is
-    deliberately independent of checkout paths, which are reused, and reads
-    cold ledger rows so archiving the reclaimer cannot hide preserved work.
-    """
-    refs: list[str] = []
+    """Find the newest recovery snapshot in this dispatch's resume lineage."""
+    lineage_ids = [str(parent_dispatch_id)]
+    try:
+        for dispatch_id in _resume_lineage_dispatch_ids(parent_dispatch_id):
+            if dispatch_id not in lineage_ids:
+                lineage_ids.append(dispatch_id)
+    except goalflight_worktree_pool.WorktreeCwdRefused:
+        pass
     try:
         candidates = goalflight_ledger.read_records()
         candidates.extend(goalflight_ledger._read_archived_records())
@@ -2069,12 +2430,107 @@ def _resume_recovery_refs_for_parent(
             f"resume refused: could not inspect recovery refs for "
             f"{parent_dispatch_id}: {exc}"
         ) from exc
-    for candidate in candidates:
-        if (
-            str(candidate.get("worktree_reclaimed_dispatch_id") or "")
-            != parent_dispatch_id
-        ):
+
+    def normalize_ref(value: object) -> str:
+        ref = str(value or "").strip()
+        if ref.startswith("goalflight/quarantine/"):
+            return f"refs/heads/{ref}"
+        if ref.startswith("goalflight/keep/"):
+            return f"refs/{ref}"
+        return ref
+
+    def timestamp_ns(value: str) -> int | None:
+        if value.isdecimal():
+            return int(value)
+        if not re.fullmatch(r"\d{8}T\d{12}Z", value):
+            return None
+        try:
+            stamp = dt.datetime.strptime(value, "%Y%m%dT%H%M%S%fZ").replace(
+                tzinfo=dt.timezone.utc
+            )
+        except ValueError:
+            return None
+        delta = stamp - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+        return (
+            (delta.days * 86_400 + delta.seconds) * 1_000_000_000
+            + delta.microseconds * 1_000
+        )
+
+    def keep_ref_timestamp_ns(ref: str) -> int | None:
+        name = ref.rsplit("/", 1)[-1]
+        if name == "head":
+            return None
+        if name.startswith(("head-", "dirty-", "prior-target-", "gc-")):
+            name = name.split("-", 1)[1]
+        elif not name.split("-", 1)[0].isdecimal():
+            return None
+        return timestamp_ns(name.split("-", 1)[0])
+
+    def quarantine_ref_timestamp_ns(ref: str, owner: str) -> int | None:
+        name = ref.rsplit("/", 1)[-1]
+        safe_id = (
+            re.sub(r"[^A-Za-z0-9._-]+", "-", owner).strip(".-")
+            or "unknown-dispatch"
+        )
+        marker = f"-{safe_id}-"
+        if marker not in name:
+            return None
+        stamp_and_suffix = name.rsplit(marker, 1)[-1]
+        stamp = stamp_and_suffix.split("-", 1)[0]
+        suffix = stamp_and_suffix[len(stamp):]
+        if suffix and not re.fullmatch(r"-[0-9a-fA-F]{12}", suffix):
+            return None
+        return timestamp_ns(stamp)
+
+    def is_keep_head_ref(ref: str) -> bool:
+        name = ref.rsplit("/", 1)[-1]
+        return name == "head" or name.startswith("head-")
+
+    root_id = lineage_ids[-1]
+    safe_root_id = (
+        re.sub(r"[^A-Za-z0-9._-]+", "-", root_id).strip(".-")
+        or "unknown-dispatch"
+    )
+    restore_marker_prefix = f"refs/goalflight/restored/{safe_root_id}/"
+    markers = goalflight_worktree_pool._git_proc(
+        project_root,
+        "for-each-ref",
+        "--format=%(refname)",
+        restore_marker_prefix,
+    )
+    if markers is None or markers.returncode != 0:
+        detail = (
+            (markers.stderr or markers.stdout).strip()
+            if markers is not None
+            else "git for-each-ref could not run"
+        ) or (f"exit {markers.returncode}" if markers is not None else "unknown error")
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: could not inspect restore markers for "
+            f"{parent_dispatch_id}: {detail}"
+        )
+    restored_after: int | None = None
+    for marker in markers.stdout.splitlines():
+        marker_name = marker.rsplit("/", 1)[-1].strip()
+        stamp_text = marker_name.split("-", 1)[0]
+        stamp = timestamp_ns(stamp_text)
+        if stamp is None:
             continue
+        restored_after = max(restored_after or 0, stamp)
+
+    def keep_ref_is_after_restore(ref: str) -> bool:
+        if restored_after is None:
+            return True
+        stamp = keep_ref_timestamp_ns(ref)
+        return stamp is not None and stamp > restored_after
+
+    event_refs: list[tuple[str, str | None, str | None, list[str]]] = []
+    for candidate in candidates:
+        owner = str(
+            candidate.get("worktree_reclaimed_dispatch_id") or ""
+        )
+        if owner not in lineage_ids:
+            continue
+        refs = []
         for key in (
             "worktree_keep_ref",
             "keep_ref",
@@ -2082,10 +2538,25 @@ def _resume_recovery_refs_for_parent(
             "quarantine_ref",
             "quarantine_branch",
         ):
-            value = candidate.get(key)
-            if value and str(value) not in refs:
-                refs.append(str(value))
-    dispatch_token = re.escape(str(parent_dispatch_id))
+            ref = normalize_ref(candidate.get(key))
+            if ref and ref not in refs:
+                refs.append(ref)
+        keep_ref = next(
+            (
+                ref for ref in refs
+                if ref.startswith(f"refs/goalflight/keep/{owner}/")
+                and is_keep_head_ref(ref)
+            ),
+            None,
+        )
+        quarantine_ref = next(
+            (ref for ref in refs if ref.startswith("refs/heads/goalflight/quarantine/")),
+            None,
+        )
+        event_refs.append((owner, keep_ref, quarantine_ref, refs))
+
+    keep_refs_by_owner = {dispatch_id: [] for dispatch_id in lineage_ids}
+    quarantine_refs: list[tuple[str, str, int | None]] = []
     for pattern in (
         "refs/goalflight/keep/",
         "refs/heads/goalflight/quarantine/",
@@ -2108,20 +2579,164 @@ def _resume_recovery_refs_for_parent(
             )
         for ref in proc.stdout.splitlines():
             ref = ref.strip()
-            leaf = ref.rsplit("/", 1)[-1]
-            if (
-                ref
-                and re.search(rf"(?:^|-){dispatch_token}(?:-|$)", leaf)
-                and ref not in refs
+            if not ref:
+                continue
+            components = ref.split("/")
+            if pattern == "refs/goalflight/keep/":
+                if len(components) > 4 and components[3] in keep_refs_by_owner:
+                    owner = components[3]
+                    if ref not in keep_refs_by_owner[owner]:
+                        keep_refs_by_owner[owner].append(ref)
+                continue
+            name = components[-1]
+            owners = sorted(lineage_ids, key=len, reverse=True)
+            for owner in owners:
+                safe_id = (
+                    re.sub(r"[^A-Za-z0-9._-]+", "-", owner).strip(".-")
+                    or "unknown-dispatch"
+                )
+                if f"-{safe_id}-" not in name:
+                    continue
+                created_at = quarantine_ref_timestamp_ns(ref, owner)
+                if created_at is not None:
+                    quarantine_refs.append((owner, ref, created_at))
+                break
+
+    snapshots: dict[str, tuple[int, str, str | None, list[str]]] = {}
+    for owner, ref, timestamp in quarantine_refs:
+        if restored_after is not None and (
+            timestamp is None or timestamp <= restored_after
+        ):
+            continue
+        snapshots[ref] = (
+            timestamp if timestamp is not None else 0,
+            owner,
+            ref,
+            [],
+        )
+    for owner, keep_ref, quarantine_ref, refs in event_refs:
+        if quarantine_ref:
+            ref_time = next(
+                (time for ref_owner, ref, time in quarantine_refs if ref == quarantine_ref),
+                None,
+            )
+            if restored_after is not None and (
+                ref_time is None or ref_time <= restored_after
             ):
-                refs.append(ref)
-    return refs
+                continue
+            snapshots[quarantine_ref] = (
+                ref_time if ref_time is not None else 0,
+                owner,
+                quarantine_ref,
+                refs,
+            )
+        elif keep_ref:
+            ref_time = keep_ref_timestamp_ns(keep_ref)
+            if restored_after is not None and (
+                ref_time is None or ref_time <= restored_after
+            ):
+                continue
+            snapshot_id = f"keep:{owner}:{keep_ref}"
+            snapshots[snapshot_id] = (
+                ref_time if ref_time is not None else 0,
+                owner,
+                None,
+                refs,
+            )
+
+    for owner, refs in keep_refs_by_owner.items():
+        if any(snapshot[1] == owner and snapshot[2] for snapshot in snapshots.values()):
+            continue
+        for keep_ref in refs:
+            name = keep_ref.rsplit("/", 1)[-1]
+            if name != "head" and not name.startswith("head-"):
+                continue
+            timestamp = keep_ref_timestamp_ns(keep_ref)
+            if restored_after is not None and (
+                timestamp is None or timestamp <= restored_after
+            ):
+                continue
+            snapshots[f"keep:{owner}:{keep_ref}"] = (
+                timestamp if timestamp is not None else 0,
+                owner,
+                None,
+                refs,
+            )
+
+    if not snapshots:
+        return []
+    selected_snapshot, snapshot = max(
+        snapshots.items(),
+        key=lambda item: (
+            item[1][0],
+            item[0].startswith(f"keep:{item[1][1]}:")
+            and item[0].rsplit("/", 1)[-1].startswith("head-"),
+        ),
+    )
+    _time, owner, quarantine_ref, event_ref_list = snapshot
+    keep_ref = None
+    keep_prefix = f"keep:{owner}:"
+    if selected_snapshot.startswith(keep_prefix):
+        keep_ref = selected_snapshot[len(keep_prefix):]
+    if quarantine_ref:
+        quarantine_commit = _resume_worktree_ref_commit(project_root, quarantine_ref)
+        if quarantine_commit:
+            parent = goalflight_worktree_pool._git_proc(
+                project_root, "rev-parse", f"{quarantine_commit}^"
+            )
+            if parent is not None and parent.returncode == 0:
+                parent_commit = parent.stdout.strip()
+                for ref in keep_refs_by_owner[owner]:
+                    if not is_keep_head_ref(ref) or not keep_ref_is_after_restore(ref):
+                        continue
+                    if _resume_worktree_ref_commit(project_root, ref) == parent_commit:
+                        keep_ref = ref
+                        break
+    if keep_ref is None:
+        keep_ref = next(
+            (
+                ref for ref in keep_refs_by_owner[owner]
+                if is_keep_head_ref(ref) and keep_ref_is_after_restore(ref)
+            ),
+            None,
+        )
+    if keep_ref is None:
+        keep_ref = next(
+            (
+                ref for ref in event_ref_list
+                if ref.startswith(f"refs/goalflight/keep/{owner}/")
+                and is_keep_head_ref(ref)
+                and keep_ref_is_after_restore(ref)
+            ),
+            None,
+        )
+    selected = [ref for ref in (keep_ref, quarantine_ref) if ref]
+    selected.extend(
+        ref for ref in keep_refs_by_owner[owner]
+        if ref not in selected and keep_ref_is_after_restore(ref)
+    )
+    if quarantine_ref is None:
+        selected.extend(
+            ref for ref in event_ref_list
+            if "/dirty-" in ref
+            and ref not in selected
+            and keep_ref_is_after_restore(ref)
+        )
+        selected.extend(
+            ref for ref in keep_refs_by_owner[owner]
+            if "/dirty-" in ref
+            and ref not in selected
+            and keep_ref_is_after_restore(ref)
+        )
+    return selected
 
 
 def _resume_worktree_branch_spec(
     project_root: Path,
     parent_dispatch_id: str,
     record: dict,
+    *,
+    recovery_refs: list[str] | None = None,
 ) -> tuple[str, str, str | None, str | None]:
     """Validate the parent's branch before a recycled-seat checkout.
 
@@ -2129,78 +2744,82 @@ def _resume_worktree_branch_spec(
     branch and recorded head are; a free seat may only be prepared after both
     agree. Legacy records can still recover their ``seat/<id>`` branch.
     """
-    recovery_refs = _resume_recovery_refs_for_parent(project_root, parent_dispatch_id)
-    if recovery_refs:
-        raise goalflight_worktree_pool.WorktreeCwdRefused(
-            f"resume refused: recycled worktree for {parent_dispatch_id} has "
-            "preserved state in recovery ref(s) "
-            + ", ".join(recovery_refs)
-            + "; restore it before resuming with "
-            + _resume_recovery_command(recovery_refs[0])
+    if recovery_refs is None:
+        recovery_refs = _resume_recovery_refs_for_parent(
+            project_root, parent_dispatch_id
         )
     keep_ref = next(
         (
-            str(record.get(key)).strip()
-            for key in ("worktree_keep_ref", "keep_ref")
-            if record.get(key)
+            ref
+            for ref in recovery_refs
+            if ref.startswith("refs/goalflight/keep/")
+            and (
+                ref.endswith("/head")
+                or ref.rsplit("/", 1)[-1].startswith("head-")
+            )
         ),
         None,
     )
     quarantine_ref = next(
-        (
-            str(record.get(key)).strip()
-            for key in (
-                "worktree_quarantine_ref",
-                "quarantine_ref",
-                "quarantine_branch",
-            )
-            if record.get(key)
-        ),
+        (ref for ref in recovery_refs if "goalflight/quarantine/" in ref),
         None,
     )
+    if not quarantine_ref and any(
+        "/dirty-" in ref for ref in recovery_refs
+    ):
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: dirty recovery snapshot for {parent_dispatch_id} "
+            "has no quarantine ref; preserved ref(s) "
+            + ", ".join(ref for ref in recovery_refs if "/dirty-" in ref)
+        )
     lineage_ids = _resume_lineage_dispatch_ids(parent_dispatch_id)
-    # Repeated resumes carry the root dispatch's branch; an intermediate
-    # child id is not another branch authorization.
-    allowed_suffixes = {lineage_ids[-1]}
+    # A branch name is not ownership evidence. Only branches recorded on a
+    # ledger row in this exact lineage can be resumed.
+    lineage_branches = {}
+    for lineage_id in lineage_ids:
+        lineage_record = _find_dispatch_record(lineage_id)
+        if (
+            not isinstance(lineage_record, dict)
+            or goalflight_ledger.record_is_unreadable(lineage_record)
+        ):
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: missing or unreadable lineage owner {lineage_id}"
+                + _resume_worktree_ref_context(keep_ref, quarantine_ref)
+            )
+        lineage_branch = str(lineage_record.get("worktree_branch") or "").strip()
+        if goalflight_worktree_pool.is_worktree_branch(lineage_branch):
+            lineage_branches.setdefault(lineage_branch, lineage_record)
     recorded_branch = record.get("worktree_branch")
     if recorded_branch:
         recorded_branch = str(recorded_branch).strip()
-        suffix = recorded_branch.split("/", 1)[1] if "/" in recorded_branch else ""
         if (
             not goalflight_worktree_pool.is_worktree_branch(recorded_branch)
-            or suffix not in allowed_suffixes
+            or recorded_branch not in lineage_branches
         ):
             raise goalflight_worktree_pool.WorktreeCwdRefused(
-                f"resume refused: recorded branch {recorded_branch} does not "
-                f"belong to resume lineage of {parent_dispatch_id}"
+                f"resume refused: branch {recorded_branch} is not recorded by "
+                f"the resume lineage of {parent_dispatch_id}"
                 + _resume_worktree_ref_context(keep_ref, quarantine_ref)
             )
         candidates = [recorded_branch]
     else:
-        candidates = [
-            candidate
-            for lineage_id in lineage_ids
-            for candidate in (
-                goalflight_worktree_pool.worktree_branch_name(lineage_id),
-                f"seat/{lineage_id}",
-            )
-        ]
+        candidates = list(lineage_branches)
 
     branch = None
+    branch_record = None
     for candidate in candidates:
-        suffix = candidate.split("/", 1)[1] if "/" in candidate else ""
-        if (
-            not goalflight_worktree_pool.is_worktree_branch(candidate)
-            or not suffix
-            or suffix not in allowed_suffixes
-            or not re.fullmatch(r"[A-Za-z0-9._-]+", suffix)
-        ):
-            continue
         if _resume_worktree_ref_commit(project_root, f"refs/heads/{candidate}"):
             branch = candidate
+            branch_record = lineage_branches[candidate]
             break
     if branch is None:
-        branch_name = candidates[0] if candidates else f"worktree/{parent_dispatch_id}"
+        if not candidates:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: no recorded worktree branch for lineage of "
+                f"{parent_dispatch_id}"
+                + _resume_worktree_ref_context(keep_ref, quarantine_ref)
+            )
+        branch_name = candidates[0]
         raise goalflight_worktree_pool.WorktreeCwdRefused(
             f"resume refused: branch {branch_name} is missing"
             + _resume_worktree_ref_context(keep_ref, quarantine_ref)
@@ -2212,9 +2831,12 @@ def _resume_worktree_branch_spec(
             f"resume refused: branch {branch} cannot be resolved"
             + _resume_worktree_ref_context(keep_ref, quarantine_ref)
         )
-    expected_heads: list[str] = []
     recorded_head_matches = False
-    recorded_head = record.get("worktree_head") or record.get("worktree_base")
+    recorded_head = (
+        branch_record.get("worktree_head") or branch_record.get("worktree_base")
+        if branch_record is not None
+        else None
+    )
     if recorded_head:
         resolved_head = _resume_worktree_ref_commit(project_root, str(recorded_head))
         if resolved_head is None:
@@ -2223,7 +2845,6 @@ def _resume_worktree_branch_spec(
                 f"{recorded_head}"
                 + _resume_worktree_ref_context(keep_ref, quarantine_ref)
             )
-        expected_heads.append(resolved_head)
         recorded_head_matches = branch_tip == resolved_head or _resume_worktree_is_descendant(
             project_root, resolved_head, branch_tip
         )
@@ -2234,19 +2855,21 @@ def _resume_worktree_branch_spec(
                 f"resume refused: branch {branch} has missing keep ref {keep_ref}"
                 + _resume_worktree_ref_context(None, quarantine_ref)
             )
+        if recovery_refs and branch_tip != keep_tip:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: recovery head {keep_ref} is {keep_tip}, but "
+                f"branch {branch} is at {branch_tip}; refusing to move the branch"
+            )
         if branch_tip == keep_tip:
             recorded_head_matches = True
-        expected_heads.append(keep_tip)
     if quarantine_ref:
-        raise goalflight_worktree_pool.WorktreeCwdRefused(
-            f"resume refused: preserved work for branch {branch} is in recovery ref "
-            f"{quarantine_ref}; restore it before resuming with "
-            f"{_resume_recovery_command(quarantine_ref)}"
-        )
-    if not expected_heads:
+        if _resume_worktree_ref_commit(project_root, quarantine_ref) is None:
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: quarantine ref {quarantine_ref} cannot be resolved"
+            )
+    if not recorded_head and not keep_ref:
         # Pre-1.7.2 records did not persist a head. The branch itself is the
-        # only durable evidence available for those records.
-        expected_heads.append(branch_tip)
+        # only durable evidence available when the ledger still records it.
         recorded_head_matches = True
     if not recorded_head_matches:
         recorded_text = str(recorded_head or "unknown")
@@ -2258,30 +2881,286 @@ def _resume_worktree_branch_spec(
     return branch, branch_tip, keep_ref, quarantine_ref
 
 
-def _resume_replacement_worktree(args, *, project_root: Path, parent_dispatch_id: str):
+def _resume_recycled_worktree_in_place(
+    args,
+    *,
+    project_root: Path,
+    parent_dispatch_id: str,
+    recovery_refs: list[str],
+):
     record = _find_dispatch_record(parent_dispatch_id) or {}
-    branch, branch_tip, _keep_ref, _quarantine_ref = _resume_worktree_branch_spec(
+    branch, branch_tip, keep_ref, quarantine_ref = _resume_worktree_branch_spec(
         project_root,
         parent_dispatch_id,
         record,
+        recovery_refs=recovery_refs,
     )
+    recovery_refusal = _resume_recovery_refusal(
+        project_root, parent_dispatch_id, recovery_refs
+    )
+    if recovery_refusal is None:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: recycled worktree for {parent_dispatch_id} has no "
+            "recovery refs; refusing to move the resume to another path"
+        )
+    recovery_head = (
+        _resume_worktree_ref_commit(project_root, keep_ref)
+        if keep_ref
+        else branch_tip
+    )
+    if recovery_head is None or recovery_head != branch_tip:
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"resume refused: recovery head for {parent_dispatch_id} does not match "
+            f"its original branch {branch}"
+        )
     label = _controller_ring_label(args, project_root)
+    cwd = _worker_cwd(args).resolve(strict=False)
+    ignored_archive_path: str | None = None
+
+    occupancy_check = _worktree_occupancy_before_reset(args)
+
+    def archive_ignored_before_reclaim(path: Path, prior_dispatch_id: str | None) -> None:
+        nonlocal ignored_archive_path
+        occupancy_check(path, prior_dispatch_id)
+        import goalflight_worktree_gc
+
+        roots, inspect_error = goalflight_worktree_gc._ignored_payload_roots(
+            path, deadline=None
+        )
+        if inspect_error is not None:
+            raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                f"ignored content could not be preserved before resume: {inspect_error}"
+            )
+        archive_path, archive_error = goalflight_worktree_gc._archive_ignored_payload(
+            path, deadline=None
+        )
+        if archive_error is not None or (roots and archive_path is None):
+            detail = archive_error or "archive returned no verified path"
+            raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                f"ignored content could not be preserved before resume: {detail}"
+            )
+        ignored_archive_path = archive_path
+        args._worktree_ignored_archive = archive_path
+        return True
+
+    def restore_before_occupant(path: Path) -> None:
+        if quarantine_ref:
+            goalflight_worktree_pool._restore_quarantined_worktree(
+                path,
+                quarantine_ref=quarantine_ref,
+                expected_head=recovery_head,
+            )
+        if ignored_archive_path:
+            import tarfile
+
+            def ignored_member_filter(member) -> PurePosixPath:
+                relative = PurePosixPath(member.name)
+                windows_relative = PureWindowsPath(member.name)
+                if (
+                    relative.is_absolute()
+                    or windows_relative.is_absolute()
+                    or windows_relative.drive
+                    or ".." in relative.parts
+                    or ".." in windows_relative.parts
+                    or not relative.parts
+                ):
+                    raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                        f"ignored archive {ignored_archive_path} has unsafe path "
+                        f"{member.name!r}"
+                    )
+                if not (member.isdir() or member.isfile() or member.issym()):
+                    raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                        f"ignored archive {ignored_archive_path} has unsupported "
+                        f"member {member.name!r}"
+                    )
+                return relative
+
+            def existing_entry(parent: Path, name: str) -> Path | None:
+                candidate = parent / name
+                try:
+                    candidate.lstat()
+                    return candidate
+                except FileNotFoundError:
+                    pass
+                for sibling in parent.iterdir():
+                    if sibling.name.casefold() != name.casefold():
+                        continue
+                    try:
+                        if os.path.samefile(sibling, candidate):
+                            return sibling
+                    except FileNotFoundError:
+                        continue
+                return None
+
+            def existing_member(relative: PurePosixPath) -> tuple[Path | None, Path | None]:
+                current = path
+                for index, component in enumerate(relative.parts):
+                    entry = existing_entry(current, component)
+                    if entry is None:
+                        return None, None
+                    if index == len(relative.parts) - 1:
+                        return entry, None
+                    if entry.is_symlink() or not entry.is_dir():
+                        return None, entry
+                    current = entry
+                return None, None
+
+            collisions: list[str] = []
+            try:
+                with tarfile.open(ignored_archive_path, "r:gz") as archive:
+                    members = [
+                        (member, ignored_member_filter(member))
+                        for member in archive.getmembers()
+                    ]
+                    for member, relative in members:
+                        existing, blocked_parent = existing_member(relative)
+                        if existing is not None:
+                            collisions.append(f"{member.name!r} (destination exists)")
+                            continue
+                        if blocked_parent is not None:
+                            collisions.append(
+                                f"{member.name!r} (parent {blocked_parent} is not a directory)"
+                            )
+                            continue
+
+                        parent = path
+                        blocked = None
+                        for component in relative.parts[:-1]:
+                            entry = existing_entry(parent, component)
+                            if entry is not None:
+                                if entry.is_symlink() or not entry.is_dir():
+                                    blocked = entry
+                                    break
+                                parent = entry
+                            else:
+                                candidate = parent / component
+                                try:
+                                    candidate.mkdir()
+                                except FileExistsError:
+                                    entry = existing_entry(parent, component)
+                                    if (
+                                        entry is None
+                                        or entry.is_symlink()
+                                        or not entry.is_dir()
+                                    ):
+                                        blocked = entry or candidate
+                                        break
+                                    parent = entry
+                                else:
+                                    parent = candidate
+                        if blocked is not None:
+                            collisions.append(
+                                f"{member.name!r} (parent {blocked} is not a directory)"
+                            )
+                            continue
+
+                        target = parent / relative.parts[-1]
+                        if existing_entry(parent, target.name) is not None:
+                            collisions.append(f"{member.name!r} (destination exists)")
+                            continue
+                        if member.isdir():
+                            try:
+                                target.mkdir(mode=member.mode & 0o777)
+                            except FileExistsError:
+                                collisions.append(f"{member.name!r} (destination exists)")
+                        elif member.issym():
+                            try:
+                                os.symlink(member.linkname, target)
+                            except FileExistsError:
+                                collisions.append(f"{member.name!r} (destination exists)")
+                        else:
+                            source = archive.extractfile(member)
+                            if source is None:
+                                raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                                    f"ignored archive member {member.name!r} has no file data"
+                                )
+                            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            if hasattr(os, "O_NOFOLLOW"):
+                                flags |= os.O_NOFOLLOW
+                            file_descriptor = None
+                            created_identity = None
+                            try:
+                                file_descriptor = os.open(
+                                    target, flags, member.mode & 0o777
+                                )
+                                info = os.fstat(file_descriptor)
+                                created_identity = (info.st_dev, info.st_ino)
+                                with source, os.fdopen(file_descriptor, "wb") as output:
+                                    file_descriptor = None
+                                    shutil.copyfileobj(source, output)
+                            except FileExistsError:
+                                collisions.append(
+                                    f"{member.name!r} (destination exists)"
+                                )
+                            except OSError:
+                                if file_descriptor is not None:
+                                    os.close(file_descriptor)
+                                if created_identity is not None:
+                                    try:
+                                        info = target.lstat()
+                                        if (info.st_dev, info.st_ino) == created_identity:
+                                            target.unlink()
+                                    except FileNotFoundError:
+                                        pass
+                                raise
+            except goalflight_worktree_pool.WorktreeSeatResetRefused:
+                raise
+            except (OSError, tarfile.TarError) as exc:
+                raise goalflight_worktree_pool.WorktreeSeatResetRefused(
+                    f"ignored content could not be restored from "
+                    f"{ignored_archive_path}: {exc}"
+                ) from exc
+            if collisions:
+                args._resume_ignored_restore_notice = (
+                    "Ignored archive members were skipped because their destination "
+                    "already existed: "
+                    + "; ".join(collisions)
+                    + f". Their bytes remain in the verified archive {ignored_archive_path}."
+                )
+
+    def record_restored_snapshot(_path: Path) -> None:
+        lineage_ids = _resume_lineage_dispatch_ids(parent_dispatch_id)
+        root_id = lineage_ids[-1]
+        safe_root_id = (
+            re.sub(r"[^A-Za-z0-9._-]+", "-", root_id).strip(".-")
+            or "unknown-dispatch"
+        )
+        stamp = str(time.time_ns())
+        marker_ref = (
+            f"refs/goalflight/restored/{safe_root_id}/"
+            f"{stamp}-{recovery_head[:12]}"
+        )
+        goalflight_worktree_pool._git(
+            project_root, "update-ref", marker_ref, recovery_head, ""
+        )
+
     lease = goalflight_worktree_pool.acquire_worktree_seat(
         project_root,
         str(args.dispatch_id),
-        base=branch_tip,
+        base=recovery_head,
         branch=branch,
         controller_label=label,
         reset=True,
+        occupy_path=cwd,
         capacity_deadline=getattr(args, "_worktree_capacity_deadline", None),
-        before_reset=_worktree_occupancy_before_reset(args),
+        before_reset=archive_ignored_before_reclaim,
+        before_occupant=restore_before_occupant,
+        after_occupant=record_restored_snapshot,
+        _preclaimed_occupancy_lock=_preclaimed_worktree_occupancy_lock(args),
         managed_root=(
             Path(str(args.worktree_root)).expanduser()
             if getattr(args, "worktree_root", None)
             else None
         ),
     )
-    args._resume_relocated_worktree = True
+    ignored_restore_notice = getattr(args, "_resume_ignored_restore_notice", None)
+    if ignored_restore_notice:
+        previous_notice = getattr(args, "_resume_cwd_notice", None)
+        args._resume_cwd_notice = (
+            f"{previous_notice}\n\n{ignored_restore_notice}"
+            if previous_notice
+            else ignored_restore_notice
+        )
     return lease
 
 
@@ -2327,6 +3206,8 @@ def _pinned_seat_refusal(
     elapsed: float,
     *,
     flock_liveness: str = "held",
+    pool_reason: str | None = None,
+    recovery_refusal: str | None = None,
 ) -> DispatchUsageError:
     holder = str(holder_id or "unknown")
     holder_liveness = "unknown"
@@ -2338,10 +3219,30 @@ def _pinned_seat_refusal(
             )
         except Exception:
             holder_liveness = "unknown"
-    return DispatchUsageError(
+    reason_detail = f" pool_reason={pool_reason}" if pool_reason else ""
+    message = (
         f"worktree seat {seat_name}; wait for a seat: holder={holder}; "
-        f"flock_liveness={flock_liveness} holder_liveness={holder_liveness}; "
+        f"flock_liveness={flock_liveness}{reason_detail} "
+        f"holder_liveness={holder_liveness}; "
         f"refusing after {elapsed:.2f}s"
+    )
+    if recovery_refusal:
+        message += f"; {recovery_refusal}"
+    return DispatchUsageError(message)
+
+
+def _is_retryable_queued_refusal(args, reason: object) -> bool:
+    text = str(reason).casefold()
+    return bool(
+        getattr(args, "from_queue", False)
+        and getattr(args, "queue_launch_token", None)
+        and getattr(args, "queue_claim_path", None)
+        and (
+            "wait for a worktree" in text
+            or "wait for a seat" in text
+            or "wait for a status lock" in text
+            or "controller not connected; reconnect as:" in text
+        )
     )
 
 
@@ -2357,6 +3258,7 @@ def _worktree_occupancy_before_reset(args):
             and _pinned_worktree_seat_name(args, path) == path.name
             and not _resume_parent_is_terminal_and_exited(parent_dispatch_id)
         ):
+            args._worktree_seat_refused = True
             raise DispatchUsageError(
                 f"resume refused: parent {parent_dispatch_id} does not have a "
                 "terminal ledger record with proven-exited worker liveness"
@@ -2368,9 +3270,8 @@ def _worktree_occupancy_before_reset(args):
         args.cwd = str(path)
         try:
             warning = _prepare_attempt_worktree_occupancy(args)
-        except BaseException:
+        finally:
             args.cwd = previous_cwd
-            raise
         args._worktree_occupancy_warning = warning
         args._worktree_occupancy_checked = True
         args._worktree_occupancy_checked_path = checked_path
@@ -2387,6 +3288,37 @@ def _validate_resume_worktree_source(
         raise DispatchUsageError(f"resume refused: dispatch {parent_dispatch_id} is missing a project root")
     try:
         project_root = goalflight_task.resolve_project_root(str(raw_root))
+        if not cwd.is_dir() and _record_declared_read_only(record):
+            read_only_verdict, _reason = (
+                goalflight_worktree_pool.read_only_worktree_path_verdict(
+                    cwd, project_root=project_root
+                )
+            )
+            pool_verdict, _pool_reason = (
+                goalflight_worktree_pool.managed_worktree_path_verdict(
+                    cwd, project_root=project_root
+                )
+            )
+            if (
+                read_only_verdict == goalflight_worktree_pool.YES
+                or pool_verdict == goalflight_worktree_pool.YES
+            ):
+                recorded_base = record.get("worktree_head") or record.get(
+                    "worktree_base"
+                )
+                if not recorded_base:
+                    raise goalflight_worktree_pool.WorktreeCwdRefused(
+                        "resume refused: reclaimed read-only checkout has no "
+                        "recorded review base"
+                    )
+                if _resume_worktree_ref_commit(
+                    project_root, str(recorded_base)
+                ) is None:
+                    raise goalflight_worktree_pool.WorktreeCwdRefused(
+                        "resume refused: reclaimed read-only checkout has an "
+                        f"unresolvable review base {recorded_base}"
+                    )
+                return
         managed = goalflight_worktree_pool.is_managed_worktree_path(
             cwd, project_root=project_root
         )
@@ -2482,8 +3414,19 @@ def _validate_resume_worktree_source(
                     f"{actual_branch}; expected branch {expected_branch}"
                 )
             return
+        recovery_refs = _resume_recovery_refs_for_parent(
+            project_root, parent_dispatch_id
+        )
+        recovery_refusal = _resume_recovery_refusal(
+            project_root, parent_dispatch_id, recovery_refs
+        )
         expected_branch, expected_head, _keep_ref, _quarantine_ref = (
-            _resume_worktree_branch_spec(project_root, parent_dispatch_id, record)
+            _resume_worktree_branch_spec(
+                project_root,
+                parent_dispatch_id,
+                record,
+                recovery_refs=recovery_refs,
+            )
         )
         try:
             actual_branch = goalflight_worktree_pool._git(
@@ -2494,7 +3437,10 @@ def _validate_resume_worktree_source(
             raise DispatchUsageError(
                 f"resume refused: could not inspect recorded worktree {cwd}: {exc}"
             ) from exc
-        if actual_branch != expected_branch or actual_head != expected_head:
+        if (
+            recovery_refusal is None
+            and (actual_branch != expected_branch or actual_head != expected_head)
+        ):
             raise goalflight_worktree_pool.WorktreeCwdRefused(
                 f"resume refused: recorded checkout {cwd} has actual branch "
                 f"{actual_branch} at {actual_head}; expected branch "
@@ -2526,8 +3472,40 @@ def _revalidate_read_only_resume_worktree(
     _validate_resume_worktree_source(
         str(args.parent_dispatch_id),
         source["record"],
-        _worker_cwd(args),
+        _resume_worker_cwd(source["record"]),
     )
+    if getattr(args, "worktree", None) == "shared-read-only":
+        cwd = _worker_cwd(args)
+        expected_ref = source["record"].get("worktree_head") or source["record"].get(
+            "worktree_base"
+        )
+        if expected_ref:
+            expected_head = _resume_worktree_ref_commit(
+                _project_root(args), str(expected_ref)
+            )
+            if expected_head is None:
+                raise DispatchUsageError(
+                    f"resume refused: recorded read-only base {expected_ref} "
+                    "cannot be resolved"
+                )
+            try:
+                actual_head = goalflight_worktree_pool._git(cwd, "rev-parse", "HEAD")
+                actual_branch = goalflight_worktree_pool._git(
+                    cwd, "rev-parse", "--abbrev-ref", "HEAD"
+                )
+            except goalflight_worktree_pool.WorktreeSeatError as exc:
+                raise DispatchUsageError(
+                    f"resume refused: could not inspect read-only checkout {cwd}: {exc}"
+                ) from exc
+            if actual_head != expected_head:
+                expected_branch = str(
+                    source["record"].get("worktree_branch") or "HEAD"
+                )
+                raise DispatchUsageError(
+                    f"resume refused: read-only checkout {cwd} has actual branch "
+                    f"{actual_branch} at {actual_head}; expected branch "
+                    f"{expected_branch} at {expected_head}"
+                )
     if getattr(args, "_worktree_read_only", False):
         clean = goalflight_worktree_pool.check_seat_cleanliness(
             _worker_cwd(args),
@@ -2540,39 +3518,6 @@ def _revalidate_read_only_resume_worktree(
             )
 
 
-def _emit_resume_worktree_recovery_refs(args, lease) -> None:
-    if not getattr(args, "_resume_relocated_worktree", False):
-        return
-    refs: list[tuple[str, str | None]] = [
-        ("keep ref", getattr(lease, "keep_ref", None)),
-        ("quarantine ref", getattr(lease, "quarantine_branch", None)),
-    ]
-    parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
-    if parent_dispatch_id:
-        record = _find_dispatch_record(str(parent_dispatch_id)) or {}
-        refs.extend(
-            (
-                label,
-                record.get(key),
-            )
-            for label, key in (
-                ("keep ref", "worktree_keep_ref"),
-                ("quarantine ref", "worktree_quarantine_ref"),
-            )
-        )
-    printed: set[str] = set()
-    for label, value in refs:
-        if value:
-            text = str(value)
-            if text in printed:
-                continue
-            printed.add(text)
-            print(
-                f"goalflight_dispatch: resume worktree recovery {label}: {text}",
-                file=sys.stderr,
-            )
-
-
 def _record_shared_read_only_worktree(
     args,
     path: Path,
@@ -2580,6 +3525,15 @@ def _record_shared_read_only_worktree(
     hold=None,
 ) -> None:
     """Record a read-only checkout and retain any pooled-seat shared hold."""
+    previous_path = getattr(args, "cwd", None)
+    if previous_path and getattr(args, "parent_dispatch_id", None):
+        previous = Path(str(previous_path)).expanduser().resolve(strict=False)
+        current = path.expanduser().resolve(strict=False)
+        if previous != current:
+            args._resume_cwd_notice = (
+                f"Your previous checkout path {previous} was reclaimed; you are now "
+                f"in {current}; do not read {previous}."
+            )
     args.cwd = str(path)
     args._worktree_base_commit = base_commit
     args._worktree_id = path.name
@@ -2701,6 +3655,12 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
         if verdict != goalflight_worktree_pool.YES:
             _release_read_only_resume_reservation(args)
             return
+        if not path.is_dir():
+            # The terminal checkout may have been reclaimed after its report
+            # was saved. Let worktree binding create a fresh read-only checkout
+            # at the recorded review base instead of validating a missing path.
+            _release_read_only_resume_reservation(args)
+            return
         parent_record = _find_dispatch_record(str(args.parent_dispatch_id)) or {}
         recorded_ref = getattr(args, "_worktree_base_commit", None) or (
             parent_record.get("worktree_head")
@@ -2758,10 +3718,6 @@ def _prepare_read_only_resume_binding(args, project_root: Path) -> None:
 def _ledger_worker_cwd(args, state: str) -> str | None:
     if state not in PRE_WORKER_LEDGER_STATES:
         return str(_worker_cwd(args))
-    if getattr(args, "parent_dispatch_id", None) and _effective_read_only(args):
-        raw_cwd = getattr(args, "cwd", None)
-        if raw_cwd:
-            return str(_worker_cwd(args))
     return None
 
 
@@ -2850,6 +3806,28 @@ def _raise_worktree_admission_refusal(args, message: str) -> None:
     raise goalflight_worktree_pool.WorktreeCwdRefused(message)
 
 
+def _release_unlaunched_worktree_seat(
+    lease: goalflight_worktree_pool.WorktreeSeatLease,
+    dispatch_id: str,
+) -> None:
+    try:
+        lease.release_unlaunched()
+    except Exception as exc:
+        print(
+            "DISPATCH-FINALIZE-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "write": "worktree_prelaunch_release",
+                    "error": type(exc).__name__,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
     """Acquire a captive worktree. Isolation is not a mode.
 
@@ -2868,21 +3846,26 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     """
     if (
         getattr(args, "worktree", None) == "shared-read-only"
-        and not _effective_read_only(args)
+        and not _occupancy_exempt_read_only(args)
     ):
         raise DispatchUsageError(
-            "shared-read-only is an internal mode and requires --read-only"
+            "shared-read-only is an internal mode and requires --read-only; "
+            "the launch must enforce read-only access"
         )
     project_root = _project_root(args)
     if not getattr(args, "_worktree_capacity_lease_active", False):
         goalflight_worktree_pool.reap_read_only_worktrees(project_root)
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
-        return existing
+        if not _occupancy_exempt_read_only(args):
+            return existing
+        _release_unlaunched_worktree_seat(
+            existing, str(getattr(args, "dispatch_id", "unknown"))
+        )
+        args._worktree_seat = None
     inherited_ring_seat_mismatch = False
-    inherited_read_only_ring_seat = False
     inherited_seat_lock = False
-    if not getattr(args, "in_place", False):
+    if not getattr(args, "in_place", False) and not _occupancy_exempt_read_only(args):
         try:
             inherited_seat_lock = _inherited_seat_lock_present()
         except goalflight_worktree_pool.WorktreeSeatError as exc:
@@ -2943,30 +3926,16 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 fd_matches_seat = goalflight_worktree_pool._lock_fd_matches_identity(
                     inherited_fd, lock_identity
                 )
-                if fd_matches_seat and _effective_read_only(args):
-                    # A read-only caller may inherit a shared lock. Do not
-                    # inspect it by requesting LOCK_EX; continue through the
-                    # existing shared-read-only admission to acquire our own
-                    # hold before the child starts.
-                    inherited_read_only_ring_seat = True
             except (OSError, ValueError, goalflight_worktree_pool.WorktreeSeatError) as exc:
                 _raise_worktree_admission_refusal(
                     args,
                     "cannot verify that the inherited worktree lock fd owns "
                     f"effective seat {cwd}: {exc}",
                 )
-            if inherited_read_only_ring_seat:
-                pass
-            elif fd_matches_seat:
+            if fd_matches_seat:
                 return None
             else:
                 inherited_ring_seat_mismatch = True
-                inherited_read_only_ring_seat = _effective_read_only(args)
-        elif _effective_read_only(args):
-            # A leaked writer fd does not make a read-only project-root launch
-            # an attempt to reuse that seat. Let ordinary read-only admission
-            # handle its cwd without acquiring a writer seat.
-            pass
         else:
             cwd_label = (
                 f"project root {project_root}"
@@ -2982,7 +3951,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     if (
         getattr(args, "parent_dispatch_id", None)
         and _occupancy_exempt_read_only(args)
-        and not inherited_ring_seat_mismatch
     ):
         # A read-only resume reuses its recorded cwd. It has no writer seat to
         # reset or occupy. A recorded pooled seat still needs a shared hold so
@@ -3026,29 +3994,36 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     f"read-only resume recorded worktree path could not be "
                     f"classified: {recorded_pool_reason}"
                 )
-            hold = goalflight_worktree_pool.try_acquire_read_only_pool_seat(
-                project_root,
-                recorded_path,
-                str(args.dispatch_id),
-                base_commit=recorded_base,
-                deadline=read_only_deadline,
+            recorded_read_only_verdict, recorded_read_only_reason = (
+                goalflight_worktree_pool.read_only_worktree_path_verdict(
+                    recorded_path, project_root=project_root
+                )
             )
-            if hold is not None:
-                _record_shared_read_only_worktree(
-                    args, hold.path, recorded_base or goalflight_worktree_pool._git(
-                        hold.path, "rev-parse", "--verify", "HEAD^{commit}"
-                    ), hold,
+            if recorded_read_only_verdict == goalflight_worktree_pool.UNKNOWN:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"read-only resume recorded checkout could not be classified: "
+                    f"{recorded_read_only_reason}"
                 )
-            elif recorded_pool_verdict == goalflight_worktree_pool.YES:
-                shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
-                    project_root,
-                    str(args.dispatch_id),
-                    base=recorded_base,
-                    reap=not getattr(args, "_worktree_capacity_lease_active", False),
+            if (
+                recorded_read_only_verdict == goalflight_worktree_pool.YES
+                and recorded_path.is_dir()
+                and not goalflight_worktree_pool._read_only_seat_matches(
+                    recorded_path, recorded_base, deadline=read_only_deadline
                 )
-                _record_shared_read_only_worktree(
-                    args, shared_path, base_commit, hold
+            ):
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"read-only resume checkout {recorded_path} is not clean "
+                    "or no longer matches its recorded base"
                 )
+            shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
+                project_root,
+                str(args.dispatch_id),
+                base=recorded_base,
+                reap=not getattr(args, "_worktree_capacity_lease_active", False),
+            )
+            _record_shared_read_only_worktree(
+                args, shared_path, base_commit, hold
+            )
         return None
     label = _controller_ring_label(args, project_root)
     skip_reset = bool(getattr(args, "skip_seat_reset", False))
@@ -3063,7 +4038,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         # probe the requested seat flock.
         capacity_deadline = 0.0
 
-    if getattr(args, "worktree", None) == "shared-read-only":
+    if _occupancy_exempt_read_only(args):
         shared_path, base_commit, hold = goalflight_worktree_pool.bind_read_only_worktree(
             project_root,
             str(args.dispatch_id),
@@ -3101,7 +4076,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     if (
         getattr(args, "worktree", None) == "off"
         and not inherited_ring_seat_mismatch
-        and not inherited_read_only_ring_seat
     ):
         # ACP direct configs do not request a post-capacity pool bind. This
         # check follows --in-place validation so nested ACP cwds are refused.
@@ -3120,64 +4094,14 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             ),
         )
         if kind == "in-place" and not force_captive:
-            if _effective_read_only(args):
+            if _occupancy_exempt_read_only(args):
                 return None
             _raise_worktree_admission_refusal(
                 args,
                 f"--cwd {cwd} is the project root; pass --in-place explicitly "
                 "to run a writer there",
             )
-        if (
-            kind == "ring-seat"
-            and inherited_read_only_ring_seat
-            and _occupancy_exempt_read_only(args)
-        ):
-            read_only_deadline = (
-                time.monotonic() + goalflight_worktree_pool.READ_ONLY_REAP_TIMEOUT_S
-            )
-            parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
-            base_ref = getattr(args, "_worktree_base_commit", None)
-            if parent_dispatch_id:
-                parent_record = _find_dispatch_record(str(parent_dispatch_id)) or {}
-                base_ref = base_ref or parent_record.get("worktree_head") or parent_record.get(
-                    "worktree_base"
-                )
-                if not base_ref:
-                    raise goalflight_worktree_pool.WorktreeCwdRefused(
-                        "read-only resume recorded a worktree without a resolvable "
-                        "review base; refusing to review its current HEAD"
-                    )
-            else:
-                base_ref = base_ref or base
-            try:
-                base_commit = goalflight_worktree_pool._git(
-                    project_root if base_ref else cwd,
-                    "rev-parse",
-                    "--verify",
-                    f"{base_ref or 'HEAD'}^{{commit}}",
-                    timeout=goalflight_worktree_pool._deadline_timeout(
-                        read_only_deadline
-                    ),
-                )
-            except goalflight_worktree_pool.WorktreeSeatError as exc:
-                raise goalflight_worktree_pool.WorktreeCwdRefused(
-                    f"cannot resolve the read-only base for seat {cwd}: {exc}"
-                ) from exc
-            hold = goalflight_worktree_pool.try_acquire_read_only_pool_seat(
-                project_root,
-                cwd,
-                str(args.dispatch_id),
-                base_commit=base_commit,
-                deadline=read_only_deadline,
-            )
-            if hold is None:
-                raise goalflight_worktree_pool.WorktreeCwdRefused(
-                    f"read-only seat {cwd} is unavailable or does not match "
-                    f"base {base_commit}; refusing to switch checkouts"
-                )
-            _record_shared_read_only_worktree(args, hold.path, base_commit, hold)
-            return None
-        elif kind == "ring-seat":
+        if kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
             expected_prior_dispatch_id = (
                 str(parent_dispatch_id) if parent_dispatch_id else None
@@ -3206,6 +4130,9 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     ),
                     "capacity_deadline": capacity_deadline,
                     "before_reset": _worktree_occupancy_before_reset(args),
+                    "_preclaimed_occupancy_lock": (
+                        _preclaimed_worktree_occupancy_lock(args)
+                    ),
                 }
                 if allowed_prior_dispatch_ids:
                     kwargs["allowed_prior_dispatch_ids"] = allowed_prior_dispatch_ids
@@ -3218,84 +4145,89 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             try:
                 lease = acquire_ring_seat()
             except goalflight_worktree_pool.WorktreeSeatReclaimed as reclaimed:
+                if not skip_reset or not parent_dispatch_id:
+                    raise
                 if getattr(reclaimed, "flock_held", False):
                     raise
-                if not skip_reset or not parent_dispatch_id:
-                    raise
-                if reclaimed.terminal_reclaimed:
-                    # The pool raised this only because the recorded id differs
-                    # from the exact expected parent. A different terminal
-                    # ancestor is not this resume's seat to adopt.
-                    raise
-                else:
-                    try:
-                        lease = _resume_replacement_worktree(
-                            args,
-                            project_root=project_root,
-                            parent_dispatch_id=str(parent_dispatch_id),
-                        )
-                    except (
-                        goalflight_worktree_pool.WorktreeSeatUnavailable,
-                        goalflight_worktree_pool.WorktreeSeatResetRefused,
-                    ):
-                        raise reclaimed
-            except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
-                if getattr(exc, "flock_held", False):
-                    raise
-                if _pinned_worktree_seat_name(args):
-                    raise
-                if not skip_reset or not parent_dispatch_id:
-                    raise
-                message = str(exc)
-                if "unknown ownership" in message:
-                    raise
-                holder_tokens = set(re.findall(r"=(\S+)", message))
-                if (
-                    (" is held:" in message or "oldest holders:" in message)
-                    and str(parent_dispatch_id) in holder_tokens
-                ):
-                    raise
-                lease = _resume_replacement_worktree(
-                    args,
-                    project_root=project_root,
-                    parent_dispatch_id=str(parent_dispatch_id),
+                recovery_refs = _resume_recovery_refs_for_parent(
+                    project_root, str(parent_dispatch_id)
                 )
-            except goalflight_worktree_pool.WorktreeCwdRefused:
-                if not (
-                    skip_reset
-                    and parent_dispatch_id
-                    and not cwd.exists()
-                ):
+                if not recovery_refs:
                     raise
-                seat_name = _pinned_worktree_seat_name(args, cwd)
-                if seat_name:
-                    flock_held, holder = (
-                        goalflight_worktree_pool._probe_worktree_seat_flock(
-                            project_root,
-                            cwd,
-                            managed_root=(
-                                Path(str(args.worktree_root)).expanduser()
-                                if getattr(args, "worktree_root", None)
-                                else None
-                            ),
+                current_holder = reclaimed.current_holder
+                try:
+                    if not reclaimed.terminal_reclaimed:
+                        holder_record = {}
+                        if current_holder:
+                            holder_record, _holder_live = (
+                                goalflight_worktree_pool._holder_record(
+                                    current_holder,
+                                    project_root=project_root,
+                                    probe_journal=False,
+                                )
+                            )
+                        holder_state = str(holder_record.get("state") or "")
+                        holder_terminal = goalflight_ledger.terminal_state_for(
+                            holder_state,
+                            holder_record.get("reason") or holder_record.get("error"),
                         )
+                        if not (
+                            goalflight_ledger.prelaunch_without_worker_evidence(
+                                holder_record
+                            )
+                            or holder_state == "cancelled"
+                            or holder_terminal not in {"", "unknown", "watcher_stopped"}
+                        ):
+                            raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                                f"worktree {cwd.name} holder "
+                                f"{current_holder or 'unknown'} has no terminal record "
+                                "for resume recovery"
+                            )
+                    lease = _resume_recycled_worktree_in_place(
+                        args,
+                        project_root=project_root,
+                        parent_dispatch_id=str(parent_dispatch_id),
+                        recovery_refs=recovery_refs,
                     )
-                    if flock_held is not False:
-                        liveness = "held" if flock_held else "unknown"
-                        raise goalflight_worktree_pool.WorktreeSeatUnavailable(
-                            f"pinned worktree seat {seat_name} flock state is "
-                            f"{liveness}",
-                            seat_name=seat_name,
-                            current_holder=holder,
-                            flock_held=flock_held is True,
-                        )
-                lease = _resume_replacement_worktree(
-                    args,
-                    project_root=project_root,
-                    parent_dispatch_id=str(parent_dispatch_id),
-                )
+                except goalflight_worktree_pool.WorktreeSeatUnavailable as holder_error:
+                    raise goalflight_worktree_pool.WorktreeSeatReclaimed(
+                        f"{reclaimed}; preserved state in recovery ref(s) "
+                        + ", ".join(recovery_refs),
+                        seat_name=reclaimed.seat_name or cwd.name,
+                        current_holder=current_holder,
+                        expected_holder=(
+                            reclaimed.expected_holder or str(parent_dispatch_id)
+                        ),
+                        terminal_reclaimed=reclaimed.terminal_reclaimed,
+                        flock_held=getattr(holder_error, "flock_held", False),
+                    ) from holder_error
+            except goalflight_worktree_pool.WorktreeCwdRefused as exc:
+                if skip_reset and parent_dispatch_id:
+                    held, holder = goalflight_worktree_pool._probe_worktree_seat_flock(
+                        project_root,
+                        cwd,
+                        managed_root=(
+                            Path(str(args.worktree_root)).expanduser()
+                            if getattr(args, "worktree_root", None)
+                            else None
+                        ),
+                    )
+                    refusal = _resume_recovery_refusal(
+                        project_root,
+                        str(parent_dispatch_id),
+                    )
+                    if held:
+                        raise _pinned_seat_refusal(
+                            cwd.name,
+                            holder,
+                            0.0,
+                            flock_liveness="held",
+                            recovery_refusal=str(refusal) if refusal else None,
+                        ) from exc
+                    if refusal is not None:
+                        raise refusal from exc
+                raise
             _record_dispatch_worktree(args, lease)
-            _emit_resume_worktree_recovery_refs(args, lease)
             return lease
         elif kind == "in-place" and force_captive:
             # ``--worktree create --cwd <project-root>`` is the explicit
@@ -3341,7 +4273,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         before_reset=_worktree_occupancy_before_reset(args),
     )
     _record_dispatch_worktree(args, lease)
-    _emit_resume_worktree_recovery_refs(args, lease)
     return lease
 
 
@@ -3366,6 +4297,24 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
             raise DispatchUsageError("--capacity-wait-s must be finite")
         wait_s = max(0.0, requested_wait)
     admission_started = time.monotonic()
+    queue_wait_limited = False
+    queue_deadline = getattr(args, "_queue_launch_deadline", None)
+    if getattr(args, "from_queue", False) and queue_deadline is not None:
+        try:
+            queue_deadline = float(queue_deadline)
+        except (TypeError, ValueError):
+            queue_deadline = float("nan")
+        if math.isfinite(queue_deadline):
+            # The queue deadline already includes 60s of preparation plus 45s
+            # of confirmation. Subtract time spent before this wait and keep
+            # 5s to persist a refusal; with 105s total and 30s already spent,
+            # at most 70s remains for seat polling. Missing/non-finite values
+            # retain the pre-change requested wait; never grant a fresh budget.
+            queue_wait_budget_s = max(
+                0.0, queue_deadline - admission_started - 5.0
+            )
+            queue_wait_limited = queue_wait_budget_s < wait_s
+            wait_s = min(wait_s, queue_wait_budget_s)
     deadline = admission_started + wait_s
     pinned_seat_name = _pinned_worktree_seat_name(args)
     pinned_wait_s = min(wait_s, PINNED_SEAT_WAIT_MAX_S)
@@ -3420,11 +4369,35 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                     remaining = pinned_deadline - time.monotonic()
                     if remaining <= 0:
                         args._worktree_seat_refused = True
+                        if (
+                            getattr(args, "from_queue", False)
+                            and queue_wait_limited
+                        ):
+                            raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                                f"seat busy: queue launch budget exhausted; {exc}",
+                                seat_name=pinned_seat_name,
+                                current_holder=holder,
+                                flock_held=flock_held,
+                                skipped_slots=getattr(exc, "skipped_slots", ()),
+                            ) from exc
+                        recovery_refusal = None
+                        parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
+                        if parent_dispatch_id:
+                            try:
+                                recovery_refusal = _resume_recovery_refusal(
+                                    _project_root(args), str(parent_dispatch_id)
+                                )
+                            except Exception:
+                                recovery_refusal = None
                         raise _pinned_seat_refusal(
                             pinned_seat_name,
                             holder,
                             min(pinned_wait_s, max(0.0, time.monotonic() - admission_started)),
                             flock_liveness="held" if flock_held else "unknown",
+                            pool_reason=getattr(exc, "reason", None),
+                            recovery_refusal=(
+                                str(recovery_refusal) if recovery_refusal else None
+                            ),
                         ) from exc
                     time.sleep(min(0.05, remaining))
                     continue
@@ -3433,10 +4406,16 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     args._worktree_seat_refused = True
+                    if getattr(args, "from_queue", False) and queue_wait_limited:
+                        raise goalflight_worktree_pool.WorktreeSeatUnavailable(
+                            f"seat busy: queue launch budget exhausted; {exc}",
+                            skipped_slots=getattr(exc, "skipped_slots", ()),
+                        ) from exc
                     if wait_s:
                         raise goalflight_worktree_pool.WorktreeSeatUnavailable(
                             f"seat wait expired after {wait_s:g}s: "
-                            f"{last_wait_error or exc}"
+                            f"{last_wait_error or exc}",
+                            skipped_slots=getattr(exc, "skipped_slots", ()),
                         ) from exc
                     raise
                 if not getattr(args, "_worktree_wait_notified", False):
@@ -3523,20 +4502,25 @@ def _admit_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease
         warning = getattr(args, "_worktree_occupancy_warning", None)
         checked_path = getattr(args, "_worktree_occupancy_checked_path", None)
         current_path = str(Path(str(_worker_cwd(args))).resolve(strict=False))
-        if checked_path != current_path:
-            if checked_path:
-                _release_worktree_occupancy_lock(args)
-            warning = _prepare_attempt_worktree_occupancy(args)
-            args._worktree_occupancy_warning = warning
-            args._worktree_occupancy_checked = True
-            args._worktree_occupancy_checked_path = current_path
+        if checked_path and checked_path != current_path:
+            _release_worktree_occupancy_lock(args)
+        # A pre-capacity check may have been held while capacity waited. Read
+        # ledger occupancy again at admission so stale evidence cannot admit
+        # a writer after the ledger becomes unreadable or changes.
+        warning = _prepare_attempt_worktree_occupancy(args)
+        args._worktree_occupancy_warning = warning
+        args._worktree_occupancy_checked = True
+        args._worktree_occupancy_checked_path = current_path
         if warning is not None:
-            args.dispatch_warnings = [*getattr(args, "dispatch_warnings", []), warning]
+            warnings = getattr(args, "dispatch_warnings", [])
+            if warning not in warnings:
+                args.dispatch_warnings = [*warnings, warning]
         return lease
     except BaseException:
         if lease is not None:
-            with contextlib.suppress(Exception):
-                lease.release()
+            _release_unlaunched_worktree_seat(
+                lease, str(getattr(args, "dispatch_id", "unknown"))
+            )
             if getattr(args, "_worktree_seat", None) is lease:
                 args._worktree_seat = None
         _release_read_only_worktree_hold(args)
@@ -3578,6 +4562,7 @@ def _queue_entry_path(dispatch_id: str, *, queue_dir: Path | None = None) -> Pat
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
+    goalflight_journal.validate_dispatch_owner_fields(payload)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
@@ -4403,6 +5388,7 @@ def _status_reminder_lines(
         "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
         "and exit early):",
         f"  status: python3 {q(str(status_py))} --dispatch {dispatch_id}",
+        f"  final:  python3 {q(str(SCRIPT_DIR / 'goalflight_dispatch.py'))} final {dispatch_id}",
         # The wait is shown in its BACKGROUNDED form on purpose. Printed as a
         # plain foreground command it reads as "block here for however long the
         # worker takes", which the >10s foreground rule forbids -- so controllers
@@ -4663,7 +5649,7 @@ def _emit_dispatch_warnings(
             tail_file.close()
 
 
-def _read_only_write_prompt_reason(args) -> str | None:
+def _read_only_write_prompt_reason(args) -> tuple[str, str] | None:
     if not _effective_read_only(args) or not _prompt_requested(args):
         return None
     text = _read_prompt_for_guard(args)
@@ -4673,8 +5659,17 @@ def _read_only_write_prompt_reason(args) -> str | None:
         if pattern.search(text):
             return None
     for label, pattern in READ_ONLY_WRITE_PROMPT_PATTERNS:
-        if pattern.search(text):
-            return label
+        match = pattern.search(text)
+        if match:
+            matched_span = match.group(0)
+            if label == "write review artifact" and matched_span.endswith("docs-private/"):
+                destination = re.match(
+                    r"docs-private/[^ \t\r\n`'\"<>;,!?]+",
+                    text[match.end() - len("docs-private/"):],
+                )
+                if destination:
+                    matched_span += destination.group(0)[len("docs-private/"):].rstrip(".")
+            return label, matched_span.replace("`", "")
     return None
 
 
@@ -4682,9 +5677,11 @@ def _guard_read_only_write_prompt(args) -> None:
     reason = _read_only_write_prompt_reason(args)
     if not reason:
         return
+    label, matched_span = reason
     raise DispatchUsageError(
         "--read-only prompt appears to require writing a review artifact "
-        f"(matched {reason}). Read-only workers cannot write review files; "
+        f"(matched {label}: {matched_span!r}). "
+        "Read-only workers cannot write review files; "
         "return findings inline in the final response, or use a writable "
         "sandbox/worktree."
     )
@@ -4742,7 +5739,11 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> dict[str, str]:
             raise ProvenPreWorkerRefusal(
                 f"--agent {args.agent!r} is retired — {retired}"
             )
-        if args.agent not in PRESET_AGENTS:
+        acp_preset = (
+            getattr(args, "shape", "bash") == "acp"
+            and args.agent in {"codex-acp", "grok-acp"}
+        )
+        if args.agent not in PRESET_AGENTS and not acp_preset:
             raise ProvenPreWorkerRefusal(
                 "no worker preset for --agent "
                 f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
@@ -5033,6 +6034,7 @@ def _nonterminal_dispatch_reuse_reason(
 # A resume chain longer than this is corrupt. Stop and leave any further
 # ancestor holding, rather than looping.
 _RESUME_LINEAGE_WALK_LIMIT = 64
+_RESUME_CONTEXT_GIT_TIMEOUT_SECONDS = 30.0
 
 
 def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
@@ -5086,6 +6088,57 @@ def _resume_lineage_dispatch_ids(parent_dispatch_id: str) -> list[str]:
     if root_branch and (not goalflight_worktree_pool.is_worktree_branch(root_branch) or root_branch.rsplit("/", 1)[-1] != root_id):
         raise goalflight_worktree_pool.WorktreeCwdRefused(f"resume refused: root lineage branch {root_branch} does not belong to root dispatch {root_id}")
     return exempt
+
+
+def _resume_context_project_root(
+    raw_path: str, cache: dict[str, Path | None],
+) -> Path | None:
+    if raw_path in cache:
+        return cache[raw_path]
+    start = Path(raw_path).expanduser()
+    git_env = os.environ.copy()
+    git_env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        top = subprocess.run(
+            [
+                "git", "-C", str(start), "-c", "core.fsmonitor=false",
+                "rev-parse", "--show-toplevel",
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=git_env, check=False, timeout=_RESUME_CONTEXT_GIT_TIMEOUT_SECONDS,
+        )
+        common = subprocess.run(
+            [
+                "git", "-C", str(start), "-c", "core.fsmonitor=false",
+                "rev-parse", "--git-common-dir",
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=git_env, check=False, timeout=_RESUME_CONTEXT_GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        cache[raw_path] = None
+        return None
+    if top.returncode != 0 or common.returncode != 0:
+        cache[raw_path] = None
+        return None
+    if not top.stdout.strip() or not common.stdout.strip():
+        cache[raw_path] = None
+        return None
+    top_path = Path(top.stdout.strip())
+    common_path = Path(common.stdout.strip())
+    if not top_path.is_absolute():
+        top_path = start / top_path
+    if not common_path.is_absolute():
+        common_path = start / common_path
+    try:
+        top_path = top_path.resolve(strict=False)
+        common_path = common_path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        cache[raw_path] = None
+        return None
+    root = common_path.parent if common_path.name == ".git" else top_path
+    cache[raw_path] = root
+    return root
 
 
 def _resume_parent_is_terminal_and_exited(parent_dispatch_id: str) -> bool:
@@ -5227,15 +6280,27 @@ def _redispatch_record_has_no_advanced_work(record: dict) -> bool:
         or record.get("base_commit")
         or ""
     ).strip().lower()
-    if not worker_cwd or not base_sha:
+    if not worker_cwd:
+        if record.get("prelaunch_failure") is True:
+            return marker_is_terminal_attention
+        raise DispatchUsageError(
+            "task redispatch refused: dispatch record is missing worker_cwd "
+            "and is not marked prelaunch_failure"
+        )
+    if not base_sha:
         return marker_is_terminal_attention
+    worker_cwd_path = Path(str(worker_cwd)).expanduser()
+    if not worker_cwd_path.is_absolute():
+        raise DispatchUsageError(
+            "task redispatch refused: recorded worker_cwd is not absolute"
+        )
     evidence = worktree_work_evidence(
-        worker_cwd,
+        worker_cwd_path,
         since_epoch=_parse_timestamp_s(record.get("started_at")),
     )
     if evidence is not None:
         return False
-    head = _git_head_for_cwd(Path(str(worker_cwd)))
+    head = _git_head_for_cwd(worker_cwd_path)
     return bool(head and head == base_sha)
 
 
@@ -5406,14 +6471,676 @@ def _redispatch_git_output(
     return result.returncode, result.stdout.strip()
 
 
-def _pin_redispatch_wip(record: dict) -> str:
+_NEVER_LAUNCHED_RECORD_FIELDS = {
+    "agent",  # Identifies the requested executor, not a started process.
+    "attempt_id",  # Journal correlation identifier.
+    "controller_label",  # Owning controller label, not worker identity.
+    "dispatch_id",  # Ledger correlation identifier.
+    "ended_at",  # Terminal bookkeeping timestamp.
+    "epoch",  # Status-sidecar generation identifier.
+    "liveness_state",  # Recorded terminal liveness classification.
+    "outcome",  # Checked separately for inert terminal reconciliation data.
+    "project_root",  # Scope for the task and journal lookup.
+    "queue_launch_token",  # Queue authorization can exist before worker spawn.
+    "reconciliation",  # Recovery audit metadata, validated below.
+    "reason",  # Terminal accounting reason.
+    "salvage_required",  # Task recovery bookkeeping, independent of launch.
+    "schema",  # Ledger record format identifier.
+    "shape",  # Requested worker shape, not launch evidence.
+    "started_at",  # Dispatch bookkeeping timestamp, not process identity.
+    "state",  # Terminal ledger state.
+    "status_path",  # Status destination; its file is checked below.
+    "status_json",  # Status destination alias; its file is checked below.
+    "stdout_path",  # Output destination; its file is checked below.
+    "tail",  # Output destination alias; its file is checked below.
+    "tail_path",  # Output destination alias; its file is checked below.
+    "task_ids",  # Task ownership identifiers.
+    "terminal_event_uuid",  # Terminal event correlation identifier.
+    "terminal_state",  # Journal terminal classification.
+    "transition_id",  # Ledger transition correlation identifier.
+    "transport",  # Requested transport, not a launch receipt.
+    "updated_at",  # Ledger bookkeeping timestamp.
+}
+_NEVER_LAUNCHED_PREPARED_RECORD_FIELDS = frozenset(
+    {
+        "account",
+        "claimant_identity",
+        "claimant_pid",
+        "controller_identity",
+        "controller_pid",
+        "controller_session_id",
+        "dispatch_argv",
+        "effective_account",
+        "engine",
+        "hostname",
+        "launch_epoch",
+        "launch_token",
+        "lease_id",
+        "logical_session_id",
+        "model",
+        "os_sandbox",
+        "prompt_id",
+        "prompt_path",
+        "prompt_sha256",
+        "queue_worker_spawn_intent",
+        "queue_worker_spawn_intent_at",
+        "reasoning_effort",
+        "remote_lease_id",
+        "stderr_path",
+    }
+)
+_NEVER_LAUNCHED_OUTCOME_FIELDS = {
+    "reason",  # Terminal accounting reason.
+    "error",  # failure_envelope's dict/list form.
+    "terminal_state",  # Terminal journal classification.
+    "reconciliation",  # Reconciliation metadata, checked separately.
+    "state",  # commit_terminal_authority observation.
+    "outcome",  # failure_envelope emitted by commit_terminal_authority.
+    "worker_still_alive",  # commit_terminal_authority liveness observation.
+    "prelaunch_failure",  # commit_terminal_authority launch classification.
+    "headline",  # Optional terminal headline emitted by commit_terminal_authority.
+    "withdrawn_by",  # Added by _cmd_withdraw to a terminal observation.
+    "superseded_by",  # Added by _cmd_withdraw to a terminal observation.
+}
+_NEVER_LAUNCHED_RECONCILIATION_FIELDS = {
+    "basis",  # _commit_abandoned_dispatch classification.
+    "checked_output",  # Reconciler audit result, not worker output.
+    "checked_task_ids",  # Reconciler audit scope.
+    "claim_recovery_count",  # Claim recovery bookkeeping count.
+    "controller_evidence",  # _commit_abandoned_dispatch liveness audit.
+    "launch_timeout_s",  # Configured timeout, not evidence of launch.
+    "lease_evidence",  # _commit_abandoned_dispatch lease audit.
+    "observed_outcome",  # _commit_abandoned_dispatch marker audit.
+    "output_evidence",  # _commit_abandoned_dispatch output audit.
+    "process_evidence",  # _commit_abandoned_dispatch liveness audit.
+    "progress_age_s",  # _commit_abandoned_dispatch stale-window audit.
+    "queue_launch_token",  # Queue authorization, not evidence of spawn.
+    "reason",  # Reconciler classification reason.
+    "resolution_source",  # commit_reconciled_terminal authority source.
+    "salvage_required",  # Recovery bookkeeping decision.
+    "source",  # Reconciliation path label, such as drain_claim_recovery.
+    "status_evidence",  # _commit_abandoned_dispatch sidecar audit.
+    "terminal_marker_kind",  # _commit_abandoned_dispatch observed marker.
+}
+# Queue-envelope fields that describe the request or its queue bookkeeping,
+# not a launched worker. The nested request names are explicit too: a future
+# receipt added anywhere in the carrier must fail closed until reviewed.
+_NEVER_LAUNCHED_CARRIER_FIELDS = frozenset({
+    "schema",  # Queue format version.
+    "state",  # Validated as queued below; claimed or later states may be racing launch.
+    "dispatch_id",  # Correlates this envelope to the terminal record.
+    "agent",  # Requested executor, not process identity.
+    "shape",  # Requested worker shape, not process identity.
+    "project_root",  # Task scope, not a worker checkout.
+    "process_cwd",  # Dispatcher request context, not worker cwd evidence.
+    "base_sha",  # Requested source revision, not worker output.
+    "parent_dispatch_id",  # Request lineage only.
+    "controller_label",  # Queue owner attribution, not worker identity.
+    "created_at",  # Enqueue timestamp.
+    "updated_at",  # Queue bookkeeping timestamp; launch receipts are separate fields.
+    "queue_path",  # Location of this envelope.
+    "dispatch_argv",  # Requested command, not a receipt that it ran.
+    "task_ids",  # Work ownership identifiers.
+    "queue_launch_token",  # Queue authorization can exist before spawn.
+    "requeued_from",  # Request lineage only.
+    "priority",  # Scheduling hint.
+    "effective_account",  # Requested account selection.
+    "account",  # Requested account selection.
+    "not_before",  # Scheduling timestamp.
+    "requeue_attempt",  # Queue retry bookkeeping.
+    "request.agent",  # Requested executor.
+    "request.priority",  # Scheduling hint.
+    "request.cwd",  # Requested project directory.
+    "request.tail",  # Output destination; its bytes are checked below.
+    "request.status_json",  # Status destination; its contents are checked below.
+    "request.prompt_file",  # Requested prompt source.
+    "request.account",  # Requested account selection.
+    "request.read_only",  # Requested execution mode.
+    "request.os_sandbox",  # Requested sandbox mode.
+    "request.task_ids",  # Work ownership identifiers.
+    "request.shape",  # Requested worker shape.
+    "request.dispatch_id",  # Request correlation identifier.
+    "request.project_root",  # Task scope.
+    "request.controller_label",  # Queue owner attribution.
+    "request.requeued_from",  # Request lineage only.
+    "request.requeue_attempt",  # Queue retry bookkeeping.
+    "request.not_before",  # Scheduling timestamp.
+})
+_NEVER_LAUNCHED_PREPARED_CARRIER_FIELDS = frozenset(
+    {
+        "queue_claimer_identity",
+        "queue_claimer_pid",
+        "queue_launch_started",
+        "queue_launch_started_at",
+        "queue_launcher_identity",
+        "queue_launcher_pid",
+        "queue_worker_spawn_intent",
+        "queue_worker_spawn_intent_at",
+    }
+)
+
+
+def _record_proves_never_launched(
+    record: dict,
+    carrier_entries: list[dict | None],
+    *,
+    allow_prepared_attempt: bool = False,
+) -> bool:
+    try:
+        return _record_proves_never_launched_unchecked(
+            record,
+            carrier_entries,
+            allow_prepared_attempt=allow_prepared_attempt,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "never-launched proof failed closed (%s)", type(exc).__name__
+        )
+        return False
+
+
+def _record_proves_never_launched_unchecked(
+    record: dict,
+    carrier_entries: list[dict | None],
+    *,
+    allow_prepared_attempt: bool = False,
+) -> bool:
+    dispatch_id = str(record.get("dispatch_id") or "").strip()
+    root = goalflight_task.resolve_project_root_for_read(record.get("project_root"))
+    if not dispatch_id or root is None:
+        return False
+
+    def populated(value: object) -> bool:
+        if value is None or value is False:
+            return False
+        return not isinstance(value, (str, bytes, list, tuple, set, dict)) or bool(value)
+
+    def known_reconciliation(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for key, nested in value.items():
+            if key not in _NEVER_LAUNCHED_RECONCILIATION_FIELDS:
+                return False
+            if key in {"checked_output", "observed_outcome", "salvage_required"}:
+                if type(nested) is not bool:
+                    return False
+            elif key == "checked_task_ids":
+                if not isinstance(nested, list) or any(
+                    not isinstance(task_id, str) for task_id in nested
+                ):
+                    return False
+            elif key == "claim_recovery_count":
+                if type(nested) is not int or nested < 0:
+                    return False
+            elif key == "launch_timeout_s":
+                if (
+                    type(nested) not in {int, float}
+                    or not math.isfinite(nested)
+                    or nested < 0
+                ):
+                    return False
+            elif key == "progress_age_s":
+                if (
+                    type(nested) not in {int, float}
+                    or not math.isfinite(nested)
+                    or nested < 0
+                ):
+                    return False
+            else:
+                if not isinstance(nested, str):
+                    return False
+        return True
+
+    def known_terminal_outcome(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for outcome_key, outcome_value in value.items():
+            if outcome_key not in _NEVER_LAUNCHED_OUTCOME_FIELDS:
+                return False
+            if not populated(outcome_value):
+                continue
+            if outcome_key in {
+                "reason", "terminal_state", "state", "headline", "withdrawn_by",
+                "superseded_by",
+            } and not isinstance(outcome_value, str):
+                return False
+            if outcome_key in {"worker_still_alive", "prelaunch_failure"} and type(
+                outcome_value
+            ) is not bool:
+                return False
+            if outcome_key == "outcome":
+                if (
+                    not isinstance(outcome_value, dict)
+                    or len(outcome_value) != 1
+                    or set(outcome_value) not in ({"reason"}, {"error"})
+                ):
+                    return False
+                if "reason" in outcome_value and not isinstance(
+                    outcome_value["reason"], str
+                ):
+                    return False
+                if "error" in outcome_value and not isinstance(
+                    outcome_value["error"], (dict, list)
+                ):
+                    return False
+            if outcome_key == "error" and not isinstance(
+                outcome_value, (str, dict, list)
+            ):
+                return False
+            if outcome_key == "error" and contains_worker_evidence(outcome_value):
+                return False
+            if outcome_key == "reconciliation":
+                if not known_reconciliation(outcome_value):
+                    return False
+        return True
+
+    def contains_worker_evidence(value: object) -> bool:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if not isinstance(key, str):
+                    return True
+                normalized = key.casefold()
+                if populated(nested) and (
+                    normalized == "pid"
+                    or normalized.endswith("_pid")
+                    or "worker" in normalized
+                    or "identity" in normalized
+                ):
+                    return True
+                if contains_worker_evidence(nested):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(contains_worker_evidence(nested) for nested in value)
+        return value is not None and not isinstance(value, (str, int, float, bool))
+
+    def known_inert_fields(values: dict) -> bool:
+        allowed_fields = _NEVER_LAUNCHED_RECORD_FIELDS
+        if allow_prepared_attempt:
+            allowed_fields = allowed_fields | _NEVER_LAUNCHED_PREPARED_RECORD_FIELDS
+        for key, value in values.items():
+            if not populated(value):
+                continue
+            if key not in allowed_fields:
+                return False
+            if key in {"claimant_identity", "controller_identity", "os_sandbox"} and not isinstance(
+                value, dict
+            ):
+                return False
+            if key in {"claimant_pid", "controller_pid"} and (
+                type(value) is not int or value <= 0
+            ):
+                return False
+            if key == "dispatch_argv" and (
+                not isinstance(value, list)
+                or any(not isinstance(part, str) for part in value)
+            ):
+                return False
+            if key == "launch_epoch" and (type(value) is not int or value != 0):
+                return False
+            if key == "logical_session_id" and value != dispatch_id:
+                return False
+            if key in {"launch_token", "prompt_path", "prompt_sha256", "hostname"} and not isinstance(
+                value, str
+            ):
+                return False
+            if key == "queue_worker_spawn_intent" and type(value) is not bool:
+                return False
+            if key == "queue_worker_spawn_intent_at" and not isinstance(
+                value, (str, int, float)
+            ):
+                return False
+            if key == "reconciliation" and not known_reconciliation(value):
+                return False
+            if key == "outcome" and not known_terminal_outcome(value):
+                return False
+        return True
+
+    def known_inert_carrier(carrier: dict) -> bool:
+        allowed_fields = _NEVER_LAUNCHED_CARRIER_FIELDS
+        if allow_prepared_attempt:
+            allowed_fields = allowed_fields | _NEVER_LAUNCHED_PREPARED_CARRIER_FIELDS
+        for key, value in carrier.items():
+            if not populated(value):
+                continue
+            if key == "request":
+                if not isinstance(value, dict):
+                    return False
+                for request_key, request_value in value.items():
+                    if populated(request_value) and (
+                        f"request.{request_key}" not in allowed_fields
+                    ):
+                        return False
+                    if isinstance(request_value, dict):
+                        return False
+                    if isinstance(request_value, list) and (
+                        request_key != "task_ids"
+                        or any(not isinstance(task_id, str) for task_id in request_value)
+                    ):
+                        return False
+                continue
+            if key not in allowed_fields:
+                return False
+            if key in {"queue_claimer_identity", "queue_launcher_identity"} and not isinstance(
+                value, dict
+            ):
+                return False
+            if key in {"queue_claimer_pid", "queue_launcher_pid"} and (
+                type(value) is not int or value <= 0
+            ):
+                return False
+            if key in {"queue_launch_started", "queue_worker_spawn_intent"} and type(
+                value
+            ) is not bool:
+                return False
+            if key in {
+                "queue_launch_started_at",
+                "queue_worker_spawn_intent_at",
+            } and not isinstance(value, (str, int, float)):
+                return False
+            if key == "state" and value != "queued":
+                return False
+            if isinstance(value, dict):
+                return False
+            if isinstance(value, list) and (
+                key not in {"dispatch_argv", "task_ids"}
+                or any(not isinstance(item, str) for item in value)
+            ):
+                return False
+        return True
+
+    if not known_inert_fields(record):
+        return False
+    if any(
+        not isinstance(carrier, dict)
+        or str(carrier.get("dispatch_id") or "") != dispatch_id
+        or not known_inert_carrier(carrier)
+        or not _entry_tail_is_empty(carrier, record)
+        for carrier in carrier_entries
+    ):
+        return False
+    for evidence in (record, *carrier_entries):
+        if _queue_claim_worker_spawned(evidence):
+            return False
+        if _queue_claim_worker_spawn_intent(evidence):
+            intent_at = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
+            if intent_at is None or time.time() - intent_at <= QUEUE_CLAIM_STALE_S:
+                return False
+    for key in ("state", "terminal_state"):
+        value = record.get(key)
+        if populated(value):
+            if not isinstance(value, str):
+                return False
+            if (
+                not allow_prepared_attempt
+                and not goalflight_dispatch_states.is_terminal_state(value)
+            ):
+                return False
+
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    sources = [record]
+    for source in (record.get("request"), envelope, envelope.get("request")):
+        if isinstance(source, dict):
+            sources.append(source)
+    for source in sources:
+        if source is not record and any(populated(value) for value in source.values()):
+            return False
+
+    output_paths = {_dispatch_base_dir() / f"{_safe_dispatch_filename(dispatch_id)}.tail"}
+    for source in sources:
+        for key in ("stdout_path", "stderr_path", "tail_path", "tail"):
+            value = source.get(key)
+            if value:
+                path = Path(str(value)).expanduser()
+                if not path.is_absolute():
+                    return False
+                output_paths.add(path)
+    status_paths = {
+        _dispatch_base_dir()
+        / f"{_safe_dispatch_filename(dispatch_id)}.status.json"
+    }
+    required_status_paths = set()
+    for source in sources:
+        for key in ("status_path", "status_json"):
+            value = source.get(key)
+            if value:
+                path = Path(str(value)).expanduser()
+                if not path.is_absolute():
+                    return False
+                status_paths.add(path)
+    for carrier in carrier_entries:
+        request = carrier.get("request")
+        if not isinstance(request, dict):
+            continue
+        value = request.get("status_json")
+        if value:
+            path = Path(str(value)).expanduser()
+            if not path.is_absolute():
+                return False
+            status_paths.add(path)
+            required_status_paths.add(path)
+    # A terminal sidecar is expected for this recovery path. Its contents must
+    # corroborate the ledger and contain only known non-worker metadata. Paths
+    # declared by a carrier are required evidence, so missing/empty sidecars
+    # fail closed rather than being treated like an absent default mirror.
+    for path in status_paths:
+        required = path in required_status_paths
+        try:
+            status_stat = path.lstat() if allow_prepared_attempt else path.stat()
+        except FileNotFoundError:
+            if required:
+                return False
+            continue
+        except OSError:
+            return False
+        if allow_prepared_attempt:
+            # For a nonterminal PREPARED attempt, absence itself is the proof.
+            # An empty or dangling status entry is still present/ambiguous.
+            return False
+        if not status_stat.st_size:
+            if required:
+                return False
+            continue
+        try:
+            status_record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(status_record, dict)
+            or status_record.get("dispatch_id") != dispatch_id
+            or goalflight_task.resolve_project_root_for_read(
+                status_record.get("project_root")
+            )
+            != root
+            or not goalflight_dispatch_states.is_terminal_state(
+                str(status_record.get("state") or status_record.get("terminal_state") or "")
+            )
+            or not known_inert_fields(status_record)
+        ):
+            return False
+        for key in ("stdout_path", "stderr_path", "tail_path", "tail"):
+            value = status_record.get(key)
+            if not value:
+                continue
+            output_path = Path(str(value)).expanduser()
+            if not output_path.is_absolute():
+                return False
+            output_paths.add(output_path)
+
+    for path in output_paths:
+        try:
+            if path.stat().st_size:
+                return False
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+
+    try:
+        attempts = goalflight_journal.Journal.open_reader(root).read_all(
+            "SELECT attempt_id, dispatch_id, lifecycle_state, launch_epoch, "
+            "worker_instance_json, terminal_outcome_json "
+            "FROM dispatch_attempts WHERE dispatch_id = ?",
+            (dispatch_id,),
+        )
+    except Exception:
+        return False
+    if len(attempts) != 1:
+        return False
+    # Journal.read_all() returns sqlite3.Row; convert it before using mapping helpers.
+    attempt = dict(attempts[0])
+    if attempt.get("dispatch_id") != dispatch_id:
+        return False
+    recorded_attempt_id = record.get("attempt_id")
+    if recorded_attempt_id not in (None, "") and recorded_attempt_id != attempt.get("attempt_id"):
+        return False
+    lifecycle_state = attempt["lifecycle_state"]
+    # Terminality is bookkeeping, not liveness evidence. Only withdrawal and
+    # path ownership opt into PREPARED after applying their own safety bounds.
+    if allow_prepared_attempt:
+        if lifecycle_state != goalflight_journal.ATTEMPT_PREPARED:
+            return False
+    elif lifecycle_state != goalflight_journal.ATTEMPT_TERMINAL:
+        return False
+    launch_epoch = attempt.get("launch_epoch")
+    if type(launch_epoch) is not int or launch_epoch != 0:
+        return False
+    raw_worker_instance = attempt["worker_instance_json"]
+    if raw_worker_instance:
+        try:
+            worker_instance = json.loads(raw_worker_instance)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(worker_instance, dict) or worker_instance:
+            return False
+    raw_terminal_outcome = attempt["terminal_outcome_json"]
+    if raw_terminal_outcome:
+        try:
+            value = json.loads(raw_terminal_outcome)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not known_terminal_outcome(value) or contains_worker_evidence(value):
+            return False
+    return True
+
+
+def _unambiguous_terminal_attempt(
+    authority: goalflight_journal.Journal,
+    attempt: dict,
+    dispatch_id: str,
+    record: dict | None = None,
+) -> bool:
+    """Whether one journal terminal/outbox pair names this exact dispatch attempt."""
+    attempt_id = attempt.get("attempt_id")
+    transition_id = attempt.get("terminal_transition_id")
+    terminal_state = attempt.get("terminal_state")
+    if (
+        attempt.get("dispatch_id") != dispatch_id
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or attempt.get("lifecycle_state") != goalflight_journal.ATTEMPT_TERMINAL
+        or not isinstance(transition_id, str)
+        or not transition_id
+        or not goalflight_dispatch_states.is_terminal_state(terminal_state)
+        or not goalflight_journal.journal_terminal_at(attempt.get("terminal_at"))
+    ):
+        return False
+    if isinstance(record, dict):
+        recorded_attempt_id = record.get("attempt_id")
+        if recorded_attempt_id not in (None, "") and recorded_attempt_id != attempt_id:
+            return False
+    try:
+        observation = json.loads(attempt.get("terminal_outcome_json") or "{}")
+        events = authority.read_all(
+            "SELECT event_uuid, event_type, payload_json FROM terminal_outbox "
+            "WHERE attempt_id = ? AND transition_id = ?",
+            (attempt_id, transition_id),
+        )
+        if not isinstance(observation, dict) or len(events) != 1:
+            return False
+        event = dict(events[0])
+        payload = json.loads(event.get("payload_json") or "{}")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        event.get("event_uuid")
+        and event.get("event_type") in goalflight_journal.TERMINAL_EVENT_TYPES
+        and isinstance(payload, dict)
+        and payload.get("attempt_id") == attempt_id
+        and payload.get("transition_id") == transition_id
+        and payload.get("dispatch_id") == dispatch_id
+        and payload.get("terminal_state") == terminal_state
+        and payload.get("observation") == observation
+    )
+
+
+def _read_unambiguous_terminal_attempt(record: dict) -> dict | None:
+    """Read a unique, internally matched terminal journal row for a ledger row."""
+    dispatch_id = str(record.get("dispatch_id") or "")
+    root = goalflight_task.resolve_project_root_for_read(record.get("project_root"))
+    if not dispatch_id or root is None:
+        return None
+    try:
+        authority = goalflight_journal.Journal.open_reader(root)
+        rows = authority.read_all(
+            "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?", (dispatch_id,)
+        )
+        if len(rows) != 1:
+            return None
+        attempt = dict(rows[0])
+        return (
+            attempt
+            if _unambiguous_terminal_attempt(authority, attempt, dispatch_id, record)
+            else None
+        )
+    except Exception:
+        return None
+
+
+def _never_launched_withdraw_command(
+    record: dict, carrier_entries: list[dict | None]
+) -> str | None:
+    if not _record_proves_never_launched(record, carrier_entries):
+        return None
+    try:
+        owner = _strict_dispatch_owner_label(record)
+    except goalflight_ledger._MalformedDispatchOwnerLabel:
+        return None
+    project_root = record.get("project_root")
+    if not owner or not project_root:
+        return None
+    return _withdraw_recovery_command(
+        str(record.get("dispatch_id") or ""), str(project_root), owner=owner
+    )
+
+
+def _pin_redispatch_wip(
+    record: dict, carrier_entries: list[dict | None]
+) -> str:
     worker_cwd = str(record.get("worker_cwd") or "").strip()
     if not worker_cwd:
-        raise DispatchUsageError(
+        message = (
             f"task redispatch refused: advanced dispatch {record.get('dispatch_id')} "
             "has no worker cwd to pin"
         )
+        withdraw_command = _never_launched_withdraw_command(record, carrier_entries)
+        if withdraw_command:
+            message += (
+                "; its owner can withdraw this never-launched record with: "
+                + withdraw_command
+            )
+        raise DispatchUsageError(
+            message
+        )
     cwd = Path(worker_cwd).expanduser()
+    if not cwd.is_absolute():
+        raise DispatchUsageError(
+            "task redispatch refused: recorded worker_cwd is not absolute"
+        )
     try:
         if not cwd.is_dir():
             raise OSError("worker cwd is not a directory")
@@ -5530,7 +7257,11 @@ def _pin_redispatch_wip(record: dict) -> str:
             "-",
             str(record.get("dispatch_id") or "dispatch"),
         ).strip("-")
-        ref = f"refs/goalflight/keep/redispatch-{safe_id or 'dispatch'}"
+        stamp = time.time_ns()
+        ref = (
+            f"refs/goalflight/keep/redispatch-{safe_id or 'dispatch'}-"
+            f"{stamp}-{commit[:12]}"
+        )
         update_code, _ = _redispatch_git_output(cwd, "update-ref", ref, commit)
         if update_code != 0:
             raise DispatchUsageError(
@@ -5568,7 +7299,27 @@ def _mark_redispatch_superseded(
                 # Re-pin the current tip under StateLock even when admission
                 # supplied a speculative ref. The old ref was made before the
                 # replacement row became visible and is not an atomic fence.
-                wip_ref = _pin_redispatch_wip(current)
+                queue_index = _build_queue_carrier_index(_dispatch_queue_dir())
+                carrier_entries: list[dict | None] = []
+                if queue_index.listing_error is not None:
+                    carrier_entries.append(None)
+                else:
+                    for carrier in queue_index.carriers_by_id.get(dispatch_id, []):
+                        try:
+                            carrier_entry = json.loads(
+                                Path(carrier.path).read_text(encoding="utf-8")
+                            ) if carrier.path else None
+                        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                            carrier_entry = None
+                        if (
+                            not isinstance(carrier_entry, dict)
+                            or str(carrier_entry.get("dispatch_id") or "") != dispatch_id
+                        ):
+                            carrier_entries = [None]
+                            break
+                        carrier_entries.append(carrier_entry)
+                if not _record_proves_never_launched(current, carrier_entries):
+                    wip_ref = _pin_redispatch_wip(current, carrier_entries)
             current["superseded_by"] = replacement_id
             current["superseded_at"] = goalflight_ledger.utc_now()
             current["supersession_actor"] = actor
@@ -5746,7 +7497,22 @@ def _completion_refusal_guidance(
                     )
                 continue
             record = _find_dispatch_record(dispatch_id) or {}
-            owner = str(record.get("controller_label") or "").strip() or None
+            try:
+                owner = _strict_dispatch_owner_label(
+                    record, project_root=project_root
+                )
+            except goalflight_ledger._MalformedDispatchOwnerLabel as exc:
+                lines.append(
+                    f"{task_text} is held by {dispatch_id} (state {state}), but "
+                    "its controller owner metadata is malformed at "
+                    + (
+                        "the current dispatch record"
+                        if exc.ancestor_depth == 0
+                        else f"ancestor depth {exc.ancestor_depth}"
+                    )
+                    + f" (type {exc.value_type}); repair that metadata before withdrawing."
+                )
+                continue
             lines.append(
                 f"{task_text} is held by {dispatch_id} (state {state}). "
                 "If you've confirmed that worker is gone, release it with:\n"
@@ -5985,6 +7751,15 @@ def _record_declared_read_only(record: dict) -> bool:
     for a writer. A top-level read_only flag with requested_profile
     workspace-write is a writer.
     """
+    argv_sources = [_dispatch_argv_from_record(record)]
+    request = record.get("request")
+    if isinstance(request, dict) and isinstance(request.get("dispatch_argv"), list):
+        argv_sources.append([str(part) for part in request["dispatch_argv"]])
+    for recorded_argv in argv_sources:
+        if "--" in recorded_argv and any(
+            part.strip() for part in recorded_argv[recorded_argv.index("--") + 1 :]
+        ):
+            return False
     posture = record.get("os_sandbox")
     requested = None
     enforced = None
@@ -6014,16 +7789,18 @@ def _occupancy_exempt_read_only(args) -> bool:
     if not _effective_read_only(args):
         return False
     raw_worker = _raw_worker_args(args)
-    if raw_worker is None or raw_worker:
-        return False
     agent = str(getattr(args, "agent", "") or "")
     shape = getattr(args, "shape", "bash")
     if shape == "acp":
+        if raw_worker:
+            return False
         try:
             from goalflight_acp_run import acp_permission_read_only_supported
         except (ImportError, AttributeError):
             return False
         return acp_permission_read_only_supported(agent)
+    if raw_worker is None or raw_worker:
+        return False
     return agent in {"grok-code", "grok-research", "codex"}
 
 
@@ -6344,25 +8121,23 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     return None, None, None
 
 
-class _InheritedOccupancyLock:
-    """A lock fd inherited from the parent launcher; this process must not close it."""
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-
-    def fileno(self) -> int:
-        return self._fd
-
-    def release(self) -> None:
-        return None
-
-
 def _bind_worktree_occupancy_lock(args, lock) -> None:
     """Keep the lock alive in this process and publish the fd for worker inherit."""
     args._worktree_occupancy_lock = lock
     fd = lock.fileno()
     os.set_inheritable(fd, True)
     os.environ[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(fd)
+
+
+def _preclaimed_worktree_occupancy_lock(args):
+    """Return only this dispatch's registry-acquired lock object."""
+    lock = getattr(args, "_worktree_occupancy_lock", None)
+    if (
+        isinstance(lock, goalflight_worktree_pool.WorktreePathLock)
+        and lock.dispatch_id == str(getattr(args, "dispatch_id", ""))
+    ):
+        return lock
+    return None
 
 
 def _release_worktree_occupancy_lock(args) -> None:
@@ -6390,6 +8165,12 @@ def _release_withdrawn_worktree(record: dict | None, dispatch_id: str) -> None:
         return
     path = record.get("worker_cwd") or record.get("worktree_path")
     root = record.get("project_root")
+    if path is None and record.get("prelaunch_failure") is True:
+        parent_id = str(record.get("parent_dispatch_id") or "").strip()
+        parent = _find_dispatch_record(parent_id) if parent_id else None
+        if isinstance(parent, dict):
+            path = parent.get("worker_cwd") or parent.get("worktree_path")
+            root = root or parent.get("project_root")
     if not root:
         return
     with contextlib.suppress(Exception):
@@ -6398,54 +8179,23 @@ def _release_withdrawn_worktree(record: dict | None, dispatch_id: str) -> None:
         )
 
 
-def _terminal_worktree_gc(project_root: Path | None, dispatch_id: str) -> None:
-    """Start an optional terminal GC report without delaying dispatch exit."""
-    mode = os.environ.get("GOALFLIGHT_WORKTREE_GC_ON_TERMINAL", "off").strip().lower()
-    if mode == "reclaim":
-        mode = "apply"
-    if mode not in {"dry-run", "apply"} or project_root is None:
-        return
-    report_path = _dispatch_base_dir() / f"{dispatch_id}.worktree-gc.json"
-    command = [
-        sys.executable,
-        str(SCRIPT_DIR / "goalflight_worktree_gc.py"),
-        str(project_root),
-        "--into",
-        "main",
-        "--json",
-        "--deadline-s",
-        str(TERMINAL_WORKTREE_GC_TIMEOUT_S),
-    ]
-    if mode == "apply":
-        command.append("--apply")
-    try:
-        report_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with report_path.open("w", encoding="utf-8") as report:
-            subprocess.Popen(
-                command,
-                cwd=str(project_root),
-                stdin=subprocess.DEVNULL,
-                stdout=report,
-                stderr=subprocess.DEVNULL,
-                env=_sidecar_env(os.environ.copy()),
-                **_detached_popen_kwargs(),
-            )
-    except (OSError, ValueError):
-        return
-
-
-def _inherited_occupancy_lock():
+def _inherited_occupancy_lock(
+    expected_target: Path,
+    dispatch_id: str,
+    current_lock=None,
+):
     raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
     if not raw:
         return None, None
     try:
         fd = int(raw)
-        os.fstat(fd)
     except ValueError as exc:
         return None, (
             f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
             f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
         )
+    try:
+        inherited_stat = os.fstat(fd)
     except OSError as exc:
         # A closed fd is leftover from a previous in-process launch whose
         # occupancy descriptor ended. It is not occupancy evidence.
@@ -6456,7 +8206,81 @@ def _inherited_occupancy_lock():
             f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
             f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
         )
-    return _InheritedOccupancyLock(fd), None
+    try:
+        resolved_target = Path(os.path.realpath(str(expected_target)))
+    except OSError as exc:
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        return None, (
+            f"expected worktree occupancy target could not be resolved "
+            f"for {expected_target}: {type(exc).__name__}: {exc}"
+        )
+
+    if isinstance(current_lock, goalflight_worktree_pool.WorktreePathLock):
+        try:
+            current_fd = current_lock.fileno()
+        except goalflight_worktree_pool.WorktreeSeatError:
+            current_fd = -1
+        if (
+            current_fd == fd
+            and current_lock.dispatch_id == dispatch_id
+            and current_lock.path == resolved_target
+        ):
+            return current_lock, None
+
+    try:
+        expected_lock_path = goalflight_worktree_pool.worktree_path_lock_path(
+            resolved_target
+        )
+        git_metadata = resolved_target / ".git"
+        git_backed = git_metadata.is_file() or git_metadata.is_dir()
+        try:
+            registry_root = goalflight_worktree_pool._git_common_dir(resolved_target)
+        except goalflight_worktree_pool.WorktreeSeatError:
+            if git_backed:
+                raise
+            registry_root = None
+        if registry_root is None:
+            lock_identity = goalflight_worktree_pool._lock_path_identity(
+                expected_lock_path
+            )
+        else:
+            lock_identity = goalflight_worktree_pool._registered_lock_identity(
+                expected_lock_path,
+                registry_root=registry_root,
+            )
+        matches_lock = goalflight_worktree_pool._lock_fd_matches_identity(
+            fd,
+            lock_identity,
+        )
+    except (OSError, goalflight_worktree_pool.WorktreeSeatError) as exc:
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        return None, (
+            f"registered worktree occupancy lock identity could not be evaluated "
+            f"for {resolved_target}: {type(exc).__name__}: {exc}"
+        )
+    if not matches_lock:
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        return None, (
+            f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} descriptor {fd} "
+            f"does not identify the registered worktree occupancy lock "
+            f"{expected_lock_path}"
+        )
+    try:
+        if fcntl is None:
+            raise OSError(errno.ENOSYS, "flock is unavailable")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file = os.fdopen(fd, "r+", encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+        return None, (
+            f"inherited worktree occupancy lock {expected_lock_path} could not be "
+            f"confirmed ({type(exc).__name__}: {exc})"
+        )
+    return goalflight_worktree_pool.WorktreePathLock(
+        path=resolved_target,
+        lock_file=lock_file,
+        dispatch_id=dispatch_id,
+    ), None
 
 
 def _occupancy_occupied_messages(reason: str) -> tuple[str, str]:
@@ -6476,9 +8300,19 @@ def _occupancy_occupied_messages(reason: str) -> tuple[str, str]:
 
 def _occupancy_unknown_messages(args, detail: str) -> tuple[str, str]:
     target = _worker_cwd(args)
+    guidance = []
+    if not getattr(args, "in_place", False):
+        try:
+            if _project_root(args).resolve(strict=False) == target.resolve(strict=False):
+                guidance.append(
+                    "Pass --in-place explicitly to write into the project root."
+                )
+        except (OSError, ValueError):
+            pass
     refusal = "\n".join(
         [
             f"worktree occupancy of {target} is unknown ({detail}).",
+            *guidance,
             "Retry the dispatch; refusing before record or launch.",
             "Use --occupied-worktree-forced to override and launch without "
             "occupancy evidence.",
@@ -6509,7 +8343,11 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
     lock = None
     lock_busy = None
     lock_unknown = None
-    inherited, inherited_unknown = _inherited_occupancy_lock()
+    inherited, inherited_unknown = _inherited_occupancy_lock(
+        Path(str(_worker_cwd(args))),
+        str(getattr(args, "dispatch_id", None) or "unknown-dispatch"),
+        getattr(args, "_worktree_occupancy_lock", None),
+    )
     if inherited_unknown:
         lock_unknown = inherited_unknown
     elif inherited is not None:
@@ -6608,14 +8446,11 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
             args, refusal=refusal, forced_warning=forced_warning
         )
     if occupied is not None and not getattr(args, "from_queue", False):
-        # A queued row is no longer an owning claim. A running row whose
-        # holder already died (SIGKILL) leaves the kernel lock free; dropping
-        # the lock we just won would recreate the dual-launch TOCTOU until the
-        # watcher rewrites the ledger. A starting row is post-admission and
-        # remains an owning claim.
-        if inherited is None and occupied_state in {
-            "running",
-        }:
+        # A queued row is no longer an owning claim. A running row can remain
+        # stale after SIGKILL; the kernel lock is authoritative, so keep a lock
+        # this process acquired or inherited until the watcher rewrites it.
+        # A starting row is post-admission and remains an owning claim.
+        if lock is not None and occupied_state == "running":
             _bind_worktree_occupancy_lock(args, lock)
             return None
         if not forced:
@@ -6633,6 +8468,24 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
         refusal, forced_warning = _occupancy_occupied_messages(occupied)
         return forced_warning
     return None
+
+
+def _prepare_explicit_worktree_occupancy(args) -> None:
+    """Check a known writer path before capacity and initial ledger work."""
+    if _occupancy_exempt_read_only(args) or not (
+        getattr(args, "cwd", None) or getattr(args, "in_place", False)
+    ):
+        return
+    warning = _prepare_attempt_worktree_occupancy(args)
+    args._worktree_occupancy_warning = warning
+    args._worktree_occupancy_checked = True
+    args._worktree_occupancy_checked_path = str(
+        Path(str(_worker_cwd(args))).resolve(strict=False)
+    )
+    if warning is not None:
+        warnings = getattr(args, "dispatch_warnings", [])
+        if warning not in warnings:
+            args.dispatch_warnings = [*warnings, warning]
 
 
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
@@ -6799,18 +8652,39 @@ def _append_steer_message(
     )
 
 
-def _report_steer_result(dispatch_id: str, result: dict) -> int:
+def _report_steer_result(
+    dispatch_id: str,
+    result: dict,
+    *,
+    failure_reason: str | None = None,
+) -> int:
     delivery = result["delivery"]
+    classification = delivery.get("dispatch_classification")
+    worker_alive = (
+        True if classification == "expected_live"
+        else False if classification in {"queued_capacity", "terminal_recorded_only"}
+        else None
+    )
     if delivery["delivered"]:
         print(
             f"steer appended: dispatch_id={dispatch_id} seq={delivery['steer_seq']} "
-            f"mailbox={delivery['steer_path']}"
+            f"mailbox={delivery['steer_path']} worker_alive={str(worker_alive).lower()}"
         )
         return 0
     non_error = delivery["status"] in {"terminal_recorded_only", "worker_view_queued"}
-    stream = sys.stdout if non_error else sys.stderr
-    print(f"steer recorded: dispatch_id={dispatch_id}; {delivery['detail']}", file=stream)
-    return 0 if non_error else 1
+    if not non_error:
+        goalflight_messages.emit_recorded_not_delivered(
+            failure_reason or delivery.get("detail") or delivery.get("status") or "worker delivery failed",
+            f"python3 scripts/goalflight_messages.py read --dispatch-id {dispatch_id} --json",
+        )
+        return 1
+    stream = sys.stdout
+    print(
+        f"steer recorded: dispatch_id={dispatch_id}; worker_alive={str(worker_alive).lower()}; "
+        f"{delivery['detail']}",
+        file=stream,
+    )
+    return 0
 
 
 def _acked_steer_seqs(record: dict) -> set[int]:
@@ -6831,7 +8705,6 @@ def _consumed_worker_wait_receipts(dispatch_id: str, record: dict) -> set[tuple[
     return goalflight_steer_mailbox.consumed_worker_wait_receipts(
         record,
         marker_entries=marker_entries,
-        mailbox_path=_steer_file(dispatch_id),
     )
 
 
@@ -6858,6 +8731,98 @@ def _worker_wait_mailbox(dispatch_id: str) -> Path:
     return mailbox
 
 
+def _worker_question_outbox(dispatch_id: str, mailbox: Path) -> Path:
+    configured = str(os.environ.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or "").strip()
+    if not configured:
+        raise DispatchUsageError("steer --wait requires GOALFLIGHT_QUESTION_OUTBOX_DIR")
+    outbox = Path(configured).expanduser().resolve(strict=False)
+    expected = goalflight_dispatch_paths.worker_question_outbox_dir(
+        dispatch_id,
+        dispatch_dir=mailbox.parent,
+    ).resolve(strict=False)
+    if outbox != expected:
+        raise DispatchUsageError(
+            f"GOALFLIGHT_QUESTION_OUTBOX_DIR does not match dispatch {dispatch_id}: {outbox}"
+        )
+    return outbox
+
+
+def _worker_wait_resume_source(
+    dispatch_id: str,
+    wait_id: str,
+    *,
+    question_kind: str,
+    question_text: str,
+) -> tuple[str, list[str]]:
+    """Find an explicitly named request in this dispatch's validated lineage."""
+    if not wait_id or any(char in wait_id for char in "\r\n/\\"):
+        raise ValueError("worker wait id must be a single path-safe value")
+    dispatch_dir = _steer_file(dispatch_id).parent
+    record = _find_dispatch_record(dispatch_id)
+    if (
+        not isinstance(record, dict)
+        or goalflight_ledger.record_is_unreadable(record)
+        or record.get("dispatch_id") != dispatch_id
+    ):
+        raise ValueError("cannot validate the dispatch lineage for this worker wait")
+    project_root = str(record.get("project_root") or "").strip()
+    if not project_root:
+        raise ValueError("dispatch lineage is missing its project root")
+    project_root = str(Path(project_root).resolve(strict=False))
+    lineage_ids: list[str] = []
+    visited: set[str] = set()
+    current = record
+    while True:
+        current_id = str(current.get("dispatch_id") or "")
+        if not current_id or current_id in visited:
+            raise ValueError("dispatch resume lineage is invalid or cyclic")
+        visited.add(current_id)
+        lineage_ids.append(current_id)
+        outbox = goalflight_dispatch_paths.worker_question_outbox_dir(
+            current_id,
+            dispatch_dir=dispatch_dir,
+        )
+        request_path = outbox / f"{wait_id}.json"
+        if request_path.exists():
+            try:
+                raw = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"worker wait {wait_id!r} has an unreadable lineage request"
+                ) from exc
+            request = goalflight_steer_mailbox.validate_worker_question_request(
+                raw,
+                dispatch_id=current_id,
+            )
+            if (
+                request is None
+                or request_path.name != f"{request['wait_id']}.json"
+                or request["wait_id"] != wait_id
+                or request["question_kind"] != question_kind
+                or request["question"] != question_text
+            ):
+                raise ValueError(
+                    f"worker wait {wait_id!r} does not match a request in this lineage"
+                )
+            return current_id, lineage_ids
+        parent_id = str(current.get("parent_dispatch_id") or "").strip()
+        if not parent_id:
+            break
+        if parent_id in visited:
+            raise ValueError("dispatch resume lineage is cyclic")
+        parent = _find_dispatch_record(parent_id)
+        if (
+            not isinstance(parent, dict)
+            or goalflight_ledger.record_is_unreadable(parent)
+            or parent.get("dispatch_id") != parent_id
+            or str(Path(str(parent.get("project_root") or "")).resolve(strict=False))
+            != project_root
+        ):
+            raise ValueError("dispatch resume lineage could not be validated")
+        current = parent
+    raise ValueError(f"worker wait {wait_id!r} has no request in this dispatch lineage")
+
+
 def _wait_event_reporter(
     dispatch_id: str,
 ):
@@ -6881,10 +8846,556 @@ def _wait_event_reporter(
                 ):
                     print(line, flush=True)
             return
+        if state == "backlog":
+            for entry in event.get("entries") or []:
+                for line in goalflight_steer_mailbox.worker_wait_reply_output_lines(
+                    entry
+                ):
+                    print(line, flush=True)
+            return
         if state == "deadline":
+            wait_id = str(event.get("wait_id") or "")
             print(f"STEER-WAIT: dispatch_id={dispatch_id} deadline reached", flush=True)
+            if wait_id:
+                prefix = (
+                    f"!BLOCKED: {dispatch_id} - wait timed out; "
+                    f"wait-id={wait_id}; question="
+                )
+                question = str(event.get("question_text") or "")
+                print(
+                    prefix + question[: max(0, 1000 - len(prefix))],
+                    flush=True,
+                )
 
     return report
+
+
+_FINAL_TAIL_CHUNK_BYTES = 8 * 1024 * 1024
+_FINAL_MESSAGE_LIMIT_BYTES = 64 * 1024
+_RUNNING_MESSAGE_LIMIT_BYTES = 8 * 1024
+
+
+def _final_footer_boundary(tail: Path, limit: int) -> tuple[int | None, str | None]:
+    """Verify ambiguous Codex footers against the transcript copy in a bounded suffix."""
+    size = tail.stat().st_size
+    window_start = max(0, size - 2 * _FINAL_TAIL_CHUNK_BYTES)
+    with tail.open("rb") as handle:
+        handle.seek(max(0, window_start - 1))
+        partial_line = window_start and handle.read(1) != b"\n"
+        window = handle.read(_FINAL_TAIL_CHUNK_BYTES) + handle.read(_FINAL_TAIL_CHUNK_BYTES)
+    if partial_line:
+        # The first partial physical line cannot contain a footer boundary.
+        first_line = window.find(b"\n") + 1
+        window_start += first_line
+        window = window[first_line:]
+    candidates = list(re.finditer(
+        rb"(?m)^[ \t]*tokens used\r?\n[ \t]*[0-9][0-9,]*[ \t]*\r?\n", window
+    ))
+    if not candidates:
+        return None, f"not found in the last 16 MB; full tail: {tail}"
+
+    def verified(candidate: re.Match[bytes]) -> bool:
+        message = window[candidate.end():candidate.end() + limit]
+        return bool(message and window.find(message, 0, candidate.start()) >= 0)
+
+    selected = goalflight_response_boundary.select_response_footer_candidate(
+        candidates, verified, verify_single=window_start > 0
+    )
+    if selected is not None:
+        return window_start + selected.end(), None
+
+    warning = f"unverified ({len(candidates)} footer candidates); full tail: {tail}"
+    return window_start + candidates[-1].end(), warning
+
+
+def _final_message(
+    tail: Path,
+    engine: str,
+    marker: dict | None,
+    *,
+    running: bool,
+) -> tuple[str | None, str | None]:
+    """Extract a bounded final turn, locating Codex footers from EOF."""
+    boundary = None
+    limit = _RUNNING_MESSAGE_LIMIT_BYTES if running else _FINAL_MESSAGE_LIMIT_BYTES
+    if engine != "codex":
+        # Grok's captured tail is its single rendered response, followed by
+        # RESULT/READY/terminal markers. Those markers are part of that response.
+        if running:
+            return None, boundary
+        start = 0
+    else:
+        start, boundary = _final_footer_boundary(tail, limit)
+    marker_text = str(marker.get("text") or "") if marker else ""
+    if start is None and marker_text:
+        # Marker-only and empty-response tails are uncommon; search a bounded
+        # suffix so a valid marker never requires reading a large transcript.
+        with tail.open("rb") as handle:
+            handle.seek(max(0, tail.stat().st_size - _FINAL_TAIL_CHUNK_BYTES))
+            suffix = handle.read(_FINAL_TAIL_CHUNK_BYTES)
+        encoded_marker = marker_text.encode("utf-8", errors="replace")
+        marker_at = suffix.rfind(encoded_marker)
+        if marker_at >= 0:
+            marker_line_start = suffix.rfind(b"\n", 0, marker_at) + 1
+            start = max(0, tail.stat().st_size - len(suffix) + marker_line_start)
+    if running and start is None:
+        return None, boundary
+    if start is None:
+        return None, boundary
+
+    size = tail.stat().st_size
+    total = max(0, size - start)
+    read_limit = min(limit, total)
+    with tail.open("rb") as handle:
+        handle.seek(start)
+        raw = handle.read(read_limit)
+    # A running tail can append tool blocks after a complete renderer footer.
+    # Stop before an un-fenced tool marker when it is present in the bounded
+    # preview; never inspect or emit the rest of the transcript.
+    if running:
+        decoded = raw.decode("utf-8", errors="ignore")
+        fence = goalflight_terminal.MarkdownFenceTracker()
+        kept: list[str] = []
+        for line in decoded.splitlines(keepends=True):
+            in_fence = fence.in_fence
+            fence.consume_boundary(line)
+            if not in_fence and line.strip() in {"exec", "tool"}:
+                break
+            kept.append(line)
+        raw = "".join(kept).encode("utf-8")
+    if not raw.strip():
+        return None, boundary
+    message = raw.decode("utf-8", errors="ignore")
+    if total > len(raw):
+        omitted = total
+        suffix = f"\n[truncated: {omitted} bytes; full tail: {tail}]"
+        while True:
+            excerpt_budget = max(0, limit - len(suffix.encode("utf-8")))
+            message = raw[:excerpt_budget].decode("utf-8", errors="ignore")
+            omitted = total - len(message.encode("utf-8"))
+            updated_suffix = f"\n[truncated: {omitted} bytes; full tail: {tail}]"
+            if updated_suffix == suffix:
+                break
+            suffix = updated_suffix
+        message += suffix
+    return message, boundary
+
+
+def _final_head(record: dict, dispatch_id: str) -> tuple[str, str]:
+    """Resolve a dispatch's durable branch tip, never its recorded launch base."""
+    project = str(record.get("project_root") or record.get("worker_cwd") or "")
+    project_field = "project_root" if record.get("project_root") else "worker_cwd"
+    if project and not Path(project).expanduser().is_absolute():
+        return "-", f"unknown (recorded {project_field} is not absolute)"
+    branch = ""
+    current = record
+    seen: set[str] = set()
+    current_id = dispatch_id
+    for _ in range(_RESUME_LINEAGE_WALK_LIMIT):
+        if current_id in seen:
+            break
+        seen.add(current_id)
+        branch = str(current.get("worktree_branch") or "").strip()
+        if branch:
+            break
+        parent_id = str(current.get("parent_dispatch_id") or "").strip()
+        if not parent_id:
+            break
+        current_id = parent_id
+        parent = _find_dispatch_record(parent_id)
+        if not isinstance(parent, dict) or goalflight_ledger.record_is_unreadable(parent):
+            break
+        if project and str(parent.get("project_root") or "") not in {"", project}:
+            break
+        current = parent
+    if not branch and dispatch_id:
+        candidate = f"worktree/{dispatch_id}"
+        if goalflight_worktree_pool.is_worktree_branch(candidate):
+            branch = candidate
+    if not project or not branch or not goalflight_worktree_pool.is_worktree_branch(branch):
+        return "-", "unknown"
+    try:
+        resolved = subprocess.run(
+            [
+                "git", "-C", project, "rev-parse", "--verify",
+                f"refs/heads/{branch}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return "-", "unknown"
+    if resolved.returncode != 0 or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}", resolved.stdout.strip()
+    ):
+        return "-", "unknown"
+    return resolved.stdout.strip(), f"branch refs/heads/{branch}"
+
+
+def _behind_summary(record: dict, head: str) -> str:
+    project = str(record.get("project_root") or record.get("worker_cwd") or "")
+    project_field = "project_root" if record.get("project_root") else "worker_cwd"
+    if project and not Path(project).expanduser().is_absolute():
+        return f"behind: unknown (recorded {project_field} is not absolute)"
+    try:
+        origin = subprocess.run(
+            ["git", "-C", project, "rev-parse", "--verify", "origin/main^{commit}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        ) if project else None
+    except subprocess.TimeoutExpired:
+        return "behind: unknown (git timeout)"
+    if not project:
+        behind = "behind: unknown (project ref unavailable)"
+    elif origin is None or origin.returncode != 0:
+        behind = "behind: unknown (origin/main ref missing)"
+    elif head == "-":
+        behind = "behind: unknown (head sha missing)"
+    else:
+        try:
+            count = subprocess.run(
+                ["git", "-C", project, "rev-list", "--count", f"{head}..origin/main"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            return "behind: unknown (git timeout)"
+        if count.returncode == 0 and count.stdout.strip().isdigit():
+            behind = f"head {head} is {count.stdout.strip()} behind origin/main"
+        else:
+            behind = "behind: unknown (head sha unavailable in local refs)"
+    return behind
+
+
+def _final_error(args, message: str) -> int:
+    if args.json:
+        print(json.dumps({"id": args.dispatch_id, "error": message}, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"goalflight_dispatch: {args.dispatch_id}: {message}", file=sys.stderr)
+    return 1
+
+
+def _cmd_final(argv: list[str]) -> int:
+    parser = _TerseArgumentParser(
+        prog=f"{Path(sys.argv[0]).name} final",
+        description="Print a dispatch's final assistant message and terminal marker.",
+        usage_hint="try final <dispatch-id> [--json]",
+    )
+    parser.add_argument("dispatch_id")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    record = _find_dispatch_record(args.dispatch_id)
+    if record is None:
+        return _final_error(args, "unknown dispatch id")
+    if goalflight_ledger.record_is_unreadable(record):
+        return _final_error(args, "unreadable dispatch record")
+    raw_tail = record.get("stdout_path") or (
+        _dispatch_base_dir() / f"{args.dispatch_id}.tail"
+    )
+    tail = Path(str(raw_tail)).expanduser()
+    if tail.suffix == ".gz":
+        return _final_error(args, f"tail is gzip-compressed at {tail}")
+    compressed_tail = Path(str(tail) + ".gz")
+    if not tail.is_file() and compressed_tail.is_file():
+        return _final_error(args, f"tail is gzip-compressed at {compressed_tail}")
+    try:
+        if not tail.is_file():
+            raise FileNotFoundError("tail file missing")
+        with tail.open("rb") as handle:
+            handle.read(1)
+    except OSError as exc:
+        return _final_error(args, f"unreadable tail ({exc})")
+    engine = goalflight_ledger.infer_engine(record.get("engine") or record.get("agent"))
+    state = str(record.get("terminal_state") or record.get("state") or "running")
+    worker_alive = record.get("worker_still_alive") is True
+    if record.get("worker_still_alive") is None and record.get("worker_pid"):
+        worker_alive = goalflight_ledger.worker_identity_liveness(record)[0] == "live"
+    terminal = goalflight_dispatch_states.is_terminal_state(state) and not worker_alive
+    if state in {"worker_dead", "transient_throttle"}:
+        error = record.get("error") if isinstance(record.get("error"), dict) else {}
+        reason = str(
+            error.get("reason")
+            or error.get("message")
+            or record.get("reason")
+            or "worker ended without a terminal marker"
+        )
+        if state == "transient_throttle" or "no_terminal_marker" in reason:
+            return _final_error(args, reason)
+    try:
+        prompt_prefix = _ignore_prefix_lines(str(record.get("prompt_path") or ""))
+        marker = (
+            _final_terminal_marker(
+                tail,
+                ignore_prefix_lines=prompt_prefix,
+                expected_dispatch_id=args.dispatch_id,
+                full_file_fallback=False,
+                recover_final_response=False,
+            )
+            if terminal
+            else None
+        )
+        if marker is None and terminal:
+            error = record.get("error") if isinstance(record.get("error"), dict) else {}
+            reason = str(error.get("reason") or record.get("reason") or "")
+            kind = str(error.get("marker_kind") or "")
+            if not kind:
+                match = re.search(
+                    r"(?:^|:)marker:(COMPLETE|READY|RESULT|BLOCKED|USER-NEED|USER-CONFIRM|FAILED)",
+                    reason,
+                )
+                kind = match.group(1) if match else ""
+            if kind:
+                marker = {"kind": kind, "line": 0, "text": str(error.get("text") or "")}
+        if terminal and marker is None:
+            raise ValueError("terminal marker not found in tail")
+        message, boundary = _final_message(
+            tail,
+            engine,
+            marker,
+            running=not terminal,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        return _final_error(args, str(exc))
+    final_checkout = None
+    final_checkout_dirty = None
+    if terminal:
+        checkout_field = "worker_cwd" if record.get("worker_cwd") else "worktree_path"
+        checkout_value = record.get("worker_cwd") or record.get("worktree_path")
+        project_value = record.get("project_root")
+        if not checkout_value and record.get("prelaunch_failure") is not True:
+            return _final_error(
+                args,
+                "dispatch record is missing worker_cwd/worktree_path and is not "
+                "marked prelaunch_failure",
+            )
+        checkout_path = None
+        if checkout_value:
+            checkout_path = Path(str(checkout_value)).expanduser()
+            if not checkout_path.is_absolute():
+                return _final_error(
+                    args, f"recorded {checkout_field} is not absolute"
+                )
+        if checkout_path is not None and project_value:
+            project_path = Path(str(project_value)).expanduser()
+            if not project_path.is_absolute():
+                return _final_error(args, "recorded project_root is not absolute")
+            checkout = checkout_path.resolve(strict=False)
+            project = project_path.resolve(strict=False)
+            checkout_identity = goalflight_worktree_pool._git_identity(
+                checkout, timeout=5
+            )
+            project_identity = goalflight_worktree_pool._git_identity(
+                project, timeout=5
+            )
+            if (
+                checkout_identity is not None
+                and project_identity is not None
+                and checkout_identity[1] == project_identity[1]
+                and fcntl is not None
+            ):
+                try:
+                    lineage_ids = set(_resume_lineage_dispatch_ids(args.dispatch_id))
+                    lock_path = goalflight_worktree_pool._candidate_lock_path(
+                        project,
+                        checkout,
+                        managed_root=goalflight_worktree_pool.repository_worktree_root(
+                            project
+                        ),
+                    )
+                    lock_fd = goalflight_worktree_pool._open_registered_lock(
+                        lock_path,
+                        goalflight_worktree_pool._lock_open_flags() & ~os.O_CREAT,
+                        registry_root=goalflight_worktree_pool._git_common_dir(project),
+                        allow_create=False,
+                        allow_unregistered=True,
+                    )
+                    with os.fdopen(lock_fd, "r+", encoding="utf-8") as lock_file:
+                        try:
+                            fcntl.flock(
+                                lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                            )
+                        except BlockingIOError:
+                            seat_locked = False
+                        else:
+                            seat_locked = True
+                        owner = (
+                            goalflight_worktree_pool._known_lock_dispatch_id(lock_file)
+                            if seat_locked
+                            else None
+                        )
+                        if seat_locked and owner in lineage_ids:
+                            branch = goalflight_worktree_pool._git(
+                                checkout, "rev-parse", "--abbrev-ref", "HEAD", timeout=5
+                            )
+                            checkout_head = goalflight_worktree_pool._git(
+                                checkout,
+                                "rev-parse",
+                                "--verify",
+                                "HEAD^{commit}",
+                                timeout=5,
+                            )
+                            try:
+                                status = goalflight_worktree_pool._git(
+                                    checkout,
+                                    "status",
+                                    "--porcelain",
+                                    "--untracked-files=all",
+                                    timeout=5,
+                                )
+                                dirty_paths = len(status.splitlines())
+                            except (
+                                UnicodeError,
+                                goalflight_worktree_pool.WorktreeSeatError,
+                            ):
+                                dirty_paths = None
+                            if re.fullmatch(r"[0-9a-fA-F]{40,64}", checkout_head):
+                                final_checkout = (branch, checkout_head)
+                                if dirty_paths is not None:
+                                    final_checkout_dirty = (dirty_paths > 0, dirty_paths)
+                                ledger_path = goalflight_ledger.record_path(
+                                    args.dispatch_id, create=False
+                                )
+                                if ledger_path.is_file():
+                                    try:
+                                        with goalflight_ledger.StateLock():
+                                            current = goalflight_ledger.read_record(
+                                                args.dispatch_id
+                                            )
+                                            current_state = (
+                                                str(
+                                                    current.get("terminal_state")
+                                                    or current.get("state")
+                                                    or ""
+                                                )
+                                                if isinstance(current, dict)
+                                                else ""
+                                            )
+                                            if (
+                                                isinstance(current, dict)
+                                                and not goalflight_ledger.record_is_unreadable(
+                                                    current
+                                                )
+                                                and goalflight_dispatch_states.is_terminal_state(
+                                                    current_state
+                                                )
+                                                and current.get("worker_still_alive") is not True
+                                            ):
+                                                current["worktree_branch"] = branch
+                                                current["worktree_head"] = checkout_head
+                                                goalflight_ledger.write_record(current)
+                                                record.update(
+                                                    worktree_branch=branch,
+                                                    worktree_head=checkout_head,
+                                                )
+                                    except OSError as exc:
+                                        return _final_error(
+                                            args,
+                                            "could not record terminal worker checkout "
+                                            f"({exc})",
+                                        )
+                except (
+                    OSError,
+                    ValueError,
+                    UnicodeError,
+                    goalflight_worktree_pool.WorktreeSeatError,
+                    goalflight_worktree_pool.WorktreeCwdRefused,
+                ):
+                    # No ownership proof means the recorded terminal state is
+                    # the only checkout data this dispatch may report.
+                    pass
+    if terminal:
+        if final_checkout is not None:
+            head = final_checkout[1]
+            head_source = f"checkout {final_checkout[0]}"
+        else:
+            recorded_head = str(record.get("worktree_head") or "")
+            has_recorded_head = bool(
+                re.fullmatch(r"[0-9a-fA-F]{40,64}", recorded_head)
+            )
+            head = recorded_head if has_recorded_head else "-"
+            branch = str(record.get("worktree_branch") or "").strip()
+            head_source = (
+                f"ledger {branch}" if branch else "ledger" if has_recorded_head else "unknown"
+            )
+    else:
+        head, head_source = _final_head(record, args.dispatch_id)
+    base = str(
+        record.get("worktree_base_sha")
+        or record.get("worktree_base")
+        or record.get("worktree_head")
+        or record.get("base_sha")
+        or "-"
+    )
+    account = str(record.get("account") or "-")
+    marker_name = f"!{marker['kind']}" if marker else "running"
+    marker_reason = str(record.get("reason") or "")
+    if isinstance(record.get("error"), dict):
+        marker_reason = marker_reason or str(record["error"].get("reason") or "")
+    if marker and marker_reason.endswith(":final_reconciliation"):
+        marker_name += ":final_reconciliation"
+    behind_summary = _behind_summary(record, head)
+    final_line = f"base {base}; head {head} ({head_source}); {behind_summary}"
+    if final_checkout_dirty is not None and final_checkout_dirty[0]:
+        final_line += f" (dirty: {final_checkout_dirty[1]} paths)"
+    if not terminal and message is None:
+        result = {
+            "id": args.dispatch_id,
+            "marker": "running",
+            "sha": head,
+            "head": head,
+            "source": head_source,
+            "engine": engine,
+            "account": account,
+            "message": f"running; no complete assistant message yet; tail: {tail}",
+            "base": base,
+            "behind": behind_summary,
+        }
+        if boundary:
+            result["boundary"] = boundary
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"{args.dispatch_id} running head {head} ({head_source}) {engine} {account}")
+            if boundary:
+                print(f"boundary: {boundary}")
+            print(result["message"])
+            print(final_line)
+        return 0
+    if terminal and message is None:
+        message = "(no final message)"
+    result = {
+        "id": args.dispatch_id,
+        "marker": marker_name,
+        "sha": head,
+        "head": head,
+        "source": head_source,
+        "engine": engine,
+        "account": account,
+        "message": message,
+        "base": base,
+        "behind": behind_summary,
+    }
+    if final_checkout_dirty is not None:
+        result["dirty"], result["dirty_paths"] = final_checkout_dirty
+    if boundary:
+        result["boundary"] = boundary
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{args.dispatch_id} {marker_name} head {head} ({head_source}) {engine} {account}")
+        if boundary:
+            print(f"boundary: {boundary}")
+        sys.stdout.write(message)
+        if not message.endswith(("\n", "\r")):
+            sys.stdout.write("\n")
+        print(final_line)
+    return 0
 
 
 def _cmd_steer(argv: list[str]) -> int:
@@ -6913,6 +9424,10 @@ def _cmd_steer(argv: list[str]) -> int:
     )
     parser.add_argument("--question-kind")
     parser.add_argument(
+        "--resume-wait-id",
+        help="Recover a reply only for this exact previously timed-out worker wait.",
+    )
+    parser.add_argument(
         "--reply-to",
         help="Correlate this typed controller reply to an active worker wait id.",
     )
@@ -6928,80 +9443,136 @@ def _cmd_steer(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    record = _find_dispatch_record(args.dispatch_id)
-    if record is None:
-        print(f"goalflight_dispatch: no ledger record for dispatch {args.dispatch_id}", file=sys.stderr)
-        return 64
+    def refuse_steer(reason: object) -> None:
+        goalflight_messages.emit_not_recorded(
+            reason,
+            f"python3 scripts/goalflight_status.py --wait {args.dispatch_id}",
+        )
+
+    record = None
+    if not args.wait_for_message:
+        record = _find_dispatch_record(args.dispatch_id)
+        if record is None:
+            goalflight_messages.emit_not_recorded(
+                f"no ledger record for dispatch {args.dispatch_id}",
+                f"python3 scripts/goalflight_status.py --wait {args.dispatch_id}",
+            )
+            return 64
 
     if args.list_messages and args.wait_for_message:
-        print("goalflight_dispatch: steer --list and --wait are mutually exclusive", file=sys.stderr)
+        refuse_steer("steer --list and --wait are mutually exclusive")
         return 64
     if args.cross_project and (args.list_messages or args.wait_for_message):
-        print(
-            "goalflight_dispatch: steer --cross-project applies only to controller steers",
-            file=sys.stderr,
-        )
+        refuse_steer("steer --cross-project applies only to controller steers")
         return 64
     if args.list_messages and (args.reply_to or args.decision):
-        print("goalflight_dispatch: steer --list cannot carry reply fields", file=sys.stderr)
+        refuse_steer("steer --list cannot carry reply fields")
+        return 64
+    if args.resume_wait_id and not args.wait_for_message:
+        refuse_steer("--resume-wait-id requires --wait")
         return 64
     if args.list_messages:
         return _list_steer_messages(args.dispatch_id, record)
     if args.wait_for_message:
         if args.reply_to or args.decision:
-            print(
-                "goalflight_dispatch: steer --wait cannot carry controller reply fields",
-                file=sys.stderr,
-            )
+            refuse_steer("steer --wait cannot carry controller reply fields")
             return 64
         if not args.question_kind or not str(args.message or "").strip():
-            print(
-                "goalflight_dispatch: steer --wait requires question text and "
-                "--question-kind",
-                file=sys.stderr,
-            )
+            refuse_steer("steer --wait requires question text and --question-kind")
             return 64
         question_kind = str(args.question_kind).strip()
         if question_kind not in goalflight_terminal.WORKER_WAIT_QUESTION_KINDS:
             valid = ", ".join(sorted(goalflight_terminal.WORKER_WAIT_QUESTION_KINDS))
-            print(
-                "goalflight_dispatch: --question-kind must be one of: "
-                f"{valid}",
-                file=sys.stderr,
-            )
+            refuse_steer(f"--question-kind must be one of: {valid}")
             return 64
         try:
+            mailbox = _worker_wait_mailbox(args.dispatch_id)
+            own_outbox_dir = _worker_question_outbox(args.dispatch_id, mailbox)
+            outbox_dir = own_outbox_dir
+            settlement_outbox_dir = None
+            consumed_reply_receipts: set[tuple[str, int]] = set()
+            wait_dispatch_id = args.dispatch_id
+            if args.resume_wait_id:
+                wait_dispatch_id, lineage_ids = _worker_wait_resume_source(
+                    args.dispatch_id,
+                    args.resume_wait_id,
+                    question_kind=question_kind,
+                    question_text=args.message,
+                )
+                consumed_reply_receipts = set().union(
+                    *(
+                        goalflight_steer_mailbox.worker_question_reply_receipts(
+                            goalflight_dispatch_paths.worker_question_outbox_dir(
+                                lineage_id,
+                                dispatch_dir=mailbox.parent,
+                            )
+                        )
+                        for lineage_id in lineage_ids
+                    )
+                )
+                if wait_dispatch_id != args.dispatch_id:
+                    mailbox = _steer_file(wait_dispatch_id)
+                    outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(
+                        wait_dispatch_id,
+                        dispatch_dir=mailbox.parent,
+                    )
+                    # A resumed child may write its receipt only to its own
+                    # sandbox-granted outbox, while reading the parent's wait.
+                    settlement_outbox_dir = own_outbox_dir
+            attempt_id = str(os.environ.get("GOALFLIGHT_ATTEMPT_ID") or "").strip()
+            if not attempt_id:
+                raise DispatchUsageError("steer --wait requires GOALFLIGHT_ATTEMPT_ID")
             result = goalflight_steer_mailbox.wait_for_worker_entries(
-                _worker_wait_mailbox(args.dispatch_id),
-                dispatch_id=args.dispatch_id,
-                acked_seqs=_acked_steer_seqs(record),
-                consumed_reply_receipts=_consumed_worker_wait_receipts(args.dispatch_id, record),
+                mailbox,
+                dispatch_id=wait_dispatch_id,
+                consumed_reply_receipts=consumed_reply_receipts,
                 question_kind=question_kind,
                 question_text=args.message,
+                attempt_id=attempt_id,
+                resume_wait_id=args.resume_wait_id,
+                # The resumed reply belongs to the parent mailbox. ACK
+                # sequences harvested from the child's tail describe the
+                # child mailbox and must not suppress it.
+                acked_seqs=(
+                    set()
+                    if args.resume_wait_id and wait_dispatch_id != args.dispatch_id
+                    else goalflight_steer_mailbox.acked_steer_seqs(
+                        {
+                            "stdout_path": os.environ.get(
+                                "GOALFLIGHT_WORKER_TAIL_FILE"
+                            )
+                        }
+                    )
+                ),
+                outbox_dir=outbox_dir,
+                settlement_outbox_dir=settlement_outbox_dir,
                 timeout_secs=args.timeout_secs,
                 poll_secs=args.poll_secs,
                 notify=_wait_event_reporter(args.dispatch_id),
             )
+        except goalflight_steer_mailbox.WorkerQuestionOutboxWriteDenied as exc:
+            refuse_steer(f"steer --wait unavailable [{type(exc).__name__}]: {exc}")
+            return 64
         except (OSError, ValueError, DispatchUsageError) as exc:
-            print(f"goalflight_dispatch: steer --wait failed: {exc}", file=sys.stderr)
+            refuse_steer(f"steer --wait failed: {exc}")
             return 64 if isinstance(exc, (ValueError, DispatchUsageError)) else 1
         except Exception as exc:
             if not goalflight_steer_mailbox.is_carrier_error(exc):
                 raise
-            print(f"goalflight_dispatch: steer --wait failed: {exc}", file=sys.stderr)
+            refuse_steer(f"steer --wait failed: {exc}")
             return 1
         return 0 if result["state"] == "messages" else 1
     if args.message is None:
-        print("goalflight_dispatch: steer requires a message, --list, or --wait", file=sys.stderr)
+        refuse_steer("steer requires a message, --list, or --wait")
         return 64
     if args.question_kind:
-        print("goalflight_dispatch: --question-kind requires --wait", file=sys.stderr)
+        refuse_steer("--question-kind requires --wait")
         return 64
     if args.decision and not args.reply_to:
-        print("goalflight_dispatch: --decision requires --reply-to", file=sys.stderr)
+        refuse_steer("--decision requires --reply-to")
         return 64
 
-    def append_controller_steer() -> int:
+    def append_controller_steer(warning: str | None = None) -> int:
         try:
             result = _append_steer_message(
                 args.dispatch_id,
@@ -7011,31 +9582,34 @@ def _cmd_steer(argv: list[str]) -> int:
                 cross_project=args.cross_project,
             )
         except (OSError, ValueError) as exc:
-            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            goalflight_messages.emit_not_recorded(
+                exc,
+                f"python3 scripts/goalflight_dispatch.py steer {args.dispatch_id} --list",
+            )
             return 64
         except Exception as exc:
-            import goalflight_messages
-
             if not isinstance(exc, goalflight_messages.MessageError):
                 raise
-            print(f"goalflight_dispatch: steer refused: {exc}", file=sys.stderr)
+            goalflight_messages.emit_not_recorded(
+                exc,
+                f"python3 scripts/goalflight_dispatch.py steer {args.dispatch_id} --list",
+            )
             return 64
-        return _report_steer_result(args.dispatch_id, result)
+        rc = _report_steer_result(args.dispatch_id, result, failure_reason=warning)
+        if warning and rc == 0:
+            print(warning, file=sys.stderr)
+        return rc
 
     shape = goalflight_ledger.infer_shape(record)
     if shape == "acp":
         warning = _worker_liveness_warning(record, in_process=True)
-        if warning:
-            print(warning, file=sys.stderr)
-        return append_controller_steer()
+        return append_controller_steer(warning)
     if shape != "bash":
-        print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
+        refuse_steer(f"dispatch {args.dispatch_id} has unsupported shape {shape!r}")
         return 64
 
     warning = _worker_liveness_warning(record, in_process=True)
-    if warning:
-        print(warning, file=sys.stderr)
-    return append_controller_steer()
+    return append_controller_steer(warning)
 
 
 def _codex_dispatch_homes_dir() -> Path:
@@ -7043,6 +9617,83 @@ def _codex_dispatch_homes_dir() -> Path:
         os.environ.get("GOALFLIGHT_CODEX_STATE_DIR", "~/.goal-flight")
     ).expanduser()
     return state_dir.resolve(strict=False) / "dispatch-homes"
+
+
+def _recorded_codex_dispatch_home(args) -> tuple[str | None, str | None, str | None]:
+    """Return this queued id's recorded home path, existing reuse path, and account."""
+    if not getattr(args, "from_queue", False) or _codex_seat_api() is None:
+        return None, None, None
+    dispatch_id = str(getattr(args, "dispatch_id", "") or "")
+    record = _find_dispatch_record(dispatch_id) if dispatch_id else None
+    if not isinstance(record, dict):
+        return None, None, None
+    owner = record.get("codex_home_owner_dispatch_id") or dispatch_id
+    if owner != dispatch_id:
+        return None, None, None
+    expected = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
+    recorded = record.get("codex_home")
+    path = (
+        Path(recorded).expanduser().resolve(strict=False)
+        if isinstance(recorded, str) and recorded
+        else expected
+    )
+    if path != expected:
+        return None, None, None
+    account = record.get("effective_account")
+    if not isinstance(account, str) or not account.strip():
+        account = record.get("account")
+        if not isinstance(account, str) or account.strip().lower() in {
+            "",
+            "default",
+            "host",
+        }:
+            account = None
+    else:
+        account = account.strip()
+    retry_home = str(path) if path.is_dir() else None
+    return str(path), retry_home, account
+
+
+def _validate_codex_worker_home(
+    dispatch_id: str,
+    home: str | None,
+    effective_account: str | None,
+    recorded_account: str | None,
+    *,
+    recorded_home: str | None = None,
+    retry_home: str | None = None,
+) -> None:
+    """Validate a queued home rebuild and any per-dispatch home before spawn.
+
+    Existing homes stay bound to their recorded account; a missing home is
+    rebuilt for this attempt's admitted account and that account is written to
+    its starting ledger row.
+    A live watcher for this id can still remove the home after this check; if it
+    wins the worker reports its missing-home failure.
+    """
+    expected = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
+    if recorded_home and not retry_home:
+        recorded = Path(recorded_home).expanduser().resolve(strict=False)
+        resolved = Path(home).expanduser().resolve(strict=False) if home else None
+        if recorded == expected and resolved != expected:
+            raise DispatchUsageError(
+                "codex_home_missing: could not rebuild recorded per-dispatch home"
+            )
+    if not home:
+        return
+    path = Path(home).expanduser()
+    if path.resolve(strict=False) != expected:
+        return
+    if not path.is_dir():
+        raise DispatchUsageError(
+            f"codex_home_missing: per-dispatch home is not a directory: {path}"
+        )
+    if retry_home and recorded_account and recorded_account != effective_account:
+        raise DispatchUsageError(
+            "codex_home_account_mismatch: recorded account "
+            f"{recorded_account!r} differs from resolved account "
+            f"{effective_account!r}; dispatch again under a new id"
+        )
 
 
 def _codex_resume_home(record: dict, dispatch_id: str) -> tuple[Path, str]:
@@ -7094,7 +9745,122 @@ def _codex_resume_status(record: dict, dispatch_id: str) -> dict | None:
     return status
 
 
-def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None:
+def _resume_validation_context(
+    records: list[dict], *, identity_probe=None,
+) -> dict:
+    """Index one ledger snapshot for the retention sweep's resume checks."""
+    records_by_id: dict[str, dict] = {}
+    record_order: list[str] = []
+    for record in records:
+        dispatch_id = record.get("dispatch_id")
+        if isinstance(dispatch_id, str) and dispatch_id:
+            if dispatch_id not in records_by_id:
+                record_order.append(dispatch_id)
+            records_by_id[dispatch_id] = record
+
+    codex_children_by_session: dict[str, list[str]] = {}
+    codex_children_by_ancestor: dict[str, list[str]] = {}
+    resume_children_by_session: dict[tuple[str, str], list[str]] = {}
+    codex_lineage_unknown: set[str] = set()
+    project_root_cache: dict[str, Path | None] = {}
+    for candidate_id in record_order:
+        candidate = records_by_id[candidate_id]
+        parent_id = candidate.get("parent_dispatch_id")
+        if (
+            not isinstance(parent_id, str)
+            or not parent_id
+            or goalflight_ledger.terminal_state_for(
+                candidate.get("state"),
+                candidate.get("reason") or candidate.get("error"),
+            ) != "unknown"
+        ):
+            continue
+        engine = goalflight_engine_sessions.resume_engine(
+            candidate.get("engine") or candidate.get("agent")
+        )
+        if engine == "codex":
+            session_id = goalflight_codex_sessions.valid_session_id(
+                candidate.get("codex_session_id")
+            )
+            if session_id is not None:
+                codex_children_by_session.setdefault(session_id, []).append(
+                    candidate_id
+                )
+
+            current = parent_id
+            seen: set[str] = set()
+            lineage_roots: set[Path] = set()
+            root_record: dict | None = None
+            lineage: list[str] = []
+            for _ in range(_RESUME_LINEAGE_WALK_LIMIT):
+                if not current:
+                    break
+                if current in seen:
+                    codex_lineage_unknown.add(candidate_id)
+                    break
+                seen.add(current)
+                ancestor = records_by_id.get(current)
+                if (
+                    ancestor is None
+                    or goalflight_ledger.record_is_unreadable(ancestor)
+                    or not ancestor.get("project_root")
+                ):
+                    codex_lineage_unknown.add(candidate_id)
+                    break
+                project_root = _resume_context_project_root(
+                    str(ancestor["project_root"]), project_root_cache,
+                )
+                if project_root is None:
+                    codex_lineage_unknown.add(candidate_id)
+                    break
+                lineage_roots.add(project_root)
+                if len(lineage_roots) > 1:
+                    codex_lineage_unknown.add(candidate_id)
+                    break
+                lineage.append(current)
+                root_record = ancestor
+                current = str(ancestor.get("parent_dispatch_id") or "").strip()
+            else:
+                codex_lineage_unknown.add(candidate_id)
+            if candidate_id not in codex_lineage_unknown:
+                if root_record is None:
+                    codex_lineage_unknown.add(candidate_id)
+                else:
+                    root_branch = str(root_record.get("worktree_branch") or "").strip()
+                    if root_branch and (
+                        not goalflight_worktree_pool.is_worktree_branch(root_branch)
+                        or root_branch.rsplit("/", 1)[-1] != lineage[-1]
+                    ):
+                        codex_lineage_unknown.add(candidate_id)
+                    else:
+                        for ancestor_id in lineage:
+                            codex_children_by_ancestor.setdefault(
+                                ancestor_id, [],
+                            ).append(candidate_id)
+        elif engine is not None:
+            session_id = goalflight_engine_sessions.valid_session_id(
+                engine,
+                candidate.get("engine_session_id") or candidate.get("codex_session_id"),
+            )
+            if session_id is not None:
+                resume_children_by_session.setdefault(
+                    (engine, session_id), [],
+                ).append(candidate_id)
+
+    return {
+        "records_by_id": records_by_id,
+        "record_order": record_order,
+        "codex_children_by_session": codex_children_by_session,
+        "codex_children_by_ancestor": codex_children_by_ancestor,
+        "resume_children_by_session": resume_children_by_session,
+        "codex_lineage_unknown": codex_lineage_unknown,
+        "identity_probe": identity_probe,
+    }
+
+
+def _assert_codex_resume_source_not_live(
+    record: dict, dispatch_id: str, *, identity_probe=None,
+) -> None:
     status = _codex_resume_status(record, dispatch_id) or {}
     record_pid = record.get("worker_pid")
     status_pid = status.get("worker_pid")
@@ -7111,8 +9877,40 @@ def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None
     identity_state, _identity_reason = _queue_claim_identity_status(
         worker_pid,
         worker_identity,
+        identity_probe=identity_probe,
     )
     if identity_state == "live":
+        worker_wait = status.get("worker_wait")
+        if status.get("state") == "awaiting_steer_reply" and isinstance(
+            worker_wait, dict
+        ):
+            wait_id = str(worker_wait.get("wait_id") or "").strip()
+            wait_detail = f" (wait-id {wait_id})" if wait_id else ""
+            raise DispatchUsageError(
+                f"dispatch {dispatch_id} is live and waiting for a question reply"
+                f"{wait_detail}; reply to the open wait before resume"
+            )
+        stale_question = next(
+            (
+                marker
+                for marker in reversed(
+                    [
+                        *(status.get("markers") or []),
+                        status.get("attention_marker"),
+                    ]
+                )
+                if isinstance(marker, dict)
+                and marker.get("kind") == "BLOCKED"
+                and "wait timed out" in str(marker.get("text") or "").lower()
+            ),
+            None,
+        )
+        if stale_question is not None:
+            wait_text = str(stale_question.get("text") or "").strip()
+            raise DispatchUsageError(
+                f"dispatch {dispatch_id} is live after a question wait timed out; "
+                f"stale question: {wait_text}; wait for terminal before resume"
+            )
         raise DispatchUsageError(
             f"dispatch {dispatch_id} is still live; wait for terminal before resume"
         )
@@ -7152,8 +9950,27 @@ def _assert_no_nonterminal_codex_resume_child(
     session_id: str,
     exclude_dispatch_id: str | None = None,
     reconcile_dead_preclaim: bool = False,
+    resume_context: dict | None = None,
 ) -> None:
-    for candidate in goalflight_ledger.read_records():
+    if resume_context is None:
+        candidates = goalflight_ledger.read_records()
+    else:
+        candidate_ids = set(
+            resume_context["codex_children_by_session"].get(session_id, ())
+        )
+        candidate_ids.update(
+            resume_context["codex_children_by_ancestor"].get(dispatch_id, ())
+        )
+        candidate_ids.update(resume_context["codex_lineage_unknown"])
+        candidates = [
+            resume_context["records_by_id"][candidate_id]
+            for candidate_id in resume_context["record_order"]
+            if candidate_id in candidate_ids
+        ]
+    identity_probe = (
+        resume_context.get("identity_probe") if resume_context is not None else None
+    )
+    for candidate in candidates:
         candidate_id = candidate.get("dispatch_id")
         if (
             candidate_id in {dispatch_id, exclude_dispatch_id}
@@ -7178,10 +9995,27 @@ def _assert_no_nonterminal_codex_resume_child(
         candidate_session_id = goalflight_codex_sessions.valid_session_id(
             candidate.get("codex_session_id")
         )
-        if candidate_session_id == session_id:
-            identity_matches, identity_reason = goalflight_ledger.identity_matches(
-                candidate
+        if candidate_session_id is not None and candidate_session_id != session_id:
+            # A Codex resume stays on its source session. A candidate on a
+            # different valid session cannot descend from this source, so a
+            # broken unrelated lineage must not refuse every resume.
+            continue
+        candidate_on_lineage = candidate_session_id == session_id
+        if (
+            not candidate_on_lineage
+            and resume_context is not None
+            and candidate_id in resume_context["codex_lineage_unknown"]
+        ):
+            raise DispatchUsageError(
+                f"resume refused: missing or unreadable lineage ancestor {candidate_id}"
             )
+        if not candidate_on_lineage and resume_context is None and isinstance(candidate_id, str):
+            candidate_on_lineage = dispatch_id in _resume_lineage_dispatch_ids(
+                candidate_id
+            )
+        if candidate_on_lineage:
+            probe = identity_probe or goalflight_ledger.identity_matches
+            identity_matches, identity_reason = probe(candidate)
             confirmed_dead_preclaim = (
                 candidate.get("state") == "waiting_capacity"
                 and not candidate.get("worker_pid")
@@ -7255,11 +10089,25 @@ def _assert_no_nonterminal_resume_child(
     session_id: str,
     exclude_dispatch_id: str | None = None,
     reconcile_dead_preclaim: bool = False,
+    resume_context: dict | None = None,
 ) -> None:
     """Refuse a second live launch against the same engine session."""
     if engine == "codex":
         return
-    for candidate in goalflight_ledger.read_records():
+    if resume_context is None:
+        candidates = goalflight_ledger.read_records()
+    else:
+        candidate_ids = resume_context["resume_children_by_session"].get(
+            (engine, session_id), (),
+        )
+        candidates = [
+            resume_context["records_by_id"][candidate_id]
+            for candidate_id in candidate_ids
+        ]
+    identity_probe = (
+        resume_context.get("identity_probe") if resume_context is not None else None
+    )
+    for candidate in candidates:
         candidate_id = candidate.get("dispatch_id")
         if (
             candidate_id in {dispatch_id, exclude_dispatch_id}
@@ -7287,9 +10135,8 @@ def _assert_no_nonterminal_resume_child(
         )
         if candidate_session_id != session_id:
             continue
-        identity_matches, identity_reason = goalflight_ledger.identity_matches(
-            candidate
-        )
+        probe = identity_probe or goalflight_ledger.identity_matches
+        identity_matches, identity_reason = probe(candidate)
         confirmed_dead_preclaim = (
             candidate.get("state") == "waiting_capacity"
             and not candidate.get("worker_pid")
@@ -7321,6 +10168,7 @@ def _validate_resume_source(
     *,
     exclude_dispatch_id: str | None = None,
     reconcile_dead_preclaim: bool = False,
+    _resume_context: dict | None = None,
 ) -> dict:
     """Validate a resume source for any wired worker CLI.
 
@@ -7328,9 +10176,19 @@ def _validate_resume_source(
     recorded native handle. Pre-capture dispatches refuse instead of starting
     a silent fresh session.
     """
-    record = _find_dispatch_record(dispatch_id)
+    record = (
+        _resume_context["records_by_id"].get(dispatch_id)
+        if _resume_context is not None
+        else _find_dispatch_record(dispatch_id)
+    )
     if record is None:
         raise DispatchUsageError(f"no ledger record for dispatch {dispatch_id}")
+    if goalflight_ledger.record_is_unreadable(record):
+        raise DispatchUsageError(f"ledger record is unreadable for dispatch {dispatch_id}")
+    if record.get("seat_release"):
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} is no longer resumable because its seat was released"
+        )
     if record.get("superseded_by"):
         raise DispatchUsageError(
             f"dispatch {dispatch_id} was superseded by {record['superseded_by']}; "
@@ -7344,13 +10202,22 @@ def _validate_resume_source(
         raise DispatchUsageError(
             f"dispatch {dispatch_id} engine {label!r} is not a resumable worker CLI"
         )
-    _assert_codex_resume_source_not_live(record, dispatch_id)
+    identity_probe = (
+        _resume_context.get("identity_probe")
+        if _resume_context is not None else None
+    )
+    _assert_codex_resume_source_not_live(
+        record, dispatch_id, identity_probe=identity_probe,
+    )
     if engine == "codex":
         _record, home, session_id, home_owner_dispatch_id = (
             _validate_codex_resume_source(
                 dispatch_id,
                 exclude_dispatch_id=exclude_dispatch_id,
                 reconcile_dead_preclaim=reconcile_dead_preclaim,
+                source_record=record,
+                resume_context=_resume_context,
+                identity_probe=identity_probe,
             )
         )
         return {
@@ -7373,6 +10240,7 @@ def _validate_resume_source(
         session_id=session_id,
         exclude_dispatch_id=exclude_dispatch_id,
         reconcile_dead_preclaim=reconcile_dead_preclaim,
+        resume_context=_resume_context,
     )
     return {
         "record": record,
@@ -7390,13 +10258,22 @@ def _validate_codex_resume_source(
     *,
     exclude_dispatch_id: str | None = None,
     reconcile_dead_preclaim: bool = False,
+    source_record: dict | None = None,
+    resume_context: dict | None = None,
+    identity_probe=None,
 ) -> tuple[dict, Path, str, str]:
-    record = _find_dispatch_record(dispatch_id)
+    record = source_record or (
+        resume_context["records_by_id"].get(dispatch_id)
+        if resume_context is not None
+        else _find_dispatch_record(dispatch_id)
+    )
     if record is None:
         raise DispatchUsageError(f"no ledger record for dispatch {dispatch_id}")
     if goalflight_ledger.infer_engine(record.get("engine") or record.get("agent")) != "codex":
         raise DispatchUsageError(f"dispatch {dispatch_id} is not a codex dispatch")
-    _assert_codex_resume_source_not_live(record, dispatch_id)
+    _assert_codex_resume_source_not_live(
+        record, dispatch_id, identity_probe=identity_probe,
+    )
     session_id = _recorded_codex_session_id(record, dispatch_id)
     if session_id is None:
         raise DispatchUsageError(
@@ -7417,6 +10294,7 @@ def _validate_codex_resume_source(
         session_id=session_id,
         exclude_dispatch_id=exclude_dispatch_id,
         reconcile_dead_preclaim=reconcile_dead_preclaim,
+        resume_context=resume_context,
     )
     return record, home, session_id, home_owner_dispatch_id
 
@@ -7426,18 +10304,14 @@ _CODEX_RESUME_DURABLE_CLAIM_HOOK = None
 
 
 def _codex_resume_lock_path(home: Path, session_id: str) -> Path:
-    key = hashlib.sha256(
-        f"{home.resolve(strict=False)}\0{session_id}".encode("utf-8")
-    ).hexdigest()
-    return home.parent / ".resume-locks" / f"{key}.lock"
+    return goalflight_dispatch_paths.codex_resume_lock_path(home, session_id)
 
 
 @contextlib.contextmanager
-def _codex_resume_lock(home: Path, session_id: str):
-    """Serialize claims and home rebuilds for one recorded Codex rollout."""
+def _resume_file_lock(lock_path: Path, purpose: str):
+    """Hold a resume lock while validating and publishing a resume claim."""
     if fcntl is None:  # pragma: no cover - resume is refused on native Windows
-        raise DispatchUsageError("codex resume requires local file locking")
-    lock_path = _codex_resume_lock_path(home, session_id)
+        raise DispatchUsageError(f"{purpose} requires local file locking")
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "a+", encoding="utf-8") as lock_file:
@@ -7446,27 +10320,147 @@ def _codex_resume_lock(home: Path, session_id: str):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _codex_resume_lock(home: Path, session_id: str):
+    """Serialize claims and home rebuilds for one recorded Codex rollout."""
+    return _resume_file_lock(
+        _codex_resume_lock_path(home, session_id), "codex resume"
+    )
 
 
 def _engine_resume_lock_path(engine: str, session_id: str) -> Path:
-    key = hashlib.sha256(f"{engine}\0{session_id}".encode("utf-8")).hexdigest()
-    return _codex_dispatch_homes_dir() / ".resume-locks" / f"{key}.lock"
+    return goalflight_dispatch_paths.engine_resume_lock_path(engine, session_id)
+
+
+def _engine_resume_lock(engine: str, session_id: str):
+    """Serialize claims for one recorded non-Codex engine session."""
+    return _resume_file_lock(
+        _engine_resume_lock_path(engine, session_id), "resume"
+    )
+
+
+def _resume_lock_path_info(record: dict, dispatch_id: str) -> tuple[Path | None, bool]:
+    engine = goalflight_engine_sessions.resume_engine(
+        record.get("engine") or record.get("agent")
+    )
+    try:
+        session_id = (
+            _recorded_codex_session_id(record, dispatch_id)
+            if engine == "codex"
+            else _recorded_engine_session_id(record, dispatch_id)
+            if engine
+            else None
+        )
+    except Exception:
+        return None, bool(engine)
+    if engine == "codex" and session_id:
+        owner = record.get("codex_home_owner_dispatch_id") or dispatch_id
+        raw_home = record.get("codex_home")
+        home = (
+            Path(raw_home).expanduser()
+            if isinstance(raw_home, str) and raw_home
+            else _codex_dispatch_homes_dir() / str(owner)
+        )
+        return _codex_resume_lock_path(home, session_id), True
+    if engine and session_id:
+        return _engine_resume_lock_path(engine, session_id), True
+    return None, bool(engine)
 
 
 @contextlib.contextmanager
-def _engine_resume_lock(engine: str, session_id: str):
-    """Serialize claims for one recorded non-Codex engine session."""
-    if fcntl is None:  # pragma: no cover - resume is refused on native Windows
-        raise DispatchUsageError("resume requires local file locking")
-    lock_path = _engine_resume_lock_path(engine, session_id)
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    with os.fdopen(fd, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+def _resume_publication_lock(args):
+    """Protect the fresh source check and first ledger row for a resume."""
+    parent_id = getattr(args, "parent_dispatch_id", None)
+    engine = goalflight_engine_sessions.resume_engine(
+        getattr(args, "engine", None) or getattr(args, "agent", None)
+    )
+    if not parent_id or getattr(args, "resume_reconstruction", False):
+        yield
+        return
+    parent_id = str(parent_id)
+    parent_record = _find_dispatch_record(parent_id) or {}
+    child_id = str(getattr(args, "dispatch_id", "")) or None
+    if engine == "codex":
         try:
+            session_id = _recorded_codex_session_id(parent_record, parent_id)
+        except Exception:
+            session_id = None
+        session_id = session_id or goalflight_codex_sessions.valid_session_id(
+            getattr(args, "codex_session_id", None)
+        )
+        raw_home = (
+            getattr(args, "_codex_resume_source_home", None)
+            or getattr(args, "codex_resume_home", None)
+            or parent_record.get("codex_home")
+        )
+        owner = (
+            getattr(args, "_codex_resume_source_home_owner_dispatch_id", None)
+            or parent_record.get("codex_home_owner_dispatch_id")
+            or parent_id
+        )
+        home = (
+            Path(raw_home).expanduser()
+            if isinstance(raw_home, str) and raw_home
+            else _codex_dispatch_homes_dir() / str(owner)
+        )
+        if not session_id:
+            raise DispatchUsageError("resume source no longer exists")
+        if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
+            _CODEX_RESUME_CLAIM_VALIDATED_HOOK(home, session_id, parent_id)
+        with _codex_resume_lock(home, session_id):
+            try:
+                _revalidate_codex_resume_claim(
+                    parent_dispatch_id=parent_id,
+                    expected_home=home.resolve(strict=False),
+                    expected_session_id=session_id,
+                    expected_home_owner_dispatch_id=str(owner),
+                    exclude_dispatch_id=child_id,
+                )
+            except DispatchUsageError as exc:
+                latest = _find_dispatch_record(parent_id) or {}
+                rollout = goalflight_codex_sessions.rollout_path(home, session_id)
+                if not latest or rollout is None or not rollout.is_file():
+                    raise DispatchUsageError(
+                        "resume source no longer exists"
+                    ) from exc
+                raise
             yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if _CODEX_RESUME_DURABLE_CLAIM_HOOK is not None:
+                _CODEX_RESUME_DURABLE_CLAIM_HOOK(
+                    home, session_id, child_id or ""
+                )
+        return
+    if engine:
+        try:
+            session_id = _recorded_engine_session_id(parent_record, parent_id)
+        except Exception:
+            session_id = None
+        session_id = session_id or goalflight_engine_sessions.valid_session_id(
+            engine, getattr(args, "engine_session_id", None)
+        )
+        if not session_id:
+            raise DispatchUsageError("resume source no longer exists")
+        with _engine_resume_lock(engine, session_id):
+            if engine in SEAT_SCOPED_SESSION_ENGINES:
+                latest = _find_dispatch_record(parent_id) or {}
+                source = _seat_session_dir(
+                    str(latest.get("effective_account") or latest.get("account") or ""),
+                    engine,
+                    str(latest.get("worker_cwd") or ""),
+                    session_id,
+                )
+                if not latest or source is None or not source.is_dir():
+                    raise DispatchUsageError("resume source no longer exists")
+            _revalidate_resume_claim(
+                parent_dispatch_id=parent_id,
+                expected_engine=engine,
+                expected_session_id=session_id,
+                exclude_dispatch_id=child_id,
+            )
+            yield
+        return
+    yield
 
 
 def _revalidate_resume_claim(
@@ -7508,13 +10502,14 @@ def _revalidate_codex_resume_claim(
     reconcile_dead_preclaim: bool = True,
 ) -> None:
     """Recheck lineage and exclusivity while the owner-home lock is held."""
-    _record, home, session_id, home_owner_dispatch_id = (
-        _validate_codex_resume_source(
-            parent_dispatch_id,
-            exclude_dispatch_id=exclude_dispatch_id,
-            reconcile_dead_preclaim=reconcile_dead_preclaim,
-        )
+    source = _validate_resume_source(
+        parent_dispatch_id,
+        exclude_dispatch_id=exclude_dispatch_id,
+        reconcile_dead_preclaim=reconcile_dead_preclaim,
     )
+    home = source["codex_home"]
+    session_id = source["session_id"]
+    home_owner_dispatch_id = source["codex_home_owner_dispatch_id"]
     if (
         home != expected_home
         or session_id != expected_session_id
@@ -7541,10 +10536,10 @@ def _seed_codex_resume_home_from_canonical(
     A recorded home is shared state during resume, so it is never rebuilt in
     place. The resumed worker gets a fresh per-dispatch home for the target
     account, built by the ordinary account path and keyed by THIS dispatch, and
-    a byte copy of the one rollout it resumes at the same path relative to the
-    home, which is where `codex exec resume <session>` looks. The source home is
-    only read. The prompt-token cache does not carry over; after a quota wall it
-    is stale anyway.
+    an independent clone or byte copy of the one rollout it resumes at the same
+    path relative to the home, which is where `codex exec resume <session>` looks.
+    The source home is only read. The prompt-token cache does not carry over;
+    after a quota wall it is stale anyway.
     """
     rollout = goalflight_codex_sessions.rollout_path(source_home, session_id)
     if rollout is None:
@@ -7598,7 +10593,9 @@ def _seed_codex_resume_home_from_canonical(
             f"{destination.name}.partial-{uuid.uuid4().hex}"
         )
         try:
-            shutil.copy2(rollout, partial)
+            goalflight_task._clone_or_copy(
+                rollout, partial, darwin_clone_only=True
+            )
             os.replace(partial, destination)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -7614,6 +10611,8 @@ def _seed_codex_resume_home_from_canonical(
 
 
 def _cmd_resume(argv: list[str]) -> int:
+    if not _admit_dispatch_disk_floor():
+        return 75
     parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} resume",
         description=(
@@ -7722,6 +10721,8 @@ def _cmd_resume(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 64
+    candidate_dispatch_id = None
+    candidate_argv = None
     try:
         source = _validate_resume_source(
             args.dispatch_id, reconcile_dead_preclaim=False
@@ -7766,17 +10767,41 @@ def _cmd_resume(argv: list[str]) -> int:
             candidate_argv=candidate_argv,
             dispatch_id=candidate_dispatch_id,
         )
-    except (DispatchUsageError, goalflight_worktree_pool.WorktreeSeatError) as exc:
+    except (
+        DispatchUsageError,
+        goalflight_worktree_pool.WorktreeSeatError,
+    ) as exc:
+        if candidate_dispatch_id and candidate_argv:
+            try:
+                refusal_args = _build_launch_parser().parse_args(candidate_argv)
+                refusal_args.dispatch_id = candidate_dispatch_id
+                refusal_args.task_ids = []
+                refusal_args.cwd = None
+                refusal_args.engine_session_id = None
+                refusal_args.codex_session_id = None
+                _record_prelaunch_failure(refusal_args, error=exc)
+            except Exception as record_exc:
+                print(
+                    "DISPATCH-FINALIZE-WARN "
+                    + json.dumps(
+                        {
+                            "dispatch_id": candidate_dispatch_id,
+                            "write": "resume_prelaunch_refusal",
+                            "error": f"{type(record_exc).__name__}: {record_exc}",
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            cleanup_codex_dispatch_home(candidate_dispatch_id)
         print(_dispatch_usage_error_message(exc), file=sys.stderr)
         return 64
     child_dispatch_id = preflight["dispatch_id"]
     result = None
-    resume_lock = preflight["resume_lock"]
     try:
         result = main(candidate_argv, resume_plan=preflight)
     finally:
-        if preflight.pop("resume_lock", None) is not None:
-            resume_lock.__exit__(*sys.exc_info())
         cleanup_id = preflight.get("reserved_dispatch_id") or child_dispatch_id
         if result != 0 and not goalflight_ledger.record_path(cleanup_id).exists():
             reservation = _dispatch_base_dir() / ".dispatch-ids" / f"{cleanup_id}.json"
@@ -7796,6 +10821,35 @@ def _dispatch_argv_from_record(record: dict) -> list[str]:
         if isinstance(blob, list) and blob:
             return [str(part) for part in blob]
     return []
+
+
+def _dispatch_owner_label(
+    record: dict,
+    *,
+    project_root: str | Path | None = None,
+    seen: set[str] | None = None,
+    reject_malformed: bool = False,
+) -> str | None:
+    return goalflight_ledger._dispatch_owner_label(
+        record,
+        project_root=project_root,
+        seen=seen,
+        reject_malformed=reject_malformed,
+    )
+
+
+def _strict_dispatch_owner_label(
+    record: dict,
+    *,
+    project_root: str | Path | None = None,
+) -> str | None:
+    """Resolve an owner without trusting a label copied over bad ancestry."""
+    goalflight_ledger._dispatch_parent_owner_label(
+        record, project_root=project_root, reject_malformed=True
+    )
+    return _dispatch_owner_label(
+        record, project_root=project_root, reject_malformed=True
+    )
 
 
 def _resume_model_from_record(record: dict) -> str | None:
@@ -7850,16 +10904,34 @@ def _resume_cwd_from_record(record: dict) -> Path | None:
 
 def _resume_recorded_controller_label(record: dict) -> str | None:
     value = record.get("controller_label")
-    if value and str(value).strip():
-        return str(value).strip()
-    recorded = _dispatch_argv_from_record(record)
-    return (
-        _option_value_before_worker_remainder(
-            recorded, "--controller-label", last=True
+    try:
+        inherited = goalflight_ledger._dispatch_parent_owner_label(
+            record, reject_malformed=True
         )
-        if recorded
-        else None
-    )
+        if value is not None and not isinstance(value, str):
+            raise goalflight_ledger._MalformedDispatchOwnerLabel(
+                type(value).__name__, 0
+            )
+    except goalflight_ledger._MalformedDispatchOwnerLabel as exc:
+        location = (
+            "current dispatch record"
+            if exc.ancestor_depth == 0
+            else f"ancestor depth {exc.ancestor_depth}"
+        )
+        raise DispatchUsageError(
+            f"resume refused: malformed controller owner metadata at {location} "
+            f"(type {exc.value_type})"
+        ) from None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    argv = _dispatch_argv_from_record(record)
+    if argv:
+        value = _option_value_before_worker_remainder(
+            argv, "--controller-label", last=True
+        )
+        if value and value.strip():
+            return value.strip()
+    return _dispatch_owner_label(record, reject_malformed=True) or inherited
 
 
 def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
@@ -7873,6 +10945,8 @@ def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
     path = _resume_cwd_from_record(record)
     if path is not None:
         if not path.is_dir():
+            if _record_declared_read_only(record):
+                return path
             raise DispatchUsageError(
                 f"resume refused: recorded worker cwd {path} is missing or unresolved"
             )
@@ -8153,84 +11227,44 @@ def _finalize_grok_resume(
         for flag, value in (("--prompt-file", reconstruction_prompt), ("--engine-session-id", engine_session_id)):
             materialized = _set_option_before_worker_remainder(materialized, flag, str(value))
         materialized = _insert_before_worker_remainder(materialized, ["--resume-reconstruction"])
-        prompt_path = _materialize_steer_prompt(reconstruction_prompt, dispatch_base, args.dispatch_id, agent=args.agent, orientation_path=orientation_path)
+        prompt_path = _materialize_steer_prompt(
+            reconstruction_prompt,
+            dispatch_base,
+            args.dispatch_id,
+            agent=args.agent,
+            orientation_path=orientation_path,
+            sandbox_profile=_supported_os_sandbox_profile(args),
+            sandbox_cwd=str(_worker_cwd(args)),
+            sandbox_command="grok",
+            sandbox_environment=getattr(args, "_account_env", None),
+            resume_contract_supersession=True,
+        )
     return materialized, prompt_path, engine_session_id
 
 
 def _prepare_unpinned_codex_resume(args) -> None:
-    """Select the effective account for an unpinned resume without writes."""
-    selected_account, rejections = select_codex_account(
-        model=getattr(args, "model", None)
+    """Resolve and retain the account snapshot before admitting a resume seat."""
+    (
+        selected_account,
+        rejections,
+        home,
+        effective_account,
+        pre_resolved,
+    ) = _prepare_codex_account_for_capacity(
+        _project_root(args),
+        str(args.dispatch_id),
+        model=getattr(args, "model", None),
     )
     args._codex_selected_account = selected_account
     args._codex_account_rejections = rejections
     args._capacity_account = selected_account
-
-
-def _resolve_unpinned_codex_resume(args, dispatch_id: str) -> None:
-    """Build the selected resume home after account and seat admission."""
-    selected_account = (
-        getattr(args, "_codex_selected_account", None)
-        or getattr(args, "_capacity_account", None)
-    )
-    try:
-        preflight_home, effective_account = resolve_codex_home(
-            _project_root(args),
-            selected_account,
-            dispatch_id,
-        )
-    except Exception as exc:
-        raise DispatchUsageError(
-            "resume refused: codex account resolution failed: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    if preflight_home is None and effective_account is None:
-        if selected_account:
-            raise DispatchUsageError(
-                "resume refused: selected Codex account could not be resolved: "
-                f"{selected_account}"
-            )
-        return
-    if preflight_home is None and effective_account == "host":
-        args._codex_resume_pre_resolved = {
-            "home": None,
-            "account": "host",
-        }
-        args._codex_selected_account = None
-        args._capacity_account = None
-        return
-    if (
-        not isinstance(preflight_home, str)
-        or not isinstance(effective_account, str)
-        or not preflight_home
-        or not effective_account
-    ):
-        raise DispatchUsageError(
-            "resume refused: codex account resolver returned an invalid home "
-            "or effective account"
-        )
-    expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
-        strict=False
-    )
-    if Path(preflight_home).resolve(strict=False) != expected_home:
-        raise DispatchUsageError(
-            "resume refused: codex account resolver returned home "
-            f"{preflight_home!r} for {dispatch_id}, expected {expected_home}"
-        )
+    args._codex_account_pre_resolved = pre_resolved
+    args._codex_pre_resolved_home = home
+    args._codex_pre_resolved_account = effective_account
     args._codex_resume_pre_resolved = {
-        "home": preflight_home,
+        "home": home,
         "account": effective_account,
     }
-    args._codex_selected_account = (
-        effective_account
-        if effective_account not in {"host", "default"}
-        else None
-    )
-    args._capacity_account = (
-        None
-        if effective_account in {"host", "default"}
-        else effective_account
-    )
 
 
 def _preflight_codex_resume_account(
@@ -8310,6 +11344,7 @@ def _preflight_resume_dispatch(
     _refuse_launch_blocked_by_completion_authority(args)
     engine = _account_engine(args.agent)
     preflight_home = None
+    _mark_spawn_intent(args.dispatch_id)
     if engine == "codex":
         requested = str(getattr(args, "account", None) or "").strip() or None
         if requested:
@@ -8334,18 +11369,6 @@ def _preflight_resume_dispatch(
         except BaseException:
             cleanup_codex_dispatch_home(dispatch_id) if preflight_home is not None else None
             raise
-    if engine == "codex":
-        resume_lock = _codex_resume_lock(
-            Path(source["codex_home"]), source["session_id"]
-        )
-    elif engine and source.get("session_id"):
-        resume_lock = _engine_resume_lock(engine, source["session_id"])
-    else:
-        resume_lock = contextlib.nullcontext()
-    try: resume_lock.__enter__()
-    except BaseException:
-        cleanup_codex_dispatch_home(dispatch_id) if preflight_home is not None else None
-        raise
     try:
         if engine == "codex":
             _revalidate_codex_resume_claim(
@@ -8358,12 +11381,6 @@ def _preflight_resume_dispatch(
                 exclude_dispatch_id=args.dispatch_id,
                 reconcile_dead_preclaim=False,
             )
-            if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
-                _CODEX_RESUME_CLAIM_VALIDATED_HOOK(
-                    Path(source["codex_home"]),
-                    source["session_id"],
-                    parent_dispatch_id,
-                )
         elif engine and source.get("session_id"):
             _revalidate_resume_claim(
                 parent_dispatch_id=parent_dispatch_id,
@@ -8373,7 +11390,6 @@ def _preflight_resume_dispatch(
                 reconcile_dead_preclaim=False,
             )
     except BaseException:
-        resume_lock.__exit__(*sys.exc_info())
         if preflight_home is not None:
             cleanup_codex_dispatch_home(dispatch_id)
         raise
@@ -8383,7 +11399,6 @@ def _preflight_resume_dispatch(
         "capacity_account": getattr(args, "_capacity_account", None),
         "dispatch_id": dispatch_id,
         "source": source,
-        "resume_lock": resume_lock,
     }
 
 
@@ -8440,18 +11455,33 @@ def _mark_reconciled_parent_resumed(
 
 
 CURSOR_AGENTS = {"cursor", "cursor-agent"}
+WORKER_ONLY_PREAMBLE = (
+    "If `GOALFLIGHT_DISPATCH_ID` is set you are a dispatched worker: do your "
+    "brief only; do not run `/goal-flight resume`, claim or renew controller "
+    "leases, arm supervise/listeners, read RESUME-NOTES for direction, or pick "
+    "queue items."
+)
 
 
 def _worker_prompt_preamble(
     agent: str | None,
     *,
     orientation_path: Path | None = None,
+    sandbox_profile: str | None = None,
+    sandbox_shape: str = "bash",
+    sandbox_cwd: str | None = None,
+    sandbox_command: str = "",
+    sandbox_environment: dict[str, str] | None = None,
+    resume_contract_supersession: bool = False,
 ) -> str:
     is_cursor = agent in CURSOR_AGENTS
-    preambles = [
+    preambles = [WORKER_ONLY_PREAMBLE]
+    if resume_contract_supersession:
+        preambles.append(RESUME_CONTRACT_SUPERSESSION_PREAMBLE)
+    preambles.extend([
         STEER_PROMPT_PREAMBLE,
         CURSOR_PROMPT_FILE_PREAMBLE if is_cursor else PROMPT_FILE_PREAMBLE,
-    ]
+    ])
     if orientation_path is not None:
         preambles.append(_project_orientation_preamble(orientation_path))
     if is_cursor:
@@ -8465,6 +11495,17 @@ def _worker_prompt_preamble(
         preambles.append(WORKER_EXECUTION_PREAMBLE)
     preambles.append(SCOPE_GUARD_PREAMBLE)
     preambles.append(SEARCH_SCOPE_PREAMBLE)
+    preambles.append(INSTRUCTION_REFUSAL_PREAMBLE)
+    sandbox_preamble = _sandbox_worker_preamble(
+        sandbox_profile,
+        agent=agent,
+        shape=sandbox_shape,
+        cwd=sandbox_cwd,
+        command=sandbox_command,
+        environment=sandbox_environment,
+    )
+    if sandbox_preamble:
+        preambles.append(sandbox_preamble)
     return "\n\n".join(preambles)
 
 
@@ -8475,13 +11516,39 @@ def _materialize_steer_prompt(
     *,
     agent: str | None = None,
     orientation_path: Path | None = None,
+    resume_cwd_notice: str | None = None,
+    remote_ci_environment: dict[str, str] | None = None,
+    sandbox_profile: str | None = None,
+    sandbox_shape: str = "bash",
+    sandbox_cwd: str | None = None,
+    sandbox_command: str = "",
+    sandbox_environment: dict[str, str] | None = None,
+    resume_contract_supersession: bool = False,
 ) -> str | None:
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
     body = _read_worker_prompt(body_path)
+    if resume_cwd_notice:
+        body = f"{body}\n\n## Resume checkout path\n{resume_cwd_notice}"
+    remote_ci_prompt = goalflight_dispatch_paths.remote_ci_worker_prompt(
+        remote_ci_environment or {}
+    )
+    if remote_ci_prompt and "Remote CI: run test suites and other heavy CPU" not in body:
+        body = f"{body.rstrip()}\n\n{remote_ci_prompt}\n"
     _warn_worker_prompt_uv_cache_references(body)
-    preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
+    preamble = _worker_prompt_preamble(
+        agent,
+        orientation_path=orientation_path,
+        sandbox_profile=sandbox_profile,
+        sandbox_shape=sandbox_shape,
+        sandbox_cwd=sandbox_cwd,
+        sandbox_command=sandbox_command,
+        sandbox_environment=sandbox_environment,
+        resume_contract_supersession=resume_contract_supersession,
+    )
+    if _prompt_requests_commit(body):
+        preamble += "\n\n" + COMMIT_CUSTODY_PREAMBLE
     # The watcher binds success markers to the dispatch id, so every agent whose
     # markers are scraped from a text tail must be told the id. That includes
     # cursor: it runs on the text path, and an untold cursor worker signed off
@@ -9442,6 +12509,18 @@ def _build_grok_reconstruction_prompt(
         Path(original_prompt).expanduser() if isinstance(original_prompt, str) else None,
         last_lines=None,
     )
+    controller_text = _read_reconstruction_excerpt(controller_prompt, last_lines=None)
+    remote_ci_marker = "Remote CI: run test suites and other heavy CPU"
+    if remote_ci_marker in original_text and remote_ci_marker in controller_text:
+        original_lines = original_text.splitlines()
+        marker_line = next(
+            index for index, line in enumerate(original_lines)
+            if remote_ci_marker in line
+        )
+        end_line = marker_line + 1
+        while end_line < len(original_lines) and original_lines[end_line].strip():
+            end_line += 1
+        original_text = "\n".join(original_lines[:marker_line] + original_lines[end_line:]).strip()
     summary = _read_reconstruction_excerpt(
         session_dir / "summary.json" if session_dir is not None else None,
         last_lines=120,
@@ -9450,9 +12529,18 @@ def _build_grok_reconstruction_prompt(
         session_dir / "chat_history.jsonl" if session_dir is not None else None,
     )
     tail_raw = record.get("stdout_path") or record.get("tail_path")
-    tail = _read_reconstruction_excerpt(
-        Path(tail_raw).expanduser() if isinstance(tail_raw, str) else None,
-    )
+    tail = ""
+    if isinstance(tail_raw, str) and tail_raw:
+        try:
+            tail_lines: deque[str] = deque(maxlen=_GROK_RECONSTRUCTION_LINES)
+            with goalflight_terminal.open_tail_reader(Path(tail_raw).expanduser()) as stream:
+                for raw_line in stream:
+                    tail_lines.append(
+                        raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    )
+            tail = "\n".join(tail_lines).strip()
+        except OSError:
+            pass
     context = [
         "RESUMED-BY-RECONSTRUCTION",
         f"The original Grok session {session_id} could not be carried to the healthy account.",
@@ -9475,8 +12563,7 @@ def _build_grok_reconstruction_prompt(
         _reconstruction_git_state(cwd),
         "",
         "## Controller resume prompt",
-        _read_reconstruction_excerpt(controller_prompt, last_lines=None)
-        or "(no controller resume prompt available)",
+        controller_text or "(no controller resume prompt available)",
         "",
         "Reconstruct the next action from this evidence, preserve existing worktree changes, and report that this is a resumed-by-reconstruction attempt.",
     ]
@@ -9521,6 +12608,8 @@ def _codex_seat_state_payload(*, now: float | None = None) -> dict | None:
         payload = json.loads(
             (state_root / "codex-seat-states.json").read_text(encoding="utf-8")
         )
+        if not isinstance(payload, dict):
+            return None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if (
@@ -9536,6 +12625,119 @@ def _codex_seat_state_payload(*, now: float | None = None) -> dict | None:
     if current - updated_ts > CODEX_SEAT_STATE_MAX_AGE_S:
         return None
     return payload
+
+
+def _codex_seat_state_updated_at() -> str:
+    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".goal-flight"
+    )
+    try:
+        payload = json.loads(
+            (state_root / "codex-seat-states.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(payload, dict):
+            return "unknown"
+        updated = _parse_timestamp_s(payload.get("updated_at"))
+        if updated is not None:
+            return dt.datetime.fromtimestamp(updated, tz=dt.timezone.utc).isoformat(
+                timespec="seconds"
+            )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return "unknown"
+
+
+def _refresh_codex_seatd_once() -> str:
+    """Start one detached seatd tick per awake-time startup window."""
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    dispatcher = os.environ.get("GOALFLIGHT_DISPATCH_SCRIPT")
+    script_dir = (
+        Path(dispatcher).expanduser().resolve().parent
+        if dispatcher
+        else SCRIPT_DIR
+    )
+    seatd = script_dir / "ext" / "codex_seatd.py"
+    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".goal-flight"
+    )
+    lock_path = state_root / "codex-active-seat.lock"
+    launch_lock_path = state_root / "refresh-launch.lock"
+    launch_stamp_path = state_root / "refresh-launch.stamp"
+    try:
+        state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with launch_lock_path.open("a+") as launch_lock:
+            try:
+                goalflight_compat.flock(
+                    launch_lock,
+                    goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+                )
+            except OSError:
+                return started_at
+            try:
+                now_awake = active_monotonic()
+                try:
+                    stamp = json.loads(launch_stamp_path.read_text(encoding="utf-8"))
+                    stamp_awake = float(stamp.get("awake_at"))
+                    stamp_started_at = stamp.get("started_at")
+                    stamp_age = now_awake - stamp_awake
+                    if (
+                        0.0 <= stamp_age <= CODEX_SEAT_REFRESH_STARTUP_ALLOWANCE_S
+                        and isinstance(stamp_started_at, str)
+                        and stamp_started_at
+                    ):
+                        return stamp_started_at
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+
+                with lock_path.open("a+") as seatd_lock:
+                    try:
+                        goalflight_compat.flock(
+                            seatd_lock,
+                            goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+                        )
+                    except OSError:
+                        return started_at
+                    goalflight_compat.flock(
+                        seatd_lock,
+                        goalflight_compat.LOCK_UN,
+                    )
+
+                _atomic_write_private_text(
+                    launch_stamp_path,
+                    json.dumps(
+                        {
+                            "awake_at": active_monotonic(),
+                            "started_at": started_at,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                )
+                subprocess.Popen(
+                    [sys.executable, str(seatd), "tick"],
+                    cwd=script_dir.parent,
+                    env=os.environ.copy(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except OSError:
+                with contextlib.suppress(OSError):
+                    launch_stamp_path.unlink()
+                raise
+            finally:
+                goalflight_compat.flock(launch_lock, goalflight_compat.LOCK_UN)
+    except OSError:
+        pass
+    return started_at
 
 
 # The seat daemon marks a seat exhausted at 100% of its worst window and writes
@@ -9583,6 +12785,82 @@ def _codex_seat_probe_says_usable(seat: str) -> bool | None:
     return float(used) < CODEX_SEAT_EXHAUSTED_AT_PERCENT
 
 
+def _codex_seatd_refusal_reason(seat: str) -> str | None:
+    """Return the safe reason the seat daemon logged for omitting a seat."""
+    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".goal-flight"
+    )
+    try:
+        lines = (state_root / "codex-seatd.log").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        fields = line.split()
+        if len(fields) < 4 or fields[0] != "codex-seatd:":
+            continue
+        if fields[1] != "managed-seat-refused-host-grant":
+            continue
+        values = dict(
+            field.split("=", 1)
+            for field in fields[2:]
+            if "=" in field
+        )
+        if values.get("seat") != seat:
+            continue
+        reason = values.get("reason", "")
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", reason):
+            return f"{fields[1]}: {reason}"
+        return fields[1]
+    return None
+
+
+def _codex_seat_admission_reason(seat: str) -> str | None:
+    """Require a fresh, healthy seat daemon publication before routing."""
+    payload = _codex_seat_state_payload()
+    if payload is None:
+        stale_since = _codex_seat_state_updated_at()
+        refresh_started_at = _refresh_codex_seatd_once()
+        deadline = active_monotonic() + CODEX_SEAT_REFRESH_WAIT_S
+        while True:
+            payload = _codex_seat_state_payload()
+            if payload is not None:
+                break
+            remaining = deadline - active_monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
+        if payload is None:
+            return (
+                f"seat state stale since {stale_since}; seat refresh in progress "
+                f"(started {refresh_started_at}); retry shortly"
+            )
+    record = (payload.get("seats") or {}).get(seat)
+    if not isinstance(record, dict):
+        refusal = _codex_seatd_refusal_reason(seat)
+        detail = f" ({refusal})" if refusal else ""
+        return f"not published by seat daemon{detail}"
+    if record.get("healthy") is not True:
+        return "seat daemon reports unhealthy"
+    cooldown_until = record.get("cooldown_until")
+    if cooldown_until:
+        cooldown_ts = _parse_timestamp_s(cooldown_until)
+        if cooldown_ts is None:
+            return "seat daemon cooldown is unknown"
+        if time.time() < cooldown_ts:
+            return "seat daemon cooldown"
+    usable = _codex_seat_probe_says_usable(seat)
+    if usable is True:
+        return None
+    if usable is False:
+        return "seat daemon reports quota exhausted"
+    return "seat daemon usage is unknown"
+
+
 def _seat_probe_says_usable(seat: str, engine: str | None) -> bool | None:
     """Did a FRESH probe measure this seat as usable? True / False / None.
 
@@ -9603,6 +12881,10 @@ def _seat_probe_says_usable(seat: str, engine: str | None) -> bool | None:
         document = grok_seats.load_states()
         if not isinstance(document, dict):
             return None
+        if not grok_seats.states_are_fresh(document):
+            document = grok_seats.refresh_states(
+                timeout_s=grok_seats.PROBE_TIMEOUT_S
+            )
         updated = document.get("updated_at")
         if not isinstance(updated, (int, float)):
             return None
@@ -9838,6 +13120,21 @@ def _static_account_configuration_error(args, account: str) -> str | None:
         )
     home = _account_home(account, engine)
     if not home.exists():
+        other_engine = next(
+            (
+                candidate
+                for candidate in ("codex", "grok", "cursor")
+                if candidate != engine and account in _configured_account_names(candidate)
+            ),
+            None,
+        )
+        if other_engine:
+            valid = ", ".join(_configured_account_names(engine)) or "(none configured)"
+            return (
+                f"--account {account!r} belongs to {other_engine}, not {engine} "
+                f"for --agent {args.agent!r}; configured {engine} accounts: {valid}. "
+                "Choose one of those accounts or omit --account."
+            )
         if engine == "codex":
             return (
                 f"--account {account} not configured (expected {home}). "
@@ -9918,10 +13215,71 @@ def _resolve_account_env(
         return {"CODEX_HOME": str(home)}
     env = dict(os.environ)
     _apply_home_env(env, home)
+    account_env_keys = (
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+    )
+    pinned_env_keys = (
+        "GOALFLIGHT_TASK_STORE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_WAKE_LEDGER_DIR",
+        "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_CAPACITY_CONF",
+        "GOALFLIGHT_GROK_SEAT_STATE_FILE",
+        "GOALFLIGHT_GROK_ACCOUNTS_DIR",
+    )
+    if engine in {"grok", "cursor"}:
+        # Resolve these while os.environ still describes the controller. The
+        # account HOME/XDG overlay is only for the provider CLI's own files.
+        import grok_seats
+        import grok_usage
+
+        seat_state_path = (
+            os.environ.get("GOALFLIGHT_GROK_SEAT_STATE_FILE", "").strip()
+            or grok_seats.STATE_PATH
+        )
+        grok_accounts_dir = (
+            os.environ.get("GOALFLIGHT_GROK_ACCOUNTS_DIR", "").strip()
+            or grok_usage.ACCOUNTS_DIR
+        )
+        env.update(
+            {
+                "GOALFLIGHT_TASK_STORE_DIR": str(
+                    goalflight_task.resolve_state_base_dir().resolve(strict=False)
+                ),
+                "GOALFLIGHT_JOURNAL_DIR": str(
+                    goalflight_journal.journals_index_dir()
+                    .parent.resolve(strict=False)
+                ),
+                "GOALFLIGHT_MESSAGES_DIR": str(
+                    goalflight_messages.default_messages_dir().resolve(strict=False)
+                ),
+                "GOALFLIGHT_WAKE_LEDGER_DIR": str(
+                    goalflight_wake.ledger_base_dir().resolve(strict=False)
+                ),
+                "GOALFLIGHT_FLEET_DIR": str(
+                    goalflight_messages.default_fleet_dir().resolve(strict=False)
+                ),
+                "GOALFLIGHT_CAPACITY_CONF": str(
+                    goalflight_agent_limits._local_conf_path()
+                    .expanduser()
+                    .resolve(strict=False)
+                ),
+                "GOALFLIGHT_GROK_SEAT_STATE_FILE": str(
+                    Path(seat_state_path).expanduser().resolve(strict=False)
+                ),
+                "GOALFLIGHT_GROK_ACCOUNTS_DIR": str(
+                    Path(grok_accounts_dir).expanduser().resolve(strict=False)
+                ),
+            }
+        )
     if engine == "grok":
         env.pop("GROK_API_KEY", None)
         env.pop("XAI_API_KEY", None)
-        return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
+        return {key: env[key] for key in (*account_env_keys, *pinned_env_keys)}
     if engine == "cursor":
         env.pop("CURSOR_API_KEY", None)
         ok, reason = _cursor_account_probe(env)
@@ -9930,7 +13288,7 @@ def _resolve_account_env(
                 f"--account {account} lacks cursor creds ({reason}). "
                 "Refusing to bill the wrong account."
             )
-        return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
+        return {key: env[key] for key in (*account_env_keys, *pinned_env_keys)}
     raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
 
 
@@ -10055,6 +13413,49 @@ def _call_resolve_codex_seat(
     return home, effective_account
 
 
+CODEX_ACCOUNT_SNAPSHOT_FAILURE_COOLDOWN_S = 5 * 60
+CODEX_ACCOUNT_SNAPSHOT_FAILURE_REASON = "account_snapshot_build_failed"
+
+
+def _codex_capacity_cooldown_reason(account: str) -> str | None:
+    try:
+        with goalflight_capacity.StateLock():
+            state = goalflight_capacity.load_state()
+    except (goalflight_capacity.CapacityStateUnreadable, OSError, ValueError):
+        return None
+    cooldown = goalflight_capacity.cooldown_for(state, "codex", account)
+    if not isinstance(cooldown, dict):
+        return None
+    until = goalflight_capacity.parse_iso(cooldown.get("until"))
+    if until is None or until > goalflight_capacity.utc_now():
+        return f"cooldown: {cooldown.get('reason') or 'unspecified'}"
+    return None
+
+
+def _record_codex_snapshot_failure_cooldown(account: str) -> None:
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            result = goalflight_capacity.cmd_cooldown(
+                argparse.Namespace(
+                    action="set",
+                    agent="codex",
+                    account=account,
+                    seconds=CODEX_ACCOUNT_SNAPSHOT_FAILURE_COOLDOWN_S,
+                    reason=CODEX_ACCOUNT_SNAPSHOT_FAILURE_REASON,
+                )
+            )
+    except (goalflight_capacity.CapacityStateUnreadable, OSError, ValueError) as exc:
+        raise DispatchUsageError(
+            f"could not record a temporary cooldown for Codex account {account!r} "
+            f"({type(exc).__name__})"
+        ) from exc
+    if result != 0:
+        raise DispatchUsageError(
+            f"could not record a temporary cooldown for Codex account {account!r}"
+        )
+
+
 def _codex_account_admission_reason(
     account: str,
     *,
@@ -10062,7 +13463,27 @@ def _codex_account_admission_reason(
     usage_rows: list[dict] | None = None,
 ) -> str | None:
     """Return why a configured account cannot accept this dispatch."""
+    cooldown_reason = _codex_capacity_cooldown_reason(account)
+    if cooldown_reason is not None:
+        return cooldown_reason
     probe = _codex_usage_probe_says_usable(account, rows=usage_rows)
+    if probe is False:
+        import goalflight_usage as usage
+
+        rows = _codex_usage_probe_rows() if usage_rows is None else usage_rows
+        if any(
+            usage._probe_state(row) == "auth_broken"
+            or (
+                isinstance(row.get("evidence"), dict)
+                and isinstance(row["evidence"].get("probe"), dict)
+                and row["evidence"]["probe"].get("state") == "auth_broken"
+            )
+            for row in _codex_account_usage_rows(account, rows)
+        ):
+            return "authentication is broken"
+    seat_reason = _codex_seat_admission_reason(account)
+    if seat_reason is not None:
+        return f"seatd: {seat_reason}"
     if probe is False:
         return "walled or quota-blocked"
     if probe is not True and _account_quota_blocked(account, engine="codex"):
@@ -10149,7 +13570,7 @@ def _codex_usage_probe_says_usable(
             or current_time - observed_at > CODEX_USAGE_PROBE_MAX_AGE_S
         ):
             return None
-        if state == "walled" or "walled" in (row.get("flags") or ()):
+        if state in {"walled", "auth_broken"} or state in (row.get("flags") or ()):
             return False
         if state != "reported":
             return None
@@ -10242,7 +13663,7 @@ def _refuse_walled_codex_account(
     usage_rows: list[dict] | None = None,
     probe_elapsed_s: float | None = None,
     allow_unknown: bool = False,
-) -> None:
+) -> list[dict]:
     """Refuse a pinned account without current, usable quota evidence."""
     import goalflight_usage as usage
 
@@ -10253,11 +13674,22 @@ def _refuse_walled_codex_account(
         if probe_elapsed_s is None and usage_rows is None
         else float(probe_elapsed_s or 0.0)
     )
-    budget_s = float(usage.DEFAULT_TIMEOUT_S)
+    budget_s = 0.0 if usage_rows is not None else float(usage.DEFAULT_TIMEOUT_S)
     probe = _codex_usage_probe_says_usable(account, rows=rows)
     if probe is None:
+        budget_s += float(usage.DEFAULT_TIMEOUT_S)
+        refresh_started = time.monotonic()
+        refreshed_rows = _codex_usage_probe_rows(account)
+        elapsed_s += max(0.0, time.monotonic() - refresh_started)
+        refreshed_probe = _codex_usage_probe_says_usable(
+            account, rows=refreshed_rows
+        )
+        if _codex_account_usage_rows(account, refreshed_rows):
+            rows = refreshed_rows
+        probe = refreshed_probe
+    if probe is None:
         if allow_unknown:
-            return
+            return rows
         timed_out = any(
             "timeout" in (row.get("flags") or ())
             for row in rows
@@ -10303,13 +13735,13 @@ def _refuse_walled_codex_account(
         raise DispatchUsageError(
             f"Codex account {account!r} health probe unknown or stale "
             f"(condition={condition}; elapsed={elapsed_s:.2f}s, "
-            f"budget={budget_s:.2f}s); "
-            "refusing pinned launch; refresh the usage probe"
+            f"budget={budget_s:.2f}s; refresh attempted); "
+            "refusing pinned launch"
         )
     if probe is not False and not (
         probe is not True and _account_quota_blocked(account, engine="codex")
     ):
-        return
+        return rows
     account_rows = _codex_account_usage_rows(account, rows)
     soonest = usage.soonest_reset(account_rows)
     reset_at = usage.parse_reset(soonest.get("reset_at")) if soonest else None
@@ -10432,8 +13864,18 @@ def select_codex_account(
     rejected: list[dict[str, str]] = []
     excluded = {str(account).strip() for account in (exclude_accounts or set())}
     usage_rows = _codex_usage_probe_rows()
+    configured = [
+        account
+        for account in _configured_account_names("codex")
+        if account not in excluded
+    ]
+    if any(
+        _codex_usage_probe_says_usable(account, rows=usage_rows) is None
+        for account in configured
+    ):
+        usage_rows = _codex_usage_probe_rows()
     candidates: list[tuple[float, str]] = []
-    for account in _configured_account_names("codex"):
+    for account in configured:
         if account in excluded:
             continue
         reason = _codex_account_admission_reason(
@@ -10452,15 +13894,15 @@ def select_codex_account(
     return min(candidates, key=lambda item: (-item[0], item[1]))[1], rejected
 
 
-def resolve_codex_home(
+def _resolve_codex_home_snapshot(
     project_root: Path | str,
     explicit_account: str | None,
     dispatch_id: str,
     *,
     model: str | None = None,
     allow_unknown_explicit: bool = False,
-) -> tuple[str | None, str | None]:
-    """Resolve one launch snapshot, refusing invalid explicit pins.
+) -> tuple[str | None, str | None, str | None, list[dict[str, str]]]:
+    """Build a Codex home snapshot, retrying eligible accounts on build failure.
 
     An explicit ``--account`` is honored as a pin. Unpinned selection first
     chooses a measured healthy account with per-account capacity headroom,
@@ -10476,30 +13918,113 @@ def resolve_codex_home(
     ``allow_unknown_explicit`` is reserved for the explicit occupancy override;
     it tolerates a missing probe but never bypasses a known quota wall.
     """
+    api = _codex_seat_api()
     if explicit_account:
+        account = explicit_account.strip()
+        if api is None:
+            return None, None, account, []
+        seat_reason = _codex_seat_admission_reason(account)
+        if seat_reason is not None:
+            raise DispatchUsageError(
+                f"Codex account {account!r} is unavailable in seatd state: "
+                f"{seat_reason}"
+            )
         _refuse_walled_codex_account(
-            explicit_account,
+            account,
             allow_unknown=allow_unknown_explicit,
         )
-    api = _codex_seat_api()
+        try:
+            resolved = _call_resolve_codex_seat(
+                api,
+                project_root,
+                account,
+                dispatch_id,
+                propagate_errors=True,
+            )
+        except Exception as exc:
+            _record_codex_snapshot_failure_cooldown(account)
+            raise DispatchUsageError(
+                f"Codex account {account!r} snapshot build failed "
+                f"({type(exc).__name__})"
+            ) from exc
+        if resolved == (None, None):
+            _record_codex_snapshot_failure_cooldown(account)
+            raise DispatchUsageError(
+                f"Codex account {account!r} snapshot build returned no home"
+            )
+        return resolved[0], resolved[1], account, []
     if api is None:
-        return None, None
-    if explicit_account:
-        return _call_resolve_codex_seat(
-            api,
-            project_root,
-            explicit_account,
-            dispatch_id,
-            propagate_errors=True,
+        return None, None, None, []
+
+    rejected_by_account: dict[str, str] = {}
+    attempted: set[str] = set()
+    while True:
+        selected, rejections = select_codex_account(
+            model=model,
+            exclude_accounts=attempted,
         )
-    selected, rejected = select_codex_account(model=model)
-    if selected:
-        resolved = _call_resolve_codex_seat(
-            api, project_root, selected, dispatch_id
-        )
+        for row in rejections:
+            account = str(row.get("account") or "").strip()
+            reason = str(row.get("reason") or "ineligible")
+            if account:
+                rejected_by_account.setdefault(account, reason)
+        if not selected:
+            break
+        attempted.add(selected)
+        try:
+            resolved = _call_resolve_codex_seat(
+                api,
+                project_root,
+                selected,
+                dispatch_id,
+                propagate_errors=True,
+            )
+        except Exception as exc:
+            resolved = (None, None)
+            failure_reason = f"snapshot build failed ({type(exc).__name__})"
+        else:
+            failure_reason = "snapshot builder returned no home"
         if resolved != (None, None):
-            return resolved
-        rejected.append({"account": selected, "reason": "account resolution failed"})
+            return (
+                resolved[0],
+                resolved[1],
+                selected,
+                [
+                    {"account": account, "reason": reason}
+                    for account, reason in sorted(rejected_by_account.items())
+                ],
+            )
+        try:
+            _record_codex_snapshot_failure_cooldown(selected)
+        except DispatchUsageError as exc:
+            rejected_by_account[selected] = (
+                f"{failure_reason}; cooldown could not be recorded"
+            )
+            details = ", ".join(
+                f"{account}={reason}"
+                for account, reason in sorted(rejected_by_account.items())
+            )
+            raise DispatchUsageError(
+                f"Codex account snapshot resolution failed; skipped: {details}; "
+                "refusing to route without a recorded cooldown"
+            ) from exc
+        rejected_by_account[selected] = failure_reason
+        print(
+            "goalflight_dispatch: WARN: Codex account "
+            f"{selected!r} {failure_reason}; skipping it for "
+            f"{CODEX_ACCOUNT_SNAPSHOT_FAILURE_COOLDOWN_S}s",
+            file=sys.stderr,
+        )
+
+    if attempted:
+        details = ", ".join(
+            f"{account}={reason}"
+            for account, reason in sorted(rejected_by_account.items())
+        )
+        raise DispatchUsageError(
+            "Codex account snapshot resolution failed; no other eligible account; "
+            f"skipped: {details}; re-login or refresh the affected account and retry"
+        )
 
     # Preserve the optional library's own dispatch-time selector for machines
     # whose account homes are not discoverable by directory enumeration. A
@@ -10516,16 +14041,49 @@ def resolve_codex_home(
         if reason is None and _codex_account_headroom(account, usage_rows) is None:
             reason = "headroom unknown"
         if reason is None:
-            return home, account
-        rejected.append({"account": account, "reason": reason})
+            return home, account, account, []
+        rejected_by_account[account] = reason
+        if reason.startswith(
+            f"cooldown: {CODEX_ACCOUNT_SNAPSHOT_FAILURE_REASON}"
+        ):
+            details = ", ".join(
+                f"{name}={why}"
+                for name, why in sorted(rejected_by_account.items())
+            )
+            raise DispatchUsageError(
+                "Codex account snapshot resolution is cooling down; "
+                f"skipped: {details}"
+            )
     print(
         "goalflight_dispatch: WARN: no managed codex account selectable "
-        f"(rejected: {rejected or 'all accounts walled or discovery failed'}); billing host",
+        f"(rejected: {rejected_by_account or 'all accounts walled or discovery failed'}); billing host",
         file=sys.stderr,
     )
     # A rejected resolver result may point at an unverified account home. Do not
     # keep that path while relabelling the billing identity as the host.
-    return None, "host"
+    return None, "host", None, [
+        {"account": name, "reason": reason}
+        for name, reason in sorted(rejected_by_account.items())
+    ]
+
+
+def resolve_codex_home(
+    project_root: Path | str,
+    explicit_account: str | None,
+    dispatch_id: str,
+    *,
+    model: str | None = None,
+    allow_unknown_explicit: bool = False,
+) -> tuple[str | None, str | None]:
+    """Resolve one launch snapshot, refusing invalid explicit pins."""
+    home, account, _selected, _rejected = _resolve_codex_home_snapshot(
+        project_root,
+        explicit_account,
+        dispatch_id,
+        model=model,
+        allow_unknown_explicit=allow_unknown_explicit,
+    )
+    return home, account
 
 
 def _prepare_codex_account_for_capacity(
@@ -10540,32 +14098,28 @@ def _prepare_codex_account_for_capacity(
     str | None,
     bool,
 ]:
-    """Select the complete unpinned account before capacity admission.
-
-    Configured account homes are selected directly. When none are discoverable,
-    the optional resolver is the only source of an account, so resolve it before
-    admission and retain the result for the launch phase. Otherwise capacity
-    would be charged to ``default`` before the resolver-selected account starts.
-    """
-    if _codex_seat_api() is None:
-        return None, [], None, None, True
-    selected, rejected = select_codex_account(model=model)
-    if selected:
-        return selected, rejected, None, None, False
-
-    try:
-        home, effective_account = resolve_codex_home(
+    """Build an unpinned account snapshot before capacity or seat admission."""
+    home, effective_account, selected_account, rejected = (
+        _resolve_codex_home_snapshot(
             project_root,
             None,
             dispatch_id,
             model=model,
         )
-    except BaseException:
-        home, effective_account = None, None
+    )
+    if home and effective_account not in {None, "host", "default"}:
+        expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(
+            strict=False
+        )
+        if Path(home).expanduser().resolve(strict=False) != expected_home:
+            raise DispatchUsageError(
+                "Codex account resolver returned an unexpected home for "
+                f"dispatch {dispatch_id}"
+            )
     capacity_account = (
         None if effective_account in {None, "host"} else effective_account
     )
-    return capacity_account, rejected, home, effective_account, True
+    return capacity_account or selected_account, rejected, home, effective_account, True
 
 
 def _codex_post_capacity_admission_reason(
@@ -10637,15 +14191,22 @@ def revalidate_codex_account_after_capacity(
         # Preserve the detailed reset/health diagnostic used by pre-admission
         # pin checks, while marking this as the no-spawn refusal path.
         setattr(args, "_codex_post_capacity_pinned_refusal", True)
-        _refuse_walled_codex_account(
+        refreshed_rows = _refuse_walled_codex_account(
             explicit_account,
             usage_rows=usage_rows,
             probe_elapsed_s=probe_elapsed_s,
         )
-        raise DispatchUsageError(
-            f"Codex account {explicit_account!r} is no longer eligible after "
-            f"capacity admission: {reason}"
+        refreshed_reason = _codex_post_capacity_admission_reason(
+            explicit_account,
+            usage_rows=refreshed_rows,
         )
+        if refreshed_reason is not None:
+            raise DispatchUsageError(
+                f"Codex account {explicit_account!r} became unusable after "
+                f"capacity admission: {refreshed_reason}; refusing pinned launch"
+            )
+        setattr(args, "_codex_post_capacity_pinned_refusal", False)
+        return explicit_account
 
     alternate, rejections = select_codex_account(
         model=getattr(args, "model", None),
@@ -10825,7 +14386,19 @@ def _validate_codex_reasoning_effort(args, env: dict[str, str]) -> None:
     levels = CODEX_FALLBACK_REASONING_EFFORTS
     fallback = True
     try:
-        cache = json.loads((home / "models_cache.json").read_text(encoding="utf-8"))
+        cache_path = home / "models_cache.json"
+        try:
+            cache_text = cache_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            canonical_home = (
+                Path(env.get("HOME") or Path.home()).expanduser() / ".codex"
+            )
+            if canonical_home.resolve(strict=False) == home.resolve(strict=False):
+                raise
+            cache_text = (canonical_home / "models_cache.json").read_text(
+                encoding="utf-8"
+            )
+        cache = json.loads(cache_text)
         models = cache["models"]
         if not model:
             # Codex's catalog default is the first visible model in priority order.
@@ -10969,7 +14542,10 @@ def _prelaunch_status_metadata(
         "shape": args.shape,
         "controller_session_id": _controller_session_id(args),
         "controller_pid": _controller_pid(args),
-        "controller_label": _controller_label(args),
+        "controller_label": (
+            _controller_label(args)
+            or getattr(args, "_prelaunch_controller_label", None)
+        ),
     }
     model = getattr(args, "model", None)
     if model:
@@ -11031,6 +14607,9 @@ def _prelaunch_status_metadata(
     lock_holder_warning = getattr(args, "_lock_holder_warning", None)
     if lock_holder_warning:
         metadata["lock_holder_warning"] = str(lock_holder_warning)
+    skipped_seats = getattr(args, "_skipped_worktree_seats", None)
+    if skipped_seats:
+        metadata["skipped_worktree_seats"] = list(skipped_seats)
     return metadata
 
 
@@ -11078,9 +14657,15 @@ def _acquire_capacity(
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
         max_total=None,
     )
+    args._capacity_blocked_status_written = False
+    args._capacity_refusal_written = False
     wait_budget_s = _capacity_wait_seconds(args)
 
     def _write_blocked(blocked_payload: dict) -> None:
+        args._capacity_blocked_status_written = True
+        args._capacity_refusal_written = _is_capacity_refusal(
+            {"state": "blocked_capacity", "reason": blocked_payload}
+        )
         if status_json is not None:
             write_status(
                 status_json,
@@ -11197,6 +14782,10 @@ def _queue_request_envelope(args) -> dict | None:
             "process_cwd",
             "base_sha",
             "task_ids",
+            "parent_dispatch_id",
+            "controller_label",
+            "controller_session_id",
+            "controller_pid",
             "requeued_from",
         )
         if key in entry
@@ -11227,6 +14816,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
             or getattr(args, "effective_account", None)
             or getattr(args, "_codex_selected_account", None)
         )
+    parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
     spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
 
     def _record_once() -> tuple[int, dict | None]:
@@ -11252,16 +14842,27 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     project_root=str(project_root),
                     controller_pid=_controller_pid(args),
                     controller_session_id=_controller_session_id(args),
-                    controller_label=_controller_label(args),
+                    controller_label=(
+                        _controller_label(args)
+                        or getattr(args, "_prelaunch_controller_label", None)
+                    ),
                     claimant_pid=os.getpid() if state == "waiting_capacity" else None,
                     worker_pid=worker_pid if spawn_state == "spawned" else None,
                     acp_session_id=None,
                     logical_session_id=args.dispatch_id,
-                    engine_session_id=_resolved_engine_session_id(args),
-                    codex_session_id=getattr(args, "codex_session_id", None),
+                    engine_session_id=(
+                        _resolved_engine_session_id(args)
+                        if spawn_state == "spawned"
+                        else None
+                    ),
+                    codex_session_id=(
+                        getattr(args, "codex_session_id", None)
+                        if spawn_state == "spawned"
+                        else None
+                    ),
                     codex_home=codex_home or getattr(args, "codex_resume_home", None),
                     codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
-                    parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                    parent_dispatch_id=parent_dispatch_id,
                     resume_mode=getattr(args, "resume_mode", None),
                     model=getattr(args, "model", None),
                     reasoning_effort=getattr(args, "reasoning_effort", None),
@@ -11279,6 +14880,10 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     worktree_reclaimed_dispatch_id=getattr(
                         args, "_worktree_reclaimed_dispatch_id", None
                     ),
+                    worktree_ignored_archive=getattr(
+                        args, "_worktree_ignored_archive", None
+                    ),
+                    lock_holder=getattr(args, "_lock_holder", None),
                     dispatch_argv=_canonical_replay_argv(
                         args,
                         _raw_worker_args(args)
@@ -11329,10 +14934,11 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
     warning = None
     if record_code != 0:
         if spawn_state == "none":
-            # No worker process exists, so a refused transition is a genuine
-            # launch failure. Unchanged behaviour.
+            refusal_detail = (refusal or {}).get("error")
+            refusal_kind = (refusal or {}).get("disposition") or "unknown"
             raise RuntimeError(
-                f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+                f"journal attempt transition refused for {args.dispatch_id}: "
+                f"exit {record_code} ({refusal_kind}: {refusal_detail or 'no detail'})"
             )
         # A worker was spawned (or spawn state is indeterminate, which takes
         # the same safe branch). Keep the liveness authority written and the
@@ -11419,7 +15025,7 @@ def _attempt_claiming_worker_argv(
         # behind the embedding's back.
         return worker_argv, False
     if attempt is None:
-        if _record_ledger is not _NATIVE_RECORD_LEDGER:
+        if getattr(_record_ledger, "_goalflight_nonpersisting_seam", False):
             # Controller registration can create the journal independently of
             # an embedder's injected, non-persisting ledger seam.  Its mere
             # presence does not prove that seam prepared a launch attempt.
@@ -11429,6 +15035,17 @@ def _attempt_claiming_worker_argv(
         raise RuntimeError(
             f"prepared attempt {attempt.attempt_id} is {attempt.lifecycle_state}, expected STARTING"
         )
+    if not getattr(_record_ledger, "_goalflight_nonpersisting_seam", False):
+        projected = goalflight_ledger.read_record(dispatch_id)
+        if (
+            not isinstance(projected, dict)
+            or projected.get("state") != "starting"
+            or projected.get("attempt_id") != attempt.attempt_id
+        ):
+            raise DispatchUsageError(
+                "committed STARTING attempt id unavailable for dispatch "
+                f"{dispatch_id}"
+            )
     # The unsandboxed watcher claims RUNNING after spawn. Do not wrap the
     # worker in launch_worker — that CAS was the only in-sandbox journal write.
     return worker_argv, True
@@ -11463,6 +15080,66 @@ def _emit_permanent_dispatch_refusal(
     dispatch_id: str | None, error: BaseException | str
 ) -> None:
     print(_permanent_dispatch_refusal_line(dispatch_id, error), end="", flush=True)
+
+
+PERMANENT_DISPATCH_REFUSAL_PREFIXES = (
+    "seat_preparation_failed:",
+    "dispatch_branch_in_use:",
+    "codex_home_missing:",
+    "codex_home_account_mismatch:",
+)
+
+
+# Keep dispatch_branch_owner_unknown retryable: an unreadable owner can become
+# verifiable later, and MAX_DRAIN_PRE_WORKER_FAILURES bounds repeated refusals.
+def _permanent_dispatch_refusal_reason(reason: object) -> str | None:
+    value = str(reason)
+    for wrapper in ("WorktreeSeatError: ", "DispatchUsageError: "):
+        if value.startswith(wrapper):
+            value = value[len(wrapper) :]
+            break
+    if value.startswith(PERMANENT_DISPATCH_REFUSAL_PREFIXES):
+        return value
+    return None
+
+
+def _finish_permanent_prelaunch_refusal(
+    dispatch_id: str,
+    reason: object,
+    *,
+    state: str,
+    elapsed_s: float = 0.0,
+    args,
+) -> str | None:
+    permanent_reason = _permanent_dispatch_refusal_reason(reason)
+    if permanent_reason is None:
+        return None
+    _emit_permanent_dispatch_refusal(dispatch_id, permanent_reason)
+    try:
+        args.dispatch_id = dispatch_id
+        _record_prelaunch_failure(
+            args,
+            error=permanent_reason,
+            reason=permanent_reason,
+            state=state,
+            allow_existing_record=True,
+            elapsed_s=elapsed_s,
+        )
+    except Exception as exc:
+        print(
+            "DISPATCH-FINALIZE-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "write": "terminal_ledger",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+    return permanent_reason
 
 
 def _emit_transient_dispatch_refusal(
@@ -11537,19 +15214,41 @@ def _pre_spawn_launch_failure_reason(proc: subprocess.CompletedProcess) -> str:
     blob = goalflight_output_redact.redact_text(
         f"{proc.stderr or ''}\n{proc.stdout or ''}"
     )
-    diagnostic = ""
-    for line in reversed(blob.splitlines()):
-        candidate = line.strip()
-        if not candidate:
-            continue
-        if candidate.startswith("goalflight_dispatch:"):
-            candidate = candidate.split(":", 1)[1].strip()
-        diagnostic = " ".join(candidate.split())[:300]
-        if diagnostic:
+    lines = [line.strip() for line in blob.splitlines() if line.strip()]
+    dispatcher_lines = [
+        line.split(":", 1)[1].strip()
+        for line in lines
+        if line.startswith("goalflight_dispatch:")
+    ]
+    diagnostic = dispatcher_lines[-1] if dispatcher_lines else ""
+    if not diagnostic:
+        for candidate in reversed(lines):
+            lower = candidate.lower()
+            if (
+                _WORKER_MARKER_LINE_RE.match(candidate)
+                or candidate.startswith((
+                    "NOT LAUNCHED:",
+                    "LAUNCH STATE UNKNOWN:",
+                    "DISPATCH-",
+                ))
+                or lower.startswith("hint:")
+                or candidate.startswith("worker still alive - re-attach via ")
+                or candidate.startswith(
+                    "interrupted — worker still running (detached); re-attach:"
+                )
+            ):
+                continue
+            diagnostic = candidate
             break
+    diagnostic = " ".join(diagnostic.split())[:300]
     if not diagnostic:
         diagnostic = "no_child_diagnostic"
     return f"launch_refused_pre_spawn:{proc.returncode}:{diagnostic}"
+
+
+_WORKER_MARKER_LINE_RE = re.compile(
+    r"^!?\s*(?:STATUS|STEER-ACK|RESULT|USER-NEED|USER-CONFIRM|BLOCKED|FAILED|COMPLETE|READY|PERMISSION-OK-PROCEEDED):"
+)
 
 
 def _proven_pre_worker_refusal_reason(
@@ -11575,6 +15274,59 @@ def _proven_pre_worker_refusal_reason(
     return None
 
 
+def _queued_controller_generation_state(entry: dict | None) -> str:
+    """Classify the exact controller capability carried by a queued launch.
+
+    A readable registry with no matching label, PID, and nonce proves the
+    recorded generation is gone. Incomplete identity or an unreadable registry
+    stays unknown so a refusal can be retried.
+    """
+    if not isinstance(entry, dict):
+        return "unknown"
+    argv = _dispatch_argv_from_record(entry)
+    label = (
+        _option_value_before_worker_remainder(argv, "--controller-label", last=True)
+        or entry.get("controller_label")
+    )
+    pid_value = (
+        _option_value_before_worker_remainder(argv, "--controller-beacon-pid", last=True)
+        or _option_value_before_worker_remainder(argv, "--controller-pid", last=True)
+        or entry.get("controller_pid")
+    )
+    session_id = (
+        _option_value_before_worker_remainder(argv, "--controller-session-id", last=True)
+        or entry.get("controller_session_id")
+    )
+    try:
+        pid = int(pid_value)
+        if not str(label or "").strip() or not str(session_id or "").strip():
+            return "unknown"
+        session_id = str(session_id).strip()
+        project_root = _project_root_for_entry(entry)
+        resolved_label = goalflight_session_status.resolve_controller_label(
+            str(label), project_root=project_root
+        )
+        if not resolved_label:
+            return "unknown"
+        lookup = _kernel_live_controller_sessions(project_root)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return "unknown"
+    if lookup.sessions is None:
+        return "unknown"
+    matches = [
+        session
+        for session in lookup.sessions
+        if str(session.get("label") or "") == resolved_label
+        and str(session.get("id") or "") == session_id
+        and str(session.get("pid") or "") == str(pid)
+    ]
+    if len(matches) == 1:
+        return "live"
+    if not matches:
+        return "dead"
+    return "unknown"
+
+
 def _proven_transient_local_pre_spawn(proc: subprocess.CompletedProcess) -> bool:
     """True only for named ambient gates whose diagnostic we can match positively.
 
@@ -11594,6 +15346,7 @@ def _proven_transient_local_pre_spawn(proc: subprocess.CompletedProcess) -> bool
 
 def _classify_local_pre_spawn_attempt(
     proc: subprocess.CompletedProcess,
+    entry: dict | None = None,
 ) -> str:
     """Classify a local pre-worker child exit into one of the three states.
 
@@ -11604,6 +15357,11 @@ def _classify_local_pre_spawn_attempt(
     """
     if _proven_pre_worker_refusal_reason(proc):
         return LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    if "controller not connected; reconnect as:" in blob:
+        if _queued_controller_generation_state(entry) == "dead":
+            return LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE
+        return LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
     if _proven_transient_local_pre_spawn(proc):
         return LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
     return LAUNCH_ATTEMPT_CLASS_UNDETERMINED
@@ -11706,6 +15464,7 @@ def _record_unsupported_sandbox_rejection(
             else base / f"{args.dispatch_id}.status.json"
         )
         project_root = _project_root(args)
+        _stamp_prelaunch_controller_identity(args, project_root)
         posture = _os_sandbox_posture(args, worker_pid=None)
         write_status(
             status_json,
@@ -11744,6 +15503,209 @@ def _record_unsupported_sandbox_rejection(
     return 64
 
 
+def _record_prelaunch_failure(
+    args,
+    *,
+    error: object,
+    reason: object | None = None,
+    state: str = "prelaunch_failed",
+    allow_existing_record: bool = False,
+    elapsed_s: float | None = 0.0,
+) -> None:
+    """Persist a terminal refusal when the dispatch never started a worker."""
+    dispatch_id = str(getattr(args, "dispatch_id", "") or "")
+    if not dispatch_id:
+        return
+    base = _dispatch_base_dir()
+    status_json = (
+        Path(args.status_json)
+        if getattr(args, "status_json", None)
+        else base / f"{dispatch_id}.status.json"
+    )
+    tail = (
+        Path(args.tail)
+        if getattr(args, "tail", None)
+        else base / f"{dispatch_id}.tail"
+    )
+    project_root = _project_root(args)
+    _stamp_prelaunch_controller_identity(args, project_root)
+    error_text = str(error)
+    reason_text = str(reason if reason is not None else error)
+    terminal_state = goalflight_ledger.terminal_state_for(state, reason_text)
+    ledger_warning = None
+    record_args = argparse.Namespace(**vars(args))
+    record_args.cwd = None
+    record_args.engine_session_id = None
+    record_args.codex_session_id = None
+    for attribute in (
+        "_worktree_id",
+        "_worktree_path",
+        "_worktree_base_commit",
+        "_worktree_head",
+        "_worktree_branch",
+        "_worktree_keep_ref",
+        "_worktree_quarantine_ref",
+        "_worktree_reclaimed_dispatch_id",
+        "_worktree_ignored_archive",
+    ):
+        setattr(record_args, attribute, None)
+    try:
+        record_exists = goalflight_ledger.record_path(
+            dispatch_id, create=False
+        ).exists()
+        if record_exists and not allow_existing_record:
+            return
+        controller_session_id = _controller_session_id(args)
+        controller_pid = _controller_pid(args)
+        controller_label = (
+            _controller_label(args)
+            or getattr(args, "_prelaunch_controller_label", None)
+        )
+        if not record_exists:
+            _record_ledger(
+                record_args,
+                project_root=project_root,
+                prompt_path=(
+                    str(Path(args.prompt_file).expanduser())
+                    if getattr(args, "prompt_file", None)
+                    else None
+                ),
+                status_json=status_json,
+                tail=tail,
+                lease_id=None,
+                worker_pid=None,
+                # Keep the projection nonterminal until the journal terminal
+                # event commits; otherwise a failed finish write falsely
+                # makes a prelaunch refusal look finalized.
+                state="waiting_capacity",
+            )
+        elif allow_existing_record:
+            with goalflight_ledger.StateLock():
+                existing = goalflight_ledger.read_record(dispatch_id)
+                if (
+                    isinstance(existing, dict)
+                    and not goalflight_ledger.record_is_unreadable(existing)
+                ):
+                    owner_label = str(controller_label)[:64] if controller_label else None
+                    changed = False
+                    if owner_label and not existing.get("controller_label"):
+                        existing["controller_label"] = owner_label
+                        changed = True
+                    if controller_session_id and controller_pid is not None and (
+                        existing.get("controller_session_id") != controller_session_id
+                        or existing.get("controller_pid") != controller_pid
+                        or existing.get("controller_label") != owner_label
+                    ):
+                        existing.update(
+                            controller_label=owner_label,
+                            controller_session_id=str(controller_session_id),
+                            controller_pid=controller_pid,
+                            controller_identity=goalflight_ledger.process_identity(
+                                controller_pid
+                            ),
+                        )
+                        changed = True
+                    if changed:
+                        goalflight_ledger.write_record(existing)
+                    if owner_label:
+                        owner_result = goalflight_journal.open_or_create_journal(
+                            project_root
+                        ).prepare_attempt(
+                            dispatch_id,
+                            owner_controller_label=owner_label,
+                            owner_session_nonce=(
+                                controller_session_id
+                                if controller_session_id and controller_pid is not None
+                                else None
+                            ),
+                        )
+                        if not owner_result.committed:
+                            ledger_warning = (
+                                "terminal controller address could not be stamped: "
+                                + str(owner_result.reason or owner_result.disposition.value)
+                            )
+        _finish_ledger(
+            dispatch_id,
+            state,
+            reason_text,
+            elapsed_s=elapsed_s,
+            worker_still_alive=False,
+            prelaunch_failure=True,
+        )
+    except Exception as exc:
+        ledger_warning = f"{type(exc).__name__}: {exc}"
+        print(
+            "DISPATCH-FINALIZE-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "write": "prelaunch_terminal_ledger",
+                    "error": ledger_warning,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    metadata = _prelaunch_status_metadata(args)
+    worktree_gc = sys.modules.get("goalflight_worktree_gc")
+    worktree_gc_file = getattr(worktree_gc, "__file__", None)
+    if worktree_gc_file:
+        try:
+            worktree_gc_file = str(Path(worktree_gc_file).resolve())
+        except OSError:
+            worktree_gc_file = str(worktree_gc_file)
+    for key in (
+        "worktree_id",
+        "worktree_seat",
+        "worktree_path",
+        "worktree_base",
+        "worktree_head",
+        "worktree_branch",
+        "worktree_keep_ref",
+        "worktree_quarantine_ref",
+        "worktree_reclaimed_dispatch_id",
+    ):
+        metadata.pop(key, None)
+    payload = {
+        **metadata,
+        "state": state,
+        "terminal_state": terminal_state,
+        "reason": reason_text,
+        "error": error_text,
+        "python_executable": sys.executable,
+        "dispatcher_file": str(Path(__file__).resolve()),
+        "goalflight_worktree_gc_file": worktree_gc_file,
+        "worker_pid": None,
+        "worker_alive": False,
+        "worker_still_alive": False,
+        "spawn_state": "none",
+        "prelaunch_failure": True,
+        "tail_path": str(tail),
+        "status_path": str(status_json),
+        "updated_at": int(time.time()),
+    }
+    if ledger_warning:
+        payload["ledger_record_warning"] = ledger_warning
+    try:
+        write_status(status_json, payload)
+    except Exception as exc:
+        print(
+            "DISPATCH-FINALIZE-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "write": "prelaunch_status",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _record_acp_prelaunch_refusal(
     args,
     *,
@@ -11752,34 +15714,12 @@ def _record_acp_prelaunch_refusal(
     state: str,
 ) -> int:
     """Persist an ACP refusal that happens before the runner can write status."""
-    base = _dispatch_base_dir()
-    status_json = (
-        Path(args.status_json)
-        if args.status_json
-        else base / f"{args.dispatch_id}.status.json"
+    refusal_state = (
+        "failed_worktree" if state == "failed_worktree" else "prelaunch_failed"
     )
-    tail = (
-        Path(args.tail)
-        if args.tail
-        else base / f"{args.dispatch_id}.tail"
-    )
-    write_status(
-        status_json,
-        {
-            "schema": "goalflight.status.v1",
-            "dispatch_id": args.dispatch_id,
-            "agent": args.agent,
-            "shape": "acp",
-            "state": state,
-            "ok": False,
-            "reason": reason,
-            "error": error,
-            "worker_pid": None,
-            "worker_alive": False,
-            "tail_path": str(tail),
-            "status_path": str(status_json),
-            "updated_at": int(time.time()),
-        },
+    terminal_state = goalflight_ledger.terminal_state_for(refusal_state, reason)
+    _record_prelaunch_failure(
+        args, error=error, reason=reason, state=refusal_state
     )
     print(f"goalflight_dispatch: {error}", file=sys.stderr)
     print(
@@ -11790,8 +15730,12 @@ def _record_acp_prelaunch_refusal(
                 "agent": args.agent,
                 "shape": "acp",
                 "worker_pid": None,
-                "status_json": str(status_json),
-                "terminal_state": state,
+                "status_json": str(
+                    Path(args.status_json)
+                    if args.status_json
+                    else _dispatch_base_dir() / f"{args.dispatch_id}.status.json"
+                ),
+                "terminal_state": terminal_state,
                 "worker_still_alive": False,
                 "reason": error,
                 "elapsed_s": 0.0,
@@ -11801,6 +15745,31 @@ def _record_acp_prelaunch_refusal(
         flush=True,
     )
     return 64
+
+
+def _stamp_prelaunch_controller_identity(args, project_root: Path) -> None:
+    """Reuse the normal controller stamp before persisting a prelaunch refusal."""
+    if not (
+        _controller_label(args)
+        and _controller_session_id(args)
+        and _controller_pid(args) is not None
+    ):
+        try:
+            _stamp_controller_session(args, project_root)
+        except Exception:
+            # Identity lookup is best-effort here; an unknown owner follows
+            # the same roster fallback as any other terminal event.
+            pass
+    # Route an unowned prelaunch outcome to the project outbox, but keep exact
+    # controller ownership separate: _controller_label still requires a live
+    # session identity.
+    args._prelaunch_controller_label = _controller_label(args) or (
+        goalflight_session_status.resolve_controller_label(
+            getattr(args, "_requested_controller_label", None)
+            or getattr(args, "controller_label", None),
+            project_root=project_root,
+        )
+    )
 
 
 def _argv_split_worker_remainder(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -12370,6 +16339,8 @@ def _queue_claim_worker_spawn_intent(entry: dict) -> bool:
 def _queue_claim_identity_status(
     pid_value: object,
     identity: object,
+    *,
+    identity_probe=None,
 ) -> tuple[str, str]:
     """Return (status, reason) for claim launcher/worker liveness.
 
@@ -12385,12 +16356,11 @@ def _queue_claim_identity_status(
     if pid <= 0:
         return "no_pid", "no_pid"
     try:
-        ok, reason = goalflight_ledger.identity_matches(
-            {
-                "worker_pid": pid,
-                "worker_identity": identity if isinstance(identity, dict) else {},
-            }
-        )
+        probe = identity_probe or goalflight_ledger.identity_matches
+        ok, reason = probe({
+            "worker_pid": pid,
+            "worker_identity": identity if isinstance(identity, dict) else {},
+        })
     except Exception as exc:
         # Provider failure is indeterminate whether or not the PID is currently
         # alive — a transient probe error must never authorize terminalization.
@@ -13013,12 +16983,7 @@ def _detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: objec
 
 
 def _pidfile_dir() -> Path:
-    return Path(
-        os.environ.get(
-            "GOAL_FLIGHT_PIDFILE_DIR",
-            goalflight_compat.temp_base() / "goal-flight-acp-pids.d",
-        )
-    )
+    return goalflight_dispatch_paths.pidfile_dir()
 
 
 def _identity_token(identity: dict | None) -> dict | None:
@@ -13634,6 +17599,8 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
     evidence: list[str] = []
     for label, pid_value, identity in probes:
         if pid_value is None or pid_value == "":
+            if identity not in (None, {}):
+                return False, f"{label}:identity_without_pid"
             continue
         if isinstance(pid_value, bool):
             return False, f"{label}:invalid_pid"
@@ -13683,7 +17650,12 @@ def _abandoned_worker_pid_present(record: dict, status: dict) -> bool:
     )
 
 
-def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool, str]:
+def _abandoned_lease_evidence(
+    record: dict,
+    capacity_state: dict,
+    *,
+    allow_reclaimable_prelaunch: bool = False,
+) -> tuple[bool, str]:
     leases = capacity_state.get("leases")
     if not isinstance(leases, dict):
         return False, "lease_map_indeterminate"
@@ -13711,6 +17683,27 @@ def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool,
     states = [str(lease.get("state") or "") for lease in matching]
     if all(state in goalflight_capacity.TERMINAL_LEASE_STATES for state in states):
         return True, "lease_terminal:" + ",".join(sorted(states))
+    if allow_reclaimable_prelaunch:
+        terminal_projection = {
+            **record,
+            "state": "withdrawn",
+            "terminal_state": "withdrawn",
+            "worker_still_alive": False,
+        }
+        for lease in matching:
+            if not isinstance(lease, dict) or lease.get("state") != "active":
+                return False, "lease_nonterminal:" + ",".join(sorted(states))
+            if lease.get("worker_pid") is not None or lease.get(
+                "worker_identity"
+            ) not in (None, {}):
+                return False, "lease_worker_identity_present"
+            if goalflight_capacity._pre_attach_claimant_liveness(lease) is not False:
+                return False, "lease_claimant_live_or_indeterminate"
+            if not goalflight_capacity._terminal_worker_gone(
+                lease, terminal_projection
+            ):
+                return False, "lease_not_reclaimable_after_terminal"
+        return True, "prelaunch_lease_reclaimable"
     return False, "lease_nonterminal:" + ",".join(sorted(states))
 
 
@@ -13788,14 +17781,113 @@ def _evaluate_abandoned_dispatch(
         return {**result, "eligible": False, "reason": "missing_dispatch_id"}
     if _dispatch_record_is_terminal(record):
         return {**result, "eligible": False, "reason": "already_terminal"}
-    if not goalflight_dispatch_states.is_running_state(record.get("state")):
-        return {**result, "eligible": False, "reason": "not_running_state"}
     if record.get("transport") != "dispatch":
         return {**result, "eligible": False, "reason": "nonlocal_transport"}
     hostname = record.get("hostname")
     if not isinstance(hostname, str) or hostname != socket.gethostname():
         return {**result, "eligible": False, "reason": "nonlocal_or_unknown_host"}
     carrier = _claim_has_active_carrier(queue_dir, dispatch_id)
+    terminal_attempt = _read_unambiguous_terminal_attempt(record)
+    if terminal_attempt is not None:
+        keep_reason = _abandoned_carrier_keep_reason(carrier)
+        if keep_reason is not None:
+            return {
+                **result,
+                "eligible": False,
+                "reason": keep_reason,
+                "claimer_status": carrier.kind.value,
+                "claimer_evidence": carrier.reason,
+            }
+        return {
+            **result,
+            "eligible": True,
+            "reason": "journal_terminal_projection",
+            "journal_terminal_projection": True,
+            "journal_attempt_id": terminal_attempt["attempt_id"],
+            "journal_terminal_state": terminal_attempt["terminal_state"],
+        }
+    if (
+        record.get("state") == "waiting_capacity"
+        and carrier.kind is ClaimCarrierKind.NONE
+        and _record_proves_never_launched(
+            record, [], allow_prepared_attempt=True
+        )
+    ):
+        status, status_evidence = _abandoned_status_payload(record)
+        if status is not None:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "status_changed_before_close",
+                "status_evidence": status_evidence,
+            }
+        process_inactive, process_evidence = _abandoned_process_evidence(
+            record, {}
+        )
+        if not process_inactive:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "worker_live_or_indeterminate",
+                "process_evidence": process_evidence,
+            }
+        lease_inactive, lease_evidence = _abandoned_lease_evidence(
+            record,
+            capacity_state,
+            allow_reclaimable_prelaunch=True,
+        )
+        if not lease_inactive:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "lease_live_or_indeterminate",
+                "lease_evidence": lease_evidence,
+            }
+        controller_inactive, controller_evidence = _abandoned_controller_evidence(
+            record
+        )
+        if not controller_inactive:
+            reason = (
+                "controller_indeterminate"
+                if controller_evidence
+                in {"controller_indeterminate", "controller_identity_absent"}
+                else "controller_live_or_indeterminate"
+            )
+            return {
+                **result,
+                "eligible": False,
+                "reason": reason,
+                "controller_evidence": controller_evidence,
+            }
+        latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(
+            record, {}
+        )
+        if latest_progress_s is None:
+            return {**result, "eligible": False, "reason": "progress_time_indeterminate"}
+        progress_age_s = now_s - latest_progress_s
+        required_age_s = max(stale_s, QUEUE_CLAIM_STALE_S)
+        if progress_age_s < required_age_s:
+            return {
+                **result,
+                "eligible": False,
+                "reason": "recent_progress",
+                "progress_age_s": round(progress_age_s, 3),
+            }
+        return {
+            **result,
+            "eligible": True,
+            "never_launched": True,
+            "reason": "never_launched_no_final",
+            "process_evidence": process_evidence,
+            "status_evidence": status_evidence,
+            "output_evidence": "no_worker_output",
+            "lease_evidence": lease_evidence,
+            "controller_evidence": controller_evidence,
+            "progress_age_s": round(progress_age_s, 3),
+            "progress_fingerprint": progress_fingerprint,
+        }
+    if not goalflight_dispatch_states.is_running_state(record.get("state")):
+        return {**result, "eligible": False, "reason": "not_running_state"}
     keep_reason = _abandoned_carrier_keep_reason(carrier)
     if keep_reason is not None:
         return {
@@ -14115,8 +18207,81 @@ def reconcile_abandoned_dispatches(
                     if final_evaluation.get("progress_fingerprint") != initial_evaluation.get("progress_fingerprint"):
                         entries.append({**final_evaluation, "eligible": False, "reason": "progress_changed_before_close"})
                         continue
-                    state, reason, marker = _abandoned_terminal_outcome(fresh)
+                    if final_evaluation.get("journal_terminal_projection"):
+                        try:
+                            settlement = _settle_final_dispatch(
+                                argparse.Namespace(
+                                    dispatch_id=final_evaluation["dispatch_id"],
+                                    project_root=fresh.get("project_root"),
+                                    operator=True,
+                                    controller_label=None,
+                                    dry_run=dry_run,
+                                    reason="project journal terminal outcome",
+                                ),
+                                resolved_queue_dir,
+                                locks_held=True,
+                            )
+                        except (
+                            ValueError,
+                            OSError,
+                            goalflight_journal.JournalIntegrityError,
+                            goalflight_journal.JournalUpgradeRequired,
+                            goalflight_journal.JournalBusy,
+                            goalflight_journal.JournalDisappeared,
+                            goalflight_journal.JournalIOError,
+                        ) as exc:
+                            entries.append(
+                                {
+                                    **final_evaluation,
+                                    "eligible": False,
+                                    "reason": "journal_terminal_projection_refused",
+                                    "detail": str(exc),
+                                }
+                            )
+                            continue
+                        entries.append(
+                            {
+                                **final_evaluation,
+                                "action": "would_close" if dry_run else "closed",
+                                "closed_state": settlement["terminal_state"],
+                                "closure_basis": "journal_terminal_projection",
+                            }
+                        )
+                        if not dry_run:
+                            committed_record = _find_dispatch_record(
+                                final_evaluation["dispatch_id"]
+                            )
+                            if committed_record is not None:
+                                _write_reconciled_terminal_status(
+                                    _abandoned_status_entry(committed_record), None
+                                )
+                                project_root = committed_record.get("project_root")
+                                if isinstance(project_root, str) and project_root:
+                                    changed_projects.add(
+                                        Path(project_root).expanduser()
+                                    )
+                        continue
+                    never_launched = bool(final_evaluation.get("never_launched"))
+                    if never_launched:
+                        state = "inconclusive_no_final"
+                        reason = "abandoned_without_verdict"
+                    else:
+                        state, reason, marker = _abandoned_terminal_outcome(fresh)
                     post_status, post_status_evidence = _abandoned_status_payload(fresh)
+                    if never_launched and (
+                        post_status is not None
+                        or post_status_evidence
+                        not in {"status_file_absent", "status_path_absent"}
+                    ):
+                        entries.append(
+                            {
+                                **final_evaluation,
+                                "eligible": False,
+                                "reason": "status_changed_before_close",
+                                "status_evidence": post_status_evidence,
+                            }
+                        )
+                        continue
                     if marker is not None and not _abandoned_worker_pid_present(
                         fresh, post_status or {}
                     ):
@@ -14129,7 +18294,7 @@ def reconcile_abandoned_dispatches(
                             }
                         )
                         continue
-                    if post_status is None and marker is None:
+                    if post_status is None and marker is None and not never_launched:
                         entries.append(
                             {
                                 **final_evaluation,
@@ -14280,6 +18445,21 @@ class _WithdrawPreflightRefusal(ValueError):
         self.liveness = liveness
 
 
+class _WithdrawOwnerMetadataRefusal(_WithdrawPreflightRefusal):
+    """Refuse withdrawal when persisted owner metadata cannot be trusted."""
+
+
+def _normalise_withdraw_owner_label(value: object, *, source: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _WithdrawOwnerMetadataRefusal(
+            "dispatch has malformed controller owner metadata "
+            f"in {source}: expected a string, got {type(value).__name__}"
+        )
+    return value.strip() or None
+
+
 def _withdraw_liveness_preflight(
     *,
     dispatch_id: str,
@@ -14288,6 +18468,8 @@ def _withdraw_liveness_preflight(
     worker: dict,
     carriers: dict[Path, dict],
     status_paths: list[object],
+    terminal_authoritative: bool = False,
+    defer_terminal_worker_absence: bool = False,
 ) -> None:
     """Require every recorded worker source to prove the same dead holder."""
     lifecycle = attempt.get("lifecycle_state")
@@ -14295,6 +18477,9 @@ def _withdraw_liveness_preflight(
         goalflight_journal.ATTEMPT_STARTING,
         goalflight_journal.ATTEMPT_RUNNING,
     }
+
+    def older_than_claim_stale_window(stamp: float | None) -> bool:
+        return stamp is not None and time.time() - stamp > QUEUE_CLAIM_STALE_S
 
     def check(source: str, pid: object, identity: object) -> bool:
         if pid in (None, ""):
@@ -14324,13 +18509,19 @@ def _withdraw_liveness_preflight(
     ledger_pid = ledger.get("worker_pid")
     ledger_identity = ledger.get("worker_identity")
     ledger_dead = check("ledger", ledger_pid, ledger_identity)
+    check(
+        "ledger claimant",
+        ledger.get("claimant_pid"),
+        ledger.get("claimant_identity"),
+    )
     journal_pid = worker.get("pid")
     journal_dead = check("journal", journal_pid, worker)
+    carrier_worker_dead = False
     for path, carrier in carriers.items():
-        check(
+        carrier_worker_dead = check(
             str(path), carrier.get("queue_worker_pid"),
             carrier.get("queue_worker_identity"),
-        )
+        ) or carrier_worker_dead
         check(
             f"{path} claimer", carrier.get("queue_claimer_pid"),
             carrier.get("queue_claimer_identity"),
@@ -14339,6 +18530,127 @@ def _withdraw_liveness_preflight(
             f"{path} launcher", carrier.get("queue_launcher_pid"),
             carrier.get("queue_launcher_identity"),
         )
+
+    stale_spawn_intent = False
+    for evidence in (ledger, *carriers.values()):
+        if _queue_claim_worker_spawn_intent(evidence) and not (
+            evidence.get("queue_worker_pid")
+            or evidence.get("worker_pid")
+            or worker.get("pid")
+        ):
+            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
+            if not terminal_authoritative and not older_than_claim_stale_window(stamp):
+                raise _WithdrawPreflightRefusal(
+                    "spawn intent has no worker pid and is not older than the claim-stale window "
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
+                    liveness="indeterminate",
+                )
+            stale_spawn_intent = True
+
+    status_sidecars_absent = True
+    for status_path in status_paths:
+        try:
+            Path(str(status_path)).expanduser().lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            status_sidecars_absent = False
+            break
+        status_sidecars_absent = False
+        break
+
+    if terminal_authoritative and isinstance(record, dict):
+        if (
+            attempt.get("terminal_state") in {"withdrawn", "superseded"}
+            and record.get("terminal_state") == attempt.get("terminal_state")
+        ):
+            try:
+                terminal_outcome = json.loads(
+                    attempt.get("terminal_outcome_json") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                terminal_outcome = {}
+            if isinstance(terminal_outcome, dict) and terminal_outcome.get("withdrawn_by"):
+                return
+        if status_sidecars_absent:
+            never_spawned = (
+                type(attempt.get("launch_epoch")) is int
+                and attempt.get("launch_epoch") == 0
+                and not worker
+            )
+            if never_spawned or ledger_dead or journal_dead or carrier_worker_dead:
+                return
+            if defer_terminal_worker_absence:
+                return
+            raise _WithdrawPreflightRefusal(
+                "terminal journal attempt has no worker identity and a nonzero launch epoch; "
+                "worker liveness is indeterminate. Wait for worker identity evidence before retrying.",
+                liveness="indeterminate",
+            )
+
+    never_launched = (
+        isinstance(record, dict)
+        and _record_proves_never_launched(
+            record,
+            [
+                carrier
+                if carrier.get("dispatch_id")
+                else {**carrier, "dispatch_id": dispatch_id}
+                for carrier in carriers.values()
+            ],
+            allow_prepared_attempt=True,
+        )
+        and status_sidecars_absent
+        and not any(_queue_claim_worker_spawned(carrier) for carrier in carriers.values())
+    )
+    if never_launched:
+        try:
+            capacity_state = _read_capacity_state_for_reconciliation()
+        except (OSError, ValueError) as exc:
+            raise _WithdrawPreflightRefusal(
+                "capacity lease evidence is unreadable; worker liveness is indeterminate. "
+                "Repair capacity state before retrying.",
+                liveness="indeterminate",
+            ) from exc
+        lease_inactive, lease_evidence = _abandoned_lease_evidence(
+            ledger,
+            capacity_state,
+            allow_reclaimable_prelaunch=True,
+        )
+        if not lease_inactive:
+            raise _WithdrawPreflightRefusal(
+                "capacity lease is live or indeterminate "
+                f"({lease_evidence}); wait for its claimant to exit before retrying",
+                liveness="indeterminate",
+            )
+        if not _dispatch_record_is_terminal(record):
+            raw_stamps = [
+                evidence.get(key)
+                for evidence in (ledger, *carriers.values())
+                for key in (
+                    "started_at",
+                    "updated_at",
+                    "created_at",
+                    "queue_launch_started_at",
+                    "queue_worker_spawn_intent_at",
+                )
+                if evidence.get(key) not in (None, "")
+            ]
+            stamps = [_parse_timestamp_s(value) for value in raw_stamps]
+            latest_stamp = (
+                max(stamp for stamp in stamps if stamp is not None)
+                if stamps and all(stamp is not None for stamp in stamps)
+                else None
+            )
+            if not older_than_claim_stale_window(latest_stamp):
+                raise _WithdrawPreflightRefusal(
+                    "never-launched dispatch is not older than the claim-stale window "
+                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
+                    liveness="indeterminate",
+                )
+        # A PREPARED epoch-zero attempt and no spawn/worker evidence prove no
+        # process could own this record. Ledger terminality is not that proof.
+        return
 
     status_dead = not status_paths
     for status_path in status_paths:
@@ -14371,20 +18683,6 @@ def _withdraw_liveness_preflight(
                     "Wait for the status evidence to become complete before retrying.",
                     liveness="indeterminate",
                 )
-
-    stale_spawn_intent = False
-    for evidence in (ledger, *carriers.values()):
-        if _queue_claim_worker_spawn_intent(evidence) and not (
-            evidence.get("queue_worker_pid") or evidence.get("worker_pid") or worker.get("pid")
-        ):
-            stamp = _parse_timestamp_s(evidence.get("queue_worker_spawn_intent_at"))
-            if stamp is None or time.time() - stamp <= QUEUE_CLAIM_STALE_S:
-                raise _WithdrawPreflightRefusal(
-                    "spawn intent has no worker pid and is not older than the claim-stale window "
-                    f"({QUEUE_CLAIM_STALE_S:g}s); wait for launch to settle and retry",
-                    liveness="indeterminate",
-                )
-            stale_spawn_intent = True
 
     if active and not stale_spawn_intent:
         if not status_dead:
@@ -14424,7 +18722,12 @@ def _withdraw_liveness_preflight(
             )
 
 
-def _withdraw_preflight(args, queue_dir: Path | None = None):
+def _withdraw_preflight(
+    args,
+    queue_dir: Path | None = None,
+    *,
+    defer_terminal_worker_absence: bool = False,
+):
     """Read authority and identity evidence without creating any state."""
     record = goalflight_ledger.read_record(args.dispatch_id)
     if goalflight_ledger.record_is_unreadable(record):
@@ -14450,10 +18753,41 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         "SELECT * FROM dispatch_attempts WHERE dispatch_id = ?", (args.dispatch_id,),
     )
     if not rows:
-        raise ValueError("no attempt for this dispatch in the selected journal; check --project-root")
+        raise ValueError(
+            "no attempt for this dispatch in the selected journal; check --project-root"
+        )
+    if len(rows) != 1:
+        raise ValueError(
+            "selected journal does not contain one unambiguous attempt for this dispatch; "
+            "check --project-root"
+        )
     attempt = dict(rows[0])
-    owner = (record or entry).get("controller_label") or attempt.get("owner_controller_label")
-    if not args.operator and not args.controller_label:
+    if attempt.get("dispatch_id") != args.dispatch_id:
+        raise ValueError("selected journal attempt belongs to a different dispatch")
+    owner_record = record or entry
+    owner = _normalise_withdraw_owner_label(
+        owner_record.get("controller_label"), source="dispatch record"
+    )
+    journal_owner = _normalise_withdraw_owner_label(
+        attempt.get("owner_controller_label"), source="journal attempt"
+    )
+    try:
+        inherited_owner = goalflight_ledger._dispatch_parent_owner_label(
+            owner_record, project_root=root, reject_malformed=True
+        )
+    except goalflight_ledger._MalformedDispatchOwnerLabel as exc:
+        raise _WithdrawOwnerMetadataRefusal(
+            "dispatch has malformed inherited controller owner metadata at "
+            f"ancestor depth {exc.ancestor_depth} (type {exc.value_type})"
+        ) from None
+    if owner is None:
+        owner = journal_owner or _normalise_withdraw_owner_label(
+            inherited_owner, source="inherited dispatch owner"
+        )
+    controller_label = _normalise_withdraw_owner_label(
+        getattr(args, "controller_label", None), source="caller controller label"
+    )
+    if not args.operator and not controller_label:
         matches = [
             session for session in goalflight_session_status._registered_controller_records(root)
             if session.get("lease_state") == goalflight_journal.LEASE_ACTIVE
@@ -14461,8 +18795,19 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         ]
         if len(matches) != 1:
             raise ValueError("caller controller is absent or ambiguous; pass --controller-label")
-        args.controller_label = matches[0]["label"]
-    if not args.operator and (not args.controller_label or args.controller_label != owner):
+        controller_label = _normalise_withdraw_owner_label(
+            matches[0].get("label"), source="registered controller"
+        )
+        args.controller_label = controller_label
+    else:
+        args.controller_label = controller_label
+    # A missing persisted owner is not evidence that another controller owns it;
+    # still require a named controller. Trim both labels before exact matching:
+    # surrounding whitespace is a storage/input artifact, not a distinct owner.
+    if not args.operator and (
+        not controller_label
+        or (owner is not None and controller_label != owner)
+    ):
         raise ValueError(f"dispatch belongs to {owner!r}; use its --controller-label, or the human owner may pass --operator")
     worker = json.loads(attempt.get("worker_instance_json") or "{}")
     outcome = json.loads(attempt.get("terminal_outcome_json") or "{}")
@@ -14471,6 +18816,9 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         path = source.get("status_path")
         if path not in (None, "") and path not in status_paths:
             status_paths.append(path)
+    terminal_authoritative = _unambiguous_terminal_attempt(
+        authority, attempt, args.dispatch_id, record
+    )
     _withdraw_liveness_preflight(
         dispatch_id=args.dispatch_id,
         attempt=attempt,
@@ -14478,6 +18826,8 @@ def _withdraw_preflight(args, queue_dir: Path | None = None):
         worker=worker,
         carriers=carriers,
         status_paths=status_paths,
+        terminal_authoritative=terminal_authoritative,
+        defer_terminal_worker_absence=defer_terminal_worker_absence,
     )
     if attempt.get("terminal_state") == "superseded" and not outcome.get("withdrawn_by"):
         raise ValueError(
@@ -14518,12 +18868,14 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
                 (attempt["attempt_id"], attempt["terminal_transition_id"]),
             )
         missing_final_outbox = not events if events is not None else False
+        ledger_needs_projection = not _dispatch_record_is_terminal(record)
         final_retirement = bool(
             (
                 journal_state in {"worker_dead", "stale_dead"}
                 or (journal_state == "abandoned" and missing_final_outbox)
             )
             and not args.dry_run
+            and not ledger_needs_projection
         )
         final_retirement_preview = bool(
             args.dry_run
@@ -14531,6 +18883,7 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
                 journal_state in {"worker_dead", "stale_dead"}
                 or (journal_state == "abandoned" and missing_final_outbox)
             )
+            and not ledger_needs_projection
         )
         if final_retirement or final_retirement_preview:
             actor = "operator" if getattr(args, "operator", False) else args.controller_label
@@ -14587,6 +18940,27 @@ def _settle_final_dispatch(args, queue_dir: Path, *, locks_held: bool = False) -
             terminal, outcome.get("reason") or journal_state,
         )
         projected["project_root"] = str(root)
+        if ledger_needs_projection:
+            envelope = outcome.get("outcome")
+            envelope = envelope if isinstance(envelope, dict) else {}
+            if envelope:
+                projected["outcome"] = {"terminal_state": journal_state, **envelope}
+                projected.update(envelope)
+            projected["reason"] = (
+                outcome.get("reason")
+                or envelope.get("reason")
+                or envelope.get("error")
+                or journal_state
+            )
+            if "prelaunch_failure" in outcome:
+                projected["prelaunch_failure"] = bool(outcome["prelaunch_failure"])
+                projected.setdefault("outcome", {"terminal_state": journal_state})[
+                    "prelaunch_failure"
+                ] = projected["prelaunch_failure"]
+            if "worker_still_alive" in outcome:
+                projected["worker_still_alive"] = outcome["worker_still_alive"]
+            if isinstance(outcome.get("headline"), str) and outcome["headline"].strip():
+                projected["headline"] = outcome["headline"].strip()
         payload = {"dispatch_id": args.dispatch_id, "status": "settled",
                    "attempt_id": attempt["attempt_id"], "terminal_state": state,
                    "journal_terminal_state": journal_state}
@@ -14646,10 +19020,13 @@ def _settle_final_for_drain(entry: dict, queue_dir: Path) -> dict | None:
     if attempt is None or attempt.lifecycle_state not in goalflight_journal.ATTEMPT_FINAL_STATES:
         return None
     try:
-        return _settle_final_dispatch(argparse.Namespace(
+        settlement = _settle_final_dispatch(argparse.Namespace(
             dispatch_id=dispatch_id, project_root=str(root), operator=True,
             controller_label=None, dry_run=False,
         ), queue_dir)
+        if settlement.get("status") == "settled":
+            _write_reconciled_terminal_status(entry, None)
+        return settlement
     except (
         ValueError,
         OSError,
@@ -14681,7 +19058,9 @@ def _cmd_withdraw(argv: list[str]) -> int:
             raise ValueError("--reason must not be blank")
         if args.superseded_by is not None and (not args.superseded_by.strip() or args.superseded_by == args.dispatch_id):
             raise ValueError("--superseded-by must name a different dispatch")
-        root, authority, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(args)
+        root, authority, attempt, record, carriers, outcome, withdrawn = _withdraw_preflight(
+            args, defer_terminal_worker_absence=not args.dry_run
+        )
         if attempt["lifecycle_state"] in goalflight_journal.ATTEMPT_FINAL_STATES and not withdrawn:
             payload = _settle_final_dispatch(args, _queue_entry_path(args.dispatch_id).parent)
             print(json.dumps(payload, sort_keys=True) if args.json else
@@ -14803,6 +19182,421 @@ def _cmd_withdraw(argv: list[str]) -> int:
     ) as exc:
         payload = {"dispatch_id": args.dispatch_id, "status": "refused", "reason": str(exc)}
         print(json.dumps(payload, sort_keys=True) if args.json else f"withdraw refused: {exc}")
+        return 1
+
+
+class _ReleaseSeatRefusal(ValueError):
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def _release_seat_default_integration_ref(project_root: Path) -> str | None:
+    remote_head = goalflight_worktree_pool._git_proc(
+        project_root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"
+    )
+    candidates = [
+        remote_head.stdout.strip()
+        if remote_head is not None and remote_head.returncode == 0
+        else "",
+        "main",
+    ]
+    for candidate in dict.fromkeys(item for item in candidates if item):
+        resolved = goalflight_worktree_pool._git_proc(
+            project_root,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            f"{candidate}^{{commit}}",
+        )
+        if resolved is not None and resolved.returncode == 0:
+            return candidate
+    return None
+
+
+def _release_seat_integration_commit(project_root: Path, ref: str) -> str:
+    resolved = goalflight_worktree_pool._git_proc(
+        project_root,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        f"{ref}^{{commit}}",
+    )
+    if resolved is None or resolved.returncode != 0:
+        raise _ReleaseSeatRefusal(
+            "invalid_integration_ref",
+            f"integration ref {ref!r} does not resolve to a commit",
+        )
+    return resolved.stdout.strip()
+
+
+def _inspect_release_seat(
+    record: dict,
+    project_root: Path,
+    integrated_into: str,
+) -> dict:
+    raw_path = record.get("worker_cwd") or record.get("worktree_path")
+    if not raw_path:
+        raise _ReleaseSeatRefusal("seat_unavailable", "dispatch has no recorded worktree seat")
+    path = Path(str(raw_path)).expanduser()
+    if not path.is_absolute():
+        raise _ReleaseSeatRefusal("seat_unavailable", "recorded worktree seat path is not absolute")
+    path = Path(os.path.realpath(str(path)))
+    if not path.is_dir() or not goalflight_worktree_pool.is_managed_worktree_path(
+        path, project_root=project_root
+    ):
+        raise _ReleaseSeatRefusal(
+            "seat_unavailable", f"recorded worktree seat is missing or unmanaged: {path}"
+        )
+    try:
+        branch = goalflight_worktree_pool._git(path, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        head = goalflight_worktree_pool._git(path, "rev-parse", "HEAD").strip()
+    except goalflight_worktree_pool.WorktreeSeatError as exc:
+        raise _ReleaseSeatRefusal("seat_unavailable", str(exc)) from exc
+    if branch == "HEAD":
+        raise _ReleaseSeatRefusal("detached_seat", "worktree seat has a detached HEAD")
+    recorded_branch = str(record.get("worktree_branch") or "").strip()
+    if recorded_branch and branch != recorded_branch:
+        raise _ReleaseSeatRefusal(
+            "seat_branch_mismatch",
+            f"seat is on {branch!r}; dispatch records {recorded_branch!r}",
+        )
+
+    integration_head = _release_seat_integration_commit(project_root, integrated_into)
+    ancestry = goalflight_worktree_pool._git_proc(
+        project_root, "merge-base", "--is-ancestor", head, integration_head
+    )
+    if ancestry is None or ancestry.returncode not in (0, 1):
+        raise _ReleaseSeatRefusal(
+            "integration_check_failed", f"could not verify whether {head[:12]} is in {integrated_into!r}"
+        )
+    if ancestry.returncode == 1:
+        raise _ReleaseSeatRefusal(
+            "branch_not_integrated",
+            f"seat tip {head[:12]} is not contained in integration ref {integrated_into!r}",
+        )
+
+    try:
+        precheck = goalflight_worktree_pool._precheck_quarantine_worktree(
+            path, seat_name=path.name
+        )
+    except (goalflight_worktree_pool.WorktreeSeatError, OSError) as exc:
+        raise _ReleaseSeatRefusal("seat_not_clean", str(exc)) from exc
+    product = precheck[1]
+    tracked = [entry for entry in product if entry[0] != "??"]
+    if tracked:
+        paths = [path for _status, names in tracked for path in names]
+        raise _ReleaseSeatRefusal(
+            "tracked_changes", "tracked changes are present: " + ", ".join(paths[:5])
+        )
+    quarantine_paths = list(
+        dict.fromkeys(
+            path
+            for entry in product
+            for path in goalflight_worktree_pool._status_tree_paths(entry)
+        )
+    )
+    return {
+        "seat": str(path),
+        "branch": branch,
+        "head": head,
+        "integrated_into": integrated_into,
+        "quarantine_paths": quarantine_paths,
+        "_precheck": precheck,
+    }
+
+
+def _release_seat_write(record: dict, release: dict) -> None:
+    record["seat_release"] = release
+    if release.get("quarantine_ref"):
+        record["worktree_quarantine_ref"] = release["quarantine_ref"]
+    goalflight_ledger.write_record(record)
+
+
+def _print_release_seat(args, payload: dict) -> None:
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+        return
+    status = payload["status"]
+    if status == "refused":
+        print(
+            f"release-seat refused [{payload['reason_code']}]: {payload['reason']}"
+        )
+    elif status == "dry-run":
+        paths = payload.get("quarantine_paths") or []
+        detail = f"; quarantine {len(paths)} untracked path(s)" if paths else ""
+        print(
+            f"{payload['dispatch_id']}: would release {payload['seat']} "
+            f"({payload['branch']}@{payload['head'][:12]} in {payload['integrated_into']}{detail})"
+        )
+    elif status == "already released":
+        print(f"{payload['dispatch_id']}: seat already released")
+    else:
+        paths = payload.get("quarantine_paths") or []
+        detail = f"; quarantined {len(paths)} untracked path(s)" if paths else ""
+        print(
+            f"{payload['dispatch_id']}: released {payload['seat']} "
+            f"({payload['branch']}@{payload['head'][:12]} in {payload['integrated_into']}{detail})"
+        )
+
+
+def _cmd_release_seat(argv: list[str]) -> int:
+    parser = _TerseArgumentParser(
+        description="Release an owned terminal dispatch seat after integration.",
+        usage_hint="try release-seat <dispatch_id> --controller-label OWNER [--integrated-into REF] [--dry-run]",
+    )
+    parser.add_argument("dispatch_id")
+    parser.add_argument("--controller-label", default=os.environ.get("GOALFLIGHT_CONTROLLER_LABEL"))
+    parser.add_argument("--project-root")
+    parser.add_argument("--integrated-into")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    preflight_args = argparse.Namespace(
+        dispatch_id=args.dispatch_id,
+        project_root=args.project_root,
+        controller_label=args.controller_label,
+        operator=False,
+    )
+
+    def load_terminal_dispatch():
+        root, _authority, attempt, record, _carriers, _outcome, _withdrawn = (
+            _withdraw_preflight(preflight_args)
+        )
+        if (
+            attempt.get("lifecycle_state") not in goalflight_journal.ATTEMPT_FINAL_STATES
+            or not goalflight_dispatch_states.is_terminal_state(attempt.get("terminal_state"))
+        ):
+            raise _ReleaseSeatRefusal(
+                "dispatch_not_terminal", "dispatch attempt is not terminal"
+            )
+        if not isinstance(record, dict):
+            raise _ReleaseSeatRefusal("dispatch_unavailable", "dispatch ledger record is missing")
+        return root, attempt, record
+
+    def integration_ref(record: dict, root: Path) -> str:
+        previous = record.get("seat_release")
+        if isinstance(previous, dict) and previous.get("status") == "pending":
+            pending_ref = str(previous.get("integrated_into") or "").strip()
+            if args.integrated_into and args.integrated_into != pending_ref:
+                raise _ReleaseSeatRefusal(
+                    "release_pending_ref_mismatch",
+                    f"release is pending against {pending_ref!r}; retry with that ref",
+                )
+            if pending_ref:
+                return pending_ref
+        requested = str(args.integrated_into or "").strip()
+        selected = requested or _release_seat_default_integration_ref(root)
+        if not selected:
+            raise _ReleaseSeatRefusal(
+                "integration_ref_required",
+                "no main integration ref is configured; pass --integrated-into REF",
+            )
+        return selected
+
+    def validate_released_marker(record: dict) -> dict | None:
+        previous = record.get("seat_release")
+        if not previous:
+            return None
+        if not isinstance(previous, dict) or previous.get("status") not in {"pending", "released"}:
+            raise _ReleaseSeatRefusal(
+                "invalid_release_state", "dispatch has an unreadable seat-release record"
+            )
+        if previous.get("status") == "released":
+            return previous
+        return None
+
+    def plan_for(root: Path, record: dict, ref: str) -> dict:
+        plan = _inspect_release_seat(record, root, ref)
+        previous = record.get("seat_release")
+        if isinstance(previous, dict) and previous.get("quarantine_ref"):
+            plan["quarantine_ref"] = previous["quarantine_ref"]
+        elif record.get("worktree_quarantine_ref"):
+            plan["quarantine_ref"] = record["worktree_quarantine_ref"]
+        return plan
+
+    try:
+        if args.dry_run:
+            root, _attempt, record = load_terminal_dispatch()
+            if validate_released_marker(record):
+                _print_release_seat(
+                    args,
+                    {"dispatch_id": args.dispatch_id, "status": "already released"},
+                )
+                return 0
+            ref = integration_ref(record, root)
+            plan = plan_for(root, record, ref)
+            payload = {key: value for key, value in plan.items() if not key.startswith("_")}
+            payload.update(dispatch_id=args.dispatch_id, status="dry-run")
+            _print_release_seat(args, payload)
+            return 0
+
+        release_record = _find_dispatch_record(args.dispatch_id) or {}
+        resume_lock_path, resume_lock_required = _resume_lock_path_info(
+            release_record, args.dispatch_id
+        )
+        with contextlib.ExitStack() as locks:
+            if resume_lock_required and resume_lock_path is not None:
+                locks.enter_context(
+                    _resume_file_lock(resume_lock_path, "seat release")
+                )
+            locks.enter_context(goalflight_ledger.StateLock())
+            root, _attempt, record = load_terminal_dispatch()
+            previous = validate_released_marker(record)
+            if previous:
+                _print_release_seat(
+                    args,
+                    {"dispatch_id": args.dispatch_id, "status": "already released"},
+                )
+                return 0
+            ref = integration_ref(record, root)
+            pending = record.get("seat_release")
+            if isinstance(pending, dict) and pending.get("status") == "pending":
+                record.pop("seat_release", None)
+                if pending.get("quarantine_ref"):
+                    record["worktree_quarantine_ref"] = pending["quarantine_ref"]
+                goalflight_ledger.write_record(record)
+            prepared: dict = {}
+
+            def prepare_release(path: Path) -> None:
+                plan = plan_for(root, record, ref)
+                if Path(plan["seat"]).resolve() != path.resolve():
+                    raise _ReleaseSeatRefusal(
+                        "seat_path_changed", "recorded worktree seat changed during release"
+                    )
+                quarantine_ref = plan.get("quarantine_ref")
+                quarantine_paths = plan["quarantine_paths"]
+                if quarantine_paths:
+                    try:
+                        quarantine_ref = goalflight_worktree_pool._quarantine_dirty_worktree(
+                            path,
+                            seat_name=path.name,
+                            abandoned_dispatch_id=args.dispatch_id,
+                            precheck=plan["_precheck"],
+                        )
+                        if quarantine_ref:
+                            record["worktree_quarantine_ref"] = quarantine_ref
+                            goalflight_ledger.write_record(record)
+                        goalflight_worktree_pool._prepare_seat_checkout(
+                            path,
+                            branch=plan["branch"],
+                            base_commit=plan["head"],
+                            keep_id=args.dispatch_id,
+                        )
+                    except (goalflight_worktree_pool.WorktreeSeatError, OSError) as exc:
+                        raise _ReleaseSeatRefusal("quarantine_failed", str(exc)) from exc
+                remaining = [
+                    entry
+                    for entry in goalflight_worktree_pool._status_records(path)
+                    if goalflight_worktree_pool._status_is_product(entry)
+                ]
+                if remaining:
+                    raise _ReleaseSeatRefusal(
+                        "quarantine_incomplete", "worktree remains dirty after quarantine"
+                    )
+                prepared.update(plan)
+                if quarantine_ref:
+                    prepared["quarantine_ref"] = quarantine_ref
+
+            released, release_reason = goalflight_worktree_pool.release_worktree_for_dispatch(
+                root,
+                record.get("worker_cwd") or record.get("worktree_path"),
+                args.dispatch_id,
+                before_release=prepare_release,
+            )
+            if release_reason.startswith("preserved parent worktree occupant "):
+                raise _ReleaseSeatRefusal(
+                    "seat_preserved_for_parent",
+                    f"seat is preserved for {release_reason.removeprefix('preserved parent worktree occupant ')}",
+                )
+            if not released:
+                code = (
+                    "seat_busy"
+                    if "kernel worktree lease" in release_reason
+                    else "seat_holder_unavailable"
+                )
+                raise _ReleaseSeatRefusal(code, release_reason)
+            record = goalflight_ledger.read_record(args.dispatch_id) or record
+            released_at = goalflight_ledger.utc_now()
+            release = {
+                "status": "released",
+                "released_at": released_at,
+                "integrated_into": ref,
+                "branch": prepared["branch"],
+                "head": prepared["head"],
+            }
+            if prepared.get("quarantine_ref"):
+                release["quarantine_ref"] = prepared["quarantine_ref"]
+            _release_seat_write(record, release)
+            payload = {key: value for key, value in prepared.items() if not key.startswith("_")}
+            payload.update(dispatch_id=args.dispatch_id, status="released")
+            _print_release_seat(args, payload)
+        return 0
+    except _ReleaseSeatRefusal as exc:
+        _print_release_seat(
+            args,
+            {
+                "dispatch_id": args.dispatch_id,
+                "status": "refused",
+                "reason_code": exc.reason_code,
+                "reason": str(exc),
+            },
+        )
+        return 1
+    except _WithdrawPreflightRefusal as exc:
+        code = "worker_live_or_unknown" if exc.liveness else "preflight_refused"
+        _print_release_seat(
+            args,
+            {
+                "dispatch_id": args.dispatch_id,
+                "status": "refused",
+                "reason_code": code,
+                "reason": str(exc),
+            },
+        )
+        return 1
+    except ValueError as exc:
+        code = "not_owner" if "dispatch belongs to" in str(exc) else "preflight_refused"
+        _print_release_seat(
+            args,
+            {
+                "dispatch_id": args.dispatch_id,
+                "status": "refused",
+                "reason_code": code,
+                "reason": str(exc),
+            },
+        )
+        return 1
+    except goalflight_worktree_pool.WorktreeSeatError as exc:
+        _print_release_seat(
+            args,
+            {
+                "dispatch_id": args.dispatch_id,
+                "status": "refused",
+                "reason_code": "seat_unavailable",
+                "reason": str(exc),
+            },
+        )
+        return 1
+    except (
+        OSError,
+        goalflight_journal.JournalIntegrityError,
+        goalflight_journal.JournalUpgradeRequired,
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        _print_release_seat(
+            args,
+            {
+                "dispatch_id": args.dispatch_id,
+                "status": "refused",
+                "reason_code": "state_unavailable",
+                "reason": f"{type(exc).__name__}: {exc}",
+            },
+        )
         return 1
 
 
@@ -15260,6 +20054,21 @@ def _entry_tail_path(entry: dict, record: dict | None = None) -> Path:
     return Path(str(raw)).expanduser()
 
 
+def _entry_tail_is_empty(entry: dict, record: dict | None = None) -> bool:
+    """Return true only when the carrier tail is confirmed absent or empty."""
+    try:
+        path = _entry_tail_path(entry, record)
+        tail_stat = path.stat()
+        if not path.is_file() or tail_stat.st_size:
+            return False
+        with path.open("rb") as tail:
+            return not tail.read(1) and os.fstat(tail.fileno()).st_size == 0
+    except FileNotFoundError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 # Local-path tokens in SUCCESS marker text (READY/COMPLETE/RESULT). Mirrors
 # goalflight_status._extract_marker_paths — kept local so recovery never depends
 # on status module load order inside the drain hot path.
@@ -15684,7 +20493,8 @@ def _completion_authority_token_bind(entry: dict | None, record: dict | None) ->
 
     Dispatch ids are reusable once terminal. A new carrier with a new
     ``queue_launch_token`` must not inherit the previous attempt's complete
-    row. Missing tokens cannot prove the bind, so the caller must not unlink.
+    row. Older terminal rows may keep the journal's ``launch_token`` but lack
+    the queue-token mirror; that token still binds the same attempt.
 
     Restore envelopes strip ``queue_launch_token`` (a new claim will mint
     one). Bind those to a terminal row through matching ``restore_txn_id``;
@@ -15692,6 +20502,8 @@ def _completion_authority_token_bind(entry: dict | None, record: dict | None) ->
     """
     entry_token = _queue_launch_token_from_entry(entry) if isinstance(entry, dict) else None
     raw = record.get("queue_launch_token") if isinstance(record, dict) else None
+    if raw in (None, "") and isinstance(record, dict):
+        raw = record.get("launch_token")
     record_token = str(raw) if raw not in (None, "") else None
     if entry_token and record_token:
         return "match" if entry_token == record_token else "mismatch"
@@ -15811,13 +20623,18 @@ def _entry_completion_authority(
             "resolution_source": "task_store",
         }
     if task_truth == "some_advanced":
-        return {
+        decision = {
             "state": "worker_dead",
             "reason": "partial_task_supersession",
             "marker": None,
             "source": "task_store",
-            "salvage_required": True,
         }
+        if not (
+            isinstance(record, dict)
+            and _record_proves_never_launched(record, [entry])
+        ):
+            decision["salvage_required"] = True
+        return decision
     if task_truth == "indeterminate":
         bounded_equality = indeterminate_cause == "timestamp_equal"
         if bounded_equality and (
@@ -16238,7 +21055,9 @@ def _controller_attribution_from_entry(
     )
     out: dict = {}
     if label is not None:
-        out["controller_label"] = str(label)
+        # Preserve the input type until the persistence guard can validate it;
+        # stringifying here would turn corrupt integers into plausible labels.
+        out["controller_label"] = label
     if pid is not None:
         try:
             out["controller_pid"] = int(pid)
@@ -16321,6 +21140,97 @@ def _completion_authority_park_fields(reason: str | None) -> dict:
     return {}
 
 
+def _entry_status_json_path(entry: dict) -> Path:
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    return Path(
+        str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json")
+    )
+
+
+def _read_entry_status(entry: dict) -> dict | None:
+    try:
+        payload = json.loads(_entry_status_json_path(entry).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _status_payload_is_terminal(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    # Capacity refusals are retryable and are explicitly restored to queued
+    # when capacity becomes available, despite their terminal-labeled state.
+    return any(
+        value != "blocked_capacity" and _is_status_terminal(value)
+        for value in (payload.get("state"), payload.get("terminal_state"))
+    )
+
+
+@contextlib.contextmanager
+def _status_launch_admission(
+    status_json: Path,
+    token: str,
+    *,
+    deadline_s: float | None = None,
+):
+    """Linearize launch admission with terminal status publication."""
+    lock = status_write_lock(status_json)
+    if deadline_s is not None and not lock.acquire_until(deadline_s):
+        raise StatusLaunchAdmissionDeferred(
+            "wait for a status lock; launch admission deferred"
+        )
+    with lock as status_lock:
+        payload = status_lock.read()
+        if _status_payload_is_terminal(payload):
+            yield None
+            return
+        status_lock.write(
+            {
+                **(payload or {}),
+                "launch_admission_token": token,
+            }
+        )
+        try:
+            yield status_lock
+        finally:
+            status_lock.clear_launch_admission(token)
+
+
+def _drain_claim_terminal_reason(entry: dict) -> str | None:
+    payload = _read_entry_status(entry)
+    status_state = next(
+        (
+            str(payload.get(key))
+            for key in ("state", "terminal_state")
+            if isinstance(payload, dict)
+            and payload.get(key) != "blocked_capacity"
+            and _is_status_terminal(payload.get(key))
+        ),
+        None,
+    )
+    decision = _entry_completion_authority(entry)
+    if status_state is not None:
+        return f"terminal_status_{status_state}"
+    if _completion_decision_blocks_restore(decision):
+        return str(
+            decision.get("reason") or decision.get("state") or "completion_authority"
+        )
+    return None
+
+
+def _dispatch_status_worktree_fields(record: object) -> dict[str, object]:
+    if not isinstance(record, dict):
+        return {}
+    if record.get("prelaunch_failure") is True:
+        return {"prelaunch_failure": True}
+    return {
+        key: record[key]
+        for key in ("worktree_path", "worktree_seat")
+        if record.get(key)
+    }
+
+
 def _write_parked_status(entry: dict, decision: dict) -> bool:
     """Write the parked-carrier status sidecar. False means the write did not land."""
     dispatch_id = str(entry.get("dispatch_id") or "")
@@ -16328,38 +21238,45 @@ def _write_parked_status(entry: dict, decision: dict) -> bool:
         return False
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
-    status_json = Path(
-        str(
-            request.get("status_json")
-            or _dispatch_base_dir() / f"{dispatch_id}.status.json"
-        )
-    )
+    dispatch_record = _find_dispatch_record(dispatch_id)
+    worktree_status_fields = _dispatch_status_worktree_fields(dispatch_record)
+    status_json = _entry_status_json_path(entry)
+    reason = str(decision.get("reason") or "completion_authority_unavailable")
+    if reason == "completion_authority_token_indeterminate":
+        return True
     tail = Path(
         str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail")
     )
-    reason = str(decision.get("reason") or "completion_authority_unavailable")
     try:
-        write_status(
-            status_json,
-            {
-                "schema": "goalflight.status.v1",
-                "dispatch_id": dispatch_id,
-                "agent": args.agent,
-                "shape": args.shape,
-                "state": "queued",
-                "reason": reason,
-                **_completion_authority_park_fields(reason),
-                "project_root": str(
-                    entry.get("project_root") or request.get("cwd") or Path.cwd()
-                ),
-                "worker_pid": None,
-                "worker_alive": False,
-                "tail_path": str(tail),
-                "status_path": str(status_json),
-                "updated_at": int(time.time()),
-                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
-            },
-        )
+        status_lock = status_write_lock(status_json)
+        if not status_lock.acquire_until(
+            time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
+        ):
+            return False
+        with status_lock:
+            if _status_payload_is_terminal(_read_entry_status(entry)):
+                return True
+            status_lock.write(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": dispatch_id,
+                    "agent": args.agent,
+                    "shape": args.shape,
+                    "state": "queued",
+                    "reason": reason,
+                    **_completion_authority_park_fields(reason),
+                    "project_root": str(
+                        entry.get("project_root") or request.get("cwd") or Path.cwd()
+                    ),
+                    **worktree_status_fields,
+                    "worker_pid": None,
+                    "worker_alive": False,
+                    "tail_path": str(tail),
+                    "status_path": str(status_json),
+                    "updated_at": int(time.time()),
+                    **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
+                }
+            )
     except OSError:
         return False
     return True
@@ -16821,6 +21738,7 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
                 "liveness_state": goalflight_terminal.terminal_liveness_state(state),
                 "terminal_marker": marker,
                 "project_root": str(project_root),
+                **_dispatch_status_worktree_fields(record),
                 "worker_pid": entry.get("queue_worker_pid"),
                 "worker_alive": False,
                 "tail_path": str(tail),
@@ -17088,6 +22006,7 @@ def _reconcile_claim_transaction(
             and not _ledger_is_restorable_prelaunch(record)
             and _completion_authority_token_bind(fresh, record) == "match"
         ):
+            terminal_mirror = (fresh, None)
             if not linked:
                 quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
@@ -19266,7 +24185,7 @@ def _drain_launch_remote_claim(
     dispatch_id: str,
     launch_token: str,
     claim: Path,
-) -> subprocess.CompletedProcess[str]:
+) -> subprocess.CompletedProcess[str] | None:
     dispatch_argv = _occupancy_argv_from_record(entry)
     refusal = None
     if dispatch_argv:
@@ -19318,8 +24237,11 @@ def _drain_launch_remote_claim(
             prompt=_remote_drain_prompt(entry),
             dispatch_id=dispatch_id,
             base_sha=_remote_drain_base_sha(entry),
+            attempt_id=launch_token,
             thin_mode=True,
         )
+        if _drain_claim_terminal_reason(entry):
+            return None
         # Stamp launch-started only once the preview gate has passed: the gate
         # fails closed before any remote side effect, so a blocked carrier must
         # stay pre-launch-shaped to remain restorable. The stamp still precedes
@@ -19332,17 +24254,46 @@ def _drain_launch_remote_claim(
                 queue_launch_token=launch_token,
             )
         )
+        if _drain_claim_terminal_reason(entry):
+            return None
         runner = getattr(args, "remote_runner", None)
         if runner is None:
             fleet_dispatch.assert_live_ssh_opt_in()
+        remote_spawn_ack_timeout_s = 120.0
+
+        def remote_runner(argv, timeout_s=None):
+            if runner is not None:
+                return runner(argv)
+            spawn_timeout_s = (
+                timeout_s
+                if timeout_s is not None
+                else remote_spawn_ack_timeout_s
+            )
+            # A timeout is not proof that the node did not spawn; let fleet
+            # preserve its launch_unconfirmed recovery state. A late remote
+            # run is bounded waste: its status and tail are attempt-scoped,
+            # and first-complete-wins publication protects the prior result.
+            return fleet_dispatch.default_ssh_runner(
+                argv,
+                timeout_s=spawn_timeout_s,
+            )
+
         result = fleet_dispatch.execute_dispatch(
             fleet_dir,
             preview,
-            runner=runner,
+            runner=remote_runner,
             dispatch_mode="one-shot",
             tool_smoke_policy=getattr(args, "remote_tool_smoke", "auto"),
             queue_launch_token=launch_token,
+            controller_status_path=str(_entry_status_json_path(entry)),
+            dispatch_record={
+                "dispatch_id": dispatch_id,
+                "project_root": entry.get("project_root"),
+                **_controller_attribution_from_entry(entry),
+            },
         )
+    except TerminalStatusLaunchRefused:
+        return None
     except fleet_dispatch.DispatchGateError as exc:
         raise _RemoteDrainBlocked(str(exc), code=getattr(exc, "code", "blocked")) from exc
     except fleet_dispatch.DispatchError as exc:
@@ -19411,7 +24362,7 @@ def _restore_queued_record_from_entry(entry: dict, queue_path: Path) -> None:
     project_root = goalflight_task.resolve_project_root(
         str(entry.get("project_root") or request.get("cwd") or Path.cwd())
     )
-    status_json = Path(str(request.get("status_json") or _dispatch_base_dir() / f"{args.dispatch_id}.status.json"))
+    status_json = _entry_status_json_path(entry)
     tail = Path(str(request.get("tail") or _dispatch_base_dir() / f"{args.dispatch_id}.tail"))
     lock = goalflight_ledger.StateLock.try_acquire(
         time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
@@ -19424,24 +24375,33 @@ def _restore_queued_record_from_entry(entry: dict, queue_path: Path) -> None:
             return
         if record.get("restore_txn_id") != entry.get("restore_txn_id") and entry.get("restore_txn_id"):
             return
-        write_status(
-            status_json,
-            {
-                "schema": "goalflight.status.v1",
-                "dispatch_id": args.dispatch_id,
-                "agent": args.agent,
-                "shape": args.shape,
-                "state": "queued",
-                "reason": "dispatch_queue_restore",
-                "queue_path": str(queue_path),
-                "project_root": str(project_root),
-                "worker_pid": None,
-                "worker_alive": False,
-                "tail_path": str(tail),
-                "updated_at": int(time.time()),
-                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
-            },
-        )
+        worktree_status_fields = _dispatch_status_worktree_fields(record)
+        status_lock = status_write_lock(status_json)
+        if not status_lock.acquire_until(
+            time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S
+        ):
+            return
+        with status_lock:
+            if _status_payload_is_terminal(_read_entry_status(entry)):
+                return
+            status_lock.write(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": args.dispatch_id,
+                    "agent": args.agent,
+                    "shape": args.shape,
+                    "state": "queued",
+                    "reason": "dispatch_queue_restore",
+                    "queue_path": str(queue_path),
+                    "project_root": str(project_root),
+                    **worktree_status_fields,
+                    "worker_pid": None,
+                    "worker_alive": False,
+                    "tail_path": str(tail),
+                    "updated_at": int(time.time()),
+                    **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
+                }
+            )
     finally:
         lock.release()
     _export_dashboard_status_for_project(project_root)
@@ -19521,6 +24481,7 @@ def _new_reconciliation_record(entry: dict) -> dict:
         "agent": entry.get("agent") or request.get("agent") or "unknown",
         "shape": entry.get("shape") or request.get("shape") or "bash",
         "transport": "dispatch",
+        "hostname": socket.gethostname(),
         "project_root": str(entry.get("project_root") or request.get("cwd") or Path.cwd()),
         "stdout_path": str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail"),
         "status_path": str(request.get("status_json") or _dispatch_base_dir() / f"{dispatch_id}.status.json"),
@@ -19742,6 +24703,8 @@ def _requeue_failure_kind(record: dict, tail: Path) -> str | None:
 # restated here rather than imported because this is a safety floor, and it has
 # to keep holding when the optional local seat library is absent.
 CODEX_SEAT_STATE_MAX_AGE_S = 30 * 60
+CODEX_SEAT_REFRESH_WAIT_S = 30.0
+CODEX_SEAT_REFRESH_STARTUP_ALLOWANCE_S = 30.0
 
 
 def _effective_account_cooldown(
@@ -20039,6 +25002,7 @@ def _commit_requeue_disposition(
 
 def _write_json_exclusive(path: Path, payload: dict) -> bool:
     """Durably create one queue entry without ever replacing an existing path."""
+    goalflight_journal.validate_dispatch_owner_fields(payload)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -20072,6 +25036,7 @@ def _requeue_child_entry(
     *,
     child_id: str,
     requeued_from: str,
+    parent_record: dict,
     queue_dir: Path,
     not_before: str | None,
     created_at: str | None = None,
@@ -20079,6 +25044,13 @@ def _requeue_child_entry(
 ) -> dict | None:
     dispatch_argv = list(entry.get("dispatch_argv") or [])
     if not dispatch_argv:
+        return None
+    project_root = parent_record.get("project_root") or entry.get("project_root")
+    try:
+        controller_label = _strict_dispatch_owner_label(
+            parent_record, project_root=project_root
+        )
+    except goalflight_ledger._MalformedDispatchOwnerLabel:
         return None
     base = _dispatch_base_dir()
     tail = base / f"{child_id}.tail"
@@ -20092,20 +25064,42 @@ def _requeue_child_entry(
     dispatch_argv = _set_option_before_worker_remainder(
         dispatch_argv, "--status-json", str(status_json)
     )
+    dispatch_argv = _remove_option_before_worker_remainder(
+        dispatch_argv, "--controller-label"
+    )
+    if controller_label:
+        dispatch_argv = _set_option_before_worker_remainder(
+            dispatch_argv, "--controller-label", controller_label
+        )
     # A retry with a new dispatch id cannot satisfy the parent's seat lock.
     # Drop the old pin and let normal post-capacity admission choose and bind
     # a seat for the child.
     dispatch_argv = _reconstruct_launch_argv(
         dispatch_argv,
+        strip_flags=("--skip-seat-reset",),
         strip_options=("--cwd", "--worktree-pin-holder"),
     )
     now = goalflight_ledger.utc_now()
     child_created_at = created_at if isinstance(created_at, str) and created_at.strip() else now
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
-    child = _sanitize_restore_envelope(entry, increment_recovery_count=False)
+    child = {
+        key: entry[key]
+        for key in (
+            "agent",
+            "shape",
+            "process_cwd",
+            "base_sha",
+            "task_ids",
+            "parent_dispatch_id",
+            "priority",
+            "effective_account",
+            "account",
+        )
+        if key in entry
+    }
     request = (
-        dict(child.get("request"))
-        if isinstance(child.get("request"), dict)
+        dict(entry.get("request"))
+        if isinstance(entry.get("request"), dict)
         else {}
     )
     request.update(
@@ -20116,6 +25110,11 @@ def _requeue_child_entry(
             "requeued_from": requeued_from,
         }
     )
+    request.pop("controller_label", None)
+    if controller_label:
+        request["controller_label"] = controller_label
+    if project_root:
+        request["project_root"] = project_root
     for key in (
         "cwd",
         "worktree_path",
@@ -20137,6 +25136,10 @@ def _requeue_child_entry(
             "requeued_from": requeued_from,
         }
     )
+    if controller_label:
+        child["controller_label"] = controller_label
+    if project_root:
+        child["project_root"] = project_root
     if requeue_attempt is not None:
         child["requeue_attempt"] = requeue_attempt
         request["requeue_attempt"] = requeue_attempt
@@ -20318,6 +25321,7 @@ def _maybe_requeue_terminal_claim(
         entry,
         child_id=child_id,
         requeued_from=dispatch_id,
+        parent_record=record,
         queue_dir=queue_dir,
         not_before=not_before,
         created_at=created_at,
@@ -20461,12 +25465,14 @@ def _mark_claim_worker_dead(
     finally:
         txn.release()
     # Re-read for status mirror if finish preserved a prior terminal.
+    worktree_status_fields = {}
     with contextlib.suppress(Exception):
         record = _find_dispatch_record(dispatch_id)
         if record and record.get("state"):
             durable_state = str(record.get("state"))
             if record.get("terminal_state"):
                 final_reason = record.get("reason") or record.get("error") or final_reason
+        worktree_status_fields = _dispatch_status_worktree_fields(record)
     # Same derived-mirror rule as _write_reconciled_terminal_status: the
     # journal terminal and carrier decision are already durable here.
     with contextlib.suppress(Exception):
@@ -20487,6 +25493,7 @@ def _mark_claim_worker_dead(
                 ),
                 "terminal_marker": terminal_marker,
                 "project_root": str(project_root),
+                **worktree_status_fields,
                 "worker_pid": entry.get("queue_worker_pid"),
                 "worker_alive": False,
                 "tail_path": str(tail),
@@ -21637,6 +26644,28 @@ def _drain_queue_once(args) -> dict:
             else:
                 drain_acc["left_queued"] += 1
             continue
+        if isinstance(_scan_entry, dict):
+            status_payload = _read_entry_status(_scan_entry)
+            terminal_state = next(
+                (
+                    status_payload.get(key)
+                    for key in ("state", "terminal_state")
+                    if isinstance(status_payload, dict)
+                    and status_payload.get(key)
+                    in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+                ),
+                None,
+            )
+            if terminal_state is not None:
+                drain_acc["left_queued"] += 1
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "queued",
+                        "reason": f"terminal_status_{terminal_state}",
+                    }
+                )
+                continue
         if project_key and project_key in drain_acc["skipped_projects_busy"]:
             _note_drain_journal_skip(
                 drain_acc,
@@ -21802,14 +26831,14 @@ def _drain_queue_once(args) -> dict:
             acc=drain_acc,
         ) as lease:
             launch_task_ids = set(_entry_task_ids(entry))
-            decision = _entry_completion_authority(entry)
+            terminal_reason = _drain_claim_terminal_reason(entry)
             same_task_already_spawned = bool(
                 launch_task_ids
                 and launch_task_ids & drain_acc["launched_task_ids"]
             )
-            if same_task_already_spawned or _completion_decision_blocks_restore(
-                decision
-            ):
+            if same_task_already_spawned or terminal_reason:
+                if terminal_reason:
+                    lease.release_reason = terminal_reason
                 # Do not spawn. Leave the claim unconsumed so __exit__ restore
                 # terminalizes or parks through the same authority path
                 # reconcile already uses. Occupancy-forced does not bypass
@@ -21858,6 +26887,10 @@ def _drain_queue_once(args) -> dict:
                 max(0.05, launch_deadline - time.monotonic()),
             )
             attempt_started = time.monotonic()
+            terminal_reason = _drain_claim_terminal_reason(entry)
+            if terminal_reason:
+                lease.release_reason = terminal_reason
+                continue
             try:
                 lease.launch_attempted = True
                 if remote_node:
@@ -21868,8 +26901,18 @@ def _drain_queue_once(args) -> dict:
                         launch_token=launch_token,
                         claim=claim,
                     )
+                    if proc is None:
+                        lease.launch_attempted = False
+                        lease.release_reason = (
+                            _drain_claim_terminal_reason(entry)
+                            or "terminal_before_remote_launch"
+                        )
+                        continue
                 else:
                     drain_env = _sidecar_env(os.environ.copy())
+                    drain_env[DRAIN_LAUNCH_DEADLINE_ENV] = repr(
+                        time.monotonic() + entry_timeout_s
+                    )
                     proc = subprocess.run(
                         [sys.executable, str(Path(__file__).resolve()), *launch_argv],
                         cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
@@ -22087,13 +27130,24 @@ def _drain_queue_once(args) -> dict:
                         lease.release_reason = (
                             f"launch_refused_pre_spawn:{proc.returncode}"
                         )
-                    attempt_class = _classify_local_pre_spawn_attempt(proc)
+                    attempt_class = _classify_local_pre_spawn_attempt(
+                        proc, observed_claim
+                    )
                 else:
                     lease.fail_reason = (
                         "launch_confirmation_missing:exit_0_no_worker_record"
                     )
                     lease.release_reason = lease.fail_reason
                     attempt_class = LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE
+                child_output = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+                seat_wait_refusal = (
+                    attempt_class == LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+                    and proc.returncode == 64
+                    and (
+                        "wait for a worktree" in child_output
+                        or "wait for a seat" in child_output
+                    )
+                )
                 _apply_launch_attempt_class(
                     lease,
                     attempt_class,
@@ -22105,6 +27159,10 @@ def _drain_queue_once(args) -> dict:
                         launch_deadline=launch_deadline,
                     ),
                 )
+                if seat_wait_refusal:
+                    # Seat contention is retried as soon as the holder exits;
+                    # it does not park the queued retry behind launch backoff.
+                    lease.stamp_backoff = False
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
     # Launches already happened, so a listing failure here must not become the
@@ -22536,17 +27594,14 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     )
     if not warned_prompt_body:
         _warn_worker_prompt_uv_cache_references(delivered_body)
-    acp_prompt_text = f"{SEARCH_SCOPE_PREAMBLE}\n\n{delivered_body}"
-    delivered_body = acp_prompt_text
-    delivered_prompt = (
-        f"{PROMPT_FILE_PREAMBLE}\n\n{delivered_body}"
-        if prompt_path
-        else delivered_body
+    remote_ci_environment = goalflight_dispatch_paths.remote_ci_worker_environment(
+        project_root, {**os.environ, **vars(args)}
     )
-    watcher_prompt_path = _persist_acp_watcher_prompt(
-        status_json=status_json,
-        prompt_text=delivered_prompt,
+    remote_ci_prompt = goalflight_dispatch_paths.remote_ci_worker_prompt(
+        remote_ci_environment
     )
+    if remote_ci_prompt and "Remote CI: run test suites and other heavy CPU" not in delivered_body:
+        delivered_body = f"{delivered_body.rstrip()}\n\n{remote_ci_prompt}\n"
     explicit_os_sandbox = getattr(args, "os_sandbox", None)
     if explicit_os_sandbox:
         os_sandbox = explicit_os_sandbox
@@ -22557,6 +27612,27 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
             and (goalflight_compat.is_macos() or args.agent == "claude")
             else OS_SANDBOX_OFF
         )
+    acp_preamble = [WORKER_ONLY_PREAMBLE]
+    if getattr(args, "parent_dispatch_id", None):
+        acp_preamble.append(RESUME_CONTRACT_SUPERSESSION_PREAMBLE)
+    acp_preamble.extend([
+        SEARCH_SCOPE_PREAMBLE,
+        SCOPE_GUARD_PREAMBLE,
+        INSTRUCTION_REFUSAL_PREAMBLE,
+    ])
+    if _prompt_requests_commit(delivered_body):
+        acp_preamble.append(COMMIT_CUSTODY_PREAMBLE)
+    acp_prompt_text = "\n\n".join([*acp_preamble, delivered_body])
+    delivered_body = acp_prompt_text
+    delivered_prompt = (
+        f"{PROMPT_FILE_PREAMBLE}\n\n{delivered_body}"
+        if prompt_path
+        else delivered_body
+    )
+    watcher_prompt_path = _persist_acp_watcher_prompt(
+        status_json=status_json,
+        prompt_text=delivered_prompt,
+    )
     liveness_profile = "remote_api" if args.agent in {"cursor", "claude"} else None
     cfg = argparse.Namespace(
         agent=args.agent,
@@ -22573,6 +27649,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         _codex_pre_resolved_account=getattr(
             args, "_codex_pre_resolved_account", None
         ),
+        _codex_selected_account=getattr(args, "_codex_selected_account", None),
+        _capacity_account=getattr(args, "_capacity_account", None),
         project_root=str(project_root),
         cwd=str(acp_cwd) if acp_cwd is not None else None,
         worktree=acp_worktree,
@@ -22585,6 +27663,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         _worktree_occupancy_checked_path=getattr(
             args, "_worktree_occupancy_checked_path", None
         ),
+        _worktree_occupancy_lock=getattr(args, "_worktree_occupancy_lock", None),
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -22597,13 +27676,16 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
         dispatch_id=args.dispatch_id,
         from_queue=bool(getattr(args, "from_queue", False)),
+        _codex_recorded_home=getattr(args, "_codex_recorded_home", None),
+        _codex_retry_home=getattr(args, "_codex_retry_home", None),
+        _codex_recorded_account=getattr(args, "_codex_recorded_account", None),
         queue_claim_path=getattr(args, "queue_claim_path", None),
         task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
         # ACP and bash use the same inline-wait policy, including lane defaults
         # for detached launchers. Only a claimed backlog entry has a durable
         # carrier that owns retry after a capacity refusal.
-        capacity_wait_s=getattr(args, "capacity_wait_s", None),
+        capacity_wait_s=_capacity_wait_seconds(args),
         preserve_capacity_refusal_attempt=_capacity_refusal_attempt_stays_prepared(args),
         prompt_id=None,
         prompt=None,
@@ -22692,6 +27774,11 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
     if not marker_path:
         return None
     project_root = _project_root(args)
+    worktree_status_fields = {}
+    if getattr(args, "_worktree_path", None):
+        worktree_status_fields["worktree_path"] = str(args._worktree_path)
+    if getattr(args, "_worktree_id", None):
+        worktree_status_fields["worktree_seat"] = str(args._worktree_id)
     worker_pid = os.getpid()
     tail_path.parent.mkdir(parents=True, exist_ok=True)
     with tail_path.open("ab") as tail_f:
@@ -22755,6 +27842,7 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
                 "shape": "acp",
                 "state": "running",
                 "terminal_state": None,
+                **worktree_status_fields,
                 "worker_pid": worker_pid,
                 "worker_alive": True,
                 "tail_path": str(tail_path),
@@ -22792,6 +27880,7 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
             "shape": "acp",
             "state": "complete",
             "terminal_state": "complete",
+            **worktree_status_fields,
             "worker_pid": worker_pid,
             "worker_alive": False,
             "tail_path": str(tail_path),
@@ -22892,6 +27981,8 @@ def _run_acp_detached_launcher(
     env_remove: list[str],
     capacity_wait_s: float,
 ) -> int:
+    global _LAUNCH_MARKER_EMITTED
+    launcher_started = time.time()
     env = os.environ.copy()
     env.update(account_env)
     for key in env_remove:
@@ -22901,6 +27992,8 @@ def _run_acp_detached_launcher(
         env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
             worktree_seat.fileno()
         )
+    elif _effective_read_only(args):
+        env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
     read_only_lock_fd = getattr(args, "_read_only_resume_lock_fd", None)
     if read_only_lock_fd is not None:
         env[goalflight_worktree_pool.READ_ONLY_ALLOCATION_LOCK_FD_ENV] = str(
@@ -22911,6 +28004,7 @@ def _run_acp_detached_launcher(
         env[READ_ONLY_ALLOCATION_LOCK_PATH_ENV] = str(read_only_lock_path)
     _apply_web_qa_env(env, args, _project_root(args))
     child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
+    _mark_spawn_intent(args.dispatch_id)
     try:
         child_pid = _spawn_daemonized_process(
             child_argv,
@@ -22919,6 +28013,7 @@ def _run_acp_detached_launcher(
             stdout_mode="ab",
             stderr="stdout",
             serialize_stdout=True,
+            filter_stdout=True,
             label="acp",
             inherit_occupancy_lock=True,
         )
@@ -22982,12 +28077,46 @@ def _run_acp_detached_launcher(
                     ),
                     flush=True,
                 )
+                _LAUNCH_MARKER_EMITTED = True
                 _release_redispatch_store_lock(args)
                 return 0
             child_alive = goalflight_compat.pid_alive(child_pid)
             with contextlib.suppress(OSError, json.JSONDecodeError):
                 status_payload = json.loads(status_json.read_text(encoding="utf-8"))
                 last_state = status_payload.get("state")
+                refusal_reason = _permanent_dispatch_refusal_reason(
+                    status_payload.get("permanent_refusal")
+                    or status_payload.get("error")
+                    or status_payload.get("reason")
+                )
+                if refusal_reason is not None:
+                    _finish_permanent_prelaunch_refusal(
+                        args.dispatch_id,
+                        refusal_reason,
+                        state=str(last_state or "failed"),
+                        elapsed_s=round(time.time() - launcher_started, 3),
+                        args=args,
+                    )
+                    print(
+                        f"goalflight_dispatch: {refusal_reason}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _release_redispatch_store_lock(args)
+                    return 64
+                if status_payload.get("dispatch_refused"):
+                    refusal = (
+                        status_payload.get("error")
+                        or status_payload.get("reason")
+                        or "dispatch refused"
+                    )
+                    print(
+                        f"goalflight_dispatch: {refusal}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _release_redispatch_store_lock(args)
+                    return 64
                 if (
                     last_state == "failed_worktree"
                     and str(status_payload.get("error", "")).startswith("WorktreeSeatUnavailable:")
@@ -23042,6 +28171,12 @@ def _run_acp_detached_launcher(
     return 1
 
 
+def _prepare_worker_scratch_dir(dispatch_id: str) -> Path:
+    scratch_dir = goalflight_dispatch_paths.worker_scratch_dir(dispatch_id)
+    scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return scratch_dir
+
+
 def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     from goalflight_acp_run import (
         acp_dispatch_exit_code,
@@ -23058,6 +28193,9 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         args.dispatch_id,
         allow_queued=getattr(args, "from_queue", False),
     )
+    scratch_dir = goalflight_dispatch_paths.worker_scratch_dir(
+        str(args.dispatch_id)
+    )
     if (
         getattr(args, "parent_dispatch_id", None)
         and _effective_read_only(args)
@@ -23066,6 +28204,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         _prepare_read_only_resume_binding(args, _project_root(args))
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     cfg = _build_acp_cfg(args, status_json=status_json, base=base)
+    cfg._worker_scratch_dir = str(scratch_dir)
     env_remove = []
     if args.billing == "sub":
         engine = _account_engine(args.agent)
@@ -23089,7 +28228,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             tail_path=tail_path,
             account_env=account_env,
             env_remove=env_remove,
-            capacity_wait_s=_capacity_wait_seconds(args) + float(cfg.capacity_wait_s or 0.0),
+            capacity_wait_s=_capacity_wait_seconds(args),
         )
     if (
         getattr(args, "parent_dispatch_id", None)
@@ -23129,6 +28268,23 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         return test_rc
     if goalflight_compat.is_windows():
         payload = asyncio.run(run_acp_dispatch(cfg))
+        if payload.get("status_launch_admission_deferred"):
+            raise DispatchUsageError(
+                str(payload.get("error") or "wait for a status lock")
+            )
+        refusal_reason = _permanent_dispatch_refusal_reason(
+            payload.get("permanent_refusal")
+            or payload.get("error")
+            or payload.get("reason")
+        )
+        if refusal_reason is not None:
+            _finish_permanent_prelaunch_refusal(
+                cfg.dispatch_id,
+                refusal_reason,
+                state=str(payload.get("state") or "failed"),
+                args=args,
+            )
+            return 64
         print(
             "DISPATCH-BLOCKED "
             + json.dumps(
@@ -23146,6 +28302,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         )
         return acp_dispatch_exit_code(payload)
 
+    _mark_spawn_intent(args.dispatch_id)
     started = time.time()
     print(
         "DISPATCH-START "
@@ -23163,6 +28320,8 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     )
     web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
     acp_env = {**account_env, **web_qa_updates}
+    acp_env.pop("GOALFLIGHT_SCRATCH_DIR", None)
+    acp_env.pop("TMPDIR", None)
     _apply_shared_worker_uv_cache_env(acp_env)
     _apply_read_only_env(acp_env, args)
     acp_remove = list(env_remove) + list(web_qa_remove)
@@ -23178,6 +28337,25 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         if worktree_seat is not None:
             worktree_seat.release()
             args._worktree_seat = None
+    refusal_reason = _permanent_dispatch_refusal_reason(
+        payload.get("permanent_refusal")
+        or payload.get("error")
+        or payload.get("reason")
+    )
+    if payload.get("status_launch_admission_deferred"):
+        raise DispatchUsageError(
+            str(payload.get("error") or "wait for a status lock")
+        )
+    if refusal_reason is not None:
+        _finish_permanent_prelaunch_refusal(
+            cfg.dispatch_id,
+            refusal_reason,
+            state=str(payload.get("state") or "failed"),
+            elapsed_s=round(time.time() - started, 3),
+            args=args,
+        )
+        print(f"goalflight_dispatch: {refusal_reason}", file=sys.stderr, flush=True)
+        return 64
     if getattr(cfg, "_worktree_admission_refused", False):
         reason = payload.get("error") or payload.get("reason") or (
             "writer dispatch refused project-root worker cwd"
@@ -23407,12 +28585,15 @@ def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
     from goalflight_os_sandbox import prepare_os_sandbox_command
 
     cwd = os.path.abspath(getattr(args, "cwd", None) or ".")
+    environment = dict(os.environ)
+    environment.update(getattr(args, "_account_env", None) or {})
     prepared = prepare_os_sandbox_command(
         argv[0],
         list(argv[1:]),
         cwd=cwd,
         os_sandbox=requested,
         agent=agent,
+        environment=environment,
     )
     return [prepared.command, *prepared.args]
 
@@ -23519,6 +28700,70 @@ def _validate_cursor_read_only_launch(
         )
 
 
+def _prepare_grok_read_only_tmpdir(args, account_env: dict[str, str]) -> Path:
+    """Return the private TMPDIR child used by read-only Grok launches."""
+    scratch_raw = str(account_env.get("GOALFLIGHT_SCRATCH_DIR") or "").strip()
+    scratch_dir = Path(scratch_raw).expanduser().resolve(strict=False)
+    if not scratch_raw or not scratch_dir.is_dir():
+        raise DispatchUsageError(
+            "--read-only Grok requires an existing per-dispatch scratch directory"
+        )
+
+    candidates = (
+        getattr(args, "_grok_read_only_tmpdir", None),
+        getattr(args, "_caller_tmpdir", None),
+        account_env.get("TMPDIR"),
+    )
+    for raw in candidates:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if ".." in candidate.parts:
+            continue
+        try:
+            relative = candidate.relative_to(scratch_dir)
+        except ValueError:
+            continue
+        # Check the caller's lexical path before resolve(), which would erase
+        # evidence that any component is a symlink into the scratch tree.
+        component = scratch_dir
+        has_symlink = False
+        for part in relative.parts:
+            component = component / part
+            if component.is_symlink():
+                has_symlink = True
+                break
+        if has_symlink:
+            continue
+        candidate = candidate.resolve(strict=False)
+        try:
+            mode = candidate.stat().st_mode
+        except OSError:
+            continue
+        if (
+            candidate.is_dir()
+            and candidate.parent == scratch_dir
+            and (mode & 0o700) == 0o700
+            and (mode & 0o077) == 0
+        ):
+            args._grok_read_only_tmpdir = str(candidate)
+            return candidate
+
+    try:
+        private_tmp = Path(tempfile.mkdtemp(
+            prefix="goalflight-grok-read-only-", dir=str(scratch_dir)
+        ))
+    except OSError as exc:
+        raise DispatchUsageError(
+            f"--read-only Grok could not create its private TMPDIR: {exc}"
+        ) from exc
+    args._grok_read_only_tmpdir = str(private_tmp)
+    return private_tmp
+
+
 def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
     """Keep Grok's shell on macOS while fencing project writes with Seatbelt."""
     if not argv or not _effective_read_only(args):
@@ -23550,18 +28795,7 @@ def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
             f"--read-only Grok account {account!r} did not resolve to its "
             f"account HOME {expected_home}; refusing the launch"
         )
-    private_tmp = getattr(args, "_grok_read_only_tmpdir", None)
-    if not private_tmp:
-        try:
-            private_tmp = tempfile.mkdtemp(
-                prefix="goalflight-grok-read-only-",
-                dir=tempfile.gettempdir(),
-            )
-        except OSError as exc:
-            raise DispatchUsageError(
-                f"--read-only Grok could not create its private TMPDIR: {exc}"
-            ) from exc
-        args._grok_read_only_tmpdir = private_tmp
+    private_tmp = _prepare_grok_read_only_tmpdir(args, account_env)
     account_env["TMPDIR"] = str(private_tmp)
     account_env["GOALFLIGHT_STEER_FILE"] = str(
         goalflight_dispatch_paths.steer_file(str(args.dispatch_id))
@@ -23578,9 +28812,10 @@ def _wrap_grok_read_only_os_sandbox(argv: list[str], args) -> list[str]:
 
 
 def _apply_read_only_env(env: dict[str, str], args) -> None:
-    """Prevent read-only Git inspection from creating an index lock."""
+    """Keep read-only workers off writable worktree locks and Git index locks."""
     if _effective_read_only(args):
         env["GIT_OPTIONAL_LOCKS"] = "0"
+        env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
 
 
 def build_worker(args, prompt_path, raw_argv: list[str]):
@@ -23600,8 +28835,15 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     model = getattr(args, "model", None)
     if args.agent == "codex":
         argv = ["codex", "exec", "--skip-git-repo-check", "--sandbox", sandbox,
-                "-c", "approval_policy=never"]
-        argv += codex_workspace_write_args(args.cwd, _effective_os_sandbox(args))
+                "-c", "approval_policy=never", *codex_plugins_off_args()]
+        # On codex-cli 0.159.0 this kept a worker home to 2.9 MB, with no
+        # remote_plugin_catalog (28 MB normally) or .tmp/plugins (88 MB when
+        # features.remote_plugin=false was used); that flag triggered fallback.
+        argv += codex_workspace_write_args(
+            args.cwd,
+            _effective_os_sandbox(args),
+            environment=getattr(args, "_account_env", None),
+        )
         if not _codex_context_mode_enabled():
             # Disable context-mode at the worker boundary (see _codex_context_mode_enabled);
             # leaves the user's ~/.codex/config.toml untouched for interactive use.
@@ -23744,10 +28986,35 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv.extend(
                 ["--mode", _cursor_read_only_mode(), "--sandbox", "enabled"]
             )
+            account_env = getattr(args, "_account_env", None) or {}
+            spool = str(account_env.get("GOALFLIGHT_REMOTE_CI_SPOOL_DIR") or "").strip()
+            roots = []
+            if spool:
+                roots.append(Path(spool).expanduser() / "requests")
+            question_outbox = str(
+                account_env.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or ""
+            ).strip()
+            if question_outbox:
+                roots.append(Path(question_outbox).expanduser())
+            expanded_roots = list(roots)
+            for root in roots:
+                try:
+                    expanded_roots.append(root.resolve())
+                except OSError:
+                    pass
+            for root in dict.fromkeys(str(path) for path in expanded_roots):
+                argv += ["--add-dir", root]
         else:
             # Cursor's adapter marks --force as requiring an explicit task
             # justification. Keep it for requested writer work only.
             argv.append("--force")
+            account_env = getattr(args, "_account_env", None) or {}
+            question_outbox = str(
+                account_env.get("GOALFLIGHT_QUESTION_OUTBOX_DIR") or ""
+            ).strip()
+            if question_outbox:
+                root = Path(question_outbox).expanduser()
+                argv += ["--add-dir", str(root)]
         argv.extend(["--trust", "--output-format", "text"])
         cursor_session_id = _resolved_engine_session_id(args)
         if cursor_session_id and getattr(args, "parent_dispatch_id", None) and not getattr(args, "resume_reconstruction", False):
@@ -23796,7 +29063,9 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("resume", "continue a recorded worker session in its existing worktree"),
     ("reconcile-abandoned", "dry-run report of abandoned dispatches; drain writes"),
     ("withdraw", "retire a dispatch with no live worker; never kills workers"),
+    ("release-seat", "release an owned terminal dispatch seat after integration"),
     ("drain", "launch queued dispatch requests"),
+    ("final", "print a dispatch's final assistant message and terminal marker"),
     ("dashboard-refresh", "rebuild the dashboard projection"),
 )
 
@@ -24129,14 +29398,76 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> int:
+def _check_dispatch_disk_floor() -> tuple[bool, str]:
+    measured: list[tuple[str, int]] = []
+    errors: list[str] = []
+    configured_paths = (
+        ("home", Path.home),
+        ("state", goalflight_compat.resolve_state_dir),
+        (
+            "codex state",
+            lambda: Path(os.environ.get("GOALFLIGHT_CODEX_STATE_DIR", "~/.goal-flight")),
+        ),
+    )
+    for label, path_provider in configured_paths:
+        try:
+            configured = path_provider()
+            path = goalflight_compat.nearest_existing_path(Path(configured))
+            if path is None:
+                raise FileNotFoundError(f"no existing path for {configured}")
+            measured.append((label, shutil.disk_usage(path).free))
+        except Exception as exc:
+            detail = str(exc).replace(chr(10), " ")
+            errors.append(f"{label}: {type(exc).__name__}: {detail}")
+
+    details = ", ".join(
+        f"{label}={free / 1_000_000_000:.1f} GB" for label, free in measured
+    )
+    floor_gb = DISK_FREE_SPACE_FLOOR_BYTES / 1_000_000_000
+    if any(free < DISK_FREE_SPACE_FLOOR_BYTES for _label, free in measured):
+        error_detail = f"; measurement errors: {'; '.join(errors)}" if errors else ""
+        return False, f"free space {details} is below the {floor_gb:g} GB floor{error_detail}"
+    if errors:
+        return True, (
+            "warning: could not measure free space for "
+            + "; ".join(errors)
+            + f"; measured {details or 'no paths'}; launch allowed with a {floor_gb:g} GB floor"
+        )
+    return True, f"free space {details} meets the {floor_gb:g} GB floor"
+
+
+def _admit_dispatch_disk_floor() -> bool:
+    disk_ok, detail = _check_dispatch_disk_floor()
+    if detail.startswith("warning:"):
+        print(f"goalflight_dispatch: {detail}", file=sys.stderr, flush=True)
+    elif not disk_ok:
+        print(
+            "goalflight_dispatch: refusing worker launch before seat allocation: "
+            + detail,
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
+def _main_impl(
+    argv: list[str] | None = None,
+    *,
+    resume_plan: dict | None = None,
+) -> int:
+    global _LAUNCH_MARKER_EMITTED
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == DAEMON_SPAWN_ARG:
         return _cmd_spawn_daemon()
     # Withdrawal dry-runs and no-op retries must not emit a wake-entry notice.
+    if argv and argv[0] == "release-seat":
+        return _cmd_release_seat(argv[1:])
     if argv and argv[0] == "withdraw":
         return _cmd_withdraw(argv[1:])
     option_argv = argv[: argv.index("--")] if "--" in argv else argv
+    if argv and argv[0] == "final":
+        return _cmd_final(argv[1:])
     if argv and argv[0] == "steer":
         return _cmd_steer(argv[1:])
     if argv and argv[0] == "resume":
@@ -24191,6 +29522,14 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 _existing_cwd_arg(args.cwd)
             except argparse.ArgumentTypeError as exc:
                 parser.error(str(exc))
+    if getattr(args, "from_queue", False):
+        raw_deadline = os.environ.pop(DRAIN_LAUNCH_DEADLINE_ENV, None)
+        try:
+            queue_deadline = float(raw_deadline) if raw_deadline is not None else float("nan")
+        except (TypeError, ValueError):
+            queue_deadline = float("nan")
+        if math.isfinite(queue_deadline):
+            args._queue_launch_deadline = queue_deadline
     # REMAINDER captures positional words even without the `--` the help text
     # requires. An unknown first word (or a stray positional after options)
     # was therefore exec'd as a raw worker. Observed 2026-09-11:
@@ -24229,6 +29568,8 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         else:
             print(goalflight_ledger.format_stats_table(payload))
         return 0
+    if resume_plan is None and not _admit_dispatch_disk_floor():
+        return 75
     raw = _raw_worker_args(args)
     if args.interactive:
         if args.shape not in {"auto", "acp"}:
@@ -24312,8 +29653,37 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     )
             _refuse_launch_blocked_by_completion_authority(args)
             resume_source = _validate_resume_source(
-                args.parent_dispatch_id, exclude_dispatch_id=args.dispatch_id
+                args.parent_dispatch_id,
+                exclude_dispatch_id=args.dispatch_id,
+                reconcile_dead_preclaim=True,
             )
+            if (
+                resume_source.get("engine") == "codex"
+                and goalflight_engine_sessions.resume_engine(args.agent) == "codex"
+            ):
+                parent_session_id = resume_source.get("session_id")
+                supplied_engine_session_id = goalflight_engine_sessions.valid_session_id(
+                    "codex", getattr(args, "engine_session_id", None)
+                )
+                supplied_codex_session_id = goalflight_codex_sessions.valid_session_id(
+                    getattr(args, "codex_session_id", None)
+                )
+                supplied_session_ids = [
+                    session_id
+                    for session_id in (
+                        supplied_engine_session_id,
+                        supplied_codex_session_id,
+                    )
+                    if session_id is not None
+                ]
+                if any(session_id != parent_session_id for session_id in supplied_session_ids) or (
+                    len(supplied_session_ids) == 2
+                    and supplied_session_ids[0] != supplied_session_ids[1]
+                ):
+                    raise DispatchUsageError(
+                        "resume refused: supplied Codex session does not match "
+                        f"parent dispatch {args.parent_dispatch_id}"
+                    )
             _validate_resume_worktree_source(
                 args.parent_dispatch_id,
                 resume_source["record"],
@@ -24326,13 +29696,18 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             print(f"goalflight_dispatch: {exc}", file=sys.stderr)
             return 64
     if resume_plan is not None and shape != "acp":
+        _mark_spawn_intent(args.dispatch_id)
         args._capacity_account = resume_plan.get("capacity_account")
         _prepare_read_only_admission(args, _project_root(args))
-        resume_lease_id = _acquire_capacity(
-            args,
-            project_root=_project_root(args),
-            status_json=None,
-        )
+        try:
+            resume_lease_id = _acquire_capacity(
+                args,
+                project_root=_project_root(args),
+                status_json=None,
+            )
+        except SystemExit as exc:
+            _record_prelaunch_failure(args, error=exc)
+            raise
         resume_signal_guard = _install_capacity_lease_signal_guard(resume_lease_id)
         try:
             base = _dispatch_base_dir()
@@ -24376,16 +29751,23 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
+            _mark_spawn_intent(args.dispatch_id)
             if not args.dispatch_id:
                 args.dispatch_id = (
                     _default_dispatch_id(args.agent)
                     if goalflight_compat.is_windows()
                     else _reserve_auto_dispatch_id(args.agent, base)
                 )
+            _mark_spawn_intent(args.dispatch_id)
             _refuse_reused_dispatch_id_for_launch(
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+            (
+                args._codex_recorded_home,
+                args._codex_retry_home,
+                args._codex_recorded_account,
+            ) = _recorded_codex_dispatch_home(args)
             _emit_launch_wake_notice()
             # Direct resume launches must validate before exempting lineage or
             # binding a seat; claim-boundary validation remains under its lock.
@@ -24397,41 +29779,48 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             # writer gets the same persisted occupancy refusal as the runner.
             # Captive ACP launches without --cwd defer this check until the
             # pooled seat is selected after capacity admission.
-            if (
-                not _occupancy_exempt_read_only(args)
-                and (getattr(args, "cwd", None) or getattr(args, "in_place", False))
-            ):
-                try:
-                    args._worktree_occupancy_warning = _prepare_attempt_worktree_occupancy(
-                        args
-                    )
-                except DispatchUsageError as exc:
-                    return _record_acp_prelaunch_refusal(
-                        args,
-                        error=str(exc),
-                        reason="worktree_occupied",
-                        state="failed_worktree",
-                    )
-                args._worktree_occupancy_checked = True
-                args._worktree_occupancy_checked_path = str(
-                    Path(str(_worker_cwd(args))).resolve(strict=False)
+            try:
+                _prepare_explicit_worktree_occupancy(args)
+            except DispatchUsageError as exc:
+                return _record_acp_prelaunch_refusal(
+                    args,
+                    error=str(exc),
+                    reason="worktree_occupied",
+                    state="failed_worktree",
                 )
-                if args._worktree_occupancy_warning is not None:
-                    args.dispatch_warnings = [
-                        *getattr(args, "dispatch_warnings", []),
-                        args._worktree_occupancy_warning,
-                    ]
             # Probe-based account health follows path occupancy, so an occupied
             # writer is recorded before a health refusal. The occupancy
             # override's allow_unknown semantics stay on this path. A missing
             # account home was already refused above, with no side effects.
             try:
                 _resolve_account_env(args)
-                _pre_resolve_pinned_codex_account(
-                    args,
-                    project_root=_project_root(args),
-                    dispatch_id=args.dispatch_id,
-                )
+                if getattr(args, "_codex_retry_home", None):
+                    if getattr(args, "account", None):
+                        _refuse_walled_codex_account(
+                            str(args.account),
+                            allow_unknown=bool(
+                                getattr(args, "occupied_worktree_forced", False)
+                            ),
+                        )
+                        retry_account = str(args.account)
+                    else:
+                        retry_account, retry_rejections = select_codex_account(
+                            model=getattr(args, "model", None)
+                        )
+                        args._codex_account_rejections = retry_rejections
+                        retry_account = retry_account or args._codex_recorded_account
+                    args._codex_selected_account = retry_account
+                    args._capacity_account = retry_account
+                else:
+                    if shape == "acp" and getattr(args, "account", None):
+                        args._codex_selected_account = str(args.account)
+                        args._capacity_account = str(args.account)
+                    elif shape != "acp":
+                        _pre_resolve_pinned_codex_account(
+                            args,
+                            project_root=_project_root(args),
+                            dispatch_id=args.dispatch_id,
+                        )
                 # The ACP runner owns the complete account -> capacity -> worktree
                 # sequence, including explicit --cwd resumes. A refusal must not
                 # create, reset, or occupy a checkout in this parent process.
@@ -24481,6 +29870,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
         except DispatchUsageError as e:
+            if args.dispatch_id:
+                _finish_permanent_prelaunch_refusal(
+                    args.dispatch_id, e, state="failed", args=args
+                )
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
         finally:
@@ -24509,23 +29902,34 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     except DispatchUsageError as e:
+        if args.dispatch_id:
+            _finish_permanent_prelaunch_refusal(
+                args.dispatch_id, e, state="failed", args=args
+            )
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
 
     # Auto-derive id + paths so the common call is one line.
     base = _dispatch_base_dir()
+    _mark_spawn_intent(args.dispatch_id)
     if not args.dispatch_id:
         try:
             args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
+    _mark_spawn_intent(args.dispatch_id)
     try:
         if resume_plan is None:
             _refuse_reused_dispatch_id_for_launch(
                 args.dispatch_id,
                 allow_queued=args.from_queue,
             )
+        (
+            args._codex_recorded_home,
+            args._codex_retry_home,
+            args._codex_recorded_account,
+        ) = _recorded_codex_dispatch_home(args)
         _emit_launch_wake_notice()
         # Validate direct resumes before lineage exemption and seat mutation.
         # Occupancy-forced is a worktree hatch and does not bypass this:
@@ -24536,6 +29940,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         # worktree bind is intentionally deferred until after the account and
         # capacity leases are durable; a refusal must not mint a checkout.
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+        _emit_skipped_worktree_seat_failure(e)
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(
             "goalflight_dispatch: refusing to git worktree add; "
@@ -24544,6 +29949,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         )
         return 2
     except goalflight_worktree_pool.WorktreeSeatError as e:
+        _emit_skipped_worktree_seat_failure(e)
         print(f"goalflight_dispatch: worktree allocation error: {e}", file=sys.stderr)
         return 1
     except DispatchUsageError as e:
@@ -24572,6 +29978,10 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
     steer_file = _steer_file(args.dispatch_id)
+    question_outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(
+        str(args.dispatch_id), dispatch_dir=base
+    )
+    worker_attempt_id = ""
     prompt_path = None
     original_prompt_path = None
     orientation_path = None
@@ -24581,6 +29991,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     project_root = _project_root(args)
     worker_pid = None
     worker_spawn_attempted = False
+    terminal_status_refused = False
     watcher_pid = None
     caffeinate_pid = None
     pidfile = None
@@ -24602,9 +30013,13 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     worktree_seat = None
     read_only_seat_hold = None
     ledger_recorded = False
-    queue_capacity_refused = False
+    scratch_dir: Path | None = None
+    scratch_ledger_recorded = False
+    queue_retryable_refusal = False
+    capacity_blocked_status_written = False
     detached_launched = False
     codex_dispatch_home = None
+    codex_home_spawn_checked = False
     resume_home_path = _codex_dispatch_homes_dir() / str(args.dispatch_id)
     resume_home_created = not resume_home_path.exists() and not resume_home_path.is_symlink()
     engine_session_id = _resolved_engine_session_id(args)
@@ -24653,17 +30068,19 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     if codex_session_id is not None:
         summary_head["codex_session_id"] = codex_session_id
     codex_home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
-    codex_resume_claim_home_owner_dispatch_id = getattr(
-        args,
-        "_codex_resume_source_home_owner_dispatch_id",
-        codex_home_owner_dispatch_id,
-    )
     if codex_home_owner_dispatch_id is not None:
         summary_head["codex_home_owner_dispatch_id"] = (
             codex_home_owner_dispatch_id
         )
 
     try:
+        # An explicit writer path can refuse contention before the initial
+        # waiting-capacity ledger write. That keeps rejected contenders from
+        # racing journal bootstrap before they reach worktree admission.
+        # Queued worktrees are checked after their pinned seat is admitted;
+        # pre-acquiring the path lock here makes a retry contend with itself.
+        if not getattr(args, "from_queue", False):
+            _prepare_explicit_worktree_occupancy(args)
         if resume_plan is None and (
             getattr(args, "parent_dispatch_id", None)
             and resume_engine == "codex"
@@ -24677,30 +30094,49 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             and not getattr(args, "_codex_selected_account", None)
             and not getattr(args, "parent_dispatch_id", None)
         ):
-            (
-                selected_account,
-                selection_rejections,
-                pre_resolved_home,
-                pre_resolved_account,
-                pre_resolved,
-            ) = _prepare_codex_account_for_capacity(
-                project_root,
-                args.dispatch_id,
-                model=getattr(args, "model", None),
-            )
+            if getattr(args, "_codex_retry_home", None):
+                selected_account, selection_rejections = select_codex_account(
+                    model=getattr(args, "model", None)
+                )
+                selected_account = selected_account or args._codex_recorded_account
+                pre_resolved_home = None
+                pre_resolved_account = None
+                pre_resolved = False
+                codex_dispatch_home = args._codex_retry_home
+                effective_account = selected_account
+            else:
+                (
+                    selected_account,
+                    selection_rejections,
+                    pre_resolved_home,
+                    pre_resolved_account,
+                    pre_resolved,
+                ) = _prepare_codex_account_for_capacity(
+                    project_root,
+                    args.dispatch_id,
+                    model=getattr(args, "model", None),
+                )
+                codex_dispatch_home = pre_resolved_home
+                effective_account = pre_resolved_account
             args._codex_selected_account = selected_account
             args._capacity_account = selected_account
             args._codex_account_rejections = selection_rejections
             args._codex_account_pre_resolved = pre_resolved
             args._codex_pre_resolved_home = pre_resolved_home
             args._codex_pre_resolved_account = pre_resolved_account
-            codex_dispatch_home = pre_resolved_home
-            effective_account = pre_resolved_account
-        _pre_resolve_pinned_codex_account(
-            args,
-            project_root=project_root,
-            dispatch_id=args.dispatch_id,
-        )
+        if getattr(args, "_codex_retry_home", None) and getattr(args, "account", None):
+            _refuse_walled_codex_account(
+                str(args.account),
+                allow_unknown=bool(getattr(args, "occupied_worktree_forced", False)),
+            )
+            args._codex_selected_account = str(args.account)
+            args._capacity_account = str(args.account)
+        else:
+            _pre_resolve_pinned_codex_account(
+                args,
+                project_root=project_root,
+                dispatch_id=args.dispatch_id,
+            )
         if _account_engine(args.agent) == "grok" and not getattr(args, "account", None):
             args._capacity_account = grok_selected_account(args)
         if resume_plan is not None:
@@ -24778,16 +30214,17 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             nonlocal ledger_recorded
             if ledger_recorded:
                 return
-            _record_ledger(
-                args,
-                project_root=project_root,
-                prompt_path=None,
-                status_json=status_json,
-                tail=tail,
-                lease_id=lease_id,
-                worker_pid=None,
-                state="waiting_capacity",
-            )
+            with _resume_publication_lock(args):
+                _record_ledger(
+                    args,
+                    project_root=project_root,
+                    prompt_path=None,
+                    status_json=status_json,
+                    tail=tail,
+                    lease_id=lease_id,
+                    worker_pid=None,
+                    state="waiting_capacity",
+                )
             ledger_recorded = True
             _release_read_only_resume_reservation(args)
 
@@ -24809,24 +30246,33 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 if post_capacity_account is not None:
                     effective_account = post_capacity_account
         except (SystemExit, KeyboardInterrupt) as exc:
-            # Queue exhausted or interrupted: the status file already says
-            # blocked_capacity; make the ledger finish agree instead of the
-            # generic "failed", mirroring the status plane's specific reason
-            # (wait_interrupted vs machine_worker_cap vs agent_worker_cap ...).
-            final_state = "blocked_capacity"
-            final_reason = "capacity_wait"
+            # Only a refusal written by this admission attempt proves that the
+            # exit was caused by capacity. A prior attempt's status sidecar can
+            # outlive the current attempt and must not classify it.
+            capacity_blocked_status_written = bool(
+                getattr(args, "_capacity_blocked_status_written", False)
+            )
+            final_state = (
+                "blocked_capacity" if capacity_blocked_status_written else "failed"
+            )
+            final_reason = (
+                "capacity_wait"
+                if capacity_blocked_status_written
+                else f"{type(exc).__name__}: {exc}"
+            )
             blocked = {}
-            with contextlib.suppress(Exception):
-                blocked = json.loads(Path(status_json).read_text(encoding="utf-8"))
-                specific = (blocked.get("reason") or {}).get("reason")
-                if specific:
-                    final_reason = f"capacity_wait:{specific}"
+            if capacity_blocked_status_written:
+                with contextlib.suppress(Exception):
+                    blocked = json.loads(Path(status_json).read_text(encoding="utf-8"))
+                    specific = (blocked.get("reason") or {}).get("reason")
+                    if specific:
+                        final_reason = f"capacity_wait:{specific}"
             capacity_refused = bool(
                 isinstance(exc, SystemExit)
                 and exc.code == 2
-                and _is_capacity_refusal(blocked)
+                and getattr(args, "_capacity_refusal_written", False)
             )
-            queue_capacity_refused = bool(
+            queue_retryable_refusal = bool(
                 capacity_refused
                 and args.from_queue
                 and args.queue_launch_token
@@ -24842,8 +30288,22 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 del args._worktree_wait_callback
         occupancy_warning = getattr(args, "_worktree_occupancy_warning", None)
         if occupancy_warning is not None:
-            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+            if occupancy_warning not in dispatch_warnings:
+                dispatch_warnings = [*dispatch_warnings, occupancy_warning]
             worker_stdout_mode = "ab"
+        ignored_restore_notice = getattr(
+            args, "_resume_ignored_restore_notice", None
+        )
+        if ignored_restore_notice:
+            dispatch_warnings = [*dispatch_warnings, ignored_restore_notice]
+            worker_stdout_mode = "ab"
+        skipped_rows = getattr(args, "_skipped_worktree_seats", None)
+        if skipped_rows:
+            skip_warning = "skipped worktree seats: " + ", ".join(
+                f"{row['seat']}={row['reason']}" for row in skipped_rows
+            )
+            if skip_warning not in dispatch_warnings:
+                dispatch_warnings.append(skip_warning)
         if _account_engine(args.agent) == "grok" and not args.account:
             # Same contract as the codex pointer: args.account stays None so the
             # ledger records "default" (nothing pinned), while effective_account
@@ -24853,55 +30313,75 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             _account_engine(args.agent) == "codex"
             and not goalflight_compat.is_windows()
         ):
-            if (
-                getattr(args, "parent_dispatch_id", None)
-                and not getattr(args, "account", None)
-                and getattr(args, "_codex_resume_pre_resolved", None) is None
-            ):
-                _resolve_unpinned_codex_resume(args, args.dispatch_id)
             if getattr(args, "parent_dispatch_id", None):
                 resume_home = Path(
                     getattr(args, "_codex_resume_source_home", args.codex_resume_home)
                 ).expanduser().resolve(strict=False)
                 args._codex_resume_source_home = str(resume_home)
-                with (
-                    contextlib.nullcontext()
+                parent_record = (
+                    resume_plan["source"]["record"]
                     if resume_plan is not None
-                    else _codex_resume_lock(resume_home, args.codex_session_id)
+                    else _find_dispatch_record(args.parent_dispatch_id) or {}
+                )
+                parent_account = parent_record.get("effective_account") or parent_record.get(
+                    "account"
+                )
+                canonical_home = goalflight_codex_sessions.canonical_account_home(
+                    parent_account
+                )
+                recorded_parent_home = parent_record.get("codex_home")
+                source_is_canonical = (
+                    canonical_home is not None
+                    and isinstance(recorded_parent_home, str)
+                    and Path(recorded_parent_home).expanduser() == canonical_home
+                )
+                if source_is_canonical and args.account and (
+                    args.account != parent_account
                 ):
-                    if resume_plan is None:
-                        _revalidate_codex_resume_claim(
-                            parent_dispatch_id=args.parent_dispatch_id,
-                            expected_home=resume_home,
-                            expected_session_id=args.codex_session_id,
-                            expected_home_owner_dispatch_id=(
-                                codex_resume_claim_home_owner_dispatch_id
+                    # Cross-account resume of a canonical-home session:
+                    # copy the rollout into a fresh home for the new
+                    # account; the source account's home is only read.
+                    codex_dispatch_home, effective_account = (
+                        _seed_codex_resume_home_from_canonical(
+                            project_root,
+                            args.parent_dispatch_id,
+                            resume_home,
+                            args.codex_session_id,
+                            dispatch_id=args.dispatch_id,
+                            account=args.account,
+                            model=getattr(args, "model", None),
+                            pre_resolved=getattr(
+                                args, "_codex_resume_pre_resolved", None
                             ),
-                            exclude_dispatch_id=args.dispatch_id,
                         )
-                    parent_record = (
-                        resume_plan["source"]["record"]
-                        if resume_plan is not None
-                        else _find_dispatch_record(args.parent_dispatch_id) or {}
                     )
-                    parent_account = parent_record.get("effective_account") or parent_record.get(
-                        "account"
+                    # The new home is dispatch-homes/<this dispatch>, so this
+                    # dispatch owns it; recording the parent as owner would
+                    # make the resumed dispatch itself unresumable.
+                    codex_home_owner_dispatch_id = args.dispatch_id
+                    args.codex_home_owner_dispatch_id = args.dispatch_id
+                    args.codex_resume_home = codex_dispatch_home
+                    summary_head["codex_home_owner_dispatch_id"] = args.dispatch_id
+                elif source_is_canonical:
+                    pre_resolved = getattr(
+                        args, "_codex_resume_pre_resolved", None
                     )
-                    canonical_home = goalflight_codex_sessions.canonical_account_home(
-                        parent_account
+                    target_account = getattr(
+                        args, "_codex_selected_account", None
+                    ) or (
+                        pre_resolved.get("account")
+                        if isinstance(pre_resolved, dict)
+                        else None
                     )
-                    recorded_parent_home = parent_record.get("codex_home")
-                    source_is_canonical = (
-                        canonical_home is not None
-                        and isinstance(recorded_parent_home, str)
-                        and Path(recorded_parent_home).expanduser() == canonical_home
-                    )
-                    if source_is_canonical and args.account and (
-                        args.account != parent_account
-                    ):
-                        # Cross-account resume of a canonical-home session:
-                        # copy the rollout into a fresh home for the new
-                        # account; the source account's home is only read.
+                    if target_account and target_account not in {
+                        "host",
+                        "default",
+                        parent_account,
+                    }:
+                        # Unpinned resume follows fresh dispatch account
+                        # selection; copy the source rollout into the
+                        # resolver-selected home instead of retaining an
+                        # exhausted parent account.
                         codex_dispatch_home, effective_account = (
                             _seed_codex_resume_home_from_canonical(
                                 project_root,
@@ -24909,107 +30389,76 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                                 resume_home,
                                 args.codex_session_id,
                                 dispatch_id=args.dispatch_id,
-                                account=args.account,
+                                account=target_account,
                                 model=getattr(args, "model", None),
-                                pre_resolved=getattr(
-                                    args, "_codex_resume_pre_resolved", None
-                                ),
+                                pre_resolved=pre_resolved,
                             )
                         )
-                        # The new home is dispatch-homes/<this dispatch>, so this
-                        # dispatch owns it; recording the parent as owner would
-                        # make the resumed dispatch itself unresumable.
                         codex_home_owner_dispatch_id = args.dispatch_id
                         args.codex_home_owner_dispatch_id = args.dispatch_id
                         args.codex_resume_home = codex_dispatch_home
-                        summary_head["codex_home_owner_dispatch_id"] = args.dispatch_id
-                    elif source_is_canonical:
-                        pre_resolved = getattr(
-                            args, "_codex_resume_pre_resolved", None
+                        summary_head["codex_home_owner_dispatch_id"] = (
+                            args.dispatch_id
                         )
-                        target_account = getattr(
-                            args, "_codex_selected_account", None
-                        ) or (
-                            pre_resolved.get("account")
-                            if isinstance(pre_resolved, dict)
-                            else None
-                        )
-                        if target_account and target_account not in {
-                            "host",
-                            "default",
-                            parent_account,
-                        }:
-                            # Unpinned resume follows fresh dispatch account
-                            # selection; copy the source rollout into the
-                            # resolver-selected home instead of retaining an
-                            # exhausted parent account.
-                            codex_dispatch_home, effective_account = (
-                                _seed_codex_resume_home_from_canonical(
-                                    project_root,
-                                    args.parent_dispatch_id,
-                                    resume_home,
-                                    args.codex_session_id,
-                                    dispatch_id=args.dispatch_id,
-                                    account=target_account,
-                                    model=getattr(args, "model", None),
-                                    pre_resolved=pre_resolved,
-                                )
-                            )
-                            codex_home_owner_dispatch_id = args.dispatch_id
-                            args.codex_home_owner_dispatch_id = args.dispatch_id
-                            args.codex_resume_home = codex_dispatch_home
-                            summary_head["codex_home_owner_dispatch_id"] = (
-                                args.dispatch_id
-                            )
-                        else:
-                            codex_dispatch_home = str(resume_home)
-                            effective_account = parent_account
                     else:
-                        pre_resolved = getattr(
-                            args, "_codex_resume_pre_resolved", None
+                        codex_dispatch_home = str(resume_home)
+                        effective_account = parent_account
+                else:
+                    pre_resolved = getattr(
+                        args, "_codex_resume_pre_resolved", None
+                    )
+                    if pre_resolved is None and getattr(
+                        args, "_codex_account_pre_resolved", False
+                    ):
+                        pre_resolved = {
+                            "home": getattr(args, "_codex_pre_resolved_home", None),
+                            "account": getattr(
+                                args, "_codex_pre_resolved_account", None
+                            ),
+                        }
+                    target_account = getattr(
+                        args, "_codex_selected_account", None
+                    ) or getattr(args, "account", None)
+                    if target_account or pre_resolved:
+                        target_account = target_account or pre_resolved.get(
+                            "account"
                         )
-                        if pre_resolved is None and getattr(
-                            args, "_codex_account_pre_resolved", False
-                        ):
-                            pre_resolved = {
-                                "home": getattr(args, "_codex_pre_resolved_home", None),
-                                "account": getattr(
-                                    args, "_codex_pre_resolved_account", None
+                    if target_account and target_account != "host":
+                        codex_dispatch_home, effective_account = (
+                            _seed_codex_resume_home_from_canonical(
+                                project_root,
+                                args.parent_dispatch_id,
+                                resume_home,
+                                args.codex_session_id,
+                                dispatch_id=args.dispatch_id,
+                                account=(
+                                    target_account
                                 ),
-                            }
-                        target_account = getattr(
-                            args, "_codex_selected_account", None
-                        ) or getattr(args, "account", None)
-                        if target_account or pre_resolved:
-                            target_account = target_account or pre_resolved.get(
-                                "account"
+                                model=getattr(args, "model", None),
+                                pre_resolved=pre_resolved,
                             )
-                        if target_account and target_account != "host":
-                            codex_dispatch_home, effective_account = (
-                                _seed_codex_resume_home_from_canonical(
-                                    project_root,
-                                    args.parent_dispatch_id,
-                                    resume_home,
-                                    args.codex_session_id,
-                                    dispatch_id=args.dispatch_id,
-                                    account=(
-                                        target_account
-                                    ),
-                                    model=getattr(args, "model", None),
-                                    pre_resolved=pre_resolved,
-                                )
-                            )
-                            codex_home_owner_dispatch_id = args.dispatch_id
-                            args.codex_home_owner_dispatch_id = args.dispatch_id
-                            args.codex_resume_home = codex_dispatch_home
-                            summary_head["codex_home_owner_dispatch_id"] = (
-                                args.dispatch_id
-                            )
-                        else:
-                            codex_dispatch_home = str(resume_home)
-                            effective_account = parent_account
+                        )
+                        codex_home_owner_dispatch_id = args.dispatch_id
+                        args.codex_home_owner_dispatch_id = args.dispatch_id
+                        args.codex_resume_home = codex_dispatch_home
+                        summary_head["codex_home_owner_dispatch_id"] = (
+                            args.dispatch_id
+                        )
+                    else:
+                        codex_dispatch_home = str(resume_home)
+                        effective_account = parent_account
             else:
-                if getattr(args, "_codex_account_pre_resolved", False):
+                if (
+                    getattr(args, "_codex_retry_home", None)
+                    and Path(args._codex_retry_home).is_dir()
+                ):
+                    codex_dispatch_home = args._codex_retry_home
+                    effective_account = (
+                        effective_account
+                        or getattr(args, "_codex_selected_account", None)
+                        or args._codex_recorded_account
+                    )
+                elif getattr(args, "_codex_account_pre_resolved", False):
                     codex_dispatch_home = getattr(
                         args, "_codex_pre_resolved_home", None
                     )
@@ -25017,13 +30466,24 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         args, "_codex_pre_resolved_account", None
                     )
                 else:
-                    codex_dispatch_home, effective_account = resolve_codex_home(
-                        project_root,
-                        getattr(args, "_codex_selected_account", None)
-                        or args.account,
-                        args.dispatch_id,
-                        model=getattr(args, "model", None),
-                    )
+                    try:
+                        codex_dispatch_home, effective_account = resolve_codex_home(
+                            project_root,
+                            getattr(args, "_codex_selected_account", None)
+                            or args.account,
+                            args.dispatch_id,
+                            model=getattr(args, "model", None),
+                        )
+                    except Exception as exc:
+                        if (
+                            getattr(args, "_codex_recorded_home", None)
+                            and not Path(args._codex_recorded_home).is_dir()
+                        ):
+                            raise DispatchUsageError(
+                                "codex_home_missing: could not rebuild recorded "
+                                f"per-dispatch home: {exc}"
+                            ) from exc
+                        raise
                 if codex_dispatch_home is None and effective_account is None:
                     canonical_home = goalflight_codex_sessions.canonical_account_home(
                         getattr(args, "account", None)
@@ -25046,13 +30506,38 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         try:
             steer_file.parent.mkdir(parents=True, exist_ok=True)
             steer_file.touch(mode=0o600, exist_ok=True)
+            question_outbox_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as exc:
             print(
-                f"goalflight_dispatch: could not pre-create steer mailbox {steer_file}: "
-                f"{type(exc).__name__}: {exc}; steering will start on first message",
+                f"goalflight_dispatch: could not pre-create dispatch mail paths: "
+                f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
                 flush=True,
             )
+            return 1
+        scratch_dir = _prepare_worker_scratch_dir(str(args.dispatch_id))
+        account_env["GOALFLIGHT_SCRATCH_DIR"] = str(scratch_dir)
+        args._caller_tmpdir = account_env.get("TMPDIR") or os.environ.get("TMPDIR")
+        account_env["TMPDIR"] = str(scratch_dir)
+        account_env.pop("GOALFLIGHT_REMOTE_RUN", None)
+        account_env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
+        account_env["GOALFLIGHT_DISPATCH_ID"] = str(args.dispatch_id)
+        account_env["GOALFLIGHT_QUESTION_OUTBOX_DIR"] = str(question_outbox_dir)
+        account_env["GOALFLIGHT_WORKER_TAIL_FILE"] = str(tail)
+        remote_ci_environment = goalflight_dispatch_paths.remote_ci_worker_environment(
+            project_root, {**os.environ, **account_env}
+        )
+        account_env.update(remote_ci_environment)
+        if (
+            args.agent in {"grok-code", "grok-research"}
+            and _effective_read_only(args)
+            and goalflight_compat.is_macos()
+        ):
+            account_env["TMPDIR"] = str(
+                _prepare_grok_read_only_tmpdir(args, account_env)
+            )
+        args._account_env = account_env
+        prompt_environment = {**os.environ, **account_env, **remote_ci_environment}
         prompt_path = None if raw else _resolve_prompt_file(args, base)
         original_prompt_path = prompt_path
         orientation_path = None if raw else _project_orientation_path(
@@ -25066,6 +30551,24 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 args.dispatch_id,
                 agent=args.agent,
                 orientation_path=orientation_path,
+                resume_cwd_notice=getattr(args, "_resume_cwd_notice", None),
+                remote_ci_environment=prompt_environment,
+                sandbox_profile=(
+                    _supported_os_sandbox_profile(args)
+                    if not raw or args.agent in CURSOR_AGENTS
+                    else None
+                ),
+                sandbox_shape=shape,
+                sandbox_cwd=str(_worker_cwd(args)),
+                sandbox_command=(
+                    "grok"
+                    if args.agent in {"grok-code", "grok-research"}
+                    else ""
+                ),
+                sandbox_environment=prompt_environment,
+                resume_contract_supersession=bool(
+                    getattr(args, "parent_dispatch_id", None)
+                ),
             )
         if resume_plan is not None and _account_engine(args.agent) == "grok":
             args._original_argv, prompt_path, engine_session_id = _finalize_grok_resume(
@@ -25090,70 +30593,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         tail.parent.mkdir(parents=True, exist_ok=True)
         _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
         _reap_quota_stuck_before_bash_launch()
-        resume_lock = contextlib.nullcontext()
-        resume_lock_kind = None
-        if getattr(args, "parent_dispatch_id", None) and resume_engine == "codex":
-            resume_home = Path(
-                getattr(args, "_codex_resume_source_home", args.codex_resume_home)
-            ).expanduser().resolve(strict=False)
-            resume_lock_kind = "codex"
-            resume_lock = (
-                contextlib.nullcontext()
-                if resume_plan is not None
-                else _codex_resume_lock(resume_home, args.codex_session_id)
-            )
-        elif (
-            getattr(args, "parent_dispatch_id", None)
-            and resume_engine
-            and engine_session_id
-            and not getattr(args, "resume_reconstruction", False)
-        ):
-            resume_lock_kind = "engine"
-            resume_lock = (
-                contextlib.nullcontext()
-                if resume_plan is not None
-                else _engine_resume_lock(resume_engine, engine_session_id)
-            )
-        with resume_lock:
-            if resume_plan is None:
-                if resume_lock_kind == "codex":
-                    _revalidate_codex_resume_claim(
-                        parent_dispatch_id=args.parent_dispatch_id,
-                        expected_home=resume_home,
-                        expected_session_id=args.codex_session_id,
-                        expected_home_owner_dispatch_id=(
-                            codex_resume_claim_home_owner_dispatch_id
-                        ),
-                        exclude_dispatch_id=args.dispatch_id,
-                    )
-                    if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
-                        _CODEX_RESUME_CLAIM_VALIDATED_HOOK(
-                            resume_home,
-                            args.codex_session_id,
-                            args.parent_dispatch_id,
-                        )
-                elif resume_lock_kind == "engine":
-                    _revalidate_resume_claim(
-                        parent_dispatch_id=args.parent_dispatch_id,
-                        expected_engine=resume_engine,
-                        expected_session_id=engine_session_id,
-                        exclude_dispatch_id=args.dispatch_id,
-                    )
-            record_worktree_wait()
-            if (
-                resume_lock_kind == "codex"
-                and _CODEX_RESUME_DURABLE_CLAIM_HOOK is not None
-            ):
-                _CODEX_RESUME_DURABLE_CLAIM_HOOK(
-                    resume_home,
-                    args.codex_session_id,
-                    args.dispatch_id,
-                )
-        ledger_recorded = True
-        if resume_plan is not None:
-            held_resume_lock = resume_plan.pop("resume_lock", None)
-            if held_resume_lock is not None:
-                held_resume_lock.__exit__(None, None, None)
         if not raw and resume_plan is None:
             codex_env = {**os.environ, **account_env}
             if codex_dispatch_home is not None:
@@ -25194,6 +30633,9 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 value = getattr(args, attr, None)
                 if value:
                     summary_head[key] = str(value)
+        skipped_seats = getattr(args, "_skipped_worktree_seats", None)
+        if skipped_seats:
+            summary_head["skipped_worktree_seats"] = list(skipped_seats)
         _record_ledger(
             args,
             project_root=project_root,
@@ -25202,11 +30644,27 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             tail=tail,
             lease_id=lease_id,
             worker_pid=None,
-            state="starting",
+            # Queue-owned attempts stay PREPARED until status admission. A
+            # deferred admission must leave the attempt reusable by its claim.
+            state="waiting_capacity",
             effective_account=effective_account,
             codex_home=codex_dispatch_home,
             request_envelope=request_envelope,
         )
+        scratch_ledger_recorded = True
+        launch_record = _find_dispatch_record(str(args.dispatch_id)) or {}
+        worker_attempt_id = str(launch_record.get("attempt_id") or "").strip()
+        if not worker_attempt_id:
+            if getattr(_record_ledger, "_goalflight_nonpersisting_seam", False):
+                # An explicitly injected non-persisting ledger has no committed
+                # attempt to project into its worker channel.
+                worker_attempt_id = uuid.uuid4().hex
+            else:
+                raise DispatchUsageError(
+                    f"committed attempt id unavailable for dispatch "
+                    f"{args.dispatch_id}"
+                )
+        account_env["GOALFLIGHT_ATTEMPT_ID"] = worker_attempt_id
         if (
             _account_engine(args.agent) == "codex"
             and codex_session_id is None
@@ -25229,6 +30687,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             summary_head["codex_home"] = codex_dispatch_home
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
         env["GOALFLIGHT_DISPATCH_SCRIPT"] = str(Path(__file__).resolve())
+        env["GOALFLIGHT_WORKER_TAIL_FILE"] = str(tail)
         # A worker's only channel used to be markers scraped out of its console
         # log, which the watcher bridges into mail. That makes every message a
         # side effect of stdout: it cannot be addressed, cannot be typed, and
@@ -25237,6 +30696,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         # envelope with goalflight_messages.py while still writing prose to its
         # log for the human reading the tail.
         env["GOALFLIGHT_DISPATCH_ID"] = str(args.dispatch_id)
+        env["GOALFLIGHT_ATTEMPT_ID"] = worker_attempt_id
         _apply_read_only_env(env, args)
         if worktree_seat is not None:
             env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
@@ -25320,45 +30780,86 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 args._lock_holder_warning = native_launch.warning
                 summary_head["lock_holder"] = native_launch.lock_holder
 
-        # The attempt peek may busy-wait for the launch retry budget. Finish it
-        # before stamping spawn intent, and keep intent immediately before
-        # spawn: a launcher killed between intent and spawn leaves a claim that
-        # recovery treats as indeterminate and cannot restore.
-        worker_argv, wait_for_worker_claim = _attempt_claiming_worker_argv(
-            project_root,
-            str(args.dispatch_id),
-            worker_argv,
-        )
         _revalidate_read_only_resume_worktree(args, resume_plan=resume_plan)
-        # A forced redispatch may supersede a waiting row while this process
-        # owns a capacity lease. Fence the final check and spawn with the
-        # ledger lock so a waiting carrier cannot start after supersession.
-        with goalflight_ledger.StateLock():
-            _redispatch_spawn_guard(args)
-            _mark_queue_claim_worker_spawn_intent(args)
-            if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
-                raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
-            # From this point a child may exist before this process receives its
-            # PID. Do not let an operator signal release the lease and finalize a
-            # failure after spawn has begun; reconciliation can adopt an
-            # indeterminate handoff, but an early release can oversubscribe the
-            # account and orphan the worker.
-            if capacity_signal_guard is not None:
-                capacity_signal_guard()
-                capacity_signal_guard = None
-            worker_spawn_attempted = True
-            worker_pid = _spawn_daemonized_process(
-                worker_argv,
-                env=env,
-                stdin_path=stdin_path,
-                stdout_path=tail,
-                stdout_mode=worker_stdout_mode,
-                stderr="stdout",
-                serialize_stdout=True,
-                label="worker",
-                cwd=str(_worker_cwd(args)),
-                inherit_occupancy_lock=True,
+        # Admit under the terminal-status lock before advancing PREPARED to
+        # STARTING. If admission is deferred, the queue attempt remains
+        # reusable. The nested ledger lock then fences redispatch and claim
+        # mutation; ledger-to-status callers acquire status with a deadline.
+        launch_admission_token = str(
+            getattr(args, "queue_launch_token", None) or uuid.uuid4().hex
+        )
+        _test_wait_for_release(
+            ready_env="GOALFLIGHT_TEST_BASH_ADMISSION_READY_FILE",
+            release_env="GOALFLIGHT_TEST_BASH_ADMISSION_RELEASE_FILE",
+            label="bash status launch admission",
+        )
+        with _status_launch_admission(
+            status_json,
+            launch_admission_token,
+            deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S,
+        ) as status_lock:
+            if status_lock is None:
+                raise TerminalStatusLaunchRefused(
+                    "terminal status prevents worker launch"
+                )
+            _record_ledger(
+                args,
+                project_root=project_root,
+                prompt_path=prompt_path,
+                status_json=status_json,
+                tail=tail,
+                lease_id=lease_id,
+                worker_pid=None,
+                state="starting",
+                effective_account=effective_account,
+                codex_home=codex_dispatch_home,
+                request_envelope=request_envelope,
             )
+            scratch_ledger_recorded = True
+            # Validate the committed STARTING attempt before recording intent.
+            worker_argv, wait_for_worker_claim = _attempt_claiming_worker_argv(
+                project_root,
+                str(args.dispatch_id),
+                worker_argv,
+            )
+            # Intent remains immediately before the spawn.
+            with goalflight_ledger.StateLock():
+                _redispatch_spawn_guard(args)
+                if lease_id and not goalflight_capacity.mark_lease_spawning(lease_id):
+                    raise RuntimeError(f"capacity lease {lease_id} lost before worker spawn")
+                # From this point a child may exist before this process receives its
+                # PID. Do not let an operator signal release the lease and finalize a
+                # failure after spawn has begun; reconciliation can adopt an
+                # indeterminate handoff, but an early release can oversubscribe the
+                # account and orphan the worker.
+                if capacity_signal_guard is not None:
+                    capacity_signal_guard()
+                    capacity_signal_guard = None
+                if _account_engine(args.agent) == "codex":
+                    _validate_codex_worker_home(
+                        str(args.dispatch_id),
+                        codex_dispatch_home,
+                        effective_account,
+                        getattr(args, "_codex_recorded_account", None),
+                        recorded_home=getattr(args, "_codex_recorded_home", None),
+                        retry_home=getattr(args, "_codex_retry_home", None),
+                    )
+                    codex_home_spawn_checked = True
+                _mark_queue_claim_worker_spawn_intent(args)
+                worker_spawn_attempted = True
+                worker_pid = _spawn_daemonized_process(
+                    worker_argv,
+                    env=env,
+                    stdin_path=stdin_path,
+                    stdout_path=tail,
+                    stdout_mode=worker_stdout_mode,
+                    stderr="stdout",
+                    serialize_stdout=True,
+                    filter_stdout=True,
+                    label="worker",
+                    cwd=str(_worker_cwd(args)),
+                    inherit_occupancy_lock=True,
+                )
         # Worker inherited the occupancy fd. Drop this process's copy so a
         # later in-process launch does not see a closed descriptor as
         # occupancy unknown. Sidecars must not keep the now-closed number.
@@ -25485,6 +30986,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                 }, sort_keys=True), file=sys.stderr, flush=True)
         with contextlib.suppress(Exception):
             print("DISPATCH-START " + json.dumps(summary_head, sort_keys=True), flush=True)
+            _LAUNCH_MARKER_EMITTED = True
         _print_status_reminder(
             args.dispatch_id,
             status_json=status_json,
@@ -25588,6 +31090,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                     ),
                     flush=True,
                 )
+                _LAUNCH_MARKER_EMITTED = True
             return 0
         watch_rc, rec, final_reason = _wait_for_detached_watcher(
             status_json=status_json,
@@ -25667,6 +31170,7 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         final_state = "failed_worktree"
         final_reason = str(e)
+        _emit_skipped_worktree_seat_failure(e)
         print(
             f"goalflight_dispatch: {e}; refusing to git worktree add",
             file=sys.stderr,
@@ -25674,7 +31178,8 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
         )
         return 2
     except goalflight_worktree_pool.WorktreeCwdRefused as e:
-        final_state = "failed"
+        final_state = "failed_worktree"
+        args._worktree_seat_refused = True
         final_reason = str(e)
         _emit_permanent_dispatch_refusal(args.dispatch_id, e)
         print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
@@ -25682,16 +31187,43 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
     except goalflight_worktree_pool.WorktreeSeatError as e:
         final_state = "failed_worktree"
         final_reason = str(e)
+        queue_retryable_refusal = _is_retryable_queued_refusal(
+            args, final_reason
+        )
+        _emit_skipped_worktree_seat_failure(e)
+        permanent_reason = _permanent_dispatch_refusal_reason(e)
+        if permanent_reason is not None:
+            final_reason = permanent_reason
+            # The permanent marker lets the drain fail this claim even if the
+            # terminal ledger write below fails; the seat then stays held by
+            # holder validation. MAX_DRAIN_PRE_WORKER_FAILURES bounds other
+            # retryable pre-worker failures.
+            _emit_permanent_dispatch_refusal(args.dispatch_id, permanent_reason)
+            print(f"goalflight_dispatch: {permanent_reason}", file=sys.stderr, flush=True)
+            return 64
         print(
             f"goalflight_dispatch: worktree allocation error: {e}",
             file=sys.stderr,
             flush=True,
         )
         return 1
+    except TerminalStatusLaunchRefused as e:
+        terminal_status_refused = True
+        final_state = "complete"
+        final_reason = str(e)
+        print(f"goalflight_dispatch: {final_reason}", file=sys.stderr, flush=True)
+        return 64
     except DispatchUsageError as e:
         final_state = "failed"
         final_reason = str(e)
-        print(f"goalflight_dispatch: {e}", file=sys.stderr, flush=True)
+        queue_retryable_refusal = _is_retryable_queued_refusal(
+            args, final_reason
+        )
+        permanent_reason = _permanent_dispatch_refusal_reason(e)
+        if permanent_reason is not None:
+            final_reason = permanent_reason
+            _emit_permanent_dispatch_refusal(args.dispatch_id, permanent_reason)
+        print(f"goalflight_dispatch: {final_reason}", file=sys.stderr, flush=True)
         return 64
     except Exception as e:
         final_state = "failed"
@@ -25703,20 +31235,27 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             capacity_signal_guard()
             capacity_signal_guard = None
         if worktree_seat is not None:
-            worktree_seat.release()
+            if worker_spawn_attempted:
+                worktree_seat.release()
+            else:
+                _release_unlaunched_worktree_seat(
+                    worktree_seat, str(args.dispatch_id)
+                )
             worktree_seat = None
         _release_read_only_worktree_hold(args)
         _release_read_only_resume_reservation(args)
-        if (
-            (
-                getattr(args, "_worktree_occupancy_refused", False)
-                or getattr(args, "_worktree_seat_refused", False)
-                or getattr(args, "_codex_post_capacity_pinned_refusal", False)
-            )
-            and not worker_spawn_attempted
-        ):
+        worktree_refused = (
+            final_state == "failed_worktree"
+            or getattr(args, "_worktree_occupancy_refused", False)
+            or getattr(args, "_worktree_seat_refused", False)
+            or getattr(args, "_codex_post_capacity_pinned_refusal", False)
+        )
+        if worktree_refused and not worker_spawn_attempted:
             _discard_preworker_ledger(args)
             ledger_recorded = False
+            scratch_ledger_recorded = False
+        if scratch_dir is not None and not scratch_ledger_recorded:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
@@ -25764,11 +31303,29 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             tail,
             agent=args.agent,
         )
-        if (
+        prelaunch_failed = (
+            not worker_spawn_attempted
+            and not detached_launched
+            and not queue_retryable_refusal
+            and not terminal_status_refused
+            and not capacity_blocked_status_written
+        )
+        if prelaunch_failed:
+            prelaunch_state = (
+                "failed_worktree" if worktree_refused else "prelaunch_failed"
+            )
+            _record_prelaunch_failure(
+                args,
+                error=final_reason or f"dispatch ended before worker launch ({final_state})",
+                state=prelaunch_state,
+                allow_existing_record=True,
+            )
+        elif (
             ledger_recorded
             and not detached_launched
             and not keep_live_watcher_open
-            and not queue_capacity_refused
+            and not queue_retryable_refusal
+            and not terminal_status_refused
         ):
             try:
                 final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
@@ -25804,9 +31361,6 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
                         file=sys.stderr,
                         flush=True,
                     )
-        if not detached_launched and not keep_live_watcher_open and final_worker_alive is not True:
-            # This is deliberately after the flushed terminal outcome above.
-            _terminal_worktree_gc(project_root, args.dispatch_id)
         # The claimant can now surrender its own lease while alive. Do not
         # surrender a worker left running for reattachment after a marker.
         if not detached_launched and final_worker_alive is False:
@@ -25832,28 +31386,39 @@ def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> i
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
             _export_dashboard_status_for_project(project_root)
         if (
-            (codex_dispatch_home is not None or resume_home_created)
+            resume_home_created
+            and getattr(args, "parent_dispatch_id", None)
+            and not worker_spawn_attempted
             and not detached_launched
             and final_worker_alive is not True
         ):
-            if (
-                resume_home_created
-                and getattr(args, "parent_dispatch_id", None)
-                and not worker_spawn_attempted
-            ):
-                owned_home = _codex_dispatch_homes_dir() / str(args.dispatch_id)
-                try:
+            owned_home = _codex_dispatch_homes_dir() / str(args.dispatch_id)
+            try:
+                sessions = owned_home / "sessions"
+                has_session_rollouts = any(
+                    sessions.rglob("rollout-*.jsonl")
+                )
+                if not has_session_rollouts:
                     if owned_home.is_symlink():
                         owned_home.unlink()
                     elif owned_home.is_dir():
                         shutil.rmtree(owned_home)
-                except OSError as exc:
-                    print(
-                        f"goalflight_dispatch: resume home cleanup warning: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-            elif codex_session_id is None:
-                cleanup_codex_dispatch_home(args.dispatch_id)
+            except OSError as exc:
+                print(
+                    f"goalflight_dispatch: resume home cleanup warning: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        elif (
+            codex_home_spawn_checked
+            and resume_home_created
+            and codex_dispatch_home is not None
+            and Path(codex_dispatch_home).expanduser().resolve(strict=False)
+            == resume_home_path.resolve(strict=False)
+            and not detached_launched
+            and final_worker_alive is not True
+            and codex_session_id is None
+        ):
+            cleanup_codex_dispatch_home(args.dispatch_id)
         if not detached_launched:
             goalflight_cursor.cleanup_dispatch_data(
                 args.dispatch_id, launcher_finished=True,
@@ -25933,6 +31498,100 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
     goalflight_acp_run._ensure_acp_sdk_python()
 
 
+def main(argv: list[str] | None = None, *, resume_plan: dict | None = None) -> int:
+    actual_argv = list(sys.argv[1:] if argv is None else argv)
+    global _LAUNCH_MARKER_EMITTED, _NOT_LAUNCHED_MARKER_EMITTED
+    global _SPAWN_INTENT, _SPAWN_INTENT_DISPATCH_ID
+    if resume_plan is None:
+        _LAUNCH_MARKER_EMITTED = False
+        _NOT_LAUNCHED_MARKER_EMITTED = False
+        _SPAWN_INTENT = False
+        _SPAWN_INTENT_DISPATCH_ID = None
+    is_launch = "--stats" not in actual_argv and not (
+        actual_argv
+        and actual_argv[0] in {
+            DAEMON_SPAWN_ARG,
+            "release-seat",
+            "withdraw",
+            "steer",
+            "reconcile-abandoned",
+            "drain",
+            "dashboard-refresh",
+            "stats",
+        }
+    )
+
+    def _emit_launch_failure_marker(result: int) -> None:
+        global _NOT_LAUNCHED_MARKER_EMITTED
+        if (
+            not is_launch
+            or result == 0
+            or _LAUNCH_MARKER_EMITTED
+            or _NOT_LAUNCHED_MARKER_EMITTED
+        ):
+            return
+        dispatch_id = _option_value_before_worker_remainder(
+            actual_argv, "--dispatch-id", last=True
+        )
+        if not dispatch_id and resume_plan is not None:
+            dispatch_id = str(resume_plan.get("dispatch_id") or "")
+        if not dispatch_id:
+            dispatch_id = _SPAWN_INTENT_DISPATCH_ID or ""
+        if _SPAWN_INTENT:
+            status_script = _skill_root() / "scripts" / "goalflight_status.py"
+            project_root = _option_value_before_worker_remainder(
+                actual_argv, "--project-root", last=True
+            )
+            status_scope = (
+                f"--project {shlex.quote(project_root)} "
+                if project_root
+                else ""
+            )
+            status_args = (
+                f"{status_scope}--dispatch {shlex.quote(dispatch_id)}"
+                if dispatch_id
+                else f"{status_scope}--json"
+            )
+            print(
+                f"LAUNCH STATE UNKNOWN: {dispatch_id or 'no id'}; check: "
+                f"python3 {shlex.quote(str(status_script))} {status_args}",
+                flush=True,
+            )
+        else:
+            reason = "launch refused or failed before allocation or spawn"
+            print(f"NOT LAUNCHED: {reason}", flush=True)
+        _NOT_LAUNCHED_MARKER_EMITTED = True
+
+    try:
+        result = _main_impl(actual_argv, resume_plan=resume_plan)
+    except SystemExit as exc:
+        result = int(exc.code or 0) if isinstance(exc.code, (int, type(None))) else 1
+        _emit_launch_failure_marker(result)
+        raise
+    except KeyboardInterrupt:
+        _emit_launch_failure_marker(130)
+        raise
+    except Exception as exc:
+        if actual_argv and actual_argv[0] == "steer":
+            dispatch_id = actual_argv[1] if len(actual_argv) > 1 else "<id>"
+            goalflight_messages.emit_not_recorded(
+                f"steer failed: {exc}",
+                f"python3 scripts/goalflight_dispatch.py steer {dispatch_id} --list",
+            )
+            return 1
+        else:
+            print(f"goalflight_dispatch: launch failed: {exc}", file=sys.stderr)
+        _emit_launch_failure_marker(1)
+        raise
+    _emit_launch_failure_marker(result)
+    return result
+
+
 if __name__ == "__main__":
-    _ensure_acp_sdk_interpreter()
+    try:
+        _ensure_acp_sdk_interpreter()
+    except Exception as exc:
+        print(f"goalflight_dispatch: startup failed before dispatch id: {exc}", file=sys.stderr)
+        print("NOT LAUNCHED: startup failed before a dispatch id was published", flush=True)
+        raise SystemExit(1)
     raise SystemExit(main())

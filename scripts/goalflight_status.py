@@ -70,6 +70,7 @@ _OUTPUT_TAIL_BLOCKING_MARKERS = BLOCKING_TERMINAL_MARKERS
 _OUTPUT_TAIL_TERMINAL_MARKERS = _OUTPUT_TAIL_SUCCESS_MARKERS | _OUTPUT_TAIL_BLOCKING_MARKERS
 _OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
 _OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
+_WORKER_JOURNAL_OUTBOX_STATUS_GRACE_S = 30.0
 _WAIT_LIVENESS_CONFIRMED_ALIVE = "confirmed_alive"
 _WAIT_LIVENESS_ALIVE_PROBABLE = "alive_probable"
 _WAIT_LIVENESS_CONFIRMED_DEAD = "confirmed_dead"
@@ -327,6 +328,10 @@ def _record_has_terminal_marker(record: dict | None) -> bool:
     return _record_terminal_marker_kind(record) in _OUTPUT_TAIL_TERMINAL_MARKERS
 
 
+def _record_has_committed_blocked_state(record: dict | None) -> bool:
+    return isinstance(record, dict) and record.get("state") == "blocked"
+
+
 def _position_validated_marker(payload: dict | None) -> dict | None:
     """Only the marker the watcher promoted after its final-line check.
 
@@ -360,6 +365,10 @@ def _record_has_attention_marker(record: dict | None) -> bool:
     done_code(). This covers bash-tail, where a marker is all there is.
     """
     marker = _position_validated_marker(record)
+    if marker is None and isinstance(record, dict):
+        candidate = record.get("attention_marker")
+        if isinstance(candidate, dict):
+            marker = candidate
     dispatch_id = str((record or {}).get("dispatch_id") or "").strip()
     if not dispatch_id:
         return False
@@ -422,7 +431,8 @@ def _tail_path_from_record(record: dict) -> Path | None:
     for key in ("stdout_path", "tail_path"):
         value = record.get(key)
         if value:
-            return Path(str(value)).expanduser()
+            path = Path(str(value)).expanduser()
+            return goalflight_terminal.resolve_tail_path(path)
     status_path = record.get("status_path")
     if not status_path:
         return None
@@ -431,7 +441,9 @@ def _tail_path_from_record(record: dict) -> Path | None:
     except (OSError, json.JSONDecodeError):
         return None
     tail_path = payload.get("tail_path") if isinstance(payload, dict) else None
-    return Path(str(tail_path)).expanduser() if tail_path else None
+    if not tail_path:
+        return None
+    return goalflight_terminal.resolve_tail_path(Path(str(tail_path)).expanduser())
 
 
 def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, float | None]:
@@ -449,6 +461,9 @@ def _tail_mtime_plausible(tail: Path, record: dict) -> tuple[bool, float | None]
 
 
 def _output_tail_reconcile_candidate(record: dict) -> bool:
+    attention_marker = record.get("attention_marker")
+    if isinstance(attention_marker, dict) and attention_marker.get("kind") == "BLOCKED":
+        return True
     cls = record.get("classification") or record.get("state") or "unknown"
     if cls == _LIVE_CLASS:
         return False
@@ -658,6 +673,17 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     tail = _tail_path_from_record(record)
     if tail is None:
         return _reconcile_draft_artifact_record(record, tail=None, tail_mtime=None)
+    if tail.suffix == ".gz":
+        out = dict(record)
+        out["tail_path"] = str(tail)
+        out["tail_compressed"] = True
+        out["output_tail_reconciliation"] = {
+            "candidate": True,
+            "promoted": False,
+            "reason": "tail_compressed",
+            "idle_threshold_s": _OUTPUT_TAIL_IDLE_RECONCILE_S,
+        }
+        return out
     plausible, mtime = _tail_mtime_plausible(tail, record)
     if not plausible:
         return _reconcile_draft_artifact_record(record, tail=tail, tail_mtime=mtime)
@@ -702,6 +728,8 @@ def _reconcile_output_tail_record(record: dict) -> dict:
         # change set fixes (done_code -> 0, normalize_state -> terminal, for a LIVE
         # worker). Keep it as a diagnostic-only observation under the reconciliation key.
         out = dict(record)
+        if marker_kind in _OUTPUT_TAIL_SUCCESS_MARKERS:
+            out.pop("attention_marker", None)
         out["tail_path"] = str(tail)
         out["tail_mtime"] = mtime
         out["output_tail_reconciliation"] = {
@@ -723,6 +751,7 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     out["reason"] = f"marker:{marker.get('kind')}:output_tail_reconciliation"
     out["terminal_marker"] = marker
     out["terminal_marker_source"] = "output_tail"
+    out.pop("attention_marker", None)
     out["tail_path"] = str(tail)
     out["tail_mtime"] = mtime
     out["output_tail_reconciliation"] = {
@@ -753,9 +782,22 @@ def _harvest_hint(record: dict) -> str:
         return ""
     kind = "a commit" if reason.endswith("committed") else "uncommitted changes"
     leg = record.get("wedge_tree_leg")
-    worktree = None
+    worktree = record.get("worktree_path")
+    if isinstance(worktree, str):
+        worktree = worktree.strip()
+        if not worktree or not Path(worktree).is_absolute():
+            worktree = None
+    else:
+        worktree = None
     if isinstance(leg, dict):
-        worktree = leg.get("scan_root") or leg.get("worker_cwd")
+        if worktree is None:
+            worktree = leg.get("scan_root") or leg.get("worker_cwd")
+            if isinstance(worktree, str):
+                worktree = worktree.strip()
+                if not worktree or not Path(worktree).is_absolute():
+                    worktree = None
+            else:
+                worktree = None
     if not worktree:
         return (
             f"UNHARVESTED WORK ({kind}) — worktree path not recorded; "
@@ -763,7 +805,8 @@ def _harvest_hint(record: dict) -> str:
         )
     return (
         f"UNHARVESTED WORK ({kind}) in {worktree}: "
-        f"git -C {worktree} status --short && git -C {worktree} log --oneline -3"
+        f"git -C {shlex.quote(worktree)} status --short && "
+        f"git -C {shlex.quote(worktree)} log --oneline -3"
     )
 
 
@@ -952,6 +995,27 @@ def _record_is_structurally_terminal(record: object) -> bool:
     )
 
 
+def _reconcile_worker_journal_outbox(record: dict) -> None:
+    dispatch_id = str(record.get("dispatch_id") or "").strip()
+    if not dispatch_id or os.environ.get("GOALFLIGHT_DISPATCH_ID"):
+        return
+    try:
+        import goalflight_messages
+        import goalflight_dispatch_paths
+
+        outbox_dir = goalflight_dispatch_paths.worker_question_outbox_dir(dispatch_id)
+        goalflight_messages.project_worker_journal_outbox(
+            dispatch_id,
+            outbox_dir=outbox_dir,
+            messages_dir=goalflight_messages.default_messages_dir(),
+            min_first_record_age_s=_WORKER_JOURNAL_OUTBOX_STATUS_GRACE_S,
+        )
+    except Exception:
+        # This bounded status poll is a fallback for outboxes the watcher did
+        # not drain; a later watcher or status pass can retry journal writes.
+        return
+
+
 def reconcile_fast_plane_record(
     record: dict,
     *,
@@ -969,12 +1033,31 @@ def reconcile_fast_plane_record(
         staged["_wait_status_snapshot"] = _status_json_payload(record)
     status_snapshot = staged.get("_wait_status_snapshot")
     expected_dispatch_id = str(staged.get("dispatch_id") or "").strip()
+    if (
+        expected_dispatch_id
+        and isinstance(status_snapshot, dict)
+        and _record_has_attention_marker(
+            {
+                "dispatch_id": expected_dispatch_id,
+                "attention_marker": status_snapshot.get("attention_marker"),
+            }
+        )
+    ):
+        staged["attention_marker"] = status_snapshot["attention_marker"]
     hinted_terminal = bool(
         expected_dispatch_id
         and isinstance(status_snapshot, dict)
-        and _validated_terminal_marker(
-            status_snapshot,
-            expected_dispatch_id=expected_dispatch_id,
+        and (
+            _validated_terminal_marker(
+                status_snapshot,
+                expected_dispatch_id=expected_dispatch_id,
+            )
+            or _record_has_attention_marker(
+                {
+                    "dispatch_id": expected_dispatch_id,
+                    "attention_marker": status_snapshot.get("attention_marker"),
+                }
+            )
         )
     )
     # Machine-wide status keeps the exhaustive recovery path. The fleet caller
@@ -1002,6 +1085,7 @@ def reconcile_fast_plane_record(
     else:
         reconciled.pop("sidecar_hold", None)
         reconciled.pop("sidecar_hold_reason", None)
+    _reconcile_worker_journal_outbox(reconciled)
     if not retain_status_snapshot:
         reconciled.pop("_wait_status_snapshot", None)
     return reconciled
@@ -1023,6 +1107,7 @@ def status_payload(*, reconcile_terminal_history: bool = True) -> dict:
     projected_records = []
     for record in dispatch.get("records", []):
         if not reconcile_terminal_history and _record_is_structurally_terminal(record):
+            _reconcile_worker_journal_outbox(record)
             projected_records.append(record)
             continue
         projected_records.append(reconcile_fast_plane_record(record))
@@ -1139,6 +1224,7 @@ def _dashboard_status_row(record: dict) -> dict:
         "updated_at": record.get("updated_at"),
         "reason": record.get("reason"),
         "error": record.get("error"),
+        "attention_marker": _status_json_payload(record).get("attention_marker"),
         "task_id": record.get("task_id"),
         "task_ids": record.get("task_ids"),
     }
@@ -1235,7 +1321,7 @@ def _last_nonempty_tail_line(path_value: object) -> str | None:
         return None
     path = Path(path_value)
     try:
-        with path.open("rb") as fh:
+        with goalflight_terminal.open_tail_reader(path) as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             start = max(0, size - 64 * 1024)
@@ -1433,17 +1519,38 @@ def terminal_marker_done_code(
     """Return the marker verdict, or None without a validated terminal marker."""
     marker = _record_marker_info(record)
     if marker is None:
+        candidate = record.get("attention_marker")
+        dispatch_id = str(record.get("dispatch_id") or "").strip()
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("kind") in _OUTPUT_TAIL_TERMINAL_MARKERS
+            and _terminal_marker_matches_dispatch(candidate, dispatch_id)
+        ):
+            marker = candidate
+    if marker is None:
         return None
     # A validated success marker is the worker's completion evidence. Current
     # process liveness still gates destructive actions, but cannot keep --wait
     # open after the worker has signed off.
     if marker.get("kind") in _OUTPUT_TAIL_SUCCESS_MARKERS:
         return 0
-    # An attention marker resolves terminal WHETHER OR NOT the worker is alive.
-    # A worker parked on USER-CONFIRM:/USER-NEED:/BLOCKED: is alive *because* it
-    # is waiting for the controller, so treating liveness as a contradiction --
-    # correct for COMPLETE: -- left --wait blocking on exactly the signals it
-    # exists to deliver. See goalflight_terminal.attention_marker_present.
+    if marker.get("kind") == "BLOCKED":
+        if _record_has_committed_blocked_state(record):
+            return 0
+        if worker_alive is None:
+            liveness = _wait_worker_liveness(record)
+            if liveness == _WAIT_LIVENESS_CONFIRMED_DEAD:
+                return 0
+            if liveness in {
+                _WAIT_LIVENESS_CONFIRMED_ALIVE,
+                _WAIT_LIVENESS_ALIVE_PROBABLE,
+            }:
+                return 1
+            return 2
+        return 1 if worker_alive else 0
+    # A worker parked on USER-CONFIRM:/USER-NEED: is alive because it is
+    # waiting for the controller, so these protocol-backed attention markers
+    # still resolve the wait while the worker is running.
     if _record_has_attention_marker(record):
         return 0
     if worker_alive is None:
@@ -1456,7 +1563,7 @@ def terminal_marker_done_code(
 
 
 def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
-    """0 = terminal/done, 1 = live, 2 = ambiguous/unknown."""
+    """0 = wait satisfied or attention needed, 1 = live, 2 = ambiguous."""
     cls = record.get("classification") or record.get("state") or "unknown"
     # A parked-for-a-human STATE outranks everything below, and is checked
     # first because it is the only wake signal that is MEASURED rather than
@@ -1474,12 +1581,18 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
         "_wait_file_snapshots_corroborated"
     ):
         return 0
+    # A final attention marker is a reason for --wait to wake even though
+    # BLOCKED remains nonterminal until the worker is proven dead or committed.
+    if (
+        isinstance(record.get("attention_marker"), dict)
+        and _record_has_attention_marker(record)
+    ) or (worker_alive is True and _record_has_attention_marker(record)):
+        return 0
     marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
     if marker_code is not None:
-        # A terminal marker is scraped from worker OUTPUT, so ordinary text can
-        # forge one. Only identity-confirmed liveness suppresses it. PID-only
-        # ownership is indeterminate and deliberately resolves on the marker:
-        # failing to identify the process is not evidence that it is this worker.
+        # Marker-specific liveness policy is applied above: success and
+        # protocol-backed question markers resolve on their marker, while
+        # BLOCKED waits for confirmed death or committed terminal state.
         return marker_code
     if _needs_liveness_recheck(record):
         if worker_alive is None:
@@ -1506,6 +1619,18 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     ):
         return 0
     return 2
+
+
+def _terminal_done_code(record: dict, *, worker_alive: bool | None = None) -> int:
+    """Classify dispatch terminality, excluding a live BLOCKED attention wake."""
+    if record.get("_wait_journal_terminal") or record.get(
+        "_wait_file_snapshots_corroborated"
+    ):
+        return 0
+    marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
+    if marker_code is not None:
+        return marker_code
+    return done_code(record, worker_alive=worker_alive)
 
 
 def find_record(payload: dict, dispatch_id: str) -> dict | None:
@@ -1719,6 +1844,24 @@ def _wait_record_from_snapshots(
     record["_wait_snapshot_complete"] = True
     record["_wait_ledger_snapshot"] = dict(raw or {})
     record["_wait_status_snapshot"] = dict(sidecar)
+    provisional_blocked_marker = _validated_terminal_marker(
+        {
+            "terminal_marker": goalflight_terminal.normalize_attention_marker(
+                sidecar.get("attention_marker")
+            )
+        },
+        expected_dispatch_id=dispatch_id,
+    )
+    if (
+        provisional_blocked_marker is not None
+        and provisional_blocked_marker.get("kind") != "BLOCKED"
+    ):
+        provisional_blocked_marker = None
+    if provisional_blocked_marker is not None:
+        record["attention_marker"] = provisional_blocked_marker
+        if _record_is_structurally_terminal(record):
+            record.pop("attention_marker", None)
+            provisional_blocked_marker = None
 
     # These are liveness/progress observations, not terminal authority. Copy
     # them from the same sidecar generation used by the rest of this record.
@@ -1746,6 +1889,11 @@ def _wait_record_from_snapshots(
     if tail_path:
         record["tail_path"] = tail_path
         record.setdefault("stdout_path", tail_path)
+    provisional_blocked_liveness = (
+        _wait_worker_liveness(record)
+        if provisional_blocked_marker is not None
+        else None
+    )
 
     if (authority or {}).get("_wait_journal_error"):
         ledger_state = str((raw or {}).get("state") or "")
@@ -1812,6 +1960,7 @@ def _wait_record_from_snapshots(
         marker = _wait_authority_marker(dispatch_id, authority)
         if marker is not None:
             record["terminal_marker"] = marker
+        record.pop("attention_marker", None)
         sidecar_marker = _validated_terminal_marker(
             sidecar,
             expected_dispatch_id=dispatch_id,
@@ -1846,11 +1995,33 @@ def _wait_record_from_snapshots(
             record["terminal_state"] = sidecar["terminal_state"]
         marker = _validated_terminal_marker(sidecar, expected_dispatch_id=dispatch_id)
         if marker is not None:
-            record["terminal_marker"] = marker
+            blocked_marker_is_terminal = (
+                marker.get("kind") != "BLOCKED"
+                or _record_has_committed_blocked_state(record)
+                or _wait_worker_liveness(record) == _WAIT_LIVENESS_CONFIRMED_DEAD
+            )
+            if blocked_marker_is_terminal:
+                record["terminal_marker"] = marker
 
     record["classification"] = goalflight_ledger.classify(record)
+    if _record_is_structurally_terminal(record) and provisional_blocked_marker is None:
+        record.pop("attention_marker", None)
+    if (
+        provisional_blocked_marker is not None
+        and not _record_is_structurally_terminal(record)
+    ):
+        if provisional_blocked_liveness == _WAIT_LIVENESS_CONFIRMED_DEAD:
+            record["state"] = "blocked"
+            record["terminal_state"] = "blocked"
+            record["terminal_marker"] = provisional_blocked_marker
+            record.pop("terminal_pending_state", None)
+        else:
+            if sidecar.get("state") == "watcher_stopped":
+                record["state"] = "watcher_stopped"
+                record["terminal_pending_state"] = "blocked"
+            record.pop("terminal_marker", None)
     if lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
-        return _decorate_trace_status(record)
+        return _decorate_trace_status(_reconcile_output_tail_record(record))
     return _decorate_trace_status(_reconcile_output_tail_record(record))
 
 
@@ -2084,7 +2255,7 @@ def _wait_worker_liveness_detail(record: dict | None) -> tuple[str, str]:
         if pid_live:
             return _WAIT_LIVENESS_INDETERMINATE, "pid_alive_without_identity"
         return _WAIT_LIVENESS_CONFIRMED_DEAD, "pid_dead"
-    return _WAIT_LIVENESS_CONFIRMED_DEAD, "no_pid"
+    return _WAIT_LIVENESS_INDETERMINATE, "no_pid"
 
 
 def _wait_worker_liveness(record: dict | None) -> str:
@@ -2103,8 +2274,8 @@ def _wait_worker_confirmed_dead(record: dict | None) -> bool:
 
     Liveness is checked the trustworthy way: identity match from the raw run
     ledger or status.json expected worker identity (survives PID reuse).
-    A live PID without identity is indeterminate; a dead PID or a row with no
-    recorded PID follows the existing crash-grace path.
+    A live PID without identity and a row with no recorded PID are
+    indeterminate; only a confirmed dead worker follows the crash-grace path.
     """
     return _wait_worker_liveness(record) == _WAIT_LIVENESS_CONFIRMED_DEAD
 
@@ -2207,6 +2378,9 @@ def _wait_tail_activity_counts(tail_path: str | None) -> dict:
     if not tail_path:
         return counts
     path = Path(tail_path)
+    if path.suffix == ".gz":
+        counts["compressed"] = True
+        return counts
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -2463,8 +2637,15 @@ def _wait_snapshot(
             code = done_code(record, worker_alive=worker_alive)
         else:
             code = done_code(record)
-        terminal = code == 0
-        state = _terminal_state(record, code=code)
+        terminal = (
+            record is not None
+            and _terminal_done_code(record, worker_alive=worker_alive) == 0
+        )
+        state = (
+            str(record.get("state") or record.get("classification") or "live")
+            if code == 0 and not terminal and record is not None
+            else _terminal_state(record, code=code)
+        )
         if progress.get("worker_alive_via_output") and not terminal:
             state = "running"
         if terminal and state == "worker_dead" and record is not None:
@@ -2492,7 +2673,19 @@ def _wait_snapshot(
         confirmed_dead = False
         if code == 2:
             confirmed_dead = _wait_worker_confirmed_dead(record)
-            worker_alive = not confirmed_dead
+            if confirmed_dead:
+                worker_alive = False
+            else:
+                liveness = _wait_worker_liveness(record)
+                worker_alive = (
+                    True
+                    if liveness
+                    in {
+                        _WAIT_LIVENESS_CONFIRMED_ALIVE,
+                        _WAIT_LIVENESS_ALIVE_PROBABLE,
+                    }
+                    else None
+                )
         if not progress:
             progress = (
                 {}
@@ -2506,6 +2699,8 @@ def _wait_snapshot(
                     worker_alive=worker_alive,
                 )
             )
+        if worker_alive is None and not terminal:
+            progress["worker_alive"] = None
         row = {
             "dispatch_id": dispatch_id,
             "done_code": code,
@@ -2765,13 +2960,29 @@ def _wait_for_dispatches_registered(
                         warned_missing.add(dispatch_id)
             if not json_output:
                 for row in rows:
-                    if row["terminal"]:
+                    if row["terminal"] or (
+                        row.get("done_code") == 0 and not row["terminal"]
+                    ):
                         heartbeat_since.pop(row["dispatch_id"], None)
                         continue
                     last = heartbeat_since.setdefault(row["dispatch_id"], start)
                     if now - last >= heartbeat:
                         print(_format_wait_heartbeat(row), flush=True)
                         heartbeat_since[row["dispatch_id"]] = now
+            attention_wakes = [
+                row
+                for row in rows
+                if row.get("done_code") == 0 and not row["terminal"]
+            ]
+            if attention_wakes:
+                if json_output:
+                    print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
+                else:
+                    print(f"wait woken for attention: {len(attention_wakes)} dispatch(es)")
+                    for row in attention_wakes:
+                        print(_wait_verdict_line(row))
+                return 0
+
             if all(row["terminal"] for row in rows):
                 if json_output:
                     print(json.dumps({"ok": True, "dispatches": rows}, sort_keys=True))
@@ -2980,13 +3191,17 @@ def _post_quota_advisories(payload: dict) -> None:
             key = str(advisory.get("advisory_key") or "")
             if not key or key in posted:
                 continue
-            _gm.post_message(
-                dispatch_id=goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID,
-                msg_type=goalflight_quota_stuck.QUOTA_STUCK_ADVISORY_TYPE,
-                payload=advisory,
-                messages_dir=messages_dir,
-                source={"adapter": "goalflight_status", "transport": "controller"},
-            )
+            try:
+                _gm.post_message(
+                    dispatch_id=goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID,
+                    msg_type=goalflight_quota_stuck.QUOTA_STUCK_ADVISORY_TYPE,
+                    payload=advisory,
+                    messages_dir=messages_dir,
+                    source={"adapter": "goalflight_status", "transport": "controller"},
+                )
+            except _gm.MessageError as exc:
+                print(f"goalflight_status: quota advisory post failed: {exc}", file=sys.stderr)
+                continue
             posted.add(key)
     except _EXPECTED_OPTIONAL_ERRORS:
         return
@@ -3133,16 +3348,19 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
     marker = None
     verification_error = None
     if tail is not None:
-        ignore_prefix_lines = _ignore_prefix_lines(record.get("prompt_path"))
-        if ignore_prefix_lines is None:
-            verification_error = "prompt unreadable; terminal marker unknown"
+        if tail.suffix == ".gz":
+            verification_error = f"tail is gzip-compressed at {tail}"
         else:
-            marker = _final_terminal_marker(
-                tail,
-                ignore_prefix_lines=ignore_prefix_lines,
-                kimi_output=moonshot_family(record.get("agent")),
-                expected_dispatch_id=dispatch_id,
-            )
+            ignore_prefix_lines = _ignore_prefix_lines(record.get("prompt_path"))
+            if ignore_prefix_lines is None:
+                verification_error = "prompt unreadable; terminal marker unknown"
+            else:
+                marker = _final_terminal_marker(
+                    tail,
+                    ignore_prefix_lines=ignore_prefix_lines,
+                    kimi_output=moonshot_family(record.get("agent")),
+                    expected_dispatch_id=dispatch_id,
+                )
     # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
     # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.
     declared: list[str] = []
@@ -3378,7 +3596,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.done is not None:
         record = find_record_or_read(payload, args.done, project_root)
-        return 2 if record is None else done_code(record)
+        return 2 if record is None else _terminal_done_code(record)
 
     if args.dispatch is not None:
         record = find_record_or_read(payload, args.dispatch, project_root)

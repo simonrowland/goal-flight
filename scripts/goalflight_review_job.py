@@ -26,6 +26,7 @@ import goalflight_ledger
 import goalflight_native_launch
 import goalflight_rate_pressure
 import goalflight_worktree_pool
+from goalflight_codex_sandbox import codex_plugins_off_args
 from goalflight_liveness import (
     active_monotonic,
     pgroup_cpu_pct,
@@ -50,6 +51,9 @@ def _commit_early_terminal(payload: dict, *, project_root: str) -> None:
         {
             "dispatch_id": str(payload["dispatch_id"]),
             "project_root": project_root,
+            **goalflight_ledger.controller_attribution_from_active_lease(
+                project_root, ambient_is_dispatcher=True
+            ),
         },
         state=state,
         reason=payload.get("reason") or payload.get("error"),
@@ -697,6 +701,7 @@ def command_for(args: argparse.Namespace) -> list[str]:
         return [
             args.codex_bin,
             "exec",
+            *codex_plugins_off_args(),
             "--json",
             "-o",
             str(final),

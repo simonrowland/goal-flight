@@ -1643,6 +1643,9 @@ def test_detached_listener_uses_detected_supervisor_ownership(
         controller_label="wake-test",
         lease_nonce=claimed.value.nonce,
     )
+    listed_supervise_command = shlex.join(
+        [*shlex.split(supervise_command), "--lease-nonce", claimed.value.nonce]
+    )
     try:
         monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
         monkeypatch.setattr(messages.os, "getppid", lambda: 1)
@@ -1651,7 +1654,7 @@ def test_detached_listener_uses_detected_supervisor_ownership(
             monkeypatch.setattr(
                 wake,
                 "_process_listing",
-                lambda: [(4242, supervise_command)],
+                lambda: [(4242, listed_supervise_command)],
             )
         else:
             monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
@@ -2003,12 +2006,15 @@ def test_tool_entry_probe_failure_is_silent_when_detector_finds_supervisor(
         controller_label="wake-test",
         lease_nonce=claimed.value.nonce,
     )
+    listed_supervise_command = shlex.join(
+        [*shlex.split(supervise_command), "--lease-nonce", claimed.value.nonce]
+    )
     try:
         shutil.rmtree(wake.ledger_dir(root))
         monkeypatch.setattr(
             wake,
             "_process_listing",
-            lambda: [(4242, supervise_command)],
+            lambda: [(4242, listed_supervise_command)],
         )
         stream = io.StringIO()
         status = wake.check_tool_entry(

@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch as dispatch  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
+import goalflight_task as task  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
@@ -36,6 +37,8 @@ def _state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, journ
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     root = tmp_path / "project"
     root.mkdir()
+    # Session-ownership cases intentionally use a temporary project root.
+    monkeypatch.setenv(task.ALLOW_VOLATILE_PROJECT_ROOT_ENV, str(root))
     return root, journal.open_or_create_journal(root)
 
 

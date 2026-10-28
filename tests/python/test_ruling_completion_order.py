@@ -284,6 +284,43 @@ def test_dispatch_recovery_preserves_blocked_ready_order(dead_terminal_entry, su
     assert state == ("complete" if resolved else "blocked")
 
 
+def test_live_blocked_watcher_repair_keeps_pending(tmp_path, monkeypatch):
+    dispatch_id = "live-blocked-repair"
+    tail = tmp_path / "worker.tail"
+    status_path = tmp_path / "worker.status.json"
+    tail.write_text(f"!BLOCKED: {dispatch_id} — need ruling\n")
+    args = SimpleNamespace(
+        dispatch_id=dispatch_id,
+        agent="codex",
+        project_root=str(tmp_path),
+    )
+    monkeypatch.setattr(dispatch.goalflight_compat, "pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        dispatch,
+        "_worker_alive_from_identity",
+        lambda _pid, _identity: (True, "identity_match"),
+    )
+    monkeypatch.setattr(dispatch, "_project_root", lambda _args: tmp_path)
+    monkeypatch.setattr(dispatch, "_export_dashboard_status_for_project", lambda _root: None)
+
+    watch_rc, repaired, _reason = dispatch._wait_for_detached_watcher(
+        status_json=status_path,
+        watcher_pid=999999999,
+        poll_secs=0.01,
+        args=args,
+        tail=tail,
+        worker_pid=12345,
+        worker_identity={"start_token": "test:12345:generation-1"},
+        pgid=None,
+        prompt_path=None,
+    )
+
+    assert repaired["state"] == "watcher_stopped", repaired
+    assert repaired["terminal_pending_state"] == "blocked", repaired
+    assert repaired["terminal_marker"] is None, repaired
+    assert watch_rc != 4, repaired
+
+
 @pytest.mark.parametrize("surface", ["repair", "claim", "authority"])
 @pytest.mark.parametrize("quoted", [False, True])
 def test_dispatch_recovers_only_unquoted_final_question(dead_terminal_entry, surface, quoted):

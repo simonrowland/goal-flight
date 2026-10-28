@@ -312,8 +312,9 @@ def case_manifest_acp_command_defaults() -> None:
 
     binary, args = agent_command("codex-acp")
     assert binary == "codex-acp"
-    # The curated marketplace falls back to an 88 MB git checkout; disabling the catalog saves no network and adds disk.
     assert "features.remote_plugin=false" not in args, args
+    configs = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-c"]
+    assert configs.count("features.plugins=false") == 1, args
 
     binary, args = agent_command("claude-acp")
     assert Path(binary).name == "claude-code-cli-acp"
@@ -478,6 +479,7 @@ def _kill_from_status(status: Path) -> None:
 def _run_fake_runner(
     scenario: str,
     *,
+    dispatch_id: str | None = None,
     progress_stall_s: float,
     heartbeat_interval: float = 0.1,
     wedge_samples: int = 2,
@@ -504,6 +506,7 @@ def _run_fake_runner(
         env = os.environ.copy()
         env.pop("GOALFLIGHT_STEER_FILE", None)
         env.pop("GOAL_FLIGHT_PERMISSION_DIR", None)
+        env.pop("GOALFLIGHT_DISPATCH_DIR", None)
         env.update(
             {
                 "GOALFLIGHT_STATE_DIR": str(state_dir),
@@ -558,6 +561,8 @@ def _run_fake_runner(
             args.extend(["--user-confirm-timeout-s", str(user_confirm_timeout_s)])
         if stall_kill:
             args.append("--stall-kill")
+        if dispatch_id is not None:
+            args.extend(["--dispatch-id", dispatch_id])
         with registered_child_environment(ROOT, env=env) as child_env:
             proc = subprocess.Popen(
                 args,
@@ -593,6 +598,20 @@ def _run_fake_runner(
                     json.loads(path.read_text())
                     for path in sorted(runs_dir.glob("*.json"))
                 ] if runs_dir.exists() else []
+                event_uuid = state_snapshot.get("event_uuid")
+                if event_uuid:
+                    import goalflight_journal
+
+                    state_snapshot["delivery_rows"] = goalflight_journal.Journal(
+                        repo
+                    ).read_all(
+                        "SELECT event_uuid, projected_at FROM delivery_events WHERE event_uuid = ?",
+                        (event_uuid,),
+                    )
+                    outbox_dir = state_dir / "dispatch" / f"{dispatch_id}.questions"
+                    state_snapshot["outbox_published"] = (
+                        outbox_dir / "journal" / "journal-00000000000000000001.published"
+                    ).is_file()
             return proc.returncode, status_payload, stdout, stderr
 
 
@@ -2978,6 +2997,42 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
         ], rows
 
 
+def case_acp_worker_journal_denial_is_projected() -> None:
+    dispatch_id = "acp-worker-outbox-projector"
+    event_uuid = "00000000-0000-4000-8000-000000000001"
+    snapshot = {"event_uuid": event_uuid}
+    code, status, stdout, stderr = _run_fake_runner(
+        "worker_outbox_post",
+        dispatch_id=dispatch_id,
+        progress_stall_s=5.0,
+        state_snapshot=snapshot,
+    )
+    assert code == 0, (status, stdout, stderr)
+    rows = snapshot.get("delivery_rows", [])
+    assert len(rows) == 1 and rows[0]["projected_at"] is not None, (status, snapshot, stderr)
+    assert snapshot.get("outbox_published") is True, snapshot
+
+
+def case_acp_worker_outbox_is_projected_during_silent_turn() -> None:
+    dispatch_id = "acp-worker-outbox-heartbeat"
+    event_uuid = "00000000-0000-4000-8000-000000000002"
+    with tempfile.TemporaryDirectory() as td:
+        witness = Path(td) / "projected-during-silence.txt"
+        snapshot = {"event_uuid": event_uuid}
+        code, status, stdout, stderr = _run_fake_runner(
+            "worker_outbox_silent",
+            dispatch_id=dispatch_id,
+            heartbeat_interval=0.05,
+            progress_stall_s=5.0,
+            extra_env={"GOALFLIGHT_FAKE_ACP_SILENT_OUTBOX_WITNESS": str(witness)},
+            state_snapshot=snapshot,
+        )
+        assert code == 0, (status, stdout, stderr)
+        assert witness.read_text(encoding="utf-8") == "projected", (status, snapshot, stderr)
+        rows = snapshot.get("delivery_rows", [])
+        assert len(rows) == 1 and rows[0]["projected_at"] is not None, (status, snapshot, stderr)
+
+
 def _run_case(case) -> None:
     try:
         case()
@@ -3055,6 +3110,8 @@ def main() -> None:
         case_env_override_warning_shell_tokens_round_trip,
         case_test_mode_hooks_require_gate,
         case_acp_missing_prompt_commits_terminal_outbox,
+        case_acp_worker_journal_denial_is_projected,
+        case_acp_worker_outbox_is_projected_during_silent_turn,
     )
     for case in cases:
         _run_case(case)

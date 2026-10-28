@@ -8,6 +8,7 @@ skip_posix_on_native_windows("liveness tests use POSIX start_new_session process
 
 import asyncio
 import datetime as dt
+import errno
 import json
 import os
 import subprocess
@@ -111,6 +112,52 @@ def test_write_status_emits_epoch_for_real_status_schemas() -> None:
             )
             payload = _read_status(status)
             assert isinstance(payload.get("epoch"), str) and payload["epoch"], payload
+
+
+def test_terminal_complete_status_and_result_are_first_writer_wins() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        status = Path(td) / "status.json"
+        goalflight_liveness.write_status(
+            status,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": "terminal-first-writer",
+                "state": "complete",
+                "terminal_state": "complete",
+                "result_text": "completed result",
+            },
+        )
+        goalflight_liveness.write_status(
+            status,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": "terminal-first-writer",
+                "state": "complete",
+                "terminal_state": "complete",
+                "result_text": "late duplicate result",
+            },
+        )
+        assert _read_status(status)["result_text"] == "completed result"
+        note = {"type": "superseded_duplicate_attempt", "attempt_id": "late-attempt"}
+        assert goalflight_liveness.append_terminal_complete_note(
+            status, "superseded_duplicate_attempt", note
+        )
+        payload = _read_status(status)
+        assert payload["state"] == "complete", payload
+        assert payload["result_text"] == "completed result", payload
+        assert payload["superseded_duplicate_attempt"] == [note], payload
+
+
+def test_status_lock_treats_windows_contention_as_deadline(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        lock = goalflight_liveness.StatusWriteLock(Path(td) / "status.json")
+
+        def windows_contention(*_args) -> None:
+            raise BlockingIOError(errno.EDEADLK, "lock is held")
+
+        monkeypatch.setattr(goalflight_liveness.goalflight_compat, "flock", windows_contention)
+        assert not lock.acquire_until(time.monotonic() + 0.01, poll_s=0.001)
+        assert lock._lock_file is None
 
 
 def test_write_status_epoch_stable_until_status_recreation() -> None:

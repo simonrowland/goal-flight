@@ -15,8 +15,10 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("watch prompt echo uses bash-tail and start_new_session")
 
-import json
+import contextlib
 import gzip
+import io
+import json
 import os
 import re
 import subprocess
@@ -24,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +38,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_watch  # noqa: E402
 import goalflight_dispatch  # noqa: E402
+import goalflight_dispatch_paths  # noqa: E402
+import goalflight_steer_mailbox  # noqa: E402
 import goalflight_terminal  # noqa: E402
 
 
@@ -48,7 +53,7 @@ CODEX_BANNER_14 = (
     "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
     "reasoning effort: xhigh\n"
     "reasoning summaries: none\n"
-    "session id: 019eb974-0dee-79d2-b315-8d2910167bf4\n"
+    "session id: 00000000-0000-4000-8000-000000000008\n"
     "--------\n"
     "user\n"
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK\n"
@@ -767,6 +772,197 @@ def test_alive_growing_terminal_candidate_is_discarded_then_final_completes() ->
         assert goalflight_watch._marker_state(final.terminal) == "complete"
 
 
+def test_quiet_result_does_not_kill_a_worker_that_is_still_active() -> None:
+    dispatch_id = "quiet-result-active"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        status = tmp / "status.json"
+        prompt = tmp / "prompt.md"
+        hold = tmp / "worker.hold"
+        prompt.write_text("finish the task\n", encoding="utf-8")
+        hold.write_text("hold\n", encoding="utf-8")
+        worker_code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            f"print('RESULT: {dispatch_id} — work is still running', flush=True)\n"
+            "value = 0\n"
+            "hold = Path(sys.argv[1])\n"
+            "while hold.exists():\n"
+            "    for _ in range(5000):\n"
+            "        value = (value + 1) % 1000003\n"
+            f"print('COMPLETE: {dispatch_id} — finished', flush=True)\n"
+        )
+        sink = tail.open("wb")
+        try:
+            worker = subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(hold)],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            sink.close()
+
+        watcher_args = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.05",
+            max_idle_secs="0.1",
+        )
+        wrapper = (
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(WATCH.parent)!r})\n"
+            "import goalflight_watch as watch\n"
+            "sys.argv = [str(pathlib.Path(watch.__file__)), *sys.argv[1:]]\n"
+            "raise SystemExit(watch.main())\n"
+        )
+        watcher = subprocess.Popen(
+            [sys.executable, "-c", wrapper, *watcher_args[2:]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_watcher_env(status),
+        )
+        try:
+            _wait_for_status_matching(
+                status,
+                lambda payload: (payload.get("terminal_marker") or {}).get("kind")
+                == "RESULT",
+            )
+            time.sleep(0.25)
+            assert worker.poll() is None, "RESULT must not terminate active work"
+            hold.unlink()
+            worker.wait(timeout=10)
+            watcher.wait(timeout=10)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+            if watcher.poll() is None:
+                watcher.kill()
+                watcher.wait(timeout=5)
+
+        transcript = tail.read_text(encoding="utf-8")
+        assert f"COMPLETE: {dispatch_id} — finished" in transcript, transcript
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert watcher.returncode == 0, payload
+        assert payload.get("state") == "complete", payload
+
+
+def test_result_candidate_survives_ordinary_tail_growth_until_discard() -> None:
+    dispatch_id = "result-ordinary-growth"
+    secret = "xai-testfake000000000000000000000000"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        status = tmp / "status.json"
+        release = tmp / "release-worker"
+        worker_code = (
+            "import json, pathlib, sys, time\n"
+            f"print('RESULT: {dispatch_id} — {secret}', flush=True)\n"
+            "status = pathlib.Path(sys.argv[1])\n"
+            "release = pathlib.Path(sys.argv[2])\n"
+            "deadline = time.monotonic() + 10\n"
+            "while time.monotonic() < deadline:\n"
+            "    try:\n"
+            "        payload = json.loads(status.read_text())\n"
+            "        if (payload.get('terminal_marker') or {}).get('kind') == 'RESULT':\n"
+            "            break\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    time.sleep(0.02)\n"
+            "print('ordinary work output after the result', flush=True)\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.02)\n"
+            f"print('COMPLETE: {dispatch_id} — finished', flush=True)\n"
+        )
+        env = _watcher_env(status)
+        capacity_conf = tmp / "capacity.local.json"
+        capacity_conf.write_text(
+            json.dumps({"output_redaction_filter": True}),
+            encoding="utf-8",
+        )
+        env["GOALFLIGHT_CAPACITY_CONF"] = str(capacity_conf)
+        with tail.open("wb") as tail_out:
+            worker = subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(status), str(release)],
+                stdout=tail_out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+            )
+        watcher_args = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.05",
+            max_idle_secs="30",
+        )
+        wrapper = (
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(WATCH.parent)!r})\n"
+            "import goalflight_watch as watch\n"
+            "watch.POST_TERMINAL_EXIT_GRACE_SECS = 0.2\n"
+            "sys.argv = [str(pathlib.Path(watch.__file__)), *sys.argv[1:]]\n"
+            "raise SystemExit(watch.main())\n"
+        )
+        watcher = subprocess.Popen(
+            [sys.executable, "-c", wrapper, *watcher_args[2:]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            candidate = _wait_for_status_matching(
+                status,
+                lambda payload: (payload.get("terminal_marker") or {}).get("kind")
+                == "RESULT",
+                timeout_s=5,
+            )
+            assert candidate.get("state") == "running_after_terminal", candidate
+            discarded = _wait_for_status_matching(
+                status,
+                lambda payload: (
+                    isinstance(payload.get("last_discarded_terminal_evidence"), dict)
+                    and payload["last_discarded_terminal_evidence"].get("kind") == "RESULT"
+                    and not payload.get("terminal_marker")
+                ),
+                timeout_s=5,
+            )
+            evidence = discarded.get("last_discarded_terminal_evidence") or {}
+            assert evidence.get("kind") == "RESULT", evidence
+            assert not discarded.get("terminal_marker"), discarded
+            assert worker.poll() is None, "worker is still doing work after RESULT"
+            release.touch()
+            worker.wait(timeout=10)
+            watcher_stdout, watcher_stderr = watcher.communicate(timeout=10)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert watcher.returncode == 0, (payload, watcher_stderr)
+        assert payload.get("state") == "complete", payload
+        discard_lines = [
+            line
+            for line in watcher_stdout.splitlines()
+            if line.startswith("WATCHER-DISCARD ")
+        ]
+        assert len(discard_lines) == 1, watcher_stdout
+        assert secret not in discard_lines[0], discard_lines[0]
+        assert "[redacted]" in discard_lines[0], discard_lines[0]
+
+
 def test_scenario_helper_matches_production_stay_after_terminal() -> None:
     cmd = _watcher_command(
         tail=Path("/tmp/isolated-watch/scenario.tail"),
@@ -1392,15 +1588,45 @@ def _nested_worker_dead_reason(payload: dict) -> object:
     return reason.get("reason") if isinstance(reason, dict) else reason
 
 
+def _clean_worker_seat(tmp: Path) -> Path:
+    """Create an inspectable empty seat whose baseline predates every test run."""
+    worker_cwd = tmp / "worker-cwd"
+    worker_cwd.mkdir()
+    subprocess.run(["git", "init", "-q", str(worker_cwd)], check=True)
+    (worker_cwd / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(worker_cwd), "add", "-A"],
+        check=True,
+        capture_output=True,
+    )
+    commit_env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+    }
+    subprocess.run(
+        [
+            "git", "-C", str(worker_cwd), "-c", "user.email=t@t", "-c",
+            "user.name=t", "commit", "-q", "-m", "baseline",
+        ],
+        check=True,
+        capture_output=True,
+        env=commit_env,
+    )
+    return worker_cwd
+
+
 def _run_dead_worker_tail(
     tail_text: str,
     prompt_text: str = "Do the requested work.\n",
     max_idle_secs: str = "0.2",
     prompt_mode: str = "file",
     dispatch_id: str | None = None,
+    clean_worker_seat: bool = False,
 ):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
+        worker_cwd = _clean_worker_seat(tmp) if clean_worker_seat else None
         prompt = tmp / "prompt.md"
         if prompt_mode == "file":
             prompt.write_text(prompt_text, encoding="utf-8")
@@ -1410,7 +1636,9 @@ def _run_dead_worker_tail(
             raise ValueError(f"unknown prompt mode: {prompt_mode}")
         tail = tmp / "tail.txt"
         tail.write_text(tail_text, encoding="utf-8")
-        worker = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
+        worker = subprocess.Popen(
+            [sys.executable, "-c", ""], cwd=worker_cwd, start_new_session=True
+        )
         worker.wait()
         return _run_watcher(
             tail,
@@ -1421,6 +1649,8 @@ def _run_dead_worker_tail(
             poll_secs="0.05",
             max_idle_secs=max_idle_secs,
             dispatch_id=dispatch_id,
+            project_root=ROOT if worker_cwd is not None else None,
+            worker_cwd=worker_cwd,
         )
 
 
@@ -1533,7 +1763,8 @@ def test_recovered_network_incident_does_not_classify_later_death() -> None:
         OBSERVED_NETWORK_DEATH_TAIL
         + "connectivity restored\n"
         + "work continued successfully\n"
-        + "fatal: brief validation failed\n"
+        + "fatal: brief validation failed\n",
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1543,7 +1774,8 @@ def test_recovered_network_incident_does_not_classify_later_death() -> None:
 
 def test_recoverable_tool_error_tail_surfaces_no_evidence() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
-        OBSERVED_RECOVERABLE_TOOL_ERROR_TAIL
+        OBSERVED_RECOVERABLE_TOOL_ERROR_TAIL,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1553,7 +1785,8 @@ def test_recoverable_tool_error_tail_surfaces_no_evidence() -> None:
 
 def test_dead_pid_narration_only_tail_surfaces_no_evidence() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
-        OBSERVED_NARRATION_ONLY_DEATH_TAIL
+        OBSERVED_NARRATION_ONLY_DEATH_TAIL,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1567,6 +1800,7 @@ def test_death_cause_ignores_evidence_echoed_from_prompt() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         prompt + "worker died before sign-off\n",
         prompt_text=prompt,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1583,6 +1817,7 @@ def test_death_cause_ignores_decorated_prompt_evidence() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(
             rendered_prompt + "worker died before sign-off\n",
             prompt_text=prompt,
+            clean_worker_seat=True,
         )
         assert rc == 1, (prefix, payload)
         assert payload.get("state") == "worker_dead", (prefix, payload)
@@ -1598,6 +1833,7 @@ def test_death_cause_ignores_isolated_prompt_evidence_line() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         OBSERVED_NETWORK_DEATH_TAIL.splitlines()[0] + "\nworker died before sign-off\n",
         prompt_text=prompt,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1613,6 +1849,7 @@ def test_death_cause_ignores_isolated_provider_prompt_line() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         provider_line,
         prompt_text=prompt,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "transient_throttle", payload
@@ -1631,6 +1868,7 @@ def test_network_sequence_after_tainted_brief_fails_closed() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         prompt + "fatal: bad brief terminated the worker\n" + OBSERVED_NETWORK_DEATH_TAIL,
         prompt_text=prompt,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1659,6 +1897,7 @@ def test_partial_prompt_mentions_taint_every_positive_family() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(
             tail,
             prompt_text=prompt + "\n",
+            clean_worker_seat=True,
         )
         assert rc == 1, (label, payload)
         assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
@@ -1690,6 +1929,7 @@ def test_split_whitespace_prompt_mentions_taint_every_positive_family() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(
             tail,
             prompt_text=prompt + "\n",
+            clean_worker_seat=True,
         )
         assert rc == 1, (label, payload)
         assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
@@ -1707,6 +1947,7 @@ def test_full_prompt_echo_plus_isolated_provider_line_fails_closed() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         prompt + "worker started investigation\n" + provider_line,
         prompt_text=prompt,
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, payload
@@ -1727,7 +1968,9 @@ def test_recovered_provider_incident_surfaces_no_evidence() -> None:
         ),
     )
     for label, tail in cases:
-        rc, _elapsed, term, payload = _run_dead_worker_tail(tail)
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail, clean_worker_seat=True
+        )
         assert rc == 1, (label, payload)
         expected_state = "transient_throttle" if label == "provider" else "worker_dead"
         assert payload.get("state") == expected_state, (label, payload)
@@ -1781,6 +2024,7 @@ def test_unavailable_prompt_sidecar_fails_death_cause_closed() -> None:
             provider_tail,
             prompt_text=prompt_text,
             prompt_mode=prompt_mode,
+            clean_worker_seat=True,
         )
         label = (prompt_mode, repr(prompt_text))
         assert rc == 1, (label, payload)
@@ -1820,6 +2064,8 @@ def test_second_prompt_replacement_invalidates_death_cause_before_reload() -> No
             tail,
             first_lines,
             prompt_provenance_available=provenance_available,
+            worker_cwd=_clean_worker_seat(tmp),
+            started_epoch=time.time(),
         )
         assert reason == NO_EVIDENCE_WORKER_DEAD_REASON, reason
 
@@ -1873,6 +2119,8 @@ def test_prompt_change_during_final_tail_snapshot_fails_closed() -> None:
                 prompt_provenance_available=True,
                 prompt_path=prompt,
                 prompt_signature=expected_signature,
+                worker_cwd=_clean_worker_seat(tmp),
+                started_epoch=time.time(),
             )
         finally:
             goalflight_watch._read_prompt_exclusion_snapshot = original_reader
@@ -1937,7 +2185,8 @@ def test_ordinary_provider_like_prose_surfaces_no_evidence() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         "Updated UI test for copy: try again at 6:13 AM\n"
         + ("ordinary progress\n" * 150)
-        + "fatal: brief validation failed\n"
+        + "fatal: brief validation failed\n",
+        clean_worker_seat=True,
     )
     assert rc == 1, payload
     assert payload.get("state") == "worker_dead", payload
@@ -1975,7 +2224,7 @@ _CURSOR_TAIL_HEAD = (
 _CURSOR_TAIL_BODY = (
     "\n"
     "**What shipped**\n"
-    "- `application/ifc_member_axis.py` (new): the t-1942 axis recovery, once — "
+    "- `application/ifc_member_axis.py` (new): the t-0002 axis recovery, once — "
     "horizontal extrusion unchanged; anything else → `RcBondBeamAxisRefusal`.\n"
     "\n"
     "**Scope deviation flagged**: the brief said \"validator calls the helper for "
@@ -1999,7 +2248,7 @@ def test_cursor_tail_completes_only_with_the_dispatch_id() -> None:
     still record worker_dead.
     """
     summary = (
-        "b-5856 landed on `seat/cursor-53688-1790108089`, report committed at "
+        "b-0001 landed on `seat/cursor-53688-1790108089`, report committed at "
         "`5bbbc5e7d5` (`docs-private/build/b5856/REPORT.md`)."
     )
     bound = (
@@ -2110,6 +2359,114 @@ def _recovered_dead_marker(tail_text: str, dispatch_id: str, prompt_text: str = 
             tail, ignore_prefix_lines=prompt_text.splitlines(),
             expected_dispatch_id=dispatch_id, recover_final_response=True,
         )
+
+
+def test_recovered_marker_uses_verified_footer_not_unfenced_count_example() -> None:
+    dispatch_id = "codex-footer-example-recovery"
+    marker = f"!COMPLETE: {dispatch_id} — recovered"
+    for newline in ("\n", "\r\n"):
+        message = (
+            f"{marker}\nThe example below is part of the response.\n"
+            "tokens used\n123\nThe response continues here.\n"
+        )
+        tail = ("assistant\n" + message + "tool\nfinished\ntokens used\n42\n" + message).replace(
+            "\n", newline
+        )
+        boundary = goalflight_watch._rendered_response_boundary(
+            ((idx, line, False) for idx, line in enumerate(tail.splitlines(), 1)), []
+        )
+        assert boundary == (10, 15), boundary
+        recovered = _recovered_dead_marker(tail, dispatch_id)
+        assert recovered and recovered.get("kind") == "COMPLETE", recovered
+        assert recovered.get("text") == f"{dispatch_id} — recovered", recovered
+
+
+def test_unverified_footer_candidates_scan_the_bounded_final_region() -> None:
+    dispatch_id = "codex-unverified-footer-recovery"
+    marker = f"!COMPLETE: {dispatch_id} — recovered"
+    for newline in ("\n", "\r\n"):
+        tail = (
+            "tokens used\n42\nEarlier unmatched text.\n"
+            f"{marker}\n"
+            "tokens used\n123\nNo repeated response follows.\n"
+        ).replace("\n", newline)
+        records = ((idx, line, False) for idx, line in enumerate(tail.splitlines(), 1))
+        assert goalflight_watch._rendered_response_boundary(records, []) is None
+        recovered = _recovered_dead_marker(tail, dispatch_id)
+        assert recovered and recovered.get("kind") == "COMPLETE", recovered
+
+
+def test_unverified_footer_recovery_keeps_quote_context_and_blocked_signal() -> None:
+    dispatch_id = "codex-unverified-footer-context"
+    for newline in ("\n", "\r\n"):
+        quoted = (
+            f"tokens used\n100\n!READY: {dispatch_id} — earlier report\n"
+            "tool\ntokens used\n200\n```text\n"
+            f"!COMPLETE: {dispatch_id} — quoted example\nmore quoted text\n")
+        records = ((idx, line, False) for idx, line in enumerate(quoted.replace("\n", newline).splitlines(), 1))
+        starts: list[int] = []
+        assert goalflight_watch._rendered_response_boundary(
+            records, [], candidate_starts=starts
+        ) is None
+        recovered = _recovered_dead_marker(quoted.replace("\n", newline), dispatch_id)
+        assert recovered and recovered.get("kind") == "READY", recovered
+
+        blocked = (
+            f"tokens used\n100\nEarlier response.\ntool\n```bash\n"
+            f"tokens used\n200\n!BLOCKED: {dispatch_id} — need ruling\nsummary\n"
+        ).replace("\n", newline)
+        recovered = _recovered_dead_marker(blocked, dispatch_id)
+        assert recovered and recovered.get("kind") == "BLOCKED", recovered
+
+
+def test_no_footer_does_not_make_nonterminal_blocked_a_final_signal() -> None:
+    dispatch_id = "codex-no-footer-nonterminal-blocked"
+    for newline in ("\n", "\r\n"):
+        tail_text = (
+            f"!BLOCKED: {dispatch_id} — need ruling{newline}summary follows{newline}"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tail = Path(tmp) / "tail.txt"
+            tail.write_text(tail_text, encoding="utf-8", newline="")
+            recovered = goalflight_watch._final_terminal_marker(
+                tail,
+                expected_dispatch_id=dispatch_id,
+                recover_final_response=True,
+            )
+        assert recovered is None, recovered
+
+
+def test_recovered_marker_real_footer_boundary_is_unchanged() -> None:
+    dispatch_id = "codex-real-footer-recovery"
+    marker = f"!COMPLETE: {dispatch_id} — recovered"
+    recovered = _recovered_dead_marker(
+        f"tool output\ntokens used\n42\nFinal response.\n{marker}\nsummary\n",
+        dispatch_id,
+    )
+    assert recovered and recovered.get("kind") == "COMPLETE", recovered
+
+
+def test_large_tail_keeps_full_file_quote_context_without_verified_footer(tmp_path) -> None:
+    dispatch_id = "codex-large-unverified-quote"
+    marker = f"!COMPLETE: {dispatch_id} — quoted example"
+    tail = tmp_path / "large-unverified-quote.tail"
+    for newline in ("\n", "\r\n"):
+        tail_text = (
+            f"```text{newline}"
+            + ("x" * 1000 + newline) * 11_800
+            + f"{marker}{newline}```{newline}"
+        )
+        with tail.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(tail_text)
+        assert 11 * 1024 * 1024 < tail.stat().st_size < 12 * 1024 * 1024
+        for recover_final_response in (False, True):
+            recovered = goalflight_watch._final_terminal_marker(
+                tail,
+                expected_dispatch_id=dispatch_id,
+                full_file_fallback=True,
+                recover_final_response=recover_final_response,
+            )
+            assert recovered is None, recovered
 
 
 def test_dead_sigiled_attention_survives_unbalanced_tool_fence() -> None:
@@ -2417,6 +2774,810 @@ def test_genuine_last_line_blocked_still_terminalizes_and_headlines() -> None:
     assert surfaces["harvested"]["kind"] == "BLOCKED", surfaces["harvested"]
     assert surfaces["harvested"]["text"] == excerpt, surfaces["harvested"]
     assert surfaces["outbox"] == excerpt, surfaces["outbox"]
+
+
+def test_live_blocked_publishes_one_attention_event() -> None:
+    """A live BLOCKED marker wakes the controller even with unknown identity."""
+    import goalflight_status as status_cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dispatch_id = "watch-live-blocked-attention"
+        status = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n",
+            encoding="utf-8",
+        )
+        project = tmp / "project"
+        project.mkdir()
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        runs = status.parent / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "test-controller",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-10-22T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        command = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.1",
+            max_idle_secs="30",
+        )
+        command += ["--project-root", str(project)]
+        command += [
+            "--worker-identity-json",
+            json.dumps({"pid": worker.pid}),
+        ]
+        watcher = subprocess.Popen(
+            command,
+            env=_watcher_env(status),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        inbox = status.parent / "messages" / f"{dispatch_id}.jsonl"
+        try:
+            deadline = time.monotonic() + 2.0
+            envelopes: list[dict] = []
+            while time.monotonic() < deadline:
+                if inbox.exists():
+                    envelopes = [
+                        json.loads(line)
+                        for line in inbox.read_text(encoding="utf-8").splitlines()
+                    ]
+                    if envelopes:
+                        break
+                time.sleep(0.02)
+            payload = _wait_for_status(status)
+            attention = payload.get("attention_marker")
+            assert isinstance(attention, dict), payload
+            assert attention.get("kind") == "BLOCKED", attention
+            assert attention.get("sequence") == 1, attention
+            assert attention.get("timestamp"), attention
+            assert payload.get("state") == "running", payload
+            assert payload.get("terminal_marker") is None, payload
+            if len(envelopes) != 1:
+                details = {
+                    key: payload.get(key)
+                    for key in (
+                        "state",
+                        "reason",
+                        "terminal_marker",
+                        "worker_alive",
+                        "worker_identity_reason",
+                        "dispatch_id",
+                    )
+                }
+                assert len(envelopes) == 1, (envelopes, details, watcher.poll())
+            event = envelopes[0]
+            assert event["type"] == "controller-notice", event
+            assert event["priority"] == "urgent", event
+            assert event["addressee"]["label"] == "test-controller", event
+            assert event["payload"]["text"] == (
+                "worker reported BLOCKED and is still running"
+            ), event
+            assert event["payload"]["marker_seq"] == 1, event
+            assert event["id"] == str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"goalflight:live-blocked:{dispatch_id}:1",
+                )
+            ), event
+            time.sleep(0.3)
+            repeated = [
+                json.loads(line)
+                for line in inbox.read_text(encoding="utf-8").splitlines()
+            ]
+            assert len(repeated) == 1, repeated
+            assert payload.get("worker_alive") is True, payload
+            assert payload.get("worker_identity_reason") == "identity_indeterminate", payload
+            assert payload.get("terminal_marker") is None, payload
+            runtime_env = _watcher_env(status)
+            isolated_env_keys = (
+                "GOALFLIGHT_TEST_MODE",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT",
+                "GOALFLIGHT_STATE_DIR",
+                "GOALFLIGHT_TASK_STORE_DIR",
+                "GOALFLIGHT_JOURNAL_DIR",
+                "GOALFLIGHT_MESSAGES_DIR",
+                "GOALFLIGHT_WAKE_LEDGER_DIR",
+                "GOAL_FLIGHT_PIDFILE_DIR",
+            )
+            original_env = {key: os.environ.get(key) for key in isolated_env_keys}
+            try:
+                os.environ.update(
+                    {key: runtime_env[key] for key in isolated_env_keys}
+                )
+                cycle = status_cli._wait_cycle_payload(
+                    [dispatch_id], project_root=str(project), journal_cache={}
+                )
+                row = status_cli._wait_snapshot(cycle, [dispatch_id])[0]
+                assert row["done_code"] == 0, row
+                assert row["terminal"] is False, row
+                wait_output = io.StringIO()
+                with contextlib.redirect_stdout(wait_output):
+                    wait_rc = status_cli.main(
+                        [
+                            "--project",
+                            str(project),
+                            "--wait",
+                            dispatch_id,
+                            "--wait-timeout",
+                            "0.02",
+                            "--poll-s",
+                            "0.01",
+                        ]
+                    )
+                assert wait_rc == 0, wait_output.getvalue()
+                assert "wait woken for attention" in wait_output.getvalue(), wait_output.getvalue()
+                done_rc = status_cli.main(
+                    ["--project", str(project), "--done", dispatch_id]
+                )
+                assert done_rc != 0, (done_rc, payload)
+                import goalflight_journal
+
+                authority = goalflight_journal.Journal.open_reader(project)
+                dispatch_record = json.loads(
+                    (runs / f"{dispatch_id}.json").read_text(encoding="utf-8")
+                )
+                assert dispatch_record.get("terminal_state") == "unknown", dispatch_record
+                outbox = authority.read_all(
+                    "SELECT event_type FROM terminal_outbox WHERE recipient = ?",
+                    (dispatch_id,),
+                )
+                assert not outbox, outbox
+            finally:
+                for key, value in original_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            watcher.terminate()
+            watcher.communicate(timeout=5)
+            stopped = _wait_for_status(status)
+            assert stopped.get("state") == "watcher_stopped", stopped
+            assert stopped.get("terminal_pending_state") == "blocked", stopped
+
+            original_project_root = status_cli.this_project_root
+            original_env = {key: os.environ.get(key) for key in isolated_env_keys}
+            try:
+                status_cli.this_project_root = lambda: str(project)
+                os.environ.update(
+                    {key: runtime_env[key] for key in isolated_env_keys}
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    wait_rc = status_cli.main(
+                        [
+                            "--project",
+                            str(project),
+                            "--wait",
+                            dispatch_id,
+                            "--wait-timeout",
+                            "0.02",
+                            "--poll-s",
+                            "0.01",
+                        ]
+                    )
+                assert wait_rc == 0, output.getvalue()
+                assert "wait woken for attention" in output.getvalue(), output.getvalue()
+                awake = _wait_for_status(status)
+                assert awake.get("state") == "watcher_stopped", awake
+                assert awake.get("terminal_pending_state") == "blocked", awake
+                assert awake.get("terminal_marker") is None, awake
+                assert stopped.get("terminal_marker") is None, stopped
+                done_rc = status_cli.main(
+                    ["--project", str(project), "--done", dispatch_id]
+                )
+                assert done_rc == 2, (done_rc, stopped)
+            finally:
+                status_cli.this_project_root = original_project_root
+                for key, value in original_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+def test_pending_question_retry_keeps_live_blocked_in_attention_marker_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dispatch_id = "watch-question-retry-blocked-attention-only"
+        status = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n",
+            encoding="utf-8",
+        )
+        project = tmp / "project"
+        project.mkdir()
+        worker_cwd = tmp / "worker-cwd"
+        worker_cwd.mkdir()
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+            cwd=worker_cwd,
+        )
+        env = _watcher_env(status)
+        runs = Path(env["GOALFLIGHT_STATE_DIR"]) / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-10-22T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        dispatch_dir = Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch"
+        env["GOALFLIGHT_DISPATCH_DIR"] = str(dispatch_dir)
+        outbox = goalflight_dispatch_paths.worker_question_outbox_dir(
+            dispatch_id,
+            dispatch_dir=dispatch_dir,
+        )
+        outbox.mkdir(parents=True, exist_ok=True)
+        request = goalflight_steer_mailbox.write_worker_question_request(
+            outbox,
+            dispatch_id=dispatch_id,
+            attempt_id="attempt-retry",
+            wait_id="wait-retry",
+            question_kind="USER-NEED",
+            question="Which target should I use?",
+            timeout_s=30,
+        )
+        command = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.05",
+            max_idle_secs="30",
+            worker_cwd=worker_cwd,
+        )
+        command += ["--project-root", str(project)]
+        command += ["--worker-identity-json", json.dumps({"pid": worker.pid})]
+        wrapper = (
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(WATCH.parent)!r})\n"
+            "import goalflight_steer_mailbox as mailbox\n"
+            "def fail_wait_arm(*args, **kwargs):\n"
+            "    raise OSError('simulated transient mailbox failure')\n"
+            "mailbox.append_worker_wait_started = fail_wait_arm\n"
+            "import goalflight_watch as watch\n"
+            "sys.argv = [str(pathlib.Path(watch.__file__)), *sys.argv[1:]]\n"
+            "raise SystemExit(watch.main())\n"
+        )
+        watcher = subprocess.Popen(
+            [sys.executable, "-c", wrapper, *command[2:]],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            payload = _wait_for_status_matching(
+                status,
+                lambda value: value.get("worker_question_publication_pending") is True,
+                timeout_s=5,
+            )
+            assert payload.get("state") == "running_after_terminal", payload
+            assert payload.get("terminal_pending_state") == "blocked", payload
+            assert payload.get("terminal_marker") is None, payload
+            assert payload.get("attention_marker", {}).get("kind") == "BLOCKED", payload
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+
+
+def test_live_blocked_idle_backstop_keeps_terminal_write_pending() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dispatch_id = "watch-live-blocked-idle-backstop"
+        status = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n",
+            encoding="utf-8",
+        )
+        project = tmp / "project"
+        project.mkdir()
+        worker_cwd = tmp / "worker-cwd"
+        worker_cwd.mkdir()
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+            cwd=worker_cwd,
+        )
+        runs = status.parent / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "test-controller",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-10-22T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        command = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.05",
+            max_idle_secs="0.2",
+            worker_cwd=worker_cwd,
+        )
+        command += ["--project-root", str(project)]
+        command += ["--wedge-idle-secs", "0.2"]
+        command += ["--worker-identity-json", json.dumps({"pid": worker.pid})]
+        watcher = subprocess.Popen(
+            command,
+            env=_watcher_env(status),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline and watcher.poll() is None:
+                time.sleep(0.05)
+            assert watcher.poll() is not None, _wait_for_status(status)
+            output, error = watcher.communicate(timeout=5)
+            payload = _wait_for_status(status)
+            live_pending = (
+                payload.get("state") == "watcher_stopped"
+                and payload.get("terminal_pending_state") == "blocked"
+                and payload.get("terminal_marker") is None
+                and payload.get("attention_marker", {}).get("kind") == "BLOCKED"
+            )
+            worker_was_live = worker.poll() is None
+
+            import goalflight_journal
+
+            runtime_env = _watcher_env(status)
+            old_journal = os.environ.get("GOALFLIGHT_JOURNAL_DIR")
+            os.environ["GOALFLIGHT_JOURNAL_DIR"] = runtime_env[
+                "GOALFLIGHT_JOURNAL_DIR"
+            ]
+            try:
+                authority = goalflight_journal.Journal.open_reader(project)
+                terminal_rows = authority.read_all(
+                    "SELECT event_type FROM terminal_outbox WHERE recipient = ?",
+                    (dispatch_id,),
+                )
+                no_terminal_commit_while_live = not terminal_rows
+                if worker_was_live:
+                    worker.terminate()
+                    worker.wait(timeout=5)
+                import goalflight_ledger
+
+                isolated_env_keys = (
+                    "GOALFLIGHT_STATE_DIR",
+                    "GOALFLIGHT_TASK_STORE_DIR",
+                    "GOALFLIGHT_JOURNAL_DIR",
+                    "GOALFLIGHT_MESSAGES_DIR",
+                    "GOALFLIGHT_WAKE_LEDGER_DIR",
+                    "GOAL_FLIGHT_PIDFILE_DIR",
+                )
+                original_env = {key: os.environ.get(key) for key in isolated_env_keys}
+                try:
+                    os.environ.update(
+                        {key: runtime_env[key] for key in isolated_env_keys}
+                    )
+                    goalflight_ledger.reconcile_terminal_outbox(project)
+                    goalflight_ledger.reconcile_terminal_outbox(project)
+                    committed = goalflight_journal.Journal.open_reader(project).read_all(
+                        "SELECT event_type, payload_json FROM terminal_outbox "
+                        "WHERE recipient = ?",
+                        (dispatch_id,),
+                    )
+                finally:
+                    for key, value in original_env.items():
+                        if value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = value
+                assert (
+                    live_pending
+                    and worker_was_live
+                    and no_terminal_commit_while_live
+                    and len(committed) == 1
+                    and committed[0]["event_type"] == "blocked"
+                ), {
+                    "live_pending": live_pending,
+                    "worker_was_live": worker_was_live,
+                    "no_terminal_commit_while_live": no_terminal_commit_while_live,
+                    "committed": committed,
+                    "watcher_output": output,
+                    "watcher_error": error,
+                }
+            finally:
+                if old_journal is None:
+                    os.environ.pop("GOALFLIGHT_JOURNAL_DIR", None)
+                else:
+                    os.environ["GOALFLIGHT_JOURNAL_DIR"] = old_journal
+        finally:
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.communicate(timeout=5)
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+
+
+def test_live_blocked_attention_projection_recovers_after_watcher_restart() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dispatch_id = "watch-live-blocked-projection-restart"
+        status = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n",
+            encoding="utf-8",
+        )
+        project = tmp / "project"
+        project.mkdir()
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        runs = status.parent / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "test-controller",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-10-22T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        command = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.1",
+            max_idle_secs="30",
+        )
+        command += ["--project-root", str(project)]
+        env = _watcher_env(status)
+        interrupted_script = tmp / "interrupted_projection_watch.py"
+        interrupted_script.write_text(
+            "import runpy, sys\n"
+            "from pathlib import Path\n"
+            "script = Path(sys.argv[1])\n"
+            "sys.path.insert(0, str(script.parent))\n"
+            "import goalflight_messages\n"
+            "def fail_projection(_assignments):\n"
+            "    raise RuntimeError('injected journal projection failure')\n"
+            "goalflight_messages._mark_journal_delivery = fail_projection\n"
+            "sys.argv = [str(script), *sys.argv[2:]]\n"
+            "runpy.run_path(str(script), run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        first = None
+        second = None
+        inbox = status.parent / "messages" / f"{dispatch_id}.jsonl"
+        event_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"goalflight:live-blocked:{dispatch_id}:1",
+            )
+        )
+
+        def delivery_rows() -> list[dict]:
+            import goalflight_journal
+
+            env_keys = ("GOALFLIGHT_JOURNAL_DIR", "GOALFLIGHT_TASK_STORE_DIR")
+            old_env = {key: os.environ.get(key) for key in env_keys}
+            os.environ.update({key: env[key] for key in env_keys})
+            try:
+                authority = goalflight_journal.Journal.open_reader(project)
+                return authority.read_all(
+                    "SELECT event_uuid, projected_at FROM delivery_events "
+                    "WHERE event_uuid = ?",
+                    (event_id,),
+                )
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        try:
+            first = subprocess.Popen(
+                [sys.executable, str(interrupted_script), str(WATCH), *command[2:]],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 3.0
+            envelopes: list[dict] = []
+            while time.monotonic() < deadline:
+                if inbox.exists():
+                    envelopes = [
+                        json.loads(line)
+                        for line in inbox.read_text(encoding="utf-8").splitlines()
+                    ]
+                    if any(event.get("id") == event_id for event in envelopes):
+                        break
+                time.sleep(0.02)
+            attention = [event for event in envelopes if event.get("id") == event_id]
+            assert len(attention) == 1, (envelopes, first.poll())
+            original_ts = attention[0]["ts"]
+            rows = delivery_rows()
+            assert len(rows) == 1 and rows[0]["projected_at"] is None, rows
+
+            first.terminate()
+            first.communicate(timeout=5)
+            second = subprocess.Popen(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 3.0
+            rows = []
+            while time.monotonic() < deadline:
+                rows = delivery_rows()
+                if rows and rows[0]["projected_at"] is not None:
+                    break
+                time.sleep(0.02)
+            envelopes = [
+                json.loads(line)
+                for line in inbox.read_text(encoding="utf-8").splitlines()
+            ]
+            attention = [event for event in envelopes if event.get("id") == event_id]
+            assert len(attention) == 1, envelopes
+            assert attention[0]["ts"] == original_ts, attention[0]
+            assert len(rows) == 1 and rows[0]["projected_at"] is not None, rows
+        finally:
+            for watcher in (first, second):
+                if watcher is None:
+                    continue
+                if watcher.poll() is None:
+                    watcher.terminate()
+                try:
+                    watcher.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    watcher.kill()
+                    watcher.communicate(timeout=5)
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+def test_wait_snapshot_wakes_for_pid_only_blocked_without_terminalizing() -> None:
+    import goalflight_status as status_cli
+
+    dispatch_id = "wait-live-blocked-pid-only"
+    raw = {
+        "dispatch_id": dispatch_id,
+        "state": "running",
+        "worker_pid": 12345,
+        "project_root": str(ROOT),
+    }
+    sidecar = {
+        "dispatch_id": dispatch_id,
+        "state": "watcher_stopped",
+        "terminal_state": "unknown",
+        "terminal_pending_state": "blocked",
+        "worker_pid": 12345,
+        "attention_marker": {
+            "kind": "BLOCKED",
+            "dispatch_id": dispatch_id,
+            "line": 4,
+            "sequence": 4,
+            "text": f"{dispatch_id} — waiting for controller",
+            "timestamp": "2026-10-22T00:00:00+00:00",
+        },
+    }
+    original_pid_alive = status_cli.goalflight_compat.pid_alive
+    original_pid_liveness = status_cli.goalflight_compat.pid_liveness
+    status_cli.goalflight_compat.pid_alive = lambda _pid: True
+    status_cli.goalflight_compat.pid_liveness = lambda _pid: True
+    try:
+        record = status_cli._wait_record_from_snapshots(
+            dispatch_id,
+            raw,
+            sidecar,
+            None,
+        )
+        assert record is not None, dispatch_id
+        assert record.get("terminal_marker") is None, record
+        assert record.get("attention_marker") == sidecar["attention_marker"], record
+        liveness, reason = status_cli._wait_worker_liveness_detail(record)
+        assert liveness == "indeterminate", (liveness, reason)
+        assert reason == "pid_alive_without_identity", reason
+        row = status_cli._wait_snapshot(
+            {"dispatch": {"records": [record]}},
+            [dispatch_id],
+        )[0]
+        assert row["terminal"] is False, row
+        assert row["done_code"] == 0, row
+        assert row["state"] == "watcher_stopped", row
+        assert status_cli._terminal_done_code(record) == 2, record
+        committed = {
+            **record,
+            "state": "blocked",
+            "terminal_marker": sidecar["attention_marker"],
+        }
+        assert status_cli.done_code(committed, worker_alive=True) == 0, committed
+        assert status_cli._terminal_done_code(committed) == 0, committed
+    finally:
+        status_cli.goalflight_compat.pid_alive = original_pid_alive
+        status_cli.goalflight_compat.pid_liveness = original_pid_liveness
+
+
+def test_live_blocked_then_complete_publishes_attention_and_result() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dispatch_id = "watch-live-blocked-then-complete"
+        status = tmp / "status.json"
+        tail = tmp / "tail.txt"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n",
+            encoding="utf-8",
+        )
+        project = tmp / "project"
+        project.mkdir()
+        completion = (
+            f"RESULT: {dispatch_id} — work completed\n"
+            f"COMPLETE: {dispatch_id} — done\n"
+        )
+        worker_script = (
+            "import json, pathlib, sys, time\n"
+            "inbox = pathlib.Path(sys.argv[2])\n"
+            "deadline = time.monotonic() + 5\n"
+            "while time.monotonic() < deadline:\n"
+            "    try:\n"
+            "        events = [json.loads(line) for line in inbox.read_text(encoding='utf-8').splitlines()]\n"
+            "    except FileNotFoundError:\n"
+            "        events = []\n"
+            "    if any(event.get('type') == 'controller-notice' for event in events):\n"
+            "        break\n"
+            "    time.sleep(0.02)\n"
+            "with open(sys.argv[1], 'a', encoding='utf-8') as stream:\n"
+            f"    stream.write({completion!r})\n"
+        )
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                worker_script,
+                str(tail),
+                str(status.parent / "messages" / f"{dispatch_id}.jsonl"),
+            ],
+            start_new_session=True,
+        )
+        runs = status.parent / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / f"{dispatch_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.dispatch.v1",
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "test-controller",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "started_at": "2026-10-22T00:00:00+00:00",
+                    "worker_pid": worker.pid,
+                    "stdout_path": str(tail),
+                    "status_path": str(status),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            identity = goalflight_watch._lightweight_process_identity(worker.pid) or {
+                "pid": worker.pid
+            }
+            rc, _elapsed, terminal, payload = _run_watcher(
+                tail,
+                status,
+                tmp / "prompt.md",
+                ignore=False,
+                worker_pid=worker.pid,
+                identity=identity,
+                poll_secs="0.1",
+                max_idle_secs="10",
+                dispatch_id=dispatch_id,
+                project_root=project,
+            )
+            worker.wait(timeout=5)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+        assert rc == 0, payload
+        assert payload.get("state") == "complete", payload
+        assert terminal.get("kind") == "COMPLETE", terminal
+        assert payload.get("attention_marker") is None, payload
+        inbox = status.parent / "messages" / f"{dispatch_id}.jsonl"
+        envelopes = [
+            json.loads(line)
+            for line in inbox.read_text(encoding="utf-8").splitlines()
+        ]
+        attention = [
+            event for event in envelopes if event["type"] == "controller-notice"
+        ]
+        results = [event for event in envelopes if event["type"] == "result"]
+        assert len(attention) == 1, envelopes
+        assert attention[0]["payload"]["text"] == (
+            "worker reported BLOCKED and is still running"
+        ), attention[0]
+        assert len(results) == 1, envelopes
 
 
 def test_attention_surfaces_agree_on_the_same_transcript() -> None:
@@ -3039,6 +4200,7 @@ def main() -> None:
     case_live_failed_marker_blocks_not_rate_limited()
     case_ready_terminal_marker()
     test_alive_growing_terminal_candidate_is_discarded_then_final_completes()
+    test_quiet_result_does_not_kill_a_worker_that_is_still_active()
     test_scenario_helper_matches_production_stay_after_terminal()
     test_dispatch_watcher_argv_ignores_the_materialized_prompt()
     test_recovery_watcher_reloads_same_mtime_atomic_prompt_replacement()
@@ -3080,6 +4242,12 @@ def main() -> None:
     test_list_item_blocked_is_not_an_escalation_on_any_surface()
     test_quoted_and_mid_tail_blocked_are_not_harvest_or_outbox_escalations()
     test_genuine_last_line_blocked_still_terminalizes_and_headlines()
+    test_live_blocked_publishes_one_attention_event()
+    test_pending_question_retry_keeps_live_blocked_in_attention_marker_only()
+    test_live_blocked_idle_backstop_keeps_terminal_write_pending()
+    test_wait_snapshot_wakes_for_pid_only_blocked_without_terminalizing()
+    test_live_blocked_attention_projection_recovers_after_watcher_restart()
+    test_live_blocked_then_complete_publishes_attention_and_result()
     test_attention_surfaces_agree_on_the_same_transcript()
     test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()

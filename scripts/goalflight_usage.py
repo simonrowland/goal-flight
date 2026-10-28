@@ -1453,7 +1453,19 @@ def render_table(
         # Prefer the consumed reading; fall back to the existing text for
         # rows that carry no numeric percentage at all.
         reading = row.get("used") or row.get("remaining") or "unknown"
-        remaining = f"{reading}{flag_text}"
+        seatd_detail = ""
+        if str(row.get("provider") or "") == "codex":
+            account = _label(row.get("account"))
+            if account:
+                try:
+                    import goalflight_dispatch as dispatch
+
+                    reason = dispatch._codex_seat_admission_reason(account)
+                except Exception:
+                    reason = None
+                if reason is not None:
+                    seatd_detail = f" · seatd: {reason}"
+        remaining = f"{reading}{flag_text}{seatd_detail}"
         reset_at = parse_reset(row.get("reset_at"))
         reset_text = "—"
         if reset_at is not None:

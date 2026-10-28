@@ -9,6 +9,7 @@ skip_posix_on_native_windows("dashboard dispatch refresh test launches POSIX wor
 
 import contextlib
 import datetime as dt
+import gzip
 import json
 import os
 import shutil
@@ -321,6 +322,17 @@ def test_last_nonempty_tail_line_multibyte_boundary_drops_leading_replacement() 
     assert line
     assert not line.startswith("\ufffd")
     assert line.startswith("é")
+
+
+def test_last_nonempty_tail_line_reads_compressed_tail() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tail = Path(td) / "worker.tail"
+        with gzip.open(Path(str(tail) + ".gz"), "wb") as stream:
+            stream.write(b"older output\nfinal answer\n")
+
+        line = S._last_nonempty_tail_line(str(tail))
+
+    assert line == "final answer"
 
 
 def test_dashboard_refresh_start_is_singleton_under_concurrent_callers(monkeypatch) -> None:

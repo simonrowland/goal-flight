@@ -3108,7 +3108,11 @@ def coverage_supervise_command(
     controller_label: str,
     lease_nonce: str,
 ) -> str:
-    """The one tracked-task command that owns the whole wake pool."""
+    """The one tracked-task command that owns the whole wake pool.
+
+    ``lease_nonce`` remains an in-process input for current callers; the
+    re-arm command resolves the controller generation from its ancestry.
+    """
     messages_script = goalflight_compat.advertised_script(
         "goalflight_messages.py",
         running_file=__file__,
@@ -3122,8 +3126,6 @@ def coverage_supervise_command(
             str(Path(project_root).expanduser().resolve(strict=False)),
             "--controller-label",
             controller_label,
-            "--lease-nonce",
-            lease_nonce,
         ]
     )
 
@@ -3550,10 +3552,10 @@ def supervisor_generation_state(
     """Whether ``supervise`` is live for this controller generation.
 
     Uses the recorded supervisor slot first, then a full process probe for
-    a matching ``goalflight_messages.py supervise --lease-nonce <this nonce>``
-    in executable position (and matching ``--project-root`` /
-    ``--controller-label`` when those flags are present). Trailing tokens
-    that merely contain a supervise command line are not a supervisor.
+    a matching ``goalflight_messages.py supervise`` in executable position
+    with matching ``--project-root`` / ``--controller-label`` and, when
+    present, ``--lease-nonce``. Trailing tokens that merely contain a
+    supervise command line are not a supervisor.
     Returns ``running``, ``absent``, or ``unknown``.
 
     ``unknown`` when the process table cannot be read, executable position

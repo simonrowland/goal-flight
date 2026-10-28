@@ -8,6 +8,7 @@ import datetime as dt
 import io
 import json
 import os
+import shlex
 import statistics
 import subprocess
 import sys
@@ -1081,7 +1082,18 @@ def _assert_controller_state(
                     lease_nonce=lease.nonce,
                 )
                 if supervisor_mode == "running":
-                    process_listing = [(4242, supervise_command)]
+                    process_listing = [
+                        (
+                            4242,
+                            shlex.join(
+                                [
+                                    *shlex.split(supervise_command),
+                                    "--lease-nonce",
+                                    lease.nonce,
+                                ]
+                            ),
+                        )
+                    ]
                 elif supervisor_mode == "absent":
                     process_listing = []
                 elif supervisor_mode == "unknown":

@@ -6,16 +6,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from support import skip_if_node_unavailable
 
 ROOT = Path(__file__).resolve().parents[2]
 TASK = ROOT / "goalflight_task.py"
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
-NODE = shutil.which("node")
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -38,7 +37,7 @@ def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
 
 def run_checker(project_root: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
+        ["node", str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
         env={**os.environ, "GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"},
         cwd=str(ROOT),
         text=True,
@@ -95,6 +94,10 @@ def test_lane_validates_as_string() -> None:
 
 
 def test_lane_cli_and_reserved_backlog_view() -> None:
+    if skip_if_node_unavailable(
+        "test_lane_cli_and_reserved_backlog_view", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
 
@@ -149,6 +152,10 @@ def test_lane_cli_and_reserved_backlog_view() -> None:
 
 
 def test_lane_cli_audit_captures_previous_lane_when_relaned() -> None:
+    if skip_if_node_unavailable(
+        "test_lane_cli_audit_captures_previous_lane_when_relaned", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
 
@@ -167,6 +174,11 @@ def test_lane_cli_audit_captures_previous_lane_when_relaned() -> None:
 
 
 def test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text() -> None:
+    if skip_if_node_unavailable(
+        "test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text",
+        script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         proc = run_task(project, "new", "Park me", "--lane", "deferred", "--by", "tester")
@@ -202,6 +214,10 @@ def test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text() -> None
 
 
 def test_list_lane_rejects_reserved_near_miss() -> None:
+    if skip_if_node_unavailable(
+        "test_list_lane_rejects_reserved_near_miss", script_mode=__name__ == "__main__",
+    ):
+        return
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
         proc = run_task(project, "new", "Visible task", "--by", "tester")
@@ -213,9 +229,6 @@ def test_list_lane_rejects_reserved_near_miss() -> None:
 
 
 def main() -> None:
-    if not NODE:
-        print("SKIP: test_lane_field.py: node not found on PATH")
-        return
     test_lane_validates_as_string()
     test_lane_cli_and_reserved_backlog_view()
     test_lane_cli_audit_captures_previous_lane_when_relaned()

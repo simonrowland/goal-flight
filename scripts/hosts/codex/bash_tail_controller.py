@@ -16,8 +16,11 @@ from pathlib import Path
 
 HOST_DIR = Path(__file__).resolve().parent
 CONTROLLER_DIR = HOST_DIR.parent / "controller"
+SCRIPTS_DIR = HOST_DIR.parents[1]
+sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(CONTROLLER_DIR))
 
+from goalflight_codex_sandbox import codex_plugins_off_args  # noqa: E402
 from common import append_tail  # noqa: E402
 
 
@@ -32,6 +35,7 @@ def spawn_codex_worker(project_root: Path, prompt_file: Path, tail_path: Path) -
         "workspace-write",
         "-c",
         "approval_policy=never",
+        *codex_plugins_off_args(),
         "-C",
         str(project_root),
     ]

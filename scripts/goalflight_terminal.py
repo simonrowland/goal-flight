@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 import re
+from typing import BinaryIO
 
 import goalflight_dispatch_states
 import goalflight_rate_pressure
@@ -137,7 +139,7 @@ def parse_own_signal_attention_line(
         if not kimi_continuation:
             return None
     stripped = raw_line.strip()
-    if not stripped:
+    if not stripped or len(stripped) > 1000:
         return None
     if kimi_output and stripped.startswith("• "):
         stripped = stripped[2:].lstrip()
@@ -203,10 +205,28 @@ def marker_is_template_example(kind: object, payload: object) -> bool:
     return kind in TEMPLATE_GUARDED_MARKERS and marker_payload_has_template_placeholder(payload)
 
 
+def resolve_tail_path(path: Path | str) -> Path:
+    """Use a compressed sibling when the recorded plain tail has been GC'd."""
+    requested = Path(path).expanduser()
+    if requested.suffix == ".gz" or requested.exists():
+        return requested
+    compressed = Path(str(requested) + ".gz")
+    return compressed if compressed.is_file() else requested
+
+
+def open_tail_reader(path: Path | str) -> BinaryIO:
+    """Open a dispatch tail, transparently reading its gzip form if needed."""
+    resolved = resolve_tail_path(path)
+    if resolved.suffix == ".gz":
+        return gzip.open(resolved, "rb")
+    return resolved.open("rb")
+
+
 def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str:
     try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
+        with open_tail_reader(path) as f:
+            f.seek(0, 2)
+            size = f.tell()
             f.seek(max(0, size - max_bytes))
             return f.read(max_bytes).decode("utf-8", errors="replace")
     except OSError:
@@ -352,6 +372,112 @@ def attention_marker_present(marker: object) -> bool:
     Bias toward waking.
     """
     return isinstance(marker, dict) and marker.get("kind") in ATTENTION_MARKERS
+
+
+def normalize_attention_marker(marker: object) -> dict | None:
+    """Normalize persisted attention marker shapes at read and write boundaries."""
+    if isinstance(marker, dict):
+        return marker
+    if isinstance(marker, str):
+        return {"kind": marker}
+    return None
+
+
+def worker_liveness_from_probe(worker_alive: object, identity_reason: object = None) -> str:
+    """Normalize process-probe results before terminal decisions."""
+    if identity_reason == "no_pid" or identity_reason == "identity_indeterminate" or (
+        isinstance(identity_reason, str)
+        and identity_reason.startswith("identity_check_error:")
+    ):
+        return "unknown"
+    if worker_alive is True:
+        return "live"
+    if worker_alive is False:
+        return "dead"
+    return "unknown"
+
+
+def blocked_outcome_marker(record: object) -> dict | None:
+    """Return the current BLOCKED evidence, including synthesized outcomes."""
+    if not isinstance(record, dict):
+        return None
+    state_fields = ("state", "terminal_state", "classification")
+    effective_state = next(
+        (
+            record.get(key)
+            for key in ("terminal_state", "state", "classification")
+            if isinstance(record.get(key), str) and record.get(key)
+        ),
+        None,
+    )
+    if effective_state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES:
+        return None
+    reason = record.get("reason")
+    reason_kind = reason.get("marker_kind") if isinstance(reason, dict) else None
+    reason_text = reason if isinstance(reason, str) else (
+        reason.get("reason") if isinstance(reason, dict) else None
+    )
+    if (
+        (not isinstance(reason_kind, str) or reason_kind not in TERMINAL_MARKERS)
+        and isinstance(reason_text, str)
+    ):
+        if reason_text.startswith("marker:"):
+            reason_kind = reason_text.removeprefix("marker:").split(":", 1)[0]
+    marker = record.get("terminal_marker")
+    marker_kind = marker.get("kind") if isinstance(marker, dict) else marker
+    if isinstance(marker_kind, str) and marker_kind in TERMINAL_MARKERS:
+        if marker_kind == "BLOCKED":
+            return marker if isinstance(marker, dict) else {"kind": "BLOCKED"}
+        if not (
+            marker_kind in SUCCESS_TERMINAL_MARKERS
+            and (effective_state == "blocked" or reason_kind == "BLOCKED")
+        ):
+            return None
+    marker = normalize_attention_marker(record.get("attention_marker"))
+    marker_kind = marker.get("kind") if marker is not None else None
+    if isinstance(marker_kind, str) and marker_kind in TERMINAL_MARKERS:
+        if marker_kind == "BLOCKED":
+            return marker
+        return None
+    if isinstance(reason_kind, str) and reason_kind in TERMINAL_MARKERS:
+        if reason_kind == "BLOCKED":
+            if isinstance(reason, dict):
+                return {
+                    key: reason[key]
+                    for key in ("dispatch_id", "sequence", "line", "timestamp", "text")
+                    if key in reason
+                } | {"kind": "BLOCKED"}
+            return {"kind": "BLOCKED"}
+        return None
+    marker = record.get("last_marker")
+    marker_kind = marker.get("kind") if isinstance(marker, dict) else marker
+    if isinstance(marker_kind, str) and marker_kind in TERMINAL_MARKERS:
+        if marker_kind == "BLOCKED":
+            return marker if isinstance(marker, dict) else {"kind": "BLOCKED"}
+        return None
+    if effective_state == "blocked" or any(
+        record.get(key) == "blocked" for key in state_fields
+    ):
+        return {"kind": "BLOCKED"}
+    return None
+
+
+def blocked_outcome_is_provisional(record: object, liveness: object) -> bool:
+    """Whether a BLOCKED outcome must stay nonterminal for this worker.
+
+    Liveness is deliberately three-valued: only proven death permits a
+    terminal write. Marker fields, reason codes, and normalized state are all
+    accepted as BLOCKED evidence at the terminal sinks.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("_wait_journal_terminal") or record.get(
+        "_wait_file_snapshots_corroborated"
+    ) or record.get("terminal_event_uuid"):
+        return False
+    if liveness is False or liveness in {"dead", "confirmed_dead"}:
+        return False
+    return blocked_outcome_marker(record) is not None
 
 
 def terminal_rate_limit_outcome(

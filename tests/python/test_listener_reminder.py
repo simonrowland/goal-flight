@@ -142,7 +142,7 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
         ("| 0 | Ring:", "remaining-depth"),
         ("| 1 | Timeout:", "clean timer expiry"),
         ("| 2 | Infrastructure or corruption", "avoid a restart loop"),
-        ("| 3 | Contention, supersession", "Reconcile the active lease"),
+        ("| 3 | Contention, supersession", "reconcile lease/PIDs"),
         ("| 4 | Detached-listener refusal", "tracked background listener"),
         ("| 5 | Did-not-arm:", "do not re-arm this nonce"),
     )
@@ -150,6 +150,11 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
         row = next((line for line in doctrine.splitlines() if meaning in line), "")
         assert row, f"missing listener exit-code row: {meaning}"
         assert action in row, f"listener exit-code row lacks supervisor action: {meaning}"
+    lease_row = next(
+        line for line in doctrine.splitlines()
+        if "| 3 | Contention, supersession" in line
+    )
+    assert "goalflight_process_census.py` before process cleanup" in lease_row
 
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     controller_entry = next(

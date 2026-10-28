@@ -21,6 +21,7 @@ OUTCOME_PASS = "pass"
 OUTCOME_SKIP = "skip"
 OUTCOME_FLAKE = "flake"
 OUTCOME_FAIL = "fail"
+MODULE_TIMEOUT_SECONDS = 300
 # CONFIG is pinned to /dev/null by isolated_machine_env, not scrubbed.
 AMBIENT_RUNTIME_ENV = AMBIENT_IDENTITY_ENV + tuple(
     key for key in AMBIENT_WEBHOOK_ENV if key != "GOALFLIGHT_WAKE_WEBHOOK_CONFIG"
@@ -48,16 +49,35 @@ def _skipped_reason(
     *,
     direct_script: bool,
 ) -> str | None:
-    if direct_script or result.returncode != 0:
+    if result.returncode != 0:
         return None
-    return next(
+    lines = result.stdout.splitlines()
+    prefix = "SKIPPED "
+    if direct_script:
+        module = next(
+            (
+                Path(argument).name
+                for argument in result.args
+                if argument.endswith(".py")
+            ),
+            "<unknown module>",
+        )
+        prefix = f"SKIP-FILE: {module}:"
+    reason = next(
         (
             line.strip()
-            for line in result.stdout.splitlines()
-            if line.startswith("SKIPPED ")
+            for line in lines
+            if line.startswith(prefix)
         ),
         None,
     )
+    if direct_script and reason and any(
+        line.strip() and not line.startswith(prefix) for line in lines
+    ):
+        raise AssertionError(
+            f"{module}: contradictory file-skip and execution evidence"
+        )
+    return reason
 
 
 def _classify_module_runs(
@@ -112,6 +132,160 @@ def _validate_module_outcome(
     raise AssertionError(f"unknown isolated module outcome: {outcome}")
 
 
+def _run_bounded(
+    command: list[str], *, label: str, **kwargs
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            timeout=MODULE_TIMEOUT_SECONDS,
+            **kwargs,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"{label} exceeded {MODULE_TIMEOUT_SECONDS}s timeout"
+        ) from exc
+
+
+def test_bounded_run_reports_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "MODULE_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(AssertionError, match="timeout probe exceeded 0.01s timeout"):
+        _run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(1)"],
+            label="timeout probe",
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_direct_script_skip_marker_distinguishes_case_skip() -> None:
+    case_skip = subprocess.CompletedProcess(
+        args=[sys.executable, "probe.py"],
+        returncode=0,
+        stdout="SKIP: one case skipped\n",
+        stderr="",
+    )
+    file_skip = subprocess.CompletedProcess(
+        args=[sys.executable, "probe.py"],
+        returncode=0,
+        stdout="SKIP-FILE: probe.py: platform requirement unavailable\n",
+        stderr="",
+    )
+
+    assert _skipped_reason(case_skip, direct_script=True) is None
+    assert _classify_module_runs(case_skip, None, direct_script=True) == OUTCOME_PASS
+    assert _skipped_reason(file_skip, direct_script=True) == (
+        "SKIP-FILE: probe.py: platform requirement unavailable"
+    )
+    assert _classify_module_runs(file_skip, None, direct_script=True) == OUTCOME_SKIP
+
+    tests_root = str(REPO_ROOT / "tests")
+    if tests_root not in sys.path:
+        sys.path.insert(0, tests_root)
+    import run_python
+
+    probe_path = TEST_DIR / "probe.py"
+    assert not run_python._is_full_file_skip(
+        probe_path, run_python._skip_lines(case_skip.stdout, case_skip.stderr)
+    )
+    assert run_python._is_full_file_skip(
+        probe_path, run_python._skip_lines(file_skip.stdout, file_skip.stderr)
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "OK: case_one\nSKIP-FILE: test_example.py: unavailable\n",
+        "SKIP-FILE: test_example.py: unavailable\nOK: case_one\n",
+    ],
+)
+def test_mixed_case_and_file_skip_evidence_is_a_failure(
+    output: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = subprocess.CompletedProcess(
+        args=[sys.executable, "test_example.py"],
+        returncode=0,
+        stdout=output,
+        stderr="",
+    )
+    with pytest.raises(AssertionError, match="test_example.py.*contradictory"):
+        _classify_module_runs(result, None, direct_script=True)
+
+    tests_root = str(REPO_ROOT / "tests")
+    if tests_root not in sys.path:
+        sys.path.insert(0, tests_root)
+    import run_python
+
+    test_dir = tmp_path / "tests" / "python"
+    test_dir.mkdir(parents=True)
+    script = test_dir / "test_example.py"
+    script.write_text(
+        "print('PASS: case_one')\n"
+        "print('SKIP-FILE: test_example.py: unavailable')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(run_python, "ROOT", tmp_path)
+    monkeypatch.setattr(run_python, "TEST_DIR", test_dir)
+    monkeypatch.setattr(run_python, "_test_files", lambda: [script])
+    monkeypatch.setattr(
+        run_python,
+        "_test_command",
+        lambda test, interpreter: ([interpreter, str(test)], False),
+    )
+
+    assert run_python.main([]) == 1
+    runner_output = capsys.readouterr().out
+    assert "FAIL  tests/python/test_example.py" in runner_output
+    assert "test_example.py reported contradictory PASS and SKIP-FILE" in runner_output
+
+
+def test_python_runner_executes_nested_local_extension_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tests_root = str(REPO_ROOT / "tests")
+    if tests_root not in sys.path:
+        sys.path.insert(0, tests_root)
+    import run_python
+
+    extension_root = tmp_path / "with-ext" / "tests" / "python"
+    extension_test = extension_root / "ext" / "nested" / "test_local.py"
+    extension_test.parent.mkdir(parents=True)
+    extension_test.write_text(
+        "def test_local_extension_executes():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(run_python, "ROOT", extension_root.parents[1])
+    monkeypatch.setattr(run_python, "TEST_DIR", extension_root)
+
+    assert run_python.main([]) == 0
+    output = capsys.readouterr().out
+    assert "RUN   tests/python/ext/nested/test_local.py" in output
+    assert "LOCAL EXTENSION TESTS: 1 discovered, 1 passed, 0 skipped, 0 failed" in output
+
+    without_ext_root = tmp_path / "without-ext" / "tests" / "python"
+    tracked_test = without_ext_root / "test_tracked.py"
+    tracked_test.parent.mkdir(parents=True)
+    tracked_test.write_text(
+        "def test_tracked_executes():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(run_python, "ROOT", without_ext_root.parents[1])
+    monkeypatch.setattr(run_python, "TEST_DIR", without_ext_root)
+
+    assert run_python.main([]) == 0
+    output = capsys.readouterr().out
+    assert "RUN   tests/python/test_tracked.py" in output
+    assert "LOCAL EXTENSION ZONE: absent; no local-only test coverage" in output
+
+
 def _run_module_with_confirmation(
     command: list[str],
     *,
@@ -119,8 +293,13 @@ def _run_module_with_confirmation(
     retry_env: dict[str, str],
     direct_script: bool,
 ) -> IsolatedModuleRun:
-    initial = subprocess.run(
+    module_label = next(
+        (Path(argument).name for argument in command if argument.endswith(".py")),
+        command[-1],
+    )
+    initial = _run_bounded(
         command,
+        label=f"isolated module {module_label}",
         cwd=REPO_ROOT,
         env=initial_env,
         capture_output=True,
@@ -129,8 +308,9 @@ def _run_module_with_confirmation(
     )
     retry = None
     if initial.returncode != 0:
-        retry = subprocess.run(
+        retry = _run_bounded(
             command,
+            label=f"isolated module confirmation {module_label}",
             cwd=REPO_ROOT,
             env=retry_env,
             capture_output=True,
@@ -399,7 +579,7 @@ def test_directory_collection_is_visible_and_clean() -> None:
     sentinel_env = os.environ.copy()
     sentinel_path = TEST_DIR / "test_dispatch_ergonomics.py"
     sentinel_env[ISOLATED_TEST_FILE_ENV] = sentinel_path.relative_to(TEST_DIR).as_posix()
-    sentinel = subprocess.run(
+    sentinel = _run_bounded(
         [
             sys.executable,
             "-m",
@@ -408,6 +588,7 @@ def test_directory_collection_is_visible_and_clean() -> None:
             "--collect-only",
             "-q",
         ],
+        label="directory collection sentinel",
         cwd=REPO_ROOT,
         env=sentinel_env,
         capture_output=True,
@@ -420,8 +601,9 @@ def test_directory_collection_is_visible_and_clean() -> None:
         f"stderr:\n{_tail(sentinel.stderr)}"
     )
 
-    result = subprocess.run(
+    result = _run_bounded(
         [sys.executable, "-m", "pytest", str(TEST_DIR), "--collect-only", "-q"],
+        label="directory collection",
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -435,7 +617,7 @@ def test_directory_collection_is_visible_and_clean() -> None:
     )
     assert combined.strip(), "directory collection exited without any diagnostic output"
 
-    execution = subprocess.run(
+    execution = _run_bounded(
         [
             sys.executable,
             "-m",
@@ -445,6 +627,7 @@ def test_directory_collection_is_visible_and_clean() -> None:
             "-k",
             "test_isolated_test_module and test_dispatch_ergonomics",
         ],
+        label="directory isolated execution",
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

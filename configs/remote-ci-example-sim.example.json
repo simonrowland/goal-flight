@@ -1,0 +1,150 @@
+{
+  "schema": "goalflight.remote-ci.config.v2",
+  "paths": {
+    "queue_dir": "/path/to/example-project/remote-ci/spool/requests",
+    "state_dir": "/path/to/example-project/remote-ci/state",
+    "result_dir": "/path/to/example-project/remote-ci/spool/results"
+  },
+  "daemon": {
+    "lock_file": "/path/to/example-project/remote-ci/state/daemon.lock",
+    "pid_file": "/path/to/example-project/remote-ci/state/daemon.pid",
+    "poll_seconds": 1,
+    "result_tail_kib": 64
+  },
+  "boxes": {
+    "example-box": {
+      "host": "example-box",
+      "expected_hostname": "example-box",
+      "python_interpreter": "/path/to/example-project/.venv/bin/python",
+      "p_cores": 1,
+      "token_pool_size": 1,
+      "max_concurrent_seats": 1,
+      "remote_exec": ["ssh", "{host}", "{script}"],
+      "managed_run_directory": "/path/to/example-project/remote-ci-managed",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "EXAMPLE_PROJECT_VENV": "/path/to/example-project/.venv",
+        "EXAMPLE_PROJECT_PRIVATE_DATA": "/path/to/example-project/private-data",
+        "EXAMPLE_DEP_CONFIG": "/path/to/example-project/example-data/config.toml",
+        "EXAMPLE_DEP_ROOT": "/path/to/example-project/dependency",
+        "PYTHONPATH": "/path/to/example-project/dependency/src",
+        "EXAMPLE_PROJECT_TOOL_A_BINARY": "/path/to/example-project/bin/tool-a",
+        "EXAMPLE_PROJECT_TOOL_B_BINARY": "/path/to/example-project/bin/tool-b",
+        "EXAMPLE_PROJECT_LIBRARY_DIR": "/path/to/example-project/lib",
+        "MPLCONFIGDIR": "/path/to/example-project/matplotlib"
+      },
+      "required_paths": [
+        "${EXAMPLE_PROJECT_VENV}/bin/python",
+        "${EXAMPLE_PROJECT_PRIVATE_DATA}",
+        "${EXAMPLE_DEP_CONFIG}",
+        "${EXAMPLE_DEP_ROOT}/src",
+        "${EXAMPLE_PROJECT_TOOL_A_BINARY}",
+        "${EXAMPLE_PROJECT_TOOL_B_BINARY}",
+        "${EXAMPLE_PROJECT_LIBRARY_DIR}",
+        "${MPLCONFIGDIR}"
+      ]
+    },
+    "example-box-2": {
+      "host": "example-box-2",
+      "expected_hostname": "example-box-2",
+      "python_interpreter": "/path/to/example-project/.venv/bin/python",
+      "p_cores": 1,
+      "token_pool_size": 1,
+      "max_concurrent_seats": 0,
+      "remote_exec": ["ssh", "{host}", "{script}"],
+      "managed_run_directory": "/path/to/example-project/remote-ci-managed",
+      "env": {"PATH": "/usr/bin:/bin"},
+      "required_paths": []
+    }
+  },
+  "repo": "example-project",
+  "fallback": "queue",
+  "checkout_basename": "checkout",
+  "base_overlays": [
+    {
+      "kind": "copy",
+      "source": "${EXAMPLE_PROJECT_PRIVATE_DATA}",
+      "destination": "private-data"
+    },
+    {
+      "kind": "copy",
+      "source": "${EXAMPLE_DEP_CONFIG}",
+      "destination": "example-data/config.toml"
+    },
+    {
+      "kind": "symlink",
+      "source": "${EXAMPLE_PROJECT_VENV}",
+      "destination": ".venv"
+    }
+  ],
+  "environment": {
+    "interpreter": "${EXAMPLE_PROJECT_VENV}/bin/python",
+    "version_probe": ["${EXAMPLE_PROJECT_VENV}/bin/python", "--version"]
+  },
+  "receipt_probes": {
+    "example_dep_config_sha256": {
+      "command": [
+        "${EXAMPLE_PROJECT_VENV}/bin/python",
+        "-c",
+        "import hashlib,pathlib; print(hashlib.sha256(pathlib.Path('example-data/config.toml').read_bytes()).hexdigest())"
+      ],
+      "expected": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "example_dependency_versions": {
+      "command": [
+        "${EXAMPLE_PROJECT_VENV}/bin/python",
+        "-c",
+        "from example_package.config import load_config; cfg = load_config(required=True); print(';'.join(f'{name}={item.cache_version()}' for name, item in sorted(cfg.identities.items())))"
+      ],
+      "expected": "<placeholder dependency version output>"
+    },
+    "dependency_module_file": {
+      "command": [
+        "${EXAMPLE_PROJECT_VENV}/bin/python",
+        "-c",
+        "import example_package; print(example_package.__file__)"
+      ],
+      "expected": "/path/to/example-project/dependency/src/example_package/__init__.py"
+    },
+    "dependency_tree_commit": {
+      "command": ["git", "-C", "${EXAMPLE_DEP_ROOT}", "rev-parse", "--short=7", "HEAD"],
+      "expected": "0000000"
+    },
+    "numpy_version": {
+      "command": [
+        "${EXAMPLE_PROJECT_VENV}/bin/python",
+        "-c",
+        "import numpy; print(numpy.__version__)"
+      ],
+      "expected": "<placeholder version>"
+    }
+  },
+  "admission": {
+    "queue_wait_seconds": 1,
+    "max_wait_seconds": 30
+  },
+  "runner": {
+    "command": ["python3", "-m", "pytest", "-n", "4"],
+    "test_command": ["python3", "-m", "pytest"],
+    "env": {},
+    "timeout_seconds": 7200,
+    "self_cap": 4,
+    "pytest_workers_cap": 4,
+    "self_cap_env": "GOALFLIGHT_REMOTE_CI_SELF_CAP",
+    "base_collection_option": "--continue-on-collection-errors",
+    "heavy_command_ids": [
+      "example-focused-tests",
+      "example-battery-tests",
+      "example-heavy-suite",
+      "example-module-suite"
+    ]
+  },
+  "selection": {
+    "path_prefixes": ["tests/"],
+    "allowed_options": ["-q", "-v", "--continue-on-collection-errors"],
+    "value_options": ["-k", "-m"],
+    "allowed_option_prefixes": [],
+    "require_selector": true,
+    "max_targeted_files": 20
+  }
+}

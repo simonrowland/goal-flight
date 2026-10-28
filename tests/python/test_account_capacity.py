@@ -23,6 +23,20 @@ import goalflight_capacity as cap  # noqa: E402
 import goalflight_dispatch as dispatch  # noqa: E402
 import goalflight_usage as usage  # noqa: E402
 
+_REAL_CODEX_SEAT_ADMISSION_REASON = getattr(
+    dispatch, "_codex_seat_admission_reason", None
+)
+
+
+@pytest.fixture(autouse=True)
+def _allow_accounts_without_seat_state_in_unrelated_tests(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    if _REAL_CODEX_SEAT_ADMISSION_REASON is not None:
+        monkeypatch.setattr(
+            dispatch, "_codex_seat_admission_reason", lambda _account: None
+        )
+
 
 @pytest.fixture()
 def isolated_capacity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -251,6 +265,36 @@ def test_walled_account_does_not_block_healthy_account(monkeypatch):
     assert rejected == [{"account": "walled", "reason": "walled or quota-blocked"}]
 
 
+def test_auth_broken_account_is_skipped_for_healthy_account(
+    isolated_capacity, monkeypatch
+):
+    monkeypatch.setattr(
+        dispatch, "_configured_account_names", lambda _engine: ["broken", "healthy"]
+    )
+    rows = [
+        _codex_probe_row("broken", "90%", state="auth_broken"),
+        _codex_probe_row("healthy", "80%"),
+    ]
+    monkeypatch.setattr(
+        dispatch, "_codex_usage_probe_rows", lambda *_args, **_kwargs: rows
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda _engine, *, account, **_kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {f"codex/{account}": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    selected, rejected = dispatch.select_codex_account()
+
+    assert selected == "healthy"
+    assert rejected == [{"account": "broken", "reason": "authentication is broken"}]
+
+
 def _codex_probe_row(
     account: str,
     remaining: str,
@@ -356,10 +400,16 @@ def test_stale_codex_probe_is_unknown_and_not_selected(
     monkeypatch.setattr(
         dispatch, "_configured_account_names", lambda engine: ["stale", "future", "fresh"]
     )
+    probe_calls: list[None] = []
+
+    def probe_rows(*_args, **_kwargs):
+        probe_calls.append(None)
+        return [stale, future, fresh]
+
     monkeypatch.setattr(
         dispatch,
         "_codex_usage_probe_rows",
-        lambda *_args, **_kwargs: [stale, future, fresh],
+        probe_rows,
     )
     monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: False)
     monkeypatch.setattr(
@@ -381,6 +431,7 @@ def test_stale_codex_probe_is_unknown_and_not_selected(
         {"account": "stale", "reason": "health probe unknown"},
         {"account": "future", "reason": "health probe unknown"},
     ]
+    assert len(probe_calls) == 2
 
 
 def test_pinned_codex_dispatch_refuses_walled_account_with_reset(
@@ -428,7 +479,7 @@ def test_pinned_codex_dispatch_refuses_unknown_health(
         match=(
             r"unknown.*health probe unknown or stale "
             r"\(condition=unusable row \(remaining=unknown\); "
-            r"elapsed=0\.00s, budget=20\.00s\)"
+            r"elapsed=0\.00s, budget=40\.00s; refresh attempted\)"
         ),
     ):
         dispatch._resolve_account_env(
@@ -567,38 +618,137 @@ def test_resume_resolution_uses_healthy_account_without_claiming_walled_one(monk
     assert calls == ["healthy"]
 
 
-def test_selection_uses_usage_health_over_seat_state(monkeypatch):
-    monkeypatch.setattr(dispatch, "_configured_account_names", lambda engine: ["alpha"])
-    monkeypatch.setattr(dispatch, "_seat_probe_says_usable", lambda *args: False)
-    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *args, **kwargs: True)
+def test_codex_snapshot_failure_fails_over_and_cools_failed_account(
+    isolated_capacity, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str | None] = []
+    home = tmp_path / "resolved-home"
+    home.mkdir()
     monkeypatch.setattr(
-        usage,
-        "collect_usage",
-        lambda **kwargs: [
-            {
-                "provider": "codex",
-                "account": "alpha",
-                "remaining": "80%",
-                "flags": [],
-                "evidence": {
-                    "probe": {"state": "reported", "observed_at": time.time()}
-                },
-            }
-        ],
+        dispatch, "_configured_account_names", lambda _engine: ["broken", "healthy"]
     )
+    rows = [
+        _codex_probe_row("broken", "95%"),
+        _codex_probe_row("healthy", "70%"),
+    ]
+    monkeypatch.setattr(
+        dispatch, "_codex_usage_probe_rows", lambda *_args, **_kwargs: rows
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_usage_probe_says_usable",
+        lambda account, **_kwargs: account in {"broken", "healthy"},
+    )
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *_a, **_k: False)
     monkeypatch.setattr(
         dispatch.goalflight_capacity,
         "launch_slot_budget",
-        lambda *args, **kwargs: {
+        lambda _agent, *, account, **_kwargs: {
+            "unreadable": False,
             "account_remaining": 30,
             "request_weight": 1.0,
-            "by_account": {"codex/alpha": {"active_weight": 0, "cap": 30}},
+            "by_account": {f"codex/{account}": {"active_weight": 0, "cap": 30}},
+        },
+    )
+
+    def resolve(_project_root, account, _dispatch_id):
+        calls.append(account)
+        if account == "broken":
+            raise ValueError("short access horizon")
+        return (str(home), account) if account == "healthy" else (None, None)
+
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve),
+    )
+
+    resolved = dispatch.resolve_codex_home(tmp_path, None, "resume-child")
+
+    assert resolved == (str(home), "healthy")
+    assert calls == ["broken", "healthy"]
+    selected, rejected = dispatch.select_codex_account()
+    assert selected == "healthy"
+    assert any(
+        row["account"] == "broken" and "cooldown" in row["reason"]
+        for row in rejected
+    )
+    cooldown = cap.load_state()["cooldowns"]["codex/broken"]
+    assert cooldown["reason"] == "account_snapshot_build_failed"
+    assert cap.parse_iso(cooldown["until"]) > cap.utc_now()
+
+
+def test_selection_and_usage_report_seatd_refusal(
+    isolated_capacity, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    assert _REAL_CODEX_SEAT_ADMISSION_REASON is not None
+    monkeypatch.setattr(
+        dispatch,
+        "_codex_seat_admission_reason",
+        _REAL_CODEX_SEAT_ADMISSION_REASON,
+    )
+    state_dir = tmp_path / "codex-state"
+    state_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state_dir))
+    (state_dir / "codex-seat-states.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": time.time(),
+                "seats": {
+                    "healthy": {
+                        "healthy": True,
+                        "worst_used": 20,
+                        "access_exp": "2030-01-02T03:04:05Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "codex-seatd.log").write_text(
+        "codex-seatd: managed-seat-refused-host-grant "
+        "seat=refused reason=same-account-id\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dispatch, "_configured_account_names", lambda _engine: ["refused", "healthy"]
+    )
+    rows = [_codex_probe_row("refused", "95%"), _codex_probe_row("healthy", "70%")]
+    monkeypatch.setattr(dispatch, "_codex_usage_probe_rows", lambda *_a, **_k: rows)
+    monkeypatch.setattr(dispatch, "_account_quota_blocked", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        dispatch.goalflight_capacity,
+        "launch_slot_budget",
+        lambda _engine, *, account, **_kwargs: {
+            "account_remaining": 30,
+            "request_weight": 1.0,
+            "by_account": {f"codex/{account}": {"active_weight": 0, "cap": 30}},
         },
     )
 
     selected, rejected = dispatch.select_codex_account()
-    assert selected == "alpha"
-    assert rejected == []
+
+    assert selected == "healthy"
+    assert rejected == [
+        {
+            "account": "refused",
+            "reason": "seatd: not published by seat daemon "
+            "(managed-seat-refused-host-grant: same-account-id)",
+        }
+    ]
+
+    monkeypatch.setattr(
+        usage,
+        "run_reader",
+        lambda *_a, **_k: [_codex_probe_row("refused", "95%")],
+    )
+    usage_rows = usage.collect_usage(
+        reader_specs=(usage.ReaderSpec("codex", "codex", "unused.py"),),
+        ledger_records=[],
+    )
+    assert "seatd" not in usage_rows[0]["evidence"]
+    assert "same-account-id" in usage.render_table(usage_rows)
 
 
 def test_codex_selection_uses_most_measured_headroom(monkeypatch: pytest.MonkeyPatch):

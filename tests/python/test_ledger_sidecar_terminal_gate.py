@@ -53,6 +53,7 @@ import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_status as status  # noqa: E402
+import goalflight_subprocess  # noqa: E402
 
 
 SpawnWorker = Callable[[], "subprocess.Popen[bytes]"]
@@ -256,6 +257,138 @@ def test_terminal_sidecars_hold_for_identity_live_worker_then_converge(
         assert attempt.lifecycle_state == journal.ATTEMPT_TERMINAL, attempt
 
 
+def test_new_complete_marker_supersedes_stale_blocked_pending_state(
+    tmp_path: Path,
+    spawn_worker: SpawnWorker,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "complete-over-stale-blocked"
+    worker = spawn_worker()
+    identity = ledger.process_identity(worker.pid)
+    assert identity, "precondition: live child has a process identity"
+    _mark_attempt_running(project, dispatch_id, identity)
+    worker.terminate()
+    worker.wait(timeout=10)
+
+    status_path = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.status.json"
+    _write_sidecar(
+        status_path,
+        dispatch_id=dispatch_id,
+        state="complete",
+        worker_pid=worker.pid,
+    )
+    sidecar = json.loads(status_path.read_text(encoding="utf-8"))
+    sidecar.update(
+        terminal_pending_state="blocked",
+        terminal_marker={
+            "kind": "COMPLETE",
+            "dispatch_id": dispatch_id,
+            "line": 4,
+            "text": f"{dispatch_id} — report",
+        },
+    )
+    status_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    _write_ledger_record(
+        project,
+        dispatch_id=dispatch_id,
+        status_path=status_path,
+        worker_pid=worker.pid,
+        worker_identity=identity,
+    )
+
+    reconciled = _reconcile(project)
+    assert reconciled["committed"] == 1, reconciled
+    row = _ledger_row(dispatch_id)
+    assert row["state"] == "complete", row
+    assert row["terminal_state"] == "complete", row
+    attempt = journal.Journal(project).attempt_for_dispatch(dispatch_id)
+    assert attempt is not None and attempt.lifecycle_state == journal.ATTEMPT_TERMINAL, attempt
+
+
+def test_reconcile_tail_complete_supersedes_frozen_blocked_attention(
+    tmp_path: Path, spawn_worker: SpawnWorker
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "idle-blocked-then-complete"
+    worker = spawn_worker()
+    identity = ledger.process_identity(worker.pid)
+    assert identity, "precondition: live child has a process identity"
+    _mark_attempt_running(project, dispatch_id, identity)
+    tail = tmp_path / "worker.tail"
+    tail.write_text(
+        f"BLOCKED: {dispatch_id} — waiting for controller\n"
+        f"COMPLETE: {dispatch_id} — finished work\n",
+        encoding="utf-8",
+    )
+    worker.terminate()
+    worker.wait(timeout=10)
+
+    status_path = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.status.json"
+    _write_sidecar(
+        status_path,
+        dispatch_id=dispatch_id,
+        state="watcher_stopped",
+        worker_pid=worker.pid,
+        reason="marker:BLOCKED:final_reconciliation",
+    )
+    status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+    status_payload.update(
+        terminal_pending_state="blocked",
+        tail_path=str(tail),
+        attention_marker={
+            "kind": "BLOCKED",
+            "dispatch_id": dispatch_id,
+            "sequence": 1,
+            "text": f"{dispatch_id} — waiting for controller",
+        },
+    )
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+    record = _write_ledger_record(
+        project,
+        dispatch_id=dispatch_id,
+        status_path=status_path,
+        worker_pid=worker.pid,
+        worker_identity=identity,
+    )
+    record["stdout_path"] = str(tail)
+    ledger.write_record(record)
+
+    reconciled = _reconcile(project)
+    assert reconciled["committed"] == 1, reconciled
+    row = _ledger_row(dispatch_id)
+    assert row["state"] == "complete", row
+    assert row["terminal_state"] == "complete", row
+    attempt = journal.Journal(project).attempt_for_dispatch(dispatch_id)
+    assert attempt is not None and attempt.lifecycle_state == journal.ATTEMPT_TERMINAL, attempt
+
+
+def test_terminal_commit_prefers_fresh_dead_probe_to_stale_identity_reason(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    record = {
+        "dispatch_id": "fresh-dead-probe",
+        "project_root": str(project),
+        "worker_identity_reason": "identity_indeterminate",
+    }
+    result = ledger.commit_terminal_authority(
+        record,
+        state="blocked",
+        reason={
+            "reason": "worker reported BLOCKED",
+            "marker_kind": "BLOCKED",
+            "text": "fresh-dead-probe — cannot proceed",
+        },
+        worker_still_alive=False,
+    )
+    assert result.committed, result
+    attempt = journal.Journal(project).attempt_for_dispatch("fresh-dead-probe")
+    assert attempt is not None and attempt.lifecycle_state == journal.ATTEMPT_TERMINAL, attempt
+
+
 def test_terminal_sidecar_terminalizes_genuinely_dead_worker(
     tmp_path: Path, spawn_worker: SpawnWorker
 ) -> None:
@@ -384,7 +517,7 @@ def test_pending_sidecar_settles_only_after_worker_death(
     if denied_probe:
         assert worker is not None
         original_kill = os.kill
-        original_check_output = subprocess.check_output
+        original_run_with_deadline = goalflight_subprocess.run_with_deadline
         probe_calls: list[list[str]] = []
 
         def denied_kill(pid, sig):
@@ -403,12 +536,12 @@ def test_pending_sidecar_settles_only_after_worker_death(
                         1, command, stderr="ps: Operation not permitted"
                     )
                 raise PermissionError(probe_errno, os.strerror(probe_errno))
-            return original_check_output(command, *args, **kwargs)
+            return original_run_with_deadline(command, *args, **kwargs)
 
         if denied_probe == "kill":
             monkeypatch.setattr(os, "kill", denied_kill)
         else:
-            monkeypatch.setattr(subprocess, "check_output", denied_ps)
+            monkeypatch.setattr(goalflight_subprocess, "run_with_deadline", denied_ps)
     reconciled = _reconcile(project)
     if denied_probe and denied_probe != "kill" and not already_terminal:
         assert probe_calls, "the combined ps probe must be forced through the stub"

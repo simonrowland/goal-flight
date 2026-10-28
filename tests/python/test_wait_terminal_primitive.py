@@ -106,7 +106,111 @@ def test_waiter_observes_dead_worker_without_casting_terminal_verdict() -> None:
     )
     assert_eq("dead worker remains nonterminal", row["terminal"], False)
     assert_eq("classifier state preserved", row["state"], "unknown_no_pid")
-    assert_eq("dead observation retained", row["progress"]["worker_alive"], False)
+    assert_eq("no pid remains an unknown observation", row["progress"]["worker_alive"], None)
+
+
+def test_no_pid_is_unknown_for_blocked_attention_terminality() -> None:
+    record = {
+        "dispatch_id": "no-pid-blocked",
+        "state": "watcher_stopped",
+        "attention_marker": {
+            "kind": "BLOCKED",
+            "text": "no-pid-blocked — waiting for controller",
+        },
+    }
+    assert_eq(
+        "no pid liveness is indeterminate",
+        status._wait_worker_liveness_detail(record),
+        (status._WAIT_LIVENESS_INDETERMINATE, "no_pid"),
+    )
+    assert_eq("no pid remains pending for terminal checks", status._terminal_done_code(record), 2)
+
+
+def test_raw_string_attention_marker_wakes_wait_before_terminal_commit() -> None:
+    for sidecar_state in ("running", "watcher_stopped"):
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatch_id = f"raw-attention-{sidecar_state}"
+            status_path = Path(tmp) / f"{dispatch_id}.status.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": sidecar_state,
+                        "worker_pid": os.getpid(),
+                        "terminal_pending_state": "blocked",
+                        "attention_marker": "BLOCKED",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raw = {
+                "dispatch_id": dispatch_id,
+                "state": "running",
+                "classification": status._LIVE_CLASS,
+                "worker_pid": os.getpid(),
+                "status_path": str(status_path),
+            }
+            sidecar = status._wait_status_sidecar(raw, dispatch_id)
+            record = status._wait_record_from_snapshots(
+                dispatch_id, raw, sidecar, None
+            )
+            assert_true("wait record exists", isinstance(record, dict))
+            row = _row(_payload(record), dispatch_id, now=10_000.0)
+
+        assert_eq(f"{sidecar_state} wakes --wait", row["done_code"], 0)
+        assert_eq(f"{sidecar_state} remains nonterminal", row["terminal"], False)
+        assert_eq(
+            "raw attention marker is normalized",
+            record.get("attention_marker"),
+            {"kind": "BLOCKED"},
+        )
+
+
+def test_idle_backstop_attention_yields_to_later_complete_tail_after_death() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dispatch_id = "idle-blocked-then-complete"
+        tail = Path(tmp) / "worker.tail"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n"
+            f"COMPLETE: {dispatch_id} — finished work\n",
+            encoding="utf-8",
+        )
+        identity = {"pid": 43210, "start_token": "test:43210:generation-1"}
+        raw = {
+            "dispatch_id": dispatch_id,
+            "state": "running",
+            "worker_pid": identity["pid"],
+            "worker_identity": identity,
+            "started_at": status.goalflight_ledger.utc_now(),
+        }
+        sidecar = {
+            "dispatch_id": dispatch_id,
+            "state": "watcher_stopped",
+            "worker_pid": identity["pid"],
+            "expected_worker_identity": identity,
+            "tail_path": str(tail),
+            "terminal_pending_state": "blocked",
+            "attention_marker": {
+                "kind": "BLOCKED",
+                "dispatch_id": dispatch_id,
+                "sequence": 1,
+                "text": f"{dispatch_id} — waiting for controller",
+            },
+        }
+        saved_identity = status.goalflight_ledger.identity_matches
+        status.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        try:
+            record = status._wait_record_from_snapshots(
+                dispatch_id, raw, sidecar, {"lifecycle_state": "RUNNING"}
+            )
+            assert_true("wait snapshot record exists", isinstance(record, dict))
+            row = _row(_payload(record), dispatch_id, now=10_000.0)
+        finally:
+            status.goalflight_ledger.identity_matches = saved_identity
+
+    assert_eq("tail COMPLETE supersedes frozen BLOCKED", record["state"], "complete")
+    assert_eq("wait row reports terminal complete", row["state"], "complete")
+    assert_eq("wait row is terminal", row["terminal"], True)
 
 
 def test_stale_dead_without_marker_terminalizes_wait_as_worker_dead() -> None:
@@ -715,6 +819,73 @@ def test_terminal_journal_outbox_wins_live_ledger() -> None:
     )
 
 
+def test_committed_failed_journal_outweighs_synthesized_blocked_marker() -> None:
+    original_identity_matches = status.goalflight_ledger.identity_matches
+    original_pid_alive = compat.pid_alive
+    status.goalflight_ledger.identity_matches = lambda _record: (True, "live")
+    compat.pid_alive = lambda _pid: True  # type: ignore[assignment]
+    try:
+        for dispatch_id, worker_identity in (
+            ("journal-failed-live", {"pid": 4242, "start_token": "test:4242:g1"}),
+            ("journal-failed-unknown", None),
+        ):
+            sidecar_marker = {
+                "kind": "BLOCKED",
+                "dispatch_id": dispatch_id,
+                "line": 7,
+                "text": f"{dispatch_id} — synthesized attention",
+            }
+            raw = {
+                "dispatch_id": dispatch_id,
+                "state": "running",
+                "worker_pid": 4242,
+            }
+            if worker_identity is not None:
+                raw["worker_identity"] = worker_identity
+            record = status._wait_record_from_snapshots(
+                dispatch_id,
+                raw,
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "worker_pid": 4242,
+                    "attention_marker": sidecar_marker,
+                },
+                {
+                    "lifecycle_state": "TERMINAL",
+                    "terminal_state": "failed",
+                    "terminal_outcome_json": json.dumps(
+                        {
+                            "state": "failed",
+                            "worker_still_alive": True,
+                            "outcome": {
+                                "error": {
+                                    "marker_kind": "BLOCKED",
+                                    "text": sidecar_marker["text"],
+                                }
+                            },
+                        }
+                    ),
+                    "event_type": "failed",
+                    "payload_json": json.dumps({"text": sidecar_marker["text"]}),
+                },
+            )
+            assert_true("journal snapshot exists", isinstance(record, dict))
+            assert_eq("journal authority retained", record.get("_wait_journal_terminal"), True)
+            assert_eq(
+                "journal failure marker source retained",
+                record.get("terminal_marker", {}).get("kind"),
+                "BLOCKED",
+            )
+            row = _row(_payload(record), dispatch_id, now=10_000.0)
+            assert_eq(f"{dispatch_id} done code", row["done_code"], 0)
+            assert_eq(f"{dispatch_id} terminal", row["terminal"], True)
+            assert_eq(f"{dispatch_id} terminal state", row["state"], "failed")
+    finally:
+        status.goalflight_ledger.identity_matches = original_identity_matches
+        compat.pid_alive = original_pid_alive  # type: ignore[assignment]
+
+
 def test_journal_terminal_supersedes_contradictory_sidecar_marker() -> None:
     contradictory = {
         "dispatch_id": "journal-blocked",
@@ -993,6 +1164,9 @@ def main() -> None:
     tests = [
         test_arming_a_wait_announces_mail_before_it_blocks,
         test_waiter_observes_dead_worker_without_casting_terminal_verdict,
+        test_no_pid_is_unknown_for_blocked_attention_terminality,
+        test_raw_string_attention_marker_wakes_wait_before_terminal_commit,
+        test_idle_backstop_attention_yields_to_later_complete_tail_after_death,
         test_stale_dead_without_marker_terminalizes_wait_as_worker_dead,
         test_stale_dead_complete_tail_wins_before_watcher_final_write,
         test_stale_dead_complete_survives_trailing_ready_pointer,
@@ -1010,6 +1184,7 @@ def main() -> None:
         test_finished_ledger_is_not_resurrected_by_stale_running_sidecar,
         test_live_sidecar_still_overlays_nonterminal_ledger,
         test_terminal_journal_outbox_wins_live_ledger,
+        test_committed_failed_journal_outweighs_synthesized_blocked_marker,
         test_journal_terminal_supersedes_contradictory_sidecar_marker,
         test_unreadable_journal_preserves_corroborated_file_terminal,
         test_unreadable_journal_requires_matching_terminal_snapshots,

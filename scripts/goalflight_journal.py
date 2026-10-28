@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Generic, TypeVar
 
 
@@ -56,8 +56,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import goalflight_compat  # noqa: E402
+from goalflight_controller_label import (  # noqa: E402
+    ControllerLabelValidationError,
+    validate_controller_label,
+)
 import goalflight_task  # noqa: E402
 import goalflight_wake  # noqa: E402
+from goalflight_liveness import host_slept_recently  # noqa: E402
 
 
 CURRENT_SCHEMA_EPOCH = 6
@@ -333,6 +338,33 @@ class JournalIOError(JournalUnavailable):
     reason = "journal-io-failure"
 
 
+def validate_dispatch_owner_fields(payload: Mapping[str, object]) -> None:
+    """Normalize blank labels and validate persisted dispatch owner fields."""
+    # The live ledger scan found 0 malformed labels among 4,734 populated labels
+    # across 4,739 rows. The owner's scope excludes hand corruption, so reject
+    # bad values at writes instead of adding another defensive check to each reader.
+    containers: list[tuple[str, Mapping[str, object]]] = [("", payload)]
+    for key in ("request", "request_envelope"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            containers.append((key, nested))
+            if key == "request_envelope":
+                request = nested.get("request")
+                if isinstance(request, Mapping):
+                    containers.append(("request_envelope.request", request))
+    for prefix, container in containers:
+        for key in ("controller_label", "owner_controller_label"):
+            if key in container:
+                field = f"{prefix}.{key}" if prefix else key
+                normalized = validate_controller_label(container[key], field=field)
+                if normalized != container[key]:
+                    if not isinstance(container, MutableMapping):
+                        raise ControllerLabelValidationError(
+                            f"{field} must be writable to normalize its controller label"
+                        )
+                    container[key] = normalized
+
+
 # Operator-facing repair pointers. Keep these as the first clause of a refusal
 # (the arithmetic is context). Commands named here must exist.
 _RESUME_SKILL_COMMAND = "/goal-flight resume"
@@ -524,6 +556,13 @@ class RowOperation:
         expected_rows: int | None = None,
         row_cap: int | None = None,
     ) -> None:
+        if (
+            isinstance(table, str)
+            and table.casefold() == "controller_stream_cursors"
+        ):
+            raise ValueError(
+                "controller_stream_cursors may only be written through the carrier-safe cursor choke point"
+            )
         sql, parameters, parameter_bytes = _compile_row_operation(
             kind=kind,
             table=table,
@@ -857,6 +896,11 @@ def resolve_journal_path(project_root: Path | str) -> Path:
         raise JournalIOError(
             f"unresolvable project root {project_root}: journal path cannot be resolved"
         )
+    return _resolve_journal_path_for_resolved_root(root)
+
+
+def _resolve_journal_path_for_resolved_root(root: Path) -> Path:
+    """Resolve the journal path when the caller already has its canonical root."""
     task_store = goalflight_task.resolve_task_store_dir(root)
     override = os.environ.get("GOALFLIGHT_JOURNAL_DIR", "").strip()
     state_base = Path(override).expanduser() if override else task_store.parents[1]
@@ -1301,8 +1345,33 @@ class Journal:
             raise JournalIOError(
                 f"unresolvable project root {project_root}: journal cannot be read"
             )
+        return cls._open_reader_for_resolved_root(
+            root,
+            client_epochs=client_epochs,
+            persistent=persistent,
+            retry_budget_s=retry_budget_s,
+            open_retry_budget_s=open_retry_budget_s,
+            transaction_budget_s=transaction_budget_s,
+            jitter_min_s=jitter_min_s,
+            jitter_max_s=jitter_max_s,
+        )
+
+    @classmethod
+    def _open_reader_for_resolved_root(
+        cls,
+        root: Path,
+        *,
+        client_epochs: ClientEpochs | None = None,
+        persistent: bool = False,
+        retry_budget_s: float = JOURNAL_READER_RETRY_BUDGET_S,
+        open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
+        transaction_budget_s: float = 1.0,
+        jitter_min_s: float = 0.005,
+        jitter_max_s: float = 0.050,
+    ) -> "Journal":
+        """Open a reader for a root already resolved by its caller."""
         self = cls.__new__(cls)
-        self._configure(
+        self._configure_resolved_root(
             root,
             client_epochs=client_epochs,
             allow_migration=False,
@@ -1331,6 +1400,30 @@ class Journal:
         jitter_min_s: float,
         jitter_max_s: float,
     ) -> None:
+        root = goalflight_task.resolve_project_root(str(project_root))
+        self._configure_resolved_root(
+            root,
+            client_epochs=client_epochs,
+            allow_migration=allow_migration,
+            retry_budget_s=retry_budget_s,
+            open_retry_budget_s=open_retry_budget_s,
+            transaction_budget_s=transaction_budget_s,
+            jitter_min_s=jitter_min_s,
+            jitter_max_s=jitter_max_s,
+        )
+
+    def _configure_resolved_root(
+        self,
+        project_root: Path,
+        *,
+        client_epochs: ClientEpochs | None,
+        allow_migration: bool | None,
+        retry_budget_s: float,
+        open_retry_budget_s: float,
+        transaction_budget_s: float,
+        jitter_min_s: float,
+        jitter_max_s: float,
+    ) -> None:
         if not 0 <= retry_budget_s < float("inf"):
             raise ValueError("retry_budget_s must be finite and >= 0")
         if not 0 <= open_retry_budget_s < float("inf"):
@@ -1339,8 +1432,8 @@ class Journal:
             raise ValueError("transaction_budget_s must be > 0")
         if not 0 <= jitter_min_s <= jitter_max_s:
             raise ValueError("journal jitter bounds are invalid")
-        self.project_root = goalflight_task.resolve_project_root(str(project_root))
-        self.path = resolve_journal_path(self.project_root)
+        self.project_root = project_root
+        self.path = _resolve_journal_path_for_resolved_root(self.project_root)
         self.client_epochs = client_epochs or ClientEpochs()
         self.allow_migration = (
             os.environ.get(ALLOW_MIGRATION_ENV) == "1"
@@ -1357,6 +1450,7 @@ class Journal:
         self._reader_connection: sqlite3.Connection | None = None
         self._reader_pid: int | None = None
         self._file_identity: tuple[int, int] | None = None
+        self._cursor_write_context = threading.local()
 
     def _acquire_construction_lock(self) -> tuple[goalflight_task.FileLock, float]:
         """Bound construction flock to the same retry budget as the open stages.
@@ -1658,6 +1752,7 @@ class Journal:
             try:
                 configured = False
                 try:
+                    connection.set_authorizer(self._authorize_sqlite_write)
                     connection.row_factory = sqlite3.Row
                     connection.execute("PRAGMA busy_timeout = 0")
                     connection.execute("PRAGMA foreign_keys = ON")
@@ -1702,6 +1797,41 @@ class Journal:
                 if _is_corruption_error(exc):
                     self._handle_corruption(exc, run_integrity_check=False)
                 raise
+
+    def _authorize_sqlite_write(
+        self,
+        action: int,
+        table: str | None,
+        _column: str | None,
+        _database: str | None,
+        _trigger: str | None,
+    ) -> int:
+        if (
+            action
+            in {
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+            }
+            and isinstance(table, str)
+            and table.casefold() == "controller_stream_cursors"
+            and getattr(self._cursor_write_context, "depth", 0) < 1
+        ):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    @contextlib.contextmanager
+    def _cursor_write_scope(self):
+        """Authorize cursor-table SQL only for a call from the carrier clamp."""
+        depth = getattr(self._cursor_write_context, "depth", 0)
+        self._cursor_write_context.depth = depth + 1
+        try:
+            yield
+        finally:
+            if depth:
+                self._cursor_write_context.depth = depth
+            else:
+                del self._cursor_write_context.depth
 
     def _startup_integrity_check(
         self,
@@ -2962,6 +3092,13 @@ class Journal:
                 )
             if type(operation).__init__ is not RowOperation.__init__:
                 raise TypeError("RowOperation subclasses may not override __init__()")
+            if (
+                isinstance(operation.table, str)
+                and operation.table.casefold() == "controller_stream_cursors"
+            ):
+                raise JournalError(
+                    "controller_stream_cursors may only be written through the carrier-safe cursor choke point"
+                )
             compiled_method = getattr(operation.compiled, "__func__", None)
             if compiled_method is not RowOperation.compiled:
                 raise TypeError("RowOperation subclasses may not override compiled()")
@@ -3560,6 +3697,7 @@ class Journal:
     # and exact generation+nonce+renewal CAS leaves concurrent claims untouched.
     def expire_stale_leases(self) -> WriteResult[list[dict[str, object]]]:
         proven_dead: list[tuple[str, int, str, str]] = []
+        slept_recently = host_slept_recently()
         for row in self.lease_records():
             label = str(row["label"])
             nonce = str(row["nonce"])
@@ -3574,6 +3712,36 @@ class Journal:
                 # Probe failure is indeterminate. Keeping routing state is the
                 # recoverable, fail-closed outcome.
                 continue
+            if alive is False and slept_recently:
+                # A sleeping controller may have lost a transient lock witness
+                # on resume. Re-probe the generation, then verify its recorded
+                # process identity before sweeping it.
+                try:
+                    alive = goalflight_wake.lease_holder_alive(
+                        self.project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if alive is False:
+                    incumbent = self.active_lease(label)
+                    principal = incumbent.principal if incumbent else {}
+                    pid = principal.get("pid")
+                    start_token = principal.get("start_token")
+                    if (
+                        isinstance(pid, int)
+                        and isinstance(start_token, str)
+                        and principal.get("hostname") == socket.gethostname()
+                    ):
+                        try:
+                            identity_alive = goalflight_compat.process_identity_matches(
+                                pid, start_token
+                            )
+                        except (OSError, RuntimeError, ValueError):
+                            identity_alive = None
+                        if identity_alive is not False:
+                            continue
             if alive is False:
                 proven_dead.append(
                     (label, int(row["generation"]), nonce, str(row["renewed_at"]))
@@ -3608,10 +3776,11 @@ class Journal:
         generation: int,
         horizon_s: float = DEFAULT_LEASE_HORIZON_S,
     ) -> WriteResult[LeaseIdentity]:
-        """Renew only the pinned active generation, without expiry or creation.
+        """Renew the pinned active generation and its registry heartbeat.
 
         The caller checks holder liveness. Death after that check can leave a
         renewed lease to lapse at its next deadline; it never mints a generation.
+        ``renewed_at`` is also the controller roster's heartbeat timestamp.
         """
         resolved_label = self._identity_token(label, label="controller label")
         resolved_nonce = self._identity_token(nonce, label="lease nonce")
@@ -3619,12 +3788,23 @@ class Journal:
             raise ValueError("lease horizon must be in (0, 604800] seconds")
 
         def action(connection: sqlite3.Connection) -> LeaseIdentity:
-            cursor = connection.execute(
-                """UPDATE controller_leases SET renew_deadline_at = ?
+            current = connection.execute(
+                """SELECT renewed_at FROM controller_leases
                    WHERE project_root = ? AND label = ? AND nonce = ?
                      AND generation = ? AND state = 'ACTIVE'""",
-                (_utc_after(horizon_s), str(self.project_root), resolved_label,
-                 resolved_nonce, generation),
+                (str(self.project_root), resolved_label, resolved_nonce, generation),
+            ).fetchone()
+            if current is None:
+                raise CASMismatch("active lease generation or nonce changed")
+            previous_renewed_at = str(current["renewed_at"])
+            renewed_at = _next_lease_renewed_at(previous_renewed_at)
+            cursor = connection.execute(
+                """UPDATE controller_leases
+                   SET renewed_at = ?, renew_deadline_at = ?
+                   WHERE project_root = ? AND label = ? AND nonce = ?
+                     AND generation = ? AND state = 'ACTIVE' AND renewed_at = ?""",
+                (renewed_at, _utc_after(horizon_s), str(self.project_root),
+                 resolved_label, resolved_nonce, generation, previous_renewed_at),
             )
             if cursor.rowcount != 1:
                 raise CASMismatch("active lease generation or nonce changed")
@@ -3949,6 +4129,14 @@ class Journal:
             WHERE exact.project_root = ?
               AND exact.recipient_label = ?
               AND exact.withdrawn_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM terminal_outbox AS terminal
+                  JOIN dispatch_attempts AS attempt
+                    ON attempt.attempt_id = terminal.attempt_id
+                  WHERE terminal.event_uuid = exact.event_uuid
+                    AND attempt.dispatch_id = exact.stream_id
+                    AND attempt.owner_controller_label = exact.recipient_label
+              )
               AND (
                     exact.projected_at IS NULL
                     OR exact.stream_seq > COALESCE(cursor.position, 0)
@@ -4137,6 +4325,155 @@ class Journal:
                 **expected,
                 "created_at": created_at,
             }
+
+        return self._domain_write(action)
+
+    def _repair_delivery_event_sequence(
+        self,
+        *,
+        recipient_label: str,
+        origin_node: str,
+        event_uuid: str,
+        stream_id: str,
+        old_stream_seq: int,
+        stream_seq: int,
+        carrier_path: Path | str,
+        event_type: str,
+        wake_class: str,
+        created_at: str,
+    ) -> WriteResult[dict[str, object] | None]:
+        """Repair a legacy sequence only when a listener proves carrier identity.
+
+        The caller supplies the sequence read from the matching carrier row.
+        Every other immutable delivery field must still agree. Cursors that
+        already crossed the carrier position rewind to just before it so the
+        corrected delivery is pending again.
+        """
+        recipient = (
+            "*"
+            if recipient_label == "*"
+            else self._identity_token(recipient_label, label="recipient label")
+        )
+        origin = self._identity_token(origin_node, label="origin node")
+        event_id = self._canonical_uuid(event_uuid, label="event_uuid")
+        stream = self._identity_token(stream_id, label="stream id")
+        kind = self._identity_token(event_type, label="event type")
+        if (
+            not isinstance(old_stream_seq, int)
+            or isinstance(old_stream_seq, bool)
+            or old_stream_seq < 1
+            or not isinstance(stream_seq, int)
+            or isinstance(stream_seq, bool)
+            or stream_seq < 1
+        ):
+            raise ValueError("delivery repair sequences must be positive integers")
+        if wake_class not in {"waking", "quiet"} or _parse_utc(created_at) is None:
+            raise ValueError("delivery repair metadata is invalid")
+        path = str(Path(carrier_path).resolve(strict=False))
+        project_root = str(self.project_root)
+
+        def action(connection: sqlite3.Connection) -> dict[str, object] | None:
+            row = connection.execute(
+                """SELECT * FROM delivery_events
+                   WHERE project_root = ? AND recipient_label = ?
+                     AND origin_node = ? AND event_uuid = ?""",
+                (project_root, recipient, origin, event_id),
+            ).fetchone()
+            if row is None or row["withdrawn_at"] is not None:
+                return None
+            expected = {
+                "stream_id": stream,
+                "carrier_path": path,
+                "event_type": kind,
+                "wake_class": wake_class,
+                "created_at": created_at,
+            }
+            if any(row[key] != value for key, value in expected.items()):
+                raise JournalIntegrityError(
+                    "delivery sequence repair refused: immutable event identity differs"
+                )
+            current_seq = int(row["stream_seq"])
+            if current_seq == stream_seq:
+                return dict(row)
+            if current_seq != old_stream_seq:
+                raise CASMismatch(
+                    "delivery sequence repair lost: assignment changed during recovery"
+                )
+            cursor_labels = self._cursor_labels_for_delivery_invalidation(
+                connection,
+                project_root=project_root,
+                recipient_label=recipient,
+            )
+            rewound_labels: set[str] = set()
+            for label in cursor_labels:
+                cursor = connection.execute(
+                    """SELECT position FROM controller_stream_cursors
+                       WHERE project_root = ? AND label = ? AND stream_id = ?""",
+                    (project_root, label, stream),
+                ).fetchone()
+                if cursor is not None and int(cursor["position"]) >= stream_seq:
+                    metadata = connection.execute(
+                        """SELECT registry_generation, cursor_version
+                           FROM controller_cursors
+                           WHERE project_root = ? AND label = ?""",
+                        (project_root, label),
+                    ).fetchone()
+                    assert metadata is not None
+                    self._write_cursor_positions(
+                        connection,
+                        resolved_label=label,
+                        generation=int(metadata["registry_generation"]),
+                        current_cursor_version=int(metadata["cursor_version"]),
+                        normalized_advances={stream: stream_seq - 1},
+                        current_positions={stream: int(cursor["position"])},
+                        actor_value="delivery-sequence-repair",
+                    )
+                    rewound_labels.add(label)
+            collision = connection.execute(
+                """SELECT event_uuid FROM delivery_events
+                   WHERE project_root = ? AND recipient_label = ? AND stream_id = ?
+                     AND stream_seq = ? AND withdrawn_at IS NULL
+                     AND NOT (origin_node = ? AND event_uuid = ?)
+                   LIMIT 1""",
+                (project_root, recipient, stream, stream_seq, origin, event_id),
+            ).fetchone()
+            if collision is not None:
+                raise JournalIntegrityError(
+                    "delivery sequence repair refused: carrier position is assigned to another event"
+                )
+            now = utc_now()
+            updated = connection.execute(
+                """UPDATE delivery_events SET stream_seq = ?
+                   WHERE project_root = ? AND recipient_label = ?
+                     AND origin_node = ? AND event_uuid = ? AND stream_seq = ?
+                     AND withdrawn_at IS NULL""",
+                (stream_seq, project_root, recipient, origin, event_id, old_stream_seq),
+            )
+            if updated.rowcount != 1:
+                raise CASMismatch("delivery sequence repair lost during update")
+            connection.execute(
+                """UPDATE wake_webhook_outbox SET stream_seq = ?
+                   WHERE project_root = ? AND recipient_label = ?
+                     AND origin_node = ? AND event_uuid = ?""",
+                (stream_seq, project_root, recipient, origin, event_id),
+            )
+            for label in cursor_labels:
+                if label in rewound_labels:
+                    continue
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=label,
+                    updated_at=now,
+                )
+            repaired = connection.execute(
+                """SELECT * FROM delivery_events
+                   WHERE project_root = ? AND recipient_label = ?
+                     AND origin_node = ? AND event_uuid = ?""",
+                (project_root, recipient, origin, event_id),
+            ).fetchone()
+            assert repaired is not None
+            return dict(repaired)
 
         return self._domain_write(action)
 
@@ -4675,13 +5012,29 @@ class Journal:
                 requested_position,
             ),
         ).fetchall()
-        material = "|".join(
-            f"{int(row['rowid'])}:{1 if row['projected_at'] is not None else 0}"
-            for row in rows
-        )
-        return hashlib.sha256(material.encode("ascii")).hexdigest(), any(
+        return Journal._cursor_snapshot_token(rows), any(
             row["projected_at"] is None for row in rows
         )
+
+    @staticmethod
+    def _cursor_snapshot_token(rows: Iterable[Mapping[str, object]]) -> str:
+        """Hash exactly the selected recipient-visible prefix."""
+        def read(row, key: str, default=None):
+            try:
+                return row[key]
+            except (IndexError, KeyError, TypeError):
+                return default
+
+        ordered = sorted(
+            rows,
+            key=lambda row: int(read(row, "_cursor_rowid", read(row, "rowid", 0))),
+        )
+        material = "|".join(
+            f"{int(read(row, '_cursor_rowid', read(row, 'rowid', 0)))}:"
+            f"{1 if read(row, 'projected_at') is not None else 0}"
+            for row in ordered
+        )
+        return hashlib.sha256(material.encode("ascii")).hexdigest()
 
     @staticmethod
     def _begin_cursor_read_snapshot(connection: sqlite3.Connection) -> None:
@@ -4690,26 +5043,45 @@ class Journal:
     @staticmethod
     def _cursor_pending_sql(
         *,
+        label: str,
+        project_root: str,
         waking_only: bool,
         stream_ids: tuple[str, ...] | None,
+        after_positions: Mapping[str, int],
         limit: int,
     ) -> tuple[str, list[object]]:
-        """Projected live rows past the recipient cursor, optionally one stream set."""
-        sql = """
-            SELECT e.*
+        """Live rows past the recipient cursor and optional report boundary."""
+        parameters: list[object] = []
+        sql = ""
+        if after_positions:
+            streams = tuple(sorted(after_positions))
+            sql += (
+                "WITH suppressed(stream_id, position) AS (VALUES "
+                + ",".join("(?, ?)" for _ in streams)
+                + ")\n"
+            )
+            for stream_id in streams:
+                parameters.extend((stream_id, after_positions[stream_id]))
+        sql += """
+            SELECT e.rowid AS _cursor_rowid, e.*
             FROM delivery_events AS e
             LEFT JOIN controller_stream_cursors AS c
               ON c.project_root = e.project_root
              AND c.label = ?
              AND c.stream_id = e.stream_id
+        """
+        if after_positions:
+            sql += " LEFT JOIN suppressed AS s ON s.stream_id = e.stream_id\n"
+        sql += """
             WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
-              AND e.projected_at IS NOT NULL
               AND e.withdrawn_at IS NULL
               AND e.stream_seq > COALESCE(c.position, 0)
         """
+        if after_positions:
+            sql += " AND (s.position IS NULL OR e.stream_seq > s.position)"
+        parameters.extend((label, project_root, label))
         if waking_only:
             sql += " AND e.wake_class = 'waking'"
-        parameters: list[object] = []
         if stream_ids:
             sql += " AND e.stream_id IN (" + ",".join("?" for _ in stream_ids) + ")"
             parameters.extend(stream_ids)
@@ -4725,6 +5097,7 @@ class Journal:
         waking_only: bool = False,
         limit: int = 1000,
         complete_addressed_streams: bool = False,
+        after_positions: Mapping[str, int] | None = None,
     ) -> CursorPeek:
         """Return one server-side cursor snapshot without advancing it.
 
@@ -4732,11 +5105,23 @@ class Journal:
         cap can cut between two positions addressed to this recipient on
         one stream. Completing each mentioned stream (not every stream)
         keeps the snapshot and the ack position on the same max.
+
+        ``after_positions`` excludes already-reported positions in SQL, before
+        the global item cap, so those rows cannot crowd newer mail out.
         """
         resolved_label = self._identity_token(label, label="controller label")
         resolved_nonce = (
             self._identity_token(nonce, label="lease nonce") if nonce is not None else None
         )
+        resolved_after_positions: dict[str, int] = {}
+        for stream_id, position in (after_positions or {}).items():
+            resolved_stream = self._identity_token(stream_id, label="stream id")
+            if not isinstance(position, int) or isinstance(position, bool) or position < 0:
+                raise ValueError("cursor peek boundary positions must be non-negative integers")
+            if position:
+                resolved_after_positions[resolved_stream] = position
+        if len(resolved_after_positions) > 1000:
+            raise ValueError("cursor peek accepts at most 1000 boundary streams")
         if not 1 <= limit <= 10_000:
             raise ValueError("cursor peek limit must be between 1 and 10000")
         project_root = str(self.project_root)
@@ -4765,11 +5150,14 @@ class Journal:
             if cursor is None or int(cursor["registry_generation"]) != int(lease["generation"]):
                 raise JournalIntegrityError("active lease is missing its generation-matched cursor")
             sql, extra = self._cursor_pending_sql(
-                waking_only=waking_only, stream_ids=None, limit=limit
+                label=resolved_label,
+                project_root=project_root,
+                waking_only=waking_only,
+                stream_ids=None,
+                after_positions=resolved_after_positions,
+                limit=limit,
             )
-            rows = connection.execute(
-                sql, [resolved_label, project_root, resolved_label, *extra]
-            ).fetchall()
+            rows = connection.execute(sql, extra).fetchall()
             if complete_addressed_streams and rows:
                 # Max per stream, not one located row: a cursor means
                 # seen-through-here. Two envelopes to this recipient on one
@@ -4783,14 +5171,14 @@ class Journal:
                     dict.fromkeys(str(row["stream_id"]) for row in rows)
                 )
                 sql, extra = self._cursor_pending_sql(
+                    label=resolved_label,
+                    project_root=project_root,
                     waking_only=waking_only,
                     stream_ids=stream_ids,
+                    after_positions=resolved_after_positions,
                     limit=10_000,
                 )
-                rows = connection.execute(
-                    sql,
-                    [resolved_label, project_root, resolved_label, *extra],
-                ).fetchall()
+                rows = connection.execute(sql, extra).fetchall()
             positions: dict[str, int] = {}
             for row in rows:
                 stream_id = str(row["stream_id"])
@@ -4818,6 +5206,65 @@ class Journal:
             )
 
         return self._read_with_retry("journal cursor peek", action)
+
+    def _cursor_rows_for_safe_advance(
+        self,
+        label: str,
+        *,
+        positions: Mapping[str, int] | None,
+    ) -> tuple[dict[str, int], list[dict[str, object]]]:
+        """Read pending assignments and cursor positions as one safety snapshot."""
+        resolved_label = self._identity_token(label, label="cursor label")
+        normalized_positions: dict[str, int] | None = None
+        if positions is not None:
+            normalized_positions = {}
+            for stream, position in positions.items():
+                resolved_stream = self._identity_token(stream, label="cursor stream")
+                if not isinstance(position, int) or isinstance(position, bool) or position < 0:
+                    raise ValueError("cursor position is invalid")
+                normalized_positions[resolved_stream] = position
+        project_root = str(self.project_root)
+
+        def action(connection: sqlite3.Connection):
+            self._begin_cursor_read_snapshot(connection)
+            current_positions = {
+                str(row["stream_id"]): int(row["position"])
+                for row in connection.execute(
+                    """SELECT stream_id, position FROM controller_stream_cursors
+                       WHERE project_root = ? AND label = ?""",
+                    (project_root, resolved_label),
+                )
+            }
+            sql = """
+                SELECT e.rowid AS _cursor_rowid, e.*
+                FROM delivery_events AS e
+                LEFT JOIN controller_stream_cursors AS c
+                  ON c.project_root = e.project_root
+                 AND c.label = ?
+                 AND c.stream_id = e.stream_id
+                WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
+                  AND e.withdrawn_at IS NULL
+                  AND e.stream_seq > COALESCE(c.position, 0)
+            """
+            parameters: list[object] = [resolved_label, project_root, resolved_label]
+            if normalized_positions is not None:
+                streams = tuple(sorted(normalized_positions))
+                if not streams:
+                    return current_positions, []
+                sql += " AND e.stream_id IN (" + ",".join("?" for _ in streams) + ")"
+                parameters.extend(streams)
+            sql += " ORDER BY e.stream_id, e.stream_seq, e.rowid"
+            rows = [dict(row) for row in connection.execute(sql, parameters).fetchall()]
+            if normalized_positions is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if int(row["stream_seq"])
+                    <= normalized_positions.get(str(row["stream_id"]), -1)
+                ]
+            return current_positions, rows
+
+        return self._read_with_retry("cursor safe-prefix snapshot", action)
 
     def pending_delivery_events(
         self,
@@ -4943,6 +5390,48 @@ class Journal:
         return has_unprojected or current_snapshot != expected_stream_snapshot
 
     def advance_cursor(
+        self,
+        label: str,
+        *,
+        nonce: str | None,
+        expected_cursor_version: int,
+        expected_stream_snapshots: Mapping[str, str],
+        advances: Mapping[str, int],
+        actor: str,
+        allow_no_lease: bool = False,
+    ) -> WriteResult[dict[str, object]]:
+        """Advance a cursor through the carrier-aware safe-prefix choke point."""
+        import goalflight_messages  # type: ignore
+
+        return goalflight_messages._advance_cursor_through_safe_prefix(
+            self,
+            label,
+            mode="advance",
+            nonce=nonce,
+            expected_cursor_version=expected_cursor_version,
+            expected_stream_snapshots=expected_stream_snapshots,
+            advances=advances,
+            actor=actor,
+            allow_no_lease=allow_no_lease,
+        )
+
+    def _repair_delivery_event_sequence_through_safe_prefix(
+        self,
+        **repair: object,
+    ) -> WriteResult[dict[str, object] | None]:
+        """Route carrier-proven sequence repair and its cursor rewind via the clamp."""
+        import goalflight_messages  # type: ignore
+
+        label = str(repair.get("recipient_label") or "*")
+        return goalflight_messages._advance_cursor_through_safe_prefix(
+            self,
+            label,
+            mode="repair",
+            actor="delivery-sequence-repair",
+            repair=repair,
+        )
+
+    def _advance_cursor_raw(
         self,
         label: str,
         *,
@@ -5104,27 +5593,44 @@ class Journal:
         positions: Mapping[str, int] | None = None,
         actor: str,
     ) -> WriteResult[dict[str, object]]:
-        """Set the owner's private bookmark, without lease or snapshot gates.
+        """Set a bookmark through the same carrier-aware safe-prefix choke point."""
+        import goalflight_messages  # type: ignore
 
-        None drains every currently deliverable stream in this write transaction.
-        Explicit positions are exact, including rewinds and positions whose
-        delivery range has changed. Anything beyond them remains pending.
-        The separate advance_cursor CAS API remains available to non-owner
-        callers such as the orphaned-label operator path.
-        """
+        return goalflight_messages._advance_cursor_through_safe_prefix(
+            self,
+            label,
+            mode="set",
+            positions=positions,
+            actor=actor,
+        )
+
+    def _set_cursor_raw(
+        self,
+        label: str,
+        *,
+        positions: Mapping[str, int],
+        expected_stream_snapshots: Mapping[str, str],
+        actor: str,
+    ) -> WriteResult[dict[str, object]]:
+        """Write selected positions after the carrier-aware choke point validates them."""
         project_root = str(self.project_root)
         resolved_label = self._identity_token(label, label="cursor label")
         actor_value = self._identity_token(actor, label="cursor actor")
-        normalized: dict[str, int] | None = None
-        if positions is not None:
-            if not isinstance(positions, Mapping) or not positions:
-                raise ValueError("cursor positions are empty or invalid")
-            normalized = {}
-            for stream, position in positions.items():
-                resolved_stream = self._identity_token(stream, label="cursor stream")
-                if not isinstance(position, int) or isinstance(position, bool) or position < 0:
-                    raise ValueError("cursor position must be a non-negative integer")
-                normalized[resolved_stream] = position
+        if not isinstance(positions, Mapping):
+            raise ValueError("cursor positions are invalid")
+        normalized: dict[str, int] = {}
+        for stream, position in positions.items():
+            resolved_stream = self._identity_token(stream, label="cursor stream")
+            if not isinstance(position, int) or isinstance(position, bool) or position < 0:
+                raise ValueError("cursor position must be a non-negative integer")
+            normalized[resolved_stream] = position
+        snapshots: dict[str, str] = {}
+        for stream, snapshot in expected_stream_snapshots.items():
+            resolved_stream = self._identity_token(stream, label="cursor snapshot stream")
+            snapshot_value = str(snapshot)
+            if re.fullmatch(r"[0-9a-f]{64}", snapshot_value) is None:
+                raise ValueError("cursor stream snapshot is invalid")
+            snapshots[resolved_stream] = snapshot_value
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
             connection.execute(
@@ -5153,25 +5659,34 @@ class Journal:
                 )
             }
             targets = normalized
-            if targets is None:
-                # No peek limit, lease lookup, or token-producing read/write gap.
-                targets = {
-                    str(row["stream_id"]): int(row["position"])
-                    for row in connection.execute(
-                        """
-                        SELECT e.stream_id, MAX(e.stream_seq) AS position
-                        FROM delivery_events AS e
-                        LEFT JOIN controller_stream_cursors AS c
-                          ON c.project_root = e.project_root AND c.label = ?
-                         AND c.stream_id = e.stream_id
-                        WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
-                          AND e.projected_at IS NOT NULL AND e.withdrawn_at IS NULL
-                          AND e.stream_seq > COALESCE(c.position, 0)
-                        GROUP BY e.stream_id
-                        """,
-                        (resolved_label, project_root, resolved_label),
+            for stream, position in targets.items():
+                current_position = current_positions.get(stream, 0)
+                if position <= current_position:
+                    continue
+                snapshot = snapshots.get(stream)
+                if snapshot is None:
+                    raise CASMismatch(
+                        f"cursor CAS lost: safe-prefix token is missing for {stream}={position}"
                     )
-                }
+                known = connection.execute(
+                    """SELECT 1 FROM delivery_events
+                       WHERE project_root = ? AND recipient_label IN (?, '*')
+                         AND stream_id = ? AND stream_seq = ?
+                         AND projected_at IS NOT NULL AND withdrawn_at IS NULL
+                       LIMIT 1""",
+                    (project_root, resolved_label, stream, position),
+                ).fetchone()
+                if known is None or self._cursor_advance_has_unseen_at_or_below(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=resolved_label,
+                    stream_id=stream,
+                    requested_position=position,
+                    expected_stream_snapshot=snapshot,
+                ):
+                    raise CASMismatch(
+                        f"cursor CAS lost: safe prefix changed at {stream}={position}"
+                    )
             return self._write_cursor_positions(
                 connection,
                 resolved_label=resolved_label,
@@ -5720,14 +6235,11 @@ class Journal:
         supplied_token = (
             self._identity_token(launch_token, label="launch_token") if launch_token else None
         )
-        if (owner_controller_label is None) != (owner_session_nonce is None):
-            raise ValueError(
-                "owner_controller_label and owner_session_nonce must be supplied together"
-            )
-        if owner_controller_label is not None and (
-            not isinstance(owner_controller_label, str) or not owner_controller_label
-        ):
-            raise ValueError("owner_controller_label must be a non-empty string")
+        if owner_session_nonce is not None and owner_controller_label is None:
+            raise ValueError("owner_session_nonce requires owner_controller_label")
+        owner_controller_label = validate_controller_label(
+            owner_controller_label, field="owner_controller_label"
+        )
         if owner_session_nonce is not None and (
             not isinstance(owner_session_nonce, str) or not owner_session_nonce
         ):
@@ -5773,12 +6285,37 @@ class Journal:
                     raise CASMismatch("dispatch already belongs to a different attempt_id")
                 if supplied_token and supplied_token != identity.launch_token:
                     raise CASMismatch("dispatch already belongs to a different launch_token")
-                if owner_controller_label is not None and (
-                    existing["owner_controller_label"] != owner_controller_label
-                    or existing["owner_session_digest"] != owner_session_digest
+                if (
+                    owner_controller_label is not None
+                    and existing["owner_controller_label"] is not None
+                    and (
+                        existing["owner_controller_label"] != owner_controller_label
+                        or (
+                            owner_session_digest is not None
+                            and existing["owner_session_digest"] is not None
+                            and existing["owner_session_digest"] != owner_session_digest
+                        )
+                    )
                 ):
                     raise CASMismatch(
                         "dispatch already belongs to a different owner capability"
+                    )
+                if owner_controller_label is not None and existing["owner_controller_label"] is None:
+                    connection.execute(
+                        """UPDATE dispatch_attempts
+                           SET owner_controller_label = ?, owner_session_digest = ?
+                           WHERE attempt_id = ?""",
+                        (owner_controller_label, owner_session_digest, identity.attempt_id),
+                    )
+                elif (
+                    owner_controller_label is not None
+                    and owner_session_digest is not None
+                    and existing["owner_session_digest"] is None
+                ):
+                    connection.execute(
+                        """UPDATE dispatch_attempts SET owner_session_digest = ?
+                           WHERE attempt_id = ?""",
+                        (owner_session_digest, identity.attempt_id),
                     )
                 if asserted_effective_account is not None and (
                     existing["effective_account"] is not None
@@ -6451,11 +6988,40 @@ class Journal:
         for row in self.pending_outbox(limit=limit):
             payload = json.loads(str(row["payload_json"]))
             try:
+                owner_label = self._terminal_owner_label(row)
+                if owner_label:
+                    stamped = self.prepare_attempt(
+                        str(row["recipient"]),
+                        owner_controller_label=owner_label,
+                    )
+                    if not stamped.committed:
+                        error_type = JournalBusy if stamped.retryable else JournalError
+                        raise error_type(
+                            stamped.reason or "terminal controller owner could not be persisted"
+                        )
+                addressee = (
+                    goalflight_messages.controller_addressee(
+                        owner_label,
+                        project_root=self.project_root,
+                    )
+                    if owner_label and len(owner_label) <= 64
+                    else None
+                )
+                if owner_label and self.active_lease(owner_label) is None:
+                    print(
+                        "GOALFLIGHT-UNROUTABLE "
+                        f"terminal event {row['event_uuid']} remains addressed to "
+                        f"controller {owner_label!r} at {self.project_root}; "
+                        "no active registered controller is available",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 result = goalflight_messages.post_message(
                     dispatch_id=str(row["recipient"]),
                     msg_type=str(row["event_type"]),
                     payload=payload,
                     messages_dir=messages_dir,
+                    addressee=addressee,
                     source={
                         "node": str(row["origin_node"]),
                         "adapter": "journal-outbox",
@@ -6522,6 +7088,25 @@ class Journal:
                 )
         return projected
 
+    def _terminal_owner_label(self, row: Mapping[str, object]) -> str | None:
+        """Return the launch-time owner name, including reparented prelaunch rows."""
+        attempt = self.read_all(
+            "SELECT owner_controller_label FROM dispatch_attempts WHERE attempt_id = ?",
+            (str(row["attempt_id"]),),
+        )
+        owner = str(attempt[0]["owner_controller_label"] or "").strip() if attempt else ""
+        if owner:
+            return owner
+        try:
+            import goalflight_ledger  # type: ignore
+
+            record_path = goalflight_ledger.record_path(str(row["recipient"]), create=False)
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        label = str(record.get("controller_label") or "").strip() if isinstance(record, dict) else ""
+        return label or None
+
     def _complete_terminal_delivery(
         self,
         row: Mapping[str, object],
@@ -6532,23 +7117,14 @@ class Journal:
         """Ensure a carrier-projected terminal has a visible delivery row."""
         origin_node = str(row["origin_node"])
         event_uuid = str(row["event_uuid"])
-        attempt = self.read_all(
-            """SELECT owner_controller_label FROM dispatch_attempts
-               WHERE attempt_id = ?""",
-            (str(row["attempt_id"]),),
-        )
-        owner = str(attempt[0]["owner_controller_label"] or "") if attempt else ""
-        if owner and self.active_lease(owner) is not None:
-            # Attempt ownership is immutable and preserves the full controller
-            # identity even when the presentation-only ledger label truncates
-            # it. Revalidate the lease inside the assignment transaction so a
-            # concurrent retirement falls back to the durable wildcard.
-            recipients = ((owner, True),)
+        owner = self._terminal_owner_label(row)
+        if owner:
+            # Keep the controller recorded at launch as the addressee even if
+            # its lease is unavailable. A stale explicit address is diagnosable;
+            # broadcasting it to unrelated controllers loses ownership.
+            recipients = ((owner, False),)
         else:
-            # A retired or absent attempt owner is unowned work. Snapshot the
-            # complete current roster on every retry and revalidate each label
-            # transactionally; an empty or concurrently retiring roster falls
-            # back to the durable wildcard.
+            # Truly ownerless work retains the existing roster/wildcard route.
             labels = tuple(
                 str(lease["label"])
                 for lease in self.lease_records()
@@ -6556,10 +7132,8 @@ class Journal:
             )
             recipients = tuple((label, True) for label in labels) or (("*", False),)
 
-        # Recompute the complete target set on every retry. A prior projection
-        # may have committed only a prefix of this fanout before crashing;
-        # record_delivery_event's recipient/origin/event UUID identity makes
-        # the committed prefix idempotent while the missing suffix is filled.
+        # Recompute the target set on every retry. A prior projection may have
+        # committed before crashing; recipient/origin/event UUID is idempotent.
         actual_recipients: set[str] = set()
         for recipient, require_active in recipients:
             recorded = self.record_delivery_event(

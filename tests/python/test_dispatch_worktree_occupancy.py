@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import contextlib
 
-from support import skip_posix_on_native_windows
+from support import make_test_git_repo, skip_posix_on_native_windows
 
 skip_posix_on_native_windows("worktree occupancy tests launch POSIX workers")
 
@@ -34,12 +34,16 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_dispatch as dispatch  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
@@ -356,6 +360,36 @@ def _ledger_record(tmp: Path, dispatch_id: str) -> dict:
         return {}
 
 
+def _assert_failed_worktree_record(tmp: Path, dispatch_id: str) -> dict:
+    record = _ledger_record(tmp, dispatch_id)
+    assert record, dispatch_id
+    assert record.get("state") == "failed_worktree", record
+    assert record.get("terminal_state") == "error", record
+    assert record.get("prelaunch_failure") is True, record
+    assert record.get("worker_still_alive") is False, record
+    assert record.get("worker_pid") is None, record
+    assert record.get("worker_cwd") is None, record
+    seat_fields = (
+        "worktree_id",
+        "worktree_seat",
+        "worktree_path",
+        "worktree_base",
+        "worktree_head",
+        "worktree_branch",
+        "worktree_keep_ref",
+        "worktree_quarantine_ref",
+        "worktree_reclaimed_dispatch_id",
+    )
+    assert not any(record.get(key) for key in seat_fields), record
+    status = json.loads(Path(record["status_path"]).read_text(encoding="utf-8"))
+    assert status.get("state") == "failed_worktree", status
+    assert status.get("terminal_state") == "error", status
+    assert status.get("prelaunch_failure") is True, status
+    assert status.get("worker_alive") is False, status
+    assert not any(status.get(key) for key in seat_fields), status
+    return record
+
+
 def _write_runs_record(tmp: Path, dispatch_id: str, **fields: object) -> dict:
     """Write a real ledger JSON file under the isolated runs.d."""
     runs = tmp / "state" / "runs.d"
@@ -442,7 +476,7 @@ def test_second_writer_refused_and_ordinary_force_rejected() -> None:
             assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
             assert "occ-incumbent" in refused.stderr, refused.stderr
             assert "--occupied-worktree-forced" in refused.stderr, refused.stderr
-            assert not _ledger_record(tmp, "occ-second"), refused.stderr
+            _assert_failed_worktree_record(tmp, "occ-second")
 
             forced = _run(
                 _dispatch_cmd(
@@ -457,10 +491,196 @@ def test_second_writer_refused_and_ordinary_force_rejected() -> None:
             )
             assert forced.returncode == 64, (forced.stdout, forced.stderr)
             assert "deprecated and rejected for ordinary dispatch" in forced.stderr
-            assert not _ledger_record(tmp, "occ-second"), forced.stderr
+            _assert_failed_worktree_record(tmp, "occ-second")
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "occ-incumbent")
+
+
+@pytest.mark.parametrize("holder_liveness", ("live", "unknown"))
+def test_fresh_pinned_writer_refuses_before_wait_publication(
+    holder_liveness: str, monkeypatch
+) -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        repo = make_test_git_repo(tmp)
+        env = _env(tmp, capacity_max_total=2)
+        monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", env["GOALFLIGHT_JOURNAL_DIR"])
+        monkeypatch.setenv("GOALFLIGHT_TASK_STORE", env["GOALFLIGHT_TASK_STORE"])
+        monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", env["GOALFLIGHT_TASK_STORE_DIR"])
+
+        def pooled_dispatch_cmd(
+            dispatch_id: str, worker_code: str, *, foreground: bool = False
+        ) -> list[str]:
+            cmd = [
+                sys.executable,
+                str(DISPATCH),
+                "--unregistered-forced",
+                "--agent",
+                "test",
+                "--dispatch-id",
+                dispatch_id,
+                "--tail",
+                str(tmp / f"{dispatch_id}.tail"),
+                "--status-json",
+                str(tmp / f"{dispatch_id}.status.json"),
+                "--poll-secs",
+                "0.1",
+                "--max-idle-secs",
+                "20",
+            ]
+            if foreground:
+                cmd.append("--foreground")
+            return [*cmd, "--", sys.executable, "-c", worker_code]
+
+        release_holder = tmp / "release-holder"
+        holder_process = None
+        occupancy_holder_process = None
+        release_occupancy_lock = tmp / "release-occupancy-lock"
+        occupancy_lock_ready = tmp / "occupancy-lock-ready.json"
+        foreign_id = f"fresh-{holder_liveness}-holder"
+        try:
+            if holder_liveness == "live":
+                holder_process = subprocess.Popen(
+                    pooled_dispatch_cmd(
+                        foreign_id,
+                        _blocking_worker(release_holder, foreign_id),
+                        foreground=True,
+                    ),
+                    cwd=str(repo),
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                holder_record = _wait_until_running(tmp, foreign_id)
+                seat = Path(holder_record["worktree_path"])
+            else:
+                seeded = _run(
+                    pooled_dispatch_cmd(
+                        "fresh-unknown-seat-seed",
+                        _quick_writer("fresh-unknown-seat-seed"),
+                        foreground=True,
+                    ),
+                    env,
+                    cwd=repo,
+                )
+                assert seeded.returncode == 0, (seeded.stdout, seeded.stderr)
+                seed_record = _ledger_record(tmp, "fresh-unknown-seat-seed")
+                seat = Path(seed_record["worktree_path"])
+                assert not _ledger_record(tmp, foreign_id)
+
+            occupancy_holder_code = (
+                "import json, sys, time\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                "from pathlib import Path\n"
+                "import goalflight_worktree_pool as pool\n"
+                f"seat = Path({str(seat)!r})\n"
+                f"dispatch_id = {foreign_id!r}\n"
+                f"ready = Path({str(occupancy_lock_ready)!r})\n"
+                f"release = Path({str(release_occupancy_lock)!r})\n"
+                "try:\n"
+                "    lock = pool.try_acquire_worktree_path_lock(seat, dispatch_id)\n"
+                "except pool.WorktreePathLockBusy as exc:\n"
+                "    ready.write_text(json.dumps({'held': False, 'holder': exc.occupant_id}), encoding='utf-8')\n"
+                "else:\n"
+                "    ready.write_text(json.dumps({'held': True}), encoding='utf-8')\n"
+                "    while not release.exists(): time.sleep(0.01)\n"
+                "    lock.release()\n"
+            )
+            occupancy_holder_process = subprocess.Popen(
+                [sys.executable, "-c", occupancy_holder_code],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert _wait_for(lambda: occupancy_lock_ready.exists()), (
+                occupancy_holder_process.poll(),
+                occupancy_holder_process.stderr,
+            )
+            occupancy_state = json.loads(
+                occupancy_lock_ready.read_text(encoding="utf-8")
+            )
+            if holder_liveness == "live" and not occupancy_state["held"]:
+                assert occupancy_state.get("holder") == foreign_id, occupancy_state
+            else:
+                assert occupancy_state["held"] is True, occupancy_state
+
+            refused_id = f"fresh-{holder_liveness}-contender"
+            journal = goalflight_journal.open_or_create_journal(repo)
+            wait_records = tmp / "waiting-records.jsonl"
+            observer_code = (
+                "import json, sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                "from pathlib import Path\n"
+                "import goalflight_dispatch as observed_dispatch\n"
+                f"wait_records = Path({str(wait_records)!r})\n"
+                "record_ledger = observed_dispatch._record_ledger\n"
+                "def record_ledger_with_observation(args, *positional, **keywords):\n"
+                "    if keywords.get('state') == 'waiting_capacity':\n"
+                "        with wait_records.open('a', encoding='utf-8') as stream:\n"
+                "            stream.write(json.dumps({'cwd': getattr(args, 'cwd', None)}) + '\\n')\n"
+                "    return record_ledger(args, *positional, **keywords)\n"
+                "observed_dispatch._record_ledger = record_ledger_with_observation\n"
+                "raise SystemExit(observed_dispatch._main_impl(sys.argv[1:]))\n"
+            )
+            dispatch_cmd = _dispatch_cmd(
+                tmp,
+                seat,
+                refused_id,
+                _quick_writer(refused_id),
+                extra=["--capacity-wait-s", "2"],
+                foreground=True,
+                in_place=False,
+            )
+            pending = subprocess.Popen(
+                [dispatch_cmd[0], "-c", observer_code, *dispatch_cmd[2:]],
+                cwd=str(repo),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            out, err = _communicate(pending, timeout=20)
+            published_cwds = []
+            if wait_records.exists():
+                published_cwds = [
+                    row.get("cwd")
+                    for line in wait_records.read_text(encoding="utf-8").splitlines()
+                    if (row := json.loads(line)).get("cwd")
+                ]
+            assert pending.returncode == 64, (pending.returncode, out, err)
+            assert "worktree seat" in err and "flock_liveness=held" in err, err
+            assert f"holder_liveness={holder_liveness}" in err, err
+            assert not any(
+                Path(raw_cwd).resolve(strict=False) == seat.resolve()
+                for raw_cwd in published_cwds
+            ), published_cwds
+            assert _ledger_record(tmp, refused_id).get("state") != "waiting_capacity"
+            attempt = journal.attempt_for_dispatch(refused_id)
+            assert attempt is None or attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL
+        finally:
+            release_holder.write_text("release", encoding="utf-8")
+            release_occupancy_lock.write_text("release", encoding="utf-8")
+            if occupancy_holder_process is not None:
+                lock_out, lock_err = _communicate(
+                    occupancy_holder_process, timeout=30
+                )
+                assert occupancy_holder_process.returncode == 0, (
+                    occupancy_holder_process.returncode,
+                    lock_out,
+                    lock_err,
+                )
+            if holder_process is not None:
+                holder_out, holder_err = _communicate(holder_process, timeout=30)
+                assert holder_process.returncode == 0, (
+                    holder_process.returncode,
+                    holder_out,
+                    holder_err,
+                )
+                _wait_until_terminal(tmp, foreign_id)
 
 
 def test_declared_read_only_raw_worker_is_refused_into_occupied_worktree() -> None:
@@ -494,7 +714,7 @@ def test_declared_read_only_raw_worker_is_refused_into_occupied_worktree() -> No
             )
             assert declared.returncode == 64, (declared.returncode, declared.stdout, declared.stderr)
             assert "ro-incumbent" in declared.stderr, declared.stderr
-            assert not _ledger_record(tmp, "ro-declared"), declared.stderr
+            _assert_failed_worktree_record(tmp, "ro-declared")
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "ro-incumbent")
@@ -563,7 +783,7 @@ def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
         assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
         assert "Retry the dispatch" in refused.stderr, refused.stderr
         assert "--occupied-worktree-forced" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "unk-writer"), refused.stderr
+        _assert_failed_worktree_record(tmp, "unk-writer")
 
         forced = _run(
             _dispatch_cmd(
@@ -578,7 +798,7 @@ def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
         )
         assert forced.returncode == 64, (forced.stdout, forced.stderr)
         assert "deprecated and rejected for ordinary dispatch" in forced.stderr
-        assert not _ledger_record(tmp, "unk-writer"), forced.stderr
+        _assert_failed_worktree_record(tmp, "unk-writer")
 
 
 def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
@@ -610,7 +830,7 @@ def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
             assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
             assert "preset-incumbent" in refused.stderr, refused.stderr
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
-            assert not _ledger_record(tmp, "preset-second"), refused.stderr
+            _assert_failed_worktree_record(tmp, "preset-second")
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "preset-incumbent")
@@ -662,7 +882,7 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
             assert "acp-incumbent" in refused.stdout, refused.stdout
             assert "acp-incumbent" in refused.stderr, refused.stderr
             assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
-            assert not _ledger_record(tmp, "acp-second"), refused.stderr
+            _assert_failed_worktree_record(tmp, "acp-second")
             from unittest.mock import patch
             from test_dispatch_registration_gate import _register_controller
 
@@ -740,6 +960,262 @@ def test_acp_writer_refused_into_occupied_worktree() -> None:
         _wait_until_terminal(tmp, "acp-incumbent")
 
 
+def test_forced_pooled_acp_does_not_pass_rejected_occupancy_fd_marker() -> None:
+    import pytest
+
+    acp_py = _managed_acp_python()
+    if acp_py is None:
+        pytest.skip("pooled ACP occupancy requires a managed ACP interpreter")
+    import fcntl
+
+    from test_acp_dispatch_sigterm import _write_fake_codex_acp_manifest
+
+    with _temp_dir() as td:
+        tmp = Path(td)
+        repo = make_test_git_repo(tmp)
+        env = _env(tmp, capacity_max_total=2)
+        _configure_test_accounts(tmp, env)
+        env["GOALFLIGHT_ACP_PYTHON"] = str(acp_py)
+        env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "goal"
+        snapshot_path = tmp / "worker-env.json"
+        env["GOALFLIGHT_TEST_ACP_WORKER_ENV"] = str(snapshot_path)
+
+        adapters = tmp / "adapters"
+        _write_fake_codex_acp_manifest(adapters)
+        manifest_path = adapters / "codex-acp.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wrapper = tmp / "capture-acp-env"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            f"name = {goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV!r}\n"
+            "Path(os.environ['GOALFLIGHT_TEST_ACP_WORKER_ENV']).write_text(\n"
+            "    json.dumps({name: name in os.environ}), encoding='utf-8'\n"
+            ")\n"
+            f"os.execv(sys.executable, [sys.executable, {str(ROOT / 'tests/fixtures/acp_fake_agent.py')!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        manifest["invocation"]["exec"]["binary"] = str(wrapper)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(adapters)
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+
+        def pooled_command(dispatch_id: str, cwd: Path = repo) -> list[str]:
+            return [
+                sys.executable,
+                str(ROOT / "scripts/goalflight_acp_run.py"),
+                "--unregistered-forced",
+                "--worktree",
+                "create",
+                "--agent",
+                "codex-acp",
+                "--cwd",
+                str(cwd),
+                "--prompt-text",
+                "hello",
+                "--status-json",
+                str(tmp / f"{dispatch_id}.status.json"),
+                "--heartbeat-interval",
+                "0.05",
+                "--dispatch-id",
+                dispatch_id,
+                "--json",
+            ]
+
+        warmed = _run(pooled_command("acp-warm-seat"), env)
+        assert warmed.returncode == 0, (warmed.stdout, warmed.stderr)
+        warmed_status = json.loads(
+            (tmp / "acp-warm-seat.status.json").read_text(encoding="utf-8")
+        )
+        warmed_seat = Path(warmed_status["worktree_path"])
+        unrelated_path = tmp / "unrelated-open-file"
+        with unrelated_path.open("w+") as unrelated_file:
+            # Keep setup subprocesses from reusing the descriptor number before
+            # the dispatcher validates the inherited file identity.
+            inherited_fd = fcntl.fcntl(
+                unrelated_file.fileno(), fcntl.F_DUPFD, 100
+            )
+            unrelated_stat = os.fstat(inherited_fd)
+            forced_env = env.copy()
+            forced_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(
+                inherited_fd
+            )
+            try:
+                forced = subprocess.run(
+                    [
+                        *pooled_command("acp-forced-mismatch"),
+                        "--occupied-worktree-forced",
+                    ],
+                    cwd=ROOT,
+                    env=forced_env,
+                    pass_fds=(inherited_fd,),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                    check=False,
+                )
+            finally:
+                os.close(inherited_fd)
+
+        status = json.loads(
+            (tmp / "acp-forced-mismatch.status.json").read_text(encoding="utf-8")
+        )
+        assert forced.returncode == 0, (
+            forced.returncode,
+            forced.stdout,
+            forced.stderr,
+            status.get("error"),
+            status.get("reason"),
+            status.get("state"),
+        )
+        assert status["state"] == "complete", status
+        forced_seat = Path(status["worktree_path"])
+        assert forced_seat != warmed_seat, status
+        occupancy_lock_path = goalflight_worktree_pool.worktree_path_lock_path(
+            forced_seat
+        )
+        expected_stat = occupancy_lock_path.stat()
+        assert (unrelated_stat.st_dev, unrelated_stat.st_ino) != (
+            expected_stat.st_dev,
+            expected_stat.st_ino,
+        )
+        assert (
+            "does not identify the registered worktree occupancy lock"
+            in forced.stderr
+        ), forced.stderr
+        assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+        worker_env = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        assert worker_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] is False, (
+            worker_env,
+            forced.stdout,
+            forced.stderr,
+        )
+
+
+def test_forced_in_place_acp_does_not_pass_unconfirmed_occupancy_fd_marker() -> None:
+    import pytest
+
+    acp_py = _managed_acp_python()
+    if acp_py is None:
+        pytest.skip("forced ACP occupancy requires a managed ACP interpreter")
+    import fcntl
+
+    from test_acp_dispatch_sigterm import _write_fake_codex_acp_manifest
+
+    with _temp_dir() as td:
+        tmp = Path(td)
+        repo = make_test_git_repo(tmp)
+        env = _env(tmp)
+        _configure_test_accounts(tmp, env)
+        env["GOALFLIGHT_ACP_PYTHON"] = str(acp_py)
+        env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "goal"
+        snapshot_path = tmp / "worker-env.json"
+        env["GOALFLIGHT_TEST_ACP_WORKER_ENV"] = str(snapshot_path)
+
+        adapters = tmp / "adapters"
+        _write_fake_codex_acp_manifest(adapters)
+        manifest_path = adapters / "codex-acp.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        wrapper = tmp / "capture-acp-env"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            f"name = {goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV!r}\n"
+            "Path(os.environ['GOALFLIGHT_TEST_ACP_WORKER_ENV']).write_text(\n"
+            "    json.dumps({name: name in os.environ}), encoding='utf-8'\n"
+            ")\n"
+            f"os.execv(sys.executable, [sys.executable, {str(ROOT / 'tests/fixtures/acp_fake_agent.py')!r}, *sys.argv[1:]])\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        manifest["invocation"]["exec"]["binary"] = str(wrapper)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(adapters)
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+
+        ready = tmp / "lock-holder-ready"
+        release = tmp / "release-lock-holder"
+        holder_code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "from pathlib import Path\n"
+            "import goalflight_worktree_pool as pool\n"
+            f"lock = pool.try_acquire_worktree_path_lock(Path({str(repo)!r}), 'foreign-lock-holder')\n"
+            f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+            f"release = Path({str(release)!r})\n"
+            "while not release.exists(): time.sleep(0.01)\n"
+            "lock.release()\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert _wait_for(ready.exists), (holder.poll(), holder.stderr)
+            lock_path = goalflight_worktree_pool.worktree_path_lock_path(repo)
+            with lock_path.open("r+") as separate_file:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(
+                        separate_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                inherited_fd = os.dup(separate_file.fileno())
+                try:
+                    forced_env = env.copy()
+                    forced_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(
+                        inherited_fd
+                    )
+                    forced = subprocess.run(
+                        _prompt_writer_cmd(
+                            tmp,
+                            repo,
+                            "acp-forced-unconfirmed",
+                            agent="codex-acp",
+                            extra=[
+                                "--shape",
+                                "acp",
+                                "--account",
+                                "occupancy-test",
+                                "--occupied-worktree-forced",
+                                "--in-place",
+                                "--foreground",
+                            ],
+                        ),
+                        cwd=ROOT,
+                        env=forced_env,
+                        pass_fds=(inherited_fd,),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=60,
+                        check=False,
+                    )
+                finally:
+                    os.close(inherited_fd)
+        finally:
+            release.write_text("release", encoding="utf-8")
+            holder.communicate(timeout=10)
+
+        status = json.loads(
+            (tmp / "acp-forced-unconfirmed.status.json").read_text(encoding="utf-8")
+        )
+        assert forced.returncode == 0, (forced.stdout, forced.stderr, status)
+        assert status["state"] == "complete", status
+        worker_env = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        assert worker_env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] is False, (
+            worker_env,
+            forced.stdout,
+            forced.stderr,
+        )
+
+
 def test_unreadable_ledger_dir_is_unknown_not_unoccupied() -> None:
     """Path.glob on chmod 000 returns []; occupancy must not treat that as free."""
     with _temp_dir() as td:
@@ -793,14 +1269,23 @@ def test_unreadable_ledger_dir_is_unknown_not_unoccupied() -> None:
         assert "already has a non-terminal ledger record" not in refused.stderr, refused.stderr
         assert "unique --dispatch-id" not in refused.stderr, refused.stderr
         assert "runs.d" in refused.stderr, refused.stderr
-        refused_record = _ledger_record(tmp, "unk-dir-writer")
+        refused_record = _ledger_record(tmp, target_id)
         assert refused_record, refused.stderr
         assert refused_record.get("worker_cwd") is None, refused_record
         assert refused_record.get("state") in {
             "waiting_capacity",
-            "failed",
-            "blocked_capacity",
+            "failed_worktree",
         }, refused_record
+        if refused_record["state"] == "failed_worktree":
+            assert refused_record.get("prelaunch_failure") is True, refused_record
+        status = json.loads(
+            Path(refused_record["status_path"]).read_text(encoding="utf-8")
+        )
+        assert status.get("state") == "failed_worktree", status
+        assert status.get("terminal_state") == "error", status
+        assert status.get("prelaunch_failure") is True, status
+        if refused_record["state"] == "waiting_capacity":
+            assert status.get("ledger_record_warning"), status
 
 
 def test_genuine_duplicate_dispatch_id_is_still_refused() -> None:
@@ -934,9 +1419,9 @@ def test_matching_project_root_writer_without_in_place_is_refused() -> None:
             env,
         )
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-        assert "project root" in refused.stderr, refused.stderr
-        assert "--in-place explicitly" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "root-only-writer"), refused.stderr
+        assert "project_root" in refused.stderr or "project root" in refused.stderr
+        assert "Pass --in-place explicitly to write into the project root." in refused.stderr, refused.stderr
+        _assert_failed_worktree_record(tmp, "root-only-writer")
 
 
 def test_matching_project_root_without_cwd_skips_when_identity_not_live() -> None:
@@ -996,7 +1481,7 @@ def test_different_project_root_with_matching_cwd_still_occupies() -> None:
         refused = _run(_dispatch_cmd(tmp, tree, "linked-second", _quick_writer("linked-second")), env)
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "linked-cwd" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "linked-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "linked-second")
 
 
 def test_cwdless_field_with_argv_cwd_matching_target_still_blocks() -> None:
@@ -1016,7 +1501,7 @@ def test_cwdless_field_with_argv_cwd_matching_target_still_blocks() -> None:
         refused = _run(_dispatch_cmd(tmp, tree, "argv-second", _quick_writer("argv-second")), env)
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "argv-cwd" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "argv-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "argv-second")
         assert "occupancy skip" not in refused.stderr, refused.stderr
 
 
@@ -1050,7 +1535,7 @@ def test_argv_cwd_and_request_cwd_disagree_occupy_both_trees() -> None:
             refused_a.returncode, refused_a.stdout, refused_a.stderr
         )
         assert "split-cwd" in refused_a.stderr, refused_a.stderr
-        assert not _ledger_record(tmp, "split-a"), refused_a.stderr
+        _assert_failed_worktree_record(tmp, "split-a")
 
         refused_b = _run(
             _dispatch_cmd(tmp, tree_b, "split-b", _quick_writer("split-b")), env
@@ -1059,7 +1544,7 @@ def test_argv_cwd_and_request_cwd_disagree_occupy_both_trees() -> None:
             refused_b.returncode, refused_b.stdout, refused_b.stderr
         )
         assert "split-cwd" in refused_b.stderr, refused_b.stderr
-        assert not _ledger_record(tmp, "split-b"), refused_b.stderr
+        _assert_failed_worktree_record(tmp, "split-b")
 
 
 def test_relative_worker_cwd_resolved_against_project_root_occupies() -> None:
@@ -1083,7 +1568,7 @@ def test_relative_worker_cwd_resolved_against_project_root_occupies() -> None:
         )
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "rel-cwd" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "rel-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "rel-second")
 
 
 def test_cwd_after_double_dash_in_argv_is_path_evidence() -> None:
@@ -1106,7 +1591,7 @@ def test_cwd_after_double_dash_in_argv_is_path_evidence() -> None:
         )
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "argv-after" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "argv-after-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "argv-after-second")
 
 
 def test_live_cwdless_matching_project_root_second_writer_is_refused() -> None:
@@ -1141,9 +1626,9 @@ def test_live_cwdless_matching_project_root_second_writer_is_refused() -> None:
             env,
         )
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-        assert "project root" in refused.stderr, refused.stderr
-        assert "--in-place explicitly" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "after-live-cwdless"), refused.stderr
+        assert "project_root" in refused.stderr or "project root" in refused.stderr
+        assert "Pass --in-place explicitly to write into the project root." in refused.stderr, refused.stderr
+        _assert_failed_worktree_record(tmp, "after-live-cwdless")
 
 
 def test_synthetic_starting_record_with_target_cwd_still_blocks() -> None:
@@ -1162,7 +1647,7 @@ def test_synthetic_starting_record_with_target_cwd_still_blocks() -> None:
         refused = _run(_dispatch_cmd(tmp, tree, "synth-second", _quick_writer("synth-second")), env)
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "synth-cwd" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "synth-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "synth-second")
 
 
 def test_live_watcher_stopped_incumbent_still_occupies() -> None:
@@ -1187,7 +1672,7 @@ def test_live_watcher_stopped_incumbent_still_occupies() -> None:
         refused = _run(_dispatch_cmd(tmp, tree, "ws-second", _quick_writer("ws-second")), env)
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "ws-live" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "ws-second"), refused.stderr
+        _assert_failed_worktree_record(tmp, "ws-second")
 
 
 def test_dead_watcher_stopped_incumbent_vacates_the_tree() -> None:
@@ -1422,6 +1907,137 @@ def test_sigkill_releases_occupancy_before_capacity_lease_cleanup() -> None:
         watcher_pid = record.get("watcher_pid")
         if watcher_pid:
             _wait_for(lambda pid=watcher_pid: _pid_gone(pid), timeout=5.0)
+
+
+def test_sigkill_running_row_survives_first_check_and_admission_recheck() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "stale-running",
+            state="running",
+            worker_cwd=str(tree.resolve()),
+            worker_pid=99999999,
+        )
+        args = SimpleNamespace(
+            agent="test",
+            shape="bash",
+            project_root=str(tree),
+            cwd=str(tree),
+            in_place=True,
+            dispatch_id="sigkill-taker",
+            occupied_worktree_forced=False,
+            from_queue=False,
+            capacity_wait_s=0,
+            dispatch_warnings=[],
+        )
+        record_path = tmp / "state" / "runs.d" / "stale-running.json"
+
+        with patch.dict(os.environ, env, clear=True):
+            try:
+                dispatch._prepare_explicit_worktree_occupancy(args)
+                lock = args._worktree_occupancy_lock
+                lock_fd = lock.fileno()
+                assert json.loads(
+                    record_path.read_text(encoding="utf-8")
+                )["state"] == "running"
+
+                with patch.object(
+                    dispatch, "_bind_dispatch_worktree", return_value=None
+                ):
+                    assert dispatch._admit_dispatch_worktree(args) is None
+
+                assert json.loads(
+                    record_path.read_text(encoding="utf-8")
+                )["state"] == "running"
+                assert args._worktree_occupancy_lock is lock
+                assert lock.fileno() == lock_fd
+                with contextlib.suppress(goalflight_worktree_pool.WorktreePathLockBusy):
+                    probe = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                        tree, "third-writer"
+                    )
+                    probe.release()
+                    raise AssertionError("admission dropped the SIGKILL reclaim lock")
+            finally:
+                dispatch._release_worktree_occupancy_lock(args)
+
+
+def test_unrelated_inherited_fd_does_not_claim_running_worktree() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "live-holder",
+            state="running",
+            worker_cwd=str(tree.resolve()),
+            worker_pid=os.getpid(),
+        )
+        args = SimpleNamespace(
+            agent="test",
+            shape="bash",
+            project_root=str(tree),
+            cwd=str(tree),
+            in_place=True,
+            dispatch_id="unrelated-fd-taker",
+            occupied_worktree_forced=False,
+            from_queue=False,
+            capacity_wait_s=0,
+            dispatch_warnings=[],
+        )
+        unrelated_path = tmp / "unrelated-open-file"
+        expected_lock_path = goalflight_worktree_pool.worktree_path_lock_path(tree)
+
+        with patch.dict(os.environ, env, clear=True):
+            live_lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                tree, "live-holder"
+            )
+            try:
+                with unrelated_path.open("w+") as unrelated_file:
+                    os.environ[
+                        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                    ] = str(unrelated_file.fileno())
+                    assert (
+                        os.fstat(unrelated_file.fileno()).st_dev,
+                        os.fstat(unrelated_file.fileno()).st_ino,
+                    ) != (
+                        expected_lock_path.stat().st_dev,
+                        expected_lock_path.stat().st_ino,
+                    )
+                    assert not hasattr(args, "_worktree_occupancy_lock")
+                    try:
+                        dispatch._prepare_attempt_worktree_occupancy(args)
+                    except dispatch.DispatchUsageError:
+                        assert not hasattr(args, "_worktree_occupancy_lock")
+                        assert (
+                            goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                            not in os.environ
+                        )
+                    else:
+                        dispatch._release_worktree_occupancy_lock(args)
+                        raise AssertionError(
+                            "unrelated inherited fd was accepted as worktree ownership"
+                        )
+                    args.occupied_worktree_forced = True
+                    os.environ[
+                        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                    ] = str(unrelated_file.fileno())
+                    warning = dispatch._prepare_attempt_worktree_occupancy(args)
+                    assert warning is not None and (
+                        "--occupied-worktree-forced accepted" in warning
+                    )
+                    assert not hasattr(args, "_worktree_occupancy_lock")
+                    assert (
+                        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV
+                        not in os.environ
+                    )
+            finally:
+                live_lock.release()
 
 
 def test_concurrent_different_trees_reach_capacity_independently() -> None:
@@ -1736,6 +2352,8 @@ if __name__ == "__main__":
     test_concurrent_second_writer_is_refused_on_every_trial()
     test_worker_inherits_occupancy_lock_fd()
     test_sigkill_releases_occupancy_before_capacity_lease_cleanup()
+    test_sigkill_running_row_survives_first_check_and_admission_recheck()
+    test_unrelated_inherited_fd_does_not_claim_running_worktree()
     test_occupancy_lock_fd_stays_out_of_sidecar_fd_tables()
     test_concurrent_different_trees_reach_capacity_independently()
     test_concurrent_three_writers_are_refused_on_every_trial()

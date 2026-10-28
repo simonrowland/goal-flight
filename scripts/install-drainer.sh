@@ -22,7 +22,8 @@ Usage:
   scripts/install-drainer.sh --uninstall
 
 Installs com.goalflight.drain as a per-user launchd agent. The agent runs:
-  python3 <skill-root>/scripts/goalflight_dispatch.py drain --json
+  python3 <skill-root>/scripts/goalflight_daemon_logs.py <log> python3 \
+    <skill-root>/scripts/goalflight_dispatch.py drain --cross-project --json
 
 Environment:
   SKILL_ROOT or GOALFLIGHT_SKILL_ROOT  override ~/.goal-flight/skill

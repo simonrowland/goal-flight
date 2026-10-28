@@ -156,8 +156,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 wake = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["wake"]
-if wake.get("path") != "goalflight_grok_bot_listen.py --report-pending --timeout-s 900":
-    raise SystemExit("host_projection.wake.path must be goalflight_grok_bot_listen.py --report-pending --timeout-s 900")
+if wake.get("path") != "goalflight_grok_bot_listen.py --report-pending --timeout-s 900 --listener-slots 1":
+    raise SystemExit("host_projection.wake.path must select one listener slot")
 if wake.get("contract") != "exit-as-wake":
     raise SystemExit("host_projection.wake.contract must be exit-as-wake")
 if wake.get("controller_label") != "goalflight-grokbot":
@@ -168,8 +168,8 @@ if "quote-check" not in str(wake.get("on_ring") or ""):
     raise SystemExit("wake.on_ring must quote-check after a ring")
 if wake.get("on_timeout") != "handoff write, quote-check, re-arm, task next":
     raise SystemExit("wake.on_timeout must write handoff, quote-check, re-arm, task next")
-if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 4:
-    raise SystemExit("wake depth must be MVP 1 / full 4")
+if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 1:
+    raise SystemExit("wake depth must remain one listener")
 if wake.get("finished_alias"):
     raise SystemExit("do not reify a FINISHED alias; success terminal is COMPLETE")
 if "native mail transport" not in " ".join(wake.get("not") or []):
@@ -368,9 +368,11 @@ if defaults != [
     "900",
     "--controller-label",
     "goalflight-grokbot",
+    "--listener-slots",
+    "1",
     "--report-pending",
 ]:
-    raise SystemExit(f"bare helper must inject timeout, label, report-pending; got {defaults}")
+    raise SystemExit(f"bare helper must inject one listener plus its other defaults; got {defaults}")
 if mod._with_host_timeout([]) != defaults:
     raise SystemExit("_with_host_timeout must alias _with_host_defaults")
 timeout_override = mod._with_host_defaults(["--timeout-s", "0"])
@@ -387,6 +389,9 @@ if label_override.count("--controller-label") != 1 or "other-slug" not in label_
     raise SystemExit("explicit --controller-label must win")
 if "goalflight-grokbot" in label_override:
     raise SystemExit("must not inject goalflight-grokbot over an explicit label")
+slot_override = mod._with_host_defaults(["--listener-slots", "4"])
+if slot_override[slot_override.index("--listener-slots") + 1] != "1":
+    raise SystemExit("the Grok Bot helper must enforce its one-listener cap")
 if "--no-report-pending" not in mod._with_host_defaults(["--no-report-pending"]):
     raise SystemExit("explicit --no-report-pending must be honored")
 if "--report-pending" in mod._with_host_defaults(["--no-report-pending"]):
@@ -474,8 +479,8 @@ echo "test13 pass: grok-bot helper defaults, Mac install caveat, and dispatch st
 # Do not grow a parallel grok-bot pytest suite here.
 wrapper="$REPO_ROOT/configs/grok-bot/skills/goal-flight/SKILL.md"
 head_block="$(sed -n '1,8p' "$wrapper")"
-printf '%s\n' "$head_block" | grep -q 'version: 1.7.4' \
-  || fail "wrapper frontmatter must pin version 1.7.4 when VERSION is 1.7.4"
+printf '%s\n' "$head_block" | grep -q 'version: 1.7.6' \
+  || fail "wrapper frontmatter must pin version 1.7.6 when VERSION is 1.7.6"
 printf '%s\n' "$head_block" | grep -q '/goal-flight' \
   || fail "wrapper description must name /goal-flight"
 printf '%s\n' "$head_block" | grep -qi 'long-running grok-bot' \
@@ -522,8 +527,8 @@ else
 fi
 grep -q -- '--takeover' "$wrapper" \
   || fail "controller resume must prove holder dead/sibling before --takeover"
-grep -q -- '--listener-slots 4' "$wrapper" \
-  || fail "resume fallback listen must use --listener-slots 4"
+grep -q -- '--listener-slots 1' "$wrapper" \
+  || fail "resume must arm one listener slot"
 grep -q 'goalflight_grok_bot_listen.py' "$wrapper" \
   || fail "resume must prefer goalflight_grok_bot_listen.py when present"
 # Re-install after the wrapper edit path: copy still matches source hash.

@@ -11,6 +11,7 @@ import time
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -582,6 +583,231 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
         unchanged = S._reconcile_output_tail_record(future)
         check("implausible old tail mtime does not reconcile",
               unchanged.get("classification") == "stale_dead")
+
+
+def _status_outbox_fixture(base: Path, dispatch_id: str) -> tuple[Path, Path, dict, str]:
+    import goalflight_journal
+    import goalflight_messages
+
+    import subprocess
+
+    project = base / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    dispatch_dir = base / "state" / "dispatch"
+    outbox = dispatch_dir / f"{dispatch_id}.questions"
+    outbox.mkdir(parents=True)
+    env = {
+        "GOALFLIGHT_STATE_DIR": str(base / "state"),
+        "GOALFLIGHT_DISPATCH_DIR": str(dispatch_dir),
+        "GOALFLIGHT_MESSAGES_DIR": str(base / "messages"),
+        "GOALFLIGHT_QUESTION_OUTBOX_DIR": str(outbox),
+        "GOALFLIGHT_JOURNAL_DIR": str(base / "journal"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(base / "task-store"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(base / "wake-ledger"),
+        "GOALFLIGHT_DISPATCH_ID": dispatch_id,
+    }
+    with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+        goalflight_messages,
+        "_worker_journal_projection",
+        return_value=((), RuntimeError("worker journal denied")),
+    ):
+        goalflight_journal.open_or_create_journal(project)
+        posted = goalflight_messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="user_need",
+            payload={"text": "recover after watcher exit", "project_root": str(project)},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "local", "adapter": "pytest", "transport": "worker"},
+        )
+    record_path = outbox / "journal" / "journal-00000000000000000001.delivery"
+    old_mtime = time.time() - 60
+    os.utime(record_path, (old_mtime, old_mtime))
+    return project, outbox, env, posted["envelope"]["id"]
+
+
+def test_status_reconcile_drains_old_outbox_after_watcher_exit() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        dispatch_id = "dead-watcher-running-outbox"
+        project, _outbox, env, event_id = _status_outbox_fixture(base, dispatch_id)
+        dead_watcher_pid = 2_147_483_647
+        check("fixture watcher process has exited", not S.goalflight_compat.pid_alive(dead_watcher_pid))
+        with mock.patch.dict(os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": ""}, clear=False):
+            reconciled = S.reconcile_fast_plane_record(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "running",
+                    "classification": "expected_live",
+                    "watcher_pid": dead_watcher_pid,
+                }
+            )
+            rows = goalflight_journal.Journal(project).read_all(
+                "SELECT event_uuid, projected_at FROM delivery_events WHERE event_uuid = ?",
+                (event_id,),
+            )
+        check("status reconciliation retains the running row", reconciled["state"] == "running")
+        check(
+            "status poll drains an old outbox for a running row",
+            len(rows) == 1 and rows[0]["projected_at"] is not None,
+        )
+
+
+def test_concurrent_watcher_and_status_outbox_drain_projects_once() -> None:
+    import threading
+
+    import goalflight_journal
+    import goalflight_messages
+    import goalflight_watch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        dispatch_id = "concurrent-watcher-status-outbox"
+        project, outbox, env, event_id = _status_outbox_fixture(base, dispatch_id)
+        status_drain_called = threading.Event()
+        start = threading.Barrier(3)
+        errors: list[BaseException] = []
+        original_project = goalflight_messages.project_worker_journal_outbox
+
+        def tracked_project(worker_id: str, **kwargs) -> int:
+            if threading.current_thread().name == "status-outbox-poll":
+                status_drain_called.set()
+            return original_project(worker_id, **kwargs)
+
+        def run_status_poll() -> None:
+            try:
+                start.wait(timeout=3)
+                S.reconcile_fast_plane_record(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "running",
+                        "classification": "expected_live",
+                        "watcher_pid": 99999998,
+                    }
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def run_watcher_pass() -> None:
+            try:
+                start.wait(timeout=3)
+                goalflight_watch.consume_worker_journal_outbox(outbox, dispatch_id)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.dict(os.environ, {**env, "GOALFLIGHT_DISPATCH_ID": ""}, clear=False), mock.patch.object(
+            goalflight_messages,
+            "project_worker_journal_outbox",
+            side_effect=tracked_project,
+        ):
+            status_thread = threading.Thread(target=run_status_poll, name="status-outbox-poll")
+            watcher_thread = threading.Thread(target=run_watcher_pass, name="watcher-outbox-pass")
+            status_thread.start()
+            watcher_thread.start()
+            start.wait(timeout=3)
+            status_thread.join(timeout=5)
+            watcher_thread.join(timeout=5)
+            rows = goalflight_journal.Journal(project).read_all(
+                "SELECT event_uuid, projected_at FROM delivery_events WHERE event_uuid = ?",
+                (event_id,),
+            )
+        check("concurrent status poll attempted an outbox drain", status_drain_called.is_set())
+        check("concurrent watcher and status threads completed", not status_thread.is_alive() and not watcher_thread.is_alive() and not errors)
+        check(
+            "concurrent watcher and status drain project exactly once",
+            len(rows) == 1 and rows[0]["projected_at"] is not None,
+        )
+def test_done_reconciles_complete_after_frozen_blocked_attention() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dispatch_id = "idle-blocked-then-complete"
+        tail = root / "worker.tail"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n"
+            f"COMPLETE: {dispatch_id} — finished work\n",
+            encoding="utf-8",
+        )
+        status_path = root / "worker.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "watcher_stopped",
+                    "tail_path": str(tail),
+                    "terminal_pending_state": "blocked",
+                    "attention_marker": {
+                        "kind": "BLOCKED",
+                        "dispatch_id": dispatch_id,
+                        "sequence": 1,
+                        "text": f"{dispatch_id} — waiting for controller",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        identity = {"pid": 43211, "start_token": "test:43211:generation-1"}
+        record = {
+            "dispatch_id": dispatch_id,
+            "project_root": str(root),
+            "agent": "codex",
+            "state": "blocked",
+            "terminal_state": "blocked",
+            "worker_pid": identity["pid"],
+            "worker_identity": identity,
+            "stdout_path": str(tail),
+            "status_path": str(status_path),
+            "started_at": S.goalflight_ledger.utc_now(),
+        }
+        saved_identity = S.goalflight_ledger.identity_matches
+        S.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        try:
+            row = S._dashboard_status_row(record)
+            reconciled = S.reconcile_fast_plane_record(row)
+        finally:
+            S.goalflight_ledger.identity_matches = saved_identity
+
+    check("done refreshes attention tail after watcher exit", reconciled.get("state") == "complete")
+    check("done reports reconciled completion", S._terminal_done_code(reconciled) == 0)
+
+
+def test_live_complete_tail_clears_superseded_blocked_attention() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dispatch_id = "live-blocked-then-complete"
+        tail = root / "worker.tail"
+        tail.write_text(
+            f"BLOCKED: {dispatch_id} — waiting for controller\n"
+            f"COMPLETE: {dispatch_id} — finished work\n",
+            encoding="utf-8",
+        )
+        record = {
+            "dispatch_id": dispatch_id,
+            "classification": "watcher_stopped",
+            "state": "watcher_stopped",
+            "terminal_pending_state": "blocked",
+            "attention_marker": {
+                "kind": "BLOCKED",
+                "dispatch_id": dispatch_id,
+                "sequence": 1,
+                "text": f"{dispatch_id} — waiting for controller",
+            },
+            "worker_identity": {"pid": 43212, "start_token": "test:43212:generation-1"},
+            "tail_path": str(tail),
+        }
+        saved_identity = S.goalflight_ledger.identity_matches
+        S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
+        try:
+            reconciled = S._reconcile_output_tail_record(record)
+        finally:
+            S.goalflight_ledger.identity_matches = saved_identity
+
+    check("live COMPLETE tail clears stale BLOCKED attention", "attention_marker" not in reconciled)
+    check("live COMPLETE tail remains nonterminal", S.done_code(reconciled, worker_alive=True) == 1)
+    check("live COMPLETE tail is not promoted", reconciled.get("terminal_marker") is None)
+    repeated = S._reconcile_output_tail_record(reconciled)
+    check("repeated wait does not wake on superseded attention", S.done_code(repeated, worker_alive=True) == 1)
 
 
 def test_idle_timeout_live_hint_rendered() -> None:
@@ -1483,6 +1709,10 @@ def main() -> int:
     test_worktree_scope_symlinked_root()
     test_done_code()
     test_output_tail_reconciles_success_marker_after_watcher_death()
+    test_status_reconcile_drains_old_outbox_after_watcher_exit()
+    test_concurrent_watcher_and_status_outbox_drain_projects_once()
+    test_done_reconciles_complete_after_frozen_blocked_attention()
+    test_live_complete_tail_clears_superseded_blocked_attention()
     test_archived_id_status_and_wait_use_read_record_fallback()
     test_dashboard_status_requests_recent_window()
     test_idle_timeout_live_hint_rendered()

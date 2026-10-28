@@ -32,6 +32,7 @@ leaves the conservative path intact.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -116,6 +117,142 @@ def test_the_freshness_boundary_is_the_documented_one() -> None:
     assert D._effective_account_cooldown(SEAT) == FUTURE_RESET
     _write_snapshot(age_s=ttl + 60)
     assert D._effective_account_cooldown(SEAT) is None
+
+
+def test_stale_codex_seat_state_ticks_once_and_rechecks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_snapshot(age_s=D.CODEX_SEAT_STATE_MAX_AGE_S + 3600)
+    attempts: list[None] = []
+
+    def refresh() -> None:
+        attempts.append(None)
+        payload = {
+            "version": 1,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "seats": {SEAT: {"healthy": True, "worst_used": 40.0}},
+        }
+        state = Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
+        (state / "codex-seat-states.json").write_text(json.dumps(payload))
+
+    monkeypatch.setattr(D, "_refresh_codex_seatd_once", refresh)
+    assert D._codex_seat_admission_reason(SEAT) is None
+    assert len(attempts) == 1
+
+
+def test_still_stale_codex_seat_state_reports_refresh_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_snapshot(age_s=D.CODEX_SEAT_STATE_MAX_AGE_S + 3600)
+    monkeypatch.setattr(D, "CODEX_SEAT_REFRESH_WAIT_S", 0)
+    monkeypatch.setattr(D, "_refresh_codex_seatd_once", lambda: None)
+
+    reason = D._codex_seat_admission_reason(SEAT)
+
+    assert reason is not None
+    assert reason.startswith("seat state stale since ")
+    assert "seat refresh in progress (started None); retry shortly" in reason
+
+
+def test_seatd_refresh_is_detached_and_never_waits_or_kills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
+    calls: list[dict] = []
+
+    class SlowTick:
+        def wait(self, *_args, **_kwargs):
+            raise AssertionError("admission must not wait on the child process")
+
+        def kill(self):
+            raise AssertionError("credential refresh ticks must never be killed")
+
+    monkeypatch.setattr(
+        D.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(kwargs) or SlowTick(),
+    )
+
+    D._refresh_codex_seatd_once()
+
+    assert len(calls) == 1
+    assert calls[0]["start_new_session"] is True
+    assert calls[0]["stdin"] == D.subprocess.DEVNULL
+
+    lock_path = state / "codex-active-seat.lock"
+    with lock_path.open("a+") as lock_file:
+        D.goalflight_compat.flock(lock_file, D.goalflight_compat.LOCK_EX)
+        D._refresh_codex_seatd_once()
+        D.goalflight_compat.flock(lock_file, D.goalflight_compat.LOCK_UN)
+    assert len(calls) == 1
+
+
+def test_seatd_refresh_stamp_closes_child_startup_gap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
+    awake = [100.0]
+    monkeypatch.setattr(D, "active_monotonic", lambda: awake[0])
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        D.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(kwargs) or object(),
+    )
+
+    D._refresh_codex_seatd_once()
+    assert len(calls) == 1
+
+    # Model Popen returning before the detached child has acquired seatd's lock.
+    lock_path = state / "codex-active-seat.lock"
+    with lock_path.open("a+") as seatd_lock:
+        D.goalflight_compat.flock(
+            seatd_lock,
+            D.goalflight_compat.LOCK_EX | D.goalflight_compat.LOCK_NB,
+        )
+        D.goalflight_compat.flock(seatd_lock, D.goalflight_compat.LOCK_UN)
+    D._refresh_codex_seatd_once()
+    assert len(calls) == 1
+
+    awake[0] += D.CODEX_SEAT_REFRESH_STARTUP_ALLOWANCE_S + 1.0
+    with lock_path.open("a+") as seatd_lock:
+        D.goalflight_compat.flock(seatd_lock, D.goalflight_compat.LOCK_EX)
+        D._refresh_codex_seatd_once()
+        assert len(calls) == 1
+        D.goalflight_compat.flock(seatd_lock, D.goalflight_compat.LOCK_UN)
+
+    D._refresh_codex_seatd_once()
+    assert len(calls) == 2
+
+
+def test_stale_grok_state_runs_one_bounded_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = {"updated_at": grok_seats._now() - grok_seats.STATE_TTL_S - 3600, "seats": {}}
+    fresh = {
+        "updated_at": grok_seats._now(),
+        "seats": {
+            SEAT: {
+                "auth_state": "valid",
+                "probe_state": "usable",
+                "used_percent": 42.0,
+            }
+        },
+    }
+    calls: list[float] = []
+    monkeypatch.setattr(grok_seats, "load_states", lambda: stale)
+    monkeypatch.setattr(
+        grok_seats,
+        "refresh_states",
+        lambda *, timeout_s: calls.append(timeout_s) or fresh,
+    )
+
+    assert D._seat_probe_says_usable(SEAT, "grok") is True
+    assert calls == [grok_seats.PROBE_TIMEOUT_S]
 
 
 def test_dropping_a_stale_cooldown_is_not_fail_open() -> None:

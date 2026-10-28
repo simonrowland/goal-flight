@@ -194,6 +194,65 @@ def request_permission(
 
 def handle_prompt(req_id: int, params: dict) -> None:
     session_id = params.get("sessionId", "")
+    if SCENARIO in {"worker_outbox_post", "worker_outbox_silent"}:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+        import goalflight_messages
+        from unittest import mock
+
+        dispatch_id = os.environ.get("GOALFLIGHT_DISPATCH_ID") or "acp-worker-outbox"
+        event_id = (
+            "00000000-0000-4000-8000-000000000002"
+            if SCENARIO == "worker_outbox_silent"
+            else "00000000-0000-4000-8000-000000000001"
+        )
+        try:
+            with mock.patch.object(
+                goalflight_messages,
+                "_worker_journal_projection",
+                return_value=((), RuntimeError("journal denied")),
+            ), mock.patch.object(
+                goalflight_messages,
+                "_prepare_journal_delivery",
+                side_effect=RuntimeError("journal denied"),
+            ):
+                goalflight_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type="user_need",
+                    payload={"text": "ACP worker needs input", "project_root": os.getcwd()},
+                    messages_dir=goalflight_messages.default_messages_dir(),
+                    source={"node": "local", "adapter": "pytest", "transport": "worker"},
+                    event_id=event_id,
+                )
+        except Exception as exc:
+            print(f"worker journal outbox post failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            raise
+        if SCENARIO == "worker_outbox_silent":
+            import goalflight_journal
+
+            witness = os.environ.get("GOALFLIGHT_FAKE_ACP_SILENT_OUTBOX_WITNESS")
+            deadline = time.monotonic() + float(
+                os.environ.get("GOALFLIGHT_FAKE_ACP_SILENT_OUTBOX_WAIT_S", "3.0")
+            )
+            projected_during_silence = False
+            while time.monotonic() < deadline:
+                rows = goalflight_journal.Journal(Path.cwd()).read_all(
+                    "SELECT projected_at FROM delivery_events WHERE event_uuid = ?",
+                    (event_id,),
+                )
+                if rows and rows[0]["projected_at"] is not None:
+                    projected_during_silence = True
+                    break
+                time.sleep(0.02)
+            if witness:
+                Path(witness).write_text(
+                    "projected" if projected_during_silence else "missing",
+                    encoding="utf-8",
+                )
+            text_update(session_id, "STATUS: resumed after silent outbox check\n")
+        else:
+            text_update(session_id, "STATUS: posted worker message\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO in {
         "user_confirm_continue",
         "user_confirm_dual",

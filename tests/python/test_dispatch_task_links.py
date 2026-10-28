@@ -9,7 +9,6 @@ skip_posix_on_native_windows("dispatch task-link tests launch POSIX workers")
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 TASK = ROOT / "goalflight_task.py"
-NODE = shutil.which("node")
 
 
 def assert_true(name: str, condition: bool) -> None:
@@ -135,9 +133,6 @@ def case_dispatch_task_ids_update_ledger_and_breadcrumbs() -> None:
 
 
 def main() -> None:
-    if not NODE:
-        print("SKIP: test_dispatch_task_links.py: node not found on PATH")
-        return
     case_dispatch_task_ids_update_ledger_and_breadcrumbs()
     print("OK: dispatch task-link tests pass")
 
