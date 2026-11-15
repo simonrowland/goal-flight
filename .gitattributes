@@ -26,8 +26,10 @@
 
 # Windows launchers: cmd.exe is the one interpreter that can mis-handle LF in
 # batch labels/gotos, so keep .cmd/.bat CRLF. PowerShell tolerates LF.
-*.cmd           text eol=crlf
-*.bat           text eol=crlf
+# Windows scripts are stored with CRLF bytes and never converted on checkout, so a
+# checkout is byte-identical to the blob (copy-on-write worker seats require that).
+*.cmd           -text
+*.bat           -text
 *.ps1           text eol=lf
 
 # Binary assets: never touch.
