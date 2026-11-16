@@ -217,7 +217,9 @@ def tier_of(reasons: set[str]) -> str:
     return "SALVAGE" if reasons <= SALVAGEABLE else "HOLD"
 # Installed agent tooling, never seats: the deployed goal-flight skill (a linked worktree) and the skill
 # packs and CLI homes that agent hosts load from (gstack lives in ~/.gstack and ~/.claude/skills).
-DEFAULT_PROTECT = ("~/.goal-flight/skill", "~/.claude", "~/.codex", "~/.gstack")
+DEFAULT_PROTECT = ("~/.goal-flight/skill", "~/.claude", "~/.codex", "~/.gstack",
+                   # package-manager installs (their Library/Taps checkouts are under these), not seats
+                   "/opt/homebrew", "/usr/local/Homebrew")
 # Ignored entries that can be rebuilt.  Only DIRECTORY components are matched (an ignored entry
 # ending in "/" or a component before the last); a final file component is allowed only by the
 # explicit file names/globs below.  `env`, `build`, `dist` and `target` are deliberately absent:
@@ -312,15 +314,51 @@ def _is_checkout(path: str) -> str | None:
     return None
 
 
+# macOS firmlinks: /Users/x and /System/Volumes/Data/Users/x are the same directory, but realpath
+# keeps both spellings.  Rows and roots are therefore deduped by (st_dev, st_ino), and a leading
+# FIRMLINK_DATA is stripped from shown paths when the stripped path is the same directory.
+FIRMLINK_DATA = "/System/Volumes/Data"
+
+
+def _resolve(p: str) -> str:
+    return os.path.realpath(p)
+
+
+def _ino(p: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(p)
+    except (OSError, ValueError):
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _display(p: str) -> str:
+    """p without a leading FIRMLINK_DATA when that names the same directory, else p."""
+    pre = FIRMLINK_DATA.rstrip(os.sep)
+    if pre and p.startswith(pre + os.sep):
+        q = p[len(pre):]
+        i = _ino(p)
+        if i is not None and _ino(q) == i:
+            return q
+    return p
+
+
+def _keep_shortest(best: dict, key, path: str) -> None:
+    """One path per directory identity: the shortest spelling (then the first alphabetically)."""
+    if key not in best or (len(path), path) < (len(best[key]), best[key]):
+        best[key] = path
+
+
 def _norm_roots(roots: list[str], skip: tuple[str, ...]) -> list[str]:
-    """Real paths of the roots (one spelling per path, so rows dedupe and no planned path runs
-    through a symlink).  A root whose path holds a skip substring is dropped before any stat."""
-    out = []
+    """Real paths of the roots (no planned path runs through a symlink), one per directory
+    identity.  A root whose path holds a skip substring is dropped before any stat."""
+    best: dict = {}
     for r in roots:
         a = os.path.abspath(os.path.expanduser(r))
         if not _skipped(a, skip):
-            out.append(os.path.realpath(a))
-    return out
+            p = _display(_resolve(a))
+            _keep_shortest(best, _ino(p) or p, p)
+    return sorted(best.values())
 
 
 def _entry_dev(e: os.DirEntry) -> int:
@@ -331,7 +369,7 @@ def find_checkouts(roots: list[str], skip: tuple[str, ...], max_depth: int,
                    prune: frozenset = frozenset()) -> list[tuple[str, str]]:
     """Checkouts under the roots.  Discovery never leaves a root's filesystem (st_dev), so
     /Volumes and network mounts are walked only when given as a root themselves."""
-    found: dict[str, str] = {}
+    found: dict = {}  # (st_dev, st_ino) -> (display path, kind)
     stack = []
     for r in _norm_roots(roots, skip):
         try:
@@ -342,7 +380,10 @@ def find_checkouts(roots: list[str], skip: tuple[str, ...], max_depth: int,
         path, depth, rdev = stack.pop()
         kind = _is_checkout(path)
         if kind:
-            found[path] = kind
+            shown = _display(path)
+            key = _ino(shown) or shown
+            if key not in found or (len(shown), shown) < (len(found[key][0]), found[key][0]):
+                found[key] = (shown, kind)  # two roots reaching one directory give one row
             continue  # measure() walks the checkout and reports the checkouts nested inside it
         if depth >= max_depth:
             continue
@@ -362,7 +403,7 @@ def find_checkouts(roots: list[str], skip: tuple[str, ...], max_depth: int,
                         stack.append((e.path, depth + 1, rdev))
         except OSError:
             continue
-    return sorted(found.items())
+    return sorted(found.values())
 
 
 def find_dirs(roots: list[str], depth: int, skip: tuple[str, ...]) -> list[str]:
@@ -382,7 +423,11 @@ def find_dirs(roots: list[str], depth: int, skip: tuple[str, ...]) -> list[str]:
                     continue
             level = nxt
         out.update(level)
-    return sorted(out)
+    best: dict = {}
+    for d in out:
+        d = _display(d)
+        _keep_shortest(best, _ino(d) or d, d)
+    return sorted(best.values())
 
 
 def measure(root: str, skip: tuple[str, ...], priv: PrivateSize, big: int, every: int,
@@ -987,6 +1032,7 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
     checkouts = find_checkouts(roots, skip, max_depth, prune) if roots else []
     folders = find_dirs(dirs or [], dirs_depth, skip)
     seen = {p for p, _ in checkouts}
+    seen_ino = {_ino(p) for p, _ in checkouts} - {None}
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
         lsof_f = ex.submit(_open_paths) if checkouts else None
@@ -999,8 +1045,12 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
                 rows.append(row)
                 for n in nested:  # nested checkouts at any depth get their own row
                     k = _is_checkout(n)
-                    if k and n not in seen:
+                    n = _display(n)
+                    i = _ino(n)
+                    if k and n not in seen and (i is None or i not in seen_ino):
                         seen.add(n)
+                        if i is not None:
+                            seen_ino.add(i)
                         pending.add(ex.submit(_measure_row, n, k, skip, big, every, opts))
         opens = lsof_f.result() if lsof_f else None
     co_rows = [r for r in rows if r["kind"] != "dir"]

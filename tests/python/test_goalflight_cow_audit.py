@@ -1428,3 +1428,44 @@ def test_changed_tracked_files_count_toward_the_salvage_cap(tmp_path, capsys):
     row = _audit(capsys, "--root", str(tmp_path / "r"), "--salvage-max-gb", "0.00001")["co"]
     assert (row["tier"], row["reasons"]) == ("HOLD", "dirty,salvage-large")
     assert _audit(capsys, "--root", str(tmp_path / "r"))["co"]["tier"] == "SALVAGE"  # under the default cap
+
+
+
+# ---- firmlink / alias dedupe and package-manager protects ----------------------------------------
+
+def _json_rows(capsys, *args: str) -> list[dict]:
+    assert audit.main([*args, "--json", "--exact"]) == 0
+    return [json.loads(ln) for ln in capsys.readouterr().out.splitlines()]
+
+
+def test_two_roots_reaching_one_directory_give_one_row(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(audit, "_resolve", os.path.abspath)  # a firmlink: realpath keeps both spellings
+    co = _repo(tmp_path / "a" / "co", "c")
+    (tmp_path / "alias").symlink_to(tmp_path / "a")
+    rows = _json_rows(capsys, "--root", str(tmp_path / "alias"), "--root", str(tmp_path / "a"))
+    assert [r["path"] for r in rows] == [str(co)]  # one row, the shorter spelling
+    # Different roots (so root dedupe can't merge them) whose walks reach the same checkout.
+    rows = _json_rows(capsys, "--root", str(tmp_path / "alias"), "--root", str(co))
+    assert [r["path"] for r in rows] == [str(co)]
+
+
+def test_data_volume_prefix_is_stripped_when_it_is_the_same_directory(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(audit, "_resolve", os.path.abspath)
+    data = tmp_path / "sysdata"
+    data.symlink_to("/")  # stand-in for /System/Volumes/Data: same directories under another prefix
+    monkeypatch.setattr(audit, "FIRMLINK_DATA", str(data))
+    co = _repo(tmp_path / "r" / "co", "c")
+    _repo(co / "worktrees" / "inner", "i")
+    rows = _json_rows(capsys, "--root", f"{data}{tmp_path / 'r'}", "--root", str(tmp_path / "r"))
+    assert sorted(r["path"] for r in rows) == sorted([str(co), str(co / "worktrees" / "inner")])
+    plan = _plan_for(capsys, Path(f"{data}{tmp_path / 'r'}"), tmp_path / "salvage")
+    assert str(data) not in plan
+
+
+def test_package_manager_installs_are_protected_with_their_taps(tmp_path, capsys):
+    assert {"/opt/homebrew", "/usr/local/Homebrew"} <= set(audit.DEFAULT_PROTECT)
+    brew = tmp_path / "homebrew"
+    _repo(brew, "b")
+    _repo(brew / "Library" / "Taps" / "org" / "homebrew-tap", "t")
+    rows = _audit(capsys, "--root", str(tmp_path), "--protect", str(brew))
+    assert "protected" in rows["homebrew"]["reasons"] and "protected" in rows["homebrew-tap"]["reasons"]
