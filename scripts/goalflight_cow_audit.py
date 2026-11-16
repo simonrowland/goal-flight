@@ -54,8 +54,8 @@ symlinked .git: checked like a repo) or orphan.
                         (its branch commits and stash live in the main repo, so they don't block)
     worktree-refs       linked worktree: per-worktree refs (refs/worktree/*, refs/bisect/*)
     locked              linked worktree that is locked
-    open, open-unknown  some process has a file open under it (one global lsof), or lsof missing;
-                        without root, lsof sees only this user's processes
+    open, open-unknown  some process has a file open under it (libproc on macOS, lsof fallback),
+                        or neither API is available; only this user's processes are scanned
     orphan              worktree whose gitdir (or its main repo) is gone: commits may be gone too
     primary             a repo directly under a --primary-root (default ~/Repos): a source checkout
     hosts-worktrees     repo whose .git administers a linked worktree that is locked or whose
@@ -68,8 +68,9 @@ symlinked .git: checked like a repo) or orphan.
     alternates-source   another audited checkout borrows objects from this one (alternates,
                         followed transitively; borrowers outside the scanned roots are not seen)
     remote-ci-seat      under a `remote-ci-managed` dir: goal-flight's lease logic owns removal
-    protected           at, under or containing a --protect path (always ~/.goal-flight/skill, ~/.claude,
-                        ~/.codex and ~/.gstack: installed agent tooling, not seats)
+    protected           at, under or containing a --protect path (always installed tooling and
+                        package-manager paths such as ~/.goal-flight/skill, ~/.claude, ~/.codex,
+                        ~/.gstack, /opt/homebrew and /usr/local/Homebrew)
     recent              newest write is younger than --stale-days
     has-skipped-names   holds --skip-name entries, so `git status` was not run on it; or its
                         gitdir/main repo/worktree paths hold one, so no git call was made at all
@@ -77,7 +78,7 @@ symlinked .git: checked like a repo) or orphan.
     git-error           a git call failed or timed out
 
 `--dirs ROOT` sizes plain folders: every directory --dirs-depth below ROOT is a `dir` row that
-counts everything inside it, checkouts included (what deleting that folder frees); no verdict.
+excludes nested checkouts, which have their own rows; no verdict.
 
 Efficient trawl:
   * discovery walks each root to --max-depth with os.scandir, prunes heavy or excluded names,
@@ -91,6 +92,12 @@ Efficient trawl:
 
 macOS/APFS only for the private size; elsewhere (or if the call fails) the allocated size is used
 and the row is marked `api=fallback`.
+
+On macOS the default libproc scan checks vnode descriptors, the process cwd, and the executable.
+`--open-scan thorough` also walks mapped file regions. The default misses a process that mmaps a
+checkout file, closes the fd, has its cwd elsewhere, and whose executable is elsewhere. That is
+acceptable because SAFE also requires no writes for 7 days; cautious scans can opt into
+`--open-scan thorough`. Neither mode covers thread-specific cwds or fileports.
 
 The tool never deletes anything.  --delete-plan prints a shell script to review and run by hand.
 The table view also prints a CLEANUP TARGETS section on stderr (stdout stays a clean TSV): the
@@ -128,7 +135,9 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import errno
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -141,6 +150,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
@@ -153,6 +163,21 @@ FSOPT_ATTR_CMN_EXTENDED = 0x00000020
 DISCOVERY_PRUNE = {"node_modules", ".venv", "venv", "__pycache__", "Library", ".Trash", ".cache"}
 GIT_TIMEOUT = 30
 LSOF_TIMEOUT = 120
+PROC_PIDLISTFDS = 1
+PROC_PIDTBSDINFO = 3
+PROC_UID_ONLY = 4
+PROC_PIDREGIONPATHINFO = 8
+PROC_PIDVNODEPATHINFO = 9
+PROC_PIDFDVNODEPATHINFO = 2
+PROX_FDTYPE_VNODE = 1
+PBI_UID_OFFSET, PBI_COMM_OFFSET, PBI_NFILES_OFFSET = 20, 48, 96
+PBI_START_OFFSET = 120
+VNODE_PATH_OFFSET, FD_VNODE_PATH_OFFSET = 152, 176
+REGION_INFO_SIZE = 96
+REGION_PATH_OFFSET = REGION_INFO_SIZE + VNODE_PATH_OFFSET
+LIBPROC_BUFFER_RETRIES = 4
+DEFAULT_SEAT_PARENTS = ("~/repos/ci-jobs/*", "~/Repos/ci-jobs/*", "~/scratch/*",
+                        "~/ci-scratch/*", "~/*-runs/*")
 # Inherited GIT_* variables (GIT_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, ...) would redirect the
 # audit's git calls; only these config-scope ones are kept.
 _GIT_ENV_KEEP = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"}
@@ -161,7 +186,8 @@ REASON_ORDER = ("dirty", "ignored-data", "ignored-data-large", "untracked-large"
                 "hosts-worktrees", "primary", "orphan-module", "submodule", "filter-driver", "alternates-source", "remote-ci-seat", "protected", "recent", "git-error",
                 "has-skipped-names", "nested-review")
 EXTRA_COLS = ("verdict", "reasons", "dirty", "unpushed", "remotes", "stash", "open", "link", "branch",
-              "last_commit_utc", "detached", "ignored", "tier", "placement", "untracked_gb")
+              "last_commit_utc", "detached", "ignored", "tier", "placement", "untracked_gb", "born_utc",
+              "owner", "class")
 # Where checkouts are supposed to live.  Anything else (docs-private, /tmp, research dirs, copies
 # inside another checkout, stray clones in ~) is `misplaced`; placement never changes the tier.
 DEFAULT_EXPECTED = (
@@ -215,10 +241,8 @@ def tier_of(reasons: set[str]) -> str:
     if not reasons:
         return "SAFE"
     return "SALVAGE" if reasons <= SALVAGEABLE else "HOLD"
-# Installed agent tooling, never seats: the deployed goal-flight skill (a linked worktree) and the skill
-# packs and CLI homes that agent hosts load from (gstack lives in ~/.gstack and ~/.claude/skills).
+# Installed agent tooling and package-manager paths are protected, never seats.
 DEFAULT_PROTECT = ("~/.goal-flight/skill", "~/.claude", "~/.codex", "~/.gstack",
-                   # package-manager installs (their Library/Taps checkouts are under these), not seats
                    "/opt/homebrew", "/usr/local/Homebrew")
 # Ignored entries that can be rebuilt.  Only DIRECTORY components are matched (an ignored entry
 # ending in "/" or a component before the last); a final file component is allowed only by the
@@ -320,10 +344,6 @@ def _is_checkout(path: str) -> str | None:
 FIRMLINK_DATA = "/System/Volumes/Data"
 
 
-def _resolve(p: str) -> str:
-    return os.path.realpath(p)
-
-
 def _ino(p: str) -> tuple[int, int] | None:
     try:
         st = os.stat(p)
@@ -351,12 +371,18 @@ def _keep_shortest(best: dict, key, path: str) -> None:
 
 def _norm_roots(roots: list[str], skip: tuple[str, ...]) -> list[str]:
     """Real paths of the roots (no planned path runs through a symlink), one per directory
-    identity.  A root whose path holds a skip substring is dropped before any stat."""
+    identity.  Skip-matching input roots are rejected before resolution; matching resolved
+    components are rejected before the auditor stats or scans the resolved directory."""
     best: dict = {}
     for r in roots:
         a = os.path.abspath(os.path.expanduser(r))
         if not _skipped(a, skip):
-            p = _display(_resolve(a))
+            p = _safe_realpath(a, skip)
+            if p is None:
+                print("# omitted one search root because a path component matched a filter or could not be safely resolved",
+                      file=sys.stderr)
+                continue
+            p = _display(p)
             _keep_shortest(best, _ino(p) or p, p)
     return sorted(best.values())
 
@@ -433,7 +459,7 @@ def find_dirs(roots: list[str], depth: int, skip: tuple[str, ...]) -> list[str]:
 def measure(root: str, skip: tuple[str, ...], priv: PrivateSize, big: int, every: int,
             split_nested: bool = True) -> dict:
     """Bytes under root.  With split_nested, nested checkouts are excluded and returned in `nested`
-    for their own rows; without it (folder rows) everything inside is counted."""
+    for their own rows; without it, all nested bytes are included."""
     logical = allocated = files = 0
     big_priv = 0
     small_alloc = small_samp_alloc = small_samp_priv = 0
@@ -442,6 +468,7 @@ def measure(root: str, skip: tuple[str, ...], priv: PrivateSize, big: int, every
     fallback = False
     n_small = n_sampled = 0
     n_skipped = 0
+    skip_matches: set[str] = set()
     seen_inodes: set[tuple[int, int]] = set()
     nested: list[str] = []
     stack = [root]
@@ -453,8 +480,10 @@ def measure(root: str, skip: tuple[str, ...], priv: PrivateSize, big: int, every
         except OSError:
             continue
         for e in entries:
-            if _skipped(e.name, skip):
+            matches = [name for name in skip if name in e.name]
+            if matches:
                 n_skipped += 1  # never stat it; only record that it is here
+                skip_matches.update(matches)
                 continue
             try:
                 if e.is_dir(follow_symlinks=False):
@@ -501,11 +530,474 @@ def measure(root: str, skip: tuple[str, ...], priv: PrivateSize, big: int, every
     return {"logical": logical, "allocated": allocated, "private": int(big_priv + small_priv),
             "hardlinked": hard_alloc, "files": files, "newest": newest,
             "estimated": n_sampled < n_small, "fallback": fallback,
-            "skipped": n_skipped, "nested": nested}
+            "skipped": n_skipped, "skip_matches": sorted(skip_matches), "nested": nested}
 
 
 def _utc(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(ts)) if ts else "-"
+
+
+def _born(path: str) -> tuple[float | None, str]:
+    """Birth time of a row root, when the platform exposes it."""
+    if sys.platform != "darwin":
+        return None, "-"
+    try:
+        ts = os.stat(path).st_birthtime
+    except (AttributeError, OSError, ValueError):
+        return None, "-"
+    return ts, _utc(ts)
+
+
+def _skip_names(cli: list[str]) -> tuple[str, ...]:
+    """Merge explicit, environment, and config skip substrings without disclosing them."""
+    names = [*cli, *(s for s in os.environ.get("GOALFLIGHT_COW_SKIP", "").split(":") if s)]
+    cfg = os.path.expanduser("~/.config/goalflight/cow-skip.txt")
+    if not _skipped(cfg, tuple(names)):
+        try:
+            st = os.lstat(cfg)
+            if stat.S_ISREG(st.st_mode):
+                with open(cfg, encoding="utf-8", errors="replace") as fh:
+                    names.extend(line.strip() for line in fh if line.strip())
+        except OSError:
+            pass
+    return tuple(dict.fromkeys(names))
+
+
+def _safe_glob(pattern: str, skip: tuple[str, ...]) -> list[str]:
+    """Expand a path glob one component at a time, pruning blinded names before descending."""
+    expanded = os.path.expanduser(pattern)
+    if _skipped(expanded, skip):
+        return []
+    expanded = os.path.abspath(expanded)
+    if _skipped(expanded, skip):
+        return []
+    parts = expanded.split(os.sep)
+    current = [os.sep] if expanded.startswith(os.sep) else [os.curdir]
+    for index, part in enumerate(parts):
+        if not part:
+            continue
+        last = index == len(parts) - 1
+        next_paths = []
+        for base in current:
+            if _skipped(base, skip):
+                continue
+            if glob.has_magic(part):
+                try:
+                    with os.scandir(base) as entries:
+                        for entry in entries:
+                            if _skipped(entry.name, skip) or (entry.name.startswith(".") and not part.startswith(".")):
+                                continue
+                            if not fnmatch.fnmatchcase(entry.name, part):
+                                continue
+                            candidate = entry.path
+                            if last:
+                                next_paths.append(candidate)
+                            else:
+                                try:
+                                    if entry.is_dir(follow_symlinks=False):
+                                        next_paths.append(candidate)
+                                except OSError:
+                                    continue
+                except OSError:
+                    continue
+            else:
+                candidate = os.path.join(base, part)
+                if _skipped(candidate, skip):
+                    continue
+                if last:
+                    next_paths.append(candidate)
+                else:
+                    try:
+                        if stat.S_ISDIR(os.lstat(candidate).st_mode):
+                            next_paths.append(candidate)
+                    except OSError:
+                        continue
+        current = next_paths
+    return current
+
+
+def _seat_candidates(patterns: list[str], skip: tuple[str, ...]) -> list[str]:
+    """Return unique immediate seat children, before separating checkouts from folder rows."""
+    best: dict[tuple[int, int] | str, str] = {}
+    for pattern in patterns:
+        for path in _safe_glob(pattern, skip):
+            if _skipped(path, skip):
+                continue
+            try:
+                if not stat.S_ISDIR(os.lstat(path).st_mode):
+                    continue
+            except OSError:
+                continue
+            shown = _display(os.path.realpath(path))
+            _keep_shortest(best, _ino(shown) or shown, shown)
+    return sorted(best.values())
+
+
+def _owner_rules(path: str | None, skip: tuple[str, ...]) -> list[tuple[str, str]]:
+    if path is None:
+        candidate = os.path.expanduser("~/Repos/.agent-context/checkout-owners.tsv")
+        if _skipped(candidate, skip):
+            return []
+        try:
+            if not stat.S_ISREG(os.lstat(candidate).st_mode):
+                return []
+        except OSError:
+            return []
+        path = candidate
+    path = os.path.abspath(os.path.expanduser(path))
+    if _skipped(path, skip):
+        return []
+    rules = []
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return []
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                fields = line.rstrip("\r\n").split("\t", 1)
+                if len(fields) == 2 and fields[0] and fields[1] and not _skipped(fields[0], skip):
+                    rules.append((os.path.expanduser(fields[0]), fields[1]))
+    except OSError:
+        return []
+    return rules
+
+
+def _mapped_owner(path: str, rules: list[tuple[str, str]], skip: tuple[str, ...]) -> str | None:
+    displayed = os.path.normpath(path)
+    for pattern, owner in rules:
+        if _skipped(pattern, skip):
+            continue
+        lexical = os.path.abspath(os.path.expanduser(pattern))
+        if not _skipped(lexical, skip) and _glob_match(displayed, lexical):
+            return owner
+    return None
+
+
+def _process_owners(rows: list[dict], opens, skip: tuple[str, ...] = ()) -> dict[str, str]:
+    commands = getattr(opens, "commands", {})
+    by_path = {os.path.realpath(r["path"]): r["path"] for r in rows}
+    owners: dict[str, str] = {}
+    for path, command in commands.items():
+        if _skipped(path, skip) or _skipped(command, skip):
+            continue
+        q = os.path.realpath(path)
+        while True:
+            row_path = by_path.get(q)
+            if row_path and row_path not in owners and command:
+                owners[row_path] = command
+            parent = os.path.dirname(q)
+            if parent == q:
+                break
+            q = parent
+    return owners
+
+
+def _repo_name(url: str, skip: tuple[str, ...]) -> str | None:
+    if _skipped(url, skip):
+        return None
+    tail = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    name = tail[:-4] if tail.endswith(".git") else tail
+    return name if name and not _skipped(name, skip) else None
+
+
+def _classify(path: str, primary_roots: list[str], seats: list[str], tools: list[str],
+              skip: tuple[str, ...], kind: str) -> str:
+    p = os.path.realpath(path)
+    for root in primary_roots:
+        root = os.path.realpath(os.path.expanduser(root))
+        if os.path.dirname(p) == root:
+            return "primary"
+    parts = p.split(os.sep)
+    pool = os.path.expanduser("~/.goal-flight/worktrees")
+    if not _skipped(pool, skip) and os.path.dirname(p) == os.path.realpath(pool):
+        return "pool"
+    if any(parts[i] in ("worktrees", ".worktrees") and i == len(parts) - 2
+           for i in range(len(parts))):
+        return "repo-worktree"
+    if "remote-ci-managed" in parts and "seats" in parts:
+        return "remote-ci-seat"
+    if kind != "dir" and any(fnmatch.fnmatchcase(part, "*-runs") for part in parts[:-1]):
+        return "run-source"
+    if any(_under(p, seat) for seat in seats):
+        return "job-tree"
+    if any(_under(p, os.path.realpath(os.path.expanduser(item))) for item in tools):
+        return "tool-install"
+    if any(part in ("scratch", "tmp") for part in parts):
+        return "scratch"
+    return "other"
+
+
+class _OpenPaths(set):
+    def __init__(self, *, complete: bool = True, scanned_processes: int = 0,
+                 not_visible_processes: int = 0, incomplete_processes: int = 0):
+        super().__init__()
+        self.commands: dict[str, str] = {}
+        self.complete = complete
+        self.scanned_processes = scanned_processes
+        self.not_visible_processes = not_visible_processes
+        self.incomplete_processes = incomplete_processes
+
+
+def _lsof_open_paths() -> _OpenPaths | None:
+    """Fallback snapshot for platforms without a working libproc API."""
+    try:
+        r = subprocess.run(["lsof", "-n", "-P", "-u", str(os.getuid()), "-F", "pcn"], capture_output=True, text=True,
+                           errors="replace", timeout=LSOF_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    opens = _OpenPaths(complete=r.returncode == 0,
+                       incomplete_processes=0 if r.returncode == 0 else 1)
+    command = ""
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            opens.scanned_processes += 1
+        elif line.startswith("c"):
+            command = line[1:]
+        elif line.startswith("n/"):
+            path = line[1:]
+            opens.add(path)
+            if command:
+                opens.commands[path] = command
+    return opens
+
+
+def _libproc_open_paths(thorough: bool = False) -> _OpenPaths | None:
+    """Snapshot same-user descriptors, cwds, and executables; thorough also checks mapped files."""
+    if sys.platform != "darwin":
+        return None
+    opens = None
+    try:
+        lib = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib", use_errno=True)
+        list_pids = lib.proc_listpids
+        pid_info = lib.proc_pidinfo
+        fd_info = lib.proc_pidfdinfo
+        list_pids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        list_pids.restype = ctypes.c_int
+        pid_info.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        pid_info.restype = ctypes.c_int
+        fd_info.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        fd_info.restype = ctypes.c_int
+        pid_path = lib.proc_pidpath
+        pid_path.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        pid_path.restype = ctypes.c_int
+
+        my_uid = os.getuid()
+        opens = _OpenPaths()
+        n = list_pids(PROC_UID_ONLY, my_uid, None, 0)
+        if n <= 0 or n % ctypes.sizeof(ctypes.c_int):
+            return _OpenPaths(complete=False, incomplete_processes=1)
+        capacity = max(n // ctypes.sizeof(ctypes.c_int) + 16, 16)
+        pids = None
+        for _ in range(LIBPROC_BUFFER_RETRIES):
+            pid_buf = (ctypes.c_int * capacity)()
+            ctypes.set_errno(0)
+            buffer_size = ctypes.sizeof(pid_buf)
+            got = list_pids(PROC_UID_ONLY, my_uid, pid_buf, buffer_size)
+            if got <= 0 or got % ctypes.sizeof(ctypes.c_int):
+                return _OpenPaths(complete=False, incomplete_processes=1)
+            if got < buffer_size:
+                pids = list(pid_buf[:got // ctypes.sizeof(ctypes.c_int)])
+                break
+            capacity = max(capacity * 2, got // ctypes.sizeof(ctypes.c_int) + 1)
+        if pids is None:
+            return _OpenPaths(complete=False, incomplete_processes=1)
+
+        def bsd_info(pid: int):
+            bsd = ctypes.create_string_buffer(512)
+            ctypes.set_errno(0)
+            size = pid_info(pid, PROC_PIDTBSDINFO, 0, bsd, ctypes.sizeof(bsd))
+            err = ctypes.get_errno()
+            if size <= 0 or size < PBI_START_OFFSET + 16:
+                return None, err
+            uid = struct.unpack_from("=I", bsd.raw, PBI_UID_OFFSET)[0]
+            nfiles = struct.unpack_from("=I", bsd.raw, PBI_NFILES_OFFSET)[0]
+            start = struct.unpack_from("=QQ", bsd.raw, PBI_START_OFFSET)
+            name = os.fsdecode(bsd.raw[PBI_COMM_OFFSET:PBI_COMM_OFFSET + 16]).split("\0", 1)[0]
+            return (uid, nfiles, start, name), 0
+
+        def failed(err: int) -> str:
+            if err == errno.EPERM:
+                return "not-visible-eperm"
+            if err == errno.ESRCH:
+                return "not-visible"
+            return "incomplete"
+
+        def collect_paths(pid: int, nfiles: int) -> tuple[list[str], str]:
+            paths: list[str] = []
+            cwd = ctypes.create_string_buffer(4096)
+            ctypes.set_errno(0)
+            size = pid_info(pid, PROC_PIDVNODEPATHINFO, 0, cwd, ctypes.sizeof(cwd))
+            err = ctypes.get_errno()
+            if size <= 0:
+                return paths, failed(err)
+            if size < VNODE_PATH_OFFSET + 1:
+                return paths, "incomplete"
+            path = os.fsdecode(cwd.raw[VNODE_PATH_OFFSET:]).split("\0", 1)[0]
+            if not path.startswith("/"):
+                return paths, "incomplete"
+            paths.append(path)
+
+            fd_capacity = max(8, nfiles * 8)
+            fd_entries = None
+            for _ in range(LIBPROC_BUFFER_RETRIES):
+                fds = ctypes.create_string_buffer(fd_capacity)
+                ctypes.set_errno(0)
+                size = pid_info(pid, PROC_PIDLISTFDS, 0, fds, ctypes.sizeof(fds))
+                err = ctypes.get_errno()
+                if size <= 0:
+                    return paths, failed(err)
+                if size == 0:
+                    fd_entries = b""
+                    break
+                if size % 8 or size > fd_capacity:
+                    return paths, "incomplete"
+                if size < fd_capacity:
+                    fd_entries = fds.raw[:size]
+                    break
+                fd_capacity = max(fd_capacity * 2, size + 8)
+            if fd_entries is None:
+                return paths, "incomplete"
+
+            for offset in range(0, len(fd_entries), 8):
+                fd, fdtype = struct.unpack_from("=iI", fd_entries, offset)
+                if fdtype != PROX_FDTYPE_VNODE:
+                    continue
+                vnode = ctypes.create_string_buffer(4096)
+                ctypes.set_errno(0)
+                size = fd_info(pid, fd, PROC_PIDFDVNODEPATHINFO, vnode, ctypes.sizeof(vnode))
+                err = ctypes.get_errno()
+                if size <= 0:
+                    return paths, failed(err)
+                if size < FD_VNODE_PATH_OFFSET + 1:
+                    return paths, "incomplete"
+                path = os.fsdecode(vnode.raw[FD_VNODE_PATH_OFFSET:]).split("\0", 1)[0]
+                if not path.startswith("/"):
+                    return paths, "incomplete"
+                paths.append(path)
+
+            executable = ctypes.create_string_buffer(4096)
+            ctypes.set_errno(0)
+            size = pid_path(pid, executable, ctypes.sizeof(executable))
+            err = ctypes.get_errno()
+            if size <= 0:
+                return paths, failed(err)
+            path = os.fsdecode(executable.raw).split("\0", 1)[0]
+            if not path.startswith("/"):
+                return paths, "incomplete"
+            paths.append(path)
+
+            app_parts = path[len("/Applications/"):].split(os.sep) if path.startswith("/Applications/") else []
+            system_executable = any(path == root or path.startswith(root + "/")
+                                    for root in ("/System", "/usr", "/Library/Apple"))
+            app_executable = (len(app_parts) > 1 and app_parts[0].endswith(".app")
+                              and app_parts[1] == "Contents")
+            if thorough and not (system_executable or app_executable):
+                address = 0
+                regions = 0
+                while True:
+                    region = ctypes.create_string_buffer(4096)
+                    ctypes.set_errno(0)
+                    size = pid_info(pid, PROC_PIDREGIONPATHINFO, address, region, ctypes.sizeof(region))
+                    err = ctypes.get_errno()
+                    if size <= 0:
+                        if err == errno.EINVAL and regions:
+                            break
+                        return paths, failed(err)
+                    if size < REGION_PATH_OFFSET + 1:
+                        return paths, "incomplete"
+                    region_address, region_size = struct.unpack_from("=QQ", region.raw, REGION_INFO_SIZE - 16)
+                    if region_size == 0 or region_address + region_size <= address:
+                        return paths, "incomplete"
+                    path = os.fsdecode(region.raw[REGION_PATH_OFFSET:]).split("\0", 1)[0]
+                    if path.startswith("/"):
+                        paths.append(path)
+                    address = region_address + region_size
+                    regions += 1
+            return paths, "ok"
+
+        for pid in pids:
+            if pid <= 0:
+                continue
+            record_paths = False
+            process_paths: list[str] = []
+            name = ""
+            for attempt in range(2):
+                process_paths = []
+                name = ""
+                try:
+                    before, err = bsd_info(pid)
+                    if before is None:
+                        result = failed(err)
+                        if result == "incomplete":
+                            if attempt == 0:
+                                continue
+                            opens.incomplete_processes += 1
+                        elif result == "not-visible-eperm":
+                            opens.not_visible_processes += 1
+                        break
+                    uid, nfiles, start, name = before
+                    if uid != my_uid:
+                        break
+                    process_paths, result = collect_paths(pid, nfiles)
+                    after, err = bsd_info(pid)
+                    if after is None:
+                        status = failed(err)
+                        if status == "incomplete":
+                            if attempt == 0:
+                                continue
+                            opens.incomplete_processes += 1
+                            record_paths = True
+                        elif status == "not-visible-eperm":
+                            opens.not_visible_processes += 1
+                        break
+                    if after[0] != uid or after[2] != start:
+                        if attempt == 0:
+                            continue
+                        opens.incomplete_processes += 1
+                        break
+                    if result != "ok":
+                        if result == "incomplete":
+                            if attempt == 0:
+                                continue
+                            opens.incomplete_processes += 1
+                            record_paths = True
+                        elif result == "not-visible-eperm":
+                            opens.not_visible_processes += 1
+                        break
+                    opens.scanned_processes += 1
+                    record_paths = True
+                    break
+                except (OSError, AttributeError, ctypes.ArgumentError, ValueError):
+                    if attempt == 0:
+                        continue
+                    opens.incomplete_processes += 1
+                    record_paths = True
+                    break
+            if record_paths:
+                for path in process_paths:
+                    opens.add(path)
+                    if name:
+                        opens.commands[path] = name
+        visible_processes = opens.scanned_processes + opens.incomplete_processes
+        opens.complete = opens.complete and opens.incomplete_processes * 20 <= visible_processes
+        return opens
+    except (OSError, AttributeError, ctypes.ArgumentError, ValueError):
+        if opens is not None:
+            opens.complete = False
+            opens.incomplete_processes += 1
+            return opens
+        return None
+
+
+def _open_paths(scan: str | None = None) -> _OpenPaths | None:
+    """Use the default libproc scan on macOS unless lsof or a thorough scan was requested."""
+    if scan == "lsof":
+        return _lsof_open_paths()
+    thorough = scan == "thorough"
+    if scan in {"libproc", "thorough"} or (scan is None and sys.platform == "darwin"):
+        paths = _libproc_open_paths(thorough=thorough)
+        if paths is not None:
+            return paths
+    return _lsof_open_paths()
 
 
 def _git(path: str, gitdir: str, *args: str, pre: tuple[str, ...] = (), ok: tuple[int, ...] = (0,),
@@ -735,7 +1227,8 @@ def git_facts(path: str, kind: str, tree_skipped: bool, skip: tuple[str, ...],
     f: dict = {"dirty": None, "ignored": None, "unpushed": None, "remotes": None, "stash": None,
                "detached": None, "link": "-", "branch": "-", "last_commit_utc": "-",
                "main_repo": None, "objects": None, "borrows": set(), "gitdir": None, "modules": set(),
-               "tracking": [], "ignored_entries": [], "untracked_gb": None, "bundle_base": [], "bundle_revs": [], "bundle_empty": False}
+               "tracking": [], "ignored_entries": [], "untracked_gb": None, "bundle_base": [], "bundle_revs": [],
+               "bundle_empty": False, "remote_name": None, "remove_path": path}
     reasons: list[str] = []
     try:
         lay = _layout(path, skip)
@@ -745,6 +1238,12 @@ def git_facts(path: str, kind: str, tree_skipped: bool, skip: tuple[str, ...],
         gitdir, common = lay["gitdir"], lay["common"]
         linked = lay["link"] == "linked"
         f["gitdir"] = os.path.realpath(gitdir)
+        if linked:
+            recorded = (_read_text(os.path.join(gitdir, "gitdir")) or "").strip()
+            remove_path = os.path.dirname(recorded) if recorded else ""
+            if remove_path and not _skipped(recorded, skip) and not _skipped(remove_path, skip):
+                if _ino(remove_path) == _ino(path):
+                    f["remove_path"] = remove_path
         f["borrows"] = _alternates({os.path.join(gitdir, "objects"), os.path.join(common, "objects")}, skip)
         if linked:
             if os.path.lexists(os.path.join(gitdir, "locked")):
@@ -784,7 +1283,11 @@ def git_facts(path: str, kind: str, tree_skipped: bool, skip: tuple[str, ...],
     # are trusted as they are: no network call checks that the remote still has them.
     counted: list[str] = []
     for name in run("remote") or []:
+        if _skipped(name, skip):
+            continue
         urls = (run("remote", "get-url", "--all", name) or []) + (run("remote", "get-url", "--push", "--all", name) or [])
+        if f["remote_name"] is None:
+            f["remote_name"] = next((_repo_name(url, skip) for url in urls if _repo_name(url, skip)), None)
         if urls and all(_is_network_url(u) and not _skipped(u, skip) for u in urls):
             counted.append(name)
     f["remotes"] = len(counted)
@@ -949,38 +1452,28 @@ def git_facts(path: str, kind: str, tree_skipped: bool, skip: tuple[str, ...],
     return f, reasons
 
 
-def _open_paths() -> set[str] | None:
-    """Paths some process has open (one global snapshot), or None when lsof is unavailable."""
-    try:
-        r = subprocess.run(["lsof", "-n", "-P", "-F", "n"], capture_output=True, text=True,
-                           errors="replace", timeout=LSOF_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # lsof exits 1 when it could not inspect some processes; the rest of its output is still valid.
-    if r.returncode != 0 and not r.stdout:
-        return None
-    return {ln[1:] for ln in r.stdout.splitlines() if ln.startswith("n/")}
-
-
 def _measure_row(path: str, kind: str, skip: tuple[str, ...], big: int, every: int,
                  opts: dict | None = None) -> tuple[dict, list[str]]:
-    m = measure(path, skip, _thread_priv(), big, every, split_nested=(kind != "dir"))
+    m = measure(path, skip, _thread_priv(), big, every, split_nested=True)
     frac = m["private"] / m["allocated"] if m["allocated"] else 0.0
+    born_ts, born_utc = _born(path)
     row = {"path": path, "kind": kind, "logical_gb": m["logical"] / 1e9,
            "allocated_gb": m["allocated"] / 1e9, "private_gb": m["private"] / 1e9,
            "hardlinked_gb": m["hardlinked"] / 1e9, "private_frac": frac,
            "cow": "NON-COW" if frac >= 0.5 else "shared", "files": m["files"],
            "estimated": m["estimated"], "api": "fallback" if m["fallback"] else "apfs",
-           "newest_utc": _utc(m["newest"]), "_newest": m["newest"], "_reasons": []}
+           "newest_utc": _utc(m["newest"]), "_newest": m["newest"], "born_utc": born_utc,
+           "_born": born_ts, "owner": "-", "class": "other", "_reasons": []}
+    row["_skip_matches"] = m["skip_matches"]
     if kind == "dir":
         row.update(dirty=None, ignored=None, unpushed=None, remotes=None, stash=None, detached=None, link="-",
                    branch="-", last_commit_utc="-", _main_repo=None, _objects=None, _borrows=set(),
                    _gitdir=None, _modules=set(), _tracking=[], _ignored_entries=[], _bundle_base=[],
-                   _bundle_revs=[], _bundle_empty=False, untracked_gb=None)
+                   _bundle_revs=[], _bundle_empty=False, _remote_name=None, _remove_path=path, untracked_gb=None)
     else:
         facts, row["_reasons"] = git_facts(path, kind, m["skipped"] > 0, skip, opts)
         for k in ("main_repo", "objects", "borrows", "gitdir", "modules", "tracking", "ignored_entries",
-                  "bundle_base", "bundle_revs", "bundle_empty"):
+                  "bundle_base", "bundle_revs", "bundle_empty", "remote_name", "remove_path"):
             row["_" + k] = facts.pop(k)
         row.update(facts)
     return row, m["nested"]
@@ -990,13 +1483,15 @@ def _under(p: str, top: str) -> bool:
     return p == top or p.startswith(top.rstrip(os.sep) + os.sep)
 
 
-def _count_open(rows: list[dict], opens: set[str]) -> dict[str, int]:
+def _count_open(rows: list[dict], opens: set[str], skip: tuple[str, ...] = ()) -> dict[str, int]:
     """Open paths per checkout, matched by realpath prefix (lsof reports /private/tmp etc.).
     Walking each open path's ancestors costs O(depth) dict lookups instead of O(rows) prefix tests;
     a file in a nested checkout counts for its parents too, since deleting them removes it."""
     idx = {os.path.realpath(r["path"]): 0 for r in rows}
     for p in opens:
-        q = p
+        if _skipped(p, skip):
+            continue
+        q = os.path.realpath(p)
         while True:
             if q in idx:
                 idx[q] += 1
@@ -1011,7 +1506,9 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
           dirs: list[str] | None = None, dirs_depth: int = 1, jobs: int = 1,
           stale_days: float = 7.0, now: float | None = None, protect: list[str] | None = None,
           opts: dict | None = None, primary_roots: list[str] | None = None,
-          prune: frozenset = frozenset(), expected: list[str] | None = None) -> list[dict]:
+          prune: frozenset = frozenset(), expected: list[str] | None = None,
+          seat_paths: list[str] | None = None, owner_rules: list[tuple[str, str]] | None = None,
+          open_scan: str | None = None) -> list[dict]:
     now = time.time() if now is None else now
     # Real path of every entry directly under a primary root, so a repo symlinked in counts too.
     primary: set[str] = set()
@@ -1029,13 +1526,20 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
             continue
     protect = [os.path.abspath(os.path.expanduser(p)) for p in (protect or [])]
     protect += [os.path.realpath(p) for p in protect if not _skipped(p, skip)]
-    checkouts = find_checkouts(roots, skip, max_depth, prune) if roots else []
+    search_roots = [*(roots or []), *(seat_paths or [])]
+    checkouts = find_checkouts(search_roots, skip, max_depth, prune) if search_roots else []
     folders = find_dirs(dirs or [], dirs_depth, skip)
+    folder_best: dict = {}
+    for p in [*folders, *(p for p in (seat_paths or []) if not _is_checkout(p))]:
+        p = _display(p)
+        _keep_shortest(folder_best, _ino(p) or p, p)
+    folders = sorted(folder_best.values())
     seen = {p for p, _ in checkouts}
     seen_ino = {_ino(p) for p, _ in checkouts} - {None}
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as ex:
-        lsof_f = ex.submit(_open_paths) if checkouts else None
+        lsof_f = (ex.submit(_open_paths) if open_scan is None else ex.submit(_open_paths, open_scan)) \
+            if checkouts or folders else None
         pending = {ex.submit(_measure_row, p, k, skip, big, every, opts) for p, k in checkouts}
         pending |= {ex.submit(_measure_row, p, "dir", skip, big, every) for p in folders}
         while pending:
@@ -1053,6 +1557,7 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
                             seen_ino.add(i)
                         pending.add(ex.submit(_measure_row, n, k, skip, big, every, opts))
         opens = lsof_f.result() if lsof_f else None
+    rows = [r for r in rows if r["kind"] != "dir" or _ino(r["path"]) not in seen_ino]
     co_rows = [r for r in rows if r["kind"] != "dir"]
     borrowed = set().union(*(r["_borrows"] for r in co_rows))
     row_gitdirs = {r["_gitdir"] for r in co_rows if r["_gitdir"]}
@@ -1073,10 +1578,33 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
         # depends on and no minter re-creates; its linked worktrees and nested seats are not primary.
         if r["kind"] == "repo" and r["link"] in ("repo", "separate") and any(n in primary for n in names):
             r["_reasons"].append("primary")
-    open_by = _count_open(co_rows, opens) if opens is not None else {}
+    open_complete = opens is not None and getattr(opens, "complete", True)
+    scanned_processes = getattr(opens, "scanned_processes", 0) if opens is not None else 0
+    not_visible_processes = getattr(opens, "not_visible_processes", 0) if opens is not None else 0
+    incomplete_processes = getattr(opens, "incomplete_processes", 0) if opens is not None else 0
+    open_by = _count_open(co_rows, opens, skip) if open_complete else {}
+    process_owner = _process_owners(rows, opens, skip) if open_complete else {}
+    for row in rows:
+        row["_scanned_processes"] = scanned_processes
+        row["_not_visible_processes"] = not_visible_processes
+        row["_incomplete_processes"] = incomplete_processes
+    rules = owner_rules or []
+    safe_primary_roots = [p for p in (primary_roots or []) if not _skipped(os.path.expanduser(p), skip)]
+    safe_tools = [p for p in DEFAULT_PROTECT if not _skipped(os.path.expanduser(p), skip)]
+    for r in rows:
+        mapped = _mapped_owner(r["path"], rules, skip)
+        proc = process_owner.get(r["path"])
+        remote = r.get("_remote_name")
+        if mapped is not None:
+            r["owner"] = mapped if not _skipped(mapped, skip) else "-"
+        elif proc is not None:
+            r["owner"] = proc if not _skipped(proc, skip) else "-"
+        else:
+            r["owner"] = remote if remote and not _skipped(remote, skip) else "-"
+        r["class"] = _classify(r["path"], safe_primary_roots, seat_paths or [], safe_tools, skip, r["kind"])
     for r in co_rows:
-        if opens is None:
-            r["open"] = None
+        if not open_complete:
+            r["open"] = "-"
             r["_reasons"].append("open-unknown")
         else:
             r["open"] = open_by[os.path.realpath(r["path"])]
@@ -1091,8 +1619,14 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
         pre = r["path"] + os.sep
         if any(p.startswith(pre) for p in own_review):
             r["_reasons"].append("nested-review")
-    pats = [os.path.realpath(os.path.expanduser(g)) for g in (expected if expected is not None else DEFAULT_EXPECTED)]
-    tmps = tmp_roots()
+    pats = [os.path.realpath(os.path.expanduser(g))
+            for g in (expected if expected is not None else DEFAULT_EXPECTED)
+            if not _skipped(os.path.expanduser(g), skip)]
+    tmp_hint = os.environ.get("TMPDIR") or tempfile.tempdir or "/tmp"
+    if _skipped(tmp_hint, skip):
+        tmps = [os.path.realpath("/private/tmp")] if not _skipped("/private/tmp", skip) else []
+    else:
+        tmps = tmp_roots()
     paths = [r["path"] for r in co_rows]
     for r in co_rows:
         real = os.path.realpath(r["path"])
@@ -1110,7 +1644,8 @@ def audit(roots: list[str], skip: tuple[str, ...], max_depth: int, big: int, eve
             r["_location"] = "home-other"
     for r in rows:
         if r["kind"] == "dir":
-            r.update(verdict="-", reasons="", open=None, tier="-", placement="-", _location="-")
+            r.update(verdict="-", reasons="", open="-" if not open_complete else None,
+                     tier="-", placement="-", _location="-")
         else:
             rs = sorted(set(r["_reasons"]), key=REASON_ORDER.index)
             r.update(verdict="REVIEW" if rs else "SAFE", reasons=",".join(rs), tier=tier_of(set(rs)))
@@ -1187,7 +1722,7 @@ def _salvage_cmds(r: dict, dest: str) -> list[str]:
 
 
 def _delete_cmd(r: dict) -> str:
-    q = shlex.quote(r["path"])
+    q = shlex.quote(r.get("_remove_path", r["path"]))
     if r["link"] == "linked" and r["_main_repo"]:
         # No --force for a clean worktree: git's own refusal is a last check at run time.  A
         # SALVAGE row with dirty files needs one --force (never the double form, which would also
@@ -1319,9 +1854,258 @@ def _tier_summary(co: list[dict]) -> str:
     return f"# NON-COW {sum(r['private_gb'] for r in nc):.2f} GB: " + " / ".join(parts)
 
 
+def _noncow_groups(rows: list[dict], key: str, label: str) -> str:
+    totals: Counter = Counter()
+    for row in rows:
+        if row["cow"] == "NON-COW":
+            totals[row.get(key, "-")] += row["private_gb"]
+    detail = ", ".join(f"{name} {gb:.2f} GB" for name, gb in
+                        sorted(totals.items(), key=lambda item: (-item[1], str(item[0]))))
+    return f"# NON-COW by {label}: {detail or '0.00 GB'}"
+
+
+def _date_cutoff(date: str) -> float:
+    return datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+
+
+LOCAL_CONFIG_PATH = "~/.config/goalflight/cow-audit.json"
+LOCAL_CONFIG_KEYS = {"protect", "seat_parents", "expected", "skip_names"}
+
+
+def _local_config() -> dict[str, list[str]]:
+    """Read optional local path lists without adding machine-specific values to the repo."""
+    path = os.path.expanduser(LOCAL_CONFIG_PATH)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            config = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    unknown = set(config) - LOCAL_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"{path} has unsupported keys: {', '.join(sorted(unknown))}")
+    for key, values in config.items():
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError(f"{path} field {key!r} must be a list of strings")
+        if any(not value or "\0" in value for value in values):
+            raise ValueError(f"{path} field {key!r} cannot contain empty strings or NULs")
+    return config
+
+
+def _remote_argv(original: list[str], skip: tuple[str, ...], plan: bool = False) -> list[str]:
+    valued = ("--hosts", "--host-jobs", "--host-timeout", "--plan-prefix", "--skip-name")
+    out, i = [], 0
+    while i < len(original):
+        token = original[i]
+        if token in valued:
+            i += 2
+            continue
+        if any(token.startswith(option + "=") for option in valued):
+            i += 1
+            continue
+        if token in ("--json", "--paths-only", "--delete-plan"):
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    for name in skip:
+        out.extend(("--skip-name", name))
+    out.append("--delete-plan" if plan else "--json")
+    return out
+
+
+def _safe_realpath(path: str, skip: tuple[str, ...]) -> str | None:
+    """Resolve a path component by component, stopping before any skipped name."""
+    path = os.path.abspath(path)
+    if _skipped(path, skip):
+        return None
+    current, pending, links = os.sep, path.split(os.sep)[1:], 0
+    while pending:
+        part = pending.pop(0)
+        if not part:
+            continue
+        if _skipped(part, skip):
+            return None
+        if part == ".":
+            continue
+        if part == "..":
+            current = os.path.dirname(current)
+            continue
+        candidate = os.path.join(current, part)
+        if _skipped(candidate, skip):
+            return None
+        try:
+            st = os.lstat(candidate)
+        except FileNotFoundError:
+            # Keep processing components: a later ".." can expose an existing symlink to resolve.
+            current = candidate
+            continue
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            links += 1
+            if links > 40:
+                return None
+            try:
+                target = os.readlink(candidate)
+            except OSError:
+                return None
+            if _skipped(target, skip) or any(_skipped(item, skip) for item in target.split(os.sep)):
+                return None
+            if os.path.isabs(target):
+                current = os.sep
+                pending = target.split(os.sep)[1:] + pending
+            else:
+                pending = target.split(os.sep) + pending
+        else:
+            current = candidate
+    resolved = os.path.normpath(current)
+    return None if _skipped(resolved, skip) else resolved
+
+
+def _write_plan_exclusive(target: str, plan: str, skip: tuple[str, ...]) -> bool:
+    """Create a private, new plan file without following a target or parent symlink blindly."""
+    target = os.path.abspath(target)
+    if _skipped(target, skip):
+        return False
+    parent = _safe_realpath(os.path.dirname(target), skip)
+    basename = os.path.basename(target)
+    if parent is None or _skipped(basename, skip):
+        return False
+    safe_target = os.path.join(parent, basename)
+    if _skipped(safe_target, skip):
+        return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    fd = os.open(safe_target, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(plan)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return True
+
+
+def _fleet(args, original: list[str], skip: tuple[str, ...]) -> int:
+    """Run independent read-only audits on hosts and merge identity-checked JSON rows."""
+    hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    if not hosts:
+        print("--hosts requires at least one host", file=sys.stderr)
+        return 2
+    script = os.path.abspath(__file__)
+    json_args = _remote_argv(original, skip)
+    plan_args = _remote_argv(original, skip, plan=True)
+
+    def run_host(index_host):
+        index, host = index_host
+        if _skipped(host, skip) or _skipped(script, skip):
+            return host, None, "IDENTITY-FAIL", "", None, 0
+        start = time.monotonic()
+        deadline = start + args.host_timeout
+        remote_script = f"/tmp/cow-audit-{os.getpid()}-{index}.py"
+        if _skipped(remote_script, skip):
+            return host, None, "IDENTITY-FAIL", "", None, 0
+
+        def remaining():
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise subprocess.TimeoutExpired(["ssh", host], args.host_timeout)
+            return timeout
+
+        try:
+            copied = subprocess.run(["scp", script, f"{host}:{remote_script}"], capture_output=True,
+                                    text=True, timeout=remaining())
+            if copied.returncode:
+                return host, None, "ERROR", "", None, 0
+            ident = subprocess.run(["ssh", host, "hostname", "-s"], capture_output=True, text=True,
+                                   timeout=remaining())
+            hostname = ident.stdout.strip().splitlines()[0] if ident.returncode == 0 and ident.stdout.strip() else ""
+            if not hostname or hostname != host or _skipped(hostname, skip):
+                return host, None, "IDENTITY-FAIL", hostname, None, 0
+
+            command = shlex.join(["python3", remote_script, *json_args])
+            result = subprocess.run(["ssh", host, command], capture_output=True, text=True,
+                                    timeout=remaining())
+            if result.returncode:
+                return host, None, "ERROR", hostname, None, (0, 0, 0)
+            rows = []
+            for line in result.stdout.splitlines():
+                if line:
+                    row = json.loads(line)
+                    row["host"] = hostname
+                    rows.append(row)
+            match = re.search(
+                r"^# open-scan: (\d+) processes scanned, (\d+) not visible \(EPERM\), (\d+) incomplete$",
+                result.stderr, re.MULTILINE)
+            open_scan = tuple(map(int, match.groups())) if match else (0, 0, 0)
+            plan = None
+            if args.delete_plan:
+                command = shlex.join(["python3", remote_script, *plan_args])
+                result = subprocess.run(["ssh", host, command], capture_output=True, text=True,
+                                        timeout=remaining())
+                if result.returncode:
+                    return host, None, "ERROR", hostname, None, open_scan
+                plan = result.stdout
+            return host, rows, "OK", hostname, plan, open_scan
+        except subprocess.TimeoutExpired:
+            return host, None, "TIMEOUT", "", None, (0, 0, 0)
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            return host, None, "ERROR", "", None, (0, 0, 0)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.host_jobs)) as pool:
+        results = list(pool.map(run_host, enumerate(hosts)))
+    merged, failed, successful_hosts = [], 0, 0
+    for host, rows, status, identity, plan, open_scan in results:
+        if rows is None:
+            failed += 1
+            label = status
+            print(f"# {label}" + (f" {host}" if not _skipped(host, skip) else ""), file=sys.stderr)
+            continue
+        successful_hosts += 1
+        merged.extend(rows)
+        gb = sum(r["private_gb"] for r in rows if r["cow"] == "NON-COW")
+        if args.delete_plan:
+            safe_host = re.sub(r"[^A-Za-z0-9._-]", "_", identity)
+            target = os.path.abspath(f"{args.plan_prefix}-{safe_host}.sh")
+            try:
+                written = _write_plan_exclusive(target, plan, skip)
+            except OSError:
+                written = False
+            if not written:
+                failed += 1
+                print(f"# ERROR {identity}: plan file not created", file=sys.stderr)
+        print(f"# HOST {identity}: {len(rows)} rows, {gb:.2f} GB NON-COW, "
+              f"open-scan: {open_scan[0]} processes scanned, {open_scan[1]} not visible (EPERM), "
+              f"{open_scan[2]} incomplete", file=sys.stderr)
+    for row in merged:
+        print(json.dumps(row))
+    total = sum(r["private_gb"] for r in merged)
+    noncow = sum(r["private_gb"] for r in merged if r["cow"] == "NON-COW")
+    print(f"# FLEET: {successful_hosts} hosts, {len(merged)} rows, "
+          f"{total:.2f} GB private total, {noncow:.2f} GB NON-COW", file=sys.stderr)
+    _summary_groups(merged, None)
+    return 2 if failed else 0
+
+
+def _summary_groups(rows: list[dict], created: tuple[str, float] | None) -> None:
+    print(_noncow_groups(rows, "owner", "owner"), file=sys.stderr)
+    print(_noncow_groups(rows, "class", "class"), file=sys.stderr)
+    if created:
+        date, cutoff = created
+        subset = [r for r in rows if r["_born"] is not None and r["_born"] >= cutoff]
+        print(_noncow_groups(subset, "class", f"class created since {date}"), file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
+    original = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser(description="Find git checkouts and folders that own their disk blocks "
-                                             "(APFS private size), with a safe-to-delete verdict.")
+                                             "(APFS private size), with a safe-to-delete verdict.",
+                                 epilog=f"Optional local lists are read from {LOCAL_CONFIG_PATH}.")
     ap.add_argument("--root", action="append", help="root to trawl for checkouts (repeatable); "
                     "default ~/Repos and ~/.goal-flight when neither --root nor --dirs is given")
     ap.add_argument("--dirs", action="append", default=[],
@@ -1329,6 +2113,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dirs-depth", type=int, default=1, help="depth of --dirs rows below the root (default 1)")
     ap.add_argument("--skip-name", action="append", default=[],
                     help="never stat or enter any name containing this non-empty substring (repeatable)")
+    ap.add_argument("--seat-parent", action="append",
+                    help="glob for immediate job-tree children (repeatable; adds to defaults and local config)")
+    ap.add_argument("--owners", help="tab-separated checkout glob and owner map")
+    ap.add_argument("--created-since", help="only show rows born on or after this UTC date (YYYY-MM-DD)")
+    ap.add_argument("--hosts", help="comma-separated SSH hosts to audit")
+    ap.add_argument("--host-jobs", type=int, default=4, help="parallel fleet hosts (default 4)")
+    ap.add_argument("--host-timeout", type=float, default=120.0, help="per-host timeout in seconds")
+    ap.add_argument("--open-scan", choices=("libproc", "lsof", "thorough"),
+                    help="open-path scan (default: libproc on macOS, lsof elsewhere; thorough also checks mapped files)")
+    ap.add_argument("--plan-prefix", default="cow-plan", help="local fleet plan filename prefix")
     ap.add_argument("--max-depth", type=int, default=12,
                     help="discovery depth below each root outside checkouts (default 12)")
     ap.add_argument("--big-mib", type=float, default=1.0, help="files at least this size are measured exactly")
@@ -1359,38 +2153,70 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prune", action="append", default=[],
                     help="also skip directories with this name during discovery (repeatable)")
     ap.add_argument("--expected", action="append",
-                    help="glob (per path component, ~ expanded) for where checkouts belong; repeatable, replaces "
-                         "the defaults (~/Repos/*, ~/Repos/*/worktrees/*, ~/.goal-flight/worktrees/*, ...)")
+                    help="glob (per path component, ~ expanded) for where checkouts belong; repeatable, adds to "
+                         "defaults and local config")
     out = ap.add_mutually_exclusive_group()
     out.add_argument("--json", action="store_true", help="emit JSON lines instead of TSV")
     out.add_argument("--paths-only", action="store_true", help="print only the selected paths, one per line")
     out.add_argument("--delete-plan", action="store_true",
                      help="print a reviewable shell script removing selected SAFE NON-COW checkouts; runs nothing")
     args = ap.parse_args(argv)
-    if any(s == "" for s in args.skip_name):
-        ap.error("--skip-name must not be empty (an empty substring would match every name)")
+    try:
+        config = _local_config()
+    except ValueError as exc:
+        ap.error(str(exc))
+    if any(s == "" for s in [*args.skip_name, *config.get("skip_names", [])]):
+        ap.error("--skip-name and local skip_names entries must not be empty (an empty substring would match every name)")
     if args.dirs_depth < 0:
         ap.error("--dirs-depth must be >= 0")
+    if args.host_jobs < 1 or args.host_timeout <= 0:
+        ap.error("--host-jobs and --host-timeout must be positive")
+    try:
+        created = (args.created_since, _date_cutoff(args.created_since)) if args.created_since else None
+    except ValueError:
+        ap.error("--created-since must be YYYY-MM-DD")
+
+    skip = _skip_names([*config.get("skip_names", []), *args.skip_name])
+    if args.hosts:
+        print(f"# active skip names: {len(skip)}", file=sys.stderr)
+        remote_original = list(original)
+        for key, option in (("protect", "--protect"), ("seat_parents", "--seat-parent"),
+                            ("expected", "--expected")):
+            for value in config.get(key, []):
+                remote_original.extend((option, value))
+        return _fleet(args, remote_original, skip)
 
     roots = args.root or ([] if args.dirs else ["~/Repos", "~/.goal-flight"])
     if args.wide:
-        roots = [*roots, *wide_roots()]
+        tmp_hint = os.environ.get("TMPDIR") or tempfile.tempdir or "/tmp"
+        wide = ["~", "/private/tmp"] if _skipped(tmp_hint, skip) else wide_roots()
+        roots = [*roots, *(p for p in wide if not _skipped(os.path.expanduser(p), skip))]
+    seat_patterns = [*DEFAULT_SEAT_PARENTS, *config.get("seat_parents", []), *(args.seat_parent or [])]
+    seat_candidates = _seat_candidates(seat_patterns, skip)
     every = 1 if args.exact else max(1, args.sample_every)
     now = time.time()
-    rows = audit(roots, tuple(args.skip_name), args.max_depth, int(args.big_mib * 1024 * 1024), every,
+    rows = audit(roots, skip, args.max_depth, int(args.big_mib * 1024 * 1024), every,
                  dirs=args.dirs, dirs_depth=args.dirs_depth, jobs=args.jobs, stale_days=args.stale_days, now=now,
-                 protect=[*DEFAULT_PROTECT, *args.protect], primary_roots=args.primary_root or ["~/Repos"],
+                 protect=[*DEFAULT_PROTECT, *config.get("protect", []), *args.protect],
+                 primary_roots=args.primary_root or ["~/Repos"],
                  opts={"salvage_max": int(args.salvage_max_gb * 1e9), "regenerable": frozenset(args.regenerable)},
-                 prune=frozenset(args.prune), expected=args.expected)
+                 prune=frozenset(args.prune),
+                 expected=[*DEFAULT_EXPECTED, *config.get("expected", []), *(args.expected or [])],
+                 seat_paths=seat_candidates,
+                 owner_rules=_owner_rules(args.owners, skip), open_scan=args.open_scan)
     shown = [r for r in rows if r["private_gb"] >= args.min_gb
              and (args.verdict is None or r["tier"] == args.verdict
                   or (args.verdict == "REVIEW" and r["tier"] in ("SALVAGE", "HOLD")))
-             and (args.older_than_days is None or r["_newest"] < now - args.older_than_days * 86400)]
+             and (args.older_than_days is None or r["_newest"] < now - args.older_than_days * 86400)
+             and (created is None or (r["_born"] is not None and r["_born"] >= created[1]))]
     # A newline or carriage return in a path would split it into two lines (two commands) downstream.
     unsafe = [r for r in shown if not _plannable_path(r["path"])]
     if args.delete_plan:
         sdir = os.path.abspath(os.path.expanduser(
             args.salvage_dir or f"~/checkout-salvage/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now))}"))
+        if _skipped(sdir, skip):
+            print("--salvage-dir contains an active skip-name", file=sys.stderr)
+            return 2
         real = os.path.realpath(sdir)
         inside = [r["path"] for r in rows if _under(sdir, r["path"]) or _under(real, os.path.realpath(r["path"]))]
         if inside or not _plannable_path(sdir):
@@ -1417,13 +2243,34 @@ def main(argv: list[str] | None = None) -> int:
     print(f"# {len(co)} checkouts (SAFE {n_t['SAFE']}, SALVAGE {n_t['SALVAGE']}, HOLD {n_t['HOLD']}); freeable (private) total "
           f"{tot_p:.1f} GB; in NON-COW checkouts {tot_nc:.1f} GB; in SAFE checkouts "
           f"{sum(r['private_gb'] for r in safe):.1f} GB", file=sys.stderr)
+    scanned = max((r.get("_scanned_processes", 0) for r in rows), default=0)
+    not_visible = max((r.get("_not_visible_processes", 0) for r in rows), default=0)
+    incomplete = max((r.get("_incomplete_processes", 0) for r in rows), default=0)
+    print(f"# open-scan: {scanned} processes scanned, {not_visible} not visible (EPERM), {incomplete} incomplete",
+          file=sys.stderr)
     if unsafe and (args.delete_plan or args.paths_only):
         print(f"# unsafe-path: {len(unsafe)} rows left out (newline or carriage return in the path)", file=sys.stderr)
     dr = [r for r in rows if r["kind"] == "dir"]
     if dr:
         print(f"# {len(dr)} dirs; private total {sum(r['private_gb'] for r in dr):.1f} GB "
-              "(dirs include any checkouts inside them)", file=sys.stderr)
+              "(nested checkouts are counted in their own rows)", file=sys.stderr)
     print(_tier_summary(co), file=sys.stderr)
+    print(f"# active skip names: {len(skip)}", file=sys.stderr)
+    skip_name_matches = []
+    for substring in skip:
+        matched = [r for r in co if r["tier"] == "HOLD"
+                   and "has-skipped-names" in r["_reasons"]
+                   and substring in r["_skip_matches"]]
+        if matched:
+            gb = sum(r["private_gb"] for r in matched)
+            skip_name_matches.append(f"{substring} {len(matched)} rows {gb:.1f} GB")
+    print(f"skip-name matches: {', '.join(skip_name_matches) or 'none'}", file=sys.stderr)
+    _summary_groups(rows, created)
+    if created:
+        born_rows = [r for r in rows if r["_born"] is not None and r["_born"] >= created[1]
+                     and r["cow"] == "NON-COW"]
+        print(f"# NON-COW created since {created[0]}: {len(born_rows)}, "
+              f"{sum(r['private_gb'] for r in born_rows):.2f} GB", file=sys.stderr)
     sys.stderr.write(misplaced_block([r for r in shown if r["kind"] != "dir"]))
     if not (args.json or args.paths_only or args.delete_plan):
         sys.stderr.write(cleanup_block(shown))

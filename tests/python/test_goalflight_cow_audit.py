@@ -8,9 +8,13 @@ hard links in a temp dir and check the reported bytes.  APFS-dependent tests ski
 from __future__ import annotations
 
 import json
+import ctypes
+from contextlib import nullcontext
+import errno
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -89,19 +93,118 @@ def test_hard_links_count_once_and_are_not_freeable(tmp_path, capsys):
 
 
 def test_skip_name_is_never_touched(tmp_path, capsys, monkeypatch):
-    keep = tmp_path / "r" / "keep"
+    skip_name = "zz-hidden"
+    root = tmp_path / "r"
+    keep = root / "keep"
     _make_checkout(keep, small=2, big_mib=0)
-    _make_checkout(tmp_path / "r" / "zz-hidden-zz", small=2, big_mib=0)
-    (keep / "zz-hidden-inside").mkdir()
-    (keep / "zz-hidden-inside" / "x.bin").write_bytes(b"x")
-    touched: list[str] = []
-    real_scandir, real_lstat = os.scandir, os.lstat
-    monkeypatch.setattr(audit.os, "scandir", lambda p: (touched.append(str(p)), real_scandir(p))[1])
-    monkeypatch.setattr(audit.os, "lstat", lambda p, *a, **k: (touched.append(str(p)), real_lstat(p, *a, **k))[1])
-    monkeypatch.setattr(audit.PrivateSize, "__call__", lambda self, p: (touched.append(str(p)), 0)[1])
-    assert audit.main(["--root", str(tmp_path / "r"), "--json", "--skip-name", "hidden"]) == 0
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.mkdir()
+    bridge = alias_parent / "bridge"
+    bridge.symlink_to(alias_parent / skip_name / "root", target_is_directory=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(alias_parent / skip_name / "root", target_is_directory=True)
+    alias_after_missing = tmp_path / "alias-after-missing"
+    alias_after_missing.symlink_to(alias_parent / "missing" / ".." / "bridge", target_is_directory=True)
+    alias_after_bridge_parent = tmp_path / "alias-after-bridge-parent"
+    alias_after_bridge_parent.symlink_to(
+        alias_parent / "missing" / ".." / "bridge" / ".." / "target", target_is_directory=True)
+    seat_parent = tmp_path / "seat-parents"
+    seat_parent.mkdir()
+
+    class SkippedEntry:
+        def __init__(self, name):
+            self.name = name
+
+    touched: list[tuple[str, str]] = []
+    real_scandir, real_lstat, real_stat = os.scandir, os.lstat, os.stat
+    real_realpath = os.path.realpath
+
+    def record(label, original, blocked, blocked_paths=()):
+        def call(path, *args, **kwargs):
+            value = os.fsdecode(os.fspath(path))
+            touched.append((label, value))
+            if skip_name in value:
+                if blocked is None:
+                    raise FileNotFoundError
+                return blocked
+            if value in blocked_paths:
+                if blocked is None:
+                    raise FileNotFoundError
+                return blocked
+            return original(path, *args, **kwargs)
+        return call
+
+    def safe_scandir(path):
+        value = os.fsdecode(os.fspath(path))
+        touched.append(("scandir", value))
+        if skip_name in value:
+            raise FileNotFoundError
+        with real_scandir(path) as entries:
+            result = list(entries)
+        if value == str(root):
+            result.append(SkippedEntry(skip_name))
+        elif value == str(keep):
+            result.extend((SkippedEntry(skip_name), SkippedEntry(skip_name + "-file")))
+        elif value == str(seat_parent):
+            result.append(SkippedEntry(skip_name))
+        return nullcontext(result)
+
+    monkeypatch.setattr(audit.os, "scandir", safe_scandir)
+    monkeypatch.setattr(audit.os, "lstat", record("lstat", real_lstat, os.stat_result((0,) * 10)))
+    monkeypatch.setattr(audit.os, "stat", record("stat", real_stat, None, (str(bridge),)))
+    monkeypatch.setattr(audit.os.path, "realpath",
+                        record("path.realpath", real_realpath, str(bridge), (str(bridge),)))
+    monkeypatch.setattr(audit.PrivateSize, "__call__",
+                        lambda self, p: (touched.append(("private-size", str(p))), 0)[1])
+    seat_glob = str(seat_parent / "*" / "jobs" / "*")
+    assert audit.main(["--root", str(root), "--root", str(alias), "--root", str(alias_after_missing),
+                       "--seat-parent", seat_glob, "--skip-name", skip_name, "--json", "--exact"]) == 0
     assert list(_rows(capsys)) == ["keep"]
-    assert not [p for p in touched if "hidden" in p]
+    assert audit._safe_realpath(str(alias_after_bridge_parent), (skip_name,)) is None
+
+    cycle = alias_parent / "cycle"
+    cycle.symlink_to(alias_parent / "missing" / ".." / "cycle", target_is_directory=True)
+    assert audit._safe_realpath(str(cycle), ()) is None
+
+    def vanished(_path):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(audit.os, "readlink", vanished)
+    assert audit._safe_realpath(str(alias), ()) is None
+    assert not any(skip_name in path for _, path in touched)
+    assert not any(label in {"stat", "path.realpath"} and path == str(bridge) for label, path in touched)
+
+def test_measure_records_matching_skip_substrings_without_touching_entries(monkeypatch):
+    class SkippedEntry:
+        name = "amber-violet-entry"
+
+        def is_dir(self, **_kwargs):
+            pytest.fail("a skip-name entry must not be inspected")
+
+        def is_file(self, **_kwargs):
+            pytest.fail("a skip-name entry must not be inspected")
+
+        def stat(self, **_kwargs):
+            pytest.fail("a skip-name entry must not be stat'ed")
+
+    monkeypatch.setattr(audit.os, "scandir", lambda _path: nullcontext([SkippedEntry()]))
+    measured = audit.measure("/unused-root", ("amber", "violet"),
+                             lambda _path: pytest.fail("private size must not be measured"),
+                             big=1, every=1)
+    assert measured["skipped"] == 1
+    assert measured["skip_matches"] == ["amber", "violet"]
+
+
+def test_measure_row_carries_matching_skip_substrings(monkeypatch):
+    metrics = {"logical": 0, "allocated": 0, "private": 0, "hardlinked": 0, "files": 0,
+               "newest": 0, "estimated": False, "fallback": False, "skipped": 1,
+               "skip_matches": ["amber"], "nested": []}
+    monkeypatch.setattr(audit, "_thread_priv", lambda: None)
+    monkeypatch.setattr(audit, "_born", lambda _path: (None, "-"))
+    monkeypatch.setattr(audit, "measure", lambda *_args, **_kwargs: metrics)
+    row, nested = audit._measure_row("/unused-root", "dir", ("amber",), 1, 1)
+    assert row["_skip_matches"] == ["amber"]
+    assert nested == []
 
 
 def test_nested_checkout_own_row_and_parent_git_counted(tmp_path, capsys):
@@ -135,13 +238,16 @@ DAY = 86400
 
 
 @pytest.fixture(autouse=True)
-def _isolated_git(monkeypatch):
+def _isolated_git(monkeypatch, tmp_path):
     # The host git config must not leak into the repos built here or into the audit's own git calls.
     for k, v in {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
                  "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}.items():
         monkeypatch.setenv(k, v)
-    # One global lsof costs ~2 s on a busy host; the open-file test restores the real snapshot.
+    home = tmp_path.parent / "isolated-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    # A global open-file snapshot is shared by each audit; tests opt into it only when needed.
     monkeypatch.setattr(audit, "_open_paths", lambda: set())
 
 
@@ -280,7 +386,7 @@ def test_open_file_is_seen(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(audit, "_open_paths", REAL_OPEN_PATHS)
     co = _repo(tmp_path / "r" / "co", tmp_path / "remote.git")
     with open(co / "a.txt") as held:
-        row = _audit(capsys, "--root", str(tmp_path / "r"))["co"]
+        row = _audit(capsys, "--root", str(tmp_path / "r"), "--open-scan", "lsof")["co"]
     assert held.closed and row["open"] >= 1 and row["reasons"] == "open"
 
 
@@ -288,7 +394,59 @@ def test_unknown_open_state_is_review(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(audit, "_open_paths", lambda: None)
     _repo(tmp_path / "r" / "co", tmp_path / "remote.git")
     row = _audit(capsys, "--root", str(tmp_path / "r"))["co"]
-    assert row["open"] is None and row["reasons"] == "open-unknown"
+    assert row["open"] == "-" and row["reasons"] == "open-unknown"
+
+
+def test_partial_lsof_output_marks_snapshot_incomplete(tmp_path, capsys, monkeypatch):
+    _repo(tmp_path / "r" / "co", tmp_path / "remote.git")
+    real_run = audit.subprocess.run
+
+    def partial_lsof(command, *args, **kwargs):
+        if command and command[0] == "lsof":
+            return subprocess.CompletedProcess(
+                command, 1, stdout="p123\nctest\nn/tmp/partial-open-file\n", stderr="partial output\n")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(audit.subprocess, "run", partial_lsof)
+    monkeypatch.setattr(audit, "_open_paths", lambda scan=None: audit._lsof_open_paths())
+    assert audit.main(["--root", str(tmp_path / "r"), "--open-scan", "lsof", "--json"]) == 0
+    captured = capsys.readouterr()
+    row = json.loads(captured.out)
+    assert row["open"] == "-" and "open-unknown" in row["reasons"].split(",")
+    assert row["tier"] == "HOLD"
+    assert "# open-scan: 1 processes scanned, 0 not visible (EPERM), 1 incomplete" in captured.err
+
+
+def test_incomplete_open_snapshot_holds_every_checkout_and_reports_count(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(audit, "_open_paths", lambda: audit._OpenPaths(
+        complete=False, scanned_processes=7, not_visible_processes=3, incomplete_processes=2))
+    _repo(tmp_path / "r" / "co1", tmp_path / "one.git")
+    _repo(tmp_path / "r" / "co2", tmp_path / "two.git")
+    assert audit.main(["--root", str(tmp_path / "r"), "--json", "--exact"]) == 0
+    captured = capsys.readouterr()
+    rows = {Path(row["path"]).name: row for row in map(json.loads, captured.out.splitlines())}
+    assert {row["open"] for row in rows.values()} == {"-"}
+    assert {row["reasons"] for row in rows.values()} == {"open-unknown"}
+    assert "# open-scan: 7 processes scanned, 3 not visible (EPERM), 2 incomplete" in captured.err
+
+
+def test_single_incomplete_process_preserves_open_results_below_threshold(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "repos"
+    first = _repo(root / "first", tmp_path / "first-remote")
+    second = _repo(root / "second", tmp_path / "second-remote")
+    opens = audit._OpenPaths(complete=True, scanned_processes=19, not_visible_processes=3,
+                             incomplete_processes=1)
+    opens.add(str(first))
+    monkeypatch.setattr(audit, "_open_paths", lambda: opens)
+    monkeypatch.setattr(audit, "_skip_names", lambda cli: tuple(cli))
+    monkeypatch.setattr(audit, "_seat_candidates", lambda *_args: [])
+    assert audit.main(["--root", str(root), "--primary-root", str(root), "--json"]) == 0
+    captured = capsys.readouterr()
+    rows = {Path(row["path"]).name: row for row in map(json.loads, captured.out.splitlines())}
+    assert rows[first.name]["open"] == 1
+    assert rows[second.name]["open"] == 0
+    assert all("open-unknown" not in row["reasons"] for row in rows.values())
+    assert "# open-scan: 19 processes scanned, 3 not visible (EPERM), 1 incomplete" in captured.err
 
 
 def test_git_status_never_runs_on_a_checkout_holding_skipped_names(tmp_path, capsys, monkeypatch):
@@ -329,10 +487,55 @@ def test_dirs_rows_count_everything_including_checkouts(tmp_path, capsys):
     _repo(plain / "inner", tmp_path / "remote.git")
     (tmp_path / "top" / "zz-hidden-dir").mkdir()
     rows = _audit(capsys, "--dirs", str(tmp_path / "top"), "--skip-name", "hidden")
-    assert set(rows) == {"plain"}  # only --dirs given: no default roots, skipped names stay out
-    row = rows["plain"]
+    assert set(rows) == {"plain", "inner"}  # folder and nested checkout each have one row
+    row, inner = rows["plain"], rows["inner"]
     assert row["kind"] == "dir" and row["verdict"] == "-" and row["dirty"] is None
-    assert row["private_gb"] > 0.008 + 0.001  # the 8 MiB blob plus the checkout's 1 MiB
+    assert row["private_gb"] > 0.008  # the 8 MiB blob; the checkout is measured separately
+    assert inner["kind"] != "dir" and inner["private_gb"] > 0.001
+
+
+def test_checkout_overlapping_root_and_dirs_is_counted_once_in_summary(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "root"
+    checkout = root / "checkout"
+    _make_checkout(checkout, small=0, big_mib=0)
+    with (checkout / "payload.bin").open("wb") as payload:
+        payload.truncate(128 << 20)
+    monkeypatch.setattr(audit.PrivateSize, "__call__", lambda self, path: os.stat(path).st_size)
+
+    assert audit.main(["--root", str(root), "--dirs", str(root), "--json", "--exact"]) == 0
+    captured = capsys.readouterr()
+    rows = [json.loads(line) for line in captured.out.splitlines()]
+    assert len(rows) == 1 and rows[0]["kind"] != "dir"
+    summary = next(line for line in captured.err.splitlines() if "freeable (private) total" in line)
+    reported = float(summary.split("freeable (private) total ", 1)[1].split(" GB", 1)[0])
+    assert reported == round(sum(row["private_gb"] for row in rows), 1)
+
+
+def test_dir_summary_matches_distinct_bytes_with_nested_checkout(tmp_path, capsys, monkeypatch):
+    job = tmp_path / "top" / "job"
+    job.mkdir(parents=True)
+    (job / "plain.bin").write_bytes(b"p" * (2 << 20))
+    co = _repo(job / "checkout", tmp_path / "remote.git")
+    monkeypatch.setattr(audit.PrivateSize, "__call__", lambda self, path: os.stat(path).st_blocks * 512)
+    assert audit.main(["--dirs", str(tmp_path / "top"), "--json", "--exact"]) == 0
+    captured = capsys.readouterr()
+    rows = {Path(row["path"]).name: row for row in map(json.loads, captured.out.splitlines())}
+    actual = sum(row["private_gb"] for row in rows.values())
+    seen, distinct = set(), 0
+    for current, _dirs, files in os.walk(job):
+        for name in files:
+            path = os.path.join(current, name)
+            st = os.stat(path, follow_symlinks=False)
+            key = (st.st_dev, st.st_ino)
+            if key not in seen:
+                seen.add(key)
+                distinct += st.st_blocks * 512
+    assert abs(actual - distinct / 1e9) < 1e-9
+    assert rows["job"]["private_gb"] < distinct / 1e9
+    assert rows["checkout"]["path"] == str(co)
+    assert "nested checkouts are counted in their own rows" in captured.err
+    summary = next(line for line in captured.err.splitlines() if line.startswith("# 1 dirs; private total"))
+    assert float(summary.split("private total ", 1)[1].split(" GB", 1)[0]) == round(rows["job"]["private_gb"], 1)
 
 
 def test_parallel_jobs_give_identical_rows(tmp_path, capsys):
@@ -566,6 +769,43 @@ def test_installed_agent_tooling_is_protected_by_default(tmp_path, capsys, monke
     assert "protected" in rows["pack"]["reasons"]
 
 
+def test_local_config_lists_merge_with_defaults_and_cli(tmp_path, capsys, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    config_path = home / ".config" / "goalflight" / "cow-audit.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({
+        "protect": ["~/config-protected"],
+        "seat_parents": ["~/config-seats/*"],
+        "expected": ["~/config-expected/*"],
+        "skip_names": ["config-hidden"],
+    }))
+    _repo(home / "config-protected" / "seed", tmp_path / "config.git")
+    _repo(home / "cli-protected" / "seed-cli", tmp_path / "cli.git")
+    _repo(home / "Repos" / "default-expected", tmp_path / "default.git")
+    _repo(home / "config-expected" / "configured", tmp_path / "configured.git")
+    _repo(home / "cli-expected" / "cli-expected", tmp_path / "expected.git")
+    _repo(home / "config-hidden", tmp_path / "hidden.git")
+    _repo(home / "cli-hidden", tmp_path / "cli-hidden.git")
+    for parent, name in ((home / "scratch", "default-seat"),
+                         (home / "config-seats", "config-seat"),
+                         (home / "cli-seats", "cli-seat")):
+        (parent / name).mkdir(parents=True)
+        (parent / name / "output.bin").write_bytes(b"output")
+
+    assert audit.main(["--root", str(home), "--protect", "~/cli-protected",
+                       "--seat-parent", "~/cli-seats/*", "--expected", "~/cli-expected/*",
+                       "--skip-name", "cli-hidden", "--json", "--exact"]) == 0
+    rows = _rows(capsys)
+    assert rows["seed"]["reasons"] == "protected"
+    assert rows["seed-cli"]["reasons"] == "protected"
+    assert rows["default-expected"]["placement"] == "expected"
+    assert rows["configured"]["placement"] == "expected"
+    assert rows["cli-expected"]["placement"] == "expected"
+    assert {rows[name]["kind"] for name in ("default-seat", "config-seat", "cli-seat")} == {"dir"}
+    assert "config-hidden" not in rows and "cli-hidden" not in rows
+
+
 def test_blinded_git_paths_are_never_followed(tmp_path, capsys, monkeypatch):
     import builtins
     r = tmp_path / "r"
@@ -634,6 +874,31 @@ def test_symlinked_dot_git_is_a_checkout_and_symlinked_roots_resolve(tmp_path, c
     assert audit.main(["--root", str(tmp_path / "link"), "--json"]) == 0
     rows = [json.loads(ln) for ln in capsys.readouterr().out.splitlines()]
     assert [r["path"] for r in rows] == [os.path.realpath(co)] and rows[0]["link"] == "separate"
+
+
+def test_symlink_roots_resolving_through_filtered_component_are_omitted(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "zz-hidden-parent" / "root"
+    _repo(target / "seat", "c")
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    touched: list[str] = []
+    real_ino, real_scandir = audit._ino, audit.os.scandir
+
+    def track_ino(path):
+        touched.append(str(path))
+        return real_ino(path)
+
+    def track_scandir(path):
+        touched.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(audit, "_ino", track_ino)
+    monkeypatch.setattr(audit.os, "scandir", track_scandir)
+    assert audit.main(["--root", str(alias), "--dirs", str(alias), "--json", "--skip-name", "hidden"]) == 0
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "omitted" in captured.err and str(target) not in captured.err
+    assert not any(str(target) in path for path in touched)
 
 
 def test_only_network_remotes_count(tmp_path, capsys):
@@ -823,7 +1088,7 @@ def _fixture_row(name: str, cow: str, verdict: str, reasons: str = "", gb: float
             "estimated": False, "api": "apfs", "newest_utc": "2026-01-01T00:00Z", "_newest": 1767225600.0,
             "verdict": verdict, "reasons": reasons, "dirty": 0, "unpushed": 0, "remotes": 1, "stash": 0,
             "open": 0, "link": "repo", "branch": "main", "last_commit_utc": "2026-01-01T00:00Z", "detached": 0,
-            "ignored": 0, "_main_repo": None}
+            "ignored": 0, "_main_repo": None, "born_utc": "-", "owner": "-", "class": "other"}
 
 
 @pytest.fixture
@@ -943,7 +1208,8 @@ def _fixture_row(name: str, cow: str, tier: str, reasons: str = "", gb: float = 
             "unpushed": 0, "remotes": 1, "stash": 0, "open": 0, "link": "repo", "branch": "main",
             "last_commit_utc": "2026-01-01T00:00Z", "detached": 0, "ignored": 0, "_main_repo": None,
             "_tracking": [], "_ignored_entries": [],
-            "placement": "expected", "_location": "-", "untracked_gb": None}
+            "placement": "expected", "_location": "-", "untracked_gb": None,
+            "born_utc": "-", "owner": "-", "class": "other"}
 
 
 @pytest.fixture
@@ -958,14 +1224,14 @@ def fixture_rows(monkeypatch):
     return rows
 
 
-def test_plain_table_is_unchanged_apart_from_the_tier_column(fixture_rows, capsys):
+def test_plain_table_includes_added_metadata_columns(fixture_rows, capsys):
     assert audit.main(["--root", "/x"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] == ("private_gb\tallocated_gb\tprivate_frac\tcow\tkind\tfiles\tnewest_utc\tapi\thardlinked_gb\tpath\t"
                       "verdict\treasons\tdirty\tunpushed\tremotes\tstash\topen\tlink\tbranch\tlast_commit_utc\t"
-                      "detached\tignored\ttier\tplacement\tuntracked_gb")
+                      "detached\tignored\ttier\tplacement\tuntracked_gb\tborn_utc\towner\tclass")
     assert out[1] == ("1.50\t1.50\t1.00\tNON-COW\trepo\t3\t2026-01-01T00:00Z\tapfs\t0.00\t/seats/small-safe\t"
-                      "SAFE\t-\t0\t0\t1\t0\t0\trepo\tmain\t2026-01-01T00:00Z\t0\t0\tSAFE\texpected\t-")
+                      "SAFE\t-\t0\t0\t1\t0\t0\trepo\tmain\t2026-01-01T00:00Z\t0\t0\tSAFE\texpected\t-\t-\t-\tother")
     assert not any(ln.startswith("#") for ln in out)  # the cleanup section is on stderr
 
 
@@ -1309,12 +1575,12 @@ def test_nested_copy_inside_a_checkout_is_misplaced_nested(fake_home, capsys):
     assert "nested-in-checkout 1" in capsys.readouterr().err
 
 
-def test_custom_expected_overrides_the_defaults(fake_home, capsys):
+def test_custom_expected_adds_to_the_defaults(fake_home, capsys):
     home, _, _ = fake_home
     _repo(home / "Downloads" / "x", "x")
     _repo(home / "Repos" / "good", "g")
     rows = _audit(capsys, "--wide", "--expected", "~/Downloads/*")
-    assert rows["x"]["placement"] == "expected" and rows["good"]["placement"] == "misplaced"
+    assert rows["x"]["placement"] == rows["good"]["placement"] == "expected"
 
 
 def test_prune_and_no_misplaced_block_when_all_expected(fake_home, capsys):
@@ -1439,7 +1705,7 @@ def _json_rows(capsys, *args: str) -> list[dict]:
 
 
 def test_two_roots_reaching_one_directory_give_one_row(tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr(audit, "_resolve", os.path.abspath)  # a firmlink: realpath keeps both spellings
+    monkeypatch.setattr(audit, "_safe_realpath", lambda path, _skip: os.path.abspath(path))  # a firmlink: realpath keeps both spellings
     co = _repo(tmp_path / "a" / "co", "c")
     (tmp_path / "alias").symlink_to(tmp_path / "a")
     rows = _json_rows(capsys, "--root", str(tmp_path / "alias"), "--root", str(tmp_path / "a"))
@@ -1450,7 +1716,7 @@ def test_two_roots_reaching_one_directory_give_one_row(tmp_path, capsys, monkeyp
 
 
 def test_data_volume_prefix_is_stripped_when_it_is_the_same_directory(tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr(audit, "_resolve", os.path.abspath)
+    monkeypatch.setattr(audit, "_safe_realpath", lambda path, _skip: os.path.abspath(path))
     data = tmp_path / "sysdata"
     data.symlink_to("/")  # stand-in for /System/Volumes/Data: same directories under another prefix
     monkeypatch.setattr(audit, "FIRMLINK_DATA", str(data))
@@ -1469,3 +1735,591 @@ def test_package_manager_installs_are_protected_with_their_taps(tmp_path, capsys
     _repo(brew / "Library" / "Taps" / "org" / "homebrew-tap", "t")
     rows = _audit(capsys, "--root", str(tmp_path), "--protect", str(brew))
     assert "protected" in rows["homebrew"]["reasons"] and "protected" in rows["homebrew-tap"]["reasons"]
+
+
+def test_created_since_filters_rows_and_reports_non_cow_totals(tmp_path, capsys):
+    co = _repo(tmp_path / "r" / "co", "c", age=False)
+    assert audit.main(["--root", str(tmp_path / "r"), "--json", "--created-since", "2000-01-01"]) == 0
+    out = capsys.readouterr()
+    rows = {Path(r["path"]).name: r for r in map(json.loads, out.out.splitlines())}
+    assert set(rows) == {"co"} and rows["co"]["born_utc"] != "-"
+    assert "# NON-COW created since 2000-01-01: 1," in out.err
+    assert "NON-COW by class created since 2000-01-01" in out.err
+    assert audit.main(["--root", str(tmp_path / "r"), "--json", "--created-since", "2999-01-01"]) == 0
+    out = capsys.readouterr()
+    assert not out.out
+    assert "# NON-COW created since 2999-01-01: 0," in out.err
+    assert co.exists()
+
+
+def test_seat_parent_adds_deduped_non_checkout_folder_rows(tmp_path, capsys):
+    parent = tmp_path / "scratch"
+    job = parent / "job-a"
+    job.mkdir(parents=True)
+    (job / "output.bin").write_bytes(b"output")
+    pattern = str(parent / "*")
+    assert audit.main(["--root", str(tmp_path / "empty"), "--seat-parent", pattern, "--seat-parent", pattern,
+                       "--json", "--exact"]) == 0
+    rows = _rows(capsys)
+    assert set(rows) == {"job-a"} and rows["job-a"]["kind"] == "dir"
+    assert rows["job-a"]["born_utc"] != "-" and rows["job-a"]["tier"] == "-"
+
+
+def test_skip_names_merge_environment_config_and_cli_without_printing_names(tmp_path, capsys, monkeypatch):
+    home = tmp_path / "home"
+    root = tmp_path / "r"
+    for name in ("env-hidden", "file-hidden", "cli-hidden", "keep"):
+        _repo(root / name, name)
+    cfg = home / ".config" / "goalflight" / "cow-skip.txt"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("file-hidden\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GOALFLIGHT_COW_SKIP", "env-hidden")
+    assert audit.main(["--root", str(root), "--json", "--skip-name", "cli-hidden"]) == 0
+    captured = capsys.readouterr()
+    rows = {Path(r["path"]).name: r for r in map(json.loads, captured.out.splitlines())}
+    assert set(rows) == {"keep"}
+    assert "# active skip names: 3" in captured.err
+    assert not any(name in captured.err for name in ("env-hidden", "file-hidden", "cli-hidden"))
+
+
+def test_skip_name_summary_groups_hold_rows_without_paths(monkeypatch, capsys):
+    rows = [
+        {"path": "/mock/repo-one", "kind": "checkout", "private_gb": 3.1,
+         "cow": "NON-COW", "verdict": "REVIEW", "tier": "HOLD",
+         "reasons": "has-skipped-names", "_reasons": ["has-skipped-names"],
+         "_skip_matches": ["amber", "violet"]},
+        {"path": "/mock/repo-two", "kind": "checkout", "private_gb": 70.0,
+         "cow": "NON-COW", "verdict": "REVIEW", "tier": "HOLD",
+         "reasons": "has-skipped-names", "_reasons": ["has-skipped-names"],
+         "_skip_matches": ["violet"]},
+        {"path": "/mock/repo-three", "kind": "checkout", "private_gb": 90.0,
+         "cow": "shared", "verdict": "SAFE", "tier": "SAFE",
+         "reasons": "", "_reasons": [], "_skip_matches": ["amber"]},
+    ]
+    monkeypatch.setattr(audit, "_skip_names", lambda cli: tuple(cli))
+    monkeypatch.setattr(audit, "_seat_candidates", lambda *_args: [])
+    monkeypatch.setattr(audit, "_owner_rules", lambda *_args: [])
+    monkeypatch.setattr(audit, "audit", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(audit, "_tier_summary", lambda _rows: "")
+    monkeypatch.setattr(audit, "_summary_groups", lambda *_args: None)
+    monkeypatch.setattr(audit, "misplaced_block", lambda *_args: "")
+
+    assert audit.main(["--root", "/mock/root", "--skip-name", "amber", "--skip-name", "violet",
+                       "--json"]) == 0
+    captured = capsys.readouterr()
+    matches = [line for line in captured.err.splitlines() if line.startswith("skip-name matches:")]
+    assert matches == ["skip-name matches: amber 1 rows 3.1 GB, violet 2 rows 73.1 GB"]
+
+
+def test_delete_plan_includes_three_sibling_linked_worktrees(tmp_path, capsys):
+    main = _repo(tmp_path / "main", "m")
+    root = tmp_path / "r"
+    seats = [root / f"seat-{i}" for i in range(3)]
+    for seat in seats:
+        _git(main, "worktree", "add", "-q", "--detach", str(seat))
+    _age(root)
+    plan = _plan_for(capsys, root, tmp_path / "salvage")
+    removals = [line for line in _cmds(plan) if "worktree remove" in line]
+    assert len(removals) == 3
+    assert all(str(seat) in "\n".join(removals) for seat in seats)
+    assert all(seat.exists() for seat in seats)
+
+
+def test_linked_worktree_plan_uses_admin_gitdir_spelling(tmp_path, capsys, monkeypatch):
+    main = _repo(tmp_path / "main", "m")
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "data-volume-alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    seat = real_root / "worktrees" / "seat"
+    _git(main, "worktree", "add", "-q", "--detach", str(seat))
+    _age(real_root)
+    monkeypatch.setattr(audit, "_safe_realpath", lambda path, _skip: os.path.abspath(path))
+    plan = _plan_for(capsys, alias_root, tmp_path / "salvage")
+    removals = [line for line in _cmds(plan) if "worktree remove" in line]
+    assert removals == [f"git -C {shlex.quote(str(main))} worktree remove -- {shlex.quote(str(seat))}"]
+    _run_plan(plan, check=True)
+    assert not seat.exists()
+
+
+def test_owner_map_and_checkout_class_are_reported(tmp_path, capsys):
+    home = tmp_path / "home"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("HOME", str(home))
+    try:
+        repos = home / "Repos"
+        co = _repo(repos / "primary", "primary")
+        owners = home / "owners.tsv"
+        owners.write_text(f"{co}\tproject-owner\n")
+        assert audit.main(["--root", str(repos), "--json", "--exact", "--owners", str(owners),
+                           "--primary-root", str(repos)]) == 0
+        out = capsys.readouterr()
+        rows = {Path(r["path"]).name: r for r in map(json.loads, out.out.splitlines())}
+        assert rows["primary"]["owner"] == "project-owner"
+        assert rows["primary"]["class"] == "primary"
+        assert "NON-COW by owner" in out.err and "NON-COW by class" in out.err
+    finally:
+        monkeypatch.undo()
+
+
+def test_owner_map_globs_match_displayed_paths_without_realpath(tmp_path, monkeypatch):
+    repos = tmp_path / "Repos"
+    repos.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(repos, target_is_directory=True)
+    pattern = str(alias / "*")
+    realpath = os.path.realpath
+    calls = []
+
+    def checked(path, *args, **kwargs):
+        calls.append(str(path))
+        assert str(path) != pattern
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(audit.os.path, "realpath", checked)
+    assert audit._mapped_owner(str(repos / "project"), [(pattern, "alias-owner")], ()) is None
+    assert pattern not in calls
+
+
+def test_fleet_plan_files_are_exclusive_and_do_not_follow_symlinks(tmp_path):
+    target = tmp_path / "new.sh"
+    assert audit._write_plan_exclusive(str(target), "first\n", ())
+    assert target.read_text() == "first\n" and target.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        audit._write_plan_exclusive(str(target), "replacement\n", ())
+    assert target.read_text() == "first\n"
+
+    victim = tmp_path / "victim.sh"
+    victim.write_text("keep\n")
+    link = tmp_path / "link.sh"
+    link.symlink_to(victim)
+    with pytest.raises(FileExistsError):
+        audit._write_plan_exclusive(str(link), "overwrite\n", ())
+    assert victim.read_text() == "keep\n"
+
+
+def test_fleet_plan_parent_alias_does_not_enter_a_skipped_directory(tmp_path, monkeypatch):
+    alias = tmp_path / "alias"
+    alias.symlink_to("/not-present/secret-hidden", target_is_directory=True)
+    real_lstat = os.lstat
+    touched = []
+
+    def guarded(path, *args, **kwargs):
+        touched.append(str(path))
+        assert "hidden" not in str(path)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(audit.os, "lstat", guarded)
+    assert not audit._write_plan_exclusive(str(alias / "plan.sh"), "plan\n", ("hidden",))
+    assert touched[-1] == str(alias)
+
+
+def test_checkout_classes_cover_each_location_type(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    repos = home / "Repos"
+    repo = repos / "primary"
+    run = tmp_path / "test-runs" / "run-a"
+    job = tmp_path / "scratch" / "job-a"
+    rows = {
+        repo: "primary",
+        repo / "worktrees" / "seat": "repo-worktree",
+        home / ".goal-flight" / "worktrees" / "seat": "pool",
+        tmp_path / "remote-ci-managed" / "node" / "seats" / "s-1" / "checkout": "remote-ci-seat",
+        job / "checkout": "job-tree",
+        run / "source": "run-source",
+        home / ".claude" / "skills" / "tool": "tool-install",
+        tmp_path / "other" / "tmp" / "checkout": "scratch",
+        Path("/goalflight-classify-test/other/checkout"): "other",
+    }
+    seats = [str(job)]
+    tools = list(audit.DEFAULT_PROTECT)
+    for path, expected in rows.items():
+        assert audit._classify(str(path), [str(repos)], seats, tools, (), "repo") == expected
+    assert audit._classify("/goalflight-classify-test/test-runs/run-a", [str(repos)], seats, tools, (), "dir") == "other"
+
+
+class _FakeProcFunction:
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, *args):
+        return self.function(*args)
+
+
+def _fake_libproc(monkeypatch, *, bsd_failure=0, fd_failure=0, fd_truncated=False,
+                  fd_truncated_once=False, fd_truncated_pids=frozenset(), pid_count=1,
+                  pid_list_failure=False, reuse=False, executable_path=None):
+    state = {"bsd_calls": 0, "cwd_calls": 0, "pid_buffers": [], "fd_buffers": [],
+             "fd_calls": {}, "region_calls": 0}
+
+    def write_path(buffer, buffer_size, offset, path):
+        raw = bytearray(buffer_size)
+        encoded = os.fsencode(path) + b"\0"
+        raw[offset:offset + len(encoded)] = encoded
+        ctypes.memmove(buffer, bytes(raw), len(raw))
+        return offset + len(encoded)
+
+    def list_pids(kind, uid, buffer, buffer_size):
+        assert kind == audit.PROC_UID_ONLY and uid == os.getuid()
+        if buffer is None:
+            return 0 if pid_list_failure else ctypes.sizeof(ctypes.c_int) * pid_count
+        capacity = buffer_size // ctypes.sizeof(ctypes.c_int)
+        state["pid_buffers"].append(capacity)
+        if len(state["pid_buffers"]) == 1:
+            return buffer_size  # full; the caller must grow and retry
+        for index in range(pid_count):
+            buffer[index] = 123 + index
+        return ctypes.sizeof(ctypes.c_int) * pid_count
+
+    def pid_info(pid, flavor, arg, buffer, buffer_size):
+        if flavor == audit.PROC_PIDTBSDINFO:
+            state["bsd_calls"] += 1
+            if bsd_failure and state["bsd_calls"] == 1:
+                ctypes.set_errno(bsd_failure)
+                return 0
+            raw = bytearray(buffer_size)
+            struct.pack_into("=I", raw, audit.PBI_UID_OFFSET, os.getuid())
+            struct.pack_into("=I", raw, audit.PBI_NFILES_OFFSET, 1)
+            start = (10, 20) if not reuse or state["bsd_calls"] == 1 else (30, 40)
+            struct.pack_into("=QQ", raw, audit.PBI_START_OFFSET, *start)
+            raw[audit.PBI_COMM_OFFSET:audit.PBI_COMM_OFFSET + 8] = b"mockproc"
+            ctypes.memmove(buffer, bytes(raw), len(raw))
+            return audit.PBI_START_OFFSET + 16
+        if flavor == audit.PROC_PIDVNODEPATHINFO:
+            state["cwd_calls"] += 1
+            generation = (state["cwd_calls"] if reuse else
+                          pid if fd_truncated or fd_truncated_once or pid in fd_truncated_pids else 2)
+            return write_path(buffer, buffer_size, audit.VNODE_PATH_OFFSET, f"/mock/cwd-{generation}")
+        if flavor == audit.PROC_PIDLISTFDS:
+            state["fd_buffers"].append(buffer_size)
+            fd_calls = state["fd_calls"].get(pid, 0)
+            state["fd_calls"][pid] = fd_calls + 1
+            if (fd_truncated or pid in fd_truncated_pids
+                    or (fd_truncated_once and fd_calls < audit.LIBPROC_BUFFER_RETRIES)):
+                return buffer_size
+            if fd_failure:
+                ctypes.set_errno(fd_failure)
+                return 0
+            ctypes.memmove(buffer, struct.pack("=iI", 4, audit.PROX_FDTYPE_VNODE), 8)
+            return 8
+        if flavor == audit.PROC_PIDREGIONPATHINFO:
+            state["region_calls"] += 1
+            if arg != 0x2000:
+                generation = state["cwd_calls"] if reuse else 2
+                raw = bytearray(buffer_size)
+                struct.pack_into("=QQ", raw, audit.REGION_INFO_SIZE - 16, 0x1000, 0x1000)
+                path = os.fsencode(f"/mock/mapped-{generation}") + b"\0"
+                raw[audit.REGION_PATH_OFFSET:audit.REGION_PATH_OFFSET + len(path)] = path
+                ctypes.memmove(buffer, bytes(raw), len(raw))
+                return audit.REGION_PATH_OFFSET + len(path)
+            ctypes.set_errno(errno.EINVAL)
+            return 0
+        raise AssertionError(f"unexpected proc_pidinfo flavor {flavor}")
+
+    def pid_path(pid, buffer, buffer_size):
+        generation = state["cwd_calls"] if reuse else 2
+        path = f"/mock/executable-{generation}" if reuse or executable_path is None else executable_path
+        return write_path(buffer, buffer_size, 0, path)
+
+    def fd_info(pid, fd, flavor, buffer, buffer_size):
+        assert flavor == audit.PROC_PIDFDVNODEPATHINFO
+        return write_path(buffer, buffer_size, audit.FD_VNODE_PATH_OFFSET, "/mock/fd-file")
+
+    class Library:
+        pass
+
+    lib = Library()
+    lib.proc_listpids = _FakeProcFunction(list_pids)
+    lib.proc_pidinfo = _FakeProcFunction(pid_info)
+    lib.proc_pidfdinfo = _FakeProcFunction(fd_info)
+    lib.proc_pidpath = _FakeProcFunction(pid_path)
+    monkeypatch.setattr(audit.sys, "platform", "darwin")
+    monkeypatch.setattr(audit.ctypes.util, "find_library", lambda _name: "proc")
+    monkeypatch.setattr(audit.ctypes, "CDLL", lambda *args, **kwargs: lib)
+    return state
+
+
+def test_libproc_offsets_match_arm64_sdk_literal_values():
+    assert (
+        audit.PBI_START_OFFSET,
+        audit.REGION_INFO_SIZE,
+        audit.REGION_INFO_SIZE - 16,
+        audit.REGION_INFO_SIZE - 8,
+        audit.REGION_PATH_OFFSET,
+        audit.VNODE_PATH_OFFSET,
+        audit.FD_VNODE_PATH_OFFSET,
+    ) == (120, 96, 80, 88, 248, 152, 176)
+
+
+def test_libproc_grows_full_buffers_and_finds_mapped_and_executable_paths(monkeypatch):
+    state = _fake_libproc(monkeypatch)
+    paths = audit._libproc_open_paths(thorough=True)
+    assert paths is not None and paths.complete and paths.incomplete_processes == 0
+    assert paths.scanned_processes == 1 and paths.not_visible_processes == 0
+    assert {"/mock/cwd-2", "/mock/fd-file", "/mock/mapped-2", "/mock/executable-2"} <= paths
+    assert state["pid_buffers"] == [17, 34] and state["fd_buffers"] == [8, 16]
+    assert state["region_calls"] > 0
+
+
+@pytest.mark.parametrize("stage", ["pid", "fd"])
+@pytest.mark.parametrize("error", [errno.EPERM, errno.ESRCH])
+def test_libproc_invisible_process_is_skipped(monkeypatch, stage, error):
+    state = _fake_libproc(
+        monkeypatch,
+        bsd_failure=error if stage == "pid" else 0,
+        fd_failure=error if stage == "fd" else 0,
+    )
+    paths = audit._libproc_open_paths()
+    assert paths is not None and paths.complete and paths.incomplete_processes == 0
+    assert paths.scanned_processes == 0
+    assert paths.not_visible_processes == (1 if error == errno.EPERM else 0)
+    assert state["region_calls"] == 0
+
+
+def test_libproc_fd_buffer_truncation_exhaustion_makes_snapshot_incomplete(monkeypatch):
+    state = _fake_libproc(monkeypatch, fd_truncated=True)
+    paths = audit._libproc_open_paths()
+    assert paths is not None and not paths.complete and paths.incomplete_processes == 1
+    assert paths.scanned_processes == 0 and paths.not_visible_processes == 0
+    assert any(path.endswith("cwd-123") for path in paths)
+    assert state["fd_calls"][123] == 2 * audit.LIBPROC_BUFFER_RETRIES
+
+
+def test_libproc_retries_an_incomplete_process_and_recovers(monkeypatch):
+    state = _fake_libproc(monkeypatch, fd_truncated_once=True)
+    paths = audit._libproc_open_paths()
+    assert paths is not None and paths.complete and paths.incomplete_processes == 0
+    assert paths.scanned_processes == 1
+    assert state["fd_calls"][123] == audit.LIBPROC_BUFFER_RETRIES + 2
+
+
+def test_libproc_keeps_partial_paths_at_the_five_percent_threshold(monkeypatch):
+    state = _fake_libproc(monkeypatch, pid_count=20, fd_truncated_pids=frozenset({123}))
+    paths = audit._libproc_open_paths()
+    assert paths is not None and paths.complete
+    assert paths.scanned_processes == 19 and paths.incomplete_processes == 1
+    assert any(path.endswith("cwd-123") for path in paths)
+    assert state["fd_calls"][123] == 2 * audit.LIBPROC_BUFFER_RETRIES
+
+
+def test_libproc_marks_snapshot_incomplete_above_five_percent(monkeypatch):
+    _fake_libproc(monkeypatch, pid_count=20, fd_truncated_pids=frozenset({123, 124}))
+    paths = audit._libproc_open_paths()
+    assert paths is not None and not paths.complete
+    assert paths.scanned_processes == 18 and paths.incomplete_processes == 2
+
+
+def test_libproc_pid_listing_failure_makes_snapshot_incomplete(monkeypatch):
+    _fake_libproc(monkeypatch, pid_list_failure=True)
+    paths = audit._libproc_open_paths()
+    assert paths is not None and not paths.complete
+
+
+@pytest.mark.parametrize("executable_path", [
+    "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+    "/usr/bin/python3",
+    "/Library/Apple/usr/bin/tool",
+    "/Applications/Editor.app/Contents/MacOS/Editor",
+])
+def test_libproc_skips_region_walk_for_system_and_app_executables(monkeypatch, executable_path):
+    state = _fake_libproc(monkeypatch, executable_path=executable_path)
+    paths = audit._libproc_open_paths(thorough=True)
+    assert paths is not None and paths.complete
+    assert executable_path in paths
+    assert state["region_calls"] == 0
+
+
+def test_libproc_retries_when_pid_start_time_changes(monkeypatch):
+    _fake_libproc(monkeypatch, reuse=True)
+    paths = audit._libproc_open_paths(thorough=True)
+    assert paths is not None and paths.complete
+    assert {"/mock/cwd-2", "/mock/mapped-2", "/mock/executable-2"} <= paths
+    assert not any(path.endswith("-1") for path in paths)
+
+
+def test_open_scan_can_force_lsof(monkeypatch):
+    expected = audit._OpenPaths()
+    monkeypatch.setattr(audit, "_open_paths", REAL_OPEN_PATHS)
+    monkeypatch.setattr(audit, "_libproc_open_paths", lambda: pytest.fail("libproc was used"))
+    monkeypatch.setattr(audit, "_lsof_open_paths", lambda: expected)
+    assert audit._open_paths("lsof") is expected
+
+
+def test_open_scan_default_skips_regions_and_thorough_walks_them(monkeypatch):
+    state = _fake_libproc(monkeypatch)
+    monkeypatch.setattr(audit, "_open_paths", REAL_OPEN_PATHS)
+
+    default = audit._open_paths()
+    assert default is not None and default.complete
+    assert {"/mock/cwd-2", "/mock/fd-file", "/mock/executable-2"} <= default
+    assert "/mock/mapped-2" not in default
+    assert state["region_calls"] == 0
+
+    thorough = audit._open_paths("thorough")
+    assert thorough is not None and thorough.complete
+    assert "/mock/mapped-2" in thorough
+    assert state["region_calls"] > 0
+
+
+def test_libproc_detects_open_file_and_subprocess_working_directory(tmp_path, monkeypatch):
+    if sys.platform != "darwin":
+        pytest.skip("libproc is macOS-only")
+    co = _repo(tmp_path / "r" / "co", "c")
+    monkeypatch.setattr(audit, "_open_paths", REAL_OPEN_PATHS)
+    monkeypatch.setattr(audit, "_lsof_open_paths", lambda: pytest.fail("lsof fallback used on macOS"))
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=co)
+    try:
+        pids = (os.getpid(), child.pid)
+        real_cdll = ctypes.CDLL
+
+        def restricted_cdll(*args, **kwargs):
+            lib = real_cdll(*args, **kwargs)
+
+            def list_pids(flavor, info, buffer, buffer_size):
+                if flavor != audit.PROC_UID_ONLY or info != os.getuid():
+                    return lib.proc_listpids(flavor, info, buffer, buffer_size)
+                payload = (ctypes.c_int * len(pids))(*pids)
+                size = ctypes.sizeof(payload)
+                if buffer is None:
+                    return size
+                if buffer_size < size:
+                    return buffer_size
+                ctypes.memmove(buffer, payload, size)
+                return size
+
+            list_pids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+            list_pids.restype = ctypes.c_int
+
+            class RestrictedLib:
+                def __getattr__(self, name):
+                    return list_pids if name == "proc_listpids" else getattr(lib, name)
+
+            return RestrictedLib()
+
+        monkeypatch.setattr(audit.ctypes, "CDLL", restricted_cdll)
+        with open(co / "a.txt"):
+            paths = audit._open_paths()
+            assert paths is not None and paths.scanned_processes == 2
+            assert os.path.realpath(co / "a.txt") in {os.path.realpath(p) for p in paths}
+        paths = audit._open_paths()
+        assert paths is not None and paths.scanned_processes == 2
+        assert os.path.realpath(co) in {os.path.realpath(p) for p in paths}
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def _fake_fleet_tools(tmp_path, monkeypatch, config):
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    fake_ssh = fakebin / "ssh"
+    fake_scp = fakebin / "scp"
+    remote_root = tmp_path / "remote"
+    log_path = tmp_path / "fleet-log.jsonl"
+    fake_scp.write_text("""#!/usr/bin/env python3
+import json, os, shutil, sys, time
+source, target = sys.argv[-2:]
+host, _, remote = target.partition(':')
+host_config = json.loads(os.environ['FAKE_SSH_CONFIG']).get(host, {})
+with open(os.environ['FAKE_FLEET_LOG'], 'a') as log:
+    log.write(json.dumps({'tool': 'scp', 'host': host}) + '\\n')
+time.sleep(host_config.get('copy_delay', 0))
+path = os.path.join(os.environ['FAKE_REMOTE_ROOT'], host, remote.lstrip('/'))
+os.makedirs(os.path.dirname(path), exist_ok=True)
+shutil.copyfile(source, path)
+""")
+    fake_ssh.write_text("""#!/usr/bin/env python3
+import json, os, shlex, subprocess, sys, time
+host, *command = sys.argv[1:]
+config = json.loads(os.environ['FAKE_SSH_CONFIG'])
+with open(os.environ['FAKE_FLEET_LOG'], 'a') as log:
+    log.write(json.dumps({'tool': 'ssh', 'host': host, 'command': command}) + '\\n')
+host_config = config.get(host, {})
+if command == ['hostname', '-s']:
+    time.sleep(host_config.get('hostname_delay', 0))
+    if host_config.get('hostname_status', 0):
+        raise SystemExit(host_config['hostname_status'])
+    print(host_config.get('identity', host))
+    raise SystemExit
+time.sleep(host_config.get('audit_delay', 0))
+if host_config.get('audit_status', 0):
+    raise SystemExit(host_config['audit_status'])
+argv = shlex.split(command[-1])
+remote_path = argv[1]
+argv[1] = os.path.join(os.environ['FAKE_REMOTE_ROOT'], host, remote_path.lstrip('/'))
+argv[0] = sys.executable
+result = subprocess.run(argv, text=True, capture_output=True)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+raise SystemExit(result.returncode)
+""")
+    for executable in (fake_ssh, fake_scp):
+        executable.chmod(0o755)
+    monkeypatch.setenv("FAKE_REMOTE_ROOT", str(remote_root))
+    monkeypatch.setenv("FAKE_FLEET_LOG", str(log_path))
+    monkeypatch.setenv("FAKE_SSH_CONFIG", json.dumps(config))
+    monkeypatch.setenv("PATH", f"{fakebin}:{os.environ['PATH']}")
+    return log_path, remote_root
+
+
+def test_fleet_identity_failure_drops_rows_and_skips_audit_command(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "r"
+    _repo(root / "co", "c")
+    log_path, _remote_root = _fake_fleet_tools(
+        tmp_path, monkeypatch, {"node-a": {"identity": "node-a"}, "node-b": {"identity": "wrong-node"}})
+    assert audit.main(["--root", str(root), "--hosts", "node-a,node-b", "--json"]) == 2
+    captured = capsys.readouterr()
+    rows = [json.loads(line) for line in captured.out.splitlines()]
+    assert len(rows) == 1 and rows[0]["host"] == "node-a"
+    assert "# IDENTITY-FAIL node-b" in captured.err
+    commands = [json.loads(line) for line in log_path.read_text().splitlines()]
+    node_b = [entry for entry in commands if entry["host"] == "node-b"]
+    assert [entry["tool"] for entry in node_b] == ["scp", "ssh"]
+    assert node_b[1]["command"] == ["hostname", "-s"]
+
+
+def test_fleet_merged_totals_include_all_successful_hosts(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "r"
+    _repo(root / "co", "c")
+    _fake_fleet_tools(tmp_path, monkeypatch, {"node-a": {}, "node-c": {}})
+    assert audit.main(["--root", str(root), "--hosts", "node-a,node-c", "--json"]) == 0
+    captured = capsys.readouterr()
+    rows = [json.loads(line) for line in captured.out.splitlines()]
+    assert {row["host"] for row in rows} == {"node-a", "node-c"}
+    total = sum(row["private_gb"] for row in rows)
+    noncow = sum(row["private_gb"] for row in rows if row["cow"] == "NON-COW")
+    summary = next(line for line in captured.err.splitlines() if line.startswith("# FLEET:"))
+    assert summary == (f"# FLEET: 2 hosts, 2 rows, {total:.2f} GB private total, "
+                       f"{noncow:.2f} GB NON-COW")
+
+
+def test_fleet_audit_failure_returns_nonzero_and_names_host(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "r"
+    _repo(root / "co", "c")
+    _fake_fleet_tools(tmp_path, monkeypatch, {"node-b": {"audit_status": 7}})
+    assert audit.main(["--root", str(root), "--hosts", "node-b", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert "# ERROR node-b" in captured.err and "# FLEET: 0 hosts, 0 rows" in captured.err
+
+
+def test_fleet_honours_cumulative_per_host_timeout(tmp_path, capsys, monkeypatch):
+    root = tmp_path / "r"
+    _repo(root / "co", "c")
+    log_path, _remote_root = _fake_fleet_tools(
+        tmp_path, monkeypatch,
+        {"slow-node": {"copy_delay": 0.08, "hostname_delay": 0.08,
+                       "audit_delay": 0.35, "audit_status": 7}})
+    started = time.monotonic()
+    assert audit.main(["--root", str(root), "--hosts", "slow-node", "--host-timeout", "0.5", "--json"]) == 2
+    elapsed = time.monotonic() - started
+    captured = capsys.readouterr()
+    assert elapsed < 1.0
+    assert "# TIMEOUT slow-node" in captured.err
+    commands = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [entry["tool"] for entry in commands] == ["scp", "ssh", "ssh"]
+    assert commands[1]["command"] == ["hostname", "-s"]
+    assert commands[2]["command"] != ["hostname", "-s"]
